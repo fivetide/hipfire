@@ -28,6 +28,10 @@ impl GpuTensor {
 pub enum DType {
     F32,
     F16,
+    Q4K,  // 144 bytes per 256 elements
+    Q6K,  // 210 bytes per 256 elements
+    Q8_0, // 34 bytes per 32 elements
+    Raw,  // raw bytes, no element interpretation
 }
 
 impl DType {
@@ -35,6 +39,7 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::F16 => 2,
+            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Raw => 1, // byte-level
         }
     }
 }
@@ -124,6 +129,17 @@ impl Gpu {
         Ok(tensor)
     }
 
+    /// Upload raw bytes to GPU (for quantized weights).
+    pub fn upload_raw(&self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
+        let buf = self.hip.malloc(data.len())?;
+        self.hip.memcpy_htod(&buf, data)?;
+        Ok(GpuTensor {
+            buf,
+            shape: shape.to_vec(),
+            dtype: DType::Raw,
+        })
+    }
+
     pub fn free_tensor(&self, tensor: GpuTensor) -> HipResult<()> {
         self.hip.free(tensor.buf)
     }
@@ -166,6 +182,128 @@ impl Gpu {
         // One block per row, 256 threads per block with shared memory reduction
         let block_size = 256u32.min(k as u32);
         let shared_mem = block_size * 4; // one float per thread
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [block_size, 1, 1],
+                shared_mem,
+                None,
+                &mut params,
+            )
+        }
+    }
+
+    /// y = A_q4k * x (quantized matrix-vector multiply, A stored as Q4_K on GPU)
+    /// a_raw: raw Q4_K bytes on GPU, x: F32 input, y: F32 output
+    /// m: number of output rows, k: number of input columns (must be multiple of 256)
+    pub fn gemv_q4k(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gemv_q4k", kernels::GEMV_Q4K_SRC, "gemv_q4k")?;
+        let func = &self.functions["gemv_q4k"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let block_size = 256u32;
+        let shared_mem = block_size * 4; // reduction only
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [block_size, 1, 1],
+                shared_mem,
+                None,
+                &mut params,
+            )
+        }
+    }
+
+    /// y = A_q8_0 * x (quantized GEMV for Q8_0)
+    pub fn gemv_q8_0(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "gemv_q8_0")?;
+        let func = &self.functions["gemv_q8_0"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let block_size = 256u32;
+        let shared_mem = block_size * 4;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [block_size, 1, 1],
+                shared_mem,
+                None,
+                &mut params,
+            )
+        }
+    }
+
+    /// y = A_q6k * x (quantized GEMV for Q6_K)
+    pub fn gemv_q6k(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gemv_q6k", kernels::GEMV_Q6K_SRC, "gemv_q6k")?;
+        let func = &self.functions["gemv_q6k"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let block_size = 256u32;
+        let shared_mem = block_size * 4;
         unsafe {
             self.hip.launch_kernel(
                 func,

@@ -1,3 +1,4 @@
 experiment	task	kernel	tok_s	throughput	pct_peak	correctness	peak_vram_mb	description	kept
 0	baseline	all	7.2	-	-	PASS	4300	TinyLlama 1.1B F32 dequant, CPU attention, 140ms/tok avg	YES
 1	task1	all	3.4	-	-	PASS	-	Qwen3-0.6B Q8_0 VERIFIED correct — matches ollama output word-for-word	YES
+2	task2	gemv_q4k	-	26.9 GB/s	6.0	PASS	-	v4: native _Float16, 1.18x faster than F32 at 2048x2048	YES
