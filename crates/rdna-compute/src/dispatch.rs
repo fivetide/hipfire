@@ -129,6 +129,20 @@ impl Gpu {
         Ok(tensor)
     }
 
+    /// GPU-side embedding lookup: copy row `token_id` from embedding table to output.
+    /// Avoids downloading the entire embedding table to CPU.
+    pub fn embedding_lookup(
+        &self,
+        table: &GpuTensor,  // [vocab_size * dim] F32
+        output: &GpuTensor, // [dim] F32
+        token_id: u32,
+        dim: usize,
+    ) -> HipResult<()> {
+        let byte_offset = (token_id as usize) * dim * 4;
+        let byte_size = dim * 4;
+        self.hip.memcpy_dtod_offset(&output.buf, &table.buf, byte_offset, byte_size)
+    }
+
     /// Upload raw bytes to GPU (for quantized weights).
     pub fn upload_raw(&self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
         let buf = self.hip.malloc(data.len())?;

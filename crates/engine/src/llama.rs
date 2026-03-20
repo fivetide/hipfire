@@ -497,11 +497,9 @@ pub fn forward(
     let n_kv_heads = config.n_kv_heads;
     let kv_dim = n_kv_heads * head_dim;
 
-    // Embedding lookup (CPU-side, then upload)
-    let embd_data = gpu.download_f32(&weights.token_embd)?;
-    let start = (token as usize) * dim;
-    let x_data = embd_data[start..start + dim].to_vec();
-    let mut x = gpu.upload_f32(&x_data, &[dim])?;
+    // Embedding lookup — GPU-side D2D copy of one row (8KB vs 262MB download)
+    let mut x = gpu.zeros(&[dim], DType::F32)?;
+    gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?;
 
     let tmp = gpu.zeros(&[dim], DType::F32)?;
 
@@ -687,6 +685,10 @@ impl KvCache {
     }
 
     /// Store K, V at position `pos` in layer cache (CPU → GPU copy into cache slot).
+    pub fn store_kv_pub(&mut self, gpu: &Gpu, layer: usize, pos: usize, k: &[f32], v: &[f32]) -> HipResult<()> {
+        self.store_kv(gpu, layer, pos, k, v)
+    }
+
     fn store_kv(
         &mut self,
         gpu: &Gpu,

@@ -190,6 +190,28 @@ impl HipRuntime {
         self.check(code, "hipMemcpy H2D offset")
     }
 
+    /// Copy bytes from one GPU buffer at an offset to another GPU buffer.
+    pub fn memcpy_dtod_offset(
+        &self,
+        dst: &DeviceBuffer,
+        src: &DeviceBuffer,
+        src_offset: usize,
+        size: usize,
+    ) -> HipResult<()> {
+        assert!(size <= dst.size, "size ({size}) exceeds dst ({})", dst.size);
+        assert!(src_offset + size <= src.size, "src_offset+size exceeds src");
+        let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
+        let code = unsafe {
+            (self.fn_memcpy)(
+                dst.ptr,
+                src_ptr,
+                size,
+                MemcpyKind::DeviceToDevice as c_uint,
+            )
+        };
+        self.check(code, "hipMemcpy D2D offset")
+    }
+
     pub fn memcpy_htod(&self, dst: &DeviceBuffer, src: &[u8]) -> HipResult<()> {
         assert!(
             src.len() <= dst.size,
