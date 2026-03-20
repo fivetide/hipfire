@@ -476,10 +476,10 @@ pub fn forward(
     let kv_dim = n_kv_heads * head_dim;
 
     // Embedding lookup — GPU-side D2D copy of one row (8KB vs 262MB download)
-    let mut x = gpu.zeros(&[dim], DType::F32)?;
+    let mut x = gpu.alloc_tensor(&[dim], DType::F32)?;
     gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?;
 
-    let tmp = gpu.zeros(&[dim], DType::F32)?;
+    let tmp = gpu.alloc_tensor(&[dim], DType::F32)?;
 
     for layer_idx in 0..config.n_layers {
         let layer = &weights.layers[layer_idx];
@@ -489,9 +489,9 @@ pub fn forward(
 
         // Q, K, V projections
         let q_dim = n_heads * head_dim;
-        let q = gpu.zeros(&[q_dim], DType::F32)?;
-        let k = gpu.zeros(&[kv_dim], DType::F32)?;
-        let v = gpu.zeros(&[kv_dim], DType::F32)?;
+        let q = gpu.alloc_tensor(&[q_dim], DType::F32)?;
+        let k = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
+        let v = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
 
         weight_gemv(gpu, &layer.wq, &tmp, &q)?;
         weight_gemv(gpu, &layer.wk, &tmp, &k)?;
@@ -538,7 +538,7 @@ pub fn forward(
         gpu.free_tensor(v)?;
 
         // GPU-side attention
-        let attn_gpu = gpu.zeros(&[q_dim], DType::F32)?;
+        let attn_gpu = gpu.alloc_tensor(&[q_dim], DType::F32)?;
         gpu.attention_f32(
             &q,
             &kv_cache.k_gpu[layer_idx],
@@ -553,12 +553,12 @@ pub fn forward(
         gpu.free_tensor(q)?;
 
         // Output projection: o = Wo * attn_out
-        let o = gpu.zeros(&[dim], DType::F32)?;
+        let o = gpu.alloc_tensor(&[dim], DType::F32)?;
         weight_gemv(gpu, &layer.wo, &attn_gpu, &o)?;
         gpu.free_tensor(attn_gpu)?;
 
         // Residual: x = x + o
-        let x_new = gpu.zeros(&[dim], DType::F32)?;
+        let x_new = gpu.alloc_tensor(&[dim], DType::F32)?;
         gpu.add_f32(&x, &o, &x_new)?;
         gpu.free_tensor(x)?;
         gpu.free_tensor(o)?;
@@ -567,28 +567,28 @@ pub fn forward(
         // FFN
         gpu.rmsnorm_f32(&x, &layer.ffn_norm, &tmp, config.norm_eps)?;
 
-        let gate = gpu.zeros(&[config.hidden_dim], DType::F32)?;
-        let up = gpu.zeros(&[config.hidden_dim], DType::F32)?;
+        let gate = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
+        let up = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
         weight_gemv(gpu, &layer.w_gate, &tmp, &gate)?;
         weight_gemv(gpu, &layer.w_up, &tmp, &up)?;
 
         // SiLU(gate) * up
-        let gate_act = gpu.zeros(&[config.hidden_dim], DType::F32)?;
+        let gate_act = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
         gpu.silu_f32(&gate, &gate_act)?;
         gpu.free_tensor(gate)?;
 
-        let ffn_hidden = gpu.zeros(&[config.hidden_dim], DType::F32)?;
+        let ffn_hidden = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
         gpu.mul_f32(&gate_act, &up, &ffn_hidden)?;
         gpu.free_tensor(gate_act)?;
         gpu.free_tensor(up)?;
 
         // Down projection
-        let ffn_out = gpu.zeros(&[dim], DType::F32)?;
+        let ffn_out = gpu.alloc_tensor(&[dim], DType::F32)?;
         weight_gemv(gpu, &layer.w_down, &ffn_hidden, &ffn_out)?;
         gpu.free_tensor(ffn_hidden)?;
 
         // Residual
-        let x_new = gpu.zeros(&[dim], DType::F32)?;
+        let x_new = gpu.alloc_tensor(&[dim], DType::F32)?;
         gpu.add_f32(&x, &ffn_out, &x_new)?;
         gpu.free_tensor(x)?;
         gpu.free_tensor(ffn_out)?;
@@ -599,7 +599,7 @@ pub fn forward(
     gpu.rmsnorm_f32(&x, &weights.output_norm, &tmp, config.norm_eps)?;
 
     // Logits: output = output_weight * x
-    let logits = gpu.zeros(&[config.vocab_size], DType::F32)?;
+    let logits = gpu.alloc_tensor(&[config.vocab_size], DType::F32)?;
     weight_gemv(gpu, &weights.output, &tmp, &logits)?;
 
     let logits_data = gpu.download_f32(&logits)?;
