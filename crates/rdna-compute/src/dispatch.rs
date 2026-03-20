@@ -278,14 +278,13 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
         ];
 
-        let block_size = 256u32;
-        let shared_mem = block_size * 4;
+        let block_size = 32u32; // single warp — warp shuffle only
         unsafe {
             self.hip.launch_kernel(
                 func,
                 [m as u32, 1, 1],
                 [block_size, 1, 1],
-                shared_mem,
+                0,
                 None,
                 &mut params,
             )

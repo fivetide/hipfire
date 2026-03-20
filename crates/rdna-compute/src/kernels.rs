@@ -195,46 +195,34 @@ __device__ __forceinline__ float half_to_float_q8(unsigned short h) {
     return __int_as_float((sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13));
 }
 
+// Q8_0 GEMV v2: 32 threads (single warp), warp shuffle. No shared memory.
+// Each thread handles element tid within each Q8_0 block, iterating over blocks.
+__launch_bounds__(32, 20)
 extern "C" __global__ void gemv_q8_0(
     const unsigned char* __restrict__ A_q8,
     const float* __restrict__ x,
     float* __restrict__ y,
     int M, int K
 ) {
-    extern __shared__ float sdata[];
-
     const int row = blockIdx.x;
     if (row >= M) return;
+    const int tid = threadIdx.x;
 
     const int blocks_per_row = K / 32;
-    const int bytes_per_block = 34;
-    const unsigned char* row_data = A_q8 + (size_t)row * blocks_per_row * bytes_per_block;
+    const unsigned char* row_data = A_q8 + (size_t)row * blocks_per_row * 34;
 
     float sum = 0.0f;
 
-    for (int elem = threadIdx.x; elem < K; elem += blockDim.x) {
-        int block_idx = elem / 32;
-        int within_block = elem % 32;
-
-        const unsigned char* block = row_data + block_idx * bytes_per_block;
-
-        unsigned short d_bits = block[0] | (block[1] << 8);
-        float d = half_to_float_q8(d_bits);
-
-        signed char qval = (signed char)block[2 + within_block];
-        float w = d * (float)qval;
-        sum += w * x[elem];
+    for (int bi = 0; bi < blocks_per_row; bi++) {
+        const unsigned char* block = row_data + bi * 34;
+        float d = (float)*((const _Float16*)block);
+        signed char qval = (signed char)block[2 + tid];
+        sum += d * (float)qval * x[bi * 32 + tid];
     }
 
-    sdata[threadIdx.x] = sum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        y[row] = sdata[0];
-    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+    if (tid == 0) y[row] = sum;
 }
 "#;
 
