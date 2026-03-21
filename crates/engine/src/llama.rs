@@ -917,70 +917,83 @@ pub fn argmax(logits: &[f32]) -> u32 {
 
 /// Sample the next token using temperature + top-k + top-p (nucleus) sampling.
 /// Qwen3 recommended: temperature=0.7, top_k=20, top_p=0.8
+///
+/// Single pass over raw logits to find top-K by value (no softmax on 151K vocab).
+/// Softmax only computed on the K=20 finalists.
 pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
     const TOP_K: usize = 20;
 
-    // Single pass: find top-K candidates via min-heap + compute softmax denominator
     let inv_temp = 1.0 / temperature;
-    let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
-    // Min-heap of (score, index) — keeps the K largest
-    let mut topk = Vec::with_capacity(TOP_K + 1);
+    // Single pass: find max AND top-K indices from raw logits simultaneously.
+    // Uses a fixed-size array (no heap alloc) with manual min-tracking.
+    let mut topk_val = [f32::NEG_INFINITY; TOP_K];
+    let mut topk_idx = [0u32; TOP_K];
+    let mut min_pos = 0usize; // index of smallest element in topk
+    let mut min_val = f32::NEG_INFINITY;
+    let mut max_logit = f32::NEG_INFINITY;
+
     for (i, &l) in logits.iter().enumerate() {
-        let score = (l - max_logit) * inv_temp;
-        if topk.len() < TOP_K {
-            topk.push((score, i as u32));
-            if topk.len() == TOP_K {
-                // Heapify: sort so min is at [0]
-                topk.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-            }
-        } else if score > topk[0].0 {
-            topk[0] = (score, i as u32);
-            // Bubble down to maintain min-heap property
-            let mut pos = 0;
-            loop {
-                let left = 2 * pos + 1;
-                let right = 2 * pos + 2;
-                let mut smallest = pos;
-                if left < TOP_K && topk[left].0 < topk[smallest].0 { smallest = left; }
-                if right < TOP_K && topk[right].0 < topk[smallest].0 { smallest = right; }
-                if smallest == pos { break; }
-                topk.swap(pos, smallest);
-                pos = smallest;
+        if l > max_logit { max_logit = l; }
+        if l > min_val {
+            topk_val[min_pos] = l;
+            topk_idx[min_pos] = i as u32;
+            // Find new min
+            min_val = f32::INFINITY;
+            for j in 0..TOP_K {
+                if topk_val[j] < min_val {
+                    min_val = topk_val[j];
+                    min_pos = j;
+                }
             }
         }
     }
 
-    // Convert to probabilities and sort descending
-    let mut candidates: Vec<(f32, u32)> = topk.iter()
-        .map(|&(score, idx)| (score.exp(), idx))
-        .collect();
-    candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    // Softmax only the K candidates (temperature-scaled)
+    let mut probs = [0.0f32; TOP_K];
+    let mut sum = 0.0f32;
+    for i in 0..TOP_K {
+        let p = ((topk_val[i] - max_logit) * inv_temp).exp();
+        probs[i] = p;
+        sum += p;
+    }
 
-    // Top-p filtering
-    let sum: f32 = candidates.iter().map(|(p, _)| p).sum();
+    // Sort descending by probability (insertion sort on 20 elements)
+    let mut order: [usize; TOP_K] = core::array::from_fn(|i| i);
+    for i in 1..TOP_K {
+        let mut j = i;
+        while j > 0 && probs[order[j]] > probs[order[j - 1]] {
+            order.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+
+    // Top-p filtering + sampling in one pass
+    let r = simple_rand() * sum; // pre-scale by total sum
     let mut cumulative = 0.0f32;
-    let mut n_keep = candidates.len();
-    for (i, &(p, _)) in candidates.iter().enumerate() {
-        cumulative += p / sum;
-        if cumulative >= top_p {
-            n_keep = i + 1;
-            break;
+    let mut sample_acc = 0.0f32;
+    let threshold = top_p * sum;
+    for &k in &order {
+        cumulative += probs[k];
+        sample_acc += probs[k];
+        if sample_acc >= r {
+            return topk_idx[k];
+        }
+        if cumulative >= threshold {
+            // Past top_p — sample from what we have
+            let r2 = simple_rand() * cumulative;
+            let mut acc2 = 0.0f32;
+            for &k2 in &order {
+                acc2 += probs[k2];
+                if acc2 >= r2 {
+                    return topk_idx[k2];
+                }
+                if acc2 >= cumulative { break; }
+            }
+            return topk_idx[order[0]];
         }
     }
-    candidates.truncate(n_keep);
-
-    // Renormalize and sample
-    let cand_sum: f32 = candidates.iter().map(|(p, _)| p).sum();
-    let r: f32 = simple_rand() * cand_sum;
-    let mut acc = 0.0f32;
-    for &(p, idx) in &candidates {
-        acc += p;
-        if acc >= r {
-            return idx;
-        }
-    }
-    candidates.last().map(|&(_, idx)| idx).unwrap_or(0)
+    topk_idx[order[0]]
 }
 
 /// Simple deterministic-seeded RNG (xorshift32). Not crypto-quality, fine for sampling.
