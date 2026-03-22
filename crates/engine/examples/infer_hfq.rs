@@ -19,8 +19,8 @@ fn main() {
 
     // Parse flags
     let temp: f32 = args.iter().position(|a| a == "--temp")
-        .map(|i| args[i + 1].parse().unwrap_or(0.7))
-        .unwrap_or(0.7);
+        .map(|i| args[i + 1].parse().unwrap_or(0.6))
+        .unwrap_or(0.6);
     let debug = args.iter().any(|a| a == "--debug");
     let top_p: f32 = if temp == 0.0 { 1.0 } else { 0.8 };
     let repeat_penalty: f32 = args.iter().position(|a| a == "--repeat-penalty")
