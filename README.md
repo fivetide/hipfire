@@ -79,7 +79,7 @@ hipfire/
 ├── crates/
 │   ├── hip-bridge/          # Safe Rust FFI to libamdhip64.so via dlopen
 │   ├── rdna-compute/        # HIP kernel compilation, dispatch, GPU tensor ops
-│   ├── engine/              # Model loading (GGUF + HFQ), forward pass, tokenizer
+│   ├── engine/              # Model loading, forward pass, tokenizer
 │   └── hipfire-quantize/    # Quantizer: HuggingFace safetensors -> .hfq
 ├── bench/                   # Profiling scripts (run_profile.sh, compile_results.py)
 └── docs/
@@ -96,7 +96,7 @@ Any LLaMA-architecture or Qwen3 model from HuggingFace. Tested:
 | Qwen3-8B | HFQ4-G256 | ~4.4 GB | 59.3 |
 | Qwen3-0.6B | HFQ4-G128 | ~0.4 GB | 256.3 |
 
-GGUF models also supported via the `infer` example (Q4_K_M, Q8_0).
+Quantize any LLaMA/Qwen3 model from HuggingFace with `hipfire-quantize --format hfq4`.
 
 ## License
 
