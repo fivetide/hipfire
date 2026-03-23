@@ -140,31 +140,59 @@ pub struct Qwen35Weights {
 // ─── State ──────────────────────────────────────────────────────────────
 
 /// Persistent state for DeltaNet layers across tokens.
+/// State quantization mode for DeltaNet S matrix.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum StateQuant {
+    FP32,
+    Q8,
+}
+
 pub struct DeltaNetState {
-    /// S matrix: [n_deltanet_layers × n_heads × head_dim × head_dim] FP32
+    /// S matrix storage — FP32 or Q8 depending on quant mode
     pub s_matrices: Vec<GpuTensor>,
+    /// Per-head scale factors (only used for Q8 mode)
+    pub s_scales: Vec<GpuTensor>,
     /// Conv ring buffer: [n_deltanet_layers × conv_channels × (kernel_size-1)] FP32
     pub conv_states: Vec<GpuTensor>,
+    /// Current quantization mode
+    pub quant: StateQuant,
 }
 
 impl DeltaNetState {
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config) -> HipResult<Self> {
+        Self::new_with_quant(gpu, config, StateQuant::FP32)
+    }
+
+    pub fn new_with_quant(gpu: &mut Gpu, config: &Qwen35Config, quant: StateQuant) -> HipResult<Self> {
         let n_delta_layers = config.layer_types.iter().filter(|t| **t == LayerType::LinearAttention).count();
         let s_dim = config.linear_key_head_dim; // 128
         let n_heads = config.linear_num_value_heads; // 16
         let s_size = n_heads * s_dim * s_dim; // 16 * 128 * 128 = 262144
 
         let conv_channels = config.linear_num_key_heads * config.linear_key_head_dim * 2
-                          + config.linear_num_value_heads * config.linear_value_head_dim; // Q+K+V dim = 6144
-        let conv_state_size = conv_channels * (config.conv_kernel_dim - 1); // 6144 * 3 = 18432
+                          + config.linear_num_value_heads * config.linear_value_head_dim;
+        let conv_state_size = conv_channels * (config.conv_kernel_dim - 1);
 
         let mut s_matrices = Vec::with_capacity(n_delta_layers);
+        let mut s_scales = Vec::with_capacity(n_delta_layers);
         let mut conv_states = Vec::with_capacity(n_delta_layers);
         for _ in 0..n_delta_layers {
-            s_matrices.push(gpu.zeros(&[s_size], DType::F32)?);
+            match quant {
+                StateQuant::FP32 => {
+                    s_matrices.push(gpu.zeros(&[s_size], DType::F32)?);
+                    s_scales.push(gpu.zeros(&[n_heads], DType::F32)?);
+                }
+                StateQuant::Q8 => {
+                    // int8 state: s_size bytes (1 byte each), per-row scales
+                    let buf = gpu.hip.malloc(s_size)?;
+                    gpu.hip.memset(&buf, 0, s_size)?;
+                    s_matrices.push(GpuTensor { buf, shape: vec![s_size], dtype: DType::F32 });
+                    s_scales.push(gpu.zeros(&[n_heads * s_dim], DType::F32)?); // per-row scale
+                }
+            }
             conv_states.push(gpu.zeros(&[conv_state_size], DType::F32)?);
         }
-        Ok(Self { s_matrices, conv_states })
+        Ok(Self { s_matrices, s_scales, conv_states, quant })
     }
 }
 
@@ -434,11 +462,19 @@ pub fn forward(
 
                 // Gated Delta Net recurrence
                 let attn_out = gpu.alloc_tensor(&[v_dim], DType::F32)?;
-                gpu.gated_delta_net_f32(
-                    &q_part, &k_part, &v_part, &alpha_out, &beta_out,
-                    &dn_state.s_matrices[delta_layer_idx], &attn_out,
-                    1, n_v_heads, config.linear_value_head_dim,
-                )?;
+                match dn_state.quant {
+                    StateQuant::FP32 => gpu.gated_delta_net_f32(
+                        &q_part, &k_part, &v_part, &alpha_out, &beta_out,
+                        &dn_state.s_matrices[delta_layer_idx], &attn_out,
+                        1, n_v_heads, config.linear_value_head_dim,
+                    )?,
+                    StateQuant::Q8 => gpu.gated_delta_net_q8(
+                        &q_part, &k_part, &v_part, &alpha_out, &beta_out,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &dn_state.s_scales[delta_layer_idx], &attn_out,
+                        1, n_v_heads, config.linear_value_head_dim,
+                    )?,
+                }
 
                 // Q-only scaling. llama.cpp also scales output by 1/sqrt(S_v)
                 // in the kernel, but that makes L00 too small (0.175 vs ref 0.501).

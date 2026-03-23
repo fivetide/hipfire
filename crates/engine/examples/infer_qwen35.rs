@@ -44,10 +44,16 @@ fn main() {
         &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len,
     ).unwrap();
 
-    // DeltaNet state
-    let mut dn_state = qwen35::DeltaNetState::new(&mut gpu, &config).unwrap();
-    eprintln!("DeltaNet state: {} S matrices, {} conv states",
-        dn_state.s_matrices.len(), dn_state.conv_states.len());
+    // DeltaNet state (check for --q8-state flag)
+    let state_quant = if std::env::var("Q8_STATE").is_ok() {
+        eprintln!("Using Q8 S-state quantization");
+        qwen35::StateQuant::Q8
+    } else {
+        qwen35::StateQuant::FP32
+    };
+    let mut dn_state = qwen35::DeltaNetState::new_with_quant(&mut gpu, &config, state_quant).unwrap();
+    eprintln!("DeltaNet state: {} S matrices ({:?}), {} conv states",
+        dn_state.s_matrices.len(), state_quant, dn_state.conv_states.len());
 
     // Tokenize with ChatML (skip if NO_CHATML env var set)
     let mut prompt_tokens = tokenizer.encode(&prompt_text);

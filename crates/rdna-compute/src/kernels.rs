@@ -3326,6 +3326,108 @@ extern "C" __global__ void gated_delta_net_f32(
 }
 "#;
 
+/// GDN recurrence with Q8-quantized S state in VRAM.
+/// State layout: signed char s_q8[n_heads][HD*HD] + float s_scales[n_heads*HD].
+/// Per-ROW absmax scale for better precision (128 scales per head).
+/// Dequant at load, full FP32 recurrence, requant at store.
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_Q8_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+#define HD 128
+
+extern "C" __global__ void gated_delta_net_q8(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ gate,
+    const float* __restrict__ beta,
+    signed char* __restrict__ s_q8,     // [n_heads × HD × HD] int8
+    float* __restrict__ s_scales,       // [n_heads × HD] per-row scale
+    float* __restrict__ output,
+    int n_tokens,
+    int n_heads,
+    int head_dim
+) {
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+    const int row = threadIdx.x;  // 0..127
+
+    const int stride = n_heads * HD;
+    signed char* S_q8_row = s_q8 + h * HD * HD + row * HD;
+    float row_scale = s_scales[h * HD + row];
+
+    // Dequantize this thread's S row from Q8 to FP32 in registers
+    float S_local[HD];
+    for (int j = 0; j < HD; j++)
+        S_local[j] = row_scale * (float)S_q8_row[j];
+
+    __shared__ float k_lds[HD];
+    __shared__ float q_lds[HD];
+
+    for (int t = 0; t < n_tokens; t++) {
+        const float* q_t = q + t * stride + h * HD;
+        const float* k_t = k + t * stride + h * HD;
+        const float* v_t = v + t * stride + h * HD;
+        float alpha_val = expf(gate[t * n_heads + h]);
+        float beta_val = beta[t * n_heads + h];
+
+        k_lds[row] = k_t[row];
+        q_lds[row] = q_t[row];
+        __syncthreads();
+
+        // Phase 1: kv = S^T @ k (column access into global Q8 state)
+        // Need S[j][row] for j=0..127. Each row j has its own scale.
+        float kv_val = 0.0f;
+        for (int j = 0; j < HD; j += 4) {
+            float sc0 = s_scales[h*HD + j];
+            float sc1 = s_scales[h*HD + j+1];
+            float sc2 = s_scales[h*HD + j+2];
+            float sc3 = s_scales[h*HD + j+3];
+            kv_val += sc0 * (float)s_q8[h*HD*HD + j*HD + row] * k_lds[j];
+            kv_val += sc1 * (float)s_q8[h*HD*HD + (j+1)*HD + row] * k_lds[j+1];
+            kv_val += sc2 * (float)s_q8[h*HD*HD + (j+2)*HD + row] * k_lds[j+2];
+            kv_val += sc3 * (float)s_q8[h*HD*HD + (j+3)*HD + row] * k_lds[j+3];
+        }
+
+        float delta = (v_t[row] - alpha_val * kv_val) * beta_val;
+
+        // Phase 2+3 fused: update S in registers and compute output
+        float out_val = 0.0f;
+        for (int j = 0; j < HD; j += 4) {
+            float s0 = alpha_val * S_local[j]   + k_lds[j]   * delta;
+            float s1 = alpha_val * S_local[j+1] + k_lds[j+1] * delta;
+            float s2 = alpha_val * S_local[j+2] + k_lds[j+2] * delta;
+            float s3 = alpha_val * S_local[j+3] + k_lds[j+3] * delta;
+            S_local[j]   = s0;
+            S_local[j+1] = s1;
+            S_local[j+2] = s2;
+            S_local[j+3] = s3;
+            out_val += s0 * q_lds[j] + s1 * q_lds[j+1] + s2 * q_lds[j+2] + s3 * q_lds[j+3];
+        }
+        output[t * stride + h * HD + row] = out_val;
+        __syncthreads();
+    }
+
+    // Quantize S row back to Q8: per-row absmax (no cross-thread reduce needed)
+    float amax = 0.0f;
+    for (int j = 0; j < HD; j++) {
+        float a = fabsf(S_local[j]);
+        if (a > amax) amax = a;
+    }
+
+    float new_scale = (amax > 0.0f) ? (amax / 127.0f) : 1.0f;
+    float inv_scale = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+
+    for (int j = 0; j < HD; j++) {
+        int val = (int)roundf(S_local[j] * inv_scale);
+        val = val < -128 ? -128 : (val > 127 ? 127 : val);
+        S_q8_row[j] = (signed char)val;
+    }
+    s_scales[h * HD + row] = new_scale;
+}
+"#;
+
 /// Alpha gate compute on GPU: out[i] = softplus(alpha[i] + dt_bias[i]) * (-exp(a_log[i])).
 /// Eliminates 85µs CPU roundtrip per DeltaNet layer.
 #[cfg(feature = "deltanet")]
