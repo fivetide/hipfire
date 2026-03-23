@@ -2262,4 +2262,66 @@ impl Gpu {
         // S matrix in global memory (fits in L2 cache).
         unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [32, 4, 1], 0, self.stream_ref(), &mut params) }
     }
+
+    /// Alpha gate compute: alpha[i] = softplus(alpha[i] + dt_bias[i]) * (-exp(a_log[i])).
+    /// Replaces 85µs CPU roundtrip with ~3µs GPU kernel.
+    #[cfg(feature = "deltanet")]
+    pub fn alpha_gate_f32(
+        &mut self, alpha: &GpuTensor, dt_bias: &GpuTensor, a_log: &GpuTensor, n: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("alpha_gate", kernels::ALPHA_GATE_SRC, "alpha_gate_f32")?;
+        let func = &self.functions["alpha_gate_f32"];
+        let mut ap = alpha.buf.as_ptr();
+        let mut dp = dt_bias.buf.as_ptr();
+        let mut lp = a_log.buf.as_ptr();
+        let mut nv = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void, &mut dp as *mut _ as *mut c_void,
+            &mut lp as *mut _ as *mut c_void, &mut nv as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Scale vector by constant: x[i] *= scale. Replaces 48µs CPU roundtrip.
+    #[cfg(feature = "deltanet")]
+    pub fn scale_f32(&mut self, x: &GpuTensor, scale: f32) -> HipResult<()> {
+        self.ensure_kernel("scale_f32", kernels::SCALE_F32_SRC, "scale_f32")?;
+        let func = &self.functions["scale_f32"];
+        let n = x.numel();
+        let mut xp = x.buf.as_ptr();
+        let mut nv = n as i32;
+        let mut sv = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void, &mut nv as *mut _ as *mut c_void,
+            &mut sv as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Fused conv1d (kernel_size=4) + SiLU decode.
+    #[cfg(feature = "deltanet")]
+    pub fn conv1d_silu_f32(
+        &mut self, output: &GpuTensor, input: &GpuTensor, weight: &GpuTensor,
+        state: &GpuTensor, n_channels: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("conv1d_silu", kernels::CONV1D_SILU_SRC, "conv1d_silu_f32")?;
+        let func = &self.functions["conv1d_silu_f32"];
+        let mut op = output.buf.as_ptr();
+        let mut ip = input.buf.as_ptr();
+        let mut wp = weight.buf.as_ptr();
+        let mut sp = state.buf.as_ptr();
+        let mut nc = n_channels as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut op as *mut _ as *mut c_void, &mut ip as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((n_channels as u32) + block - 1) / block;
+        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
 }

@@ -403,37 +403,17 @@ pub fn forward(
                 weight_gemv(gpu, &layer.w_beta, &tmp, &beta_out)?;
                 gpu.sigmoid_f32(&beta_out)?;
 
-                // Alpha projection: gate = softplus(alpha + dt_bias) * A_log
-                // (llama.cpp multiplies raw A_log, not -exp(A_log))
+                // Alpha projection + gate compute (all on GPU, no CPU roundtrip)
                 let alpha_out = gpu.alloc_tensor(&[n_v_heads], DType::F32)?;
                 weight_gemv(gpu, &layer.w_alpha, &tmp, &alpha_out)?;
-                let mut alpha_cpu = gpu.download_f32(&alpha_out)?;
-                let dt_bias_cpu = gpu.download_f32(&layer.dt_bias)?;
-                let a_log_cpu = gpu.download_f32(&layer.a_log)?;
-                for i in 0..n_v_heads {
-                    let biased = alpha_cpu[i] + dt_bias_cpu[i];
-                    let sp = if biased > 20.0 { biased } else if biased < -20.0 { biased.exp() } else { (1.0 + biased.exp()).ln() };
-                    // llama.cpp's ssm_a = -exp(A_log) (converted during GGUF export)
-                    // We apply the same conversion here since we load raw A_log from safetensors
-                    alpha_cpu[i] = sp * (-a_log_cpu[i].exp());
-                }
-                let alpha_bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(alpha_cpu.as_ptr() as *const u8, alpha_cpu.len() * 4)
-                };
-                gpu.hip.memcpy_htod(&alpha_out.buf, alpha_bytes)?;
+                gpu.alpha_gate_f32(&alpha_out, &layer.dt_bias, &layer.a_log, n_v_heads)?;
 
-                // Conv1d on QKV
+                // Fused conv1d + SiLU (one kernel instead of two)
                 let conv_out = gpu.alloc_tensor(&[qkv_dim], DType::F32)?;
-                gpu.conv1d_decode_f32(
+                gpu.conv1d_silu_f32(
                     &conv_out, &qkv, &layer.conv_weight,
                     &dn_state.conv_states[delta_layer_idx], qkv_dim,
                 )?;
-
-                // SiLU on conv output (out-of-place, reuse buffer)
-                let conv_silu = gpu.alloc_tensor(&[qkv_dim], DType::F32)?;
-                gpu.silu_f32(&conv_out, &conv_silu)?;
-                gpu.free_tensor(conv_out)?;
-                let conv_out = conv_silu;
 
                 // Split conv output into Q, K, V
                 let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -449,16 +429,8 @@ pub fn forward(
                 gpu.l2_norm_f32(&q_part, config.linear_num_key_heads, config.linear_key_head_dim, config.norm_eps)?;
                 gpu.l2_norm_f32(&k_part, config.linear_num_key_heads, config.linear_key_head_dim, config.norm_eps)?;
 
-                // Scale Q by 1/sqrt(S_k) before recurrence (matches llama.cpp)
-                {
-                    let mut q_cpu = gpu.download_f32(&q_part)?;
-                    let scale = 1.0 / (config.linear_key_head_dim as f32).sqrt();
-                    for v in &mut q_cpu { *v *= scale; }
-                    let q_bytes: &[u8] = unsafe {
-                        std::slice::from_raw_parts(q_cpu.as_ptr() as *const u8, q_cpu.len() * 4)
-                    };
-                    gpu.hip.memcpy_htod(&q_part.buf, q_bytes)?;
-                }
+                // Scale Q by 1/sqrt(S_k) before recurrence (all on GPU)
+                gpu.scale_f32(&q_part, 1.0 / (config.linear_key_head_dim as f32).sqrt())?;
 
                 // Gated Delta Net recurrence
                 let attn_out = gpu.alloc_tensor(&[v_dim], DType::F32)?;

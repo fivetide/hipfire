@@ -3262,6 +3262,66 @@ extern "C" __global__ void gated_delta_net_f32(
 }
 "#;
 
+/// Alpha gate compute on GPU: out[i] = softplus(alpha[i] + dt_bias[i]) * (-exp(a_log[i])).
+/// Eliminates 85µs CPU roundtrip per DeltaNet layer.
+#[cfg(feature = "deltanet")]
+pub const ALPHA_GATE_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+extern "C" __global__ void alpha_gate_f32(
+    float* __restrict__ alpha,          // in: raw projection output, out: gate values
+    const float* __restrict__ dt_bias,
+    const float* __restrict__ a_log,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float biased = alpha[i] + dt_bias[i];
+    float sp = (biased > 20.0f) ? biased : ((biased < -20.0f) ? expf(biased) : logf(1.0f + expf(biased)));
+    alpha[i] = sp * (-expf(a_log[i]));
+}
+"#;
+
+/// Scale vector by constant: x[i] *= scale. Eliminates 48µs CPU roundtrip.
+#[cfg(feature = "deltanet")]
+pub const SCALE_F32_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+extern "C" __global__ void scale_f32(float* __restrict__ x, int n, float scale) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] *= scale;
+}
+"#;
+
+/// Fused conv1d (kernel_size=4) + SiLU. Eliminates one kernel launch.
+#[cfg(feature = "deltanet")]
+pub const CONV1D_SILU_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+extern "C" __global__ void conv1d_silu_f32(
+    float* __restrict__ output,
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    float* __restrict__ state,
+    int n_channels
+) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n_channels) return;
+
+    float x = input[c];
+    float s0 = state[c * 3];
+    float s1 = state[c * 3 + 1];
+    float s2 = state[c * 3 + 2];
+
+    float y = weight[c * 4 + 3] * x + weight[c * 4 + 2] * s0
+            + weight[c * 4 + 1] * s1 + weight[c * 4] * s2;
+
+    // SiLU fused
+    output[c] = y / (1.0f + expf(-y));
+
+    state[c * 3 + 2] = s1;
+    state[c * 3 + 1] = s0;
+    state[c * 3]     = x;
+}
+"#;
+
 /// GPU-side KV cache write using pos from a GPU buffer.
 /// Copies kv_dim floats from src to dst at offset pos_buf[0] * kv_dim.
 pub const KV_CACHE_WRITE_SRC: &str = r#"
