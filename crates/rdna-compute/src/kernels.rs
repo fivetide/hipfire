@@ -2363,7 +2363,13 @@ extern "C" __global__ void attention_q8_0_kv(
     float* scores = sdata;
     float* workspace = sdata + seq_len;
 
-    // Phase 1: Q @ K^T with Q8_0 dequant
+    // Preload Q head into shared memory (loaded once, used for all positions)
+    float* q_shared = workspace + nthreads;  // after workspace
+    for (int d = tid; d < head_dim; d += nthreads)
+        q_shared[d] = q_head[d];
+    __syncthreads();
+
+    // Phase 1: Q @ K^T with Q8_0 dequant (Q preloaded in shared memory)
     float local_max = -1e30f;
     for (int t = tid; t < seq_len; t += nthreads) {
         float dot = 0.0f;
@@ -2371,9 +2377,9 @@ extern "C" __global__ void attention_q8_0_kv(
             const unsigned char* block = k_cache + (size_t)t * total_blocks_per_pos * 34
                                         + (kv_head_block_start + bi) * 34;
             float d = (float)*((const _Float16*)block);
+            const float* qb = q_shared + bi * 32;
             for (int j = 0; j < 32; j++) {
-                signed char qval = (signed char)block[2 + j];
-                dot += q_head[bi * 32 + j] * (d * (float)qval);
+                dot += qb[j] * (d * (float)((signed char)block[2 + j]));
             }
         }
         float s = dot * scale_attn;
@@ -2631,7 +2637,9 @@ extern "C" __global__ void kv_cache_write_hfq4(
 }
 "#;
 
-/// Attention with HFQ4 KV blocks. 72 bytes per head, co-located scale+zero+nibbles.
+/// Attention with HFQ4 KV blocks v2. Tight single-block pattern.
+/// 72 bytes per head = one HFQ4-G128 block (scale+zero+64 nibble bytes).
+/// Q preloaded into shared memory. One scale+zero load per position.
 pub const ATTENTION_HFQ4_KV_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 
@@ -2652,79 +2660,66 @@ extern "C" __global__ void attention_hfq4_kv(
 
     const int h = blockIdx.x;
     if (h >= n_heads) return;
-
     const int kv_group = n_heads / n_kv_heads;
     const int kv_h = h / kv_group;
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
 
-    const float* q_head = q + h * head_dim;
-    const int bytes_per_block = 8 + head_dim / 2;
-    const int bytes_per_pos = n_kv_heads * bytes_per_block;
+    const int bpb = 8 + head_dim / 2;  // 72 for head_dim=128
+    const int bpp = n_kv_heads * bpb;
 
     float* scores = sdata;
-    float* workspace = sdata + seq_len;
+    float* ws = sdata + seq_len;
+    float* q_sh = ws + nthreads;  // Q preloaded in shared memory
 
-    // Phase 1: Q @ K^T with HFQ4 dequant
-    float local_max = -1e30f;
+    // Preload Q head into shared memory
+    const float* q_head = q + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads)
+        q_sh[d] = q_head[d];
+    __syncthreads();
+
+    // Phase 1: Q @ K^T — one 72-byte block per position, tight nibble loop
+    float lmax = -1e30f;
     for (int t = tid; t < seq_len; t += nthreads) {
-        const unsigned char* block = k_cache + (size_t)t * bytes_per_pos + kv_h * bytes_per_block;
-        float k_scale = *(const float*)(block);
-        float k_zero  = *(const float*)(block + 4);
+        const unsigned char* blk = k_cache + (size_t)t * bpp + kv_h * bpb;
+        float sc = *(const float*)(blk);
+        float zr = *(const float*)(blk + 4);
         float dot = 0.0f;
-        for (int d = 0; d < head_dim; d += 2) {
-            unsigned char byte_val = block[8 + d / 2];
-            float k0 = k_scale * (float)(byte_val & 0xF) + k_zero;
-            float k1 = k_scale * (float)(byte_val >> 4) + k_zero;
-            dot += q_head[d] * k0 + q_head[d + 1] * k1;
+        // 64 bytes of nibbles = 128 elements, 2 per byte
+        for (int j = 0; j < head_dim / 2; j++) {
+            unsigned char pk = blk[8 + j];
+            dot += q_sh[j * 2]     * (sc * (float)(pk & 0xF) + zr)
+                 + q_sh[j * 2 + 1] * (sc * (float)(pk >> 4) + zr);
         }
-        float s = dot * scale_attn;
-        scores[t] = s;
-        local_max = fmaxf(local_max, s);
+        scores[t] = dot * scale_attn;
+        lmax = fmaxf(lmax, scores[t]);
     }
 
-    workspace[tid] = local_max;
+    ws[tid] = lmax;
     __syncthreads();
-    for (int s = nthreads / 2; s > 0; s >>= 1) {
-        if (tid < s) workspace[tid] = fmaxf(workspace[tid], workspace[tid + s]);
-        __syncthreads();
-    }
-    float max_val = workspace[0];
+    for (int s = nthreads / 2; s > 0; s >>= 1) { if (tid < s) ws[tid] = fmaxf(ws[tid], ws[tid + s]); __syncthreads(); }
+    float max_val = ws[0]; __syncthreads();
+
+    float lsum = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) { float e = expf(scores[t] - max_val); scores[t] = e; lsum += e; }
+    ws[tid] = lsum; __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) { if (tid < s) ws[tid] += ws[tid + s]; __syncthreads(); }
+    float sv = ws[0]; __syncthreads();
+    for (int t = tid; t < seq_len; t += nthreads) scores[t] /= sv;
     __syncthreads();
 
-    float local_sum = 0.0f;
-    for (int t = tid; t < seq_len; t += nthreads) {
-        float e = expf(scores[t] - max_val);
-        scores[t] = e;
-        local_sum += e;
-    }
-    workspace[tid] = local_sum;
-    __syncthreads();
-    for (int s = nthreads / 2; s > 0; s >>= 1) {
-        if (tid < s) workspace[tid] += workspace[tid + s];
-        __syncthreads();
-    }
-    float sum_val = workspace[0];
-    __syncthreads();
-
-    for (int t = tid; t < seq_len; t += nthreads) {
-        scores[t] /= sum_val;
-    }
-    __syncthreads();
-
-    // Phase 2: weighted V sum with HFQ4 dequant
+    // Phase 2: weighted V sum — same 72-byte block dequant
     float* out_head = out + h * head_dim;
     for (int d = tid; d < head_dim; d += nthreads) {
         float val = 0.0f;
         int byte_idx = d / 2;
         int is_high = d & 1;
         for (int t = 0; t < seq_len; t++) {
-            const unsigned char* block = v_cache + (size_t)t * bytes_per_pos + kv_h * bytes_per_block;
-            float v_scale = *(const float*)(block);
-            float v_zero  = *(const float*)(block + 4);
-            unsigned char bv = block[8 + byte_idx];
-            float v_val = v_scale * (float)(is_high ? (bv >> 4) : (bv & 0xF)) + v_zero;
-            val += scores[t] * v_val;
+            const unsigned char* blk = v_cache + (size_t)t * bpp + kv_h * bpb;
+            float sc = *(const float*)(blk);
+            float zr = *(const float*)(blk + 4);
+            unsigned char pk = blk[8 + byte_idx];
+            val += scores[t] * (sc * (float)(is_high ? (pk >> 4) : (pk & 0xF)) + zr);
         }
         out_head[d] = val;
     }
