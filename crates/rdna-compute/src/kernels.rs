@@ -4677,11 +4677,17 @@ extern "C" __global__ void kv_cache_write_turbo2(
         // Parallel FWHT
         for (int d = tid; d < head_dim; d += nthreads) x[d] *= signs1[d];
         __syncthreads();
-        for (int stride = 1; stride < head_dim; stride <<= 1) {
+        for (int stride = 1; stride <= 2; stride <<= 1) {
             for (int base = tid; base < head_dim / 2; base += nthreads) {
                 int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
-                float a = x[i], b = x[i + stride];
-                x[i] = a + b; x[i + stride] = a - b;
+                float a = x[i], b = x[i + stride]; x[i] = a + b; x[i + stride] = a - b;
+            }
+        }
+        __syncthreads();
+        for (int stride = 4; stride < head_dim; stride <<= 1) {
+            for (int base = tid; base < head_dim / 2; base += nthreads) {
+                int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
+                float a = x[i], b = x[i + stride]; x[i] = a + b; x[i + stride] = a - b;
             }
             __syncthreads();
         }
@@ -5018,7 +5024,15 @@ extern "C" __global__ void attention_turbo2_kv(
     __syncthreads();
     for (int d = tid; d < head_dim; d += nthreads) q_rot[d] *= signs1[d];
     __syncthreads();
-    for (int stride = 1; stride < head_dim; stride <<= 1) {
+    // FWHT butterfly: strides 1-2 are thread-local (no sync needed)
+    for (int stride = 1; stride <= 2; stride <<= 1) {
+        for (int base = tid; base < head_dim / 2; base += nthreads) {
+            int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
+            float a = q_rot[i], b = q_rot[i + stride]; q_rot[i] = a + b; q_rot[i + stride] = a - b;
+        }
+    }
+    __syncthreads();
+    for (int stride = 4; stride < head_dim; stride <<= 1) {
         for (int base = tid; base < head_dim / 2; base += nthreads) {
             int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
             float a = q_rot[i], b = q_rot[i + stride]; q_rot[i] = a + b; q_rot[i + stride] = a - b;
@@ -5082,7 +5096,15 @@ extern "C" __global__ void attention_turbo2_kv(
     __syncthreads();
     for (int d = tid; d < head_dim; d += nthreads) q_rot[d] *= signs2[d];
     __syncthreads();
-    for (int stride = 1; stride < head_dim; stride <<= 1) {
+    // FWHT butterfly: strides 1-2 are thread-local (no sync needed)
+    for (int stride = 1; stride <= 2; stride <<= 1) {
+        for (int base = tid; base < head_dim / 2; base += nthreads) {
+            int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
+            float a = q_rot[i], b = q_rot[i + stride]; q_rot[i] = a + b; q_rot[i + stride] = a - b;
+        }
+    }
+    __syncthreads();
+    for (int stride = 4; stride < head_dim; stride <<= 1) {
         for (int base = tid; base < head_dim / 2; base += nthreads) {
             int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
             float a = q_rot[i], b = q_rot[i + stride]; q_rot[i] = a + b; q_rot[i + stride] = a - b;
