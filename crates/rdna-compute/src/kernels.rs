@@ -4818,43 +4818,20 @@ extern "C" __global__ void kv_cache_write_turbo3(
             x[d] *= inv_norm;
         __syncthreads();
 
-        // FWHT: parallel butterfly passes (all 32 threads participate)
-        // Step 1: signs1
-        for (int d = tid; d < head_dim; d += nthreads)
-            x[d] *= signs1[d];
-        __syncthreads();
-
-        // Butterfly passes
-        for (int stride = 1; stride < head_dim; stride <<= 1) {
-            for (int base = tid; base < head_dim / 2; base += nthreads) {
-                int block_id = base / stride;
-                int j = base % stride;
-                int i = block_id * stride * 2 + j;
-                float a = x[i];
-                float b = x[i + stride];
-                x[i] = a + b;
-                x[i + stride] = a - b;
-            }
-            __syncthreads();
-        }
-
-        // Scale + signs2
-        const float inv_sqrt = 0.08838834764831845f;
-        for (int d = tid; d < head_dim; d += nthreads)
-            x[d] *= inv_sqrt * signs2[d];
-        __syncthreads();
-
-        // Parallel quantize to 3-bit + compute reconstruction norm
-        // Each thread handles its dims
+        // Register-only FWHT via __shfl_xor
         const int dpt = head_dim / nthreads;
         const int d0 = tid * dpt;
+        float fa = x[d0], fb = x[d0+1], fc = x[d0+2], fd = x[d0+3];
+        fwht_shfl_forward(fa, fb, fc, fd, signs1, signs2, tid);
+
+        // Quantize to 3-bit from registers
         float local_recon_sq = 0.0f;
-        unsigned char local_qs[4] = {0, 0, 0, 0};  // dpt/4 = 1 byte (4 dims → 4 × 2-bit = 1 byte)
-        unsigned char local_hi = 0;  // 4 bits of high bits
+        unsigned char local_qs[4] = {0, 0, 0, 0};
+        unsigned char local_hi = 0;
+        float fvals[4] = {fa, fb, fc, fd};
 
         for (int i = 0; i < dpt; i++) {
-            int d = d0 + i;
-            float val = x[d];
+            float val = fvals[i];
             int idx = (val > -0.154258f) + (val > -0.091775f) + (val > -0.043589f) + (val > 0.0f)
                      + (val > 0.043589f) + (val > 0.091775f) + (val > 0.154258f);
             float c = TURBO_C3[idx];
