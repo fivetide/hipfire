@@ -1,0 +1,572 @@
+#[cfg(not(feature = "deltanet"))]
+fn main() -> std::process::ExitCode {
+    eprintln!("test_inferenceQA requires --features deltanet");
+    std::process::ExitCode::from(10)
+}
+
+// QA mirror for the inference integration harness.
+// Uses subprocess isolation per case so hangs, panics, and slowdowns are attributed
+// to a single case instead of collapsing the whole sweep.
+
+#[cfg(feature = "deltanet")]
+use engine::gguf::GgufFile;
+#[cfg(feature = "deltanet")]
+use engine::hfq::HfqFile;
+#[cfg(feature = "deltanet")]
+use engine::llama;
+#[cfg(feature = "deltanet")]
+use engine::qwen35;
+#[cfg(feature = "deltanet")]
+use engine::qwen35::DeltaNetState;
+#[cfg(feature = "deltanet")]
+use engine::tokenizer::Tokenizer;
+#[cfg(feature = "deltanet")]
+use std::any::Any;
+#[cfg(feature = "deltanet")]
+use std::env;
+#[cfg(feature = "deltanet")]
+use std::path::{Path, PathBuf};
+#[cfg(feature = "deltanet")]
+use std::process::{Command, ExitCode};
+#[cfg(feature = "deltanet")]
+use std::thread;
+#[cfg(feature = "deltanet")]
+use std::time::{Duration, Instant};
+
+#[cfg(feature = "deltanet")]
+const SKIP_EXIT: u8 = 10;
+#[cfg(feature = "deltanet")]
+const QWEN_GGUF_FALLBACK: &str = "/home/kaden/llama.cpp/models/Qwen3-0.6B-Q8_0.gguf";
+
+#[cfg(feature = "deltanet")]
+struct CaseDef {
+    name: &'static str,
+    timeout: Duration,
+}
+
+#[cfg(feature = "deltanet")]
+const CASES: &[CaseDef] = &[
+    CaseDef { name: "forward_finite_logits", timeout: Duration::from_secs(20) },
+    CaseDef { name: "forward_scratch_matches", timeout: Duration::from_secs(20) },
+    CaseDef { name: "sequence_no_hang", timeout: Duration::from_secs(20) },
+    CaseDef { name: "think_token_detectable", timeout: Duration::from_secs(10) },
+    CaseDef { name: "chatml_single_tokens", timeout: Duration::from_secs(10) },
+    CaseDef { name: "asym_cache_allocates", timeout: Duration::from_secs(20) },
+    CaseDef { name: "asym_forward_no_hang", timeout: Duration::from_secs(20) },
+    CaseDef { name: "decode_speed_sanity", timeout: Duration::from_secs(35) },
+    CaseDef { name: "vram_leak_signal", timeout: Duration::from_secs(20) },
+];
+
+#[cfg(feature = "deltanet")]
+enum CaseOutcome {
+    Pass(String),
+    Skip(String),
+    Fail(String),
+}
+
+#[cfg(feature = "deltanet")]
+struct Context {
+    _hfq: HfqFile,
+    model_label: String,
+    tokenizer_source: String,
+    config: qwen35::Qwen35Config,
+    tokenizer: Tokenizer,
+    gpu: rdna_compute::Gpu,
+    weights: qwen35::Qwen35Weights,
+}
+
+#[cfg(feature = "deltanet")]
+fn main() -> ExitCode {
+    let args: Vec<String> = env::args().collect();
+    let mut case_name: Option<String> = None;
+    let mut model_path: Option<PathBuf> = None;
+
+    let mut i = 1usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--qa-case" => {
+                i += 1;
+                case_name = args.get(i).cloned();
+            }
+            "--model" => {
+                i += 1;
+                model_path = args.get(i).map(PathBuf::from);
+            }
+            other if !other.starts_with("--") && model_path.is_none() => {
+                model_path = Some(PathBuf::from(other));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let model_path = model_path.or_else(resolve_model_from_env);
+
+    if let Some(case) = case_name {
+        return run_case(&case, model_path.as_deref());
+    }
+
+    supervisor(model_path.as_deref())
+}
+
+#[cfg(feature = "deltanet")]
+fn resolve_model_from_env() -> Option<PathBuf> {
+    env::var("QWEN35_TEST_MODEL").ok().map(PathBuf::from)
+}
+
+#[cfg(feature = "deltanet")]
+fn supervisor(model_path: Option<&Path>) -> ExitCode {
+    let model_path = match model_path {
+        Some(path) => path,
+        None => {
+            eprintln!("QA SKIP: no model supplied. Pass --model <model.hfq> or set QWEN35_TEST_MODEL.");
+            return ExitCode::from(SKIP_EXIT);
+        }
+    };
+
+    if !model_path.exists() {
+        eprintln!("QA SKIP: model not found at {}", model_path.display());
+        return ExitCode::from(SKIP_EXIT);
+    }
+
+    let exe = match env::current_exe() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("failed to resolve current executable: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut passed = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+
+    eprintln!("=== hipfire inference QA harness ===");
+    eprintln!("Model: {}", model_path.display());
+
+    for case in CASES {
+        eprintln!("\n--- {} ---", case.name);
+        let mut child = match Command::new(&exe)
+            .arg("--qa-case")
+            .arg(case.name)
+            .arg("--model")
+            .arg(model_path)
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(err) => {
+                failed += 1;
+                eprintln!("spawn failed: {err}");
+                continue;
+            }
+        };
+
+        let start = Instant::now();
+        let code = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.code().unwrap_or(1),
+                Ok(None) => {
+                    if start.elapsed() > case.timeout {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break 124;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Err(err) => {
+                    eprintln!("wait failed: {err}");
+                    break 1;
+                }
+            }
+        };
+
+        match code {
+            0 => {
+                passed += 1;
+                eprintln!("SUPERVISOR PASS {} ({:.0}ms)", case.name, start.elapsed().as_secs_f64() * 1000.0);
+            }
+            x if x == SKIP_EXIT as i32 => {
+                skipped += 1;
+                eprintln!("SUPERVISOR SKIP {} ({:.0}ms)", case.name, start.elapsed().as_secs_f64() * 1000.0);
+            }
+            124 => {
+                failed += 1;
+                eprintln!("SUPERVISOR FAIL {} timed out after {:.1}s", case.name, case.timeout.as_secs_f64());
+            }
+            other => {
+                failed += 1;
+                eprintln!("SUPERVISOR FAIL {} rc={other}", case.name);
+            }
+        }
+    }
+
+    eprintln!("\n--- Summary ---");
+    eprintln!("  Passed:  {passed}");
+    eprintln!("  Skipped: {skipped}");
+    eprintln!("  Failed:  {failed}");
+
+    if failed > 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+#[cfg(feature = "deltanet")]
+fn run_case(case_name: &str, model_path: Option<&Path>) -> ExitCode {
+    let model_path = match model_path {
+        Some(path) if path.exists() => path,
+        Some(path) => {
+            eprintln!("QA SKIP {case_name}: model not found at {}", path.display());
+            return ExitCode::from(SKIP_EXIT);
+        }
+        None => {
+            eprintln!("QA SKIP {case_name}: no model path provided");
+            return ExitCode::from(SKIP_EXIT);
+        }
+    };
+
+    let result = std::panic::catch_unwind(|| {
+        let mut ctx = build_context(model_path)?;
+        Ok::<CaseOutcome, CaseOutcome>(match case_name {
+            "forward_finite_logits" => forward_finite_logits(&mut ctx),
+            "forward_scratch_matches" => forward_scratch_matches(&mut ctx),
+            "sequence_no_hang" => sequence_no_hang(&mut ctx),
+            "think_token_detectable" => think_token_detectable(&mut ctx),
+            "chatml_single_tokens" => chatml_single_tokens(&mut ctx),
+            "asym_cache_allocates" => asym_cache_allocates(&mut ctx),
+            "asym_forward_no_hang" => asym_forward_no_hang(&mut ctx),
+            "decode_speed_sanity" => decode_speed_sanity(&mut ctx),
+            "vram_leak_signal" => vram_leak_signal(&mut ctx),
+            other => CaseOutcome::Fail(format!("unknown case: {other}")),
+        })
+    });
+
+    match result {
+        Ok(Ok(CaseOutcome::Pass(msg))) => {
+            eprintln!("QA PASS {case_name}: {msg}");
+            ExitCode::SUCCESS
+        }
+        Ok(Ok(CaseOutcome::Skip(msg))) => {
+            eprintln!("QA SKIP {case_name}: {msg}");
+            ExitCode::from(SKIP_EXIT)
+        }
+        Ok(Ok(CaseOutcome::Fail(msg))) | Ok(Err(CaseOutcome::Fail(msg))) => {
+            eprintln!("QA FAIL {case_name}: {msg}");
+            ExitCode::from(1)
+        }
+        Ok(Err(CaseOutcome::Skip(msg))) => {
+            eprintln!("QA SKIP {case_name}: {msg}");
+            ExitCode::from(SKIP_EXIT)
+        }
+        Ok(Err(CaseOutcome::Pass(msg))) => {
+            eprintln!("QA PASS {case_name}: {msg}");
+            ExitCode::SUCCESS
+        }
+        Err(_) => {
+            eprintln!("QA FAIL {case_name}: panic");
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[cfg(feature = "deltanet")]
+fn build_context(model_path: &Path) -> Result<Context, CaseOutcome> {
+    let hfq = HfqFile::open(model_path)
+        .map_err(|e| CaseOutcome::Fail(format!("failed to open HFQ: {e}")))?;
+    let model_label = classify_qwen35_candidate(&hfq)?;
+    let config = qwen35::config_from_hfq(&hfq)
+        .ok_or_else(|| CaseOutcome::Fail("failed to parse Qwen3.5 config".to_string()))?;
+    let (tokenizer, tokenizer_source) = load_tokenizer(&hfq)?;
+    let mut gpu = rdna_compute::Gpu::init()
+        .map_err(|e| CaseOutcome::Skip(format!("GPU init unavailable: {e}")))?;
+    let weights = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        qwen35::load_weights(&hfq, &config, &mut gpu)
+    }))
+    .map_err(|panic| CaseOutcome::Fail(format!("weight load panicked: {}", panic_message(panic))))?
+    .map_err(|e| CaseOutcome::Fail(format!("failed to load weights: {e}")))?;
+
+    Ok(Context {
+        _hfq: hfq,
+        model_label,
+        tokenizer_source,
+        config,
+        tokenizer,
+        gpu,
+        weights,
+    })
+}
+
+#[cfg(feature = "deltanet")]
+fn classify_qwen35_candidate(hfq: &HfqFile) -> Result<String, CaseOutcome> {
+    let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+        .map_err(|e| CaseOutcome::Fail(format!("bad metadata JSON: {e}")))?;
+    let config = meta
+        .get("config")
+        .ok_or_else(|| CaseOutcome::Fail("no config in metadata".to_string()))?;
+    let text_config = config.get("text_config").unwrap_or(config);
+    let model_type = text_config
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    let qwen35_layout = hfq.tensor_data("model.language_model.embed_tokens.weight").is_some();
+    if model_type.starts_with("qwen3_5") || model_type == "qwen3.5" || qwen35_layout {
+        Ok(model_type.to_string())
+    } else {
+        Err(CaseOutcome::Skip(format!(
+            "unsupported HFQ for qwen35 QA: model_type={model_type}"
+        )))
+    }
+}
+
+#[cfg(feature = "deltanet")]
+fn load_tokenizer(hfq: &HfqFile) -> Result<(Tokenizer, String), CaseOutcome> {
+    if let Some(tokenizer) = Tokenizer::from_hfq_metadata(&hfq.metadata_json) {
+        return Ok((tokenizer, "hfq-metadata".to_string()));
+    }
+
+    let fallback = Path::new(QWEN_GGUF_FALLBACK);
+    if !fallback.exists() {
+        return Err(CaseOutcome::Skip(format!(
+            "tokenizer metadata missing and fallback GGUF not found at {}",
+            fallback.display()
+        )));
+    }
+
+    let gguf = GgufFile::open(fallback)
+        .map_err(|e| CaseOutcome::Skip(format!("failed to open fallback GGUF tokenizer: {e}")))?;
+    let tokenizer = Tokenizer::from_gguf(&gguf)
+        .ok_or_else(|| CaseOutcome::Skip("failed to parse fallback GGUF tokenizer".to_string()))?;
+    Ok((tokenizer, format!("gguf:{}", fallback.display())))
+}
+
+#[cfg(feature = "deltanet")]
+fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    if let Some(msg) = payload.downcast_ref::<&str>() {
+        (*msg).to_string()
+    } else if let Some(msg) = payload.downcast_ref::<String>() {
+        msg.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+#[cfg(feature = "deltanet")]
+fn ensure(cond: bool, msg: impl Into<String>) -> Result<(), String> {
+    if cond {
+        Ok(())
+    } else {
+        Err(msg.into())
+    }
+}
+
+#[cfg(feature = "deltanet")]
+fn forward_finite_logits(ctx: &mut Context) -> CaseOutcome {
+    match (|| -> Result<String, String> {
+        let kv_seq = 128usize;
+        let mut kv = llama::KvCache::new_gpu_q8(&mut ctx.gpu, ctx.config.n_layers, ctx.config.n_kv_heads, ctx.config.head_dim, kv_seq)
+            .map_err(|e| e.to_string())?;
+        let mut dn = DeltaNetState::new(&mut ctx.gpu, &ctx.config)
+            .map_err(|e: hip_bridge::HipError| e.to_string())?;
+        let logits = qwen35::forward(&mut ctx.gpu, &ctx.weights, &ctx.config, 1, 0, &mut kv, &mut dn)
+            .map_err(|e| e.to_string())?;
+        ensure(logits.len() == ctx.config.vocab_size, format!("expected vocab {} logits, got {}", ctx.config.vocab_size, logits.len()))?;
+        ensure(logits[0].is_finite(), format!("logits[0] is non-finite: {}", logits[0]))?;
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        ensure(max > -1e10, format!("all logits are too negative: {max}"))?;
+        Ok(format!("{} tokenizer={} logits[0]={:.4} max={:.4}", ctx.model_label, ctx.tokenizer_source, logits[0], max))
+    })() {
+        Ok(msg) => CaseOutcome::Pass(msg),
+        Err(err) => CaseOutcome::Fail(err),
+    }
+}
+
+#[cfg(feature = "deltanet")]
+fn forward_scratch_matches(ctx: &mut Context) -> CaseOutcome {
+    match (|| -> Result<String, String> {
+        let kv_seq = 128usize;
+        let mut kv1 = llama::KvCache::new_gpu_q8(&mut ctx.gpu, ctx.config.n_layers, ctx.config.n_kv_heads, ctx.config.head_dim, kv_seq)
+            .map_err(|e| e.to_string())?;
+        let mut dn1 = DeltaNetState::new(&mut ctx.gpu, &ctx.config)
+            .map_err(|e: hip_bridge::HipError| e.to_string())?;
+        let mut kv2 = llama::KvCache::new_gpu_q8(&mut ctx.gpu, ctx.config.n_layers, ctx.config.n_kv_heads, ctx.config.head_dim, kv_seq)
+            .map_err(|e| e.to_string())?;
+        let mut dn2 = DeltaNetState::new(&mut ctx.gpu, &ctx.config)
+            .map_err(|e: hip_bridge::HipError| e.to_string())?;
+        let scratch = qwen35::Qwen35Scratch::new(&mut ctx.gpu, &ctx.config, 64)
+            .map_err(|e: hip_bridge::HipError| e.to_string())?;
+
+        let token = *ctx.tokenizer.encode("Hello").first().ok_or_else(|| "tokenizer returned no tokens for Hello".to_string())?;
+        let logits_a = qwen35::forward(&mut ctx.gpu, &ctx.weights, &ctx.config, token, 0, &mut kv1, &mut dn1)
+            .map_err(|e: hip_bridge::HipError| e.to_string())?;
+        qwen35::forward_scratch(&mut ctx.gpu, &ctx.weights, &ctx.config, token, 0, &mut kv2, &mut dn2, &scratch)
+            .map_err(|e: hip_bridge::HipError| e.to_string())?;
+        let logits_b = ctx.gpu.download_f32(&scratch.logits).map_err(|e| e.to_string())?;
+        let max_diff = logits_a.iter().zip(logits_b.iter())
+            .map(|(a, b)| (*a - *b).abs())
+            .fold(0.0f32, f32::max);
+        ensure(max_diff < 0.001, format!("forward vs scratch diverged: max_diff={max_diff}"))?;
+        Ok(format!("max_diff={max_diff:.6}"))
+    })() {
+        Ok(msg) => CaseOutcome::Pass(msg),
+        Err(err) => CaseOutcome::Fail(err),
+    }
+}
+
+#[cfg(feature = "deltanet")]
+fn sequence_no_hang(ctx: &mut Context) -> CaseOutcome {
+    match (|| -> Result<String, String> {
+        let kv_seq = 128usize;
+        let mut kv = llama::KvCache::new_gpu_q8(&mut ctx.gpu, ctx.config.n_layers, ctx.config.n_kv_heads, ctx.config.head_dim, kv_seq)
+            .map_err(|e| e.to_string())?;
+        let mut dn = DeltaNetState::new(&mut ctx.gpu, &ctx.config)
+            .map_err(|e: hip_bridge::HipError| e.to_string())?;
+        let tokens = ctx.tokenizer.encode("What is the capital");
+        ensure(!tokens.is_empty(), "prompt encoded to zero tokens")?;
+        let t0 = Instant::now();
+        for (pos, &tok) in tokens.iter().enumerate() {
+            let _ = qwen35::forward(&mut ctx.gpu, &ctx.weights, &ctx.config, tok, pos, &mut kv, &mut dn)
+                .map_err(|e: hip_bridge::HipError| e.to_string())?;
+        }
+        let ms = t0.elapsed().as_millis();
+        let tps = tokens.len() as f64 / (ms.max(1) as f64 / 1000.0);
+        Ok(format!("{} tokens in {ms}ms ({tps:.1} tok/s)", tokens.len()))
+    })() {
+        Ok(msg) => CaseOutcome::Pass(msg),
+        Err(err) => CaseOutcome::Fail(err),
+    }
+}
+
+#[cfg(feature = "deltanet")]
+fn think_token_detectable(ctx: &mut Context) -> CaseOutcome {
+    let tokens = ctx.tokenizer.encode("</think>");
+    if tokens.is_empty() {
+        CaseOutcome::Fail(format!("</think> encoded to empty token sequence via {}", ctx.tokenizer_source))
+    } else {
+        CaseOutcome::Pass(format!("{} token(s): {:?}", tokens.len(), tokens))
+    }
+}
+
+#[cfg(feature = "deltanet")]
+fn chatml_single_tokens(ctx: &mut Context) -> CaseOutcome {
+    let im_start = ctx.tokenizer.encode("<|im_start|>");
+    let im_end = ctx.tokenizer.encode("<|im_end|>");
+    if im_start.len() != 1 || im_end.len() != 1 {
+        CaseOutcome::Fail(format!(
+            "ChatML special tokens are not single tokens: im_start={:?} im_end={:?} source={}",
+            im_start, im_end, ctx.tokenizer_source
+        ))
+    } else {
+        CaseOutcome::Pass(format!("im_start={} im_end={}", im_start[0], im_end[0]))
+    }
+}
+
+#[cfg(feature = "deltanet")]
+fn asym_cache_allocates(ctx: &mut Context) -> CaseOutcome {
+    match llama::KvCache::new_gpu_asym_q8k_turbo4v(
+        &mut ctx.gpu,
+        ctx.config.n_layers,
+        ctx.config.n_kv_heads,
+        ctx.config.head_dim,
+        128,
+    ) {
+        Ok(kv) => {
+            if kv.quant_asym && kv.quant_q8 && kv.quant_turbo == 4 && kv.turbo_signs1.is_some() && kv.turbo_signs2.is_some() {
+                CaseOutcome::Pass(format!("allocated asymmetric KV for {} layers", ctx.config.n_layers))
+            } else {
+                CaseOutcome::Fail("asymmetric KV cache flags were inconsistent".to_string())
+            }
+        }
+        Err(err) => CaseOutcome::Fail(format!("failed to allocate asymmetric KV cache: {err}")),
+    }
+}
+
+#[cfg(feature = "deltanet")]
+fn asym_forward_no_hang(ctx: &mut Context) -> CaseOutcome {
+    match (|| -> Result<String, String> {
+        let mut kv = llama::KvCache::new_gpu_asym_q8k_turbo4v(
+            &mut ctx.gpu,
+            ctx.config.n_layers,
+            ctx.config.n_kv_heads,
+            ctx.config.head_dim,
+            128,
+        ).map_err(|e: hip_bridge::HipError| e.to_string())?;
+        let mut dn = DeltaNetState::new(&mut ctx.gpu, &ctx.config)
+            .map_err(|e: hip_bridge::HipError| e.to_string())?;
+        let tokens = ctx.tokenizer.encode("Hello world");
+        ensure(!tokens.is_empty(), "prompt encoded to zero tokens")?;
+        let t0 = Instant::now();
+        for (pos, &tok) in tokens.iter().enumerate() {
+            let _ = qwen35::forward(&mut ctx.gpu, &ctx.weights, &ctx.config, tok, pos, &mut kv, &mut dn)
+                .map_err(|e: hip_bridge::HipError| e.to_string())?;
+        }
+        Ok(format!("{} tokens in {}ms", tokens.len(), t0.elapsed().as_millis()))
+    })() {
+        Ok(msg) => CaseOutcome::Pass(msg),
+        Err(err) => CaseOutcome::Fail(err),
+    }
+}
+
+#[cfg(feature = "deltanet")]
+fn decode_speed_sanity(ctx: &mut Context) -> CaseOutcome {
+    match (|| -> Result<String, String> {
+        let kv_seq = 256usize;
+        let mut kv = llama::KvCache::new_gpu_q8(&mut ctx.gpu, ctx.config.n_layers, ctx.config.n_kv_heads, ctx.config.head_dim, kv_seq)
+            .map_err(|e| e.to_string())?;
+        let mut dn = DeltaNetState::new(&mut ctx.gpu, &ctx.config)
+            .map_err(|e: hip_bridge::HipError| e.to_string())?;
+        let prompt = ctx.tokenizer.encode("The quick brown fox");
+        ensure(!prompt.is_empty(), "prompt encoded to zero tokens")?;
+        for (pos, &tok) in prompt.iter().enumerate() {
+            let _ = qwen35::forward(&mut ctx.gpu, &ctx.weights, &ctx.config, tok, pos, &mut kv, &mut dn)
+                .map_err(|e: hip_bridge::HipError| e.to_string())?;
+        }
+        let mut tok = 1u32;
+        let mut generated = Vec::new();
+        let t0 = Instant::now();
+        for i in 0..20 {
+            let logits = qwen35::forward(&mut ctx.gpu, &ctx.weights, &ctx.config, tok, prompt.len() + i, &mut kv, &mut dn)
+                .map_err(|e: hip_bridge::HipError| e.to_string())?;
+            tok = llama::argmax(&logits);
+            generated.push(tok);
+        }
+        let ms = t0.elapsed().as_millis();
+        let tps = 20.0 / (ms.max(1) as f64 / 1000.0);
+        ensure(tps > 10.0, format!("decode too slow: {tps:.1} tok/s"))?;
+        let preview = ctx.tokenizer.decode(&generated[..generated.len().min(8)]).replace('\n', " ");
+        ensure(!preview.trim().is_empty(), "generated preview was empty")?;
+        Ok(format!("{tps:.1} tok/s preview='{}'", preview.trim()))
+    })() {
+        Ok(msg) => CaseOutcome::Pass(msg),
+        Err(err) => CaseOutcome::Fail(err),
+    }
+}
+
+#[cfg(feature = "deltanet")]
+fn vram_leak_signal(ctx: &mut Context) -> CaseOutcome {
+    match (|| -> Result<String, String> {
+        let (free_before, _) = ctx.gpu.hip.get_vram_info().map_err(|e| e.to_string())?;
+        {
+            let kv = llama::KvCache::new_gpu_q8(
+                &mut ctx.gpu,
+                ctx.config.n_layers,
+                ctx.config.n_kv_heads,
+                ctx.config.head_dim,
+                512,
+            ).map_err(|e| e.to_string())?;
+            let (free_during, _) = ctx.gpu.hip.get_vram_info().map_err(|e| e.to_string())?;
+            let alloc_mb = (free_before - free_during) as f64 / 1e6;
+            if alloc_mb <= 0.0 {
+                return Err(format!("expected VRAM allocation, measured {alloc_mb:.2}MB"));
+            }
+            drop(kv);
+        }
+        let (free_after, _) = ctx.gpu.hip.get_vram_info().map_err(|e| e.to_string())?;
+        let leak_mb = (free_before as i64 - free_after as i64) as f64 / 1e6;
+        Ok(format!("post-drop delta={leak_mb:.2}MB"))
+    })() {
+        Ok(msg) => CaseOutcome::Pass(msg),
+        Err(err) => CaseOutcome::Fail(err),
+    }
+}
