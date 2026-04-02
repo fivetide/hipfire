@@ -58,19 +58,19 @@ extern "C" __global__ void kv_cache_write_turbo4_v256(
     int ia, ib;
 
     // Batch 1: v0-v3
-    ia = turbo_quantize_4bit(v0); local_rsq += TURBO_C4[ia] * TURBO_C4[ia];
-    ib = turbo_quantize_4bit(v1); local_rsq += TURBO_C4[ib] * TURBO_C4[ib];
+    ia = turbo_quantize_4bit_256(v0); local_rsq += TURBO_C4_256[ia] * TURBO_C4_256[ia];
+    ib = turbo_quantize_4bit_256(v1); local_rsq += TURBO_C4_256[ib] * TURBO_C4_256[ib];
     unsigned char p0 = (unsigned char)((ib << 4) | (ia & 0xF));
-    ia = turbo_quantize_4bit(v2); local_rsq += TURBO_C4[ia] * TURBO_C4[ia];
-    ib = turbo_quantize_4bit(v3); local_rsq += TURBO_C4[ib] * TURBO_C4[ib];
+    ia = turbo_quantize_4bit_256(v2); local_rsq += TURBO_C4_256[ia] * TURBO_C4_256[ia];
+    ib = turbo_quantize_4bit_256(v3); local_rsq += TURBO_C4_256[ib] * TURBO_C4_256[ib];
     unsigned char p1 = (unsigned char)((ib << 4) | (ia & 0xF));
 
     // Batch 2: v4-v7
-    ia = turbo_quantize_4bit(v4); local_rsq += TURBO_C4[ia] * TURBO_C4[ia];
-    ib = turbo_quantize_4bit(v5); local_rsq += TURBO_C4[ib] * TURBO_C4[ib];
+    ia = turbo_quantize_4bit_256(v4); local_rsq += TURBO_C4_256[ia] * TURBO_C4_256[ia];
+    ib = turbo_quantize_4bit_256(v5); local_rsq += TURBO_C4_256[ib] * TURBO_C4_256[ib];
     unsigned char p2 = (unsigned char)((ib << 4) | (ia & 0xF));
-    ia = turbo_quantize_4bit(v6); local_rsq += TURBO_C4[ia] * TURBO_C4[ia];
-    ib = turbo_quantize_4bit(v7); local_rsq += TURBO_C4[ib] * TURBO_C4[ib];
+    ia = turbo_quantize_4bit_256(v6); local_rsq += TURBO_C4_256[ia] * TURBO_C4_256[ia];
+    ib = turbo_quantize_4bit_256(v7); local_rsq += TURBO_C4_256[ib] * TURBO_C4_256[ib];
     unsigned char p3 = (unsigned char)((ib << 4) | (ia & 0xF));
 
     // Store packed nibbles immediately (frees p0-p3 before norm reduction)

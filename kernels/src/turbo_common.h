@@ -8,6 +8,14 @@ __constant__ float TURBO_C4[16] = {
      0.011225f,  0.034295f,  0.057983f,  0.083262f,  0.111016f,  0.143012f,  0.182875f,  0.241565f
 };
 
+// Lloyd-Max optimal centroids for N(0, 1/256) — all values = 128-dim × 1/sqrt(2)
+__constant__ float TURBO_C2_256[4] = {-0.094376f, -0.028300f, 0.028300f, 0.094376f};
+__constant__ float TURBO_C3_256[8] = {-0.134860f, -0.083320f, -0.046469f, -0.015176f, 0.015176f, 0.046469f, 0.083320f, 0.134860f};
+__constant__ float TURBO_C4_256[16] = {
+    -0.170807f, -0.129321f, -0.101134f, -0.078505f, -0.058869f, -0.041003f, -0.024249f, -0.007938f,
+     0.007938f,  0.024249f,  0.041003f,  0.058869f,  0.078505f,  0.101134f,  0.129321f,  0.170807f
+};
+
 // In-place FWHT on 128 elements in registers.
 // signs1/signs2 are ±1.0f arrays in global memory (uploaded once).
 __device__ void fwht_forward_128(float* x,
@@ -316,6 +324,21 @@ __device__ int turbo_quantize_4bit(float x) {
          + (x > -0.070622f) + (x > -0.046139f) + (x > -0.022760f) + (x > 0.0f)
          + (x > 0.022760f) + (x > 0.046139f) + (x > 0.070622f) + (x > 0.097139f)
          + (x > 0.127014f) + (x > 0.162944f) + (x > 0.212220f);
+}
+
+// 256-dim quantize functions — thresholds = 128-dim × 1/sqrt(2)
+__device__ int turbo_quantize_2bit_256(float x) {
+    return (x > -0.061352f) + (x > 0.0f) + (x > 0.061352f);
+}
+__device__ int turbo_quantize_3bit_256(float x) {
+    return (x > -0.109068f) + (x > -0.064903f) + (x > -0.030827f) + (x > 0.0f)
+         + (x > 0.030827f) + (x > 0.064903f) + (x > 0.109068f);
+}
+__device__ int turbo_quantize_4bit_256(float x) {
+    return (x > -0.150086f) + (x > -0.115239f) + (x > -0.089815f) + (x > -0.068691f)
+         + (x > -0.049935f) + (x > -0.032626f) + (x > -0.016096f) + (x > 0.0f)
+         + (x > 0.016096f) + (x > 0.032626f) + (x > 0.049935f) + (x > 0.068691f)
+         + (x > 0.089815f) + (x > 0.115239f) + (x > 0.150086f);
 }
 
 // Sign flip array for cheap decorrelation (seed=42, ±1.0)

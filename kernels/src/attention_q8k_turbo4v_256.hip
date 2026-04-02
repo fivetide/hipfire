@@ -114,14 +114,14 @@ extern "C" __global__ void attention_q8k_turbo4v_256(
         unsigned char p2 = vb[4 + tid * 4 + 2];
         unsigned char p3 = vb[4 + tid * 4 + 3];
 
-        mv[0] += wn * TURBO_C4[(p0)       & 0xF];
-        mv[1] += wn * TURBO_C4[(p0 >> 4)  & 0xF];
-        mv[2] += wn * TURBO_C4[(p1)       & 0xF];
-        mv[3] += wn * TURBO_C4[(p1 >> 4)  & 0xF];
-        mv[4] += wn * TURBO_C4[(p2)       & 0xF];
-        mv[5] += wn * TURBO_C4[(p2 >> 4)  & 0xF];
-        mv[6] += wn * TURBO_C4[(p3)       & 0xF];
-        mv[7] += wn * TURBO_C4[(p3 >> 4)  & 0xF];
+        mv[0] += wn * TURBO_C4_256[(p0)       & 0xF];
+        mv[1] += wn * TURBO_C4_256[(p0 >> 4)  & 0xF];
+        mv[2] += wn * TURBO_C4_256[(p1)       & 0xF];
+        mv[3] += wn * TURBO_C4_256[(p1 >> 4)  & 0xF];
+        mv[4] += wn * TURBO_C4_256[(p2)       & 0xF];
+        mv[5] += wn * TURBO_C4_256[(p2 >> 4)  & 0xF];
+        mv[6] += wn * TURBO_C4_256[(p3)       & 0xF];
+        mv[7] += wn * TURBO_C4_256[(p3 >> 4)  & 0xF];
     }
 
     // Inverse FWHT-256 to undo rotation
