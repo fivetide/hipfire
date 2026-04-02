@@ -1001,7 +1001,34 @@ fn forward_scratch_layers(
                 gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, pos as i32,
                     config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
 
-                if kv_cache.quant_q8 {
+                if kv_cache.quant_turbo > 0 {
+                    let s1 = kv_cache.turbo_signs1.as_ref().unwrap();
+                    let s2 = kv_cache.turbo_signs2.as_ref().unwrap();
+                    match kv_cache.quant_turbo {
+                        4 => {
+                            gpu.kv_cache_write_turbo4_fused(
+                                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_k, &s.fa_v, &s.pos_buf, s1, s2, config.n_kv_heads, config.head_dim)?;
+                            gpu.attention_turbo4_kv(&s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_attn_out, &s.pos_buf, s1, s2, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq)?;
+                        }
+                        3 => {
+                            gpu.kv_cache_write_turbo3_fused(
+                                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_k, &s.fa_v, &s.pos_buf, s1, s2, config.n_kv_heads, config.head_dim)?;
+                            gpu.attention_turbo3_kv(&s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_attn_out, &s.pos_buf, s1, s2, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq)?;
+                        }
+                        2 => {
+                            gpu.kv_cache_write_turbo2_fused(
+                                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_k, &s.fa_v, &s.pos_buf, s1, s2, config.n_kv_heads, config.head_dim)?;
+                            gpu.attention_turbo2_kv(&s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                &s.fa_attn_out, &s.pos_buf, s1, s2, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq)?;
+                        }
+                        _ => {}
+                    }
+                } else if kv_cache.quant_q8 {
                     gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
                     gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
                     gpu.attention_q8_0_kv(
