@@ -1026,6 +1026,13 @@ fn screen_weights_qwen35(weights: &qwen35::Qwen35Weights, gpu: &mut rdna_compute
         };
 
         for (wt, _name) in wts {
+            // MMQ kernels only operate on HFQ4G256 weights. Other formats
+            // (MQ3, MQ2, HFQ6, etc.) use different dispatch paths and must
+            // not be fed to the HFQ4-specific screening kernels — buffer
+            // layout mismatch would read past the end. See PR #106.
+            if !matches!(wt.gpu_dtype, rdna_compute::DType::HFQ4G256) {
+                continue;
+            }
             if gpu.mmq_screen_weight(&wt.buf, wt.m, wt.k) {
                 n_safe += 1;
             } else {

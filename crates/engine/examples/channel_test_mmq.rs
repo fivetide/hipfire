@@ -556,6 +556,9 @@ fn run_site_scan(
                 Some(w) => w,
                 None => continue,
             };
+            if !matches!(weight.gpu_dtype, rdna_compute::DType::HFQ4G256) {
+                continue;
+            }
             let m = weight.m;
             let k = weight.k;
             let seed = seed_for_site(site_name);
@@ -627,6 +630,10 @@ fn run_channel_map(
                 continue;
             }
         };
+        if !matches!(weight.gpu_dtype, rdna_compute::DType::HFQ4G256) {
+            eprintln!("  layer={layer_idx}: site '{site_name}' not HFQ4G256 (skipped)");
+            continue;
+        }
 
         let m = weight.m;
         let k = weight.k;
@@ -684,8 +691,11 @@ fn run_layer_sweep(
     for (layer_idx, layer) in weights.layers.iter().enumerate() {
         let weight = match get_weight_for_site(layer, site_name) {
             Some(w) => w,
-            None => continue, // site not applicable to this layer type
+            None => continue,
         };
+        if !matches!(weight.gpu_dtype, rdna_compute::DType::HFQ4G256) {
+            continue;
+        }
 
         let m = weight.m;
         let k = weight.k;
@@ -752,6 +762,11 @@ fn run_screen(
                 Some(w) => w,
                 None => continue,
             };
+            // MMQ screening only applies to HFQ4G256 weights — other formats
+            // (MQ3, MQ2, HFQ6) use different kernels and would OOB. See PR #106.
+            if !matches!(weight.gpu_dtype, rdna_compute::DType::HFQ4G256) {
+                continue;
+            }
             let safe = gpu.mmq_screen_weight(&weight.buf, weight.m, weight.k);
             if safe {
                 n_safe += 1;
