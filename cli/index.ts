@@ -160,8 +160,10 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   // Set false (or HIPFIRE_NORMALIZE_PROMPT=0) to opt out.
   prompt_normalize: true,
   // MMQ per-weight screening: detect Q8_1 outlier rows and fall back to
-  // WMMA. Default ON — prevents tool-call corruption (#87) at <0.1% perf cost.
-  mmq_screen: true,
+  // WMMA. Default OFF — no single threshold produces byte-identical output
+  // across models without screening out 90%+ of weights. Opt in to prevent
+  // tool-call corruption (#87) when using HIPFIRE_MMQ=1.
+  mmq_screen: false,
   mmq_screen_threshold: 0.10,
 };
 

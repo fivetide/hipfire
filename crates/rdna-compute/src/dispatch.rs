@@ -406,8 +406,8 @@ impl Gpu {
             q8_1_mmq_x_scratch_bytes: 0,
             mmq_screen_cache: HashMap::new(),
             mmq_screen: std::env::var("HIPFIRE_MMQ_SCREEN").ok()
-                .map(|v| v != "0")
-                .unwrap_or(true),
+                .map(|v| v == "1")
+                .unwrap_or(false),
             mmq_screen_threshold: std::env::var("HIPFIRE_MMQ_SCREEN_THRESHOLD")
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(0.10),
             capture_mode: false,
