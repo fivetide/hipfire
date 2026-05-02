@@ -141,7 +141,6 @@ fn should_use_mmq(arch: &str, batch_size: usize) -> bool {
         }
     }
 }
-
 /// Tensor stored on the GPU. Tracks shape and element type.
 pub struct GpuTensor {
     pub buf: DeviceBuffer,
