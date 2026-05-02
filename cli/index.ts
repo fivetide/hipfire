@@ -308,7 +308,22 @@ function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
   if (!tag) return base;
   const resolved = resolveModelTag(tag);
   const overrides = loadPerModelConfigs()[resolved] ?? loadPerModelConfigs()[tag] ?? {};
-  return { ...base, ...overrides };
+  const merged = { ...base, ...overrides };
+
+  // A3B models (MoE 35B/3B-active) have a documented thinking-loop problem
+  // where the model repeats reasoning content indefinitely inside <think>
+  // without ever closing the block. Cap thinking to at most 1024 tokens,
+  // overriding user config if it's higher. The model loops well before
+  // 8192 (common bulk per-model default), so a lower cap is required.
+  // See: QwenLM/Qwen3.6#88, QwenLM/Qwen3.6#145, ollama/ollama#14421.
+  if (/a3b/i.test(resolved ?? tag ?? "")) {
+    const A3B_THINK_CAP = 1024;
+    if (merged.max_think_tokens === 0 || merged.max_think_tokens > A3B_THINK_CAP) {
+      merged.max_think_tokens = A3B_THINK_CAP;
+    }
+  }
+
+  return merged;
 }
 
 // applyThinkingMode is intentionally NOT called anywhere. The previous
