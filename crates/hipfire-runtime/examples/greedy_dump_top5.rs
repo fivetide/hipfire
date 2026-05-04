@@ -71,7 +71,7 @@ fn main() {
     eprintln!("prompt: {} tokens", prompt_tokens.len());
 
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
 
     let kv_seq = 2048usize;
     let mut kv_cache = KvCache::new_gpu_q8(

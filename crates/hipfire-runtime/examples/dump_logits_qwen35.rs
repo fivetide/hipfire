@@ -52,7 +52,7 @@ fn main() {
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     eprintln!("dump_logits_qwen35: arch={} prefill_len={}", gpu.arch, prefill_len);
 
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
 
     let kv_seq = (prefill_len + 16).max(512);
     let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());

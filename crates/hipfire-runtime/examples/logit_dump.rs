@@ -30,7 +30,7 @@ fn main() {
     let arch = gpu.arch.clone();
     eprintln!("GPU: {arch}");
 
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("failed to load weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("failed to load weights");
     let max_seq = 2048usize;
     let mut kv_cache = KvCache::new_gpu_q8(
         &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq

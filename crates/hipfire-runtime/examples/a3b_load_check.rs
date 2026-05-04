@@ -49,7 +49,7 @@ fn main() {
 
     eprintln!("\nInitializing GPU + loading weights ...");
     let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init failed");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load_weights failed");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load_weights failed");
 
     eprintln!("\n=== LOAD SUCCEEDED ===");
     eprintln!("Loaded {} layers:", weights.layers.len());

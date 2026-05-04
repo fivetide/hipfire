@@ -62,7 +62,7 @@ fn main() {
     eprintln!("GPU: {}", gpu.arch);
 
     let t_load = Instant::now();
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
     eprintln!("Weights loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
     // Find first FA layer so we know which layer's KV to probe.
