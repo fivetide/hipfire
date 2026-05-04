@@ -39,7 +39,7 @@ fn main() {
 
     eprintln!("Loading weights ...");
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
     eprintln!("Loaded {} layers.", weights.layers.len());
 
     let kv_seq = std::env::var("HIPFIRE_SMOKE_KV_SEQ")

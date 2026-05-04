@@ -22,7 +22,7 @@ fn main() {
         config.dim, config.n_heads, config.linear_num_key_heads, config.linear_key_head_dim);
 
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load weights failed");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights failed");
     let mut dn_state = qwen35::DeltaNetState::new(&mut gpu, &config).unwrap();
     let mut kv_cache = llama::KvCache::new_gpu(
         &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, 128,

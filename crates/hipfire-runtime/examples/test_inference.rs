@@ -31,7 +31,7 @@ fn main() {
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
     eprintln!("GPU: {}", gpu.arch);
 
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("failed to load weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("failed to load weights");
 
     let mut passed = 0;
     let mut failed = 0;

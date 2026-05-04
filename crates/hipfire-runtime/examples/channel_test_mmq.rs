@@ -168,7 +168,7 @@ fn main() {
         "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
         config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size
     );
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load_weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load_weights");
     eprintln!("Weights loaded. Running stage: {stage}");
 
     // ── Dispatch stage ───────────────────────────────────────────────────

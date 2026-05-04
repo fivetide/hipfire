@@ -108,7 +108,7 @@ fn main() {
     let kv_seq = budget + beta + 8;
 
     let mut gpu = Gpu::init().expect("gpu init");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("weights");
 
     let mut kv = match kv_mode.as_str() {
         "asym2" => KvCache::new_gpu_asym2(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),

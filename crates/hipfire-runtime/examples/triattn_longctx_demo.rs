@@ -48,7 +48,7 @@ fn main() {
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
 
     let mut gpu = Gpu::init().expect("gpu init");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("weights");
 
     let prompt_tokens = tok.encode(prompt);
     let prompt_len = prompt_tokens.len();

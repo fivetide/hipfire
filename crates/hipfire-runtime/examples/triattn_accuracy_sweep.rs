@@ -106,7 +106,7 @@ fn main() {
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
 
     let mut gpu = Gpu::init().expect("gpu init");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("weights");
 
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).expect("scratch");
     let alloc_kv = |gpu: &mut Gpu, seq: usize| match kv_mode.as_str() {

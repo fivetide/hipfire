@@ -156,7 +156,7 @@ fn main() {
     let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
 
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("weights");
 
     let kv_seq = 512usize;
     let mut kv = KvCache::new_gpu_q8(

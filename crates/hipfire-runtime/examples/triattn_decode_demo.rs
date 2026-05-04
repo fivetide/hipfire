@@ -55,7 +55,7 @@ fn main() {
     eprintln!("budget={budget} prefill={prefill_len} gen={gen_len}");
 
     let mut gpu = Gpu::init().expect("gpu init");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("weights");
 
     let kv_seq = 512usize;
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).expect("scratch");

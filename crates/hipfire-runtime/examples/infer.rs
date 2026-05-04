@@ -120,7 +120,7 @@ fn main() {
 
     // Load text weights
     eprintln!("Loading text weights...");
-    let weights = qwen35::load_weights(&hfq, &text_config, &mut gpu).expect("failed to load text weights");
+    let weights = qwen35::load_weights(&mut hfq, &text_config, &mut gpu).expect("failed to load text weights");
 
     let kv_seq = 4096usize;
     eprintln!("KV cache: {kv_mode}");
