@@ -4,7 +4,7 @@
 //! the model predicts each next token. Outputs per-position JSONL with
 //! cross-entropy, top-1/top-5 accuracy, and logit statistics.
 //!
-//! Usage: teacher_eval <model.hfq> <reference.txt> [output.jsonl]
+//! Usage: teacher_eval <model.hfq> <reference.txt> [output.jsonl] [--binary-logits <output.bin>]
 //!
 //! The reference text is tokenized and run through the model position by
 //! position. At each position i, the model sees token[i] and we check
@@ -14,6 +14,11 @@
 //!   {"pos":0,"ref_token":1234,"top1":1234,"top1_correct":true,
 //!    "top5_correct":true,"cross_entropy":0.123,"top1_logit":5.6,
 //!    "ref_logit":5.6,"ref_rank":1}
+//!
+//! Binary logits format (llama.cpp compatible):
+//!   [n_vocab:u32][n_tokens:u32][f32 x n_vocab x n_tokens]
+//!   Written in native (little-endian) byte order for consumption by
+//!   llama-perplexity --kl-divergence and quality_metrics.py.
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -31,12 +36,35 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: teacher_eval <model.hfq> <reference.txt> [output.jsonl]");
+        eprintln!("Usage: teacher_eval <model.hfq> <reference.txt> [output.jsonl] [--binary-logits <output.bin>]");
         std::process::exit(1);
     }
     let model_path = &args[1];
     let reference_path = &args[2];
-    let output_path = args.get(3).map(|s| s.as_str());
+
+    // Parse --binary-logits flag (can appear anywhere after positional args)
+    let binary_logits_path = {
+        let mut path = None;
+        let mut i = 3;
+        while i < args.len() {
+            if args[i] == "--binary-logits" {
+                if i + 1 >= args.len() {
+                    eprintln!("--binary-logits requires a path argument");
+                    std::process::exit(1);
+                }
+                path = Some(args[i + 1].clone());
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        path
+    };
+
+    // Positional output.jsonl: first non-flag arg after model and reference
+    let output_path = args.get(3).and_then(|s| {
+        if s == "--binary-logits" { None } else { Some(s.as_str()) }
+    });
 
     let reference_text = std::fs::read_to_string(reference_path)
         .unwrap_or_else(|e| {
@@ -88,6 +116,21 @@ fn main() {
     let eval_len = (n_tokens - 1).min(max_seq - 1);
     eprintln!("  evaluating {eval_len} positions...");
 
+    // Set up binary logits output if requested
+    let mut binary_file = binary_logits_path.map(|path| {
+        use std::io::BufWriter;
+        let f = std::fs::File::create(&path)
+            .unwrap_or_else(|e| panic!("Failed to create binary logits file {path}: {e}"));
+        let mut w = BufWriter::new(f);
+        // Write header: [n_vocab:u32][n_tokens:u32]
+        let n_vocab = config.vocab_size as u32;
+        let n_toks = eval_len as u32;
+        w.write_all(&n_vocab.to_le_bytes()).unwrap();
+        w.write_all(&n_toks.to_le_bytes()).unwrap();
+        eprintln!("  binary-logits: {path} (n_vocab={n_vocab}, n_tokens={n_toks})");
+        w
+    });
+
     let mut total_ce = 0.0f64;
     let mut top1_hits = 0u64;
     let mut top5_hits = 0u64;
@@ -114,6 +157,17 @@ fn main() {
 
         let logits = gpu.download_f32(&scratch.logits).unwrap();
         let vocab_size = logits.len();
+
+        // Write raw logits to binary file if requested
+        if let Some(ref mut w) = binary_file {
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    logits.as_ptr() as *const u8,
+                    logits.len() * std::mem::size_of::<f32>(),
+                )
+            };
+            w.write_all(bytes).unwrap();
+        }
 
         // Compute softmax cross-entropy for the target token
         let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -180,6 +234,11 @@ fn main() {
     }
 
     output.flush().ok();
+
+    // Flush binary logits file
+    if let Some(ref mut w) = binary_file {
+        w.flush().unwrap();
+    }
 
     // Print summary to stderr
     let mean_ce = total_ce / count as f64;
