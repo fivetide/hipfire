@@ -24,11 +24,10 @@ GGUF Path (llama.cpp vs llama.cpp):
   quantized GGUF --> llama-perplexity --kl-divergence --> KL result
                      --kl-divergence-base golden.bin
 
-Hipfire Path (hipfire vs llama.cpp):
+Hipfire Path (hipfire vs golden):
   model.hfq --> hipfire logit_dump --> hipfire.bin
-  hipfire.bin --> llama-perplexity --kl-divergence --> KL result
-                 --kl-divergence-base golden.bin
   golden.bin + hipfire.bin --> quality_metrics.py --> results.json
+  (computes KL, token agreement, top-k overlap, perplexity delta)
 ```
 
 ## Binary Logit Format
@@ -130,9 +129,11 @@ python3 scripts/quality_metrics.py <golden.bin> <test.bin> \
 via `--thresholds`). Reports `"pass": true/false` based on whether all metrics
 are within bounds. Without thresholds, reports `"pass": null`.
 
-**Note on KL**: This script computes KL as a cross-check. The authoritative KL
-number comes from `llama-perplexity --kl-divergence` (battle-tested). The
-Python KL provides percentile breakdowns that llama-perplexity doesn't expose.
+**Note on KL**: For the GGUF path, `llama-perplexity --kl-divergence` computes
+KL natively (it generates test logits from its own model run). For the hipfire
+path, this script is the authoritative KL source — llama-perplexity cannot
+consume pre-computed logit files as the "test" side. The Python KL also
+provides percentile breakdowns (p95, max) that llama-perplexity doesn't expose.
 
 ### 3. `quality-gate.sh` — Orchestration Script
 
@@ -172,12 +173,7 @@ llama-perplexity -m "$QUANTIZED_GGUF" -f "$CORPUS" \
 ./target/release/examples/logit_dump "$HFQ_MODEL" "$WORKDIR/hipfire.bin" \
     -f "$CORPUS" --ctx-size "$CTX" --max-tokens "$MAX_TOKENS"
 
-# Phase 4: Hipfire vs golden KL (via llama-perplexity)
-llama-perplexity --kl-divergence --kl-divergence-base "$GOLDEN" \
-    --save-all-logits "$WORKDIR/hipfire.bin" \
-    -c "$CTX" -n "$MAX_TOKENS" > "$WORKDIR/hipfire-kl.txt"
-
-# Phase 5: Full metric comparison (Python)
+# Phase 4: Full metric comparison (Python — computes KL, agreement, top-k)
 python3 scripts/quality_metrics.py "$GOLDEN" "$WORKDIR/hipfire.bin" \
     --thresholds "$THRESHOLDS" --output "$WORKDIR/results.json"
 ```
