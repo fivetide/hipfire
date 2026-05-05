@@ -7,12 +7,14 @@
 //! RDNA-native quantized weights.
 
 mod gguf_input;
+pub mod tensor_spill;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use tensor_spill::TensorSpill;
 
 // ─── Safetensors Parser ─────────────────────────────────────────────────────
 
@@ -1034,7 +1036,8 @@ struct HfqTensor {
     quant_type: QuantType,
     shape: Vec<u32>,
     group_size: u32,
-    data: Vec<u8>,
+    data_len: usize,
+    spill_idx: usize,
 }
 
 fn write_hfq(
@@ -1042,6 +1045,7 @@ fn write_hfq(
     arch: u32,
     metadata_json: &str,
     tensors: &[HfqTensor],
+    spill: &TensorSpill,
 ) -> std::io::Result<()> {
     let mut f = File::create(path)?;
 
@@ -1072,7 +1076,7 @@ fn write_hfq(
         // group size
         index_bytes.extend_from_slice(&t.group_size.to_le_bytes());
         // data size (offset computed at read time from cumulative sizes)
-        index_bytes.extend_from_slice(&(t.data.len() as u64).to_le_bytes());
+        index_bytes.extend_from_slice(&(t.data_len as u64).to_le_bytes());
     }
 
     // Data starts after index, aligned to 4096
@@ -1097,9 +1101,10 @@ fn write_hfq(
     let pad_size = (data_offset - data_start_unaligned) as usize;
     f.write_all(&vec![0u8; pad_size])?;
 
-    // Write tensor data
+    // Write tensor data — read back from spill one at a time
     for t in tensors {
-        f.write_all(&t.data)?;
+        let data = spill.read_back(t.spill_idx)?;
+        f.write_all(&data)?;
     }
 
     Ok(())
@@ -1530,6 +1535,7 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat) -> std::io
     let signs1 = if needs_signs { gen_fwht_signs(42, 256) } else { Vec::new() };
     let signs2 = if needs_signs { gen_fwht_signs(1042, 256) } else { Vec::new() };
 
+    let mut spill = TensorSpill::new()?;
     let mut hfq_tensors: Vec<HfqTensor> = Vec::with_capacity(gguf.tensors.len());
     let mut total_params: u64 = 0;
     let mut quant_params: u64 = 0;
@@ -1610,7 +1616,8 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat) -> std::io
             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
         };
 
-        total_bytes_out += data.len() as u64;
+        let data_len = data.len();
+        total_bytes_out += data_len as u64;
         eprintln!(
             "  {label:>9}: {} → {} {:?} ({} src={:?}, {:.1} KB → {:.1} KB)",
             info.name,
@@ -1619,15 +1626,17 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat) -> std::io
             n_elements,
             info.dtype,
             raw.len() as f64 / 1024.0,
-            data.len() as f64 / 1024.0,
+            data_len as f64 / 1024.0,
         );
 
+        let spill_idx = spill.spill(data)?;
         hfq_tensors.push(HfqTensor {
             name: out_name,
             quant_type,
             shape,
             group_size,
-            data,
+            data_len,
+            spill_idx,
         });
     }
 
@@ -1645,7 +1654,7 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat) -> std::io
         100.0 * total_bytes_out as f64 / total_bytes_in as f64,
     );
 
-    write_hfq(output, arch_id, &metadata_json, &hfq_tensors)?;
+    write_hfq(output, arch_id, &metadata_json, &hfq_tensors, &spill)?;
     eprintln!("\nWrote: {}", output.display());
     Ok(())
 }
@@ -1841,6 +1850,7 @@ fn main() {
     eprintln!("Found {} tensors", all_tensors.len());
 
     // Quantize
+    let mut spill = TensorSpill::new().expect("failed to create TensorSpill temp dir");
     let mut hfq_tensors = Vec::new();
     let mut total_params = 0u64;
     let mut quantized_params = 0u64;
@@ -1916,32 +1926,31 @@ fn main() {
             let parent_owned = parent.to_string();
             let inner_shape_clone = inner_shape.clone();
             let base_owned = base_name.to_string();
-            let mut new_tensors: Vec<HfqTensor> = (0..n_experts).into_par_iter().map(|x| {
-                let slice_off = x * inner_bytes;
-                let slice = &raw_data[slice_off..slice_off + inner_bytes];
-                let f32_slice = to_f32(slice, &dtype);
-                let (quantized, qt, gs) = if supports_mq4 {
-                    let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
-                    (q, QuantType::MQ4G256, 256u32)
-                } else {
-                    let q = quantize_hfq4g128(&f32_slice);
-                    (q, QuantType::HFQ4G128, 128u32)
-                };
-                HfqTensor {
-                    name: format!("{parent_owned}{x}.{base_owned}.weight"),
-                    quant_type: qt,
-                    shape: inner_shape_clone.clone(),
-                    group_size: gs,
-                    data: quantized,
-                }
-            }).collect();
+            // Parallel quantize, then sequentially spill (spill needs &mut)
+            let quantized_experts: Vec<(String, QuantType, Vec<u32>, u32, Vec<u8>)> =
+                (0..n_experts).into_par_iter().map(|x| {
+                    let slice_off = x * inner_bytes;
+                    let slice = &raw_data[slice_off..slice_off + inner_bytes];
+                    let f32_slice = to_f32(slice, &dtype);
+                    let (quantized, qt, gs) = if supports_mq4 {
+                        let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
+                        (q, QuantType::MQ4G256, 256u32)
+                    } else {
+                        let q = quantize_hfq4g128(&f32_slice);
+                        (q, QuantType::HFQ4G128, 128u32)
+                    };
+                    (format!("{parent_owned}{x}.{base_owned}.weight"), qt, inner_shape_clone.clone(), gs, quantized)
+                }).collect();
             quantized_params += inner_n as u64 * n_experts as u64;
-            // Single eprintln to summarize the whole expert sweep.
             let label = if supports_mq4 { "MQ4G256" } else { "HFQ4G128" };
-            let bytes_per = new_tensors.first().map(|t| t.data.len()).unwrap_or(0);
+            let bytes_per = quantized_experts.first().map(|(_, _, _, _, d)| d.len()).unwrap_or(0);
             eprintln!("  {label:>8}: {parent_owned}{{0..{n_experts}}}.{base_owned}.weight {:?} (×{n_experts} experts || {:.1} KB/expert, parallel)",
                 inner_shape, bytes_per as f64 / 1024.0);
-            hfq_tensors.append(&mut new_tensors);
+            for (name, qt, shape, gs, data) in quantized_experts {
+                let data_len = data.len();
+                let spill_idx = spill.spill(data).expect("spill failed");
+                hfq_tensors.push(HfqTensor { name, quant_type: qt, shape, group_size: gs, data_len, spill_idx });
+            }
             continue;
         }
 
@@ -1980,18 +1989,21 @@ fn main() {
                     }
                 }
 
+                let data_len = quantized.len();
                 eprintln!("  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB, stride={})",
                     "Q8_HFQ", name, meta.shape, n_elements,
                     raw_data.len() as f64 / 1024.0,
-                    quantized.len() as f64 / 1024.0,
+                    data_len as f64 / 1024.0,
                     row_stride);
 
+                let spill_idx = spill.spill(quantized).expect("spill failed");
                 hfq_tensors.push(HfqTensor {
                     name: name.to_string(),
                     quant_type: QuantType::Q8HFQ,
                     shape,
                     group_size: 32,
-                    data: quantized,
+                    data_len,
+                    spill_idx,
                 });
             } else {
             // Choose quant format per tensor
@@ -2238,17 +2250,20 @@ fn main() {
                 _n_quant_groups += 1;
             }
 
+            let data_len = quantized.len();
             eprintln!("  {label:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB)",
                 name, meta.shape, n_elements,
                 raw_data.len() as f64 / 1024.0,
-                quantized.len() as f64 / 1024.0);
+                data_len as f64 / 1024.0);
 
+            let spill_idx = spill.spill(quantized).expect("spill failed");
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(),
                 quant_type: qt,
                 shape,
                 group_size: gs,
-                data: quantized,
+                data_len,
+                spill_idx,
             });
             } // end else (non-Q8HFQ path)
         } else if is_vision && vision_quant == "hfq4" && n_elements >= 32 {
@@ -2264,15 +2279,18 @@ fn main() {
             };
             let qt = if gs == 256 { QuantType::HFQ4G256 } else { QuantType::HFQ4G128 };
             let label = if gs == 256 { "HFQ4G256" } else { "HFQ4G128" };
+            let data_len = quantized.len();
             eprintln!("  {label:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB) [vision]",
                 name, meta.shape, n_elements,
-                raw_data.len() as f64 / 1024.0, quantized.len() as f64 / 1024.0);
+                raw_data.len() as f64 / 1024.0, data_len as f64 / 1024.0);
+            let spill_idx = spill.spill(quantized).expect("spill failed");
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(),
                 quant_type: qt,
                 shape,
                 group_size: gs,
-                data: quantized,
+                data_len,
+                spill_idx,
             });
         } else if is_vision && vision_quant == "bf16" && meta.dtype == "BF16" {
             // Store vision weights as original BF16 (zero precision loss)
@@ -2280,12 +2298,16 @@ fn main() {
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
             eprintln!("  BF16:       {} {:?} ({} elements, {:.1} KB) [vision, lossless]",
                 name, meta.shape, n_elements, raw_data.len() as f64 / 1024.0);
+            let data = raw_data.to_vec();
+            let data_len = data.len();
+            let spill_idx = spill.spill(data).expect("spill failed");
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(),
                 quant_type: QuantType::BF16,
                 shape,
                 group_size: 0,
-                data: raw_data.to_vec(),
+                data_len,
+                spill_idx,
             });
         } else if is_vision && vision_quant == "bf16" {
             // Non-BF16 source (F16/F32) — store as F16
@@ -2295,11 +2317,13 @@ fn main() {
             };
             quantized_params += n_elements as u64;
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            let data_len = data.len();
             eprintln!("  F16:        {} {:?} ({:.1} KB) [vision, bf16 fallback]",
-                name, meta.shape, data.len() as f64 / 1024.0);
+                name, meta.shape, data_len as f64 / 1024.0);
+            let spill_idx = spill.spill(data).expect("spill failed");
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(), quant_type: QuantType::F16,
-                shape, group_size: 0, data,
+                shape, group_size: 0, data_len, spill_idx,
             });
         } else {
             // Keep as F16 (convert BF16 -> F16 if needed)
@@ -2322,21 +2346,24 @@ fn main() {
             };
 
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            let data_len = f16_data.len();
             eprintln!("  F16:        {} {:?} ({} elements, {:.1} KB)",
-                name, meta.shape, n_elements, f16_data.len() as f64 / 1024.0);
+                name, meta.shape, n_elements, data_len as f64 / 1024.0);
 
+            let spill_idx = spill.spill(f16_data).expect("spill failed");
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(),
                 quant_type: QuantType::F16,
                 shape,
                 group_size: 0,
-                data: f16_data,
+                data_len,
+                spill_idx,
             });
         }
     }
 
     // Summary
-    let total_bytes: usize = hfq_tensors.iter().map(|t| t.data.len()).sum();
+    let total_bytes: usize = hfq_tensors.iter().map(|t| t.data_len).sum();
     let mean_quant_error = if quantized_params > 0 {
         total_quant_error / quantized_params as f64
     } else { 0.0 };
@@ -2353,7 +2380,7 @@ fn main() {
 
     // Write .hfq file
     eprintln!("\nWriting: {}", output_path.display());
-    write_hfq(output_path, arch_id, &metadata_json, &hfq_tensors).unwrap();
+    write_hfq(output_path, arch_id, &metadata_json, &hfq_tensors, &spill).unwrap();
 
     let file_size = std::fs::metadata(output_path).unwrap().len();
     eprintln!("Done: {:.1} MB written", file_size as f64 / 1e6);
