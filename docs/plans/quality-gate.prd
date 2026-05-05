@@ -1,0 +1,254 @@
+# Quality Gate: Inference Quality Measurement for Quantized Models
+
+**Date**: 2026-05-05
+**Status**: Approved
+**Approach**: Thin wrapper around llama.cpp's KL tooling + hipfire logit dump
+
+## Overview
+
+A system to measure inference quality degradation in hipfire's quantized models
+compared against known-good reference (golden) outputs from an original FP16
+model. Provides quantitative metrics (token agreement, top-k overlap, KL
+divergence, perplexity delta) via two evaluation paths:
+
+1. **GGUF path**: llama.cpp quantized GGUF vs golden (validates quantization format)
+2. **Hipfire path**: hipfire runtime output vs golden (validates end-to-end inference)
+
+## Architecture & Data Flow
+
+```
+Golden Generation (one-time):
+  FP16 GGUF --> llama-perplexity --save-all-logits --> golden.bin
+
+GGUF Path (llama.cpp vs llama.cpp):
+  quantized GGUF --> llama-perplexity --kl-divergence --> KL result
+                     --kl-divergence-base golden.bin
+
+Hipfire Path (hipfire vs llama.cpp):
+  model.hfq --> hipfire logit_dump --> hipfire.bin
+  hipfire.bin --> llama-perplexity --kl-divergence --> KL result
+                 --kl-divergence-base golden.bin
+  golden.bin + hipfire.bin --> quality_metrics.py --> results.json
+```
+
+## Binary Logit Format
+
+Both hipfire and llama.cpp write the same format (llama.cpp's native layout):
+
+```
+Offset 0:   n_vocab   (u32, little-endian)
+Offset 4:   n_tokens  (u32, little-endian)
+Offset 8:   logits    (f32 x n_vocab x n_tokens, row-major)
+```
+
+Each row is one token position's full logit vector. Total file size =
+`8 + 4 * n_vocab * n_tokens` bytes.
+
+## Components
+
+### 1. `logit_dump.rs` — Hipfire Logit Dump Binary
+
+**Location**: `crates/hipfire-runtime/examples/logit_dump.rs`
+
+**Behavior**: Teacher-forced evaluation (not autoregressive generation).
+Tokenizes the input corpus, runs forward passes in chunks, and writes the full
+logit vector at each token position to the output file in llama.cpp's binary
+format.
+
+**Interface**:
+```bash
+logit_dump <model.hfq> <output.bin> -f <corpus.txt> [--ctx-size 512] [--stride 512]
+```
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `-f <file>` | required | Input corpus text file |
+| `--ctx-size N` | 512 | Context window per chunk (tokens) |
+| `--stride N` | = ctx-size | Stride between chunks (for overlapping windows) |
+| `--max-tokens N` | all | Cap total tokens evaluated |
+
+**Algorithm**:
+1. Tokenize entire corpus into `tokens[]`
+2. Write header: `[n_vocab: u32][n_tokens: u32]` (n_tokens = min(len(tokens)-1, max-tokens))
+3. For each chunk of `ctx-size` tokens (advancing by `stride`):
+   - Run prefill forward pass on the chunk via `forward_prefill_batch`
+   - For each position in the chunk (excluding overlap from previous chunk):
+     write the logit vector (f32 x n_vocab) to the output file
+4. Flush and close
+
+**Key details**:
+- Uses `forward_prefill_batch` (same path as `greedy_dump`) — exercises the
+  real inference code
+- Greedy argmax is NOT applied — raw logits before softmax are dumped
+- Stride < ctx-size allows overlapping evaluation (only non-overlapping
+  positions are written), matching how llama-perplexity handles context
+  boundaries
+- Progress printed to stderr: `chunk 12/48, 6144/24576 tokens`
+
+**Difference from `greedy_dump`**: greedy_dump does autoregressive generation
+(each token depends on the previous). `logit_dump` does teacher-forced
+evaluation (ground-truth tokens fed at every position), which is what
+perplexity measurement requires.
+
+### 2. `quality_metrics.py` — Comparison Tool
+
+**Location**: `scripts/quality_metrics.py`
+
+**Interface**:
+```bash
+python3 scripts/quality_metrics.py <golden.bin> <test.bin> \
+    [--top-k 10] [--thresholds <file>] [--output results.json]
+```
+
+**Metrics computed** (single pass over both files via numpy memmap):
+
+| Metric | Definition | Interpretation |
+|--------|-----------|----------------|
+| `token_agreement` | % of positions where argmax(golden) == argmax(test) | 1.0 = byte-exact match |
+| `top_k_overlap` | Mean Jaccard similarity of top-k token sets across positions | 1.0 = same top-k everywhere |
+| `mean_rank_delta` | Mean absolute rank displacement of the golden argmax token in the test distribution | 0 = golden's pick is always test's #1 |
+| `mean_kl_divergence` | Mean KL(softmax(golden) \|\| softmax(test)) per position | 0 = identical distributions |
+| `max_kl_divergence` | Worst-case single-position KL | Catches catastrophic local failures |
+| `perplexity_delta` | Difference in corpus perplexity (test PPL - golden PPL) | 0 = no quality loss |
+
+**Output** (JSON to stdout or `--output`):
+```json
+{
+  "n_vocab": 151936,
+  "n_tokens": 24576,
+  "token_agreement": 0.943,
+  "top_k_overlap": { "k": 10, "mean_jaccard": 0.871 },
+  "mean_rank_delta": 0.12,
+  "kl_divergence": { "mean": 0.0023, "max": 0.41, "p95": 0.008 },
+  "perplexity": { "golden": 6.82, "test": 7.01, "delta": 0.19 },
+  "pass": true,
+  "thresholds_file": "tests/quality-baselines/qwen35-9b-mq4.json"
+}
+```
+
+**Pass/fail logic**: Reads thresholds from a JSON baseline file (if provided
+via `--thresholds`). Reports `"pass": true/false` based on whether all metrics
+are within bounds. Without thresholds, reports `"pass": null`.
+
+**Note on KL**: This script computes KL as a cross-check. The authoritative KL
+number comes from `llama-perplexity --kl-divergence` (battle-tested). The
+Python KL provides percentile breakdowns that llama-perplexity doesn't expose.
+
+### 3. `quality-gate.sh` — Orchestration Script
+
+**Location**: `scripts/quality-gate.sh`
+
+**Interface**:
+```bash
+./scripts/quality-gate.sh [--model <tag>] [--corpus <file>] [--golden <file>] \
+    [--generate-golden] [--ctx-size 512] [--max-tokens 10000] \
+    [--gguf-quantized <file>] [--thresholds <file>]
+```
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--model <tag>` | `qwen3.5-9b` | Model tag (resolves to .gguf and .hfq paths) |
+| `--corpus <file>` | `benchmarks/calib/calib-1m.txt` | Evaluation corpus |
+| `--golden <file>` | `benchmarks/quality-goldens/<model>-fp16.bin` | Golden logits file |
+| `--generate-golden` | off | Generate golden from FP16 GGUF before comparison |
+| `--gguf-quantized <file>` | auto-resolved | Quantized GGUF for llama.cpp path |
+| `--ctx-size N` | 512 | Context window |
+| `--max-tokens N` | 10000 | Token budget (limits eval time) |
+| `--thresholds <file>` | `tests/quality-baselines/<model>.json` | Pass/fail thresholds |
+
+**Execution flow**:
+
+```bash
+# Phase 1: Golden generation (skipped if --golden exists)
+llama-perplexity -m "$FP16_GGUF" -f "$CORPUS" \
+    --save-all-logits "$GOLDEN" -c "$CTX" -n "$MAX_TOKENS"
+
+# Phase 2: GGUF path (quantized GGUF vs golden)
+llama-perplexity -m "$QUANTIZED_GGUF" -f "$CORPUS" \
+    --kl-divergence --kl-divergence-base "$GOLDEN" \
+    -c "$CTX" -n "$MAX_TOKENS" > "$WORKDIR/gguf-kl.txt"
+
+# Phase 3: Hipfire path (logit dump)
+./target/release/examples/logit_dump "$HFQ_MODEL" "$WORKDIR/hipfire.bin" \
+    -f "$CORPUS" --ctx-size "$CTX" --max-tokens "$MAX_TOKENS"
+
+# Phase 4: Hipfire vs golden KL (via llama-perplexity)
+llama-perplexity --kl-divergence --kl-divergence-base "$GOLDEN" \
+    --save-all-logits "$WORKDIR/hipfire.bin" \
+    -c "$CTX" -n "$MAX_TOKENS" > "$WORKDIR/hipfire-kl.txt"
+
+# Phase 5: Full metric comparison (Python)
+python3 scripts/quality_metrics.py "$GOLDEN" "$WORKDIR/hipfire.bin" \
+    --thresholds "$THRESHOLDS" --output "$WORKDIR/results.json"
+```
+
+**Exit codes**: 0 = pass, 1 = fail (threshold exceeded), 2 = build/environment error
+
+**Artifact directory**: `/tmp/quality-gate-<timestamp>/` (or `$HIPFIRE_QUALITY_OUT`)
+
+### 4. Threshold Baselines
+
+**Location**: `tests/quality-baselines/<model>.json`
+
+**Example** (`tests/quality-baselines/qwen35-9b-mq4.json`):
+```json
+{
+  "model": "qwen3.5-9b",
+  "format": "mq4",
+  "corpus": "calib-1m.txt",
+  "ctx_size": 512,
+  "max_tokens": 10000,
+  "thresholds": {
+    "token_agreement_min": 0.90,
+    "top_k_overlap_min": 0.80,
+    "mean_kl_max": 0.05,
+    "max_kl_max": 2.0,
+    "perplexity_delta_max": 0.5
+  }
+}
+```
+
+**How thresholds are established**:
+1. Run `quality-gate.sh --generate-golden --model <model>` on the current
+   quantized model
+2. Review the metrics — if quality is acceptable, record them with ~10% margin
+   as the baseline
+3. Commit the threshold file
+
+**When baselines need updating**: Same rule as speed-gate — if a legitimate
+change improves quality (e.g., better quantization grid), update the baseline
+in the same commit so reviewers see the change explicitly.
+
+### 5. Golden File Storage
+
+Golden logit files are large (100MB+). They live in
+`benchmarks/quality-goldens/` but are **gitignored** — generated on-demand via
+`--generate-golden` or fetched from a shared artifact store.
+
+A manifest file (`benchmarks/quality-goldens/MANIFEST.md`) records the md5,
+source GGUF, and generation parameters for reproducibility.
+
+### 6. CI Integration
+
+Not wired into the pre-commit hook by default (too slow — a 10k-token eval
+takes minutes). Instead:
+- `coherence-gate.sh` remains the fast qualitative check (pre-commit)
+- `quality-gate.sh` is run manually or in CI for quantization-affecting changes
+  (new formats, kernel changes, quantizer changes)
+
+## Dependencies
+
+- `llama-perplexity` (system-installed, ROCm-enabled)
+- Python 3 + numpy (for `quality_metrics.py`)
+- Existing hipfire build infrastructure (cargo, deltanet feature flag)
+
+## File Inventory
+
+| Path | Type | Purpose |
+|------|------|---------|
+| `crates/hipfire-runtime/examples/logit_dump.rs` | Rust | Hipfire logit dump binary |
+| `scripts/quality-gate.sh` | Shell | Orchestration |
+| `scripts/quality_metrics.py` | Python | Metric computation + JSON report |
+| `tests/quality-baselines/*.json` | JSON | Pass/fail thresholds per model |
+| `benchmarks/quality-goldens/` | gitignored | Golden logit files |
+| `benchmarks/quality-goldens/MANIFEST.md` | Markdown | Golden file provenance |
