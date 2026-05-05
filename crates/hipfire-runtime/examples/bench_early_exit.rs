@@ -13,7 +13,7 @@ fn main() {
         std::process::exit(1);
     });
 
-    let hfq = HfqFile::open(Path::new(&model_path)).expect("failed to parse HFQ");
+    let mut hfq = HfqFile::open(Path::new(&model_path)).expect("failed to parse HFQ");
     let config = hfq::config_from_hfq(&hfq).expect("failed to read config");
     eprintln!("Config: dim={}, layers={}, heads={}", config.dim, config.n_layers, config.n_heads);
 

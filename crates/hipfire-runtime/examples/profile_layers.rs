@@ -261,7 +261,7 @@ fn main() {
     let model_path = args.get(1).expect("Usage: profile_layers <model.hfq> [n_tokens]");
     let n_tokens: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
     let config = hfq::config_from_hfq(&hfq).expect("failed to read config");
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("no tokenizer in HFQ");

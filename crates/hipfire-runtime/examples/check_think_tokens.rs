@@ -7,7 +7,7 @@ use std::path::Path;
 
 fn main() {
     let model_path = std::env::args().nth(1).expect("usage: check_think_tokens <model.hfq>");
-    let hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("need tokenizer");
 

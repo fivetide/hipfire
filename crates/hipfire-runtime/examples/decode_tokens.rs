@@ -9,7 +9,7 @@ fn main() {
     let model_path = args.get(1).expect("model path");
     let tokens_path = args.get(2).expect("tokens path");
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("tokenizer");
 

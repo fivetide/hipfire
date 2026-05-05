@@ -148,7 +148,7 @@ fn dequant_hfq4(data: &[u8], n: usize, group_size: usize) -> Vec<f32> {
     out
 }
 
-pub fn load_vision_weights(hfq: &HfqFile, config: &VisionConfig, gpu: &mut Gpu) -> HipResult<VisionWeights> {
+pub fn load_vision_weights(hfq: &mut HfqFile, config: &VisionConfig, gpu: &mut Gpu) -> HipResult<VisionWeights> {
     let h = config.hidden_size;
     // Detect vision weight format (F16 direct vs HFQ4 auto-dequant) and log once.
     // HFQ4 vision weights (qt=6 G256, qt=7 G128) are dequantized to F16 at load

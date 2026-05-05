@@ -36,7 +36,7 @@ fn run_test(gpu: &mut rdna_compute::Gpu, weights: &hipfire_runtime::llama::Llama
 
 fn main() {
     let model_path = std::env::args().nth(1).unwrap_or_else(|| { eprintln!("Usage: sweep_exit <model.hfq>"); std::process::exit(1); });
-    let hfq = HfqFile::open(Path::new(&model_path)).expect("parse");
+    let mut hfq = HfqFile::open(Path::new(&model_path)).expect("parse");
     let config = hfq::config_from_hfq(&hfq).expect("config");
     let mut gpu = rdna_compute::Gpu::init().expect("gpu");
     let weights = hfq::load_weights_hfq(&hfq, &config, &mut gpu).expect("weights");

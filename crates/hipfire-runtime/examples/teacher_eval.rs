@@ -72,7 +72,7 @@ fn main() {
             std::process::exit(1);
         });
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("failed to open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("failed to open model");
     let config = qwen35::config_from_hfq(&hfq).expect("failed to read config");
     let tokenizer =
         hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
@@ -92,7 +92,7 @@ fn main() {
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
     eprintln!("  gpu: {}", gpu.arch);
 
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("failed to load weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("failed to load weights");
     let max_seq = n_tokens.min(4096);
     let mut kv_cache = KvCache::new_gpu_q8(
         &mut gpu,

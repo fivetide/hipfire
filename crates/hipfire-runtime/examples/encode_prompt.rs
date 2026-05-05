@@ -11,7 +11,7 @@ fn main() {
     let normalize = args.iter().any(|a| a == "--normalize");
     let heat = args.iter().any(|a| a == "--heat");
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("tokenizer");
 

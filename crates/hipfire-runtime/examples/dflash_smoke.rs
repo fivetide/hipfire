@@ -47,7 +47,7 @@ fn main() {
     eprintln!("draft: {path}");
     eprintln!("block_size: {block_size}  ctx_len: {ctx_len}");
 
-    let hfq = HfqFile::open(Path::new(path)).expect("open draft .hfq");
+    let mut hfq = HfqFile::open(Path::new(path)).expect("open draft .hfq");
     let cfg = DflashConfig::from_hfq(&hfq).expect("parse DflashConfig");
     eprintln!(
         "config: layers={} hidden={} heads={} kv_heads={} head_dim={} block={} mask={} target_layers={:?} (of {})",

@@ -75,6 +75,26 @@ impl SafetensorsFile {
         Some((meta, &self.mmap[start..end]))
     }
 
+    /// Advise the kernel to drop page cache for a tensor's data region.
+    /// On UMA systems this is critical: large mmap'd safetensors pages
+    /// compete with hipMalloc for the same physical RAM.
+    #[cfg(unix)]
+    fn drop_tensor_pages(&self, name: &str) {
+        if let Some(meta) = self.tensors.get(name) {
+            let start = self.header_size + meta.data_offsets[0];
+            let len = meta.data_offsets[1] - meta.data_offsets[0];
+            use std::os::unix::io::AsRawFd;
+            // POSIX_FADV_DONTNEED = 4
+            unsafe {
+                extern "C" { fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32; }
+                posix_fadvise(self._file.as_raw_fd(), start as i64, len as i64, 4);
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn drop_tensor_pages(&self, _name: &str) {}
+
     fn tensor_names(&self) -> Vec<&str> {
         self.tensors.keys().map(|s| s.as_str()).collect()
     }
@@ -1707,6 +1727,9 @@ fn main() {
     let use_hfq2g128 = format == "hfq2g128" || format == "hfq2" || format == "hf2";
     let use_hfq_mixed = format == "hfq-mixed";  // Q8 attn + HFQ4 FFN
     let use_mq6g256 = format == "mq6" || format == "mq6g256";
+    // Mixed: MQ4 for attention/shared-expert + MQ6 for routed experts only.
+    // Saves ~15 GB vs full MQ6 on 122B-A10B (75 GB vs 90 GB), fits in 125 GB UMA.
+    let use_mq4_mq6exp = format == "mq4-mq6exp" || format == "mq4-mq6experts";
     let use_mq3g256 = format == "mq3" || format == "mq3g256";
     let use_mq2g256 = format == "mq2" || format == "mq2g256";
     let use_hfq6 = format == "hfq6" || format == "hfq6g256" || format == "hf6";
@@ -1911,12 +1934,15 @@ fn main() {
             // Strip the trailing base; what remains is the parent path with `experts.` already on the end
             let parent = &name[..name.len() - base_name.len()];
 
-            // Inner MQ4G256 quantization helpers — we know we want MQ4 for experts
-            // (router/shared_expert use the standard format-flag path below).
+            // Inner quantization for experts — respects --format flag.
+            // MQ6 reduces quantization error that compounds across 48 MoE
+            // layers × 9 expert contributions per layer at the cost of ~50%
+            // more VRAM per expert. MQ4 is the default for VRAM efficiency.
             let signs1 = gen_fwht_signs(42, 256);
             let signs2 = gen_fwht_signs(1042, 256);
             let inner_k = inner_shape[1] as usize;
-            let supports_mq4 = inner_k % 256 == 0;
+            let supports_g256 = inner_k % 256 == 0;
+            let expert_mq6 = (use_mq6g256 || use_mq4_mq6exp) && supports_g256;
 
             // Parallelize across the 256 expert slices via rayon. Each slice
             // dequant→FWHT→quant→pack is a CPU-bound, self-contained job.
@@ -1932,7 +1958,10 @@ fn main() {
                     let slice_off = x * inner_bytes;
                     let slice = &raw_data[slice_off..slice_off + inner_bytes];
                     let f32_slice = to_f32(slice, &dtype);
-                    let (quantized, qt, gs) = if supports_mq4 {
+                    let (quantized, qt, gs) = if expert_mq6 {
+                        let q = quantize_mq6g256(&f32_slice, &signs1, &signs2);
+                        (q, QuantType::MQ6G256, 256u32)
+                    } else if supports_g256 {
                         let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ4G256, 256u32)
                     } else {
@@ -1942,7 +1971,7 @@ fn main() {
                     (format!("{parent_owned}{x}.{base_owned}.weight"), qt, inner_shape_clone.clone(), gs, quantized)
                 }).collect();
             quantized_params += inner_n as u64 * n_experts as u64;
-            let label = if supports_mq4 { "MQ4G256" } else { "HFQ4G128" };
+            let label = if expert_mq6 { "MQ6G256" } else if supports_g256 { "MQ4G256" } else { "HFQ4G128" };
             let bytes_per = quantized_experts.first().map(|(_, _, _, _, d)| d.len()).unwrap_or(0);
             eprintln!("  {label:>8}: {parent_owned}{{0..{n_experts}}}.{base_owned}.weight {:?} (×{n_experts} experts || {:.1} KB/expert, parallel)",
                 inner_shape, bytes_per as f64 / 1024.0);
@@ -1951,6 +1980,8 @@ fn main() {
                 let spill_idx = spill.spill(data).expect("spill failed");
                 hfq_tensors.push(HfqTensor { name, quant_type: qt, shape, group_size: gs, data_len, spill_idx });
             }
+            // Release source file page cache after each expert batch.
+            st_files[*file_idx].drop_tensor_pages(name);
             continue;
         }
 
@@ -2079,10 +2110,10 @@ fn main() {
                     let q = quantize_q8f16(&f32_data);
                     (q, QuantType::Q8F16, 32u32, "Q8_F16")
                 }
-            } else if use_mq4g256 && is_embed {
+            } else if (use_mq4g256 || use_mq4_mq6exp) && is_embed {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_mq4g256 {
+            } else if use_mq4g256 || use_mq4_mq6exp {
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
                 if k_dim % 256 == 0 {
                     let signs1 = gen_fwht_signs(42, 256);
@@ -2360,6 +2391,9 @@ fn main() {
                 spill_idx,
             });
         }
+        // Release source file page cache after each tensor to prevent
+        // mmap'd pages from starving GPU allocations on UMA systems.
+        st_files[*file_idx].drop_tensor_pages(name);
     }
 
     // Summary

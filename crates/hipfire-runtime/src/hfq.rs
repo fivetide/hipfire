@@ -240,9 +240,48 @@ impl HfqFile {
         self.tensor_data(name)
     }
 
+    /// Read tensor data using the best available path:
+    /// - Unix: pread + fadvise_dontneed (avoids page cache buildup)
+    /// - Non-unix with mmap: mmap slice copy (returns None if mmap was dropped)
+    ///
+    /// Returns owned Vec<u8> so callers can drop it independently to free memory
+    /// before loading the next tensor. Works after `drop_mmap()` on unix.
+    pub fn tensor_data_vec(&self, name: &str) -> Option<(&HfqTensorInfo, Vec<u8>)> {
+        let idx = *self.tensor_map.get(name)?;
+        let info = &self.tensors[idx];
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = self._file.as_raw_fd();
+            let mut buf = vec![0u8; info.data_size];
+            let mut total_read = 0usize;
+            while total_read < info.data_size {
+                let n = unsafe {
+                    libc::pread(
+                        fd,
+                        buf[total_read..].as_mut_ptr() as *mut libc::c_void,
+                        info.data_size - total_read,
+                        (info.data_offset + total_read) as libc::off_t,
+                    )
+                };
+                if n <= 0 { break; }
+                total_read += n as usize;
+            }
+            fadvise_dontneed(fd, info.data_offset, info.data_size);
+            return Some((info, buf));
+        }
+
+        #[cfg(not(unix))]
+        {
+            let mmap = self.mmap.as_ref()?;
+            Some((info, mmap[info.data_offset..info.data_offset + info.data_size].to_vec()))
+        }
+    }
+
     /// Release the mmap, freeing virtual address space and page cache.
     /// After this call, [`Self::tensor_data`] returns `None` for every tensor.
-    /// Use [`Self::tensor_data_pread`] or the weight pager for post-drop reads.
+    /// Use [`Self::tensor_data_vec`], [`Self::tensor_data_pread`], or the weight pager for post-drop reads.
     pub fn drop_mmap(&mut self) {
         self.mmap = None;
     }
@@ -461,7 +500,7 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
 
 /// Load LLaMA weights from an HFQ file onto GPU.
 pub fn load_weights_hfq(
-    hfq: &HfqFile,
+    hfq: &mut HfqFile,
     config: &LlamaConfig,
     gpu: &mut Gpu,
 ) -> HipResult<LlamaWeights> {

@@ -18,7 +18,7 @@ fn main() {
     let model_path = args.get(1)
         .unwrap_or_else(|| { eprintln!("Usage: smoke_llama_prefill_batch <model.hfq>"); std::process::exit(1); });
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open HFQ");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open HFQ");
     let config = hfq::config_from_hfq(&hfq).expect("config");
     eprintln!("Model: dim={}, layers={}, heads={}, kv_heads={}, head_dim={}",
         config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.head_dim);

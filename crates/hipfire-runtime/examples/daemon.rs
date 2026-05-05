@@ -1000,7 +1000,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
-    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .ok_or("tokenizer not found")?;
 
@@ -1148,7 +1148,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         let vision_config = <Qwen35Vl as Architecture>::config_from_hfq(&hfq).ok();
         let (vision_config, vision_weights) = if let Some(vc) = vision_config {
             if has_vision_tensors {
-                let vw = <Qwen35Vl as Architecture>::load_weights(&hfq, &vc, gpu)
+                let vw = <Qwen35Vl as Architecture>::load_weights(&mut hfq, &vc, gpu)
                     .map_err(|e| format!("{e}"))?;
                 eprintln!("  VL model: vision encoder (hidden={}, layers={})", vc.hidden_size, vc.num_layers);
                 (Some(vc), Some(vw))
@@ -1159,7 +1159,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             (None, None)
         };
 
-        let weights = <Qwen35 as Architecture>::load_weights(&hfq, &config, gpu)?;
+        let weights = <Qwen35 as Architecture>::load_weights(&mut hfq, &config, gpu)?;
 
         // MMQ per-weight screening (#87): pre-screen all weight matrices at
         // load time so the first prefill doesn't pay the screening overhead.
@@ -1305,7 +1305,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         use hipfire_runtime::arch::Architecture;
         let config = <Llama as Architecture>::config_from_hfq(&hfq)
             .map_err(|e| e.to_string())?;
-        let weights = <Llama as Architecture>::load_weights(&hfq, &config, gpu)?;
+        let weights = <Llama as Architecture>::load_weights(&mut hfq, &config, gpu)?;
         eprintln!("  KV cache: Q8");
         let kv = llama::KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?;
         let scratch = <Llama as Architecture>::new_state(gpu, &config)?;
@@ -1420,7 +1420,7 @@ fn load_dflash_state(
     target_dn: &DeltaNetState,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<DflashState, String> {
-    let hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("open draft: {e}"))?;
+    let mut hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("open draft: {e}"))?;
     let draft_config = DflashConfig::from_hfq(&hfq).ok_or("parse DflashConfig")?;
     let draft_weights = DflashWeights::load(gpu, &hfq, &draft_config).map_err(|e| format!("load weights: {e}"))?;
     let draft_scratch = DflashScratch::new_with_mq(
