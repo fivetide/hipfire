@@ -44,7 +44,9 @@ pub struct HfqFile {
     path: std::path::PathBuf,
     /// mmap kept for backward compat (small models, non-APU systems).
     /// On unified-memory APUs, tensor data is read via pread instead.
-    mmap: Mmap,
+    /// `None` after [`Self::drop_mmap`] — callers must use `tensor_data_pread`
+    /// or the weight pager after the mmap is released.
+    mmap: Option<Mmap>,
     pub arch_id: u32,
     pub metadata_json: String,
     tensors: Vec<HfqTensorInfo>,
@@ -169,7 +171,7 @@ impl HfqFile {
         Ok(Self {
             _file: file,
             path: path.to_path_buf(),
-            mmap, arch_id, metadata_json, tensors, tensor_map,
+            mmap: Some(mmap), arch_id, metadata_json, tensors, tensor_map,
             pread_buf: std::cell::RefCell::new(Vec::new()),
         })
     }
@@ -190,9 +192,11 @@ impl HfqFile {
     }
 
     pub fn tensor_data(&self, name: &str) -> Option<(&HfqTensorInfo, &[u8])> {
+        debug_assert!(self.mmap.is_some(), "tensor_data() called after drop_mmap()");
         let idx = *self.tensor_map.get(name)?;
         let info = &self.tensors[idx];
-        Some((info, &self.mmap[info.data_offset..info.data_offset + info.data_size]))
+        let mmap = self.mmap.as_ref()?;
+        Some((info, &mmap[info.data_offset..info.data_offset + info.data_size]))
     }
 
     /// Read tensor data via pread into a reusable buffer, then FADV_DONTNEED
@@ -234,6 +238,21 @@ impl HfqFile {
     #[cfg(not(unix))]
     pub fn tensor_data_pread(&self, name: &str) -> Option<(&HfqTensorInfo, &[u8])> {
         self.tensor_data(name)
+    }
+
+    /// Release the mmap, freeing virtual address space and page cache.
+    /// After this call, [`Self::tensor_data`] returns `None` for every tensor.
+    /// Use [`Self::tensor_data_pread`] or the weight pager for post-drop reads.
+    pub fn drop_mmap(&mut self) {
+        self.mmap = None;
+    }
+
+    /// Returns `true` if the mmap is still live (i.e. [`Self::drop_mmap`] has
+    /// not been called). Callers that need to branch on mmap availability
+    /// (e.g. choosing between `tensor_data` and `tensor_data_pread`) can
+    /// check this instead of attempting a dummy lookup.
+    pub fn has_mmap(&self) -> bool {
+        self.mmap.is_some()
     }
 
     /// Release page cache for a byte range. Only works if the range is NOT mmap'd.
