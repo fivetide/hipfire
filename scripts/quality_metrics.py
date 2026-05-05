@@ -497,6 +497,18 @@ def main():
         "--top-k", type=int, default=10, help="k for top-k Jaccard overlap (default: 10)"
     )
     cmp_parser.add_argument("--output", "-o", help="Write result JSON to this path")
+    cmp_parser.add_argument(
+        "--max-kl-mean", type=float, default=None,
+        help="Fail if KL divergence mean exceeds this threshold"
+    )
+    cmp_parser.add_argument(
+        "--min-top1-agreement", type=float, default=None,
+        help="Fail if top-1 token agreement drops below this (0.0-1.0)"
+    )
+    cmp_parser.add_argument(
+        "--min-jaccard-mean", type=float, default=None,
+        help="Fail if mean top-k Jaccard overlap drops below this (0.0-1.0)"
+    )
 
     # Backwards compatibility: if first arg isn't a known subcommand, treat as legacy JSONL
     if len(sys.argv) > 1 and sys.argv[1] not in ("jsonl", "compare", "-h", "--help"):
@@ -605,14 +617,37 @@ def main():
         if pd["perplexity_ratio"] is not None:
             print(f"    ratio:             {pd['perplexity_ratio']:.6f}")
 
-        result = {"metrics": metrics, "status": "PASS"}
+        # Threshold checks for golden comparison gating
+        failures = []
+        if args.max_kl_mean is not None and kl["mean"] > args.max_kl_mean:
+            failures.append(
+                f"kl_divergence.mean: {kl['mean']:.6f} > threshold {args.max_kl_mean:.6f}"
+            )
+        if args.min_top1_agreement is not None and ta["top1_agreement"] < args.min_top1_agreement:
+            failures.append(
+                f"top1_agreement: {ta['top1_agreement']:.4f} < threshold {args.min_top1_agreement:.4f}"
+            )
+        if args.min_jaccard_mean is not None and tj["mean"] < args.min_jaccard_mean:
+            failures.append(
+                f"topk_jaccard.mean: {tj['mean']:.4f} < threshold {args.min_jaccard_mean:.4f}"
+            )
+
+        if failures:
+            print("\n=== GOLDEN COMPARISON REGRESSION DETECTED ===")
+            for fail in failures:
+                print(f"  FAIL: {fail}")
+            result = {"metrics": metrics, "status": "FAIL", "failures": failures}
+        else:
+            if args.max_kl_mean is not None or args.min_top1_agreement is not None or args.min_jaccard_mean is not None:
+                print("\n=== Golden comparison: all metrics within thresholds ===")
+            result = {"metrics": metrics, "status": "PASS", "failures": []}
 
         if args.output:
             with open(args.output, "w") as f:
                 json.dump(result, f, indent=2)
                 f.write("\n")
 
-        sys.exit(0)
+        sys.exit(1 if result["status"] == "FAIL" else 0)
 
 
 if __name__ == "__main__":

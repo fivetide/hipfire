@@ -17,6 +17,15 @@
 #   ./scripts/quality-gate.sh --update     # capture new baselines
 #   ./scripts/quality-gate.sh --tolerance 0.08  # override tolerance (default 0.05)
 #
+# Golden comparison (FP16 GGUF reference):
+#   ./scripts/quality-gate.sh --generate-golden --gguf-fp16 <model.gguf>
+#       Generate golden logits from an FP16 GGUF model via llama-perplexity.
+#       Saves to tests/quality-baselines/<arch>/golden_<ref>.bin
+#
+#   ./scripts/quality-gate.sh --golden <dir>
+#       Compare hipfire's binary logit output against golden reference files.
+#       <dir> contains golden .bin files (one per reference text).
+#
 # Reference texts live in benchmarks/quality-gate/. Baselines in
 # tests/quality-baselines/<arch>/<model>.json.
 
@@ -26,12 +35,18 @@ cd "$(dirname "$0")/.."
 FULL=0
 UPDATE=0
 TOLERANCE=""
+GENERATE_GOLDEN=0
+GGUF_FP16=""
+GOLDEN_DIR=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --full) FULL=1 ;;
         --update|--update-baselines) UPDATE=1 ;;
         --tolerance) TOLERANCE="$2"; shift ;;
-        -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+        --generate-golden) GENERATE_GOLDEN=1 ;;
+        --gguf-fp16) GGUF_FP16="$2"; shift ;;
+        --golden) GOLDEN_DIR="$2"; shift ;;
+        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
     shift
@@ -88,25 +103,27 @@ if [ -z "$BASELINE_ARCH" ]; then
 fi
 echo "quality-gate: arch=$BASELINE_ARCH"
 
-# ── Build teacher_eval ──────────────────────────────────────────────────
-rebuild=0
-if [ ! -x "$EXE" ]; then
-    rebuild=1
-else
-    for src in crates/hipfire-arch-qwen35/src/qwen35.rs crates/hipfire-runtime/src/llama.rs \
-               crates/hipfire-runtime/src/hfq.rs crates/hipfire-runtime/examples/teacher_eval.rs \
-               crates/rdna-compute/src/dispatch.rs; do
-        if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
-            rebuild=1
-            break
+# ── Build teacher_eval (skip for --generate-golden which only uses llama-perplexity) ──
+if [ "$GENERATE_GOLDEN" -eq 0 ]; then
+    rebuild=0
+    if [ ! -x "$EXE" ]; then
+        rebuild=1
+    else
+        for src in crates/hipfire-arch-qwen35/src/qwen35.rs crates/hipfire-runtime/src/llama.rs \
+                   crates/hipfire-runtime/src/hfq.rs crates/hipfire-runtime/examples/teacher_eval.rs \
+                   crates/rdna-compute/src/dispatch.rs; do
+            if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
+                rebuild=1
+                break
+            fi
+        done
+    fi
+    if [ "$rebuild" -eq 1 ]; then
+        echo "quality-gate: building teacher_eval..."
+        if ! cargo build --release --example teacher_eval --features deltanet >&2; then
+            echo "quality-gate: build failed" >&2
+            exit 2
         fi
-    done
-fi
-if [ "$rebuild" -eq 1 ]; then
-    echo "quality-gate: building teacher_eval..."
-    if ! cargo build --release --example teacher_eval --features deltanet >&2; then
-        echo "quality-gate: build failed" >&2
-        exit 2
     fi
 fi
 
@@ -122,6 +139,139 @@ if [ -r "$LOCK_SCRIPT" ]; then
     . "$LOCK_SCRIPT"
     gpu_acquire "quality-gate" || { echo "could not acquire GPU lock" >&2; exit 2; }
     trap 'gpu_release 2>/dev/null || true' EXIT
+fi
+
+# ── Golden generation mode ─────────────────────────────────────────────
+if [ "$GENERATE_GOLDEN" -eq 1 ]; then
+    if [ -z "$GGUF_FP16" ]; then
+        echo "quality-gate: --generate-golden requires --gguf-fp16 <model.gguf>" >&2
+        exit 2
+    fi
+    if [ ! -f "$GGUF_FP16" ]; then
+        echo "quality-gate: GGUF file not found: $GGUF_FP16" >&2
+        exit 2
+    fi
+    if ! command -v llama-perplexity >/dev/null 2>&1; then
+        echo "quality-gate: llama-perplexity not found in PATH" >&2
+        exit 2
+    fi
+
+    golden_out_dir="$BASELINE_DIR/$BASELINE_ARCH"
+    mkdir -p "$golden_out_dir"
+
+    for ref_file in "$REFERENCE_DIR"/*.txt; do
+        [ -f "$ref_file" ] || continue
+        ref_name=$(basename "$ref_file" .txt)
+        golden_file="$golden_out_dir/golden_${ref_name}.bin"
+
+        echo "== generating golden: $ref_name =="
+        echo "  model: $GGUF_FP16"
+        echo "  reference: $ref_file"
+        echo "  output: $golden_file"
+
+        if ! llama-perplexity \
+            -m "$GGUF_FP16" \
+            -f "$ref_file" \
+            --save-all-logits "$golden_file" \
+            -c 0 \
+            2>&1 | tail -5; then
+            echo "  ERROR: llama-perplexity failed for $ref_name" >&2
+            exit 2
+        fi
+
+        if [ ! -s "$golden_file" ]; then
+            echo "  ERROR: golden file empty or not created" >&2
+            exit 2
+        fi
+        echo "  golden written: $golden_file ($(stat -c%s "$golden_file") bytes)"
+    done
+
+    echo
+    echo "quality-gate: golden baselines generated in $golden_out_dir/"
+    echo "Review with: ls -la $golden_out_dir/golden_*.bin"
+    exit 0
+fi
+
+# ── Golden comparison mode ─────────────────────────────────────────────
+if [ -n "$GOLDEN_DIR" ]; then
+    if [ ! -d "$GOLDEN_DIR" ]; then
+        # Allow passing a single file — derive dir
+        if [ -f "$GOLDEN_DIR" ]; then
+            echo "quality-gate: --golden expects a directory containing golden .bin files" >&2
+            exit 2
+        fi
+        echo "quality-gate: golden dir not found: $GOLDEN_DIR" >&2
+        exit 2
+    fi
+
+    pass=0
+    fail=0
+    skip=0
+
+    for size in "0.8b" "4b" "9b"; do
+        model_path="$MODELS_DIR/qwen3.5-${size}.mq4"
+        [ -f "$model_path" ] || continue
+        if [ "$FULL" -eq 0 ] && [ "$size" != "0.8b" ]; then
+            continue
+        fi
+
+        for ref_file in "$REFERENCE_DIR"/*.txt; do
+            [ -f "$ref_file" ] || continue
+            ref_name=$(basename "$ref_file" .txt)
+            golden_file="$GOLDEN_DIR/golden_${ref_name}.bin"
+
+            if [ ! -f "$golden_file" ]; then
+                echo "  qwen3.5-${size} / $ref_name: SKIP (no golden file)"
+                skip=$((skip + 1))
+                continue
+            fi
+
+            echo "== qwen3.5-${size} / $ref_name (golden comparison) =="
+
+            candidate_file="/tmp/quality-gate_golden_${size}_${ref_name}_$$.bin"
+
+            # Run teacher_eval with --binary-logits to produce candidate logits
+            if ! "$EXE" "$model_path" "$ref_file" /dev/null --binary-logits "$candidate_file" 2>&1 | grep -E "^  (pos|tokens|QUALITY|binary)" | tail -3; then
+                echo "  HARD_ERROR: teacher_eval crashed"
+                fail=$((fail + 1))
+                rm -f "$candidate_file"
+                continue
+            fi
+
+            if [ ! -s "$candidate_file" ]; then
+                echo "  HARD_ERROR: no binary logit output produced"
+                fail=$((fail + 1))
+                rm -f "$candidate_file"
+                continue
+            fi
+
+            # Compare golden vs candidate using quality_metrics.py
+            # Default thresholds: KL mean < 2.0, top-1 agreement > 30%, Jaccard > 0.3
+            # These are lenient for quantized (MQ4) vs FP16 comparison
+            threshold_args="--max-kl-mean ${HIPFIRE_GOLDEN_MAX_KL:-2.0}"
+            threshold_args="$threshold_args --min-top1-agreement ${HIPFIRE_GOLDEN_MIN_TOP1:-0.30}"
+            threshold_args="$threshold_args --min-jaccard-mean ${HIPFIRE_GOLDEN_MIN_JACCARD:-0.30}"
+            if python3 scripts/quality_metrics.py compare "$golden_file" "$candidate_file" $threshold_args; then
+                pass=$((pass + 1))
+            else
+                fail=$((fail + 1))
+            fi
+
+            rm -f "$candidate_file"
+        done
+    done
+
+    echo
+    if [ "$fail" -eq 0 ]; then
+        if [ "$pass" -eq 0 ] && [ "$skip" -gt 0 ]; then
+            echo "quality-gate (golden): NO COMPARISONS RUN (${skip} skipped)"
+            exit 0
+        fi
+        echo "quality-gate (golden): PASSED (${pass} checks, ${skip} skipped)"
+        exit 0
+    fi
+    echo "quality-gate (golden): FAILED (${fail} regression(s), ${pass} passed, ${skip} skipped)"
+    exit 1
 fi
 
 # ── Model matrix ────────────────────────────────────────────────────────
