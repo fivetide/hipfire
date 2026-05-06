@@ -20,7 +20,7 @@ fn main() {
     eprintln!("=== hipfire inference integration tests ===");
     eprintln!("Model: {model_path}");
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
     let config = qwen35::config_from_hfq(&hfq).expect("failed to read config");
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("tokenizer not found");

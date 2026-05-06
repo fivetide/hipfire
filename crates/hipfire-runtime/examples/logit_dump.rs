@@ -16,7 +16,7 @@ fn main() {
 
     let prompt_text = "The quick brown fox jumps over the lazy dog. Explain step by step how a combustion engine works, covering the four stroke cycle, fuel injection, and exhaust.";
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("failed to open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("failed to open model");
     let config = qwen35::config_from_hfq(&hfq).expect("failed to read config");
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("need tokenizer");

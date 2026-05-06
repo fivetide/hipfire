@@ -18,7 +18,7 @@ fn main() {
     let n_gen: usize = std::env::var("HIPFIRE_GEN")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(80);
 
-    let hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load");

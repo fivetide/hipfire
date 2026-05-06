@@ -280,7 +280,7 @@ fn run_case(case_name: &str, model_path: Option<&Path>) -> ExitCode {
 
 #[cfg(feature = "deltanet")]
 fn build_context(model_path: &Path) -> Result<Context, CaseOutcome> {
-    let hfq = HfqFile::open(model_path)
+    let mut hfq = HfqFile::open(model_path)
         .map_err(|e| CaseOutcome::Fail(format!("failed to open HFQ: {e}")))?;
     let model_label = classify_qwen35_candidate(&hfq)?;
     let config = qwen35::config_from_hfq(&hfq)

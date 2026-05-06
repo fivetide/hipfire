@@ -47,7 +47,7 @@ fn main() {
         }
     }
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     eprintln!("dump_logits_qwen35: arch={} prefill_len={}", gpu.arch, prefill_len);

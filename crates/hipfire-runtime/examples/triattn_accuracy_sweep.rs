@@ -96,7 +96,7 @@ fn main() {
 
     let budget_fractions: &[f32] = &[1.00, 0.50, 0.25];
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
     let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
     let centers = TriAttnCenters::load(Path::new(sidecar_path)).expect("load sidecar");

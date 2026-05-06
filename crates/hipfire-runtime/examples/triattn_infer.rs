@@ -95,7 +95,7 @@ fn main() {
     };
     let prompt = hipfire_runtime::tokenizer::maybe_normalize_prompt(&prompt).into_owned();
 
-    let hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
     let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
     let centers = TriAttnCenters::load(Path::new(&sidecar_path)).expect("load sidecar");

@@ -162,7 +162,7 @@ fn main() {
 
     // ── Model loading ────────────────────────────────────────────────────
     eprintln!("Loading model: {model_path}");
-    let hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config_from_hfq");
     eprintln!(
         "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
