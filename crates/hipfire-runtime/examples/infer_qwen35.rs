@@ -71,7 +71,7 @@ fn main() {
         eprintln!("Guards: ON (prompt_frame + sampler + eos_filter + loop_guard)");
     }
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
     let config = qwen35::config_from_hfq(&hfq).expect("failed to read Qwen3.5 config");
     eprintln!("Config: dim={}, layers={}, heads={}, vocab={}", config.dim, config.n_layers, config.n_heads, config.vocab_size);
 

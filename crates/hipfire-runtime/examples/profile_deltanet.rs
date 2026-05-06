@@ -16,7 +16,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let model_path = args.get(1).expect("Usage: profile_deltanet <model.hfq>");
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("failed to open HFQ");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("failed to open HFQ");
     let config = qwen35::config_from_hfq(&hfq).expect("failed to parse config");
     eprintln!("dim={}, heads={}, linear_heads={}, head_dim={}",
         config.dim, config.n_heads, config.linear_num_key_heads, config.linear_key_head_dim);

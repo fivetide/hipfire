@@ -69,7 +69,7 @@ fn main() {
     eprintln!("Prompt: {prompt_text}");
 
     // Load model config + tokenizer
-    let hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
     let text_config = qwen35::config_from_hfq(&hfq).expect("failed to read Qwen3.5 config");
     eprintln!("Text: dim={}, layers={}, vocab={}", text_config.dim, text_config.n_layers, text_config.vocab_size);
 

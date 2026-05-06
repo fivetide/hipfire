@@ -357,7 +357,7 @@ fn main() {
     eprintln!("model md5:   {model_md5}");
 
     let t_load_start = Instant::now();
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open HFQ");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open HFQ");
     let config = qwen35::config_from_hfq(&hfq).expect("qwen35 config");
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("tokenizer");

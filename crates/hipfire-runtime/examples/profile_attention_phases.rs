@@ -51,7 +51,7 @@ fn main() {
     eprintln!("Model: {model_path}");
     eprintln!("Prefill: {prefill_len}  Repeats: {repeats}");
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
     eprintln!(
         "Config: dim={} layers={} n_heads={} n_kv_heads={} head_dim={}",

@@ -8,7 +8,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let path = args.get(1).expect("Usage: test_qwen35_load <model.hfq>");
 
-    let hfq = HfqFile::open(Path::new(path)).expect("failed to open HFQ");
+    let mut hfq = HfqFile::open(Path::new(path)).expect("failed to open HFQ");
     eprintln!("HFQ arch_id: {}", hfq.arch_id);
 
     // Parse metadata

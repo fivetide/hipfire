@@ -44,7 +44,7 @@ fn main() {
     eprintln!("Model: {model_path}");
     eprintln!("Phases: prefill={prefill_len} prefill_runs={prefill_runs} warmup={warmup_len} gen={gen_len}");
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
     eprintln!(
         "Config: dim={} layers={} heads={} kv_heads={} vocab={}",

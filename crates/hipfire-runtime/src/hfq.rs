@@ -211,6 +211,10 @@ impl HfqFile {
     pub fn tensor_data(&self, name: &str) -> Option<(&HfqTensorInfo, &[u8])> {
         let idx = *self.tensor_map.get(name)?;
         let info = &self.tensors[idx];
+        debug_assert!(
+            self.mmap.is_some(),
+            "tensor_data() called after drop_mmap() — use tensor_data_vec() or tensor_data_pread() instead (tensor: {name})"
+        );
         let mmap = self.mmap.as_ref()?;
         Some((info, &mmap[info.data_offset..info.data_offset + info.data_size]))
     }

@@ -97,7 +97,7 @@ it?".to_string(),
     eprintln!("turns: {}", turns.len());
 
     // ── Load model ──────────────────────────────────────────────────────
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tok");
 

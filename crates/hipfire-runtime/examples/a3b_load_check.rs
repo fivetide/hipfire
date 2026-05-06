@@ -23,7 +23,7 @@ fn main() {
     let model_path = &args[1];
     eprintln!("Opening: {model_path}");
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
 
     eprintln!("Config:");

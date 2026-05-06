@@ -1094,7 +1094,14 @@ impl TensorSpill {
     }
 
     fn cleanup(self) {
-        drop(self.file);
+        // Explicit cleanup — Drop impl handles the actual removal.
+        drop(self);
+    }
+}
+
+impl Drop for TensorSpill {
+    fn drop(&mut self) {
+        // Ensure the temp file is removed even on panic.
         let _ = std::fs::remove_file(&self.path);
     }
 }
