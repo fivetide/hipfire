@@ -77,6 +77,7 @@ Add hipfire to your flake inputs and enable the service.
 services.hipfire = {
   enable = true;
   gpuTargets = [ "gfx1100" ];
+  openFirewall = true;  # opens port 11435
 
   # Inference settings
   defaultModel = "qwen3.5:9b";
@@ -204,6 +205,7 @@ services.hipfire.gpuTargets = [ "gfx1100" "gfx1030" ];
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enable` | bool | `false` | Enable the hipfire service |
+| `openFirewall` | bool | `false` | Open the API port in the firewall |
 | `src` | path or null | `null` | Custom source derivation (overrides everything) |
 | `github.owner` | str | `"Kaden-Schutt"` | GitHub repo owner |
 | `github.repo` | str | `"hipfire"` | GitHub repo name |

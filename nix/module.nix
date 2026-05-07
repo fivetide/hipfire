@@ -62,6 +62,12 @@ in
 
     enable = lib.mkEnableOption "hipfire inference daemon";
 
+    openFirewall = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Open the API port in the firewall.";
+    };
+
     package = lib.mkOption {
       type = lib.types.package;
       default = pkgs.hipfire;
@@ -295,6 +301,10 @@ in
 
     # Expose the CLI globally so `hipfire pull`, `hipfire diag`, etc. work
     { environment.systemPackages = [ hipfirePkg ]; }
+
+    (lib.mkIf cfg.openFirewall {
+      networking.firewall.allowedTCPPorts = [ cfg.port ];
+    })
 
     # ── System service mode ──────────────────────────────────
     (lib.mkIf (!cfg.userService) {
