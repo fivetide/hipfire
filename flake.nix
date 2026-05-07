@@ -2,7 +2,7 @@
   description = "hipfire — LLM inference for AMD RDNA GPUs";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -20,6 +20,7 @@
           rocmSupport = true;
         };
 
+        # Default target; override via services.hipfire.gpuTargets in NixOS module
         hipfire-kernels = pkgs.callPackage ./nix/kernels.nix {
           gpuTargets = [ "gfx1100" ];
         };

@@ -10,7 +10,9 @@ let
     (builtins.toJSON cfg.perModelSettings);
 
   hipfirePkg = cfg.package;
-  hipfireKernelsPkg = cfg.kernelsPackage;
+  hipfireKernelsPkg = cfg.kernelsPackage.override {
+    gpuTargets = cfg.gpuTargets;
+  };
 
   envList =
     (lib.mapAttrsToList (k: v: "${k}=${v}") cfg.environment)
@@ -178,7 +180,9 @@ in
         };
         script = ''
           export HOME=/var/lib/hipfire
-          ${hipfirePkg}/bin/hipfire-daemon --precompile || true
+          if ! ${hipfirePkg}/bin/hipfire-daemon --precompile; then
+            echo "WARNING: kernel pre-compilation failed (exit $?). Daemon will JIT-compile on first request." >&2
+          fi
         '';
       };
 
@@ -198,7 +202,8 @@ in
           ProtectSystem = "strict";
           ReadWritePaths = [ cfg.modelDir "/var/lib/hipfire" ];
           NoNewPrivileges = true;
-          DeviceAllow = [ "/dev/kfd rw" "/dev/dri/renderD128 rw" ];
+          PrivateDevices = true;
+          DeviceAllow = [ "/dev/kfd rw" "/dev/dri rw" "/dev/dri/* rw" ];
         };
       };
     })
