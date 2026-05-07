@@ -4,11 +4,15 @@
 , gpuTargets ? [ "gfx1100" ]
 }:
 
+let
+  src = lib.cleanSource ./..;
+  cargoToml = builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"));
+in
 stdenv.mkDerivation {
   pname = "hipfire-kernels";
-  version = "0.1.20";
+  version = cargoToml.workspace.package.version or cargoToml.package.version;
 
-  src = lib.cleanSource ./..;
+  inherit src;
 
   nativeBuildInputs = [
     rocmPackages.clr
@@ -18,7 +22,11 @@ stdenv.mkDerivation {
   buildPhase = ''
     runHook preBuild
     export HOME=$TMPDIR
-    bash scripts/compile-kernels.sh ${lib.concatStringsSep " " gpuTargets}
+    # Allow partial failures — some kernels are arch-specific and won't
+    # compile for every target. The daemon JIT-compiles missing kernels.
+    bash scripts/compile-kernels.sh ${lib.concatStringsSep " " gpuTargets} || {
+      echo "WARNING: some kernels failed to compile (see above). Daemon will JIT-compile them on first use."
+    }
     runHook postBuild
   '';
 

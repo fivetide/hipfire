@@ -8,9 +8,12 @@
 , cargoLockFile ? ../Cargo.lock
 }:
 
+let
+  cargoToml = builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"));
+in
 rustPlatform.buildRustPackage {
   pname = "hipfire";
-  version = "0.1.20";
+  version = cargoToml.workspace.package.version or cargoToml.package.version;
 
   inherit src;
   cargoLock.lockFile = cargoLockFile;
