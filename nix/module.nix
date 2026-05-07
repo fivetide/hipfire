@@ -10,9 +10,10 @@ let
     (builtins.toJSON cfg.perModelSettings);
 
   hipfirePkg = cfg.package;
-  hipfireKernelsPkg = cfg.kernelsPackage.override {
-    gpuTargets = cfg.gpuTargets;
-  };
+  hipfireKernelsPkg =
+    if cfg.kernelsPackage == pkgs.hipfire-kernels
+    then cfg.kernelsPackage.override { gpuTargets = cfg.gpuTargets; }
+    else cfg.kernelsPackage;
 
   envList =
     (lib.mapAttrsToList (k: v: "${k}=${v}") cfg.environment)
@@ -202,7 +203,7 @@ in
           ProtectSystem = "strict";
           ReadWritePaths = [ cfg.modelDir "/var/lib/hipfire" ];
           NoNewPrivileges = true;
-          PrivateDevices = true;
+          DevicePolicy = "closed";
           DeviceAllow = [ "/dev/kfd rw" "/dev/dri rw" "/dev/dri/* rw" ];
         };
       };

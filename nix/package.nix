@@ -12,6 +12,7 @@ rustPlatform.buildRustPackage {
 
   src = lib.cleanSource ./..;
   cargoLock.lockFile = ../Cargo.lock;
+  doCheck = false;  # tests require GPU
 
   # The main binaries are cargo [[example]] targets, not [[bin]].
   buildPhase = ''
