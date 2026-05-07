@@ -53,16 +53,11 @@ rustPlatform.buildRustPackage {
          \( -name '*.test.ts' -o -name 'test_*.ts' -o -name 'bench_*.ts' \) \
          -delete 2>/dev/null || true
 
-    # Create symlink so CLI finds daemon via its relative path resolution:
-    # CLI __dirname = $out/share/hipfire/cli/
-    # CLI checks: resolve(__dirname, "../target/release/examples/daemon")
-    # = $out/share/hipfire/target/release/examples/daemon
-    mkdir -p $out/share/hipfire/target/release/examples
-    ln -s $out/bin/hipfire-daemon $out/share/hipfire/target/release/examples/daemon
-
     # Create hipfire CLI wrapper
+    # HIPFIRE_DAEMON_BIN tells the CLI where to find the wrapped daemon
     makeWrapper ${bun}/bin/bun $out/bin/hipfire \
       --add-flags "run $out/share/hipfire/cli/index.ts" \
+      --set HIPFIRE_DAEMON_BIN $out/bin/hipfire-daemon \
       ${lib.optionalString rocmSupport
         "--prefix LD_LIBRARY_PATH : ${rocmPackages.clr}/lib"}
 
