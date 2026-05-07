@@ -954,7 +954,9 @@ class Engine {
 
   async start() {
     const exe = process.platform === "win32" ? ".exe" : "";
+    const envBin = process.env.HIPFIRE_DAEMON_BIN;
     const bins = [
+      ...(envBin ? [envBin] : []),
       resolve(__dirname, `../target/release/examples/daemon${exe}`),
       join(HIPFIRE_DIR, "bin", `daemon${exe}`),
     ];
