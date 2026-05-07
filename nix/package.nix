@@ -4,14 +4,16 @@
 , bun
 , makeWrapper
 , rocmSupport ? true
+, src ? lib.cleanSource ./..
+, cargoLockFile ? ../Cargo.lock
 }:
 
 rustPlatform.buildRustPackage {
   pname = "hipfire";
   version = "0.1.20";
 
-  src = lib.cleanSource ./..;
-  cargoLock.lockFile = ../Cargo.lock;
+  inherit src;
+  cargoLock.lockFile = cargoLockFile;
   doCheck = false;  # tests require GPU
 
   # The main binaries are cargo [[example]] targets, not [[bin]].

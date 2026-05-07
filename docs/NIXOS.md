@@ -127,6 +127,59 @@ Your user must be in `video` and `render` groups:
 users.users.yourname.extraGroups = [ "video" "render" ];
 ```
 
+### Building from a specific branch or fork
+
+By default the module builds from the flake input (pinned in `flake.lock`).
+To build from a different branch, tag, commit, or fork:
+
+```nix
+# Build from a specific branch
+services.hipfire = {
+  enable = true;
+  gpuTargets = [ "gfx1100" ];
+  github.rev = "feat/cool-thing";
+  github.hash = "";  # build once — nix will print the correct hash
+};
+```
+
+```nix
+# Build from a fork
+services.hipfire = {
+  enable = true;
+  gpuTargets = [ "gfx1100" ];
+  github.owner = "my-username";
+  github.rev = "my-branch";
+  github.hash = "sha256-AAAA...";
+};
+```
+
+```nix
+# Build from a pinned commit
+services.hipfire = {
+  enable = true;
+  gpuTargets = [ "gfx1100" ];
+  github.rev = "abc123def456";
+  github.hash = "sha256-AAAA...";
+};
+```
+
+You can also pass an arbitrary source derivation directly:
+
+```nix
+services.hipfire = {
+  enable = true;
+  src = pkgs.fetchFromGitHub {
+    owner = "Kaden-Schutt";
+    repo = "hipfire";
+    rev = "v0.2.0";
+    hash = "sha256-AAAA...";
+  };
+};
+```
+
+**Tip:** Set `github.hash = ""` on the first build — Nix will error with
+the correct SRI hash to paste back in.
+
 ## GPU Targets
 
 | Arch | Card | Generation |
@@ -151,6 +204,11 @@ services.hipfire.gpuTargets = [ "gfx1100" "gfx1030" ];
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enable` | bool | `false` | Enable the hipfire service |
+| `src` | path or null | `null` | Custom source derivation (overrides everything) |
+| `github.owner` | str | `"Kaden-Schutt"` | GitHub repo owner |
+| `github.repo` | str | `"hipfire"` | GitHub repo name |
+| `github.rev` | str or null | `null` | Branch, tag, or commit to fetch from GitHub |
+| `github.hash` | str | `""` | SRI hash of fetched source (required with `rev`) |
 | `gpuTargets` | list of str | `["gfx1100"]` | GPU architectures for kernel compilation |
 | `defaultModel` | str | `""` | Model to pre-warm on startup |
 | `temperature` | float | `0.3` | Sampling temperature |

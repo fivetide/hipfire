@@ -22,7 +22,23 @@ let
   perModelConfigJson = pkgs.writeText "hipfire-per-model-config.json"
     (builtins.toJSON cfg.perModelSettings);
 
-  hipfirePkg = cfg.package;
+  # Resolve source: explicit src > github.rev > package default
+  effectiveSrc =
+    if cfg.src != null then cfg.src
+    else if cfg.github.rev != null then
+      pkgs.fetchFromGitHub {
+        owner = cfg.github.owner;
+        repo = cfg.github.repo;
+        rev = cfg.github.rev;
+        hash = cfg.github.hash;
+      }
+    else null;
+
+  hipfirePkg =
+    if effectiveSrc != null then
+      cfg.package.override { src = effectiveSrc; cargoLockFile = "${effectiveSrc}/Cargo.lock"; }
+    else
+      cfg.package;
   hipfireKernelsPkg =
     if cfg.kernelsPackage == pkgs.hipfire-kernels
     then cfg.kernelsPackage.override { gpuTargets = cfg.gpuTargets; }
@@ -44,6 +60,51 @@ in
       default = pkgs.hipfire;
       defaultText = lib.literalExpression "pkgs.hipfire";
       description = "The hipfire package to use.";
+    };
+
+    src = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = ''
+        Custom source tree for building hipfire. Overrides the package's
+        default source. Set this directly, or use the github.* options
+        for convenience.
+      '';
+    };
+
+    github = {
+      owner = lib.mkOption {
+        type = lib.types.str;
+        default = "Kaden-Schutt";
+        description = "GitHub repository owner.";
+      };
+
+      repo = lib.mkOption {
+        type = lib.types.str;
+        default = "hipfire";
+        description = "GitHub repository name.";
+      };
+
+      rev = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "master";
+        description = ''
+          Git revision to build from (branch name, tag, or commit hash).
+          When set, fetches the source from GitHub instead of using the
+          local flake source. Takes precedence unless src is also set.
+        '';
+      };
+
+      hash = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        example = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        description = ''
+          SRI hash of the fetched source. Required when github.rev is set.
+          Set to "" and build once to get the correct hash from the error.
+        '';
+      };
     };
 
     kernelsPackage = lib.mkOption {
