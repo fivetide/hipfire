@@ -362,6 +362,7 @@ in
         description = "hipfire inference daemon";
         after = [ "network.target" "hipfire-precompile.service" ];
         wantedBy = [ "multi-user.target" ];
+        path = lib.optionals cfg.rocmSupport [ pkgs.rocmPackages.clr ];
         serviceConfig = {
           ExecStart = "${hipfirePkg}/bin/hipfire serve";
           Restart = "on-failure";
@@ -405,6 +406,7 @@ in
         description = "hipfire inference daemon (user)";
         after = [ "hipfire-setup.service" ];
         wantedBy = [ "default.target" ];
+        path = lib.optionals cfg.rocmSupport [ pkgs.rocmPackages.clr ];
         serviceConfig = {
           ExecStart = "${hipfirePkg}/bin/hipfire serve";
           Restart = "on-failure";
