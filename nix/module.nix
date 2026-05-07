@@ -3,6 +3,7 @@
 let
   cfg = config.services.hipfire;
 
+
   # Build config.json from typed options — camelCase NixOS options → snake_case JSON keys
   configAttrs = {
     port = cfg.port;
@@ -116,11 +117,16 @@ in
 
     gpuTargets = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [ "gfx1100" ];
+      default = [ ];
       example = [ "gfx1100" "gfx1030" ];
       description = ''
-        GPU architectures to compile kernels for.
-        Detect yours: grep gfx_target_version /sys/class/kfd/kfd/topology/nodes/*/properties
+        GPU architectures to compile kernels for. Must be set explicitly —
+        Nix cannot probe hardware at evaluation time.
+
+        Detect yours:
+          rocminfo 2>/dev/null | grep -oP 'amdgcn-amd-amdhsa--\K\S+' | sort -u
+        or:
+          grep gfx_target_version /sys/class/kfd/kfd/topology/nodes/*/properties
       '';
     };
 
@@ -265,6 +271,18 @@ in
   };
 
   config = lib.mkIf cfg.enable (lib.mkMerge [
+
+    {
+      assertions = [{
+        assertion = cfg.gpuTargets != [ ];
+        message = ''
+          services.hipfire.gpuTargets is empty. Set it to your GPU architecture(s).
+          Detect yours by running:
+            rocminfo 2>/dev/null | grep -oP 'amdgcn-amd-amdhsa--\K\S+' | sort -u
+          Example: services.hipfire.gpuTargets = [ "gfx1100" ];
+        '';
+      }];
+    }
 
     # ── System service mode ──────────────────────────────────
     (lib.mkIf (!cfg.userService) {

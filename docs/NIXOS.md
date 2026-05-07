@@ -209,7 +209,7 @@ services.hipfire.gpuTargets = [ "gfx1100" "gfx1030" ];
 | `github.repo` | str | `"hipfire"` | GitHub repo name |
 | `github.rev` | str or null | `null` | Branch, tag, or commit to fetch from GitHub |
 | `github.hash` | str | `""` | SRI hash of fetched source (required with `rev`) |
-| `gpuTargets` | list of str | `["gfx1100"]` | GPU architectures for kernel compilation |
+| `gpuTargets` | list of str | `[]` (required) | GPU architectures for kernel compilation |
 | `defaultModel` | str | `""` | Model to pre-warm on startup |
 | `temperature` | float | `0.3` | Sampling temperature |
 | `topP` | float | `0.8` | Nucleus sampling threshold |
