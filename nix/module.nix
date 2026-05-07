@@ -3,9 +3,22 @@
 let
   cfg = config.services.hipfire;
 
-  settingsWithPort = cfg.settings // { port = cfg.port; };
+  # Build config.json from typed options — camelCase NixOS options → snake_case JSON keys
+  configAttrs = {
+    port = cfg.port;
+    default_model = cfg.defaultModel;
+    temperature = cfg.temperature;
+    top_p = cfg.topP;
+    max_tokens = cfg.maxTokens;
+    max_seq = cfg.maxSeq;
+    repeat_penalty = cfg.repeatPenalty;
+    kv_cache = cfg.kvCache;
+    dflash_mode = cfg.dflashMode;
+    idle_timeout = cfg.idleTimeout;
+  } // cfg.extraSettings;
+
   configJson = pkgs.writeText "hipfire-config.json"
-    (builtins.toJSON settingsWithPort);
+    (builtins.toJSON configAttrs);
   perModelConfigJson = pkgs.writeText "hipfire-per-model-config.json"
     (builtins.toJSON cfg.perModelSettings);
 
@@ -59,31 +72,80 @@ in
       '';
     };
 
+    # ── Inference settings (written to config.json) ──────────
+
     port = lib.mkOption {
       type = lib.types.port;
       default = 11435;
       description = "Port for the OpenAI-compatible API server.";
     };
 
-    modelDir = lib.mkOption {
+    defaultModel = lib.mkOption {
       type = lib.types.str;
-      default = "/var/lib/hipfire/models";
-      description = "Directory containing model files.";
+      default = "";
+      example = "qwen3.5:27b";
+      description = "Model to pre-warm on startup. Empty = none.";
     };
 
-    settings = lib.mkOption {
-      type = lib.types.attrs;
-      default = {
-        temperature = 0.3;
-        top_p = 0.8;
-        max_tokens = 512;
-      };
+    temperature = lib.mkOption {
+      type = lib.types.float;
+      default = 0.3;
+      description = "Sampling temperature.";
+    };
+
+    topP = lib.mkOption {
+      type = lib.types.float;
+      default = 0.8;
+      description = "Nucleus sampling threshold.";
+    };
+
+    maxTokens = lib.mkOption {
+      type = lib.types.int;
+      default = 512;
+      description = "Per-request token cap.";
+    };
+
+    maxSeq = lib.mkOption {
+      type = lib.types.int;
+      default = 32768;
+      description = "KV cache physical capacity (tokens).";
+    };
+
+    repeatPenalty = lib.mkOption {
+      type = lib.types.float;
+      default = 1.05;
+      description = "Repetition penalty. Keep conservative — 1.3+ causes MQ4 gibberish at low temp.";
+    };
+
+    kvCache = lib.mkOption {
+      type = lib.types.str;
+      default = "auto";
+      example = "asym3";
+      description = "KV cache quantization mode: auto / q8 / asym4 / asym3 / asym2 / turbo / turbo4 / turbo3 / turbo2.";
+    };
+
+    dflashMode = lib.mkOption {
+      type = lib.types.enum [ "on" "off" "auto" ];
+      default = "off";
+      description = "DFlash speculative decode: on / off / auto.";
+    };
+
+    idleTimeout = lib.mkOption {
+      type = lib.types.int;
+      default = 300;
+      description = "Seconds before evicting loaded model from VRAM. 0 = never.";
+    };
+
+    extraSettings = lib.mkOption {
+      type = lib.types.attrsOf lib.types.anything;
+      default = { };
       description = ''
-        Global configuration written to config.json.
-        See docs/CONFIG.md for all available keys.
-        Note: the 'port' key is managed by services.hipfire.port.
+        Additional config.json keys (snake_case) not covered by dedicated options.
+        These are merged last and can override typed options.
       '';
     };
+
+    # ── Per-model overrides ──────────────────────────────────
 
     perModelSettings = lib.mkOption {
       type = lib.types.attrsOf lib.types.attrs;
@@ -98,8 +160,16 @@ in
       '';
       description = ''
         Per-model config overrides written to per_model_config.json.
-        Keys are model tags, values are config attrsets.
+        Keys are model tags, values are config attrsets (snake_case keys).
       '';
+    };
+
+    # ── Runtime / service options ────────────────────────────
+
+    modelDir = lib.mkOption {
+      type = lib.types.str;
+      default = "/var/lib/hipfire/models";
+      description = "Directory containing model files.";
     };
 
     environment = lib.mkOption {

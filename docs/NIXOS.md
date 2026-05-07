@@ -4,7 +4,7 @@ hipfire has first-class NixOS support via a Nix flake.
 
 ## Prerequisites
 
-- NixOS 24.05+ or nixos-unstable
+- NixOS 25.11+ (or nixos-unstable)
 - AMD GPU with the `amdgpu` kernel module loaded
 - User in `video` and `render` groups (for non-service usage)
 
@@ -51,7 +51,7 @@ Add hipfire to your flake inputs and enable the service.
 # flake.nix
 {
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     hipfire.url = "github:Kaden-Schutt/hipfire";
   };
 
@@ -78,18 +78,18 @@ services.hipfire = {
   enable = true;
   gpuTargets = [ "gfx1100" ];
 
-  # Global config (written to config.json)
-  settings = {
-    temperature = 0.3;
-    top_p = 0.8;
-    max_tokens = 512;
-    kv_cache = "asym3";
-    dflash_mode = "auto";
-    idle_timeout = 300;
-    default_model = "qwen3.5:9b";
-  };
+  # Inference settings
+  defaultModel = "qwen3.5:9b";
+  temperature = 0.3;
+  topP = 0.8;
+  maxTokens = 512;
+  maxSeq = 32768;
+  repeatPenalty = 1.05;
+  kvCache = "asym3";
+  dflashMode = "auto";
+  idleTimeout = 300;
 
-  # Per-model overrides (written to per_model_config.json)
+  # Per-model overrides (snake_case keys — these map directly to config.json)
   perModelSettings = {
     "qwen3.5:27b" = {
       max_seq = 16384;
@@ -146,6 +146,29 @@ Build kernels for multiple arches:
 services.hipfire.gpuTargets = [ "gfx1100" "gfx1030" ];
 ```
 
+## Module Options Reference
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enable` | bool | `false` | Enable the hipfire service |
+| `gpuTargets` | list of str | `["gfx1100"]` | GPU architectures for kernel compilation |
+| `defaultModel` | str | `""` | Model to pre-warm on startup |
+| `temperature` | float | `0.3` | Sampling temperature |
+| `topP` | float | `0.8` | Nucleus sampling threshold |
+| `maxTokens` | int | `512` | Per-request token cap |
+| `maxSeq` | int | `32768` | KV cache capacity (tokens) |
+| `repeatPenalty` | float | `1.05` | Repetition penalty |
+| `kvCache` | str | `"auto"` | KV cache mode: auto/q8/asym4/asym3/asym2/turbo* |
+| `dflashMode` | enum | `"off"` | DFlash spec-decode: on/off/auto |
+| `idleTimeout` | int | `300` | Seconds before VRAM eviction (0 = never) |
+| `extraSettings` | attrs | `{}` | Additional config.json keys (snake_case) |
+| `perModelSettings` | attrs of attrs | `{}` | Per-model overrides (snake_case keys) |
+| `environment` | attrs of str | `{}` | Extra HIPFIRE_* env vars |
+| `modelDir` | str | `"/var/lib/hipfire/models"` | Model file directory |
+| `rocmSupport` | bool | `true` | Use nixpkgs ROCm libraries |
+| `userService` | bool | `false` | Run as user-level systemd service |
+| `port` | port | `11435` | API server port |
+
 ## ROCm Configuration
 
 ### Default: bundled nixpkgs ROCm
@@ -175,7 +198,7 @@ apply transparently.
 hipfire uses a layered config system. Precedence (lowest to highest):
 
 1. Engine defaults (hardcoded)
-2. `config.json` — set via `services.hipfire.settings`
+2. `config.json` — set via module options (`temperature`, `kvCache`, etc.)
 3. `per_model_config.json` — set via `services.hipfire.perModelSettings`
 4. Environment variables — set via `services.hipfire.environment`
 
