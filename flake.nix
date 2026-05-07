@@ -11,6 +11,7 @@
   };
 
   outputs = { self, nixpkgs, rust-overlay, flake-utils }:
+    let lib = nixpkgs.lib; in
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
@@ -18,6 +19,8 @@
 
         hipfire = pkgs.callPackage ./nix/package.nix {
           rocmSupport = true;
+          src = lib.cleanSource ./.;
+          cargoLockFile = ./Cargo.lock;
         };
 
         # Default target; override via services.hipfire.gpuTargets in NixOS module
@@ -42,6 +45,8 @@
       overlays.default = final: prev: {
         hipfire = final.callPackage ./nix/package.nix {
           rocmSupport = true;
+          src = lib.cleanSource ./.;
+          cargoLockFile = ./Cargo.lock;
         };
         hipfire-kernels = final.callPackage ./nix/kernels.nix {
           gpuTargets = [ "gfx1100" ];
