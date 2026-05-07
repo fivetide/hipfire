@@ -130,7 +130,7 @@ fn main() {
 
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
     eprintln!("Loading weights...");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("failed to load weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("failed to load weights");
 
     let kv_seq = 2048usize;
     let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
