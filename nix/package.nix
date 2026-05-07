@@ -41,7 +41,12 @@ rustPlatform.buildRustPackage {
     cp target/release/examples/daemon $out/bin/hipfire-daemon-unwrapped
     makeWrapper $out/bin/hipfire-daemon-unwrapped $out/bin/hipfire-daemon \
       ${lib.optionalString rocmSupport
-        "--prefix LD_LIBRARY_PATH : ${rocmPackages.clr}/lib"}
+        "--prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [
+          rocmPackages.clr
+          rocmPackages.rocm-runtime
+          rocmPackages.rocm-comgr
+          rocmPackages.rocprofiler-register
+        ]}"}
 
     # Install other binaries
     cp target/release/examples/infer $out/bin/hipfire-infer 2>/dev/null || true
@@ -65,7 +70,12 @@ rustPlatform.buildRustPackage {
       --add-flags "run $out/share/hipfire/cli/index.ts" \
       --set HIPFIRE_DAEMON_BIN $out/bin/hipfire-daemon \
       ${lib.optionalString rocmSupport
-        "--prefix LD_LIBRARY_PATH : ${rocmPackages.clr}/lib"}
+        "--prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [
+          rocmPackages.clr
+          rocmPackages.rocm-runtime
+          rocmPackages.rocm-comgr
+          rocmPackages.rocprofiler-register
+        ]}"}
 
     runHook postInstall
   '';

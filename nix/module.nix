@@ -47,8 +47,14 @@ let
 
   envList =
     (lib.mapAttrsToList (k: v: "${k}=${v}") cfg.environment)
+    ++ [ "HIPFIRE_MODELS_DIR=${cfg.modelDir}" ]
     ++ lib.optionals cfg.rocmSupport [
-      "LD_LIBRARY_PATH=${pkgs.rocmPackages.clr}/lib"
+      "LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [
+        pkgs.rocmPackages.clr
+        pkgs.rocmPackages.rocm-runtime
+        pkgs.rocmPackages.rocm-comgr
+        pkgs.rocmPackages.rocprofiler-register
+      ]}"
     ];
 in
 {
@@ -236,7 +242,10 @@ in
     modelDir = lib.mkOption {
       type = lib.types.str;
       default = "/var/lib/hipfire/models";
-      description = "Directory containing model files.";
+      description = ''
+        Directory containing model files (.mq4, .hfq6, etc.).
+        The CLI and daemon resolve models from this path via HIPFIRE_MODELS_DIR.
+      '';
     };
 
     environment = lib.mkOption {
@@ -283,6 +292,9 @@ in
         '';
       }];
     }
+
+    # Expose the CLI globally so `hipfire pull`, `hipfire diag`, etc. work
+    { environment.systemPackages = [ hipfirePkg ]; }
 
     # ── System service mode ──────────────────────────────────
     (lib.mkIf (!cfg.userService) {
