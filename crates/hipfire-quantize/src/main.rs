@@ -1312,6 +1312,90 @@ enum QuantType {
     MQ3G256Lloyd = 20, // MagnumQuant 3-bit + per-block Lloyd-Max 8-entry fp16 codebook (112 B/group)
 }
 
+/// Per-tensor precision level assigned by the K-map pre-pass.
+/// Determines whether a tensor gets the base format, a 6-bit promotion,
+/// Q8, or F16. See docs/superpowers/specs/2026-05-08-mixed-quant-kmap-design.md.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum QuantLevel {
+    /// Store as F16 (norms, biases, 1D tensors).
+    F16,
+    /// Store as Q8_F16 (embeddings, lm_head, MoE routers).
+    Q8,
+    /// Promote to 6-bit variant of the base format (edge layers, MoE expert FFN).
+    Promote6,
+    /// Use the base format as-is.
+    Base,
+}
+
+/// Extract layer index from a tensor name.
+/// Handles both safetensors (`layers.{N}.`) and GGUF (`blk.{N}.`) patterns.
+/// Uses unanchored search to handle any prefix (model.layers, model.language_model.layers, etc.).
+fn parse_layer_idx(name: &str) -> Option<usize> {
+    // Try safetensors pattern: "layers.{N}."
+    if let Some(pos) = name.find("layers.") {
+        let after = &name[pos + 7..]; // skip "layers."
+        if let Some(dot) = after.find('.') {
+            if let Ok(idx) = after[..dot].parse::<usize>() {
+                return Some(idx);
+            }
+        }
+    }
+    // Try GGUF pattern: "blk.{N}."
+    if let Some(pos) = name.find("blk.") {
+        let after = &name[pos + 4..]; // skip "blk."
+        if let Some(dot) = after.find('.') {
+            if let Ok(idx) = after[..dot].parse::<usize>() {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the quantization level for a tensor based on its name, the model's
+/// layer count, and whether the model is MoE. See spec for rule ordering.
+///
+/// Note: In the safetensors path, norms/biases are filtered by `should_quantize()`
+/// before this function is called. Rules 1-2 exist for the GGUF path and completeness.
+fn kmap_resolve(name: &str, n_layers: usize, is_moe: bool) -> QuantLevel {
+    // Rule 1: norms, biases, 1D (GGUF path mainly)
+    if name.contains("norm") || name.contains("bias") {
+        return QuantLevel::F16;
+    }
+
+    // Rule 2: embeddings, lm_head, output projection
+    if name.contains("embed_tokens") || name.contains("token_embd")
+        || name.contains("lm_head") || name.ends_with("output.weight")
+    {
+        return QuantLevel::Q8;
+    }
+
+    // Rule 3: MoE routers
+    if is_moe
+        && (name.ends_with("mlp.gate.weight")
+            || name.contains("shared_expert_gate"))
+    {
+        return QuantLevel::Q8;
+    }
+
+    // Rule 4: MoE expert FFN weights
+    if is_moe && name.contains("mlp.experts.") {
+        return QuantLevel::Promote6;
+    }
+
+    // Rule 5: edge layers (first 2 + last 2)
+    if n_layers > 0 {
+        if let Some(idx) = parse_layer_idx(name) {
+            if idx < 2 || idx >= n_layers.saturating_sub(2) {
+                return QuantLevel::Promote6;
+            }
+        }
+    }
+
+    // Rule 6: everything else
+    QuantLevel::Base
+}
+
 struct HfqTensor {
     name: String,
     quant_type: QuantType,
