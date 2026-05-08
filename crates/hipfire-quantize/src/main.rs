@@ -2376,8 +2376,10 @@ fn main() {
     }
 
     // Extract layer count for K-map edge-layer promotion.
+    // Qwen3.5+ nests config under "text_config"; try both paths.
     let n_layers: usize = config
         .get("num_hidden_layers")
+        .or_else(|| config.get("text_config").and_then(|tc| tc.get("num_hidden_layers")))
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
     if n_layers == 0 {
