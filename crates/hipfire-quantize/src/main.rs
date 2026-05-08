@@ -1666,12 +1666,30 @@ fn parse_layer_idx(name: &str) -> Option<usize> {
     None
 }
 
+/// llama.cpp-style alternating promotion: edge layers always promoted,
+/// middle layers promoted every `stride` layers. Returns true if the layer
+/// at `idx` should be promoted given `n_layers` total.
+fn is_positional_promote(idx: usize, n_layers: usize, stride: usize) -> bool {
+    if n_layers == 0 || stride == 0 { return false; }
+    // Edge layers: first 2 + last 2
+    if idx < 2 || idx >= n_layers.saturating_sub(2) { return true; }
+    // Middle: every `stride` layers, offset from first non-edge layer
+    (idx - 2) % stride == 0
+}
+
 /// Resolve the quantization level for a tensor based on its name, the model's
 /// layer count, and whether the model is MoE. See spec for rule ordering.
+///
+/// `kmap_mode`: 0 = default, 1 = alternating (ffn_down every 3rd middle layer),
+/// 2 = typed (promote ffn_down + attn_v everywhere, skip gate/up).
 ///
 /// Note: In the safetensors path, norms/biases are filtered by `should_quantize()`
 /// before this function is called. Rules 1-2 exist for the GGUF path and completeness.
 fn kmap_resolve(name: &str, n_layers: usize, is_moe: bool) -> QuantLevel {
+    kmap_resolve_mode(name, n_layers, is_moe, 0)
+}
+
+fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -> QuantLevel {
     // Rule 1: norms, biases, 1D (GGUF path mainly)
     if name.contains("norm") || name.contains("bias") {
         return QuantLevel::F16;
@@ -1694,10 +1712,54 @@ fn kmap_resolve(name: &str, n_layers: usize, is_moe: bool) -> QuantLevel {
 
     // Rule 4: MoE expert FFN weights
     if is_moe && name.contains("mlp.experts.") {
+        if kmap_mode == 1 {
+            // Alternating: promote expert groups only in positional layers
+            if let Some(idx) = parse_layer_idx(name) {
+                if is_positional_promote(idx, n_layers, 3) {
+                    return QuantLevel::Promote6;
+                }
+                return QuantLevel::Base;
+            }
+        }
         return QuantLevel::Promote6;
     }
 
-    // Rule 5: edge layers (first 2 + last 2)
+    // Mode 2 (typed): promote ffn_down and attn_v everywhere, skip gate/up
+    if kmap_mode == 2 {
+        let is_down = name.contains("down_proj") || name.contains("ffn_down");
+        let is_v = name.contains("v_proj") || name.contains("attn_v");
+        if is_down || is_v {
+            return QuantLevel::Promote6;
+        }
+        // Edge layers: promote everything
+        if n_layers > 0 {
+            if let Some(idx) = parse_layer_idx(name) {
+                if idx < 2 || idx >= n_layers.saturating_sub(2) {
+                    return QuantLevel::Promote6;
+                }
+            }
+        }
+        return QuantLevel::Base;
+    }
+
+    // Mode 1 (alternating): ffn_down in edge + every 3rd middle layer
+    if kmap_mode == 1 {
+        let is_down = name.contains("down_proj") || name.contains("ffn_down");
+        if n_layers > 0 {
+            if let Some(idx) = parse_layer_idx(name) {
+                if is_down && is_positional_promote(idx, n_layers, 3) {
+                    return QuantLevel::Promote6;
+                }
+                // Edge layers: all tensors (attn+FFN)
+                if idx < 2 || idx >= n_layers.saturating_sub(2) {
+                    return QuantLevel::Promote6;
+                }
+            }
+        }
+        return QuantLevel::Base;
+    }
+
+    // Rule 5 (default mode 0): edge layers (first 2 + last 2)
     if n_layers > 0 {
         if let Some(idx) = parse_layer_idx(name) {
             if idx < 2 || idx >= n_layers.saturating_sub(2) {
@@ -2332,7 +2394,7 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
         for info in &gguf.tensors {
             let out_name = gguf_to_safetensors_name(&info.name)
                 .unwrap_or_else(|| info.name.clone());
-            let level = kmap_resolve(&out_name, n_layers, is_moe);
+            let level = kmap_resolve_mode(&out_name, n_layers, is_moe, 0); // GGUF: default mode only
             match level {
                 QuantLevel::F16 => counts[0] += 1,
                 QuantLevel::Q8 => counts[1] += 1,
@@ -2570,6 +2632,19 @@ fn main() {
     // ppl_kmap_20260508.md). Maintainer directive 2026-05-08: "intends to
     // help ONLY (never on dense)" by default.
     let kmap_dense = args.iter().any(|a| a == "--kmap-dense");
+    // K-map mode: 0=default, 1=alternating (ffn_down every 3rd + edge), 2=typed (ffn_down+attn_v everywhere)
+    let kmap_mode: u8 = args.iter().position(|a| a == "--kmap-mode")
+        .and_then(|i| args.get(i + 1))
+        .map(|v| match v.as_str() {
+            "default" | "0" => 0,
+            "alternating" | "alt" | "1" => 1,
+            "typed" | "2" => 2,
+            _ => { eprintln!("warning: unknown --kmap-mode '{v}', using default"); 0 }
+        })
+        .unwrap_or(0);
+    if kmap_mode > 0 {
+        eprintln!("K-map mode: {}", match kmap_mode { 1 => "alternating", 2 => "typed", _ => "default" });
+    }
 
     // ── Adaptive cosim override (alternative to K-map) ──────────────────
     let adaptive = args.iter().any(|a| a == "--adaptive");
@@ -2712,12 +2787,13 @@ fn main() {
     if is_moe {
         eprintln!("  MoE detected — will split 3D expert tensors per-expert before quantization.");
     }
-    if adaptive && !no_kmap && (is_moe || kmap_dense) {
-        eprintln!("error: --adaptive and K-map are mutually exclusive. Use --no-kmap with --adaptive.");
-        std::process::exit(1);
-    }
+    let kmap_active = !no_kmap && (is_moe || kmap_dense);
     if adaptive {
-        eprintln!("Adaptive cosim: threshold={cosim_threshold}, max_promotions={max_promotions}");
+        if kmap_active {
+            eprintln!("Adaptive cosim + K-map: K-map defines promotion groups, adaptive gates activation (threshold={cosim_threshold})");
+        } else {
+            eprintln!("Adaptive cosim: threshold={cosim_threshold}, max_promotions={max_promotions}");
+        }
     }
 
     // Extract layer count for K-map edge-layer promotion.
@@ -2792,7 +2868,7 @@ fn main() {
         let mut map = HashMap::new();
         let mut counts = [0u32; 4]; // F16, Q8, Promote6, Base
         for (name, _fi) in &all_tensors {
-            let level = kmap_resolve(name, n_layers, is_moe);
+            let level = kmap_resolve_mode(name, n_layers, is_moe, kmap_mode);
             match level {
                 QuantLevel::F16 => counts[0] += 1,
                 QuantLevel::Q8 => counts[1] += 1,
@@ -2891,7 +2967,36 @@ fn main() {
             // (e.g. "...mlp.experts.gate_up_proj") contains "mlp.experts."
             // so kmap_resolve rule 4 matches it. The kmap HashMap was built
             // from all_tensors which has these parent names as keys.
-            let kmap_promote = kmap.get(*name) == Some(&QuantLevel::Promote6);
+            let kmap_promote_raw = kmap.get(*name) == Some(&QuantLevel::Promote6);
+            // When --adaptive gates K-map, probe the expert group before promoting.
+            // If all experts pass raw cosim threshold, skip promotion.
+            let kmap_promote = if kmap_promote_raw && adaptive && supports_g256 {
+                use rayon::prelude::*;
+                let fail_count = std::sync::atomic::AtomicU64::new(0);
+                (0..n_experts).into_par_iter().for_each(|x| {
+                    let slice_off = x * inner_bytes;
+                    let slice = &raw_data[slice_off..slice_off + inner_bytes];
+                    let f32_slice = to_f32(slice, &meta.dtype);
+                    let q = quantize_hfq4g256(&f32_slice);
+                    let d = dequant_hfq4g256(&q, f32_slice.len());
+                    let cs = cosine_similarity(&f32_slice, &d);
+                    if cs < cosim_threshold {
+                        fail_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                });
+                let n_fail = fail_count.load(std::sync::atomic::Ordering::Relaxed);
+                adaptive_total += 1;
+                if n_fail > 0 {
+                    adaptive_promoted += 1;
+                    eprintln!("  PROMOTE: {parent}{{..}}.{base_name}.weight: {n_fail}/{n_experts} experts below cosim — promoting group");
+                    true
+                } else {
+                    eprintln!("  SKIP:    {parent}{{..}}.{base_name}.weight: all {n_experts} experts pass cosim — keeping base");
+                    false
+                }
+            } else {
+                kmap_promote_raw
+            };
             let expert_mq6 = (use_mq6g256 || use_mq4_mq6exp || (kmap_promote && use_mq4g256)) && supports_g256;
             let expert_hfq6 = (use_hfq6 || (kmap_promote && use_hfq4g256)) && supports_g256;
             let expert_hfq4 = use_hfq4g256 && !kmap_promote && supports_g256;
@@ -2904,7 +3009,7 @@ fn main() {
             let parent_owned = parent.to_string();
             let inner_shape_clone = inner_shape.clone();
             let base_owned = base_name.to_string();
-            let expert_adaptive = adaptive && !kmap_promote && supports_g256;
+            let expert_adaptive = adaptive && !kmap_promote && !kmap_promote_raw && supports_g256;
             let expert_base_fmt = if use_mq4g256 || use_mq4_mq6exp { "mq4" }
                 else if use_mq3g256 { "mq3" }
                 else if use_mq2g256 { "mq2" }
@@ -3063,9 +3168,41 @@ fn main() {
                     .collect();
                 (f16_bytes, QuantType::F16, 0u32, "F16")
             } else if kmap_level == QuantLevel::Promote6 {
-                // K-map says promote to 6-bit
+                // K-map says promote to 6-bit.
+                // When --adaptive is active, gate by raw cosim: only promote if
+                // the tensor's raw HFQ4 cosim is below threshold. This avoids
+                // promoting tensors that quantize well enough at the base level.
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if (use_mq4g256 || use_mq4_mq6exp || use_mq3g256 || use_mq2g256
+                let skip_promote = adaptive && k_dim % 256 == 0 && {
+                    let probe_q = quantize_hfq4g256(&f32_data);
+                    let probe_d = dequant_hfq4g256(&probe_q, n_elements);
+                    let cs = cosine_similarity(&f32_data, &probe_d);
+                    adaptive_total += 1;
+                    if cs >= cosim_threshold {
+                        true // cosim OK — skip promotion
+                    } else {
+                        adaptive_promoted += 1;
+                        eprintln!("  PROMOTE: {} (cosim={:.6} < {:.4})", name, cs, cosim_threshold);
+                        false // cosim bad — promote
+                    }
+                };
+                if skip_promote {
+                    // Fall through to base-level quantization
+                    let is_mq = use_mq4g256 || use_mq4_mq6exp || use_mq3g256 || use_mq2g256
+                        || use_mq2g256_lloyd || use_mq3g256_lloyd || use_mq6g256;
+                    if is_mq && k_dim % 256 == 0 {
+                        let signs1 = gen_fwht_signs(42, 256);
+                        let signs2 = gen_fwht_signs(1042, 256);
+                        let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                        (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                    } else if k_dim % 256 == 0 {
+                        let q = quantize_hfq4g256(&f32_data);
+                        (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
+                    } else {
+                        let q = quantize_hfq4g128(&f32_data);
+                        (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                    }
+                } else if (use_mq4g256 || use_mq4_mq6exp || use_mq3g256 || use_mq2g256
                     || use_mq2g256_lloyd || use_mq3g256_lloyd) && k_dim % 256 == 0
                 {
                     let signs1 = gen_fwht_signs(42, 256);
@@ -3078,17 +3215,14 @@ fn main() {
                     let q = quantize_hfq6g256(&f32_data);
                     (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
                 } else if use_mq6g256 && k_dim % 256 == 0 {
-                    // Already 6-bit MQ — no-op promotion
                     let signs1 = gen_fwht_signs(42, 256);
                     let signs2 = gen_fwht_signs(1042, 256);
                     let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ6G256, 256u32, "MQ6G256")
                 } else if use_hfq6 && k_dim % 256 == 0 {
-                    // Already 6-bit HFQ — no-op promotion
                     let q = quantize_hfq6g256(&f32_data);
                     (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
                 } else {
-                    // Non-256-aligned fallback: Q8
                     let q = quantize_q8f16(&f32_data);
                     (q, QuantType::Q8F16, 32u32, "Q8_F16")
                 }
