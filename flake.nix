@@ -23,9 +23,13 @@
           cargoLockFile = ./Cargo.lock;
         };
 
-        # Default target; override via services.hipfire.gpuTargets in NixOS module
+        # Default to no precompiled kernels — daemon JIT-compiles on first
+        # use. Override via `services.hipfire.gpuTargets` in NixOS module
+        # (e.g. `lib.mkForce [ "gfx1010" ]`) or pass an override to
+        # `hipfire-kernels` in your own flake. Empty default avoids the
+        # silent footgun where 5700-XT users build gfx1100 kernels.
         hipfire-kernels = pkgs.callPackage ./nix/kernels.nix {
-          gpuTargets = [ "gfx1100" ];
+          gpuTargets = [];
         };
       in
       {
@@ -49,7 +53,7 @@
           cargoLockFile = ./Cargo.lock;
         };
         hipfire-kernels = final.callPackage ./nix/kernels.nix {
-          gpuTargets = [ "gfx1100" ];
+          gpuTargets = [];  # JIT by default; override per-host
         };
       };
     };

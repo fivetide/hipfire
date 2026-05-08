@@ -1,7 +1,7 @@
 { lib
 , stdenv
 , rocmPackages
-, gpuTargets ? [ "gfx1100" ]
+, gpuTargets ? []
 }:
 
 let
