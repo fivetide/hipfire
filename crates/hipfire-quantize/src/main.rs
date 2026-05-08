@@ -2476,9 +2476,14 @@ fn main() {
             let signs2 = gen_fwht_signs(1042, 256);
             let inner_k = inner_shape[1] as usize;
             let supports_g256 = inner_k % 256 == 0;
-            let expert_mq6 = (use_mq6g256 || use_mq4_mq6exp) && supports_g256;
-            let expert_hfq6 = use_hfq6 && supports_g256;
-            let expert_hfq4 = use_hfq4g256 && supports_g256;
+            // K-map: check if any child expert tensor is Promote6. Use the
+            // first child name as representative (all experts in the same
+            // parent get the same K-map level from rule 4).
+            let child_name = format!("{parent}0.{base_name}.weight");
+            let kmap_promote = kmap.get(&child_name) == Some(&QuantLevel::Promote6);
+            let expert_mq6 = (use_mq6g256 || use_mq4_mq6exp || (kmap_promote && use_mq4g256)) && supports_g256;
+            let expert_hfq6 = (use_hfq6 || (kmap_promote && use_hfq4g256)) && supports_g256;
+            let expert_hfq4 = use_hfq4g256 && !kmap_promote && supports_g256;
 
             // Parallelize across the 256 expert slices via rayon. Each slice
             // dequant→FWHT→quant→pack is a CPU-bound, self-contained job.
