@@ -2174,12 +2174,20 @@ fn main() {
     // Mixed: MQ4 for attention/shared-expert + MQ6 for routed experts only.
     // Saves ~15 GB vs full MQ6 on 122B-A10B (75 GB vs 90 GB), fits in 125 GB UMA.
     let use_mq4_mq6exp = format == "mq4-mq6exp" || format == "mq4-mq6experts";
+    if use_mq4_mq6exp {
+        eprintln!(
+            "warning: --format mq4-mq6exp is deprecated. Use --format mq4 instead — \
+             K-map promotes expert FFNs (and edge layers) to MQ6 automatically. \
+             Proceeding as --format mq4."
+        );
+    }
     let use_mq3g256 = format == "mq3" || format == "mq3g256";
     let use_mq2g256 = format == "mq2" || format == "mq2g256";
     let use_mq2g256_lloyd = format == "mq2-lloyd" || format == "mq2g256-lloyd" || format == "mq2lloyd";
     let use_mq3g256_lloyd = format == "mq3-lloyd" || format == "mq3g256-lloyd" || format == "mq3lloyd";
     let use_hfq6 = format == "hfq6" || format == "hfq6g256" || format == "hf6";
     let q8_router_flag = args.iter().any(|a| a == "--q8-router");
+    let no_kmap = args.iter().any(|a| a == "--no-kmap" || a == "--uniform");
 
     // ── Sub-4-bit guards (2026-04-30 sweep) ─────────────────────────────
     // MQ2 with the current uniform 4-level codebook collapses at every
@@ -2312,6 +2320,15 @@ fn main() {
         eprintln!("  MoE detected — will split 3D expert tensors per-expert before quantization.");
     }
 
+    // Extract layer count for K-map edge-layer promotion.
+    let n_layers: usize = config
+        .get("num_hidden_layers")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    if n_layers == 0 {
+        eprintln!("  warning: num_hidden_layers not found in config.json — edge-layer promotion disabled");
+    }
+
     // Read tokenizer if present
     let tokenizer_json = input_dir.join("tokenizer.json");
     let tokenizer_str = if tokenizer_json.exists() {
@@ -2357,6 +2374,34 @@ fn main() {
     }
     all_tensors.sort_by_key(|(name, _)| name.to_string());
     eprintln!("Found {} tensors", all_tensors.len());
+
+    // ── K-map pre-pass ──────────────────────────────────────────────────────
+    // Build per-tensor quant level map. Default on; --no-kmap disables.
+    let kmap: HashMap<String, QuantLevel> = if no_kmap {
+        HashMap::new()
+    } else {
+        let mut map = HashMap::new();
+        let mut counts = [0u32; 4]; // F16, Q8, Promote6, Base
+        for (name, _fi) in &all_tensors {
+            let level = kmap_resolve(name, n_layers, is_moe);
+            match level {
+                QuantLevel::F16 => counts[0] += 1,
+                QuantLevel::Q8 => counts[1] += 1,
+                QuantLevel::Promote6 => counts[2] += 1,
+                QuantLevel::Base => counts[3] += 1,
+            }
+            map.insert(name.to_string(), level);
+        }
+        if !map.is_empty() {
+            eprintln!("K-map plan ({format} base, {n_layers} layers{}):",
+                if is_moe { ", MoE" } else { "" });
+            eprintln!("  F16:       {:>4} tensors (norms, biases)", counts[0]);
+            eprintln!("  Q8:        {:>4} tensors (embed, lm_head, routers)", counts[1]);
+            eprintln!("  Promote6:  {:>4} tensors", counts[2]);
+            eprintln!("  Base:      {:>4} tensors (remaining)", counts[3]);
+        }
+        map
+    };
 
     // Quantize
     let mut hfq_tensors = Vec::new();
