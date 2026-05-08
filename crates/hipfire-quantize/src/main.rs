@@ -2633,18 +2633,19 @@ fn main() {
     // help ONLY (never on dense)" by default.
     let kmap_dense = args.iter().any(|a| a == "--kmap-dense");
     // K-map mode: 0=default, 1=alternating (ffn_down every 3rd + edge), 2=typed (ffn_down+attn_v everywhere)
+    // K-map mode: 0=full (all candidates promoted), 1=alternating (edge + every 3rd),
+    // 2=typed (ffn_down+attn_v everywhere). Default: alternating — same PPL as full
+    // at 17% less model size on MoE (22.9 vs 27.7 GB, PPL 8K: 19.96 vs 20.07).
     let kmap_mode: u8 = args.iter().position(|a| a == "--kmap-mode")
         .and_then(|i| args.get(i + 1))
         .map(|v| match v.as_str() {
-            "default" | "0" => 0,
+            "full" | "0" => 0,
             "alternating" | "alt" | "1" => 1,
             "typed" | "2" => 2,
-            _ => { eprintln!("warning: unknown --kmap-mode '{v}', using default"); 0 }
+            _ => { eprintln!("warning: unknown --kmap-mode '{v}', using alternating"); 1 }
         })
-        .unwrap_or(0);
-    if kmap_mode > 0 {
-        eprintln!("K-map mode: {}", match kmap_mode { 1 => "alternating", 2 => "typed", _ => "default" });
-    }
+        .unwrap_or(1);
+    eprintln!("K-map mode: {}", match kmap_mode { 0 => "full", 1 => "alternating", 2 => "typed", _ => "unknown" });
 
     // ── Adaptive cosim override (alternative to K-map) ──────────────────
     let adaptive = args.iter().any(|a| a == "--adaptive");
