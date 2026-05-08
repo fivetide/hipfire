@@ -1424,6 +1424,14 @@ struct AdaptiveResult {
 ///
 /// `base_format` is one of: "mq2", "mq3", "mq4", "hfq2", "hfq3", "hfq4".
 /// Only call this for tensors with k_dim % 256 == 0 (G256 formats).
+///
+/// **Cosim probe strategy:** For MQ formats (FWHT-rotated), cosim is measured
+/// using the equivalent HFQ (non-rotated) quant/dequant at each bit level.
+/// FWHT normalizes quantization error so uniformly that post-rotation cosim
+/// has zero per-tensor variance (~0.99967 for every tensor). By probing on
+/// raw weights without rotation, we see the actual per-tensor difficulty —
+/// tensors with outliers or heavy-tailed distributions get low raw cosim and
+/// are promoted, even though FWHT would mask the problem at runtime.
 fn try_adaptive_promote(
     f32_data: &[f32],
     base_format: &str,
@@ -1433,146 +1441,149 @@ fn try_adaptive_promote(
     signs2: &[f32],
 ) -> AdaptiveResult {
     let n = f32_data.len();
+    let is_mq = base_format.starts_with("mq");
 
     // Define the promotion ladder per base format.
-    // Each entry: (quantize_fn, dequant_fn, QuantType, group_size, label)
-    let ladder: Vec<(
-        Box<dyn Fn(&[f32]) -> Vec<u8>>,
-        Box<dyn Fn(&[u8], usize) -> Vec<f32>>,
-        QuantType,
-        u32,
-        &'static str,
-    )> = match base_format {
+    // Each entry: (quantize_fn, QuantType, group_size, label, probe_bits)
+    // probe_bits: the HFQ bit-equivalent used for cosim probing.
+    struct Rung {
+        quantize: Box<dyn Fn(&[f32]) -> Vec<u8>>,
+        qt: QuantType,
+        gs: u32,
+        label: &'static str,
+        probe_bits: u8, // 2, 3, 4, 6, or 8 (8 = terminal, skip cosim)
+    }
+
+    let ladder: Vec<Rung> = match base_format {
         "mq2" => {
             let s1a = signs1.to_vec(); let s2a = signs2.to_vec();
             let s1b = signs1.to_vec(); let s2b = signs2.to_vec();
             let s1c = signs1.to_vec(); let s2c = signs2.to_vec();
             let s1d = signs1.to_vec(); let s2d = signs2.to_vec();
-            let s1e = signs1.to_vec(); let s2e = signs2.to_vec();
-            let s1f = signs1.to_vec(); let s2f = signs2.to_vec();
             vec![
-                (Box::new(move |d: &[f32]| quantize_mq2g256(d, &s1a, &s2a)),
-                 Box::new(|_d: &[u8], _n: usize| vec![0.0f32; 0]), // no dequant for mq2 yet — will fail cosim
-                 QuantType::MQ2G256, 256, "MQ2G256"),
-                (Box::new(move |d: &[f32]| quantize_mq3g256(d, &s1b, &s2b)),
-                 Box::new(|_d: &[u8], _n: usize| vec![0.0f32; 0]),
-                 QuantType::MQ3G256, 256, "MQ3G256"),
-                (Box::new(move |d: &[f32]| quantize_mq4g256(d, &s1c, &s2c)),
-                 Box::new(move |d: &[u8], n: usize| dequant_mq4g256(d, n, &s1d, &s2d)),
-                 QuantType::MQ4G256, 256, "MQ4G256"),
-                (Box::new(move |d: &[f32]| quantize_mq6g256(d, &s1e, &s2e)),
-                 Box::new(move |d: &[u8], n: usize| dequant_mq6g256(d, n, &s1f, &s2f)),
-                 QuantType::MQ6G256, 256, "MQ6G256"),
+                Rung { quantize: Box::new(move |d: &[f32]| quantize_mq2g256(d, &s1a, &s2a)),
+                       qt: QuantType::MQ2G256, gs: 256, label: "MQ2G256", probe_bits: 2 },
+                Rung { quantize: Box::new(move |d: &[f32]| quantize_mq3g256(d, &s1b, &s2b)),
+                       qt: QuantType::MQ3G256, gs: 256, label: "MQ3G256", probe_bits: 3 },
+                Rung { quantize: Box::new(move |d: &[f32]| quantize_mq4g256(d, &s1c, &s2c)),
+                       qt: QuantType::MQ4G256, gs: 256, label: "MQ4G256", probe_bits: 4 },
+                Rung { quantize: Box::new(move |d: &[f32]| quantize_mq6g256(d, &s1d, &s2d)),
+                       qt: QuantType::MQ6G256, gs: 256, label: "MQ6G256", probe_bits: 6 },
             ]
         }
         "mq3" => {
             let s1a = signs1.to_vec(); let s2a = signs2.to_vec();
             let s1b = signs1.to_vec(); let s2b = signs2.to_vec();
             let s1c = signs1.to_vec(); let s2c = signs2.to_vec();
-            let s1d = signs1.to_vec(); let s2d = signs2.to_vec();
             vec![
-                (Box::new(move |d: &[f32]| quantize_mq3g256(d, &s1a, &s2a)),
-                 Box::new(|_d: &[u8], _n: usize| vec![0.0f32; 0]),
-                 QuantType::MQ3G256, 256, "MQ3G256"),
-                (Box::new(move |d: &[f32]| quantize_mq4g256(d, &s1b, &s2b)),
-                 Box::new(move |d: &[u8], n: usize| dequant_mq4g256(d, n, &s1c, &s2c)),
-                 QuantType::MQ4G256, 256, "MQ4G256"),
-                (Box::new(move |d: &[f32]| quantize_mq6g256(d, &s1d, &s2d)),
-                 Box::new(|_d: &[u8], _n: usize| vec![0.0f32; 0]),
-                 QuantType::MQ6G256, 256, "MQ6G256"),
+                Rung { quantize: Box::new(move |d: &[f32]| quantize_mq3g256(d, &s1a, &s2a)),
+                       qt: QuantType::MQ3G256, gs: 256, label: "MQ3G256", probe_bits: 3 },
+                Rung { quantize: Box::new(move |d: &[f32]| quantize_mq4g256(d, &s1b, &s2b)),
+                       qt: QuantType::MQ4G256, gs: 256, label: "MQ4G256", probe_bits: 4 },
+                Rung { quantize: Box::new(move |d: &[f32]| quantize_mq6g256(d, &s1c, &s2c)),
+                       qt: QuantType::MQ6G256, gs: 256, label: "MQ6G256", probe_bits: 6 },
             ]
         }
         "mq4" => {
             let s1a = signs1.to_vec(); let s2a = signs2.to_vec();
             let s1b = signs1.to_vec(); let s2b = signs2.to_vec();
-            let s1c = signs1.to_vec(); let s2c = signs2.to_vec();
-            let s1d = signs1.to_vec(); let s2d = signs2.to_vec();
             vec![
-                (Box::new(move |d: &[f32]| quantize_mq4g256(d, &s1a, &s2a)),
-                 Box::new(move |d: &[u8], n: usize| dequant_mq4g256(d, n, &s1b, &s2b)),
-                 QuantType::MQ4G256, 256, "MQ4G256"),
-                (Box::new(move |d: &[f32]| quantize_mq6g256(d, &s1c, &s2c)),
-                 Box::new(move |d: &[u8], n: usize| dequant_mq6g256(d, n, &s1d, &s2d)),
-                 QuantType::MQ6G256, 256, "MQ6G256"),
-                (Box::new(|d: &[f32]| quantize_q8f16(d)),
-                 Box::new(|_d: &[u8], _n: usize| vec![0.0f32; 0]), // Q8 is terminal — no dequant needed
-                 QuantType::Q8F16, 32, "Q8_F16"),
+                Rung { quantize: Box::new(move |d: &[f32]| quantize_mq4g256(d, &s1a, &s2a)),
+                       qt: QuantType::MQ4G256, gs: 256, label: "MQ4G256", probe_bits: 4 },
+                Rung { quantize: Box::new(move |d: &[f32]| quantize_mq6g256(d, &s1b, &s2b)),
+                       qt: QuantType::MQ6G256, gs: 256, label: "MQ6G256", probe_bits: 6 },
+                Rung { quantize: Box::new(|d: &[f32]| quantize_q8f16(d)),
+                       qt: QuantType::Q8F16, gs: 32, label: "Q8_F16", probe_bits: 8 },
             ]
         }
         "hfq2" => vec![
-            (Box::new(|d: &[f32]| quantize_hfq2g256(d)),
-             Box::new(|_d: &[u8], _n: usize| vec![0.0f32; 0]),
-             QuantType::HFQ2G256, 256, "HFQ2G256"),
-            (Box::new(|d: &[f32]| quantize_hfq3g256(d)),
-             Box::new(|_d: &[u8], _n: usize| vec![0.0f32; 0]),
-             QuantType::HFQ3G256, 256, "HFQ3G256"),
-            (Box::new(|d: &[f32]| quantize_hfq4g256(d)),
-             Box::new(|d: &[u8], n: usize| dequant_hfq4g256(d, n)),
-             QuantType::HFQ4G256, 256, "HFQ4G256"),
-            (Box::new(|d: &[f32]| quantize_hfq6g256(d)),
-             Box::new(|d: &[u8], n: usize| dequant_hfq6g256(d, n)),
-             QuantType::HFQ6G256, 256, "HFQ6G256"),
+            Rung { quantize: Box::new(|d: &[f32]| quantize_hfq2g256(d)),
+                   qt: QuantType::HFQ2G256, gs: 256, label: "HFQ2G256", probe_bits: 2 },
+            Rung { quantize: Box::new(|d: &[f32]| quantize_hfq3g256(d)),
+                   qt: QuantType::HFQ3G256, gs: 256, label: "HFQ3G256", probe_bits: 3 },
+            Rung { quantize: Box::new(|d: &[f32]| quantize_hfq4g256(d)),
+                   qt: QuantType::HFQ4G256, gs: 256, label: "HFQ4G256", probe_bits: 4 },
+            Rung { quantize: Box::new(|d: &[f32]| quantize_hfq6g256(d)),
+                   qt: QuantType::HFQ6G256, gs: 256, label: "HFQ6G256", probe_bits: 6 },
         ],
         "hfq3" => vec![
-            (Box::new(|d: &[f32]| quantize_hfq3g256(d)),
-             Box::new(|_d: &[u8], _n: usize| vec![0.0f32; 0]),
-             QuantType::HFQ3G256, 256, "HFQ3G256"),
-            (Box::new(|d: &[f32]| quantize_hfq4g256(d)),
-             Box::new(|d: &[u8], n: usize| dequant_hfq4g256(d, n)),
-             QuantType::HFQ4G256, 256, "HFQ4G256"),
-            (Box::new(|d: &[f32]| quantize_hfq6g256(d)),
-             Box::new(|d: &[u8], n: usize| dequant_hfq6g256(d, n)),
-             QuantType::HFQ6G256, 256, "HFQ6G256"),
+            Rung { quantize: Box::new(|d: &[f32]| quantize_hfq3g256(d)),
+                   qt: QuantType::HFQ3G256, gs: 256, label: "HFQ3G256", probe_bits: 3 },
+            Rung { quantize: Box::new(|d: &[f32]| quantize_hfq4g256(d)),
+                   qt: QuantType::HFQ4G256, gs: 256, label: "HFQ4G256", probe_bits: 4 },
+            Rung { quantize: Box::new(|d: &[f32]| quantize_hfq6g256(d)),
+                   qt: QuantType::HFQ6G256, gs: 256, label: "HFQ6G256", probe_bits: 6 },
         ],
         "hfq4" => vec![
-            (Box::new(|d: &[f32]| quantize_hfq4g256(d)),
-             Box::new(|d: &[u8], n: usize| dequant_hfq4g256(d, n)),
-             QuantType::HFQ4G256, 256, "HFQ4G256"),
-            (Box::new(|d: &[f32]| quantize_hfq6g256(d)),
-             Box::new(|d: &[u8], n: usize| dequant_hfq6g256(d, n)),
-             QuantType::HFQ6G256, 256, "HFQ6G256"),
-            (Box::new(|d: &[f32]| quantize_q8f16(d)),
-             Box::new(|_d: &[u8], _n: usize| vec![0.0f32; 0]),
-             QuantType::Q8F16, 32, "Q8_F16"),
+            Rung { quantize: Box::new(|d: &[f32]| quantize_hfq4g256(d)),
+                   qt: QuantType::HFQ4G256, gs: 256, label: "HFQ4G256", probe_bits: 4 },
+            Rung { quantize: Box::new(|d: &[f32]| quantize_hfq6g256(d)),
+                   qt: QuantType::HFQ6G256, gs: 256, label: "HFQ6G256", probe_bits: 6 },
+            Rung { quantize: Box::new(|d: &[f32]| quantize_q8f16(d)),
+                   qt: QuantType::Q8F16, gs: 32, label: "Q8_F16", probe_bits: 8 },
         ],
         _ => panic!("unsupported base format for adaptive: {base_format}"),
     };
 
     let mut best_data = Vec::new();
-    let mut best_qt = ladder[0].2;
-    let mut best_gs = ladder[0].3;
-    let mut best_label = ladder[0].4;
+    let mut best_qt = ladder[0].qt;
+    let mut best_gs = ladder[0].gs;
+    let mut best_label = ladder[0].label;
     let mut best_cosim = 0.0f64;
     let mut promotions = 0usize;
 
-    // Walk the ladder: base level + up to max_promotions steps
-    let max_idx = (1 + max_promotions).min(ladder.len());
-    for (i, (quantize_fn, dequant_fn, qt, gs, label)) in ladder.iter().enumerate() {
-        if i >= max_idx { break; }
-        let quantized = quantize_fn(f32_data);
-        best_data = quantized;
-        best_qt = *qt;
-        best_gs = *gs;
-        best_label = label;
-        promotions = i;
+    // Probe cosim at the BASE level only (rung 0), using raw (non-rotated)
+    // HFQ quant/dequant. If cosim >= threshold, keep base level. Otherwise,
+    // promote up to max_promotions steps without re-probing — the raw probe
+    // measures weight-distribution difficulty, not per-format quality, so
+    // re-checking at MQ6 would give misleading results.
+    let base_rung = &ladder[0];
+    let base_cosim = if is_mq {
+        match base_rung.probe_bits {
+            4 => {
+                let q = quantize_hfq4g256(f32_data);
+                let d = dequant_hfq4g256(&q, n);
+                cosine_similarity(f32_data, &d)
+            }
+            6 => {
+                let q = quantize_hfq6g256(f32_data);
+                let d = dequant_hfq6g256(&q, n);
+                cosine_similarity(f32_data, &d)
+            }
+            _ => 0.0, // sub-4-bit: promote unconditionally
+        }
+    } else {
+        // HFQ formats: quantize and dequant directly
+        let q = (base_rung.quantize)(f32_data);
+        match base_rung.probe_bits {
+            4 => {
+                let d = dequant_hfq4g256(&q, n);
+                cosine_similarity(f32_data, &d)
+            }
+            6 => {
+                let d = dequant_hfq6g256(&q, n);
+                cosine_similarity(f32_data, &d)
+            }
+            _ => 0.0,
+        }
+    };
 
-        // Terminal level (Q8) — no dequant needed, accept unconditionally
-        if *qt == QuantType::Q8F16 {
-            best_cosim = 1.0;
-            break;
-        }
-
-        let reconstructed = dequant_fn(&best_data, n);
-        if reconstructed.is_empty() {
-            // No dequant available for this level — promote unconditionally
-            continue;
-        }
-        let cs = cosine_similarity(f32_data, &reconstructed);
-        best_cosim = cs;
-        if cs >= threshold {
-            break;
-        }
-    }
+    let need_promote = base_cosim < threshold;
+    // Pick the target rung: base (0) if cosim passes, else promote by 1 step.
+    // max_promotions caps how far up we go (default 2, but practically 1 is
+    // the sweet spot since the probe only measures base-level difficulty).
+    let target_idx = if need_promote {
+        (1usize).min(max_promotions).min(ladder.len() - 1)
+    } else {
+        0
+    };
+    let rung = &ladder[target_idx];
+    best_data = (rung.quantize)(f32_data);
+    best_qt = rung.qt;
+    best_gs = rung.gs;
+    best_label = rung.label;
+    best_cosim = base_cosim;
+    promotions = target_idx;
 
     AdaptiveResult {
         data: best_data,
@@ -2565,7 +2576,7 @@ fn main() {
     let cosim_threshold: f64 = args.iter().position(|a| a == "--cosim-threshold")
         .and_then(|i| args.get(i + 1))
         .and_then(|v| v.parse().ok())
-        .unwrap_or(0.9995);
+        .unwrap_or(0.995);
     let max_promotions: usize = args.iter().position(|a| a == "--max-promotions")
         .and_then(|i| args.get(i + 1))
         .and_then(|v| v.parse().ok())
@@ -2901,29 +2912,60 @@ fn main() {
                 else if use_hfq3g256 { "hfq3" }
                 else if use_hfq2g256 { "hfq2" }
                 else { "" };
-            let expert_promote_count = std::sync::atomic::AtomicU64::new(0);
+            // Adaptive expert strategy: probe ALL experts with raw cosim,
+            // if ANY fail the threshold, promote the ENTIRE group to MQ6.
+            // Mixed quant types within an expert group are not supported by
+            // the runtime (all slices share one QuantType in the HFQ index).
+            let is_mq_expert = expert_base_fmt.starts_with("mq");
+            let expert_promote_group = if expert_adaptive && !expert_base_fmt.is_empty() {
+                use rayon::prelude::*;
+                let fail_count = std::sync::atomic::AtomicU64::new(0);
+                (0..n_experts).into_par_iter().for_each(|x| {
+                    let slice_off = x * inner_bytes;
+                    let slice = &raw_data[slice_off..slice_off + inner_bytes];
+                    let f32_slice = to_f32(slice, &dtype);
+                    // Probe with HFQ4 (no rotation) to see raw weight difficulty
+                    let cs = if is_mq_expert {
+                        let q = quantize_hfq4g256(&f32_slice);
+                        let d = dequant_hfq4g256(&q, f32_slice.len());
+                        cosine_similarity(&f32_slice, &d)
+                    } else {
+                        let q = quantize_hfq4g256(&f32_slice);
+                        let d = dequant_hfq4g256(&q, f32_slice.len());
+                        cosine_similarity(&f32_slice, &d)
+                    };
+                    if cs < cosim_threshold {
+                        fail_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                });
+                let n_fail = fail_count.load(std::sync::atomic::Ordering::Relaxed);
+                if n_fail > 0 {
+                    eprintln!("  PROMOTE: {parent_owned}{{..}}.{base_owned}.weight: {n_fail}/{n_experts} experts below cosim threshold — promoting entire group");
+                    adaptive_promoted += 1; // count as 1 group promotion
+                }
+                adaptive_total += 1; // 1 group
+                n_fail > 0
+            } else {
+                false
+            };
             let mut new_tensors: Vec<HfqTensor> = (0..n_experts).into_par_iter().map(|x| {
                 let slice_off = x * inner_bytes;
                 let slice = &raw_data[slice_off..slice_off + inner_bytes];
                 let f32_slice = to_f32(slice, &dtype);
-                let (quantized, qt, gs) = if expert_mq6 {
-                    let q = quantize_mq6g256(&f32_slice, &signs1, &signs2);
-                    (q, QuantType::MQ6G256, 256u32)
+                let (quantized, qt, gs) = if expert_mq6 || expert_promote_group {
+                    if is_mq_expert || expert_mq6 {
+                        let q = quantize_mq6g256(&f32_slice, &signs1, &signs2);
+                        (q, QuantType::MQ6G256, 256u32)
+                    } else {
+                        let q = quantize_hfq6g256(&f32_slice);
+                        (q, QuantType::HFQ6G256, 256u32)
+                    }
                 } else if expert_hfq6 {
                     let q = quantize_hfq6g256(&f32_slice);
                     (q, QuantType::HFQ6G256, 256u32)
                 } else if expert_hfq4 {
                     let q = quantize_hfq4g256(&f32_slice);
                     (q, QuantType::HFQ4G256, 256u32)
-                } else if expert_adaptive && !expert_base_fmt.is_empty() {
-                    let ar = try_adaptive_promote(
-                        &f32_slice, expert_base_fmt, cosim_threshold, max_promotions,
-                        &signs1, &signs2,
-                    );
-                    if ar.promotions > 0 {
-                        expert_promote_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    (ar.data, ar.quant_type, ar.group_size)
                 } else if supports_g256 {
                     let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                     (q, QuantType::MQ4G256, 256u32)
@@ -2940,14 +2982,6 @@ fn main() {
                     spilled_len: 0,
                 }
             }).collect();
-            let n_expert_promoted = expert_promote_count.load(std::sync::atomic::Ordering::Relaxed);
-            if expert_adaptive && n_expert_promoted > 0 {
-                eprintln!("  PROMOTE: {parent_owned}{{..}}.{base_owned}.weight: {n_expert_promoted}/{n_experts} experts promoted");
-                adaptive_promoted += n_expert_promoted;
-            }
-            if expert_adaptive {
-                adaptive_total += n_experts as u64;
-            }
             quantized_params += inner_n as u64 * n_experts as u64;
             // Single eprintln to summarize the whole expert sweep.
             let label = if expert_mq6 { "MQ6G256" } else if expert_hfq6 { "HFQ6G256" } else if expert_hfq4 { "HFQ4G256" } else if supports_g256 { "MQ4G256" } else { "HFQ4G128" };
@@ -3732,16 +3766,16 @@ mod tests {
     fn adaptive_promotes_when_threshold_above_base_cosim() {
         let signs1 = gen_fwht_signs(42, 256);
         let signs2 = gen_fwht_signs(1042, 256);
-        // Generate data, quantize at MQ4, measure its actual cosim, then set
-        // threshold just above that to force promotion.
+        // Probe uses HFQ4 (no rotation) cosim. Measure that directly,
+        // then set threshold just above to force promotion.
         let data: Vec<f32> = (0..256).map(|i| (i as f32 * 0.1) - 12.8).collect();
-        let q = quantize_mq4g256(&data, &signs1, &signs2);
-        let recon = dequant_mq4g256(&q, 256, &signs1, &signs2);
-        let base_cosim = cosine_similarity(&data, &recon);
-        // Set threshold above base cosim to guarantee promotion
-        let threshold = base_cosim + 0.0001;
+        let q = quantize_hfq4g256(&data);
+        let recon = dequant_hfq4g256(&q, 256);
+        let probe_cosim = cosine_similarity(&data, &recon);
+        // Set threshold above probe cosim to guarantee promotion
+        let threshold = probe_cosim + 0.0001;
         let ar = try_adaptive_promote(&data, "mq4", threshold, 2, &signs1, &signs2);
-        assert!(ar.promotions > 0, "expected promotion: base cosim={base_cosim}, threshold={threshold}");
+        assert!(ar.promotions > 0, "expected promotion: probe cosim={probe_cosim}, threshold={threshold}");
         // Should promote to MQ6
         assert_eq!(ar.quant_type, QuantType::MQ6G256);
     }
