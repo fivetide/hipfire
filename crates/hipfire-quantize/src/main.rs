@@ -3095,3 +3095,119 @@ fn main() {
     let file_size = std::fs::metadata(output_path).unwrap().len();
     eprintln!("Done: {:.1} MB written", file_size as f64 / 1e6);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_layer_idx_safetensors_dense() {
+        assert_eq!(parse_layer_idx("model.layers.0.self_attn.q_proj.weight"), Some(0));
+        assert_eq!(parse_layer_idx("model.layers.63.mlp.gate_proj.weight"), Some(63));
+    }
+
+    #[test]
+    fn parse_layer_idx_safetensors_moe() {
+        assert_eq!(
+            parse_layer_idx("model.language_model.layers.5.mlp.experts.0.gate_up_proj.weight"),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn parse_layer_idx_gguf() {
+        assert_eq!(parse_layer_idx("blk.0.attn_q.weight"), Some(0));
+        assert_eq!(parse_layer_idx("blk.31.ffn_gate.weight"), Some(31));
+    }
+
+    #[test]
+    fn parse_layer_idx_no_match() {
+        assert_eq!(parse_layer_idx("token_embd.weight"), None);
+        assert_eq!(parse_layer_idx("output.weight"), None);
+    }
+
+    #[test]
+    fn kmap_norms_are_f16() {
+        assert_eq!(kmap_resolve("model.layers.0.input_layernorm.weight", 64, false), QuantLevel::F16);
+        assert_eq!(kmap_resolve("model.layers.30.post_attention_layernorm.weight", 64, false), QuantLevel::F16);
+    }
+
+    #[test]
+    fn kmap_embeds_are_q8() {
+        assert_eq!(kmap_resolve("model.embed_tokens.weight", 64, false), QuantLevel::Q8);
+        assert_eq!(kmap_resolve("lm_head.weight", 64, false), QuantLevel::Q8);
+        assert_eq!(kmap_resolve("output.weight", 64, false), QuantLevel::Q8);
+    }
+
+    #[test]
+    fn kmap_moe_router_q8() {
+        assert_eq!(
+            kmap_resolve("model.language_model.layers.5.mlp.gate.weight", 64, true),
+            QuantLevel::Q8
+        );
+        assert_eq!(
+            kmap_resolve("model.language_model.layers.5.mlp.shared_expert_gate.weight", 64, true),
+            QuantLevel::Q8
+        );
+    }
+
+    #[test]
+    fn kmap_moe_router_not_promoted_on_dense() {
+        // On a dense model, mlp.gate.weight is not a router — falls to edge/base
+        assert_ne!(
+            kmap_resolve("model.layers.30.mlp.gate.weight", 64, false),
+            QuantLevel::Q8
+        );
+    }
+
+    #[test]
+    fn kmap_moe_expert_ffn_promote6() {
+        assert_eq!(
+            kmap_resolve("model.language_model.layers.30.mlp.experts.5.gate_up_proj.weight", 64, true),
+            QuantLevel::Promote6
+        );
+        assert_eq!(
+            kmap_resolve("model.language_model.layers.30.mlp.experts.5.down_proj.weight", 64, true),
+            QuantLevel::Promote6
+        );
+    }
+
+    #[test]
+    fn kmap_edge_layers_promote6() {
+        // First 2 layers
+        assert_eq!(kmap_resolve("model.layers.0.self_attn.q_proj.weight", 64, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.1.mlp.gate_proj.weight", 64, false), QuantLevel::Promote6);
+        // Last 2 layers
+        assert_eq!(kmap_resolve("model.layers.62.self_attn.v_proj.weight", 64, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.63.mlp.down_proj.weight", 64, false), QuantLevel::Promote6);
+    }
+
+    #[test]
+    fn kmap_middle_layers_base() {
+        assert_eq!(kmap_resolve("model.layers.2.self_attn.q_proj.weight", 64, false), QuantLevel::Base);
+        assert_eq!(kmap_resolve("model.layers.30.mlp.gate_proj.weight", 64, false), QuantLevel::Base);
+        assert_eq!(kmap_resolve("model.layers.61.mlp.down_proj.weight", 64, false), QuantLevel::Base);
+    }
+
+    #[test]
+    fn kmap_edge_layers_small_model_24_layers() {
+        // 24 layers: edge = 0,1 and 22,23
+        assert_eq!(kmap_resolve("model.layers.0.mlp.gate_proj.weight", 24, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.1.mlp.gate_proj.weight", 24, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.2.mlp.gate_proj.weight", 24, false), QuantLevel::Base);
+        assert_eq!(kmap_resolve("model.layers.22.mlp.gate_proj.weight", 24, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.23.mlp.gate_proj.weight", 24, false), QuantLevel::Promote6);
+    }
+
+    #[test]
+    fn kmap_n_layers_zero_disables_edge() {
+        assert_eq!(kmap_resolve("model.layers.0.mlp.gate_proj.weight", 0, false), QuantLevel::Base);
+    }
+
+    #[test]
+    fn kmap_gguf_names() {
+        assert_eq!(kmap_resolve("blk.0.attn_q.weight", 64, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("blk.63.ffn_gate.weight", 64, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("blk.30.ffn_gate.weight", 64, false), QuantLevel::Base);
+    }
+}
