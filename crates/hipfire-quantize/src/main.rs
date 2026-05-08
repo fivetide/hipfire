@@ -2587,6 +2587,54 @@ fn main() {
                     spilled_len: 0,
                 });
             } else {
+
+            // ── K-map override ──────────────────────────────────────────────
+            let kmap_level = kmap.get(&**name).copied().unwrap_or(QuantLevel::Base);
+
+            let (quantized, qt, gs, label) = if kmap_level == QuantLevel::Q8 {
+                // K-map says Q8 (embed, lm_head, router)
+                let q = quantize_q8f16(&f32_data);
+                (q, QuantType::Q8F16, 32u32, "Q8_F16")
+            } else if kmap_level == QuantLevel::F16 {
+                // K-map says F16 (should not normally reach here — should_quantize filters first)
+                let f16_bytes: Vec<u8> = f32_data
+                    .iter()
+                    .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                    .collect();
+                (f16_bytes, QuantType::F16, 0u32, "F16")
+            } else if kmap_level == QuantLevel::Promote6 {
+                // K-map says promote to 6-bit
+                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                if (use_mq4g256 || use_mq4_mq6exp || use_mq3g256 || use_mq2g256
+                    || use_mq2g256_lloyd || use_mq3g256_lloyd) && k_dim % 256 == 0
+                {
+                    let signs1 = gen_fwht_signs(42, 256);
+                    let signs2 = gen_fwht_signs(1042, 256);
+                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                } else if (use_hfq4g256 || use_hfq3g256 || use_hfq3g128
+                    || use_hfq2g256 || use_hfq2g128) && k_dim % 256 == 0
+                {
+                    let q = quantize_hfq6g256(&f32_data);
+                    (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
+                } else if use_mq6g256 && k_dim % 256 == 0 {
+                    // Already 6-bit MQ — no-op promotion
+                    let signs1 = gen_fwht_signs(42, 256);
+                    let signs2 = gen_fwht_signs(1042, 256);
+                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                } else if use_hfq6 && k_dim % 256 == 0 {
+                    // Already 6-bit HFQ — no-op promotion
+                    let q = quantize_hfq6g256(&f32_data);
+                    (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
+                } else {
+                    // Non-256-aligned fallback: Q8
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                }
+            } else {
+            // QuantLevel::Base — existing format-specific logic below
+
             // Choose quant format per tensor
             let this_q8 = if use_q4k_all {
                 false // everything Q4_K
@@ -2604,7 +2652,7 @@ fn main() {
             // large-dim models (9B: dim=4096, values ~0.016, Q4 step ~0.007)
             let is_embed = name.contains("embed_tokens");
 
-            let (quantized, qt, gs, label) = if use_hfq_mixed {
+            if use_hfq_mixed {
                 // hfq-mixed: Q8 for attention, HFQ4 for FFN (fits 9B in 8GB VRAM)
                 let is_ffn = name.contains("mlp.") || name.contains("ffn");
                 if !is_ffn {
@@ -2804,7 +2852,8 @@ fn main() {
             } else {
                 let q = quantize_q4f16_g64(&f32_data);
                 (q, QuantType::Q4F16G64, 64u32, "Q4_F16")
-            };
+            }
+            }; // end K-map outer if-else
 
             // Compute quantization error (skip for Q8 embeddings — always negligible)
             let block_size = gs as usize;
@@ -2829,7 +2878,7 @@ fn main() {
                         total_quant_error += err as f64;
                         max_quant_error = max_quant_error.max(err);
                     }
-                } else if this_q8 || this_q4as8 {
+                } else if label == "Q8_FP16" || label == "Q4asQ8" || label == "Q8_F16" {
                     let off = b * 34;
                     let scale = f16_to_f32(u16::from_le_bytes([quantized[off], quantized[off + 1]]));
                     for i in 0..(end - start) {
