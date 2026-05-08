@@ -1949,7 +1949,7 @@ impl GgufFormat {
 /// (Q4-grade is too lossy for embeddings) and 1D norms stay F16. Tensor
 /// names are translated GGUF → safetensors style so the engine's existing
 /// `load_weights_hfq` can consume the output.
-fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat) -> std::io::Result<()> {
+fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: bool) -> std::io::Result<()> {
     eprintln!("=== GGUF → {} conversion ===", format.label());
     eprintln!("Input:  {}", input.display());
     eprintln!("Output: {}", output.display());
@@ -1994,6 +1994,44 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat) -> std::io
     let signs1 = if needs_signs { gen_fwht_signs(42, 256) } else { Vec::new() };
     let signs2 = if needs_signs { gen_fwht_signs(1042, 256) } else { Vec::new() };
 
+    // K-map setup for GGUF path
+    let is_moe = arch_id == 6;
+    let n_layers: usize = config_json
+        .get("num_hidden_layers")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
+    // Build K-map using translated (safetensors-style) names where available,
+    // falling back to raw GGUF names for untranslated tensors.
+    let kmap: HashMap<String, QuantLevel> = if no_kmap {
+        HashMap::new()
+    } else {
+        let mut map = HashMap::new();
+        let mut counts = [0u32; 4];
+        for info in &gguf.tensors {
+            let out_name = gguf_to_safetensors_name(&info.name)
+                .unwrap_or_else(|| info.name.clone());
+            let level = kmap_resolve(&out_name, n_layers, is_moe);
+            match level {
+                QuantLevel::F16 => counts[0] += 1,
+                QuantLevel::Q8 => counts[1] += 1,
+                QuantLevel::Promote6 => counts[2] += 1,
+                QuantLevel::Base => counts[3] += 1,
+            }
+            map.insert(out_name, level);
+        }
+        if !map.is_empty() {
+            eprintln!("K-map plan ({} base, {n_layers} layers{}):",
+                format.label(),
+                if is_moe { ", MoE" } else { "" });
+            eprintln!("  F16:       {:>4} tensors", counts[0]);
+            eprintln!("  Q8:        {:>4} tensors", counts[1]);
+            eprintln!("  Promote6:  {:>4} tensors", counts[2]);
+            eprintln!("  Base:      {:>4} tensors", counts[3]);
+        }
+        map
+    };
+
     let mut hfq_tensors: Vec<HfqTensor> = Vec::with_capacity(gguf.tensors.len());
     let mut total_params: u64 = 0;
     let mut quant_params: u64 = 0;
@@ -2020,22 +2058,39 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat) -> std::io
         let out_name = gguf_to_safetensors_name(&info.name)
             .unwrap_or_else(|| info.name.clone());
 
+        let kmap_level = kmap.get(&out_name).copied().unwrap_or(QuantLevel::Base);
+
         let (data, quant_type, group_size, label) = if is_norm || !is_2d {
-            // Store as F16 — convert via dequant→f32→f16 for any source dtype.
+            // Norms and 1D tensors always F16 (primary gate)
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             let f16_bytes: Vec<u8> = f32_data
                 .iter()
                 .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                 .collect();
             (f16_bytes, QuantType::F16, 0u32, "F16")
-        } else if is_embed {
-            // Q8 embedding (matches safetensors path's is_embed rule).
+        } else if kmap_level == QuantLevel::Q8 || is_embed {
+            // K-map Q8 or embedding
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             let q = quantize_q8f16(&f32_data);
             quant_params += n_elements as u64;
             (q, QuantType::Q8F16, 32u32, "Q8_F16")
+        } else if kmap_level == QuantLevel::Promote6 && k_dim % 256 == 0 {
+            // K-map promote to 6-bit
+            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            quant_params += n_elements as u64;
+            match format {
+                GgufFormat::Mq4 | GgufFormat::Mq3 | GgufFormat::Mq2
+                | GgufFormat::Mq2Lloyd | GgufFormat::Mq3Lloyd | GgufFormat::Mq6 => {
+                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                }
+                GgufFormat::Hfq4 | GgufFormat::Hfq6 => {
+                    let q = quantize_hfq6g256(&f32_data);
+                    (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
+                }
+            }
         } else if k_dim % 256 == 0 {
-            // 256-aligned 2D weight — quantize per the chosen format.
+            // 256-aligned 2D weight — quantize per the chosen format (Base level).
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             quant_params += n_elements as u64;
             match format {
@@ -2279,7 +2334,7 @@ fn main() {
                 GgufFormat::Hfq4
             });
             let out = Path::new(output_path);
-            if let Err(e) = run_gguf_pipeline(raw_input, out, gguf_format) {
+            if let Err(e) = run_gguf_pipeline(raw_input, out, gguf_format, no_kmap) {
                 eprintln!("GGUF pipeline failed: {e}");
                 std::process::exit(2);
             }
