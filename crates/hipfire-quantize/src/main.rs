@@ -2936,6 +2936,7 @@ fn main() {
                         max_quant_error = max_quant_error.max(err);
                     }
                 } else if label == "Q8_FP16" || label == "Q4asQ8" || label == "Q8_F16" {
+                    // NB: string match because this_q8/this_q4as8 are scoped inside Base block.
                     let off = b * 34;
                     let scale = f16_to_f32(u16::from_le_bytes([quantized[off], quantized[off + 1]]));
                     for i in 0..(end - start) {
@@ -3204,6 +3205,23 @@ mod tests {
     #[test]
     fn kmap_n_layers_zero_disables_edge() {
         assert_eq!(kmap_resolve("model.layers.0.mlp.gate_proj.weight", 0, false), QuantLevel::Base);
+    }
+
+    #[test]
+    fn kmap_edge_layers_tiny_model_3_layers() {
+        // 3 layers: first-2 = {0,1}, last-2 = {1,2}. All layers promoted.
+        assert_eq!(kmap_resolve("model.layers.0.mlp.gate_proj.weight", 3, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.1.mlp.gate_proj.weight", 3, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.2.mlp.gate_proj.weight", 3, false), QuantLevel::Promote6);
+    }
+
+    #[test]
+    fn kmap_expert_not_promoted_on_dense() {
+        // "mlp.experts." in name but is_moe=false — should NOT trigger rule 4
+        assert_eq!(
+            kmap_resolve("model.layers.30.mlp.experts.5.gate_up_proj.weight", 64, false),
+            QuantLevel::Base
+        );
     }
 
     #[test]
