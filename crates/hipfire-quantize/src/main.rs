@@ -1949,7 +1949,7 @@ impl GgufFormat {
 /// (Q4-grade is too lossy for embeddings) and 1D norms stay F16. Tensor
 /// names are translated GGUF → safetensors style so the engine's existing
 /// `load_weights_hfq` can consume the output.
-fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: bool) -> std::io::Result<()> {
+fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: bool, kmap_dense: bool) -> std::io::Result<()> {
     eprintln!("=== GGUF → {} conversion ===", format.label());
     eprintln!("Input:  {}", input.display());
     eprintln!("Output: {}", output.display());
@@ -2003,7 +2003,14 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
 
     // Build K-map using translated (safetensors-style) names where available,
     // falling back to raw GGUF names for untranslated tensors.
-    let kmap: HashMap<String, QuantLevel> = if no_kmap {
+    //
+    // K-map is gated to MoE models only. On dense models the author's own
+    // bench shows a mixed picture (PPL +1.5% to +2.5% at 2K context on 4B
+    // and 27B; PPL -4.8% on 27B at 8K context — crossover at ~3K). The
+    // ship-default is the conservative shape per maintainer directive
+    // (2026-05-08): never silently change dense quantization. Users who
+    // want K-map on dense pass `--kmap-dense` (see flag parsing below).
+    let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !kmap_dense) {
         HashMap::new()
     } else {
         let mut map = HashMap::new();
@@ -2243,6 +2250,12 @@ fn main() {
     let use_hfq6 = format == "hfq6" || format == "hfq6g256" || format == "hf6";
     let q8_router_flag = args.iter().any(|a| a == "--q8-router");
     let no_kmap = args.iter().any(|a| a == "--no-kmap" || a == "--uniform");
+    // K-map gate: applies to MoE models by default. Dense models opt in
+    // via --kmap-dense (the K-map dense PPL effect is mixed: regression at
+    // short context, win at long context — see benchmarks/results/
+    // ppl_kmap_20260508.md). Maintainer directive 2026-05-08: "intends to
+    // help ONLY (never on dense)" by default.
+    let kmap_dense = args.iter().any(|a| a == "--kmap-dense");
 
     // ── Sub-4-bit guards (2026-04-30 sweep) ─────────────────────────────
     // MQ2 with the current uniform 4-level codebook collapses at every
@@ -2334,7 +2347,7 @@ fn main() {
                 GgufFormat::Hfq4
             });
             let out = Path::new(output_path);
-            if let Err(e) = run_gguf_pipeline(raw_input, out, gguf_format, no_kmap) {
+            if let Err(e) = run_gguf_pipeline(raw_input, out, gguf_format, no_kmap, kmap_dense) {
                 eprintln!("GGUF pipeline failed: {e}");
                 std::process::exit(2);
             }
@@ -2433,8 +2446,15 @@ fn main() {
     eprintln!("Found {} tensors", all_tensors.len());
 
     // ── K-map pre-pass ──────────────────────────────────────────────────────
-    // Build per-tensor quant level map. Default on; --no-kmap disables.
-    let kmap: HashMap<String, QuantLevel> = if no_kmap {
+    // Build per-tensor quant level map. Gated to MoE models by default
+    // (maintainer directive 2026-05-08): K-map's dense PPL effect is mixed
+    // (+1.5% to +2.5% at 2K, -4.8% at 8K — crossover at ~3K context). To
+    // avoid silently changing dense quantization output, dense models opt
+    // out by default and require `--kmap-dense` to enable. MoE models keep
+    // the K-map default-on path because the routed-expert promotion is
+    // the headline win and the empirical regression there is tighter
+    // (+1.7% PPL at 2K, gated below the dense regression threshold).
+    let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !kmap_dense) {
         HashMap::new()
     } else {
         let mut map = HashMap::new();
