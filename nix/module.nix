@@ -147,7 +147,10 @@ in
       default = true;
       description = ''
         Use nixpkgs ROCm libraries (rocmPackages.clr).
-        Set to false to provide your own libamdhip64.so via environment.
+        When true (the default), the module automatically enables
+        hardware.graphics and registers the ROCm ICD so the HIP
+        runtime can discover GPUs. Set to false only if you provide
+        your own libamdhip64.so via services.hipfire.environment.
       '';
     };
 
@@ -288,16 +291,40 @@ in
   config = lib.mkIf cfg.enable (lib.mkMerge [
 
     {
-      assertions = [{
-        assertion = cfg.gpuTargets != [ ];
-        message = ''
-          services.hipfire.gpuTargets is empty. Set it to your GPU architecture(s).
-          Detect yours by running:
-            rocminfo 2>/dev/null | grep -oP 'amdgcn-amd-amdhsa--\K\S+' | sort -u
-          Example: services.hipfire.gpuTargets = [ "gfx1100" ];
-        '';
-      }];
+      assertions = [
+        {
+          assertion = cfg.gpuTargets != [ ];
+          message = ''
+            services.hipfire.gpuTargets is empty. Set it to your GPU architecture(s).
+            Detect yours by running:
+              rocminfo 2>/dev/null | grep -oP 'amdgcn-amd-amdhsa--\K\S+' | sort -u
+            Example: services.hipfire.gpuTargets = [ "gfx1100" ];
+          '';
+        }
+        {
+          assertion = !cfg.rocmSupport || config.hardware.graphics.enable;
+          message = ''
+            services.hipfire requires hardware.graphics.enable = true so the
+            HIP runtime can discover GPUs via the Mesa/DRI stack.
+            Either set hardware.graphics.enable = true (recommended) or set
+            services.hipfire.rocmSupport = false and provide your own
+            libamdhip64.so via services.hipfire.environment.
+          '';
+        }
+      ];
     }
+
+    # ── GPU driver stack (ICD + DRI) ──────────────────────────
+    # The HIP runtime discovers GPUs via the ROCm ICD registered
+    # through hardware.graphics.extraPackages. Without this, the
+    # daemon loads libamdhip64.so but hipGetDeviceCount returns 0.
+    (lib.mkIf cfg.rocmSupport {
+      hardware.graphics.enable = lib.mkDefault true;
+      hardware.graphics.extraPackages = [
+        pkgs.rocmPackages.clr.icd        # registers the HIP ICD
+        pkgs.rocmPackages.clr             # HIP runtime userspace
+      ];
+    })
 
     # Expose the CLI globally so `hipfire pull`, `hipfire diag`, etc. work
     { environment.systemPackages = [ hipfirePkg ]; }
@@ -374,9 +401,16 @@ in
           ];
           ProtectSystem = "strict";
           ReadWritePaths = [ cfg.modelDir "/var/lib/hipfire" ];
+          PrivateTmp = true;
           NoNewPrivileges = true;
           DevicePolicy = "closed";
-          DeviceAllow = [ "/dev/kfd rw" "/dev/dri rw" "/dev/dri/* rw" ];
+          DeviceAllow = [
+            "/dev/kfd rw"
+            "/dev/dri rw"
+            "/dev/dri/* rw"
+            "/dev/accel rw"       # compute accelerator nodes (kernel 6.2+);
+            "/dev/accel/* rw"     # HIP runtime probes these during GPU enumeration
+          ];
         };
       };
     })
