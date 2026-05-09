@@ -1352,6 +1352,13 @@ fn parse_layer_idx(name: &str) -> Option<usize> {
     None
 }
 
+/// Stride for alternating-mode promotion: edge layers always promoted,
+/// plus every Nth middle layer. 3 was chosen empirically — promotes ~40%
+/// of middle layers, matching llama.cpp Q4_K_M's budget-allocation pattern.
+/// On MoE 3.6-35B-A3B: stride=3 gives PPL 8K=19.96 at 21.8 GB vs full
+/// K-map PPL 8K=20.07 at 27.7 GB.
+const ALTERNATING_STRIDE: usize = 3;
+
 /// llama.cpp-style alternating promotion: edge layers always promoted,
 /// middle layers promoted every `stride` layers.
 fn is_positional_promote(idx: usize, n_layers: usize, stride: usize) -> bool {
@@ -1399,7 +1406,7 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
         if kmap_mode == 1 {
             // Alternating: promote expert groups only in positional layers
             if let Some(idx) = parse_layer_idx(name) {
-                if is_positional_promote(idx, n_layers, 3) {
+                if is_positional_promote(idx, n_layers, ALTERNATING_STRIDE) {
                     return QuantLevel::Promote6;
                 }
                 return QuantLevel::Base;
@@ -1434,7 +1441,7 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
         let is_down = name.contains("down_proj") || name.contains("ffn_down");
         if n_layers > 0 {
             if let Some(idx) = parse_layer_idx(name) {
-                if is_down && is_positional_promote(idx, n_layers, 3) {
+                if is_down && is_positional_promote(idx, n_layers, ALTERNATING_STRIDE) {
                     return QuantLevel::Promote6;
                 }
                 // Edge layers: attn+FFN for MoE, FFN only for dense.
@@ -2108,7 +2115,8 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
             map.insert(out_name, level);
         }
         if !map.is_empty() {
-            eprintln!("K-map plan ({} base, {n_layers} layers{}):",
+            let mode_label = match kmap_mode { 0 => "full", 1 => "alternating", 2 => "typed", _ => "?" };
+            eprintln!("K-map plan ({} base, {n_layers} layers{}, mode={mode_label}):",
                 format.label(),
                 if is_moe { ", MoE" } else { "" });
             eprintln!("  F16:       {:>4} tensors", counts[0]);
@@ -2562,7 +2570,8 @@ fn main() {
             map.insert(name.to_string(), level);
         }
         if !map.is_empty() {
-            eprintln!("K-map plan ({format} base, {n_layers} layers{}):",
+            let mode_label = match kmap_mode { 0 => "full", 1 => "alternating", 2 => "typed", _ => "?" };
+            eprintln!("K-map plan ({format} base, {n_layers} layers{}, mode={mode_label}):",
                 if is_moe { ", MoE" } else { "" });
             eprintln!("  F16:       {:>4} tensors (norms, biases)", counts[0]);
             eprintln!("  Q8:        {:>4} tensors (embed, lm_head, routers)", counts[1]);
@@ -3418,6 +3427,34 @@ mod tests {
         // gate_proj NOT promoted in middle layers
         assert_eq!(
             kmap_resolve_mode("model.layers.5.mlp.gate_proj.weight", 40, false, 1),
+            QuantLevel::Base
+        );
+    }
+
+    #[test]
+    fn kmap_alternating_n_layers_zero() {
+        // With n_layers=0, alternating mode should return Base for everything
+        assert_eq!(
+            kmap_resolve_mode("model.layers.0.mlp.down_proj.weight", 0, false, 1),
+            QuantLevel::Base
+        );
+    }
+
+    #[test]
+    fn kmap_alternating_gguf_names() {
+        // GGUF ffn_down in edge layer
+        assert_eq!(
+            kmap_resolve_mode("blk.0.ffn_down.weight", 40, false, 1),
+            QuantLevel::Promote6
+        );
+        // GGUF ffn_down in middle non-stride layer
+        assert_eq!(
+            kmap_resolve_mode("blk.3.ffn_down.weight", 40, false, 1),
+            QuantLevel::Base
+        );
+        // GGUF ffn_gate stays base in middle
+        assert_eq!(
+            kmap_resolve_mode("blk.5.ffn_gate.weight", 40, false, 1),
             QuantLevel::Base
         );
     }
