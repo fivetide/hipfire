@@ -388,23 +388,25 @@ fn dequant_q4_k(data: &[u8], n: usize) -> Vec<f32> {
             mins[4 + i] = (sc_data[8 + i] >> 4) | ((sc_data[4 + i] >> 6) << 4);
         }
 
-        let qdata = &data[off + 16..off + 16 + 128];
+        // GGML Q4_K: 4 groups of 64 elements, each group has two 32-element
+        // sub-blocks sharing the same qs bytes. Low nibble → first sub-block,
+        // high nibble → second sub-block. 32 qs bytes per group.
+        let qs = &data[off + 16..off + 16 + 128];
+        let base = b * block_size;
         for group in 0..4 {
-            let sb_even = group * 2;
-            let sb_odd = group * 2 + 1;
-            let sc_even = d * scales[sb_even] as f32;
-            let m_even = dmin * mins[sb_even] as f32;
-            let sc_odd = d * scales[sb_odd] as f32;
-            let m_odd = dmin * mins[sb_odd] as f32;
+            let sc_lo = d * scales[group * 2] as f32;
+            let m_lo = dmin * mins[group * 2] as f32;
+            let sc_hi = d * scales[group * 2 + 1] as f32;
+            let m_hi = dmin * mins[group * 2 + 1] as f32;
             for l in 0..32 {
-                let byte = qdata[group * 32 + l];
-                let idx_even = b * block_size + group * 64 + l;
-                let idx_odd = idx_even + 32;
-                if idx_even < n {
-                    out[idx_even] = (byte & 0x0F) as f32 * sc_even - m_even;
+                let byte = qs[group * 32 + l];
+                let idx_lo = base + group * 64 + l;
+                let idx_hi = idx_lo + 32;
+                if idx_lo < n {
+                    out[idx_lo] = (byte & 0x0F) as f32 * sc_lo - m_lo;
                 }
-                if idx_odd < n {
-                    out[idx_odd] = ((byte >> 4) & 0x0F) as f32 * sc_odd - m_odd;
+                if idx_hi < n {
+                    out[idx_hi] = ((byte >> 4) & 0x0F) as f32 * sc_hi - m_hi;
                 }
             }
         }
@@ -413,6 +415,11 @@ fn dequant_q4_k(data: &[u8], n: usize) -> Vec<f32> {
 }
 
 fn dequant_q5_k(data: &[u8], n: usize) -> Vec<f32> {
+    // Q5_K block: 256 elements, 176 bytes.
+    // Layout: d(f16) + dmin(f16) + scales[12] + qh[32] + ql[128]
+    // Same group structure as Q4_K (4 groups of 64, two 32-element sub-blocks).
+    // High bit from qh[l]: bit `is` for low nibble, bit `is+1` for high nibble,
+    // where is = group * 2 (matches GGML reference dequantize_row_q5_K).
     let block_size = 256;
     let block_bytes = 176;
     let nblocks = (n + block_size - 1) / block_size;
@@ -425,7 +432,6 @@ fn dequant_q5_k(data: &[u8], n: usize) -> Vec<f32> {
         let d = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
         let dmin = f16_to_f32(u16::from_le_bytes([data[off + 2], data[off + 3]]));
 
-        // 12-byte packed scales/mins — same layout as Q4_K
         let sc_data = &data[off + 4..off + 16];
         let mut scales = [0u8; 8];
         let mut mins = [0u8; 8];
@@ -438,30 +444,28 @@ fn dequant_q5_k(data: &[u8], n: usize) -> Vec<f32> {
             mins[4 + i] = (sc_data[8 + i] >> 4) | ((sc_data[4 + i] >> 6) << 4);
         }
 
-        // 32 bytes of high bits (1 bit per element), then 128 bytes of low nibbles
         let qh = &data[off + 16..off + 48];
         let ql = &data[off + 48..off + 176];
+        let base = b * block_size;
 
         for group in 0..4 {
-            let sb_even = group * 2;
-            let sb_odd = group * 2 + 1;
-            let sc_even = d * scales[sb_even] as f32;
-            let m_even = dmin * mins[sb_even] as f32;
-            let sc_odd = d * scales[sb_odd] as f32;
-            let m_odd = dmin * mins[sb_odd] as f32;
+            let is = group * 2;
+            let sc_lo = d * scales[is] as f32;
+            let m_lo = dmin * mins[is] as f32;
+            let sc_hi = d * scales[is + 1] as f32;
+            let m_hi = dmin * mins[is + 1] as f32;
             for l in 0..32 {
                 let byte = ql[group * 32 + l];
-                let hbit = ((qh[l] >> group) & 1) as u8;
-                let hbit2 = ((qh[l] >> (group + 4)) & 1) as u8;
-                let idx_even = b * block_size + group * 64 + l;
-                let idx_odd = idx_even + 32;
-                if idx_even < n {
-                    let q = ((byte & 0x0F) | (hbit << 4)) as f32;
-                    out[idx_even] = q * sc_even - m_even;
+                let h = (qh[l] >> is) as u8;
+                let idx_lo = base + group * 64 + l;
+                let idx_hi = idx_lo + 32;
+                if idx_lo < n {
+                    let q = ((byte & 0x0F) | ((h & 1) << 4)) as f32;
+                    out[idx_lo] = q * sc_lo - m_lo;
                 }
-                if idx_odd < n {
-                    let q = (((byte >> 4) & 0x0F) | (hbit2 << 4)) as f32;
-                    out[idx_odd] = q * sc_odd - m_odd;
+                if idx_hi < n {
+                    let q = (((byte >> 4) & 0x0F) | ((h & 2) << 3)) as f32;
+                    out[idx_hi] = q * sc_hi - m_hi;
                 }
             }
         }

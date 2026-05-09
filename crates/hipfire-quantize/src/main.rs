@@ -1701,24 +1701,27 @@ fn is_gguf_input(p: &Path) -> bool {
 /// (we then keep them under their GGUF name; the future loader can decide
 /// what to do, or they're skipped).
 fn gguf_to_safetensors_name(gguf_name: &str) -> Option<String> {
+    // The engine's weight loader uses the `model.language_model.` prefix
+    // (matching Qwen 3.5+ safetensors layout). All translated names must
+    // include this prefix so the .hfq is loadable by `load_weights_hfq`.
+    let lm = "model.language_model";
+
     // Top-level tensors.
     match gguf_name {
-        "token_embd.weight" => return Some("model.embed_tokens.weight".to_string()),
+        "token_embd.weight" => return Some(format!("{lm}.embed_tokens.weight")),
         "output.weight" => return Some("lm_head.weight".to_string()),
-        "output_norm.weight" => return Some("model.norm.weight".to_string()),
+        "output_norm.weight" => return Some(format!("{lm}.norm.weight")),
         _ => {}
     }
-    // Per-layer: blk.{N}.<slot>.weight  →  model.layers.{N}.<slot>.weight
+    // Per-layer: blk.{N}.<slot>.weight  →  model.language_model.layers.{N}.<slot>.weight
     if let Some(rest) = gguf_name.strip_prefix("blk.") {
-        // rest = "{N}.<slot>.weight"
         let dot = rest.find('.')?;
         let layer_idx = &rest[..dot];
-        let slot_full = &rest[dot + 1..]; // "<slot>.weight"
-        // Drop the trailing ".weight" so we can rewrite slots like "attn_q"→"self_attn.q_proj".
+        let slot_full = &rest[dot + 1..];
         let slot = slot_full.strip_suffix(".weight")?;
         let translated = match slot {
             "attn_norm" => "input_layernorm".to_string(),
-            "ffn_norm" => "post_attention_layernorm".to_string(),
+            "ffn_norm" | "post_attention_norm" => "post_attention_layernorm".to_string(),
             "attn_q" => "self_attn.q_proj".to_string(),
             "attn_k" => "self_attn.k_proj".to_string(),
             "attn_v" => "self_attn.v_proj".to_string(),
@@ -1728,9 +1731,9 @@ fn gguf_to_safetensors_name(gguf_name: &str) -> Option<String> {
             "ffn_gate" => "mlp.gate_proj".to_string(),
             "ffn_up" => "mlp.up_proj".to_string(),
             "ffn_down" => "mlp.down_proj".to_string(),
-            other => return Some(format!("model.layers.{layer_idx}.{other}.weight")),
+            other => return Some(format!("{lm}.layers.{layer_idx}.{other}.weight")),
         };
-        return Some(format!("model.layers.{layer_idx}.{translated}.weight"));
+        return Some(format!("{lm}.layers.{layer_idx}.{translated}.weight"));
     }
     None
 }
@@ -1976,7 +1979,8 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
     let arch_id: u32 = match arch_str.as_str() {
         "llama" => 0,
         "qwen3" | "qwen2" => 1,
-        "qwen3moe" => 6,
+        "qwen35" | "qwen3_5" | "qwen3_5_text" => 5,
+        "qwen3moe" | "qwen35moe" | "qwen3_5_moe" | "qwen3_5_moe_text" => 6,
         other => {
             eprintln!("warning: unknown GGUF architecture '{other}', tagging as llama-compatible");
             0
@@ -2062,13 +2066,15 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
         total_params += n_elements as u64;
         total_bytes_in += raw.len() as u64;
 
-        let shape: Vec<u32> = info.shape.iter().map(|&s| s as u32).collect();
+        // GGUF stores shapes in GGML row-major order (d0=innermost/fastest),
+        // but the engine (and safetensors convention) uses [M, K] = [rows, cols].
+        // Reverse the shape to match engine expectations.
+        let shape: Vec<u32> = info.shape.iter().rev().map(|&s| s as u32).collect();
 
         // Tensor classification (uses the original GGUF name).
         let is_norm = gguf_is_norm_tensor(&info.name);
         let is_embed = gguf_is_embed_tensor(&info.name);
-        let is_2d = info.shape.len() == 2;
-        let k_dim = if is_2d { info.shape[0] } else { n_elements };
+        let k_dim = if info.shape.len() >= 2 { info.shape[0] } else { n_elements };
 
         // Translate to the safetensors-style name `hipfire_runtime::hfq::load_weights_hfq`
         // expects. If we don't have a translation, keep the original name —
@@ -2078,7 +2084,7 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
 
         let kmap_level = kmap.get(&out_name).copied().unwrap_or(QuantLevel::Base);
 
-        let (data, quant_type, group_size, label) = if is_norm || !is_2d {
+        let (data, quant_type, group_size, label) = if is_norm || info.shape.len() < 2 {
             // Norms and 1D tensors always F16 (primary gate)
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             let f16_bytes: Vec<u8> = f32_data
