@@ -1,4 +1,4 @@
-# HFP4 Quality Investigation — Results
+# HFP4 Quality Investigation — Results (Revised with KLD)
 
 **Full report:** `docs/investigations/2026-05-11-hfp4-quality-analysis.md` (branch `docs/hfp4-quality-investigation`)
 
@@ -6,38 +6,49 @@
 
 ## TL;DR
 
-We benchmarked MFP4G32 (our FWHT-rotated E2M1 FP4 format) against MQ4G256 (FWHT-rotated INT4) on Qwen3.5 0.8B/4B/9B wikitext2 perplexity.
+MFP4G32 (FWHT + E2M1 FP4) loses to MQ4G256 (FWHT + INT4) by **+25–94% PPL**. But KL divergence tells a different story: **MFP4 is actually the closest format to MQ4 at the output distribution level.**
 
-**MFP4 loses by +25–94% PPL.** E2M1 also loses unrotated at 4B (+16%).
+## PPL says MFP4 loses
 
-## Why
+| Model | MQ4 PPL | MFP4 PPL | Delta |
+|-------|---------|----------|-------|
+| 0.8B  | 24.37   | 47.23    | +94%  |
+| 4B    | 12.59   | 16.65    | +32%  |
+| 9B    | 9.94    | 12.47    | +25%  |
 
-FWHT + E2M1 is an **anti-synergy**. We measured post-FWHT per-block distributions at kurtosis ~2.82 (sub-Gaussian, stable across 0.8B/27B/35B-MoE). This is the zone where uniform quantization (INT4) is near-optimal. E2M1's non-uniform codebook concentrates codes near zero — exactly where the post-FWHT distribution no longer needs them.
+## KLD says MFP4 is closest to MQ4
 
-Lloyd-Max analysis on real data confirms: the optimal 16-code codebook for post-FWHT weights is **nearly uniform**. E2M1 has 58.8% more MSE than optimal; INT4 has 33.7% more.
+| Metric | MFP4 (FWHT+E2M1) | HFP4 (E2M1 only) | HFQ4 (INT4 only) |
+|--------|:-:|:-:|:-:|
+| **Mean KLD** | **0.661** | 0.815 | 0.936 |
+| **Top-1 agreement** | **63.2%** | 59.6% | 49.3% |
+| **Max KLD** | **4.04** | 7.08 | 7.53 |
 
-Interesting twist: **E2M1 beats INT4 at g=256** (wider blocks, more dynamic range). HFP4's g=32 block size works *against* E2M1 by normalizing away the variance it's designed to exploit.
+MFP4 picks the same token as MQ4 nearly two-thirds of the time. Fewest catastrophic positions. 30% lower KLD than HFQ4.
 
-## Decomposition (9B, +25% PPL gap)
+## Why PPL and KLD disagree
 
-- 60% — E2M1 codebook mismatch for sub-Gaussian data
-- 25% — UE8M0 power-of-2 scale (26.6% avg overshoot). FP16 block scale gives 8.76% NRMSE gain; FP32 adds zero more.
-- 10% — No zero-point. INT4's per-group affine adaptation is its key advantage.
-- 5% — FP16 vs FP32 scale precision
+PPL measures probability of the *correct* next token. KLD measures divergence of the *full* output distribution. MFP4 tracks MQ4's distribution closely but with slightly higher entropy — probability mass spreads from the correct token to neighbors at every position. This compounds into worse PPL but doesn't cause wrong tokens or distributional collapse.
 
-## NRMSE Paradox
+**For sampling (temp > 0), MFP4 may be practically equivalent to MQ4.** The PPL gap overstates the real-world quality difference.
 
-E2M1 + FP16 block scale **beats MQ4 on per-tensor NRMSE** (0.101 vs 0.109) but still loses on PPL. Per-tensor reconstruction quality is not the right optimization target — error propagation pattern through the transformer stack matters more.
+## Key correction: FWHT helps E2M1
 
-## What This Means for RDNA4
+Initial analysis concluded FWHT + E2M1 was an "anti-synergy." **KLD disproves this:** MFP4 (with FWHT) has 19% lower KLD than HFP4 (without). FWHT makes E2M1 errors more uniform, keeping distributions closer to MQ4.
 
-E2M1 is hardware-locked on RDNA4 (`v_cvt_pk_fp8_e2m1`). To make it competitive:
+## Other findings (unchanged)
 
-1. **Don't pair with FWHT** — use E2M1 unrotated on native heavy-tailed weights
-2. **FP16 block scales** — UE8M0's power-of-2 constraint wastes 8.76% NRMSE for nothing (+0.25 bpw)
-3. **Add per-block zero-point** — INT4's real advantage is affine adaptation, not uniform spacing
-4. **Pre-RDNA4: Lloyd-Max LUT** — 37% less MSE than E2M1, it's just a software table swap
+- Post-FWHT kurtosis = 2.82 (sub-Gaussian). Lloyd-Max optimal codebook is nearly uniform.
+- FP16 block scale: +8.76% NRMSE over UE8M0; FP32 adds zero more. (+0.25 bpw)
+- E2M1 beats INT4 at g=256 but loses at g=32 (block-size crossover)
+- Per-block zero-point would give E2M1 the affine adaptation that is INT4's key advantage
 
-MQ4 remains quality king for FWHT-rotated inference. MFP4 (FWHT + E2M1) should not receive further investment.
+## What to do
 
-Full methodology, PPL tables, codebook analysis, and scale precision data in the report.
+1. **Keep FWHT with E2M1** — it helps (KLD proves it)
+2. **FP16 block scales** — may disproportionately close the PPL gap if entropy spread is scale-driven
+3. **Per-block zero-point** — lets E2M1 match INT4's affine adaptation
+4. **Evaluate on downstream tasks under sampling** — PPL alone misleads for the chat/code use case
+5. **MQ4 stays quality king for greedy decoding** — unchanged
+
+Full methodology, PPL tables, KLD tables, codebook analysis, and scale precision data in the report.

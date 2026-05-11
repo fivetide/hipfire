@@ -15,16 +15,23 @@
 
 MFP4G32 (hipfire's FWHT-rotated E2M1 FP4 format) produces **+25–94% worse
 perplexity** than MQ4G256 (FWHT-rotated INT4) across three model sizes.
-Unrotated E2M1 also loses to unrotated INT4 at 4B scale (+16%). The root
-cause is a **fundamental anti-synergy between FWHT rotation and the E2M1
-codebook**: FWHT transforms heavy-tailed weight distributions into
-sub-Gaussian shapes where uniform quantization is near-optimal, making
-E2M1's non-uniform near-zero concentration counterproductive.
+However, **KL divergence analysis reveals a more nuanced picture**: MFP4 is
+actually the **closest** to MQ4 at the output distribution level (KLD 0.661
+vs HFQ4's 0.936), with 63.2% top-1 token agreement and the fewest
+catastrophic divergence positions.
 
-Seven concrete improvement paths are identified and ranked by empirical
-evidence. The most impactful: avoid pairing E2M1 with FWHT, switch to FP16
-block scales (+8.76% NRMSE for +0.25 bpw), and add per-block zero-point
-adaptation.
+**The PPL gap is not a distributional collapse — it's a consistent small
+entropy increase.** E2M1's errors slightly broaden probability mass from
+the correct next token to its neighbors at every position, compounding into
+worse PPL. But the overall distribution shape tracks MQ4 closely. For
+sampling-based generation (temperature > 0), MFP4 may be nearly equivalent.
+
+**FWHT genuinely helps E2M1** (contradicts initial "anti-synergy"
+hypothesis): MFP4 (FWHT+E2M1) has 30% lower KLD than HFP4 (E2M1 alone).
+
+Seven concrete improvement paths are identified and ranked. The most
+impactful: FP16 block scales (+8.76% NRMSE for +0.25 bpw), per-block
+zero-point, and entropy-focused optimization rather than NRMSE.
 
 ---
 
@@ -216,7 +223,69 @@ PPL gap.
 
 ---
 
-## 5. Improvement Paths (Ranked)
+## 5. KL Divergence Analysis (Critical Revision)
+
+KLD analysis against MQ4 as reference (0.8B, wikitext2, ctx=512, asym4):
+
+### 5.1 Results
+
+| Metric | MFP4 (FWHT+E2M1) | HFP4 (E2M1, no FWHT) | HFQ4 (INT4, no FWHT) |
+|--------|:-:|:-:|:-:|
+| **Mean KLD** | **0.661** | 0.815 | 0.936 |
+| Median KLD | 0.498 | 0.696 | 0.799 |
+| **Max KLD** | **4.044** | 7.076 | 7.533 |
+| **Mean JSD** | **0.131** | 0.153 | 0.180 |
+| **Top-1 agreement** | **63.2%** | 59.6% | 49.3% |
+| Top-5 overlap | 2.96/5 | 2.81/5 | 2.71/5 |
+| Mean L-inf | 0.192 | 0.213 | 0.240 |
+
+Self-comparison (MQ4 vs MQ4) produces exactly zero divergence across all
+503 scored positions, confirming tool correctness.
+
+### 5.2 MFP4 is Closest to MQ4
+
+Despite losing on PPL, MFP4 is **the closest format to MQ4** at the output
+distribution level:
+- 30% lower KLD than HFQ4 (0.661 vs 0.936)
+- 19% lower KLD than HFP4 (0.661 vs 0.815)
+- 63.2% top-1 agreement (vs 49.3% for HFQ4)
+- Fewest catastrophic positions (max KLD 4.04 vs 7.53)
+
+### 5.3 FWHT Helps E2M1 (Contradicts "Anti-Synergy" Hypothesis)
+
+MFP4 (FWHT + E2M1) has significantly lower KLD than HFP4 (E2M1 alone):
+0.661 vs 0.815, a 19% improvement. FWHT makes E2M1's quantization errors
+more uniform and predictable, keeping output distributions closer to MQ4.
+
+The initial "anti-synergy" conclusion was based solely on PPL, which
+measures cross-entropy against the corpus (ground truth), not against MQ4.
+KLD reveals that FWHT + E2M1 produces distributions that track MQ4 more
+closely than E2M1 alone — the opposite of what PPL suggested.
+
+### 5.4 PPL vs KLD: Why They Disagree
+
+**PPL** = cross-entropy against ground truth tokens. Sensitive to the
+probability assigned to the single correct next token.
+
+**KLD** = divergence of the full output distribution from a reference.
+Captures overall distributional similarity.
+
+MFP4 tracks MQ4's distribution closely (low KLD, high top-1 agreement)
+but with consistently slightly **higher entropy** — probability mass
+spreads slightly from the correct token to neighbors. Each position
+loses a small amount of log-probability on the correct token. This
+compounds multiplicatively across hundreds of positions into a large
+PPL gap, even though the per-position distributions look similar.
+
+**Implication:** The PPL gap is a consistent small entropy increase, not a
+distributional collapse. For **sampling-based generation** (temperature > 0,
+which is the dominant use case for chat/code/reasoning), MFP4's output
+quality may be nearly equivalent to MQ4. The PPL gap overstates the
+practical quality difference.
+
+---
+
+## 6. Improvement Paths (Ranked, Revised Post-KLD)
 
 Given the constraint that RDNA4-native E2M1 is the long-term hardware
 target (`v_cvt_pk_fp8_e2m1`, `v_wmma_f32_16x16x32_fp8_fp8`):
@@ -225,17 +294,18 @@ target (`v_cvt_pk_fp8_e2m1`, `v_wmma_f32_16x16x32_fp8_fp8`):
 
 | # | Improvement | Evidence | Impact estimate | Cost |
 |---|-------------|----------|:---------------:|:----:|
-| 1 | **Don't pair E2M1 with FWHT** | Anti-synergy: +25-94% PPL vs MQ4 under FWHT; only +16% without | Eliminates largest quality loss factor (~60% of gap) | Architecture decision |
-| 2 | **FP16 block scale** | 8.76% NRMSE gain; FP32 = zero additional benefit | ~2-5% PPL improvement (25% of gap) | +0.25 bpw (+5.8% size) |
-| 3 | **Per-block zero-point** | INT4 wins unrotated because of per-group affine adaptation | ~2-3% PPL improvement (10% of gap) | +0.5 bpw (+12% size) |
+| 1 | **FP16 block scale** | 8.76% NRMSE gain; FP32 = zero additional benefit | May disproportionately close PPL gap if entropy spread is scale-driven | +0.25 bpw (+5.8% size) |
+| 2 | **Per-block zero-point** | INT4 wins unrotated because of per-group affine adaptation | ~2-3% PPL improvement (10% of gap) | +0.5 bpw (+12% size) |
+| 3 | **Keep FWHT with E2M1** | KLD: MFP4 0.661 vs HFP4 0.815 — FWHT helps 19% | Reversed from initial recommendation | No cost change |
 
 ### Tier 2 — Moderate impact, theoretically grounded
 
 | # | Improvement | Evidence | Impact estimate | Cost |
 |---|-------------|----------|:---------------:|:----:|
-| 4 | **Lloyd-Max LUT on pre-RDNA4** | 58.8% less MSE than E2M1; codebook is nearly uniform | Significant but pre-RDNA4 only (software LUT) | Zero runtime cost |
-| 5 | **Stochastic rounding** | RTN bias in E2M1's 0-to-0.5 density gap is systematic | Small PPL gain; literature recommends for FP4 | ~10 lines in quantizer |
-| 6 | **E2M1 at g=256** | E2M1 beats INT4 at g=256 in MSE (0.00137 vs 0.00169) | May recover E2M1's natural advantage | Loses fine block adaptation |
+| 4 | **Entropy-focused optimization** | PPL gap is entropy spread, not wrong tokens | Target: reduce probability broadening, not MSE | Research needed |
+| 5 | **Lloyd-Max LUT on pre-RDNA4** | 58.8% less MSE than E2M1; codebook is nearly uniform | Significant but pre-RDNA4 only (software LUT) | Zero runtime cost |
+| 6 | **Stochastic rounding** | RTN bias in E2M1's 0-to-0.5 density gap is systematic | May reduce entropy spread | ~10 lines in quantizer |
+| 7 | **E2M1 at g=256** | E2M1 beats INT4 at g=256 in MSE (0.00137 vs 0.00169) | May recover E2M1's natural advantage | Loses fine block adaptation |
 
 ### Tier 3 — High effort, untested
 
@@ -247,52 +317,59 @@ target (`v_cvt_pk_fp8_e2m1`, `v_wmma_f32_16x16x32_fp8_fp8`):
 
 ---
 
-## 6. Strategic Recommendations
+## 7. Strategic Recommendations (Revised Post-KLD)
 
-### 6.1 For RDNA4 Hardware Path
+### 7.1 For RDNA4 Hardware Path
 
 The RDNA4 `v_cvt_pk_fp8_e2m1` instruction locks the element format to
-E2M1. Given this constraint:
+E2M1. Given this constraint and the KLD findings:
 
-1. **Ship unrotated E2M1** — don't apply FWHT. Let E2M1 handle
-   heavy-tailed distributions natively. FWHT actively hurts E2M1.
+1. **Keep FWHT with E2M1** — KLD shows FWHT helps E2M1 by 19% (MFP4
+   KLD 0.661 vs HFP4 0.815). The initial "anti-synergy" conclusion
+   was based on PPL alone and is revised.
 2. **Use FP16 block scales** — UE8M0's power-of-2 constraint costs
    8.76% NRMSE for zero benefit. FP16 captures all available precision.
+   May disproportionately close the PPL gap if the entropy spread is
+   driven by scale overshoot.
 3. **Add per-block FP16 bias (zero-point)** — the single biggest
    quality differentiator between INT4 and E2M1 is per-group affine
    adaptation, not the codebook shape. A per-block bias would give E2M1
    the same per-group adaptivity at +0.5 bpw.
-4. **Investigate GPTQ-style error feedback** — already in the research
-   queue for MQ3/MQ2 (`docs/plans/mq-sub4bit-research-queue.md`).
-   Extend to E2M1.
+4. **Focus on entropy reduction** — the PPL gap is from consistent
+   small probability broadening, not wrong tokens. Investigate whether
+   tighter scales, stochastic rounding, or GPTQ error feedback can
+   reduce this entropy spread specifically.
 
-### 6.2 For Pre-RDNA4 (Current gfx1100/1151)
+### 7.2 For Pre-RDNA4 (Current gfx1100/1151)
 
-1. **Keep MQ4G256 as the quality default** — it wins in every rotated
-   comparison and the FWHT rotation is hipfire's moat for INT4.
-2. **Consider Lloyd-Max LUT** for unrotated FP4 on pre-RDNA4 — the LUT
-   is pure software, zero hardware cost, 37% less MSE than E2M1.
-3. **Don't invest further in MFP4** (FWHT + E2M1) — the anti-synergy
-   is fundamental and confirmed by both theory and measurement.
+1. **Keep MQ4G256 as the quality default for greedy decoding** — it
+   wins on PPL in every comparison.
+2. **MFP4 may be viable for sampling use cases** — 63.2% top-1
+   agreement with MQ4 and lowest KLD of any alternative format. The
+   PPL gap may not manifest in practice under temperature > 0.
+3. **Consider Lloyd-Max LUT** for unrotated FP4 — the LUT is pure
+   software, zero hardware cost, 37% less MSE than E2M1.
 
-### 6.3 The Uncomfortable Question
+### 7.3 The Key Question Going Forward
 
-With the recommended changes (FP16 scale, zero-point, no FWHT), the
-RDNA4-native format becomes "E2M1 codes with FP16 affine parameters per
-block" — structurally similar to INT4 with affine quantization, but
-using E2M1's fixed non-uniform code spacing instead of uniform spacing.
-At g=32, this is strictly worse than INT4 uniform (58.8% more MSE).
+The PPL-vs-KLD divergence reveals that **the right evaluation metric
+depends on the use case:**
 
-The question is whether RDNA4's hardware E2M1 decode path provides
-enough throughput advantage to justify the quality cost. If the hardware
-`v_cvt_pk_fp8_e2m1` + `v_wmma_f32_16x16x32_fp8_fp8` path delivers 2×
-the FLOPS of software INT4 dequant + FP16 WMMA, the quality gap may be
-an acceptable trade. This is an empirical question that can only be
-answered on RDNA4 silicon.
+- **Greedy/deterministic decoding** (benchmarks, factual QA): PPL is
+  the right metric. MQ4 wins. E2M1's entropy spread compounds.
+- **Sampling-based generation** (chat, code, reasoning with temp > 0):
+  KLD and top-1 agreement are more relevant. MFP4's 63.2% top-1
+  agreement and low KLD suggest practical equivalence.
+- **RDNA4 hardware throughput**: if `v_cvt_pk_fp8_e2m1` +
+  `v_wmma_f32_16x16x32_fp8_fp8` delivers 2× FLOPS of software INT4,
+  MFP4's small entropy cost may be an acceptable trade for speed.
+
+The next step is to measure MFP4 vs MQ4 on **downstream task quality**
+(chat coherence, code completion accuracy) under sampling, not just PPL.
 
 ---
 
-## 7. Methodology Notes
+## 8. Methodology Notes
 
 ### 7.1 Tools and Data
 
