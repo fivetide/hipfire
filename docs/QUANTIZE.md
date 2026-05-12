@@ -111,6 +111,35 @@ Q5_K, Q5_0, Q5_1, IQ2_*, IQ3_*, IQ4_* are not implemented. The
 quantizer panics on encounter. Adding one is a ~150-line port from
 llama.cpp's `ggml-quants.c` to `crates/hipfire-quantize/src/gguf_input.rs`.
 
+## Importance Matrix (imatrix)
+
+Improve quantization quality by providing activation importance data
+from a calibration run:
+
+```bash
+hipfire quantize Qwen/Qwen3.5-9B \
+    --format mq4 \
+    --imatrix path/to/imatrix.gguf \
+    --install
+```
+
+The imatrix file is a llama.cpp-format GGUF containing per-column
+importance scores. Community-provided imatrix files are available on
+HuggingFace for popular models. Generate your own with llama.cpp's
+`llama-imatrix` tool on ~100K tokens of calibration text.
+
+When `--imatrix` is provided:
+- All quantize functions use importance-weighted scale optimization
+  (better scale/zero choices for important features)
+- Tensor promotion is data-driven: the most important tensors get
+  promoted to 6-bit, matching the budget of the default K-map
+
+Without `--imatrix`, behavior is identical to today.
+
+Quantization time increases ~3x when `--imatrix` is used (iterative
+scale optimizer). No runtime/inference changes — the output `.hfq`
+file format is unchanged.
+
 ## Quality caveat for GGUF
 
 GGUF input is double-quantization: the source weights are already
