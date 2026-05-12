@@ -684,7 +684,8 @@ impl Gpu {
             eprintln!("WARNING: HIP runtime {}.{} may not support {}. Minimum: {}.{}", hip_major, hip_minor, arch, min_major, min_minor);
             eprintln!("  Update your HIP runtime or kernels may fail to load.");
         }
-        eprintln!("GPU dev {}: {} ({:.1} GB VRAM, HIP {}.{})", id, arch, vram_total as f64 / 1e9, hip_major, hip_minor);
+        let mem_label = if hip.is_integrated() { "unified RAM, iGPU" } else { "VRAM" };
+        eprintln!("GPU dev {}: {} ({:.1} GB {}, HIP {}.{})", id, arch, vram_total as f64 / 1e9, mem_label, hip_major, hip_minor);
 
         let compiler = KernelCompiler::new(&arch)?;
 
@@ -1624,6 +1625,24 @@ impl Gpu {
     pub fn download_f32(&self, tensor: &GpuTensor) -> HipResult<Vec<f32>> {
         self.bind_thread()?;
         let numel = tensor.numel();
+        // iGPU: all pool buffers are fine-grained coherent unified memory,
+        // so the GPU pointer is directly readable from CPU after a sync.
+        if self.hip.is_integrated() {
+            if let Some(s) = self.active_stream.as_ref() {
+                self.hip.stream_synchronize(s)?;
+            } else {
+                self.hip.device_synchronize()?;
+            }
+            let mut data = vec![0.0f32; numel];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    tensor.buf.as_ptr() as *const f32,
+                    data.as_mut_ptr(),
+                    numel,
+                );
+            }
+            return Ok(data);
+        }
         let mut data = vec![0.0f32; numel];
         let bytes = unsafe {
             std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, numel * 4)

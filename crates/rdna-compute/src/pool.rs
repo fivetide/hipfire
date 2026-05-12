@@ -16,6 +16,8 @@ pub struct GpuPool {
     pub total_allocated: usize,
     pub total_reused: usize,
     pub total_new: usize,
+    /// Use unified memory for new allocations (set once at first alloc).
+    use_unified: Option<bool>,
 }
 
 impl GpuPool {
@@ -25,6 +27,7 @@ impl GpuPool {
             total_allocated: 0,
             total_reused: 0,
             total_new: 0,
+            use_unified: None,
         }
     }
 
@@ -69,7 +72,11 @@ impl GpuPool {
         let actual = if size < MIN_ALLOC { MIN_ALLOC } else { size };
         self.total_new += 1;
         self.total_allocated += actual;
-        hip.malloc(actual)
+        if *self.use_unified.get_or_insert_with(|| hip.is_integrated()) {
+            Ok(hip.malloc_unified(actual)?.0)
+        } else {
+            hip.malloc(actual)
+        }
     }
 
     /// Return a buffer to the pool for reuse. The buffer's ACTUAL

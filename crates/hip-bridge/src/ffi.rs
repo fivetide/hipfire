@@ -209,6 +209,15 @@ pub struct HipRuntime {
     fn_get_device_properties: unsafe extern "C" fn(*mut u8, c_int) -> u32,
     fn_get_device_attribute: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32,
     fn_mem_get_info: unsafe extern "C" fn(*mut usize, *mut usize) -> u32,
+
+    // iGPU unified memory — optional symbols, loaded at init
+    fn_ext_malloc_with_flags:
+        Option<unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32>,
+    fn_stream_query: Option<unsafe extern "C" fn(HipStream) -> u32>,
+    fn_event_query: Option<unsafe extern "C" fn(HipEvent) -> u32>,
+
+    /// Cached iGPU detection. OnceLock is Sync-safe (unlike Cell).
+    integrated: std::sync::OnceLock<bool>,
 }
 
 // HipRuntime is Send+Sync — the underlying HIP runtime is thread-safe for API calls.
@@ -332,6 +341,10 @@ impl HipRuntime {
                 fn_get_device_properties: load_fn!(lib, "hipGetDeviceProperties", unsafe extern "C" fn(*mut u8, c_int) -> u32),
                 fn_get_device_attribute: load_fn!(lib, "hipDeviceGetAttribute", unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32),
                 fn_mem_get_info: load_fn!(lib, "hipMemGetInfo", unsafe extern "C" fn(*mut usize, *mut usize) -> u32),
+                fn_ext_malloc_with_flags: lib.get::<unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32>(b"hipExtMallocWithFlags\0").ok().map(|s| *s.into_raw()),
+                fn_stream_query: lib.get::<unsafe extern "C" fn(HipStream) -> u32>(b"hipStreamQuery\0").ok().map(|s| *s.into_raw()),
+                fn_event_query: lib.get::<unsafe extern "C" fn(HipEvent) -> u32>(b"hipEventQuery\0").ok().map(|s| *s.into_raw()),
+                integrated: std::sync::OnceLock::new(),
                 _lib: lib,
             })
         }
@@ -1072,6 +1085,48 @@ impl HipRuntime {
         let code = unsafe { (self.fn_mem_get_info)(&mut free, &mut total) };
         self.check(code, "hipMemGetInfo")?;
         Ok((free, total))
+    }
+
+    // ── iGPU / APU support ──────────────────────────────────────
+
+    /// Whether the current device is an integrated GPU (APU).
+    /// Cached via OnceLock. Override with `HIPFIRE_FORCE_INTEGRATED={0,1}`.
+    pub fn is_integrated(&self) -> bool {
+        *self.integrated.get_or_init(|| {
+            match std::env::var("HIPFIRE_FORCE_INTEGRATED").ok().as_deref() {
+                Some("1") => true,
+                Some("0") => false,
+                // hipDeviceAttributeIntegrated == 67
+                _ => self.get_device_attribute(67, 0).unwrap_or(0) != 0,
+            }
+        })
+    }
+
+    /// Allocate fine-grained coherent unified memory (iGPU fast path).
+    /// Returns `(DeviceBuffer, is_unified)`. Falls back to `hipMalloc`.
+    pub fn malloc_unified(&self, size: usize) -> HipResult<(DeviceBuffer, bool)> {
+        // hipDeviceMallocFinegrained == 0x1 (hip_runtime_api.h)
+        if let Some(ext_malloc) = self.fn_ext_malloc_with_flags {
+            let mut ptr: *mut c_void = ptr::null_mut();
+            let code = unsafe { (ext_malloc)(&mut ptr, size, 0x1) };
+            if code == HIP_SUCCESS {
+                return Ok((DeviceBuffer { ptr, size }, true));
+            }
+        }
+        let buf = self.malloc(size)?;
+        Ok((buf, false))
+    }
+
+    /// Non-blocking stream query. Returns `true` if the stream is idle.
+    pub fn stream_query(&self, stream: &Stream) -> bool {
+        self.fn_stream_query
+            .map_or(true, |q| unsafe { (q)(stream.0) } == HIP_SUCCESS)
+    }
+
+    /// Non-blocking event query. Returns `true` if the event has completed.
+    pub fn event_query(&self, event: &Event) -> bool {
+        self.fn_event_query
+            .map_or(false, |q| unsafe { (q)(event.0) } == HIP_SUCCESS)
     }
 }
 
