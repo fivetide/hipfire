@@ -1625,23 +1625,23 @@ impl Gpu {
     pub fn download_f32(&self, tensor: &GpuTensor) -> HipResult<Vec<f32>> {
         self.bind_thread()?;
         let numel = tensor.numel();
-        // iGPU: all pool buffers are fine-grained coherent unified memory,
-        // so the GPU pointer is directly readable from CPU after a sync.
+        // iGPU zero-copy: when we have an active stream, sync it and read
+        // directly from the unified pointer. Avoids hipMemcpy D2H overhead.
+        // When no active stream, fall through to memcpy_dtoh which handles
+        // its own sync and is already cheap on unified memory.
         if self.hip.is_integrated() {
             if let Some(s) = self.active_stream.as_ref() {
                 self.hip.stream_synchronize(s)?;
-            } else {
-                self.hip.device_synchronize()?;
+                let mut data = vec![0.0f32; numel];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        tensor.buf.as_ptr() as *const f32,
+                        data.as_mut_ptr(),
+                        numel,
+                    );
+                }
+                return Ok(data);
             }
-            let mut data = vec![0.0f32; numel];
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    tensor.buf.as_ptr() as *const f32,
-                    data.as_mut_ptr(),
-                    numel,
-                );
-            }
-            return Ok(data);
         }
         let mut data = vec![0.0f32; numel];
         let bytes = unsafe {
