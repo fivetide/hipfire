@@ -6589,17 +6589,36 @@ fn ffn_batched(
         // Grouped gate_up GEMM: M = 2*im (gate||up concat), K = hidden.
         // x_row_div = k_top because X is per-token ffn_x_rot_batch [B, K].
         //
-        // Opt-in 4-warp 64×16 variant (HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W=1):
-        // bit-exact vs the single-warp baseline (`bench_mq2g256_lloyd_moe_4w`
-        // max_abs=0 across all V4F MoE cells). 1.04-1.13× microbench at
-        // PP_BATCH ∈ {128, 256, 1024}. Default OFF — the kernel is
-        // memory-latency / scheduling bound at ~6 GiB/s (well below DRAM
-        // peak), so the tile lever is small here; opt in for tuning.
-        let use_lloyd_4w = std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W")
-            .as_deref() == Ok("1")
-            && (2 * im) % 64 == 0
-            && hidden % 256 == 0;
-        if use_lloyd_4w {
+        // 4-warp 64×16 variant (gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2).
+        // Default ON for gfx11+ (measured 83.8% vs 43.4% L2 hit, -9% kernel
+        // time on gfx1151). Opt out via HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W=0.
+        // Shape gate: gate_up M=2*im must be multiple of 64, K=hidden of 256.
+        let use_lloyd_4w = match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W")
+            .as_deref()
+        {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => (gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"))
+        } && (2 * im) % 64 == 0
+          && hidden % 256 == 0;
+        // MMQ-style preload override (HIPFIRE_DEEPSEEK4_MOE_MMQLOAD=1).
+        let use_mmqload = use_lloyd_4w && std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD")
+            .as_deref() == Ok("1");
+        if use_mmqload {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(
+                gate_up_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.ffn_x_rot_batch,
+                &pbs.moe_y_gate_up_grouped,
+                2 * im,
+                hidden,
+                k_top,
+                m_total_max,
+                batch_size,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_mmqload gate_up l{layer_idx}: {e:?}"))?;
+        } else if use_lloyd_4w {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
                 gate_up_ptrs,
                 &pbs.moe_expert_tile_ids,
@@ -6690,12 +6709,32 @@ fn ffn_batched(
         // Grouped down GEMM: M = hidden, K = im. x_row_div = 1 because
         // moe_rot_batch is [B × k_top, im] flat — sorted_slot_index[s]
         // already yields the row index directly (b*k_top + krank).
-        // Same 4w shape-gated opt-in as the gate_up GEMM above.
-        let use_lloyd_4w_down = std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W")
-            .as_deref() == Ok("1")
-            && hidden % 64 == 0
-            && im % 256 == 0;
-        if use_lloyd_4w_down {
+        // Same 4w default as the gate_up GEMM above.
+        let use_lloyd_4w_down = match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W")
+            .as_deref()
+        {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => (gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"))
+        } && hidden % 64 == 0
+          && im % 256 == 0;
+        let use_mmqload_down = use_lloyd_4w_down && std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD")
+            .as_deref() == Ok("1");
+        if use_mmqload_down {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(
+                w2_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.moe_rot_batch,
+                &pbs.moe_y_down_grouped,
+                hidden,
+                im,
+                1,
+                m_total_max,
+                batch_size * k_top,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_mmqload down l{layer_idx}: {e:?}"))?;
+        } else if use_lloyd_4w_down {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
                 w2_ptrs,
                 &pbs.moe_expert_tile_ids,
