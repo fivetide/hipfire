@@ -13054,6 +13054,11 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 Some("ldscoop") => ("gemm_gate_up_hfq4g256_wmma_ldscoop",
                                     kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC,
                                     16, 32),
+                // nosync = barrier-free variant. Removes LDS staging +
+                // __syncthreads(); each warp loads weights from global.
+                Some("nosync") => ("gemm_gate_up_hfq4g256_wmma_ldscoop_nosync",
+                                   kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_NOSYNC_SRC,
+                                   16, 32),
                 // 2tile = 32 rows × 16 cols per block, 2 wave32 waves.
                 // Halves grid in M; both waves share the same X tile so
                 // L0/L1 cache absorbs the second wave's loads cheaply.
@@ -30575,6 +30580,10 @@ impl Gpu {
 
     /// Barrier-free variant of the mmqload kernel.
     /// Eliminates __syncthreads() and LDS X staging.
+    /// Barrier-free nosync variant of the mmqload kernel.
+    /// Eliminates __syncthreads() and LDS X staging; each warp loads
+    /// X from global memory independently.
+    #[allow(clippy::too_many_arguments)]
     pub fn gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync(
         &mut self,
         expert_weight_ptrs: &GpuTensor,
@@ -30624,6 +30633,7 @@ impl Gpu {
         let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
         let timer = crate::profile::begin_timer(
             &self.hip, "gemm", kernel_name, bytes,
+            &self.hip, "gemm", "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync", bytes,
         );
         let result = self.launch_maybe_blob(
             kernel_name,
