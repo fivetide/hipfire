@@ -13088,6 +13088,10 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 Some("nosync") => ("gemm_gate_up_hfq4g256_wmma_ldscoop_nosync",
                                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_NOSYNC_SRC,
                                    16, 32),
+                // hybrid = LDS weight staging + no __syncthreads.
+                Some("hybrid") => ("gemm_gate_up_hfq4g256_wmma_hybrid",
+                                   kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_HYBRID_SRC,
+                                   16, 32),
                 // 2tile = 32 rows × 16 cols per block, 2 wave32 waves.
                 // Halves grid in M; both waves share the same X tile so
                 // L0/L1 cache absorbs the second wave's loads cheaply.

@@ -1366,6 +1366,9 @@ pub const GEMM_GATE_UP_HFQ4G256_WMMA_K4_SRC: &str = include_str!("../../../kerne
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_ldscoop.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_NOSYNC_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_ldscoop_nosync.hip");
+/// Hybrid variant: LDS weight staging (coalesced) + no __syncthreads.
+pub const GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_HYBRID_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_hybrid.hip");
 // 2tile variant: 32 rows × 16 cols output tile per block, 64 threads
 // (2 wave32). Halves grid in M-dim (1728 → 864 blocks at M=27648),
 // amortizing per-block X-tile (FP16 batch matrix) loads across both
