@@ -5514,8 +5514,14 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, n,
             );
         }
-        let (src, module) = kernels::gemm_gate_up_mq3g256_lloyd_wmma_for_arch(&self.arch_caps);
-        self.ensure_kernel(module, src, "gemm_gate_up_mq3g256_lloyd_wmma")?;
+        let use_nosync = std::env::var("HIPFIRE_GATE_UP_NOSYNC").is_ok();
+        let (src, module) = if use_nosync {
+            kernels::gemm_gate_up_mq3g256_lloyd_wmma_nosync_for_arch(&self.arch_caps)
+        } else {
+            kernels::gemm_gate_up_mq3g256_lloyd_wmma_for_arch(&self.arch_caps)
+        };
+        let kernel_name = if use_nosync { "gemm_gate_up_mq3g256_lloyd_wmma_nosync" } else { "gemm_gate_up_mq3g256_lloyd_wmma" };
+        self.ensure_kernel(module, src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
         let mut a_gate_p = a_gate.buf.as_ptr();
@@ -5548,8 +5554,9 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         let timer = crate::profile::begin_timer(
             &self.hip, "gemm", "gemm_gate_up_mq3g256_lloyd_wmma", bytes,
         );
+        let launch_name = if use_nosync { "gemm_gate_up_mq3g256_lloyd_wmma_nosync" } else { "gemm_gate_up_mq3g256_lloyd_wmma" };
         let result = self.launch_maybe_blob(
-            "gemm_gate_up_mq3g256_lloyd_wmma",
+            launch_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -5578,8 +5585,14 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         k: usize, n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_gate_up_mq3g256_lloyd_wmma_mb4_for_arch(&self.arch_caps);
-        self.ensure_kernel(module, src, "gemm_gate_up_mq3g256_lloyd_wmma_mb4")?;
+        let use_nosync = std::env::var("HIPFIRE_GATE_UP_NOSYNC").is_ok();
+        let (src, module) = if use_nosync {
+            kernels::gemm_gate_up_mq3g256_lloyd_wmma_mb4_nosync_for_arch(&self.arch_caps)
+        } else {
+            kernels::gemm_gate_up_mq3g256_lloyd_wmma_mb4_for_arch(&self.arch_caps)
+        };
+        let kernel_name = if use_nosync { "gemm_gate_up_mq3g256_lloyd_wmma_mb4_nosync" } else { "gemm_gate_up_mq3g256_lloyd_wmma_mb4" };
+        self.ensure_kernel(module, src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
         let mut a_gate_p = a_gate.buf.as_ptr();
@@ -5612,8 +5625,9 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         let timer = crate::profile::begin_timer(
             &self.hip, "gemm", "gemm_gate_up_mq3g256_lloyd_wmma_mb4", bytes,
         );
+        let launch_name = if use_nosync { "gemm_gate_up_mq3g256_lloyd_wmma_mb4_nosync" } else { "gemm_gate_up_mq3g256_lloyd_wmma_mb4" };
         let result = self.launch_maybe_blob(
-            "gemm_gate_up_mq3g256_lloyd_wmma_mb4",
+            launch_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
