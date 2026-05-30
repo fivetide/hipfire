@@ -13007,6 +13007,11 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 Some("ldscoop") => ("gemm_gate_up_hfq4g256_wmma_ldscoop",
                                     kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC,
                                     16, 32),
+                // nosync = barrier-free variant. Removes LDS staging +
+                // __syncthreads(); each warp loads weights from global.
+                Some("nosync") => ("gemm_gate_up_hfq4g256_wmma_ldscoop_nosync",
+                                   kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_NOSYNC_SRC,
+                                   16, 32),
                 // 2tile = 32 rows × 16 cols per block, 2 wave32 waves.
                 // Halves grid in M; both waves share the same X tile so
                 // L0/L1 cache absorbs the second wave's loads cheaply.
@@ -30509,6 +30514,75 @@ impl Gpu {
         let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
         let timer = crate::profile::begin_timer(
             &self.hip, "gemm", kernel_name, bytes,
+        );
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1], [128, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep); b.push_ptr(tp); b.push_ptr(sp);
+                b.push_ptr(xp); b.push_ptr(yp);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b.push_i32(xrd_val); b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Barrier-free nosync variant of the mmqload kernel.
+    /// Eliminates __syncthreads() and LDS X staging; each warp loads
+    /// X from global memory independently.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(m % 64, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync: M must be a multiple of 64 (got {m})");
+        debug_assert_eq!(k % 256, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync: K must be a multiple of 256 (got {k})");
+        let kernel_name = "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync";
+        let kernel_src  = kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_MMQLOAD_NOSYNC_SRC;
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val   = m as i32;
+        let k_val   = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val  = m_total as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+        let row_tiles  = ((m + 63) / 64) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync", bytes,
         );
         let result = self.launch_maybe_blob(
             kernel_name,
