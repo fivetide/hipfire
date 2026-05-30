@@ -30662,7 +30662,6 @@ impl Gpu {
         let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
         let timer = crate::profile::begin_timer(
             &self.hip, "gemm", kernel_name, bytes,
-            &self.hip, "gemm", "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync", bytes,
         );
         let result = self.launch_maybe_blob(
             kernel_name,
