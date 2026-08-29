@@ -5,7 +5,9 @@
 //! Mmaps .safetensors files and serves tensor data by name.
 
 use crate::model_source::{ModelSource, QuantConfig, TensorInfo};
+use half::bf16;
 use memmap2::Mmap;
+use safetensors::SafeTensors;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read as _;
@@ -14,7 +16,6 @@ use std::path::{Path, PathBuf};
 struct SafetensorsFile {
     _file: File,
     mmap: Mmap,
-    header_size: usize,
 }
 
 pub struct SafetensorsSource {
@@ -68,58 +69,42 @@ impl SafetensorsSource {
             let file = File::open(st_path)?;
             let mmap = unsafe { Mmap::map(&file)? };
 
-            // Parse safetensors header
-            let header_len = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
-            let header_json = std::str::from_utf8(&mmap[8..8 + header_len])
+            let parsed = SafeTensors::deserialize(&mmap)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            let raw: serde_json::Value = serde_json::from_str(header_json)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-            let header_size = 8 + header_len;
-
-            if let serde_json::Value::Object(map) = raw {
-                for (name, meta) in map {
-                    if name == "__metadata__" {
-                        continue;
-                    }
-                    let dtype = meta["dtype"].as_str().unwrap_or("F16").to_string();
-                    let shape: Vec<usize> = meta["shape"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|v| v.as_u64().map(|n| n as usize))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let offsets = meta["data_offsets"]
-                        .as_array()
-                        .map(|a| {
-                            let start = a[0].as_u64().unwrap_or(0) as usize;
-                            let end = a[1].as_u64().unwrap_or(0) as usize;
-                            (start, end)
-                        })
-                        .unwrap_or((0, 0));
-
-                    let tensor_idx = tensors.len();
-                    let info = TensorInfo {
-                        name: name.clone(),
-                        dtype,
-                        shape,
-                        quant_type: 0xFF, // not an HFQ quant_type
-                        data_offset: header_size + offsets.0,
-                        data_size: offsets.1 - offsets.0,
-                    };
-                    tensors.push(info);
-                    tensor_map.insert(name, (file_idx, tensor_idx));
-                }
+            let mmap_start = mmap.as_ptr() as usize;
+            for (name, view) in parsed.iter() {
+                let data_offset = (view.data().as_ptr() as usize)
+                    .checked_sub(mmap_start)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("safetensors tensor {name} is outside its mmap"),
+                        )
+                    })?;
+                let tensor_idx = tensors.len();
+                let info = TensorInfo {
+                    name: name.to_string(),
+                    dtype: view.dtype().to_string(),
+                    shape: view.shape().to_vec(),
+                    quant_type: 0xFF, // not an HFQ quant_type
+                    data_offset,
+                    data_size: view.data().len(),
+                };
+                tensors.push(info);
+                tensor_map.insert(name.to_string(), (file_idx, tensor_idx));
             }
 
-            files.push(SafetensorsFile {
-                _file: file,
-                mmap,
-                header_size,
-            });
+            files.push(SafetensorsFile { _file: file, mmap });
         }
+
+        tracing::debug!(
+            model_dir = %dir.display(),
+            shard_count = files.len(),
+            tensor_count = tensors.len(),
+            arch_id,
+            quantized = quant_config.is_some(),
+            "opened safetensors model source"
+        );
 
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -202,7 +187,7 @@ impl ModelSource for SafetensorsSource {
     }
 }
 
-fn derive_arch_id(config: &serde_json::Value) -> u32 {
+pub fn derive_arch_id(config: &serde_json::Value) -> u32 {
     let archs = config
         .get("architectures")
         .and_then(|a| a.as_array())
@@ -217,8 +202,19 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         .unwrap_or(0)
         > 0;
 
+    // Architectures field takes priority over model_type (HF convention).
+    // This loop is table-driven: any known model_type substring inside the
+    // architecture string is resolved via the canonical table, longest key
+    // wins so gemma4_unified_assistant (22) beats gemma4 (13) and
+    // muse_glimmer_assistant (23) beats muse_glimmer (14). The table alone
+    // cannot express the priority ordering nor the qwen3.5/3.6 dense-vs-MoE
+    // has_experts decision, so those remain explicit.
     for arch in &archs {
         let arch_lower = arch.to_lowercase();
+        // qwen3.5/3.6 family: dense (5) vs MoE (6) decided by has_experts.
+        // This is the only per-arch substring check that must remain: the
+        // table maps the four dense strings to 5, but a MoE checkpoint uses
+        // the same strings with num_experts>0 to mean 6.
         if arch_lower.contains("qwen3_5")
             || arch_lower.contains("qwen3.5")
             || arch_lower.contains("qwen3_6")
@@ -226,59 +222,46 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         {
             return if has_experts { 6 } else { 5 };
         }
-        // qwen2 → arch_id=7 (Qwen2Carrier loads the Q/K/V attention biases the
-        // llama-family Dir loader drops); qwen3 → arch_id=1 (LlamaCarrier).
-        if arch_lower.contains("qwen2") {
-            return 7;
+        // Generic table-driven substring match for all other architectures.
+        let mut best: Option<(&'static str, u32)> = None;
+        for (k, v) in crate::arch_mapping::MODEL_TYPE_TO_ARCH_ID {
+            if arch_lower.contains(*k) {
+                match best {
+                    Some((bk, _)) if k.len() <= bk.len() => {}
+                    _ => best = Some((*k, *v)),
+                }
+            }
         }
-        if arch_lower.contains("qwen3") {
-            return 1;
-        }
-        if arch_lower.contains("llama") || arch_lower.contains("mistral") {
-            return 0;
+        if let Some((_, id)) = best {
+            return id;
         }
     }
 
-    // Fallback: check model_type
+    // Fallback: check model_type via the canonical table (single source of truth).
     let model_type = config
         .get("model_type")
         .or_else(|| text_config.get("model_type"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    match model_type {
-        "qwen3_5" | "qwen3.5" | "qwen3_6" | "qwen3.6" => {
-            if has_experts {
-                6
-            } else {
-                5
-            }
+    if let Some(mut id) = crate::arch_mapping::lookup_model_type(model_type) {
+        // qwen3.5/3.6 dense entries are 5 in the table; has_experts flips to 6.
+        if id == 5 && has_experts {
+            id = 6;
         }
-        "qwen3" => 1,
-        // qwen2 dirs route to arch_id=7 (Qwen2Carrier / hipfire-arch-qwen2) so
-        // the Q/K/V `attention_bias=true` biases load — the llama-family Dir
-        // loader (arch_id=1) drops them and produces garbage.
-        "qwen2" => 7,
-        "llama" | "mistral" => 0,
-        // Per-expert / VLM arches whose safetensors Dir paths route to their
-        // dedicated carriers. model_type strings mirror the quantizer ingest
-        // map (hipfire-quantize/src/main.rs auto_arch_id).
-        "dots_ocr" => 8,
-        "deepseek_v4" => 9,
-        "minimax_m2" => 10,
-        "lfm2_moe" | "lfm2" => 11,
-        "cohere2_moe" => 12,
-        _ => {
-            // C1: unrecognized model_type → an explicit unclaimed sentinel that NO
-            // carrier matches, so `load_model` fails cleanly with "no carrier for
-            // <dir>" instead of silently mis-routing to Qwen35 (arch_id=5) and dying
-            // deep in weight loading with a confusing error.
-            eprintln!(
-                "warning: unrecognized model_type '{model_type}'; no carrier claims it \
-                 (add a carrier or extend derive_arch_id's model_type mapping)"
-            );
-            UNCLAIMED_ARCH_ID
-        }
+        return id;
+    }
+
+    // C1: unrecognized model_type → an explicit unclaimed sentinel that NO
+    // carrier matches, so `load_model` fails cleanly with "no carrier for
+    // <dir>" instead of silently mis-routing to Qwen35 (arch_id=5) and dying
+    // deep in weight loading with a confusing error.
+    {
+        let supported = crate::arch_mapping::supported_model_types_display();
+        eprintln!(
+            "warning: unrecognized model_type '{model_type}'; no carrier claims it              (supported model_types: {supported})"
+        );
+        UNCLAIMED_ARCH_ID
     }
 }
 
@@ -286,7 +269,7 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
 /// `model_type`. No carrier's `claims_arch_id` matches it, so routing fails
 /// loudly with a clean "no carrier" error rather than silently defaulting to
 /// Qwen35. Far outside the assigned range (0..=64) the registry tests sweep.
-const UNCLAIMED_ARCH_ID: u32 = u32::MAX;
+pub const UNCLAIMED_ARCH_ID: u32 = u32::MAX;
 
 fn parse_quant_config(config: &serde_json::Value) -> Option<QuantConfig> {
     let qc = config.get("quantization_config")?;
@@ -347,7 +330,7 @@ fn build_metadata_json(config: &serde_json::Value, raw_config: &str) -> String {
 /// BF16 is the upper 16 bits of an IEEE-754 F32 number — widening is left-shifting by 16.
 #[inline]
 pub fn bf16_to_f32(bits: u16) -> f32 {
-    f32::from_bits((bits as u32) << 16)
+    bf16::from_bits(bits).to_f32()
 }
 
 /// Convert BF16 byte slice to F16 byte vector (owned).

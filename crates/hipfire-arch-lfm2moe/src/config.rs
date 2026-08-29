@@ -160,7 +160,7 @@ fn default_routed_scale() -> f32 {
 /// No env ⇒ no-op (`config.reap_keep` stays `None`); the MoE loader then
 /// takes the literal original full-load path — byte-identical to baseline.
 pub fn apply_reap_plan(config: &mut Lfm2MoeConfig) -> Result<(), String> {
-    if let Some(plan) = hipfire_reap::plan::ReapPlan::from_env(
+    if let Some(plan) = hipfire_reap::plan::ReapPlan::from_config(
         "lfm2moe",
         None,
         config.num_hidden_layers,
@@ -303,6 +303,10 @@ impl Lfm2MoeConfig {
             .filter(|&&t| t == MixerKind::Conv)
             .count()
     }
+    /// Dense-only models have `num_experts == 0` (Lfm2ForCausalLM).
+    pub fn is_dense(&self) -> bool {
+        self.num_experts == 0
+    }
 }
 
 /// Parse Lfm2MoeConfig from a `&dyn ModelSource` (safetensors or HFQ wrapper).
@@ -312,4 +316,32 @@ pub fn config_from_source(source: &dyn ModelSource) -> Option<Lfm2MoeConfig> {
     let meta: serde_json::Value = serde_json::from_str(source.metadata_json()).ok()?;
     let inner = meta.get("config")?;
     Lfm2MoeConfig::from_config_value(inner).ok()
+}
+
+/// Lightweight classification helper: extract only `num_experts` from the config
+/// JSON value.  Returns `Ok(n)` on success, `Err` on malformed input.  Avoids
+/// parsing the full [`Lfm2MoeConfig`] (which requires all 20+ fields).
+fn classify_num_experts(inner: &serde_json::Value) -> Result<usize, String> {
+    #[derive(Deserialize)]
+    struct ExpertsOnly {
+        #[serde(default)]
+        num_experts: usize,
+    }
+    let raw: ExpertsOnly =
+        serde_json::from_value(inner.clone()).map_err(|e| format!("lfm2moe: {e}"))?;
+    Ok(raw.num_experts)
+}
+
+/// Full-ownership classification: accepts a `ModelSource`, parses the metadata
+/// envelope internally, and returns `true` for MoE (num_experts > 0) or `false`
+/// for dense.  Callers never touch the metadata envelope — only the arch crate
+/// knows the envelope format.
+pub fn classify_is_moe(source: &dyn ModelSource) -> Result<bool, String> {
+    let meta: serde_json::Value = serde_json::from_str(source.metadata_json())
+        .map_err(|e| format!("lfm2moe: invalid metadata: {e}"))?;
+    let inner = meta
+        .get("config")
+        .ok_or_else(|| "lfm2moe: missing config in metadata".to_string())?;
+    let num = classify_num_experts(inner)?;
+    Ok(num > 0)
 }

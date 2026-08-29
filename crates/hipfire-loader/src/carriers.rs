@@ -4,16 +4,19 @@
 //! Per-arch carrier structs with object-safe [`Carrier`] impls.
 //! Each carrier owns its full load path (HFQ + safetensors-dir).
 
+use crate::parallel_capability::ModelVariant;
 use crate::spec_build::Qwen35SlotGuard;
 use crate::Carrier;
 use crate::{
     finish_qwen35_load, resolve_chat_template, resolve_chat_template_overrides, LoadedModel,
-    ModelState,
 };
 use hipfire_arch_minimax::{config_from_safetensors, load_weights_from_safetensors, MiniMaxState};
+use hipfire_runtime::kv_backend::KvBackend;
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 use hipfire_runtime::model_source::ModelSource as _;
 use hipfire_runtime::spec::{InPlaceGuard, SpecEmit, SpecEmitCtx, SpecTargetGuard};
+use std::any::Any;
 
 // The ChatML/Hermes per-token emitter (`Qwen35Emit`) is shared by every
 // ChatML-family spec arm — qwen35 DFlash AND the llama/qwen2 n-gram paths all
@@ -108,11 +111,13 @@ impl Carrier for Qwen2Carrier {
     }
     fn spec_target_guard<'m>(
         &self,
-        state: &'m mut Option<ModelState>,
+        state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-        match state.as_mut() {
-            Some(ModelState::Qwen2(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+        match state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen2::Qwen2Bundle>()
+        }) {
+            Some(bundle) => Ok(Box::new(InPlaceGuard { bundle })),
             _ => Err("qwen2: spec target state mismatch".into()),
         }
     }
@@ -127,6 +132,46 @@ impl Carrier for Qwen2Carrier {
         // here so the qwen2 Q/K/V `attention_bias=true` biases load (the
         // llama-family Dir loader drops them).
         arch_id == 7
+    }
+    fn classify_parallel_variant(&self, _src: &ModelSource) -> Result<ModelVariant, String> {
+        Ok(ModelVariant::Qwen2)
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+            supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(0.3, 0.8, 1.0)
+    }
+    fn bench_prefill(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+        _n: usize,
+        _prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let b = m.qwen2_mut().unwrap();
+        let config = &b.config;
+        let weights = &b.weights;
+        let state = &mut b.state;
+        let mut ok = true;
+        for &tok in synthetic {
+            if hipfire_arch_qwen2::qwen2::forward_step(gpu, weights, config, state, tok).is_err() {
+                ok = false;
+                break;
+            }
+        }
+        Some(ok)
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
@@ -146,7 +191,7 @@ impl Carrier for Qwen2Carrier {
             ctx.spec,
         );
         Ok(LoadedModel {
-            state: Some(ModelState::Qwen2(bundle)),
+            state: Some(Box::new(bundle)),
             speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
@@ -166,7 +211,7 @@ fn kv_mode_from_ctx(ctx: &LoadCtx) -> String {
     ctx.kv_mode_override
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default())
+        .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone())
 }
 
 fn resolve_kv_mode(
@@ -187,6 +232,7 @@ fn arch_default_template(arch_id: u32) -> Option<String> {
     match arch_id {
         5 | 6 => Some(super::FROGGERIC_QWEN35_TEMPLATE.to_string()),
         11 => Some(super::LFM2_TEMPLATE.to_string()),
+        13 => Some(super::GEMMA4_TEMPLATE.to_string()),
         _ => None,
     }
 }
@@ -203,28 +249,14 @@ fn load_qwen35_pp(
     let pp = ctx.pp;
     let config = hipfire_arch_qwen35::qwen35::config_from_hfq(&hfq_file)
         .map_err(|e| format!("failed to read Qwen3.5 config: {e}"))?;
-    let mut gpus = match std::env::var("HIPFIRE_PP_LAYERS")
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
-        Some(spec) => {
-            let counts: Result<Vec<usize>, _> =
-                spec.split(',').map(|s| s.trim().parse::<usize>()).collect();
-            let counts = counts.map_err(|e| format!("HIPFIRE_PP_LAYERS parse: {e}"))?;
-            if counts.len() != pp {
-                return Err(format!(
-                    "HIPFIRE_PP_LAYERS has {} entries, expected pp={}",
-                    counts.len(),
-                    pp
-                ));
-            }
-            let sum: usize = counts.iter().sum();
-            if sum != config.n_layers {
-                return Err(format!(
-                    "HIPFIRE_PP_LAYERS sum={} != n_layers={}",
-                    sum, config.n_layers
-                ));
-            }
+    let mut gpus = match parse_pp_layer_bands(
+        hipfire_config::developer_var("HIPFIRE_PP_LAYERS")
+            .ok()
+            .as_deref(),
+        pp,
+        config.n_layers,
+    )? {
+        Some(counts) => {
             hipfire_runtime::multi_gpu::Gpus::init_layers(&counts).map_err(|e| format!("{e}"))?
         }
         None => hipfire_runtime::multi_gpu::Gpus::init_uniform(pp, config.n_layers)
@@ -252,7 +284,7 @@ fn load_qwen35_pp(
         max_seq: ctx.max_seq,
         physical_cap: Some(ctx.max_seq),
     };
-    let kv = hipfire_runtime::llama::KvCache::from_mode(
+    let kv = <hipfire_runtime::llama::KvCache as hipfire_runtime::llama::KvCacheExt>::from_mode(
         mode,
         hipfire_runtime::llama::KvTarget::Multi(&mut gpus),
         &dims,
@@ -285,9 +317,15 @@ fn load_qwen35_pp(
         scratch: single_scratch,
         kv_cache: kv,
         dn_state: dn,
+        // Adaptive is single-GPU only; PP path never engages the controller.
+        kv_adaptive: None,
+        pp_scratch_set: Some(scratch_set),
+        vision_config: None,
+        vision_weights: None,
+        qwen35_decode_batch: None,
     };
     Ok(LoadedModel {
-        state: Some(ModelState::Qwen35(bundle)),
+        state: Some(Box::new(bundle)),
         ..LoadedModel::skeleton_pp(
             meta.arch_id,
             meta.tokenizer,
@@ -297,7 +335,6 @@ fn load_qwen35_pp(
             meta.chat_template,
             pp,
             gpus,
-            scratch_set,
             la_to_device,
         )
     })
@@ -310,7 +347,7 @@ impl Carrier for Qwen35Carrier {
     }
     fn spec_target_guard<'m>(
         &self,
-        state: &'m mut Option<ModelState>,
+        state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         // qwen35 moves its bundle out of `state` into the RAII Qwen35SlotGuard
@@ -327,7 +364,149 @@ impl Carrier for Qwen35Carrier {
         // 5 = dense (+VL), 6 = MoE — same ids in both namespaces.
         matches!(arch_id, 5 | 6)
     }
+    fn classify_parallel_variant(&self, src: &ModelSource) -> Result<ModelVariant, String> {
+        match src {
+            ModelSource::Hfq(hfq) => match hfq.arch_id {
+                6 => Ok(ModelVariant::Qwen35Moe),
+                5 => {
+                    // Match the production loader: use tensor_data (not
+                    // find_tensor_info) so that only tensors with physically
+                    // present data count.
+                    let has_vision_tower = hfq
+                        .tensor_data("model.visual.patch_embed.proj.weight")
+                        .is_some();
+                    if has_vision_tower {
+                        Ok(ModelVariant::Qwen35Vl)
+                    } else {
+                        Ok(ModelVariant::Qwen35Dense)
+                    }
+                }
+                other => Err(format!("qwen35: unexpected HFQ arch_id {}", other)),
+            },
+            ModelSource::Dir(source) => match source.arch_id() {
+                6 => Ok(ModelVariant::Qwen35Moe),
+                5 => {
+                    // VL tower presence is the classifier for dense (arch 5);
+                    // the pre-merge composite text_config+vision_config check
+                    // is a Phase 2 refinement (classify_vl removed from the
+                    // arch crate during the mainline refactor).
+                    if source
+                        .tensor_info("model.visual.patch_embed.proj.weight")
+                        .is_some()
+                    {
+                        Ok(ModelVariant::Qwen35Vl)
+                    } else {
+                        Ok(ModelVariant::Qwen35Dense)
+                    }
+                }
+                other => Err(format!("qwen35 safetensors: unexpected arch_id {}", other)),
+            },
+        }
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: true,
+            supports_ep_batch: true,
+            dflash: Some(saddle_core::caps::DflashKind::Qwen),
+            supports_mtp: true,
+            spec_excludes_adaptive: true,
+            semantic_contract_version: Some(2),
+            has_deltanet: true,
+            // Architectural capability: Qwen3.5-VL tower is optional per-model
+            // (probed via `model.visual.patch_embed.proj.weight`); this flag
+            // declares that the arch CAN accept images when that tower is
+            // present. Per-instance gating still checks `LoadedModel::vision_config`.
+            supports_images: true,
+            reasoning_contract: saddle_core::caps::ReasoningContract::QwenJinja,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(0.3, 0.8, 1.0)
+    }
+    fn bench_prefill(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+        _n: usize,
+        _prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let b = m.qwen35_mut().unwrap();
+        let config = &b.config;
+        let weights = &b.weights;
+        let scratch = &b.scratch;
+        let kv = &mut b.kv_cache;
+        let dn = &mut b.dn_state;
+        Some(
+            hipfire_arch_qwen35::qwen35::forward_prefill_batch(
+                gpu, weights, config, synthetic, 0, kv, dn, scratch, None, None, None, None,
+            )
+            .is_ok(),
+        )
+    }
+    fn bench_decode_prime(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+    ) -> Option<Option<String>> {
+        let b = m.qwen35_mut().unwrap();
+        Some(
+            hipfire_arch_qwen35::qwen35::forward_prefill_batch(
+                gpu,
+                &b.weights,
+                &b.config,
+                synthetic,
+                0,
+                &mut b.kv_cache,
+                &mut b.dn_state,
+                &b.scratch,
+                None,
+                None,
+                None,
+                None,
+            )
+            .err()
+            .map(|e| format!("{e:?}")),
+        )
+    }
+    fn bench_decode_run(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        context: usize,
+        iterations: usize,
+        _decode_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let b = m.qwen35_mut().unwrap();
+        let mut ok = true;
+        for i in 0..iterations {
+            let token = 101 + (i as u32 % 1000);
+            if hipfire_arch_qwen35::qwen35::forward_scratch(
+                gpu,
+                &b.weights,
+                &b.config,
+                token,
+                context + i,
+                &mut b.kv_cache,
+                &mut b.dn_state,
+                &b.scratch,
+            )
+            .is_err()
+            {
+                ok = false;
+                break;
+            }
+        }
+        Some(ok)
+    }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.kv_backend == KvBackend::Vmm && ctx.pp > 1 {
+            return Err(
+                "qwen35: KV backend 'vmm' currently requires pp=1; use 'contiguous' for pipeline parallelism"
+                    .into(),
+            );
+        }
         // Dir + pp>1: early return before any diagnostics/meta resolution,
         // preserving the original error string and preventing tokenizer work.
         if ctx.pp > 1 {
@@ -347,17 +526,7 @@ impl Carrier for Qwen35Carrier {
                 }
 
                 // ── pp=1 path (single-GPU) ────────────────────
-                let physical_cap = if ctx.cask.sidecar.is_some() {
-                    let env_override = std::env::var("HIPFIRE_KV_PHYSICAL_CAP")
-                        .ok()
-                        .and_then(|s| s.parse::<usize>().ok());
-                    let safety = 256usize;
-                    let floor = ctx.cask.budget + ctx.cask.beta + 4;
-                    let derived = ctx.cask.budget + ctx.cask.beta + safety;
-                    env_override.unwrap_or(derived).clamp(floor, ctx.max_seq)
-                } else {
-                    ctx.max_seq
-                };
+                let physical_cap = ctx.cask.physical_cap(ctx.max_seq)?;
 
                 // VL detection — loads weights from hfq_file in-place
                 let (vision_config, vision_weights) = {
@@ -382,8 +551,54 @@ impl Carrier for Qwen35Carrier {
                     }
                 };
 
-                let bundle =
-                    hipfire_arch_qwen35::load_qwen35_bundle(ModelSource::Hfq(hfq_file), ctx)?;
+                // Trunk bundle after optional VL upload. On bundle failure, reclaim
+                // any vision weights already on-device (HFQ is single-pass: VL must
+                // load from the same file before the carrier consumes it).
+                let bundle = match hipfire_arch_qwen35::load_qwen35_bundle(
+                    ModelSource::Hfq(hfq_file),
+                    ctx,
+                ) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        if let Some(vw) = vision_weights {
+                            vw.free_gpu(ctx.gpu);
+                        }
+                        // The bundle error carries exact-retention cleanup
+                        // owners; retry once before reducing to a String.
+                        // Whatever still fails is logged — never dropped.
+                        let hipfire_arch_qwen35::carrier::Qwen35BundleLoadError {
+                            message,
+                            cleanup,
+                        } = e;
+                        if let Some(cf) = cleanup {
+                            let first_failures = cf.num_failed();
+                            match cf.retry(ctx.gpu) {
+                                Ok(()) => {
+                                    if first_failures > 0 {
+                                        eprintln!(
+                                            "  qwen35 bundle load: first cleanup attempt failed \
+                                             ({first_failures} owner(s)) but retry succeeded"
+                                        );
+                                    }
+                                }
+                                Err(remaining) => {
+                                    let pending = remaining.num_failed();
+                                    let summaries = remaining.error_summaries();
+                                    hipfire_runtime::gpu_cleanup::enqueue_cleanup_failure(
+                                        remaining,
+                                    );
+                                    eprintln!(
+                                        "  qwen35 bundle load cleanup retry failed \
+                                         ({pending} owner(s) enqueued to the retained-owner \
+                                         backlog): {}",
+                                        summaries.join("; ")
+                                    );
+                                }
+                            }
+                        }
+                        return Err(message);
+                    }
+                };
                 finish_qwen35_load(
                     bundle,
                     meta.tokenizer,
@@ -404,16 +619,30 @@ impl Carrier for Qwen35Carrier {
                 if ctx.cask.sidecar.is_some() {
                     eprintln!("  warning: CASK eviction is not supported for safetensors Dir sources; eviction sidecar ignored");
                 }
-                let mut paro_source =
-                    hipfire_arch_qwen35::qwen35::ParoSource::new(&source, &config)
-                        .map_err(|e| format!("ParoSource::new: {e:?}"))?;
-                let paro_layout = hipfire_arch_qwen35::qwen35::Layout::single(config.n_layers);
-                let weights = hipfire_arch_qwen35::qwen35::load_weights(
-                    &mut paro_source,
-                    std::slice::from_mut(ctx.gpu),
-                    &paro_layout,
-                )
-                .map_err(|e| format!("load_weights: {e:?}"))?;
+                // CPU-only before any GPU ownership (parity with HFQ carrier).
+                let dn_quant = crate::parse_state_quant(ctx.state_quant_override)
+                    .map_err(|e| format!("{e}"))?;
+                eprintln!(
+                    "  DeltaNet state quant: {}",
+                    if dn_quant == hipfire_arch_qwen35::qwen35::StateQuant::FP32 {
+                        "FP32"
+                    } else if dn_quant == hipfire_arch_qwen35::qwen35::StateQuant::Q4 {
+                        "Q4"
+                    } else {
+                        "Q8"
+                    }
+                );
+                if config.dim < 2048 && dn_quant != hipfire_arch_qwen35::qwen35::StateQuant::FP32 {
+                    eprintln!(
+                        "  warning: model dim={} (<2048); FP32 DeltaNet state is recommended for small models (current: {})",
+                        config.dim,
+                        if dn_quant == hipfire_arch_qwen35::qwen35::StateQuant::Q4 {
+                            "Q4"
+                        } else {
+                            "Q8"
+                        }
+                    );
+                }
                 let is_kv_layer: Vec<bool> = config
                     .layer_types
                     .iter()
@@ -431,53 +660,78 @@ impl Carrier for Qwen35Carrier {
                     max_seq: ctx.max_seq,
                     physical_cap: Some(ctx.max_seq),
                 };
-                let kv_cache = hipfire_runtime::llama::KvCache::from_mode(
+
+                let mut paro_source =
+                    hipfire_arch_qwen35::qwen35::ParoSource::new(&source, &config)
+                        .map_err(|e| format!("ParoSource::new: {e:?}"))?;
+                let paro_layout = hipfire_arch_qwen35::qwen35::Layout::single(config.n_layers);
+                let weights = hipfire_arch_qwen35::qwen35::load_weights(
+                    &mut paro_source,
+                    std::slice::from_mut(ctx.gpu),
+                    &paro_layout,
+                )
+                .map_err(|e| format!("load_weights: {e:?}"))?;
+                hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
+
+                // Staged GPU free on every post-weight error (VMM arenas via free_gpu).
+                let kv_cache = match <hipfire_runtime::llama::KvCache as hipfire_runtime::llama::KvCacheExt>::from_mode_with_backend(
                     mode,
+                    ctx.kv_backend,
                     hipfire_runtime::llama::KvTarget::Single(ctx.gpu),
                     &dims,
-                )
-                .map_err(|e| format!("KvCache: {e}"))?;
-
-                let dn_quant = crate::parse_state_quant(ctx.state_quant_override)
-                    .map_err(|e| format!("{e}"))?;
-                eprintln!(
-                    "  DeltaNet state quant: {}",
-                    if dn_quant == hipfire_arch_qwen35::qwen35::StateQuant::FP32 {
-                        "FP32"
-                    } else if dn_quant == hipfire_arch_qwen35::qwen35::StateQuant::Q4 {
-                        "Q4"
-                    } else {
-                        "Q8"
+                ) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        weights.free_gpu(ctx.gpu);
+                        return Err(format!("KvCache: {e}"));
                     }
-                );
-                if config.dim < 2048 && dn_quant != hipfire_arch_qwen35::qwen35::StateQuant::FP32 {
-                    eprintln!(
-                        "  warning: model dim={} (<2048); FP32 DeltaNet state is recommended for small models (current: {})",
-                        config.dim,
-                        if dn_quant == hipfire_arch_qwen35::qwen35::StateQuant::Q4 { "Q4" } else { "Q8" }
-                    );
-                }
-                let dn_state = hipfire_arch_qwen35::qwen35::DeltaNetState::new_with_quant(
+                };
+
+                let dn_state = match hipfire_arch_qwen35::qwen35::DeltaNetState::new_with_quant(
                     ctx.gpu, &config, dn_quant,
-                )
-                .map_err(|e| format!("DeltaNetState::new_with_quant: {e:?}"))?;
-                let scratch = hipfire_arch_qwen35::qwen35::Qwen35Scratch::new_with_kv_max(
+                ) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let mut note = format!("DeltaNetState::new_with_quant: {e:?}");
+                        if let Err(fe) = kv_cache.free_gpu(ctx.gpu) {
+                            note = format!("{note}; cleanup also failed: {fe}");
+                        }
+                        weights.free_gpu(ctx.gpu);
+                        return Err(note);
+                    }
+                };
+                let scratch = match hipfire_arch_qwen35::qwen35::Qwen35Scratch::new_with_kv_max(
                     ctx.gpu,
                     &config,
                     2048,
                     ctx.max_seq,
-                )
-                .map_err(|e| format!("Qwen35Scratch::new_with_kv_max: {e:?}"))?;
-
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let mut note = format!("Qwen35Scratch::new_with_kv_max: {e:?}");
+                        if let Err(fe) = kv_cache.free_gpu(ctx.gpu) {
+                            note = format!("{note}; cleanup also failed: {fe}");
+                        }
+                        dn_state.free_gpu(ctx.gpu);
+                        weights.free_gpu(ctx.gpu);
+                        return Err(note);
+                    }
+                };
                 let bundle = hipfire_arch_qwen35::Qwen35Bundle {
                     config,
                     weights,
                     scratch,
                     kv_cache,
                     dn_state,
+                    // Dir/safetensors path does not engage adaptive (HFQ carrier only).
+                    kv_adaptive: None,
+                    pp_scratch_set: None,
+                    vision_config: None,
+                    vision_weights: None,
+                    qwen35_decode_batch: None,
                 };
                 Ok(LoadedModel {
-                    state: Some(ModelState::Qwen35(bundle)),
+                    state: Some(Box::new(bundle)),
                     ..LoadedModel::skeleton(
                         meta.arch_id,
                         meta.tokenizer,
@@ -501,11 +755,13 @@ impl Carrier for LlamaCarrier {
     }
     fn spec_target_guard<'m>(
         &self,
-        state: &'m mut Option<ModelState>,
+        state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-        match state.as_mut() {
-            Some(ModelState::Llama(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+        match state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()
+        }) {
+            Some(bundle) => Ok(Box::new(InPlaceGuard { bundle })),
             _ => Err("llama: spec target state mismatch".into()),
         }
     }
@@ -521,6 +777,77 @@ impl Carrier for LlamaCarrier {
         // swallow any future HFQ id in 2..=4 into the llama path).
         matches!(arch_id, 0 | 1)
     }
+    fn classify_parallel_variant(&self, src: &ModelSource) -> Result<ModelVariant, String> {
+        match src {
+            ModelSource::Hfq(hfq) => {
+                // config_from_hfq already prefixes errors with "llama: " —
+                // propagate without adding another prefix to avoid "llama: llama:".
+                let config = hipfire_runtime::hfq::config_from_hfq(hfq)?;
+                // Architecture check first: Qwen3 (arch_id=1) is always PlainQwen3
+                // regardless of any QK-norm tensors that might be present.
+                // has_qk_norm only applies to LLaMA/Mistral (arch_id=0).
+                if config.arch == hipfire_runtime::llama::ModelArch::Qwen3 {
+                    Ok(ModelVariant::PlainQwen3)
+                } else if config.has_qk_norm {
+                    Ok(ModelVariant::LlamaQkNorm)
+                } else {
+                    Ok(ModelVariant::LlamaNoQkNorm)
+                }
+            }
+            ModelSource::Dir(source) => {
+                let config = hipfire_runtime::hfq::config_from_safetensors_llama(source)?;
+                if config.arch == hipfire_runtime::llama::ModelArch::Qwen3 {
+                    Ok(ModelVariant::PlainQwen3)
+                } else if config.has_qk_norm {
+                    Ok(ModelVariant::LlamaQkNorm)
+                } else {
+                    Ok(ModelVariant::LlamaNoQkNorm)
+                }
+            }
+        }
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: Some(saddle_core::caps::DflashKind::Llama),
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+            supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(0.3, 0.8, 1.0)
+    }
+    fn bench_prefill(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+        _n: usize,
+        _prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let b = m.llama_mut().unwrap();
+        let config = &b.config;
+        let weights = &b.weights;
+        let scratch = &b.scratch;
+        let kv = &mut b.kv;
+        let mut ok = true;
+        for (i, &tok) in synthetic.iter().enumerate() {
+            if hipfire_runtime::llama::forward_scratch(
+                gpu, weights, config, tok, i, kv, scratch, 0.0, 1.0, 42, 0, 1.0,
+            )
+            .is_err()
+            {
+                ok = false;
+                break;
+            }
+        }
+        Some(ok)
+    }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err(match &src {
@@ -532,54 +859,7 @@ impl Carrier for LlamaCarrier {
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
 
-        // ── source-varying seam: yields a LlamaBundle ──
-        let mut bundle = match src {
-            ModelSource::Hfq(hfq) => {
-                hipfire_arch_llama::load_llama_bundle(ModelSource::Hfq(hfq), ctx)?
-            }
-            ModelSource::Dir(source) => {
-                let config =
-                    hipfire_runtime::hfq::config_from_safetensors_llama(&source).map_err(|e| {
-                        format!("failed to parse LLaMA/Qwen3 config from config.json: {e}")
-                    })?;
-                let weights =
-                    hipfire_runtime::hfq::load_weights_paroquant_llama(&source, &config, ctx.gpu)
-                        .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
-                let mode = resolve_kv_mode(
-                    ctx,
-                    &hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY,
-                    config.head_dim,
-                );
-                let dims = hipfire_runtime::llama::KvDims {
-                    layers: hipfire_runtime::llama::KvLayers::Flat(config.n_layers),
-                    n_kv_heads: config.n_kv_heads,
-                    head_dim: config.head_dim,
-                    max_seq: ctx.max_seq,
-                    physical_cap: Some(ctx.max_seq),
-                };
-                let kv = hipfire_runtime::llama::KvCache::from_mode(
-                    mode,
-                    hipfire_runtime::llama::KvTarget::Single(ctx.gpu),
-                    &dims,
-                )
-                .map_err(|e| format!("KvCache: {e}"))?;
-                let scratch = hipfire_runtime::llama::ForwardScratch::new_with_max_seq(
-                    ctx.gpu,
-                    &config,
-                    ctx.max_seq,
-                )
-                .map_err(|e| format!("ForwardScratch::new_with_max_seq: {e:?}"))?;
-                hipfire_arch_llama::LlamaBundle {
-                    config,
-                    weights,
-                    scratch,
-                    kv,
-                    dflash_extract_layers: Vec::new(),
-                    dspark_weights: None,
-                    dspark_assets: None,
-                }
-            }
-        };
+        let mut bundle = hipfire_arch_llama::load_llama_bundle(src, ctx)?;
 
         // ── DSpark sidecar discovery ──────────────────────────────────────────
         // When a `<stem>-dspark.<ext>` sidecar exists alongside the main model
@@ -680,11 +960,12 @@ impl Carrier for LlamaCarrier {
             // conf_threshold ladder: env > CLI arg > 0.1
             // Default 0.1 (sweep-tuned): 0.5 over-truncates (1.46/7 proposed);
             // 0.1 proposes ~6.94/7, +16.6% prose tok/s / +7.1% code tok/s.
-            let conf_threshold = std::env::var("HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .or(ctx.spec.dspark_conf_threshold)
-                .unwrap_or(0.1f32);
+            let conf_threshold =
+                hipfire_config::developer_var("HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .or(ctx.spec.dspark_conf_threshold)
+                    .unwrap_or(0.1f32);
 
             eprintln!(
                 "  llama DSpark speculator enabled (sidecar, block={}, conf_threshold={:.2})",
@@ -710,6 +991,7 @@ impl Carrier for LlamaCarrier {
                 // (fused sample_top_p_pf, honors temp+top_p+top_k). The daemon routes
                 // temp>0 llama through the chain path (requires_greedy()==false).
                 true,
+                0.5,
             ))
         } else if let Some(dp) = ctx.draft_path {
             // Peek at the draft's arch_id without consuming the path; the builder
@@ -791,7 +1073,7 @@ impl Carrier for LlamaCarrier {
             )
         };
         Ok(LoadedModel {
-            state: Some(ModelState::Llama(bundle)),
+            state: Some(Box::new(bundle)),
             speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
@@ -817,6 +1099,48 @@ impl Carrier for DotsOcrCarrier {
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 8
     }
+    fn classify_parallel_variant(&self, _src: &ModelSource) -> Result<ModelVariant, String> {
+        Ok(ModelVariant::DotsOcr)
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+            supports_images: true,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(0.3, 0.8, 1.0)
+    }
+    fn bench_prefill(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+        _n: usize,
+        _prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let bundle = m.dots_ocr_mut().unwrap();
+        let state = &mut bundle.state;
+        let config = &bundle.config;
+        let weights = &bundle.weights;
+        let mut ok = true;
+        for &tok in synthetic {
+            if hipfire_arch_qwen2::qwen2::forward_step(gpu, &weights.text, &config.text, state, tok)
+                .is_err()
+            {
+                ok = false;
+                break;
+            }
+        }
+        Some(ok)
+    }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err(match &src {
@@ -828,28 +1152,7 @@ impl Carrier for DotsOcrCarrier {
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
 
-        use hipfire_arch_dots_ocr::dots_ocr::{DotsOcrConfig, DotsOcrWeights};
-        use hipfire_arch_dots_ocr::DotsOcr;
-        use hipfire_runtime::arch::Architecture;
-        // ── source-varying seam: (config, weights) only ──
-        let (config, weights) = match src {
-            ModelSource::Hfq(mut hfq) => {
-                let config = <DotsOcr as Architecture>::config_from_hfq(&hfq)?;
-                let weights = <DotsOcr as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
-                (config, weights)
-            }
-            ModelSource::Dir(source) => {
-                let config = DotsOcrConfig::from_source(&source)?;
-                let weights = DotsOcrWeights::load_weights_from_source(&source, &config, ctx.gpu)?;
-                (config, weights)
-            }
-        };
-        let state = hipfire_arch_qwen2::qwen2::Qwen2State::new_with_max_seq(
-            ctx.gpu,
-            &config.text,
-            ctx.max_seq,
-        )
-        .map_err(|e| format!("dots-ocr: Qwen2State::new_with_max_seq failed: {e:?}"))?;
+        let bundle = hipfire_arch_dots_ocr::load_dots_ocr_bundle(src, ctx)?;
         // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). dots.ocr's
         // text decoder IS Qwen2, so the n-gram arm drives it via the
         // `DotsOcrBundle: SpecTarget` impl — a strong fit because layout-JSON
@@ -865,9 +1168,7 @@ impl Carrier for DotsOcrCarrier {
             ctx.spec,
         );
         Ok(LoadedModel {
-            qwen2_state: Some(state),
-            dots_ocr_config: Some(config),
-            dots_ocr_weights: Some(weights),
+            state: Some(Box::new(bundle)),
             speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
@@ -890,12 +1191,20 @@ impl Carrier for Deepseek4Carrier {
     }
     fn spec_target_guard<'m>(
         &self,
-        state: &'m mut Option<ModelState>,
+        state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-        match state.as_mut() {
-            Some(ModelState::Deepseek4(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
-            _ => Err("deepseek4: spec target state mismatch".into()),
+        if state
+            .as_ref()
+            .is_some_and(|s| (s.as_ref() as &dyn Any).is::<crate::Deepseek4HeterogeneousBundle>())
+        {
+            Err("deepseek4 heterogeneous route is direct-AR only until G6".into())
+        } else if let Some(b) = state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+        }) {
+            Ok(Box::new(InPlaceGuard { bundle: b }))
+        } else {
+            Err("deepseek4: spec target state mismatch".into())
         }
     }
     fn make_spec_emitter<'a>(
@@ -909,6 +1218,57 @@ impl Carrier for Deepseek4Carrier {
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 9
     }
+    fn classify_parallel_variant(&self, _src: &ModelSource) -> Result<ModelVariant, String> {
+        Ok(ModelVariant::Deepseek4)
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+            supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::DeepSeek4,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(0.0, 1.0, 1.0)
+    }
+    fn bench_prefill(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+        n: usize,
+        _prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let b = m
+            .state
+            .as_mut()
+            .and_then(|s| {
+                (s.as_mut() as &mut dyn Any)
+                    .downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+            })
+            .unwrap();
+        let pbs = b
+            .pbs
+            .as_mut()
+            .expect("deepseek4_pbs missing on arch_id=9 bench_prefill");
+        let config = &b.config;
+        let weights = &b.weights;
+        let state = &mut b.state;
+        let ok = hipfire_arch_deepseek4::forward::forward_prefill_batch_chunked(
+            config, weights, state, gpu, synthetic, 0, pbs,
+        )
+        .is_ok();
+        if ok {
+            state.n_tokens = n as u64;
+        }
+        Some(ok)
+    }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err(match &src {
@@ -919,42 +1279,43 @@ impl Carrier for Deepseek4Carrier {
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
+        let compressor_cache =
+            crate::resolve_deepseek4_compressor_cache_kv_mode(ctx.kv_mode_override)?;
+
+        if !matches!(
+            ctx.deepseek4_compute_placement,
+            hipfire_config::Deepseek4ComputePlacement::Single
+        ) {
+            let model = hipfire_arch_deepseek4::load_deepseek4_heterogeneous_model(
+                &src,
+                ctx,
+                compressor_cache,
+            )?;
+            let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<｜end▁of▁sentence｜>"]);
+            let advertised_context = model.config.max_position_embeddings;
+            return Ok(LoadedModel {
+                state: Some(Box::new(crate::Deepseek4HeterogeneousBundle {
+                    model,
+                    eos_tok,
+                })),
+                ..LoadedModel::skeleton(
+                    meta.arch_id,
+                    meta.tokenizer,
+                    advertised_context,
+                    advertised_context,
+                    ctx.path.to_string(),
+                    meta.chat_template,
+                )
+            });
+        }
 
         use hipfire_arch_deepseek4 as deepseek4;
-        use hipfire_runtime::arch::Architecture;
-        // ── source-varying seam: (config, weights) only ──
-        // NOTE: the Dir/safetensors arm is UNVALIDATED — no deepseek_v4
-        // checkpoint was available locally to verify load fidelity. Reviewer-ask.
-        // DSpark sidecar load gate: `speculation=dspark`/`auto` load the 3×MoE
-        // sidecar; any other mechanism (`Some(false)`) skips it so it never pages
-        // into VRAM. `None` (auto / directly-driven daemon) keeps default-on.
-        let load_dspark = ctx.spec.dspark != Some(false);
-        let (config, weights) = match src {
-            ModelSource::Hfq(mut hfq) => {
-                let mut config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
-                config.load_dspark = load_dspark;
-                let weights = <deepseek4::DeepseekV4 as Architecture>::load_weights(
-                    &mut hfq, &config, ctx.gpu,
-                )?;
-                (config, weights)
-            }
-            ModelSource::Dir(source) => {
-                let mut config = deepseek4::config_from_safetensors(&source).ok_or_else(|| {
-                    "deepseek4: failed to parse config from safetensors".to_string()
-                })?;
-                config.load_dspark = load_dspark;
-                let weights = deepseek4::DeepseekV4::load_weights_from_safetensors(
-                    &source, &config, ctx.gpu,
-                )?;
-                (config, weights)
-            }
-        };
-        let state = deepseek4::DeepseekV4State::new(&config)?;
-        let pbs_max_batch: usize = std::env::var("HIPFIRE_DEEPSEEK4_PP_BATCH")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1024);
-        let pbs = deepseek4::forward::PrefillBatchScratch::new(ctx.gpu, &config, pbs_max_batch)?;
+        let deepseek4::Deepseek4LoadParts {
+            config,
+            weights,
+            state,
+            pbs,
+        } = deepseek4::load_deepseek4_bundle(src, ctx, compressor_cache)?;
         let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<｜end▁of▁sentence｜>"]);
         // deepseek4 MTP spec-decode capability: present iff the MTP addon weights loaded
         // (HIPFIRE_DEEPSEEK4_MTP_ADDON / .mtp-addon.hfq / HIPFIRE_DEEPSEEK4_LOAD_MTP). The
@@ -1000,14 +1361,10 @@ impl Carrier for Deepseek4Carrier {
         } else if weights.mtp_layer.is_some() {
             // spec_k resolution MUST mirror daemon.rs:9349 (HIPFIRE_DEEPSEEK4_SPEC_K →
             // HIPFIRE_MTP_K → default 2) so T4's spec.k() matches the bespoke loop's window.
-            let max_n: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
+            let max_n: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_SPEC_K")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .or_else(|| {
-                    std::env::var("HIPFIRE_MTP_K")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                })
+                .or_else(|| Some(hipfire_runtime::config::get().mtp_k))
                 .unwrap_or(2);
             let ctx_capacity = config.max_position_embeddings;
             eprintln!("  deepseek4 MTP speculator enabled (in-weights, K={max_n})");
@@ -1020,20 +1377,24 @@ impl Carrier for Deepseek4Carrier {
         } else {
             None
         };
+        let advertised_context = config.max_position_embeddings;
+        eprintln!(
+            "  deepseek4 KV cache: automatic VMM growth to advertised context {advertised_context}"
+        );
         Ok(LoadedModel {
-            state: Some(crate::ModelState::Deepseek4(deepseek4::Deepseek4Bundle {
+            state: Some(Box::new(deepseek4::Deepseek4Bundle {
                 config,
                 weights,
                 state,
                 eos_tok,
+                pbs: Some(pbs),
             })),
             speculator,
-            deepseek4_pbs: Some(pbs),
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,
-                ctx.max_seq,
-                ctx.max_seq,
+                advertised_context,
+                advertised_context,
                 ctx.path.to_string(),
                 meta.chat_template,
             )
@@ -1050,11 +1411,14 @@ impl Carrier for MinimaxCarrier {
     }
     fn spec_target_guard<'m>(
         &self,
-        state: &'m mut Option<ModelState>,
+        state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-        match state.as_mut() {
-            Some(ModelState::Minimax(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+        match state
+            .as_mut()
+            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<crate::MiniMaxBundle>())
+        {
+            Some(bundle) => Ok(Box::new(InPlaceGuard { bundle })),
             _ => Err("minimax: spec target state mismatch".into()),
         }
     }
@@ -1069,6 +1433,50 @@ impl Carrier for MinimaxCarrier {
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 10
     }
+    fn classify_parallel_variant(&self, _src: &ModelSource) -> Result<ModelVariant, String> {
+        Ok(ModelVariant::Minimax)
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+            supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(1.0, 1.0, 1.0)
+    }
+    fn bench_prefill(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+        _n: usize,
+        _prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let b = m.minimax_mut().expect("arch_id=10 requires minimax bundle");
+        let config = &b.config;
+        let weights = &b.weights;
+        let state = &mut b.state;
+        let mut ok = true;
+        for (i, &tok) in synthetic.iter().enumerate() {
+            if hipfire_arch_minimax::forward::decode_step(
+                config, weights, state, gpu, tok, i as u32,
+            )
+            .is_err()
+            {
+                ok = false;
+                break;
+            }
+        }
+        Some(ok)
+    }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             // Preserve the two per-source error strings byte-for-byte.
@@ -1081,42 +1489,7 @@ impl Carrier for MinimaxCarrier {
         // Per-source diagnostic stays at the call site, before resolve_source_meta.
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
-
-        // ── source-varying seam: (config, weights) only ──
-        use hipfire_runtime::arch::Architecture;
-        let (config, weights) = match src {
-            ModelSource::Hfq(mut hfq_file) => {
-                let config =
-                    <hipfire_arch_minimax::arch::MiniMaxM2 as Architecture>::config_from_hfq(
-                        &hfq_file,
-                    )?;
-                let weights =
-                    <hipfire_arch_minimax::arch::MiniMaxM2 as Architecture>::load_weights(
-                        &mut hfq_file,
-                        &config,
-                        ctx.gpu,
-                    )?;
-                (config, weights)
-            }
-            ModelSource::Dir(source) => {
-                let config = config_from_safetensors(&source)
-                    .map_err(|e| format!("failed to parse MiniMax config from config.json: {e}"))?;
-                let weights = load_weights_from_safetensors(&source, &config, ctx.gpu)?;
-                (config, weights)
-            }
-        };
-
-        // ── single shared tail (byte-identical to the previous per-arm tails) ──
-        let state = MiniMaxState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
-            .map_err(|e| format!("minimax: MiniMaxState::new_with_max_seq failed: {e}"))?;
-        let eos_tok = resolve_eos_tok(
-            &meta.tokenizer,
-            &["[e~[", "<|im_end|>", "</s>", "<|endoftext|>"],
-        );
-        // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). MiniMax-M2
-        // (arch_id=10) impls `SpecTarget` (pure GQA, no recurrent state), so it
-        // can be driven by the arch-generic spec loop with no draft model.
-        // `None` ⇒ AR-only (the bespoke `generate_minimax` path).
+        let bundle = hipfire_arch_minimax::load_minimax_bundle(src, ctx)?;
         let speculator = crate::spec_build::build_speculator(
             meta.arch_id,
             None,
@@ -1126,12 +1499,7 @@ impl Carrier for MinimaxCarrier {
             ctx.spec,
         );
         Ok(LoadedModel {
-            state: Some(ModelState::Minimax(crate::MiniMaxBundle {
-                config,
-                weights,
-                state,
-                eos_tok,
-            })),
+            state: Some(Box::new(bundle)),
             speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
@@ -1154,11 +1522,14 @@ impl Carrier for Lfm2MoeCarrier {
     }
     fn spec_target_guard<'m>(
         &self,
-        state: &'m mut Option<ModelState>,
+        state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-        match state.as_mut() {
-            Some(ModelState::Lfm2Moe(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+        match state
+            .as_mut()
+            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<crate::Lfm2MoeBundle>())
+        {
+            Some(bundle) => Ok(Box::new(InPlaceGuard { bundle })),
             _ => Err("lfm2moe: spec target state mismatch".into()),
         }
     }
@@ -1173,6 +1544,70 @@ impl Carrier for Lfm2MoeCarrier {
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 11
     }
+    fn classify_parallel_variant(&self, src: &ModelSource) -> Result<ModelVariant, String> {
+        // Dense vs MoE is determined by `num_experts` in the config.
+        // Extract the concrete source so we can pass it to the
+        // architecture-owned helper (which expects &dyn model_source::ModelSource).
+        match src {
+            ModelSource::Hfq(hfq) => {
+                let is_moe = hipfire_arch_lfm2moe::config::classify_is_moe(hfq)?;
+                Ok(if is_moe {
+                    ModelVariant::Lfm2Moe
+                } else {
+                    ModelVariant::Lfm2Dense
+                })
+            }
+            ModelSource::Dir(s) => {
+                let is_moe = hipfire_arch_lfm2moe::config::classify_is_moe(s)?;
+                Ok(if is_moe {
+                    ModelVariant::Lfm2Moe
+                } else {
+                    ModelVariant::Lfm2Dense
+                })
+            }
+        }
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: true,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+            supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(0.1, 0.80, 1.05)
+    }
+    fn bench_prefill(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+        _n: usize,
+        _prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let b = m.lfm2moe_mut().expect("arch_id=11 requires lfm2moe bundle");
+        let config = &b.config;
+        let weights = &b.weights;
+        let state = &mut b.state;
+        let mut ok = true;
+        for (i, &tok) in synthetic.iter().enumerate() {
+            if hipfire_arch_lfm2moe::forward::decode_step(
+                config, weights, state, gpu, tok, i as u32,
+            )
+            .is_err()
+            {
+                ok = false;
+                break;
+            }
+        }
+        Some(ok)
+    }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err(match &src {
@@ -1183,31 +1618,7 @@ impl Carrier for Lfm2MoeCarrier {
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
-
-        use hipfire_arch_lfm2moe as lfm2moe;
-        // ── source-varying seam: (config, weights) only ──
-        let (config, weights) = match src {
-            ModelSource::Hfq(mut hfq) => {
-                let config = lfm2moe::config::Lfm2MoeConfig::from_hfq(&hfq)?;
-                let weights = lfm2moe::lfm2moe::Lfm2MoeWeights::load(&mut hfq, &config, ctx.gpu)?;
-                (config, weights)
-            }
-            ModelSource::Dir(source) => {
-                let config = lfm2moe::config_from_source(&source).ok_or_else(|| {
-                    "lfm2moe: failed to parse config from safetensors".to_string()
-                })?;
-                let weights = lfm2moe::load_weights_from_source(&source, &config, ctx.gpu)?;
-                (config, weights)
-            }
-        };
-
-        let state = lfm2moe::lfm2moe::Lfm2MoeState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
-            .map_err(|e| format!("lfm2moe: Lfm2MoeState::new_with_max_seq failed: {e}"))?;
-        let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<|im_end|>", "</s>", "<|endoftext|>"]);
-        // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). LFM2.5-MoE
-        // (arch_id=11) impls `SpecTarget` with conv-state snapshot/rollback in
-        // `verify_block`/`commit_prefix`, so it can be driven by the arch-generic
-        // spec loop with no draft model. `None` ⇒ AR-only (`generate_lfm2moe`).
+        let bundle = hipfire_arch_lfm2moe::load_lfm2moe_bundle(src, ctx)?;
         let speculator = crate::spec_build::build_speculator(
             meta.arch_id,
             None,
@@ -1217,12 +1628,7 @@ impl Carrier for Lfm2MoeCarrier {
             ctx.spec,
         );
         Ok(LoadedModel {
-            state: Some(ModelState::Lfm2Moe(crate::Lfm2MoeBundle {
-                config,
-                weights,
-                state,
-                eos_tok,
-            })),
+            state: Some(Box::new(bundle)),
             speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
@@ -1250,11 +1656,14 @@ impl Carrier for Cohere2MoeCarrier {
     }
     fn spec_target_guard<'m>(
         &self,
-        state: &'m mut Option<ModelState>,
+        state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-        match state.as_mut() {
-            Some(ModelState::Cohere2Moe(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+        match state
+            .as_mut()
+            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<crate::Cohere2MoeBundle>())
+        {
+            Some(bundle) => Ok(Box::new(InPlaceGuard { bundle })),
             _ => Err("cohere2moe: spec target state mismatch".into()),
         }
     }
@@ -1271,47 +1680,230 @@ impl Carrier for Cohere2MoeCarrier {
         // 12 = Cohere2-MoE in both the HFQ and safetensors-Dir namespaces.
         arch_id == 12
     }
+    fn classify_parallel_variant(&self, _src: &ModelSource) -> Result<ModelVariant, String> {
+        Ok(ModelVariant::Cohere2Moe)
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+            supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(1.0, 0.95, 1.0)
+    }
+    fn bench_prefill(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+        _n: usize,
+        _prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let b = m
+            .cohere2moe_mut()
+            .expect("arch_id=12 requires cohere2moe bundle");
+        let config = &b.config;
+        let weights = &b.weights;
+        let state = &mut b.state;
+        let mut ok = true;
+        if hipfire_arch_cohere2moe::forward::forward_batch_supported(weights) && synthetic.len() > 1
+        {
+            let mut i = 0;
+            while i < synthetic.len() {
+                let end = (i + 256).min(synthetic.len());
+                let start_pos = state.n_tokens;
+                if hipfire_arch_cohere2moe::forward::forward_batch(
+                    config,
+                    weights,
+                    state,
+                    gpu,
+                    &synthetic[i..end],
+                    start_pos,
+                )
+                .is_err()
+                {
+                    ok = false;
+                    break;
+                }
+                i = end;
+            }
+        } else {
+            for (i, &tok) in synthetic.iter().enumerate() {
+                if hipfire_arch_cohere2moe::forward::decode_step(
+                    config, weights, state, gpu, tok, i as u32,
+                )
+                .is_err()
+                {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        Some(ok)
+    }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err("cohere2moe: pp>1 unsupported via registry".into());
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
+        let bundle = hipfire_arch_cohere2moe::load_cohere2moe_bundle(src, ctx)?;
+        let speculator = crate::spec_build::build_speculator(
+            meta.arch_id,
+            None,
+            None,
+            true,
+            ctx.max_seq,
+            ctx.spec,
+        );
+        Ok(LoadedModel {
+            state: Some(Box::new(bundle)),
+            speculator,
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                meta.chat_template,
+            )
+        })
+    }
+}
+
+// ─── Gemma4Carrier ───────────────────────────────────────────────────
+
+fn gemma4_use_lowered(
+    enable_moe_block: bool,
+    want_batched: bool,
+    has_drafter: bool,
+    is_e_series: bool,
+) -> bool {
+    enable_moe_block || (want_batched && !has_drafter && !is_e_series)
+}
+
+fn gemma4_validate_drafter_route(
+    is_e_series: bool,
+    is_moe: bool,
+    has_drafter: bool,
+) -> Result<(), String> {
+    if is_moe && has_drafter {
+        return Err(
+            "gemma4: lowered/MoE EAGLE spec-decode is not supported; load the MoE target without params.drafter"
+                .into(),
+        );
+    }
+    if is_e_series && has_drafter {
+        return Err(
+            "gemma4: E2B/E4B EAGLE spec-decode is not yet supported; load the E-series target without params.drafter"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+pub struct Gemma4Carrier;
+impl Carrier for Gemma4Carrier {
+    fn name(&self) -> &'static str {
+        "gemma4"
+    }
+    fn spec_target_guard<'m>(
+        &self,
+        _state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        Err("gemma4: spec decode not yet wired (AR-only)".into())
+    }
+    fn make_spec_emitter<'a>(
+        &self,
+        _ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        Err("gemma4: spec emitter not yet wired".into())
+    }
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        // 13 = gemma4_text (primary), 22 = gemma4_unified_assistant (EAGLE drafter sidecar).
+        // The drafter file (22) is loaded via params.drafter path, not as a primary serve model,
+        // but claiming it here lets the quantizer's 22-stamped draft file be probed without
+        // "no carrier" error and keeps the two namespaces aligned. Primary serve of 22 alone
+        // would still need a target model, so it naturally fails later in generate routing.
+        matches!(arch_id, 13 | 22)
+    }
+    fn classify_parallel_variant(&self, src: &ModelSource) -> Result<ModelVariant, String> {
         match src {
-            ModelSource::Hfq(hfq) => {
-                let tokenizer =
-                    hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-                        .map_err(|e| format!("cohere2moe: tokenizer not found: {e}"))?;
-                let mut lm =
-                    crate::load_cohere2moe(hfq, tokenizer, ctx.gpu, ctx.max_seq, ctx.path)?;
-                // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1).
-                lm.speculator = crate::spec_build::build_speculator(
-                    meta.arch_id,
-                    None,
-                    None,
-                    true,
-                    ctx.max_seq,
-                    ctx.spec,
-                );
-                Ok(lm)
+            ModelSource::Hfq(hfq) => match hfq.arch_id {
+                // 13 is the only primary Gemma4 topology id. arch 22 (EAGLE
+                // drafter sidecar) is never a CAP-001 target — no row exists.
+                13 => Ok(ModelVariant::Gemma4),
+                other => Err(format!("gemma4: unexpected HFQ arch_id {}", other)),
+            },
+            ModelSource::Dir(source) => match source.arch_id() {
+                13 => Ok(ModelVariant::Gemma4),
+                other => Err(format!("gemma4 safetensors: unexpected arch_id {}", other)),
+            },
+        }
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: Some(2),
+            has_deltanet: false,
+            supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::GemmaBoolean,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(1.0, 0.95, 1.0)
+    }
+    fn bench_prefill(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+        _n: usize,
+        _prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let bundle = m.gemma4_mut().unwrap();
+        let config = &bundle.config;
+        let weights = &bundle.weights;
+        let state = &mut bundle.state;
+        let mut ok = true;
+        for (i, &tok) in synthetic.iter().enumerate() {
+            if hipfire_arch_gemma4::forward::decode_step(config, weights, state, gpu, tok, i as u32)
+                .is_err()
+            {
+                ok = false;
+                break;
             }
-            ModelSource::Dir(source) => {
-                // Transparent ParoQuant safetensors-Dir path (North-Mini-Code).
-                let config = hipfire_arch_cohere2moe::Cohere2MoeConfig::from_safetensors(&source)
-                    .map_err(|e| {
-                    format!("failed to parse Cohere2-MoE config from config.json: {e}")
-                })?;
-                let weights =
-                    hipfire_arch_cohere2moe::paro_dir::load_from_source(&source, &config, ctx.gpu)?;
-                let state = hipfire_arch_cohere2moe::Cohere2MoeState::new_with_max_seq(
-                    ctx.gpu,
-                    &config,
-                    ctx.max_seq,
-                )
-                .map_err(|e| format!("cohere2moe: new_with_max_seq failed: {e}"))?;
+        }
+        Some(ok)
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.pp > 1 {
+            return Err("gemma4: pp>1 unsupported".into());
+        }
+        if ctx.draft_path.is_some() {
+            return Err("params.draft (qwen3.5 DFlash) is not supported on arch_id=13 (Gemma 4). For Gemma 4 spec-decode pass the arch-22 EAGLE drafter via params.drafter instead.".to_string());
+        }
+        dir_diag(&src);
+        let meta = resolve_source_meta(&src, ctx.path)?;
+        let bundle = hipfire_arch_gemma4::load_gemma4_bundle(src, ctx)?;
+        match bundle {
+            hipfire_arch_gemma4::Gemma4Bundle::Lowered(l) => {
                 let eos_tok = resolve_eos_tok(
                     &meta.tokenizer,
-                    &["<|END_OF_TURN_TOKEN|>", "</s>", "<|endoftext|>"],
+                    &["<end_of_turn>", "<turn|>", "<eos>", "<|im_end|>"],
                 );
                 let speculator = crate::spec_build::build_speculator(
                     meta.arch_id,
@@ -1321,12 +1913,16 @@ impl Carrier for Cohere2MoeCarrier {
                     ctx.max_seq,
                     ctx.spec,
                 );
-                Ok(LoadedModel {
-                    state: Some(ModelState::Cohere2Moe(crate::Cohere2MoeBundle {
-                        config,
-                        weights,
-                        state,
+                let model = LoadedModel {
+                    state: Some(Box::new(crate::Gemma4LoweredBundle {
+                        config: l.config,
+                        weights: l.weights,
+                        scratch: l.scratch,
+                        kv_sliding: l.kv_sliding,
+                        kv_full: l.kv_full,
                         eos_tok,
+                        cursor: hipfire_arch_gemma4::lowered::Gemma4Cursor::default(),
+                        prefix_cache: crate::GemmaPrefixCache::default(),
                     })),
                     speculator,
                     ..LoadedModel::skeleton(
@@ -1337,8 +1933,676 @@ impl Carrier for Cohere2MoeCarrier {
                         ctx.path.to_string(),
                         meta.chat_template,
                     )
-                })
+                };
+                let owner_bytes = model
+                    .gemma4_lowered()
+                    .map_or(0, crate::Gemma4LoweredBundle::owner_bytes);
+                if let Err(error) = hipfire_arch_gemma4::lowered::fail_after_construction_stage(
+                    hipfire_arch_gemma4::lowered::Gemma4ConstructionStage::Session,
+                ) {
+                    let cleanup = crate::unload_model(model, ctx.gpu);
+                    let cleanup_note = cleanup
+                        .err()
+                        .map(|cleanup| format!("; cleanup failed: {cleanup}"))
+                        .unwrap_or_default();
+                    return Err(format!(
+                        "gemma4 (lowered) session stage: {error:?}{cleanup_note}"
+                    ));
+                }
+                hipfire_arch_gemma4::lowered::Gemma4AllocationTelemetry::emit_from_gpu(
+                    "publish",
+                    hipfire_arch_gemma4::lowered::allocation_telemetry_cycle(),
+                    owner_bytes,
+                    ctx.gpu,
+                    Vec::new(),
+                );
+                Ok(model)
+            }
+            hipfire_arch_gemma4::Gemma4Bundle::Eager(e) => {
+                let eos_tok = resolve_eos_tok(
+                    &meta.tokenizer,
+                    &["<end_of_turn>", "<turn|>", "<eos>", "<|im_end|>"],
+                );
+                let _ = &e.weights;
+                // Optional EAGLE drafter (arch-22) — populated only when
+                // `gemma4_drafter_path` is Some. Validates draft_len 1..=5,
+                // arch_id 22, and backbone_hidden == target dim. On failure
+                // logs and falls back to AR-only (mirrors PR's contract) to
+                // avoid hard failing a valid target model due to a bad sidecar.
+                let eagle = if let Some(dp) = ctx.gemma4_drafter_path {
+                    let draft_len = crate::gemma4_eagle_spec_len(Some(ctx.gemma4_draft_len as u64))
+                        .map_err(|e| format!("gemma4 drafter spec_len: {e}"))?;
+                    match load_gemma4_eagle_state(dp, draft_len, &e.config, &e.weights, ctx.gpu) {
+                        Ok(st) => {
+                            eprintln!(
+                                "  gemma4 EAGLE drafter loaded: {} (layers={}, hidden={}, draft_len={})",
+                                dp, st.drafter_config.n_layers, st.drafter_config.hidden, st.draft_len,
+                            );
+                            Some(st)
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "  gemma4 EAGLE drafter load failed ({}): {} — falling back to AR only",
+                                dp, e
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let speculator = crate::spec_build::build_speculator(
+                    meta.arch_id,
+                    None,
+                    None,
+                    true,
+                    ctx.max_seq,
+                    ctx.spec,
+                );
+                let model = LoadedModel {
+                    state: Some(Box::new(crate::Gemma4Bundle {
+                        config: e.config,
+                        weights: e.weights,
+                        state: e.state,
+                        eos_tok,
+                        eagle,
+                        prefix_cache: crate::GemmaPrefixCache::default(),
+                    })),
+                    speculator,
+                    ..LoadedModel::skeleton(
+                        meta.arch_id,
+                        meta.tokenizer,
+                        ctx.max_seq,
+                        ctx.max_seq,
+                        ctx.path.to_string(),
+                        meta.chat_template,
+                    )
+                };
+                let owner_bytes = model.gemma4().map_or(0, crate::Gemma4Bundle::owner_bytes);
+                hipfire_arch_gemma4::lowered::Gemma4AllocationTelemetry::emit_from_gpu(
+                    "publish",
+                    hipfire_arch_gemma4::lowered::allocation_telemetry_cycle(),
+                    owner_bytes,
+                    ctx.gpu,
+                    Vec::new(),
+                );
+                Ok(model)
             }
         }
+    }
+}
+
+fn load_gemma4_eagle_state(
+    drafter_path: &str,
+    draft_len: usize,
+    target_cfg: &hipfire_arch_gemma4::config::Gemma4Config,
+    target_weights: &hipfire_arch_gemma4::gemma4::Gemma4Weights,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<crate::Gemma4EagleState, String> {
+    use std::path::Path;
+    let dhfq = hipfire_runtime::hfq::HfqFile::open(Path::new(drafter_path))
+        .map_err(|e| format!("open gemma4 drafter: {e}"))?;
+    if dhfq.arch_id != 22 {
+        return Err(format!(
+            "gemma4 EAGLE drafter must be arch_id=22 (gemma4_unified_assistant); got arch_id={} — a DFlash draft goes in params.draft on qwen3.5 targets, not params.drafter",
+            dhfq.arch_id
+        ));
+    }
+    let dcfg = hipfire_arch_gemma4::drafter::Gemma4DrafterConfig::from_hfq(&dhfq)?;
+    if dcfg.backbone_hidden != target_cfg.dim {
+        return Err(format!(
+            "drafter backbone_hidden ({}) != target hidden ({}) — this drafter was trained against a different target width",
+            dcfg.backbone_hidden, target_cfg.dim
+        ));
+    }
+    let drafter_weights =
+        hipfire_arch_gemma4::drafter::Gemma4DrafterWeights::load(&dhfq, &dcfg, gpu)?;
+    let drafter_scratch = hipfire_arch_gemma4::drafter::Gemma4DrafterScratch::new(gpu, &dcfg)
+        .map_err(|e| format!("gemma4 drafter scratch: {e}"))?;
+    let spec_scratch =
+        hipfire_arch_gemma4::speculative::Gemma4SpecScratch::new(gpu, target_cfg, draft_len)
+            .map_err(|e| format!("gemma4 spec scratch: {e}"))?;
+    // Prime the batched verify path (b=1 then real block size) on disposable
+    // throwaway states — mirrors PR's warmup to ensure kernels are compiled.
+    let warm_b = draft_len + 1;
+    {
+        let mut warm =
+            hipfire_arch_gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, target_cfg, warm_b + 4)
+                .map_err(|e| format!("gemma4-eagle: warm state: {e}"))?;
+        let _ = hipfire_arch_gemma4::forward::forward_batch(
+            target_cfg,
+            target_weights,
+            &mut warm,
+            gpu,
+            &[target_cfg.bos_token],
+            0,
+        );
+        let _ = gpu.hip.device_synchronize();
+        warm.free_gpu(gpu);
+    }
+    {
+        let mut warm =
+            hipfire_arch_gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, target_cfg, warm_b + 4)
+                .map_err(|e| format!("gemma4-eagle: warm state 2: {e}"))?;
+        let _ = hipfire_arch_gemma4::forward::forward_batch(
+            target_cfg,
+            target_weights,
+            &mut warm,
+            gpu,
+            &vec![target_cfg.bos_token; warm_b],
+            0,
+        );
+        let _ = gpu.hip.device_synchronize();
+        warm.free_gpu(gpu);
+    }
+    Ok(crate::Gemma4EagleState {
+        drafter_config: dcfg,
+        drafter_weights,
+        drafter_scratch,
+        spec_scratch,
+        draft_len,
+    })
+}
+
+// ─── MuseGlimmerCarrier ────────────────────────────────────────────────
+/// HIPFIRE_PP_LAYERS band-spec validation — the same parse/count/sum
+/// authority `load_qwen35_pp` uses, exposed so the daemon preflight can
+/// refuse a bad band spec BEFORE the eager prior-model teardown. Returns
+/// `None` when the env is unset/empty (uniform split).
+pub fn parse_pp_layer_bands(
+    spec: Option<&str>,
+    pp: usize,
+    n_layers: usize,
+) -> Result<Option<Vec<usize>>, String> {
+    let Some(spec) = spec.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let counts: Result<Vec<usize>, _> =
+        spec.split(',').map(|s| s.trim().parse::<usize>()).collect();
+    let counts = counts.map_err(|e| format!("HIPFIRE_PP_LAYERS parse: {e}"))?;
+    if counts.len() != pp {
+        return Err(format!(
+            "HIPFIRE_PP_LAYERS has {} entries, expected pp={}",
+            counts.len(),
+            pp
+        ));
+    }
+    let sum: usize = counts.iter().sum();
+    if sum != n_layers {
+        return Err(format!(
+            "HIPFIRE_PP_LAYERS sum={} != n_layers={}",
+            sum, n_layers
+        ));
+    }
+    Ok(Some(counts))
+}
+
+/// Muse Glimmer carrier preconditions — the single authority shared by the
+/// carrier load and the daemon-side preflight (VMM+CASK, pp, source shape,
+/// gemma4 drafter).
+pub fn preflight_muse_glimmer(src: &ModelSource, ctx: &LoadCtx) -> Result<(), String> {
+    if ctx.kv_backend == KvBackend::Vmm && ctx.cask.sidecar.is_some() {
+        return Err(
+            "muse_glimmer: KV backend 'vmm' does not support CASK/TriAttention eviction; disable the sidecar or use 'contiguous'"
+                .into(),
+        );
+    }
+    if ctx.pp > 1 {
+        return Err(match src {
+            ModelSource::Hfq(_) => "muse_glimmer: pipeline-parallel (pp>1) unsupported",
+            ModelSource::Dir(_) => "muse_glimmer: safetensors + pp>1 unsupported",
+        }
+        .into());
+    }
+    if matches!(src, ModelSource::Dir(_)) {
+        return Err(
+            "muse_glimmer: safetensors Dir load not yet wired — use HFQ (quantize with --arch-id 14) or add config_from_source to hipfire-arch-muse-glimmer"
+                .into(),
+        );
+    }
+    if ctx.gemma4_drafter_path.is_some() {
+        return Err(
+            "params.drafter (Gemma4 EAGLE) is not supported on arch_id=14 (Muse Glimmer).                  Remove params.drafter for AR-only decode."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Shared tokenizer metadata resolution — the same authority every carrier
+/// load uses (`resolve_source_meta`). Exposed so the daemon preflight can
+/// refuse a source whose tokenizer metadata does not parse BEFORE any
+/// prior-model teardown.
+pub fn preflight_tokenizer(src: &ModelSource, path: &str) -> Result<(), String> {
+    resolve_source_meta(src, path).map(|_| ())
+}
+
+pub struct MuseGlimmerCarrier;
+impl Carrier for MuseGlimmerCarrier {
+    fn name(&self) -> &'static str {
+        "muse_glimmer"
+    }
+    fn spec_target_guard<'m>(
+        &self,
+        _state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        Err("muse_glimmer: spec decode not yet wired (AR-only)".into())
+    }
+    fn make_spec_emitter<'a>(
+        &self,
+        _ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        Err("muse_glimmer: spec emitter not yet wired".into())
+    }
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        arch_id == 14
+    }
+    fn classify_parallel_variant(&self, src: &ModelSource) -> Result<ModelVariant, String> {
+        match src {
+            ModelSource::Hfq(hfq) => match hfq.arch_id {
+                // 14 is the only primary Muse Glimmer id. arch 23 (DFlash
+                // drafter sidecar) is never a CAP-001 target — no row exists.
+                14 => Ok(ModelVariant::MuseGlimmer),
+                other => Err(format!("muse_glimmer: unexpected HFQ arch_id {}", other)),
+            },
+            ModelSource::Dir(source) => match source.arch_id() {
+                14 => Ok(ModelVariant::MuseGlimmer),
+                other => Err(format!(
+                    "muse_glimmer safetensors: unexpected arch_id {}",
+                    other
+                )),
+            },
+        }
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: Some(2),
+            has_deltanet: false,
+            supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::MuseGlimmer,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(0.3, 0.8, 1.0)
+    }
+    fn bench_prefill(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+        _n: usize,
+        prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let bundle = m.muse_glimmer_mut().unwrap();
+        Some(if bundle.device_hidden_capture_enabled() {
+            match hipfire_arch_muse_glimmer::forward::prefill_with_device_capture(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                synthetic,
+                0,
+            ) {
+                Ok(_) => true,
+                Err(e) => {
+                    *prefill_err = Some(e);
+                    false
+                }
+            }
+        } else {
+            let mut hidden_out: Vec<f32> = Vec::new();
+            match hipfire_arch_muse_glimmer::forward::prefill_with_capture(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                synthetic,
+                0,
+                &[],
+                &mut hidden_out,
+            ) {
+                Ok(_) => true,
+                Err(e) => {
+                    *prefill_err = Some(e);
+                    false
+                }
+            }
+        })
+    }
+    fn bench_decode_prime(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+    ) -> Option<Option<String>> {
+        let bundle = m.muse_glimmer_mut().unwrap();
+        bundle.reset_session_state();
+        Some(if bundle.device_hidden_capture_enabled() {
+            hipfire_arch_muse_glimmer::forward::prefill_with_device_capture(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                synthetic,
+                0,
+            )
+            .err()
+        } else {
+            let mut hidden_out: Vec<f32> = Vec::new();
+            hipfire_arch_muse_glimmer::forward::prefill_with_capture(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                synthetic,
+                0,
+                &[],
+                &mut hidden_out,
+            )
+            .err()
+        })
+    }
+    fn bench_decode_run(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        context: usize,
+        iterations: usize,
+        decode_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let bundle = m.muse_glimmer_mut().unwrap();
+        let config = &bundle.config;
+        let weights = &bundle.weights;
+        let state = &mut bundle.state;
+        let mut ok = true;
+        for i in 0..iterations {
+            let token = 101 + (i as u32 % 1000);
+            match hipfire_arch_muse_glimmer::forward::decode_step(
+                config,
+                weights,
+                state,
+                gpu,
+                token,
+                (context + i) as u32,
+            ) {
+                Ok(_) => {}
+                Err(e) => {
+                    *decode_err = Some(format!("iter {i} pos {}: {e}", context + i));
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        Some(ok)
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        // Shared authority with the daemon-side preflight.
+        preflight_muse_glimmer(&src, ctx)?;
+        dir_diag(&src);
+        let meta = resolve_source_meta(&src, ctx.path)?;
+        match src {
+            ModelSource::Hfq(hfq) => {
+                // HFQ load path via the crate API (contract: from_hfq / load /
+                // new_with_max_seq_backend with ctx.kv_backend).
+                let config = hipfire_arch_muse_glimmer::config::GlimmerConfig::from_hfq(&hfq)?;
+                let weights = hipfire_arch_muse_glimmer::glimmer::GlimmerWeights::load(
+                    &hfq, &config, ctx.gpu,
+                )?;
+                let mut state =
+                    match hipfire_arch_muse_glimmer::glimmer::GlimmerState::new_with_max_seq_backend(
+                        ctx.gpu,
+                        &config,
+                        ctx.max_seq,
+                        ctx.kv_backend,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            weights.free_gpu(ctx.gpu);
+                            return Err(format!(
+                                "muse_glimmer: GlimmerState::new_with_max_seq_backend failed: {e}"
+                            ));
+                        }
+                    };
+                // eos resolution by name with 200001 as the documented fallback.
+                // 200001 is Glimmer's eos_token_id (config.eos_token, bos 200000).
+                // Try tokenizer encode of common EOS surface forms first; if none
+                // tokenize to a single id, fall back to 200001 (never 1 — the
+                // generic fallback in resolve_eos_tok would be silently wrong
+                // for Glimmer and would cause runaway generation).
+                let eos_tok = {
+                    let tok = resolve_eos_tok(
+                        &meta.tokenizer,
+                        &[
+                            "<end_of_turn>",
+                            "<|im_end|>",
+                            "</s>",
+                            "<|endoftext|>",
+                            "<eos>",
+                        ],
+                    );
+                    if tok == 1 {
+                        200001
+                    } else {
+                        tok
+                    }
+                };
+                // Optional DFlash drafter (arch 23). OFF by default — daemon
+                // only populates ctx.draft_path when HIPFIRE_DFLASH_DRAFT is set
+                // (or params.draft) and dflash_mode != "off". When present, load
+                // the 5-layer diffusion draft head (encoder.fc / layers.* / norm)
+                // and stash it on the bundle for the speculator to consume.
+                // On any failure, log and fall back to AR-only (never fail the
+                // target load because the draft is auxiliary).
+                let drafter: Option<crate::GlimmerDrafterBundle> = if let Some(dp) =
+                    ctx.draft_path.clone()
+                {
+                    match (|| -> Result<crate::GlimmerDrafterBundle, String> {
+                        let dhfq = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(&dp))
+                            .map_err(|e| format!("open glimmer drafter '{dp}': {e}"))?;
+                        if dhfq.arch_id
+                            != hipfire_arch_muse_glimmer::drafter::GLIMMER_DRAFTER_ARCH_ID
+                        {
+                            return Err(format!(
+                                "glimmer drafter '{}' arch_id {} != {} (muse_glimmer_assistant); a DFlash draft (arch 20) or Gemma4 draft (22) does not match",
+                                dp, dhfq.arch_id, hipfire_arch_muse_glimmer::drafter::GLIMMER_DRAFTER_ARCH_ID
+                            ));
+                        }
+                        let dcfg =
+                            hipfire_arch_muse_glimmer::drafter::GlimmerDrafterConfig::from_hfq(
+                                &dhfq,
+                            )?;
+                        if dcfg.hidden != config.dim {
+                            return Err(format!(
+                                "glimmer drafter hidden {} != target dim {} (cross-attention concat invariant)",
+                                dcfg.hidden, config.dim
+                            ));
+                        }
+                        if dcfg.block_size != 16 {
+                            eprintln!("glimmer drafter: WARNING block_size {} != 16 (expected diffusion recipe)", dcfg.block_size);
+                        }
+                        let dweights =
+                            hipfire_arch_muse_glimmer::drafter::GlimmerDrafterWeights::load(
+                                &dhfq, &dcfg, ctx.gpu,
+                            )?;
+                        // Freeze HIPFIRE_GLIMMER_CTX_CAP once at load (daemon/load default
+                        // 256). Same value sizes drafter scratch and device hidden log.
+                        let ctx_cap = {
+                            let requested = std::env::var("HIPFIRE_GLIMMER_CTX_CAP")
+                                .ok()
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .filter(|v| *v > 0)
+                                .unwrap_or(
+                                    hipfire_arch_muse_glimmer::drafter::GLIMMER_DRAFTER_CTX_CAP_DEFAULT,
+                                );
+                            requested.clamp(1, ctx.max_seq)
+                        };
+                        let dscratch =
+                            match hipfire_arch_muse_glimmer::drafter::GlimmerDrafterScratch::new(
+                                ctx.gpu,
+                                &dcfg,
+                                ctx.max_seq,
+                                ctx_cap,
+                            ) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    dweights.free_gpu(ctx.gpu);
+                                    return Err(format!("glimmer drafter scratch: {e}"));
+                                }
+                            };
+                        eprintln!(
+                            "  glimmer DFlash drafter loaded: {} (layers={}, hidden={}, block={}, mask={}, ctx_cap={})",
+                            dp, dcfg.n_layers, dcfg.hidden, dcfg.block_size, dcfg.mask_token_id, ctx_cap
+                        );
+                        Ok(crate::GlimmerDrafterBundle {
+                            config: dcfg,
+                            weights: dweights,
+                            scratch: dscratch,
+                        })
+                    })() {
+                        Ok(b) => Some(b),
+                        Err(e) => {
+                            eprintln!("  glimmer DFlash drafter load failed ({}): {} — falling back to AR only", ctx.draft_path.as_deref().unwrap_or(""), e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                // Device hidden capture is an opt-in experiment. The controlled
+                // gfx1100 gate removed all capture D2Hs but regressed decode
+                // throughput, so the unchanged host path remains the default.
+                // Selection is frozen here — no runtime path flipping after load.
+                if let Some(d) = &drafter {
+                    let device_enabled =
+                        hipfire_config::developer_var("HIPFIRE_GLIMMER_DEVICE_CAPTURE")
+                            .ok()
+                            .as_deref()
+                            == Some("1");
+                    if !device_enabled {
+                        eprintln!(
+                            "  glimmer hidden capture: backend=host (set HIPFIRE_GLIMMER_DEVICE_CAPTURE=1 to test device capture)"
+                        );
+                    } else {
+                        // Same frozen cap used for scratch construction (no env re-read).
+                        let ctx_cap = d.scratch.ctx_capacity();
+                        let layers = &d.config.target_layer_ids;
+                        match state.enable_device_hidden_capture(
+                            ctx.gpu,
+                            layers,
+                            ctx_cap,
+                            config.n_layers,
+                            config.dim,
+                        ) {
+                            Ok(()) => {
+                                eprintln!(
+                                    "  glimmer hidden capture: backend=device capacity_rows={} target_layer_ids={:?} shape=[{}, {}, {}]",
+                                    ctx_cap,
+                                    layers,
+                                    ctx_cap,
+                                    layers.len(),
+                                    config.dim,
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "  glimmer hidden capture: device enable failed ({e}) — continuing with host fallback"
+                                );
+                            }
+                        }
+                    }
+                }
+                let speculator = crate::spec_build::build_speculator(
+                    meta.arch_id,
+                    None,
+                    None,
+                    true,
+                    ctx.max_seq,
+                    ctx.spec,
+                );
+                let chat_template = match meta.chat_template {
+                    Some(t) => match crate::rewrite_muse_glimmer_onyx_template(&t) {
+                        Ok(rewritten) => Some(rewritten),
+                        Err(e) => {
+                            state.free_gpu(ctx.gpu);
+                            weights.free_gpu(ctx.gpu);
+                            if let Some(d) = drafter {
+                                d.scratch.free_gpu(ctx.gpu);
+                                d.weights.free_gpu(ctx.gpu);
+                            }
+                            return Err(e);
+                        }
+                    },
+                    None => None,
+                };
+                Ok(LoadedModel {
+                    state: Some(Box::new(crate::MuseGlimmerBundle {
+                        config,
+                        weights,
+                        state,
+                        eos_tok,
+                        drafter,
+                        target_hidden_host: Vec::new(),
+                    })),
+                    speculator,
+                    ..LoadedModel::skeleton(
+                        meta.arch_id,
+                        meta.tokenizer,
+                        ctx.max_seq,
+                        ctx.max_seq,
+                        ctx.path.to_string(),
+                        chat_template,
+                    )
+                })
+            }
+            ModelSource::Dir(source) => {
+                let _ = source;
+                return Err(
+                    "muse_glimmer: safetensors Dir load not yet wired — use HFQ (quantize with --arch-id 14) or add config_from_source to hipfire-arch-muse-glimmer".into()
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod gemma4_route_tests {
+    use super::{gemma4_use_lowered, gemma4_validate_drafter_route, Carrier, Gemma4Carrier};
+
+    #[test]
+    fn gemma4_advertises_staged_semantic_contract() {
+        let caps = Gemma4Carrier.caps();
+        assert_eq!(caps.semantic_contract_version, Some(2));
+    }
+
+    #[test]
+    fn e_series_never_enters_dense_lowered_prefill() {
+        assert!(!gemma4_use_lowered(false, true, false, true));
+    }
+
+    #[test]
+    fn dense_opt_in_and_moe_keep_existing_routes() {
+        assert!(gemma4_use_lowered(false, true, false, false));
+        assert!(!gemma4_use_lowered(false, true, true, false));
+        assert!(gemma4_use_lowered(true, false, false, false));
+    }
+
+    #[test]
+    fn e_series_drafter_fails_closed() {
+        assert!(gemma4_validate_drafter_route(true, false, true).is_err());
+        assert!(gemma4_validate_drafter_route(true, false, false).is_ok());
+        assert!(gemma4_validate_drafter_route(false, false, true).is_ok());
+    }
+
+    #[test]
+    fn moe_drafter_fails_closed_instead_of_falling_back_to_ar() {
+        let error = gemma4_validate_drafter_route(false, true, true).unwrap_err();
+        assert!(error.contains("lowered/MoE"));
+        assert!(error.contains("without params.drafter"));
     }
 }

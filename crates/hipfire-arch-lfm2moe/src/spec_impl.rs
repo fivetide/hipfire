@@ -35,10 +35,25 @@
 use crate::config::Lfm2MoeConfig;
 use crate::forward::decode_step;
 use crate::lfm2moe::{Lfm2MoeState, Lfm2MoeWeights};
+use hipfire_runtime::gpu_cleanup::{BundleTeardown, GpuCleanupFailure};
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Single-pass argmax over a host logit row.
+// NOTE: deliberately NOT `hipfire_runtime::llama::argmax`, and deliberately
+// duplicated with the other arch crate that carries this function.
+//
+// The runtime's copy adds an `is_finite()` guard (its "O2b-2 finite guard")
+// because it doubles as the degenerate fallback for `sample_top_p` /
+// `sample_full_dist`, where a `+Inf` logit must not beat the real finite max.
+//
+// This copy is on the speculative-decode path and must agree bit-for-bit with
+// the GPU kernel it is checked against — `kernels/src/argmax.hip:13` is a bare
+// `if (data[i] > lmax)`, which *does* select `+Inf`. Adding the finite guard
+// here would make draft and target disagree on `+Inf` logits and produce
+// spurious spec-decode rejections.
+//
+// Both behaviours are correct for their own caller. Do not unify them.
 fn argmax(logits: &[f32]) -> u32 {
     logits
         .iter()
@@ -68,6 +83,12 @@ pub struct Lfm2MoeBundle {
     pub weights: Lfm2MoeWeights,
     pub state: Lfm2MoeState,
     pub eos_tok: u32,
+    /// Continuous-decode batch state (arch 11 dense, single-GPU). `Some` only
+    /// when continuous batch has been staged via `batch_staging::stage_continuous_batch`;
+    /// `None` is the common AR path. Lives in the bundle (not `LoadedModel`)
+    /// so `LoadedModel` can become arch-free. Previously
+    /// `LoadedModel.lfm2_decode_batch`.
+    pub lfm2_decode_batch: Option<crate::batch::Lfm2DecodeBatchState>,
 }
 
 /// LFM2.5-MoE verify scratch: the pre-verify conv-state snapshot.
@@ -120,18 +141,57 @@ impl Lfm2MoeBundle {
     }
 }
 
+impl BundleTeardown for Lfm2MoeBundle {
+    /// Checked teardown of a fully constructed bundle: every GPU owner in
+    /// weights and state is freed with a checked free; on failure the exact
+    /// unfreed owners are retained in the returned [`GpuCleanupFailure`] for
+    /// retry — no best-effort free as a correctness mechanism.
+    fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let Lfm2MoeBundle {
+            config: _,
+            weights,
+            state,
+            eos_tok: _,
+            lfm2_decode_batch,
+        } = self;
+        let mut cf = GpuCleanupFailure::empty();
+        // The batch state owns the batched KV cache, conv rings, and every
+        // batched scratch buffer — all GpuTensors with no Drop. `free_gpu` is
+        // infallible, so free it explicitly here (mirrors arch_model.rs and
+        // qwen35's qwen35_decode_batch teardown); ignoring it would orphan
+        // device memory.
+        if let Some(batch) = lfm2_decode_batch {
+            batch.free_gpu(gpu);
+        }
+        if let Err(f) = weights.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if let Err(f) = state.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
+    }
+}
+
 impl SpecTarget for Lfm2MoeBundle {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
 
-    fn reset_recurrent(&mut self, gpu: &mut Gpu) {
+    fn reset_recurrent(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         // Zero every conv-state ring buffer + reset the token count (the daemon's
         // arch_id=11 reset path). KV is overwritten by absolute-position writes,
         // so there is no separate KV cursor to rewind here; drop the eviction
         // offset for symmetry with qwen35's reset.
-        let _ = self.state.reset(gpu);
+        self.state
+            .reset(gpu)
+            .map_err(|e| format!("lfm2moe reset_recurrent: {e}"))?;
         self.state.kv.compact_offset = 0;
+        Ok(())
     }
 
     fn new_spec_scratch(
@@ -159,20 +219,15 @@ impl SpecTarget for Lfm2MoeBundle {
         abort: &dyn Fn() -> bool,
         _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
-        // Plain target advance: feed each token at its absolute position. `reset`
-        // zeroes the conv-states + token count first (cache-miss prefill); on a
-        // cache-hit suffix / replay we continue from current recurrent state.
         if reset {
-            self.state
-                .reset(gpu)
-                .map_err(|e| format!("lfm2moe: spec_advance reset: {e}"))?;
-            self.state.kv.compact_offset = 0;
+            self.reset_recurrent(gpu)
+                .map_err(|e| format!("lfm2moe spec_advance reset: {e}"))?;
         }
+        // Plain target advance: feed each token at its absolute position. The
+        // model owner performs the sole request reset before this hook runs.
         let mut last_logits: Vec<f32> = Vec::new();
         for (i, &tok) in tokens.iter().enumerate() {
             if abort() {
-                let _ = self.state.reset(gpu);
-                self.state.kv.compact_offset = 0;
                 return Ok(SpecAdvance::Aborted);
             }
             let pos = (start_pos + i) as u32;
@@ -180,6 +235,7 @@ impl SpecTarget for Lfm2MoeBundle {
         }
         Ok(SpecAdvance::Ready {
             last_argmax: argmax(&last_logits),
+            last_logits: Some(last_logits),
         })
     }
 

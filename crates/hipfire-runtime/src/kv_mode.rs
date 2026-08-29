@@ -6,22 +6,7 @@
 //! dispatcher [`crate::llama::KvCache::from_mode`] turns the resolved mode into
 //! the actual allocating constructor call.
 
-/// The resolved, validated KV-cache mode (plus one resolver-internal sentinel).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KvMode {
-    Q8,
-    Asym2,
-    Asym3,
-    Asym4,
-    Fwht2,
-    Fwht3,
-    Fwht4,
-    /// SENTINEL — not an allocatable mode. Emitted only by site 3's
-    /// `normalize_dir` for its `auto`-set (`"" | "auto" | "turbo" | "turbo3"`).
-    /// `resolve` collapses it to `Asym3` (head_dim == 256) or `Q8` (else)
-    /// *before returning*, so [`crate::llama::KvCache::from_mode`] never sees it.
-    Asym3Auto,
-}
+pub use saddle_core::kv::KvMode;
 
 /// Per-site alias table + accepted set + default. One const per load site.
 pub struct KvModePolicy {
@@ -109,11 +94,15 @@ pub const DIR_SAFETENSORS_POLICY: KvModePolicy = KvModePolicy {
     default: Q8, // recognized-but-unaccepted AND unrecognized both → plain q8
 };
 
-/// Site 4 — llama HFQ carrier. carrier.rs:21. Hardcoded q8 today.
+/// Site 4 — llama HFQ carrier. carrier.rs:21. Default q8. Accepts the three
+/// modes that have Flat KV constructors: Q8, Asym3, Asym4. Asym3/Asym4 are
+/// gated in `KvCache::from_mode` with a clean error at head_dim≠256 (most llama
+/// models are head_dim=128; only validated at 256 via Qwen 3.5). Asym2/Fwht*
+/// have no Flat constructor and silently fall to q8 (unimplemented, not broken).
 pub const LLAMA_HFQ_POLICY: KvModePolicy = KvModePolicy {
     site: "llama-hfq",
     normalize_alias: normalize_full,
-    accepted: &[Q8],
+    accepted: &[Q8, Asym3, Asym4],
     default: Q8,
 };
 
@@ -261,14 +250,37 @@ mod tests {
     }
 
     #[test]
-    fn truth_table_q8_only_policies() {
-        for p in [&LLAMA_HFQ_POLICY, &HFQ_Q8_ONLY_POLICY] {
-            assert_eq!(resolve("", p, 128).mode, KvMode::Q8);
-            assert_eq!(resolve("q8", p, 128).mode, KvMode::Q8);
-            assert_eq!(resolve("asym3", p, 128).mode, KvMode::Q8); // unaccepted → q8
-            assert_eq!(resolve("fwht4", p, 256).mode, KvMode::Q8);
-            assert_eq!(resolve("garbage", p, 256).mode, KvMode::Q8);
-        }
+    fn truth_table_llama_hfq_expanded() {
+        let p = &LLAMA_HFQ_POLICY;
+        // Default and explicit q8 → Q8.
+        assert_eq!(resolve("", p, 128).mode, KvMode::Q8);
+        assert_eq!(resolve("", p, 256).mode, KvMode::Q8); // default is Q8, not Asym3
+        assert_eq!(resolve("q8", p, 128).mode, KvMode::Q8);
+        // Asym3/Asym4 accepted — reach from_mode where head_dim gate fires.
+        assert_eq!(resolve("asym3", p, 128).mode, KvMode::Asym3);
+        assert_eq!(resolve("asym3", p, 256).mode, KvMode::Asym3);
+        assert_eq!(resolve("asym4", p, 128).mode, KvMode::Asym4);
+        assert_eq!(resolve("turbo3", p, 128).mode, KvMode::Asym3);
+        assert_eq!(resolve("turbo4", p, 256).mode, KvMode::Asym4);
+        // auto/turbo normalize to Asym3 (accepted → pass through).
+        assert_eq!(resolve("auto", p, 256).mode, KvMode::Asym3);
+        // Unaccepted modes (asym2/fwht*) silently fall to Q8 default.
+        assert_eq!(resolve("asym2", p, 128).mode, KvMode::Q8);
+        assert!(resolve("asym2", p, 128).warning.is_some());
+        assert_eq!(resolve("fwht3", p, 256).mode, KvMode::Q8);
+        // Unrecognized strings also fall to Q8 with warning.
+        assert_eq!(resolve("garbage", p, 256).mode, KvMode::Q8);
+        assert!(resolve("garbage", p, 256).warning.is_some());
+    }
+
+    #[test]
+    fn truth_table_hfq_q8_only() {
+        let p = &HFQ_Q8_ONLY_POLICY;
+        assert_eq!(resolve("", p, 128).mode, KvMode::Q8);
+        assert_eq!(resolve("q8", p, 128).mode, KvMode::Q8);
+        assert_eq!(resolve("asym3", p, 128).mode, KvMode::Q8); // unaccepted → q8
+        assert_eq!(resolve("fwht4", p, 256).mode, KvMode::Q8);
+        assert_eq!(resolve("garbage", p, 256).mode, KvMode::Q8);
     }
 
     #[test]

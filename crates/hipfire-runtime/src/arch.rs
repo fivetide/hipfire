@@ -2,6 +2,25 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
+//! ## Status: intra-crate helper, NOT the architecture contract
+//!
+//! This trait once competed with `hipfire_loader::Carrier` to be "the" arch
+//! contract. It no longer does, and the distinction matters when adding a model:
+//!
+//! - **The contract** is `Carrier` (registration + load, in the loader because
+//!   `Carrier::load` returns `LoadedModel`) plus
+//!   [`crate::arch_model::ArchModel`] (the arch-agnostic view of a loaded model,
+//!   implemented in the arch crate).
+//! - **This trait** is a typed bring-up convenience — associated
+//!   `Config`/`Weights`/`State` plus `config_from_hfq` / `load_weights` /
+//!   `new_state`. It is used only *within* arch crates, by their own
+//!   `load_<arch>_bundle` functions. Measured: zero consumers in
+//!   `hipfire-loader`, `hipfire-generate` or `hipfire-daemon`.
+//!
+//! It is therefore optional. `hipfire-arch-muse-glimmer` implements it not at
+//! all and loads fine. Adopt it if the typed shape helps your crate; skip it if
+//! it does not. Its four override hooks were deleted as dead in an earlier pass.
+//!
 //! The bring-up contract for a hipfire architecture. Implement this
 //! trait in your arch crate (e.g. `hipfire-arch-qwen35`) to plug a
 //! model into the runtime. Generation, sampling, eviction, spec
@@ -46,13 +65,14 @@
 //!      time.
 
 use crate::hfq::HfqFile;
-use rdna_compute::Gpu;
+use crate::llama::WeightTensor;
+use rdna_compute::{DType, Gpu};
 
 /// Bring-up contract for a hipfire architecture.
 ///
 /// Implementors live in their own arch crate (`hipfire-arch-<name>`)
 /// and provide the three required types (Config / Weights / State)
-/// plus five required methods. The four optional override hooks let
+/// plus five required methods. The optional override hook lets
 /// an arch deviate from Qwen3.5 family defaults without growing a
 /// per-`arch_id` `match` ladder in the daemon.
 ///
@@ -71,12 +91,10 @@ use rdna_compute::Gpu;
 ///
 /// See per-method docs below.
 ///
-/// # Optional: override hooks
+/// # Optional: override hook
 ///
-/// `loop_guard_overrides`, `sampler_overrides`, `prompt_frame_overrides`,
-/// `eos_filter_overrides`. Default impls match Qwen3.5 conventions.
-/// Override per-arch when the arch's prompt format / sampling
-/// requirements / end-of-turn markers diverge.
+/// `eos_filter_overrides`. Default impl matches Qwen3.5 conventions.
+/// Override per-arch when the arch's end-of-turn markers diverge.
 pub trait Architecture: Send + 'static {
     type Weights;
     type State;
@@ -153,6 +171,34 @@ pub trait Architecture: Send + 'static {
     ///   workspace; no recurrent state.
     fn new_state(gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String>;
 
+    /// Declarative weight-placement manifest (Phase 2, device-mesh plan): for
+    /// each tensor, its logical shape/dtype + [`ShardPolicy`]. The engine slices
+    /// each tensor to its `(stage, tp_rank)` via the mesh before the arch sees
+    /// it, so the arch declares *what it needs*, not *where it goes*. Pure CPU,
+    /// no GPU/HFQ dependency — implement by transcribing the arch's existing
+    /// imperative loader; unit-test before the fulfillment loop exists. Default
+    /// is unimplemented so arches opt in incrementally.
+    fn weight_manifest(_cfg: &Self::Config) -> Vec<crate::weight_manifest::WeightEntry> {
+        unimplemented!("weight_manifest not yet implemented for this arch")
+    }
+
+    /// Declarative per-layer state manifest (KV/recurrent/conv) — sibling of
+    /// [`Architecture::weight_manifest`], placed by the same mesh projection.
+    /// Default empty (arches opt in). See device-mesh plan §4.
+    fn state_manifest(_cfg: &Self::Config) -> Vec<crate::weight_manifest::StateEntry> {
+        Vec::new()
+    }
+
+    /// Declarative MoE expert-group manifest. The runtime resolves global
+    /// expert ids to owners and compact local slots; non-MoE architectures
+    /// retain their existing behavior through the empty default.
+    fn expert_group_manifest(
+        _cfg: &Self::Config,
+        _policy: &crate::moe_plan::MoEExecutionPolicy,
+    ) -> Vec<crate::weight_manifest::ExpertGroupSpec> {
+        Vec::new()
+    }
+
     // Forward pass shapes are arch-specific; declare the surface but
     // don't constrain types in this trait — concrete arch crates
     // expose their own typed forward methods. The runtime's generic
@@ -164,34 +210,6 @@ pub trait Architecture: Send + 'static {
     // the trait is intentionally minimal — just enough scaffolding for
     // a canary arch crate to implement and the runtime to type-check.
 
-    /// Override loop-guard config for this arch. Default is None on
-    /// every field, falling back to runtime/env defaults.
-    ///
-    /// Override when a base or instruct-tuned model legitimately
-    /// emits short repeating sequences (e.g. structured output, code
-    /// boilerplate) that the default n-gram threshold would falsely
-    /// flag. See `LoopGuardOverrides` for fields.
-    fn loop_guard_overrides(_cfg: &Self::Config) -> LoopGuardOverrides {
-        LoopGuardOverrides::default()
-    }
-
-    /// Override sampler config for this arch. Default is empty on
-    /// `blocked_tokens`, None on `repeat_penalty`.
-    ///
-    /// Override to add arch-specific blocked tokens (e.g. a special
-    /// `<tool_call>` opener that the model emits in attractor loops)
-    /// or to set a per-arch default `repeat_penalty`.
-    fn sampler_overrides(_cfg: &Self::Config) -> SamplerOverrides {
-        SamplerOverrides::default()
-    }
-
-    /// Override prompt framing for this arch. Default assumes ChatML
-    /// (`<|im_start|>` / `<|im_end|>` markers).
-    ///
-    /// Override `raw: Some(true)` for a non-ChatML completion model.
-    fn prompt_frame_overrides(_cfg: &Self::Config) -> PromptFrameOverrides {
-        PromptFrameOverrides::default()
-    }
 
     /// Override EOS handling for this arch. Default uses ChatML
     /// `<|im_end|>` plus the `<think>` strip policy from runtime.
@@ -204,53 +222,6 @@ pub trait Architecture: Send + 'static {
     }
 }
 
-/// Per-arch overrides for the loop-guard n-gram blocker.
-///
-/// The runtime's loop guard (`hipfire_runtime::loop_guard`) detects
-/// repeated n-grams in the recent decode window and blocks the
-/// repeating token before sampler draws it. Defaults come from env
-/// (`HIPFIRE_NGRAM_THRESHOLD`, `HIPFIRE_NGRAM_WINDOW`); per-arch
-/// overrides take precedence.
-#[derive(Debug, Clone, Default)]
-pub struct LoopGuardOverrides {
-    /// If `Some`, replace the env-derived n-gram threshold (count of
-    /// repeats before block fires). Lower = more aggressive blocking.
-    pub ngram_threshold: Option<usize>,
-    /// If `Some`, replace the env-derived window length (recent-token
-    /// span the n-gram detector scans).
-    pub ngram_window: Option<usize>,
-}
-
-/// Per-arch overrides for the sampler.
-///
-/// `hipfire_runtime::sampler` owns top-p / top-k / temperature / repeat-
-/// penalty / blocked-token mechanics. Per-arch overrides add to (don't
-/// replace) the runtime config.
-#[derive(Debug, Clone, Default)]
-pub struct SamplerOverrides {
-    /// Tokens to add to `SamplerConfig::blocked_tokens` for this arch
-    /// (e.g. arch-specific `<tool_call>` opener IDs that the model
-    /// emits in attractor loops). Appended to the runtime list, not
-    /// replacing it.
-    pub blocked_tokens: Vec<u32>,
-    /// If `Some`, override the repeat penalty for this arch. Use
-    /// sparingly — `1.05` is the user-validated default floor; values
-    /// >1.3 cause MQ4/MQ6 gibberish at low temperature.
-    pub repeat_penalty: Option<f32>,
-}
-
-/// Per-arch overrides for prompt framing.
-///
-/// `hipfire_runtime::prompt_frame` owns the `<|im_start|>` / `<|im_end|>`
-/// scaffolding plus `<think>` injection for thinking-mode models.
-#[derive(Debug, Clone, Default)]
-pub struct PromptFrameOverrides {
-    /// If `Some`, override the assistant prefix scheme. `Some(true)`
-    /// disables ChatML framing entirely (raw completion, no
-    /// `<|im_start|>assistant`); `Some(false)` forces ChatML even if
-    /// the runtime would otherwise auto-detect raw.
-    pub raw: Option<bool>,
-}
 
 /// Per-arch overrides for EOS / end-of-turn filtering.
 ///
@@ -273,4 +244,57 @@ pub struct EosFilterOverrides {
     /// If `Some`, override whether to strip `<think>...</think>` blocks
     /// from the visible stream. Default is on for thinking-mode arches.
     pub strip_think: Option<bool>,
+}
+
+/// Architecture-owned iteration over weights eligible for load-time MMQ
+/// safety screening. Each implementation returns `(safe, unsafe)` counts.
+pub trait MmqScreenable {
+    fn screen_mmq_weights(&self, gpu: &mut Gpu) -> (usize, usize);
+}
+
+/// Screen one weight tensor when its storage layout is accepted by the HFQ4
+/// MMQ reference probe. The dtype guard is load-bearing: probing a different
+/// packed layout can read beyond the tensor buffer.
+pub fn screen_weight_tensor(
+    weight: &WeightTensor,
+    gpu: &mut Gpu,
+    safe: &mut usize,
+    unsafe_count: &mut usize,
+) {
+    if !matches!(weight.gpu_dtype, DType::HFQ4G256 | DType::MQ4G256) {
+        return;
+    }
+    if gpu.mmq_screen_weight(&weight.buf, weight.m, weight.k) {
+        *safe += 1;
+    } else {
+        *unsafe_count += 1;
+    }
+}
+
+/// Apply the current enable/architecture policy and screen an architecture's
+/// weights. Screening remains opt-in; disabled loads return immediately.
+pub fn maybe_screen_mmq(weights: &impl MmqScreenable, gpu: &mut Gpu) {
+    if !gpu.mmq_screen.enabled
+        || !matches!(
+            gpu.arch.as_str(),
+            "gfx906"
+                | "gfx1100"
+                | "gfx1101"
+                | "gfx1102"
+                | "gfx1103"
+                | "gfx1150"
+                | "gfx1151"
+                | "gfx1152"
+        )
+    {
+        return;
+    }
+
+    let started = std::time::Instant::now();
+    let (safe, unsafe_count) = weights.screen_mmq_weights(gpu);
+    eprintln!(
+        "  MMQ screening: {safe} safe, {unsafe_count} unsafe (threshold={:.2}, {:.1}ms)",
+        gpu.mmq_screen.threshold,
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
 }

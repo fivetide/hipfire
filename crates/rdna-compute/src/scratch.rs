@@ -27,6 +27,14 @@ pub struct ScratchState {
     pub mq_x_rot_fp8_bytes: usize,
     pub mq_x_q8: Option<DeviceBuffer>,
     pub mq_x_scales: Option<DeviceBuffer>,
+    /// Persistent gfx1100 K=2048 RMSNorm+MQ state shared by the split and
+    /// wavegrid experiments. The wavegrid layout is eight f32 partials, one
+    /// f32 RMS value, and three u32 epoch counters, padded to 64 bytes; the
+    /// split path uses its first f32 as the RMS handoff.
+    pub mq_rmsnorm_wavegrid_scratch: Option<DeviceBuffer>,
+    /// Dedicated F32 temporary for the unfused GEMV-residual alias fallback.
+    /// Lazily allocated and grown on demand; no other scratch path uses it.
+    pub gemv_residual_tmp: Option<GpuTensor>,
     pub paro_x_scratch: Option<GpuTensor>,
     /// Rotation scratch buffers for PARO fused-kernel dispatch. 4 × [k] F32
     /// buffers, lazily allocated and grown on demand. Used by
@@ -71,12 +79,24 @@ pub(crate) fn compile_and_load_kernel(
     }
     let obj_path = compiler.compile(module_name, source)?;
     let obj_path_str = obj_path.to_str().unwrap().to_string();
+    // Alias the launched function name to this arch's compiled artifact so the
+    // retained-PM4 capture can resolve func_name -> owning .hsaco even when the
+    // arch-selected module name differs (e.g. gemv_hfq4g256_residual launched vs
+    // module gemv_hfq4g256_residual_rdna3 on RDNA3). Additive; no-op when equal.
+    if func_name != module_name {
+        compiler.register_func_artifact(func_name, std::path::PathBuf::from(&obj_path_str));
+    }
     if !modules.contains_key(module_name) {
         let module = module_load_or_recompile(hip, compiler, module_name, source, &obj_path_str)?;
         modules.insert(module_name.to_string(), module);
     }
     let module = &modules[module_name];
-    let func = hip.module_get_function(module, func_name)?;
+    let func = hip.module_get_function(module, func_name).map_err(|error| {
+        let context = format!(
+            "hipModuleGetFunction failed for symbol {func_name:?} in module {module_name:?}: {error}"
+        );
+        hip_bridge::HipError::new(error.code, &context)
+    })?;
     functions.insert(func_name.to_string(), func);
     Ok(())
 }
@@ -108,34 +128,128 @@ pub(crate) fn module_load_or_recompile(
     }
 }
 
-/// Launch a kernel, routing through the blob path when graph capture or
-/// force_blob is active. Shared between `Gpu::launch_maybe_blob` and
-/// `ScratchState` methods so the branching logic stays in one place.
+/// Launch a kernel, routing through the blob path when graph capture, replay
+/// recording, or force_blob is active. Shared between `Gpu::launch_maybe_blob`
+/// and `ScratchState` methods so the branching logic stays in one place.
+///
+/// Invariant: for any body, `capture_blobs.len()` after a HipGraph capture
+/// equals `replay.recorded_launches().len()` after a ReplayController capture.
+/// A divergence means a helper bypassed the replay recorder.
 pub(crate) fn launch_maybe_blob(
     hip: &HipRuntime,
+    compiler: Option<&crate::compiler::KernelCompiler>,
     functions: &HashMap<String, Function>,
     stream: Option<&Stream>,
     capture_blobs: &mut Vec<Vec<u8>>,
     capture_mode: bool,
     force_blob_path: bool,
+    mut replay: Option<&mut crate::replay::ReplayController>,
     func_name: &str,
     grid: [u32; 3],
     block: [u32; 3],
     shared_mem: u32,
-    params: &mut Vec<*mut c_void>,
+    params: &mut [*mut c_void],
     blob_builder: impl FnOnce() -> KernargBlob,
 ) -> HipResult<()> {
-    if capture_mode || force_blob_path {
+    let record = replay.as_ref().map_or(false, |r| r.is_recording());
+    if record || capture_mode || force_blob_path {
         let mut blob = blob_builder();
         blob.pad_to(16);
-        capture_blobs.push(blob.into_vec());
-        let buf = capture_blobs.last_mut().unwrap();
-        let func = &functions[func_name];
-        unsafe { hip.launch_kernel_blob(func, grid, block, shared_mem, stream, buf.as_mut_slice()) }
+        if record {
+            // Single decision point for how a launch is recorded: same
+            // artifact lookup shape as `Gpu::launch_maybe_blob_bound`.
+            let artifact = compiler
+                .as_ref()
+                .and_then(|c| {
+                    c
+                .compiled_kernels()
+                .get(func_name)
+                .or_else(|| match func_name {
+                    "mq_rotate_x" => c.compiled_kernels().get("gemv_mq4g256"),
+                    "deinterleave_f32_batched" => {
+                        c.compiled_kernels().get("deinterleave_batched")
+                    }
+                    name if name.starts_with("gemv_hfq4g256_residual_sigmoid_scaled_gpu") => {
+                        c
+                            .compiled_kernels()
+                            .get("gemv_hfq4g256_residual_scaled")
+                    }
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed" => c
+                        .compiled_kernels()
+                        .get("gemv_hfq4g256_moe_gate_up_indexed"),
+                    name if name.starts_with("gemv_hfq4g256_multirow_r") => c
+                        .compiled_kernels()
+                        .get("gemv_hfq4g256_multirow_default")
+                        .or_else(|| {
+                            c
+                                .compiled_kernels()
+                                .get("gemv_hfq4g256_multirow_rdna3")
+                        }),
+                    name if name.starts_with("gemv_hfq4g256_residual_multirow_r") => c
+                        .compiled_kernels()
+                        .get("gemv_hfq4g256_residual_multirow_default")
+                        .or_else(|| {
+                            c
+                                .compiled_kernels()
+                                .get("gemv_hfq4g256_residual_multirow_rdna3")
+                        }),
+                    _ => None,
+                })
+                .or_else(|| {
+                    func_name
+                        .strip_suffix("_f32")
+                        .and_then(|name| c.compiled_kernels().get(name))
+                })
+                        .cloned()
+                });
+            replay.as_mut().unwrap().record_hip_launch_typed_bound(
+                hip,
+                func_name,
+                artifact,
+                grid,
+                block,
+                shared_mem,
+                blob.as_bytes(),
+                None,
+            );
+        }
+        if capture_mode {
+            capture_blobs.push(blob.into_vec());
+            let buf = capture_blobs.last_mut().unwrap();
+            let func = &functions[func_name];
+            unsafe { hip.launch_kernel_blob(func, grid, block, shared_mem, stream, buf.as_mut_slice()) }
+        } else {
+            let mut bytes = blob.into_vec();
+            let func = &functions[func_name];
+            unsafe { hip.launch_kernel_blob(func, grid, block, shared_mem, stream, bytes.as_mut_slice()) }
+        }
     } else {
         let func = &functions[func_name];
         unsafe { hip.launch_kernel(func, grid, block, shared_mem, stream, params) }
     }
+}
+
+/// Predicate for the FP16/FP8 scratch fast path. The convert kernel must run
+/// iff either recorder is active (`is_recording || capture_mode`) or the
+/// cached source pointer differs. This is the same predicate
+/// `Gpu::launch_maybe_blob_bound` uses for deciding whether to record, so
+/// the skip and the record stay coupled: if the kernel does not run it is
+/// not recorded, and if a recorder is active the kernel always runs.
+#[inline]
+pub(crate) fn scratch_must_convert(
+    capture_mode: bool,
+    is_recording: bool,
+    cached_ptr: *mut c_void,
+    src_ptr: *mut c_void,
+) -> bool {
+    is_recording || capture_mode || cached_ptr != src_ptr
+}
+
+/// Unified predicate for routing through the blob path. Mirrors
+/// `Gpu::launch_maybe_blob_bound`'s `record || capture_mode || force_blob_path`.
+#[inline]
+pub(crate) fn use_blob_path(is_recording: bool, capture_mode: bool, force_blob_path: bool) -> bool {
+    is_recording || capture_mode || force_blob_path
 }
 
 // ── FWHT sign table generation (deterministic LCG) ──────────────────────
@@ -156,6 +270,70 @@ fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
 
 // ── ScratchState helpers ────────────────────────────────────────────────
 
+/// Grow a `Option<DeviceBuffer>` scratch slot to at least `needed` bytes,
+/// RELEASING the previous allocation.
+///
+/// `DeviceBuffer` has no `Drop` impl, so the natural-looking
+///
+/// ```ignore
+/// if self.foo_bytes < needed {
+///     self.foo = Some(hip.malloc(needed)?);
+///     self.foo_bytes = needed;
+/// }
+/// ```
+///
+/// silently leaks the old allocation on every growth step, for every
+/// architecture. These scratches are keyed on batch/context, so a serving
+/// session that sees a sequence of increasing shapes leaks one buffer per
+/// distinct larger shape.
+///
+/// Measured on gfx1100 (25.8 GB) before this fix, issuing requests with
+/// growing prompts and sampling VRAM between them: repeating the SAME shape
+/// cost +0.0 MB (the buffer is correctly reused), while each larger shape
+/// added its FULL size rather than the increment --
+/// +199.6, +411.1, +754.9, +1459.9, +2906.8 MB across five shapes, 5.7 GB
+/// retained. That is what pushed a multi-turn DFlash session into
+/// `hipMalloc: out of memory` on turn 3.
+///
+/// The old buffer may still be referenced by kernels already enqueued on the
+/// stream, and `HipRuntime::free` documents that the caller must ensure the
+/// buffer is idle, so synchronise before releasing. Growth is monotonic and
+/// bounded by the largest shape ever seen, so this sync is rare and its cost
+/// is irrelevant next to the allocation it replaces.
+///
+/// Frees BEFORE allocating: the whole point is to run when memory is tight,
+/// and holding both at once is what we are trying to avoid. On allocation
+/// failure the slot is left empty with a zero byte count, so the `?` in the
+/// caller returns before any `unwrap`, and a later call retries cleanly.
+fn grow_scratch_buffer(
+    hip: &HipRuntime,
+    slot: &mut Option<DeviceBuffer>,
+    have_bytes: &mut usize,
+    needed: usize,
+) -> HipResult<()> {
+    if *have_bytes >= needed && slot.is_some() {
+        return Ok(());
+    }
+    if let Some(old) = slot.take() {
+        if crate::graph::any_graph_captured() {
+            // A captured hipGraph embeds the pointers live at capture time, so
+            // releasing this buffer would make every later replay read freed
+            // memory. Measured: freeing here breaks qwen35 outright, every turn
+            // empty with `spec_step: HipError(700) ... reset_recurrent`. Retain
+            // it (the pre-existing behaviour) and let the process reclaim it.
+            std::mem::forget(old);
+        } else {
+            hip.device_synchronize()?;
+            let _ = hip.free(old);
+        }
+    }
+    *have_bytes = 0;
+    let fresh = hip.malloc(needed)?;
+    *slot = Some(fresh);
+    *have_bytes = needed;
+    Ok(())
+}
+
 impl ScratchState {
     /// Ensure the ksplit_det partials scratch is at least `n_bytes`, growing
     /// (never shrinking). Returns the device pointer. No init needed: every
@@ -165,10 +343,12 @@ impl ScratchState {
         hip: &HipRuntime,
         n_bytes: usize,
     ) -> HipResult<*mut c_void> {
-        if self.ksplit_det_partials_bytes < n_bytes {
-            self.ksplit_det_partials = Some(hip.malloc(n_bytes)?);
-            self.ksplit_det_partials_bytes = n_bytes;
-        }
+        grow_scratch_buffer(
+            hip,
+            &mut self.ksplit_det_partials,
+            &mut self.ksplit_det_partials_bytes,
+            n_bytes,
+        )?;
         Ok(self.ksplit_det_partials.as_ref().unwrap().as_ptr())
     }
 
@@ -181,11 +361,37 @@ impl ScratchState {
         hip: &HipRuntime,
         n_bytes: usize,
     ) -> HipResult<*mut c_void> {
-        if self.sample_partials_bytes < n_bytes {
-            self.sample_partials = Some(hip.malloc(n_bytes)?);
-            self.sample_partials_bytes = n_bytes;
-        }
+        grow_scratch_buffer(
+            hip,
+            &mut self.sample_partials,
+            &mut self.sample_partials_bytes,
+            n_bytes,
+        )?;
         Ok(self.sample_partials.as_ref().unwrap().as_ptr())
+    }
+
+    /// Ensure the dedicated GEMV-residual temporary can hold at least
+    /// `min_elems` F32 values, growing on demand and never shrinking.
+    pub fn ensure_gemv_residual_tmp(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+        min_elems: usize,
+    ) -> HipResult<&GpuTensor> {
+        crate::graph::bind_thread(hip, device_id)?;
+        let needed_bytes = min_elems * 4;
+        let needs_grow = self
+            .gemv_residual_tmp
+            .as_ref()
+            .map_or(true, |tmp| tmp.buf.size() < needed_bytes);
+        if needs_grow {
+            self.gemv_residual_tmp = Some(GpuTensor {
+                buf: hip.malloc(needed_bytes)?,
+                shape: vec![min_elems],
+                dtype: DType::F32,
+            });
+        }
+        Ok(self.gemv_residual_tmp.as_ref().unwrap())
     }
 
     /// Lazily initialize MagnumQuant FWHT sign tables (256 floats each, seeds 42 and 1042).
@@ -216,6 +422,21 @@ impl ScratchState {
         self.mq_x_rot = Some(x_rot);
         self.mq_x_q8 = Some(x_q8);
         self.mq_x_scales = Some(x_scales);
+        Ok(())
+    }
+
+    /// Lazily allocate and zero the persistent gfx1100 RMSNorm state.
+    pub fn ensure_mq_rmsnorm_wavegrid_scratch(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+    ) -> HipResult<()> {
+        crate::graph::bind_thread(hip, device_id)?;
+        if self.mq_rmsnorm_wavegrid_scratch.is_none() {
+            let scratch = hip.malloc(64)?;
+            hip.memset(&scratch, 0, 64)?;
+            self.mq_rmsnorm_wavegrid_scratch = Some(scratch);
+        }
         Ok(())
     }
 
@@ -320,7 +541,9 @@ impl ScratchState {
 
     /// Ensure the FP16 X scratch contains the conversion of `x`. Skips the
     /// convert kernel if `x.buf.as_ptr()` matches the last converted source.
-    /// Returns the FP16 device pointer.
+    /// When either recorder is active (`capture_mode` or `replay.is_recording()`)
+    /// the kernel always runs so the tape stays complete; the skip only applies
+    /// to the live non-recording path. Returns the FP16 device pointer.
     pub fn ensure_fp16_x(
         &mut self,
         hip: &HipRuntime,
@@ -331,6 +554,7 @@ impl ScratchState {
         capture_blobs: &mut Vec<Vec<u8>>,
         capture_mode: bool,
         force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
         x: &GpuTensor,
         n_elems: usize,
     ) -> HipResult<*mut c_void> {
@@ -347,14 +571,18 @@ impl ScratchState {
         let src_ptr = x.buf.as_ptr();
         let needed = n_elems * 2;
 
-        // Grow scratch if needed (never shrinks)
+        // Grow scratch if needed (never shrinks), releasing the old buffer.
         if self.fp16_x_scratch_bytes < needed {
-            self.fp16_x_scratch = Some(hip.malloc(needed)?);
-            self.fp16_x_scratch_bytes = needed;
+            grow_scratch_buffer(
+                hip,
+                &mut self.fp16_x_scratch,
+                &mut self.fp16_x_scratch_bytes,
+                needed,
+            )?;
             self.fp16_x_source_ptr = std::ptr::null_mut(); // force reconversion after realloc
         }
 
-        let must_convert = capture_mode || self.fp16_x_source_ptr != src_ptr;
+        let must_convert = scratch_must_convert(capture_mode, replay.is_recording(), self.fp16_x_source_ptr, src_ptr);
         if must_convert {
             let in_ptr = src_ptr;
             let out_ptr = self.fp16_x_scratch.as_ref().unwrap().as_ptr();
@@ -370,11 +598,13 @@ impl ScratchState {
             let grid = ((n_elems + 255) / 256) as u32;
             launch_maybe_blob(
                 hip,
+                Some(&*compiler),
                 functions,
                 stream,
                 capture_blobs,
                 capture_mode,
                 force_blob_path,
+                Some(replay),
                 "convert_f32_to_f16",
                 [grid, 1, 1],
                 [256, 1, 1],
@@ -398,6 +628,8 @@ impl ScratchState {
     /// pointer is reused with different contents across layers (e.g.
     /// DeepSeek V4 prefill reuses the same x_in pointer with new contents
     /// every layer), where pointer-keyed caching would read stale FP16.
+    /// Always launches; both recorders observe the same launch via
+    /// `launch_maybe_blob`'s unified `record || capture_mode || force_blob` gate.
     pub fn convert_fp16_x_uncached(
         &mut self,
         hip: &HipRuntime,
@@ -408,6 +640,7 @@ impl ScratchState {
         capture_blobs: &mut Vec<Vec<u8>>,
         capture_mode: bool,
         force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
         x: &GpuTensor,
         n_elems: usize,
     ) -> HipResult<*mut c_void> {
@@ -423,8 +656,12 @@ impl ScratchState {
 
         let needed = n_elems * 2;
         if self.fp16_x_scratch_bytes < needed {
-            self.fp16_x_scratch = Some(hip.malloc(needed)?);
-            self.fp16_x_scratch_bytes = needed;
+            grow_scratch_buffer(
+                hip,
+                &mut self.fp16_x_scratch,
+                &mut self.fp16_x_scratch_bytes,
+                needed,
+            )?;
             self.fp16_x_source_ptr = std::ptr::null_mut();
         }
 
@@ -441,12 +678,14 @@ impl ScratchState {
         ];
         let grid = ((n_elems + 255) / 256) as u32;
         launch_maybe_blob(
-            hip,
-            functions,
-            stream,
-            capture_blobs,
-            capture_mode,
-            force_blob_path,
+                hip,
+                Some(&*compiler),
+                functions,
+                stream,
+                capture_blobs,
+                capture_mode,
+                force_blob_path,
+                Some(replay),
             "convert_f32_to_f16",
             [grid, 1, 1],
             [256, 1, 1],
@@ -467,6 +706,8 @@ impl ScratchState {
     /// (an F32 GpuTensor). Returns the FP8 device pointer. gfx12 only —
     /// uses cvt_pk_fp8_f32. Caches by `x.buf.as_ptr()` like its FP16
     /// sibling so back-to-back same-X GEMM dispatches skip reconversion.
+    /// The cache is bypassed when either recorder is active, matching
+    /// `ensure_fp16_x` and `scratch_must_convert`.
     pub fn ensure_fp8_x(
         &mut self,
         hip: &HipRuntime,
@@ -477,6 +718,7 @@ impl ScratchState {
         capture_blobs: &mut Vec<Vec<u8>>,
         capture_mode: bool,
         force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
         x: &GpuTensor,
         n_elems: usize,
     ) -> HipResult<*mut c_void> {
@@ -494,12 +736,16 @@ impl ScratchState {
         let needed = n_elems; // 1 byte per element
 
         if self.fp8_x_scratch_bytes < needed {
-            self.fp8_x_scratch = Some(hip.malloc(needed)?);
-            self.fp8_x_scratch_bytes = needed;
+            grow_scratch_buffer(
+                hip,
+                &mut self.fp8_x_scratch,
+                &mut self.fp8_x_scratch_bytes,
+                needed,
+            )?;
             self.fp8_x_source_ptr = std::ptr::null_mut();
         }
 
-        let must_convert = capture_mode || self.fp8_x_source_ptr != src_ptr;
+        let must_convert = scratch_must_convert(capture_mode, replay.is_recording(), self.fp8_x_source_ptr, src_ptr);
         if must_convert {
             let in_ptr = src_ptr;
             let out_ptr = self.fp8_x_scratch.as_ref().unwrap().as_ptr();
@@ -515,11 +761,13 @@ impl ScratchState {
             let grid = ((n_elems + 4095) / 4096) as u32;
             launch_maybe_blob(
                 hip,
+                Some(&*compiler),
                 functions,
                 stream,
                 capture_blobs,
                 capture_mode,
                 force_blob_path,
+                Some(replay),
                 "pack_f32_to_fp8_gfx12",
                 [grid, 1, 1],
                 [256, 1, 1],
@@ -541,7 +789,8 @@ impl ScratchState {
 
     /// Ensure prefill activations are quantized into a llama.cpp-style
     /// `block_q8_1_mmq` layout. The scratch is ordered by [K/128 block, batch]
-    /// so a 128-column batch tile is contiguous for each K tile.
+    /// so a 128-column batch tile is contiguous for each K tile. Always
+    /// launches; both recorders observe it via the unified blob gate.
     pub fn ensure_q8_1_mmq_x(
         &mut self,
         hip: &HipRuntime,
@@ -552,6 +801,7 @@ impl ScratchState {
         capture_blobs: &mut Vec<Vec<u8>>,
         capture_mode: bool,
         force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
         device_id: i32,
         x: &GpuTensor,
         batch_size: usize,
@@ -571,10 +821,12 @@ impl ScratchState {
         let blocks_k = (k + 127) / 128;
         let block_q8_1_mmq_bytes = 144usize;
         let needed = blocks_k * batch_size * block_q8_1_mmq_bytes;
-        if self.q8_1_mmq_x_scratch_bytes < needed {
-            self.q8_1_mmq_x_scratch = Some(hip.malloc(needed)?);
-            self.q8_1_mmq_x_scratch_bytes = needed;
-        }
+        grow_scratch_buffer(
+            hip,
+            &mut self.q8_1_mmq_x_scratch,
+            &mut self.q8_1_mmq_x_scratch_bytes,
+            needed,
+        )?;
 
         let src_ptr = x.buf.as_ptr();
         let must_convert = true;
@@ -594,11 +846,13 @@ impl ScratchState {
             let grid_y = batch_size as u32;
             launch_maybe_blob(
                 hip,
+                Some(&*compiler),
                 functions,
                 stream,
                 capture_blobs,
                 capture_mode,
                 force_blob_path,
+                Some(replay),
                 "quantize_q8_1_mmq_ds4",
                 [grid_x, grid_y, 1],
                 [256, 1, 1],
@@ -644,11 +898,13 @@ impl ScratchState {
     pub fn rotate_x_mq(
         &mut self,
         hip: &HipRuntime,
+        compiler: &crate::compiler::KernelCompiler,
         functions: &HashMap<String, Function>,
         stream: Option<&Stream>,
         capture_blobs: &mut Vec<Vec<u8>>,
         capture_mode: bool,
         force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
         pool: &mut crate::pool::GpuPool,
         device_id: i32,
         x: &GpuTensor,
@@ -673,12 +929,14 @@ impl ScratchState {
         let bytes = crate::profile::mq_rotate_bytes(k);
         let timer = crate::profile::begin_timer(hip, "fwht", "mq_rotate_x", bytes);
         let result = launch_maybe_blob(
-            hip,
-            functions,
-            stream,
-            capture_blobs,
-            capture_mode,
-            force_blob_path,
+                hip,
+                Some(compiler),
+                functions,
+                stream,
+                capture_blobs,
+                capture_mode,
+                force_blob_path,
+                Some(replay),
             "mq_rotate_x",
             [n_groups, 1, 1],
             [32, 1, 1],
@@ -705,11 +963,13 @@ impl ScratchState {
     pub fn rotate_x_mq_batched(
         &mut self,
         hip: &HipRuntime,
+        compiler: &crate::compiler::KernelCompiler,
         functions: &HashMap<String, Function>,
         stream: Option<&Stream>,
         capture_blobs: &mut Vec<Vec<u8>>,
         capture_mode: bool,
         force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
         pool: &mut crate::pool::GpuPool,
         device_id: i32,
         x: &GpuTensor,
@@ -737,14 +997,16 @@ impl ScratchState {
         let bytes = crate::profile::mq_rotate_bytes(k) * batch_size;
         let timer = crate::profile::begin_timer(hip, "fwht", "mq_rotate_x_batched", bytes);
         let result = launch_maybe_blob(
-            hip,
-            functions,
-            stream,
-            capture_blobs,
-            capture_mode,
-            force_blob_path,
+                hip,
+                Some(compiler),
+                functions,
+                stream,
+                capture_blobs,
+                capture_mode,
+                force_blob_path,
+                Some(replay),
             "mq_rotate_x",
-            [n_groups, batch_size as u32, 1],
+            [n_groups * batch_size as u32, 1, 1],
             [32, 1, 1],
             0,
             &mut params,
@@ -769,11 +1031,13 @@ impl ScratchState {
     pub fn rotate_x_mq_128(
         &mut self,
         hip: &HipRuntime,
+        compiler: &crate::compiler::KernelCompiler,
         functions: &HashMap<String, Function>,
         stream: Option<&Stream>,
         capture_blobs: &mut Vec<Vec<u8>>,
         capture_mode: bool,
         force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
         pool: &mut crate::pool::GpuPool,
         device_id: i32,
         x: &GpuTensor,
@@ -798,12 +1062,14 @@ impl ScratchState {
         let bytes = crate::profile::mq_rotate_bytes(k);
         let timer = crate::profile::begin_timer(hip, "fwht", "mq_rotate_x_128", bytes);
         let result = launch_maybe_blob(
-            hip,
-            functions,
-            stream,
-            capture_blobs,
-            capture_mode,
-            force_blob_path,
+                hip,
+                Some(compiler),
+                functions,
+                stream,
+                capture_blobs,
+                capture_mode,
+                force_blob_path,
+                Some(replay),
             "mq_rotate_x_128",
             [n_groups, 1, 1],
             [32, 1, 1],
@@ -826,16 +1092,16 @@ impl ScratchState {
         result
     }
 
-    /// Phase A Stage A — F2 AWQ-aware variant of `rotate_x_mq`.
-    /// Divides each input element by `awq_scale[i]` BEFORE the FWHT.
     pub fn rotate_x_mq_awq(
         &mut self,
         hip: &HipRuntime,
+        compiler: &crate::compiler::KernelCompiler,
         functions: &HashMap<String, Function>,
         stream: Option<&Stream>,
         capture_blobs: &mut Vec<Vec<u8>>,
         capture_mode: bool,
         force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
         pool: &mut crate::pool::GpuPool,
         device_id: i32,
         x: &GpuTensor,
@@ -863,12 +1129,14 @@ impl ScratchState {
         let bytes = k * 4 * 3 + 2 * 256 * 4;
         let timer = crate::profile::begin_timer(hip, "fwht", "rotate_x_mq_awq", bytes);
         let result = launch_maybe_blob(
-            hip,
-            functions,
-            stream,
-            capture_blobs,
-            capture_mode,
-            force_blob_path,
+                hip,
+                Some(compiler),
+                functions,
+                stream,
+                capture_blobs,
+                capture_mode,
+                force_blob_path,
+                Some(replay),
             "rotate_x_mq_awq",
             [n_groups, 1, 1],
             [32, 1, 1],
@@ -897,11 +1165,13 @@ impl ScratchState {
     pub fn rotate_x_mq_awq_batched(
         &mut self,
         hip: &HipRuntime,
+        compiler: &crate::compiler::KernelCompiler,
         functions: &HashMap<String, Function>,
         stream: Option<&Stream>,
         capture_blobs: &mut Vec<Vec<u8>>,
         capture_mode: bool,
         force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
         pool: &mut crate::pool::GpuPool,
         device_id: i32,
         x: &GpuTensor,
@@ -932,12 +1202,14 @@ impl ScratchState {
         let bytes = (k * 4 * 3 + 2 * 256 * 4) * batch_size;
         let timer = crate::profile::begin_timer(hip, "fwht", "rotate_x_mq_awq_batched", bytes);
         let result = launch_maybe_blob(
-            hip,
-            functions,
-            stream,
-            capture_blobs,
-            capture_mode,
-            force_blob_path,
+                hip,
+                Some(compiler),
+                functions,
+                stream,
+                capture_blobs,
+                capture_mode,
+                force_blob_path,
+                Some(replay),
             "rotate_x_mq_awq",
             [n_groups, batch_size as u32, 1],
             [32, 1, 1],
@@ -976,6 +1248,7 @@ impl ScratchState {
         force_blob_path: bool,
         compiler: &mut crate::compiler::KernelCompiler,
         modules: &mut HashMap<String, Module>,
+        replay: &mut crate::replay::ReplayController,
         pool: &mut crate::pool::GpuPool,
         device_id: i32,
         x: &GpuTensor,
@@ -993,10 +1266,7 @@ impl ScratchState {
             "mq_rotate_x_dual_fp8_gfx12",
         )?;
         // Lazily allocate the FP8 sibling scratch sized to match k bytes.
-        if self.mq_x_rot_fp8_bytes < k {
-            self.mq_x_rot_fp8 = Some(hip.malloc(k)?);
-            self.mq_x_rot_fp8_bytes = k;
-        }
+        grow_scratch_buffer(hip, &mut self.mq_x_rot_fp8, &mut self.mq_x_rot_fp8_bytes, k)?;
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let xp = x.buf.as_ptr();
@@ -1015,12 +1285,14 @@ impl ScratchState {
         let bytes = crate::profile::mq_rotate_bytes(k) + k;
         let timer = crate::profile::begin_timer(hip, "fwht", "mq_rotate_x_dual_fp8", bytes);
         let result = launch_maybe_blob(
-            hip,
-            functions,
-            stream,
-            capture_blobs,
-            capture_mode,
-            force_blob_path,
+                hip,
+                Some(compiler),
+                functions,
+                stream,
+                capture_blobs,
+                capture_mode,
+                force_blob_path,
+                Some(replay),
             "mq_rotate_x_dual_fp8_gfx12",
             [n_groups, 1, 1],
             [32, 1, 1],
@@ -1050,8 +1322,13 @@ impl ScratchState {
     pub fn rotate_quantize_x_mq8(
         &mut self,
         hip: &HipRuntime,
+        compiler: &crate::compiler::KernelCompiler,
         functions: &HashMap<String, Function>,
         stream: Option<&Stream>,
+        capture_blobs: &mut Vec<Vec<u8>>,
+        capture_mode: bool,
+        force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
         pool: &mut crate::pool::GpuPool,
         device_id: i32,
         x: &GpuTensor,
@@ -1066,31 +1343,54 @@ impl ScratchState {
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 256) as u32;
 
-        let rot_func = &functions["mq8_rotate_quantize_x"];
-        let mut xp = x.buf.as_ptr();
-        let mut xq = xq_ptr;
-        let mut xs = xs_ptr;
-        let mut s1 = s1_ptr;
-        let mut s2 = s2_ptr;
-        let mut kv = k as i32;
+        let xp = x.buf.as_ptr();
+        let xq = xq_ptr;
+        let xs = xs_ptr;
+        let s1 = s1_ptr;
+        let s2 = s2_ptr;
+        let kv = k as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut xp as *mut _ as *mut c_void,
-            &mut xq as *mut _ as *mut c_void,
-            &mut xs as *mut _ as *mut c_void,
-            &mut s1 as *mut _ as *mut c_void,
-            &mut s2 as *mut _ as *mut c_void,
-            &mut kv as *mut _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &xq as *const _ as *mut c_void,
+            &xs as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
         ];
-        unsafe {
-            hip.launch_kernel(
-                rot_func,
-                [n_groups, 1, 1],
-                [32, 1, 1],
-                0,
-                stream,
-                &mut params,
-            )
+        let bytes = crate::profile::mq_rotate_bytes(k) + (k / 256) * 4 + k;
+        let timer = crate::profile::begin_timer(hip, "fwht", "mq8_rotate_quantize_x", bytes);
+        let result = launch_maybe_blob(
+            hip,
+            Some(compiler),
+            functions,
+            stream,
+            capture_blobs,
+            capture_mode,
+            force_blob_path,
+            Some(replay),
+            "mq8_rotate_quantize_x",
+            [n_groups, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(xq);
+                b.push_ptr(xs);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(hip);
         }
+        // Invalidate caches for the internal q8 buffers' output? The output
+        // is internal scratch, not x_rot, so no fp16/fp8 cache invalidation needed.
+        // But keep symmetric: if any future caller aliases, this remains safe.
+        result
     }
 }
 

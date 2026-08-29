@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 
 //! Speculative-decode build/glue that lives at the top of the DAG, where both
-//! `LoadedModel`/`ModelState` and the arch crates are in scope.
+//! `LoadedModel` and the arch crates are in scope.
 //!
 //! Contents: the [`Qwen35SlotGuard`] RAII target borrow, and the generic
 //! [`build_speculator`] registry that dispatches on draft kind: a loaded DFlash
@@ -12,11 +12,11 @@
 //! `spec_ngram`). The registry is what lets the loader pick a drafter at load
 //! time without the daemon learning which ran.
 
-use crate::ModelState;
+use hipfire_arch_qwen35::Qwen35Bundle;
+use std::any::Any;
 use hipfire_arch_qwen35::dflash_spec::{build_dflash_speculator, DflashState};
 use hipfire_arch_qwen35::mtp_head::Qwen35MtpHead;
 use hipfire_arch_qwen35::speculative::ModelSlot;
-use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_runtime::spec::{SpecTarget, SpecTargetGuard, Speculator};
 use hipfire_runtime::spec_ngram::{ChainSpeculator, NgramDrafter};
 use std::path::Path;
@@ -27,7 +27,7 @@ use std::path::Path;
 /// `m.state`.
 ///
 /// This is the single chokepoint that replaces the eight hand-written
-/// `m.state = Some(ModelState::Qwen35(..))` reconstructions in the daemon's
+/// `m.state = Some(Box::new(..))` reconstructions in the daemon's
 /// DFlash loop, structurally eliminating the "forgot to restore on early
 /// return" cross-request state-bleed class (#462): there is no longer a code
 /// path on which the bundle fails to return to `m.state`.
@@ -39,7 +39,7 @@ use std::path::Path;
 /// `Drop` to restore — so a reopen error can surface as `Err` without ever
 /// leaving `m.state == None`.
 pub struct Qwen35SlotGuard<'m> {
-    state_back: &'m mut Option<ModelState>,
+    state_back: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
     model_path: String,
     // `Option` only so `Drop` can move the contents out; it is `Some` for the
     // guard's entire observable lifetime.
@@ -66,13 +66,19 @@ impl<'m> Qwen35SlotGuard<'m> {
     /// untouched) if the model is not a loaded Qwen3.5 bundle — note the
     /// `matches!` guard *before* `take()` so a non-Qwen35 model is never moved
     /// out and dropped.
-    pub fn take(state: &'m mut Option<ModelState>, model_path: &str) -> Result<Self, String> {
-        if !matches!(state, Some(ModelState::Qwen35(_))) {
+    pub fn take(state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>, model_path: &str) -> Result<Self, String> {
+        if !state
+            .as_ref()
+            .is_some_and(|s| (s.as_ref() as &dyn Any).is::<Qwen35Bundle>())
+        {
             return Err("Qwen35SlotGuard: model state is not a loaded Qwen3.5 bundle".into());
         }
-        let Some(ModelState::Qwen35(bundle)) = state.take() else {
+        let Some(state_box) = state.take() else {
             unreachable!("guarded by the matches! above")
         };
+        let bundle = * (state_box as Box<dyn Any>)
+            .downcast::<Qwen35Bundle>()
+            .unwrap();
         Ok(Self {
             state_back: state,
             model_path: model_path.to_string(),
@@ -117,7 +123,7 @@ impl Drop for Qwen35SlotGuard<'_> {
             Some(Parked::Slot(slot)) => slot.into_bundle(),
             None => return, // only reachable if `Drop` ran twice — it cannot.
         };
-        *self.state_back = Some(ModelState::Qwen35(bundle));
+        *self.state_back = Some(Box::new(bundle));
     }
 }
 
@@ -139,7 +145,7 @@ impl SpecTargetGuard for Qwen35SlotGuard<'_> {
 ///
 /// Dispatch:
 /// 1. A loaded DFlash draft (`dflash = Some`) → [`DflashSpeculator`].
-/// 2. Else, when `HIPFIRE_NGRAM_DRAFT=1` and the arch has a `SpecTarget` impl
+/// 2. Else, when `speculation.ngram = "on"` and the arch has a `SpecTarget` impl
 ///    (qwen35 5/6, llama 0/1), the model-free `ChainSpeculator<NgramDrafter>` —
 ///    spec-decode with no draft model. Opt-in until validated.
 /// 3. Otherwise `None` (AR-only).
@@ -152,7 +158,7 @@ impl SpecTargetGuard for Qwen35SlotGuard<'_> {
 ///
 /// The n-gram arm is arch-typeless: it builds its target-side verify scratch
 /// lazily on first `prefill` via `SpecTarget::new_spec_scratch`, so this fn needs
-/// only `arch_id`, the drafter env, and the target's `ctx_capacity`. `arch_id`
+/// only `arch_id`, the resolved policy, and the target's `ctx_capacity`. `arch_id`
 /// gates which arches the model-free arm is enabled for (qwen35 5/6 today; llama
 /// added with its `SpecTarget` impl).
 pub fn build_speculator(
@@ -161,23 +167,22 @@ pub fn build_speculator(
     mtp: Option<Qwen35MtpHead>,
     eviction_is_none: bool,
     ctx_capacity: usize,
-    ngram: hipfire_runtime::loader_api::SpecLoadCfg,
+    spec: hipfire_runtime::loader_api::SpecLoadCfg,
 ) -> Option<Box<dyn Speculator>> {
     if let Some(df) = dflash {
         return Some(build_dflash_speculator(df, eviction_is_none));
     }
-    // qwen35 MTP head (arch 5/6). The load site only hands us a head when
-    // HIPFIRE_QWEN35_MTP=1, the source is a bundled `.mq4-mtp`, no DFlash draft
-    // was requested, and eviction is None — re-assert the eviction guard here
-    // (the MTP head KV is NOT FlashCASK-compacted, so building under eviction
-    // would desync head/trunk positions). MTP wins over n-gram when present.
+    // qwen35 MTP head (arch 5/6). MTP wins over n-gram when present; the load
+    // site is authoritative for whether a head was loaded (no `&mut Gpu` here
+    // to free it). Re-assert the eviction guard here (the MTP head KV is NOT
+    // FlashCASK-compacted, so building under eviction would desync head/trunk
+    // positions).
     if let Some(head) = mtp {
         if eviction_is_none && matches!(arch_id, 5 | 6) {
-            let max_n = std::env::var("HIPFIRE_QWEN35_MTP_K")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(4usize)
-                .clamp(1, 8);
+            let max_n = spec
+                .mtp_k
+                .unwrap_or(hipfire_runtime::config::get().mtp_k)
+                .clamp(1, 10);
             eprintln!("  qwen35 MTP speculator enabled (compressed-serial, K={max_n})");
             return Some(hipfire_arch_qwen35::build_qwen35_mtp_speculator(
                 head,
@@ -191,16 +196,10 @@ pub fn build_speculator(
         eprintln!("  qwen35 MTP head present but arm declined (eviction/arch) — ignored");
         let _ = head;
     }
-    // n-gram enable resolves env-wins-else-param: an explicit `HIPFIRE_NGRAM_DRAFT`
-    // (the top of the config ladder) overrides; otherwise the CLI-resolved
-    // `ngram.ngram_draft` (per-model > global, already folded by the CLI) decides;
-    // absent both, off. This keeps a directly-driven daemon (no hipfire CLI,
-    // `HIPFIRE_NGRAM_DRAFT=1`) working while letting the config ladder drive it.
-    let ngram_enabled = match std::env::var("HIPFIRE_NGRAM_DRAFT").ok().as_deref() {
-        Some("1") => true,
-        Some(_) => false, // env set to anything else explicitly disables
-        None => ngram.ngram_draft.unwrap_or(false),
-    };
+    // The CLI resolves per-model and global TOML into this per-load policy.
+    // Direct protocol clients inherit the daemon's typed process policy before
+    // the carrier is invoked, so the loader never consults ambient env.
+    let ngram_enabled = spec.ngram_draft.unwrap_or(false);
     // Spec-capable arches with a `SpecTarget` impl: dense LLaMA family
     // (0 = LLaMA/Mistral, 1 = plain Qwen3), qwen35 DeltaNet (5/6), Qwen2
     // (7 = VibeThinker, own `Qwen2State` KV), dots-ocr (8, VL decode-phase),
@@ -210,20 +209,10 @@ pub fn build_speculator(
         // windows nearly free, and an n-gram K-sweep (vibethinker-3b, 2026-06-23)
         // showed acceptance saturates at K≈12 (tau ~0.38) — K=12 peaks decode
         // tok/s, K=16 ties, K≥24 regresses (wasted verify on drafts past the
-        // acceptance plateau). Resolution mirrors the enable flag: env wins, else
-        // the CLI-resolved param (per-model > global, from `ngram_k`/
-        // `ngram_min_count`), else the default. K keeps its `.max(2)` floor.
-        let block_size = std::env::var("HIPFIRE_NGRAM_DRAFT_K")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or(ngram.ngram_k)
-            .unwrap_or(12usize)
-            .max(2);
-        let min_count = std::env::var("HIPFIRE_NGRAM_MIN_COUNT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or(ngram.ngram_min_count)
-            .unwrap_or(2u32);
+        // acceptance plateau). Values are already resolved through the TOML
+        // ladder. K keeps its `.max(2)` floor.
+        let block_size = spec.ngram_k.unwrap_or(12usize).max(2);
+        let min_count = spec.ngram_min_count.unwrap_or(2u32);
         eprintln!(
             "  n-gram speculator enabled (model-free, K={}, min_count={})",
             block_size, min_count

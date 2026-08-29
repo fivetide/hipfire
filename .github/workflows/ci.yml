@@ -5,12 +5,13 @@ name: CI
 # hipfire loads the HIP/ROCm runtime via dlopen at *runtime* (see
 # crates/hip-bridge — libloading, no build.rs, no link-time -lamdhip64),
 # so the entire workspace compiles and unit-tests on a stock runner with
-# no GPU and no ROCm installed. The GPU-bound gates (test_kernels,
-# coherence-gate.sh, serve-multiturn-gate.sh, speed-gate.sh) need real RDNA
-# hardware and run on a self-hosted runner instead — see
-# .github/workflows/gpu-gates.yml (TODO). serve-multiturn-gate.sh is the
-# multi-request serve-output guard for the #462-class regression (recurrent
-# state bleeding across requests) that single-request gates structurally miss.
+# no GPU and no ROCm installed. The GPU-bound gates need real RDNA
+# hardware and are run MANUALLY from a checkout — see docs/VALIDATION.md
+# and scripts/gates.sh. The agentic CI gate workflows (claude-review.yml,
+# gpu-gates.yml, gate-merge.yml, gate-sweep.yml) were removed; they were
+# never reached on the release line and are being replaced by a
+# cheaper, provider-agnostic reviewer. Do not reintroduce a self-hosted
+# GPU gate workflow without a matching validation-policy update.
 #
 # Required vs advisory: `build` and `test` are the load-bearing
 # "is it broken" gates and are intended to be required status checks on
@@ -54,11 +55,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build workspace (lib + bins + examples + tests)
         run: cargo build --release --workspace --all-targets --locked
-      - name: Build daemon example (real shipped binary, arch features on)
-        run: >
-          cargo build --release --locked
-          -p hipfire-runtime --example daemon
-          --features arch-qwen35,arch-qwen35-vl,arch-llama,arch-qwen2,arch-deepseek4,arch-dots-ocr
+      - name: Build daemon (real shipped binary, all architectures in)
+        run: cargo build --release --locked -p hipfire-daemon
 
   test:
     name: unit tests (lib, no GPU)
@@ -74,14 +72,59 @@ jobs:
         # GPU runner and are intentionally excluded here.
         run: cargo test --lib --workspace --locked
 
+  gates:
+    name: gates (ratchets, layering, registers)
+    runs-on: ubuntu-latest
+    # GPU-free structural gates. Until now every one of these was a script a
+    # human had to remember to run: nothing in CI invoked leanup-ratchets.sh,
+    # check-layering.py, check-arch-dispatch.py, check-crate-maps.py or the
+    # table registers, and the only references to them outside scripts/ were
+    # comments in Cargo.toml. Phase 3A's mandate is "every gate either fails on
+    # regression or is deleted"; a gate nothing runs fails on nothing.
+    #
+    # Not advisory. These assert committed expectations that are green on the
+    # branch that introduces them, so a red here is a real regression, not lint
+    # debt. scripts/gates.sh is the separate GPU/model harness and needs
+    # hardware -- it is deliberately not called from CI.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # ratchet-diff resolves the merge base to read the base revision's
+          # thresholds; a shallow clone has no merge base to find.
+          fetch-depth: 0
+      - name: Ratchets, layering, arch dispatch, qt register, bypass ledger
+        run: bash scripts/leanup-ratchets.sh
+      - name: Crate maps match the tree
+        run: python3 scripts/check-crate-maps.py --check
+      - name: No committed expectation was loosened
+        # PR-only: on a push there is no proposed base to compare against.
+        if: github.event_name == 'pull_request'
+        run: bash scripts/ratchet-diff.sh "origin/${{ github.base_ref }}"
+
+  supply-chain:
+    name: cargo-deny (${{ matrix.checks }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        checks:
+          - advisories
+          - bans licenses sources
+    # A newly published advisory should be visible immediately without making
+    # an unrelated PR unmergeable. License, source, and ban policy is blocking.
+    continue-on-error: ${{ matrix.checks == 'advisories' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check ${{ matrix.checks }}
+
   fmt:
     name: rustfmt (advisory)
     runs-on: ubuntu-latest
     # Truly advisory: on pushes, ci-rustfmt-changed diffs vs master and surfaces
     # the whole dispatch-effort format backlog (Kevin's in-flight files included),
-    # so this is expected-red until the cleanup pass. Don't fail the run — green
-    # must mean the load-bearing build+test gates pass.
-    continue-on-error: true
+    # so keep the step visible without making the job's status check red.
     steps:
       - uses: actions/checkout@v4
         with:
@@ -90,6 +133,7 @@ jobs:
         with:
           components: rustfmt
       - run: bash scripts/ci-rustfmt-changed.sh
+        continue-on-error: true
 
   clippy:
     name: clippy (advisory)

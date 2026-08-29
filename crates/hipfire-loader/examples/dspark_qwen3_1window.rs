@@ -14,7 +14,7 @@
 //!
 //! ```
 //! source scripts/gpu-lock.sh && gpu_acquire dspark-qwen3
-//! cargo build --release -p hipfire-loader --example dspark_qwen3_1window
+//! cargo build --release -p hipfire-loader --example dspark_qwen3_1window --features lab
 //! ./target/release/examples/dspark_qwen3_1window /home/bjoern/.hipfire/models/qwen3-8b.mq4
 //! gpu_release
 //! ```
@@ -38,6 +38,8 @@ fn main() -> Result<(), String> {
     let max_seq = 512usize;
     let cask = hipfire_runtime::loader_api::CaskConfig::default();
     let spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg {
+        mtp_mode: None,
+        mtp_k: None,
         dspark: None, // auto: load sidecar if present
         ..Default::default()
     };
@@ -50,7 +52,7 @@ fn main() -> Result<(), String> {
         None, // kv_adaptive_override
         None, // state_quant_override
         &cask,
-        1, // pp
+        1, // pp: single-GPU
         spec_cfg,
         &mut gpu,
     )?;
@@ -112,9 +114,10 @@ fn main() -> Result<(), String> {
             target,
             position,
             seed,
-            &[],  // emitted (empty: no prior context for repeat-penalty)
-            None, // grammar
-            0.0,  // temp: greedy
+            &[],        // emitted (empty: no prior context for repeat-penalty)
+            None,       // grammar
+            0.0,        // temp: greedy
+            usize::MAX, // uncapped bench window
         )
         .map_err(|e| format!("step: {e}"))?;
 

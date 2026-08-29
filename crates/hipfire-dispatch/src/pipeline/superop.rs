@@ -260,11 +260,21 @@ pub fn lower_layer(steps: &[Step], ctx: &DispatchCtx) -> LayerProgram {
             PipelineOp::GemvResidual => SuperOpKind::ResidualGemv,
             PipelineOp::RmsnormAutomatic => SuperOpKind::Norm,
             PipelineOp::Attend => SuperOpKind::Attend,
-            // Rope/QkNorm/BiasAdd are per-op-only Step vocabulary: never fused,
-            // never lowered via superop. Emitting them into a lowered program
-            // is a bug (no SuperOpKind exists for them).
-            PipelineOp::Rope | PipelineOp::QkNorm | PipelineOp::BiasAdd => {
-                unreachable!("Rope/QkNorm/BiasAdd are per-op only; not lowerable via superop")
+            // Rope/QkNorm/BiasAdd, the Gemma4 primitives, and the typed GELU
+            // expert Step are per-op-only vocabulary: never fused, never
+            // lowered via superop. Emitting them into a lowered program is a
+            // bug (no SuperOpKind exists for them) — rejected explicitly so
+            // none falls to the catch-all.
+            PipelineOp::Rope
+            | PipelineOp::QkNorm
+            | PipelineOp::BiasAdd
+            | PipelineOp::RmsNorm
+            | PipelineOp::Copy
+            | PipelineOp::Scale
+            | PipelineOp::GeluTanhMul
+            | PipelineOp::RopePartial
+            | PipelineOp::MoeGeluExperts => {
+                unreachable!("per-op-only Step vocabulary is not lowerable via superop")
             }
             // Remaining PipelineOp values are not producible from a Step.
             _ => SuperOpKind::Norm,
@@ -378,6 +388,114 @@ pub trait ForwardBindings {
             quant: "",
         })
     }
+
+    /// Whether this rank replaces replicated `Attend` with a rank-local
+    /// attention projection whose hidden-width result must be all-reduced.
+    /// False by default, so existing Qwen, MiniMax, and single-rank routes do
+    /// not change behavior.
+    fn attention_tp_enabled(&self) -> bool {
+        false
+    }
+
+    /// Run the rank-local attention body up to (but excluding) the residual
+    /// mix. Called only when every rank reports [`attention_tp_enabled`].
+    fn run_attend_ep(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "run_attend_ep-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    /// Return the hidden-width rank-local attention partial produced by
+    /// [`run_attend_ep`]. The EP executor all-reduces this buffer in place.
+    fn ep_attention_partial(&self) -> Option<&GpuTensor> {
+        None
+    }
+
+    /// Finish the attention residual mix after the rank-local partial has been
+    /// all-reduced in place.
+    fn ep_finish_attend(&mut self, _gpu: &mut Gpu) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_finish_attend-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    /// Whether this binding can fuse a fixed four-rank peer reduction into
+    /// both post-attention and post-MoE Hyper-Connection consumers.
+    ///
+    /// False by default: the runtime also requires four peer-connected
+    /// gfx1201 devices before invoking either hook.
+    fn supports_tp_peer_hc4(&self) -> bool {
+        false
+    }
+
+    /// Whether this binding can fuse a fixed three-rank peer reduction into
+    /// both post-attention and post-MoE Hyper-Connection consumers.
+    fn supports_tp_peer_hc3(&self) -> bool {
+        false
+    }
+
+    fn ep_finish_attend_peer_hc3(
+        &mut self,
+        _gpu: &mut Gpu,
+        _partials: [&GpuTensor; 3],
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_finish_attend_peer_hc3-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    fn ep_finish_moe_peer_hc3(
+        &mut self,
+        _gpu: &mut Gpu,
+        _partials: [&GpuTensor; 3],
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_finish_moe_peer_hc3-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    fn ep_finish_attend_peer_hc4(
+        &mut self,
+        _gpu: &mut Gpu,
+        _partials: [&GpuTensor; 4],
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_finish_attend_peer_hc4-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    fn ep_finish_moe_peer_hc4(
+        &mut self,
+        _gpu: &mut Gpu,
+        _partials: [&GpuTensor; 4],
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_finish_moe_peer_hc4-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
 }
 
 /// Dispatch a SINGLE super-op to its [`ForwardBindings`] method. Extracted from
@@ -479,12 +597,127 @@ mod tests {
         assert_eq!(prog.len(), 1);
         assert_eq!(prog[0].binding.key, Some(fk()));
     }
-
     #[test]
     fn lower_walk_zero_span_does_not_stall() {
         // A defensive (key, 0) must not infinite-loop: falls to single-step.
         let prog = lower_walk(2, |_| SuperOpKind::Proj, |_| Some((fk(), 0)));
         assert_eq!(prog.len(), 2);
         assert!(prog.iter().all(|op| op.binding.key.is_none()));
+    }
+
+    // Per-op-only Step vocabulary must never lower via superop
+    // The six Gemma4 primitives join Rope/QkNorm/BiasAdd in the explicit
+    // rejection branch: emitting any of them into a lowered program is a
+    // bug, so lower_layer must panic (never reach the `_ => Norm` catch-all).
+
+    fn meta_tensor(ptr: usize) -> GpuTensor {
+        GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr as *mut std::ffi::c_void, 4096) },
+            shape: vec![8],
+            dtype: rdna_compute::DType::F32,
+        }
+    }
+
+    fn assert_lower_rejects(step: Step<'_>) {
+        let ctx = DispatchCtx::for_test("gfx1100");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            lower_layer(std::slice::from_ref(&step), &ctx)
+        }));
+        assert!(
+            result.is_err(),
+            "per-op Step must be rejected by lower_layer, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn lower_layer_rejects_rmsnorm() {
+        let x = meta_tensor(1);
+        assert_lower_rejects(Step::RmsNorm {
+            x: &x,
+            weight: &x,
+            out: &x,
+            eps: 1e-6,
+        });
+    }
+
+    #[test]
+    fn lower_layer_rejects_copy() {
+        let x = meta_tensor(1);
+        assert_lower_rejects(Step::Copy {
+            src: &x,
+            dst: &x,
+            bytes: 32,
+        });
+    }
+
+    #[test]
+    fn lower_layer_rejects_scale() {
+        let x = meta_tensor(1);
+        assert_lower_rejects(Step::Scale { x: &x, scale: 2.0 });
+    }
+
+    #[test]
+    fn lower_layer_rejects_gelu_tanh_mul() {
+        let x = meta_tensor(1);
+        assert_lower_rejects(Step::GeluTanhMul {
+            gate: &x,
+            up: &x,
+            out: &x,
+            n: 8,
+        });
+    }
+
+    #[test]
+    fn lower_layer_rejects_rope_partial() {
+        let x = meta_tensor(1);
+        let pos = unsafe { hip_bridge::DeviceBuffer::from_raw(8 as *mut std::ffi::c_void, 4) };
+        assert_lower_rejects(Step::RopePartial {
+            q: &x,
+            k: &x,
+            pos_buf: &pos,
+            n_heads: 1,
+            n_kv_heads: 1,
+            head_dim: 512,
+            n_rot_pairs: 64,
+            theta: 1e4,
+        });
+    }
+
+    #[test]
+    fn lower_layer_rejects_moe_gelu_experts() {
+        let x = meta_tensor(1);
+        let pool = GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(2 as *mut std::ffi::c_void, 4096) },
+            shape: vec![4096],
+            dtype: rdna_compute::DType::Raw,
+        };
+        let scales_host = [1.0_f32];
+        let experts = crate::families::moe::MoeGeluExpertsRef {
+            gate_up_pool: &pool,
+            down_pool: &pool,
+            gate_up_ptrs: &x,
+            down_ptrs: &x,
+            gate_up_dtype: rdna_compute::DType::MQ4G256,
+            down_dtype: rdna_compute::DType::Q8_0,
+            gate_up_bytes: 16,
+            down_bytes: 16,
+            n_experts: 1,
+        };
+        assert_lower_rejects(Step::MoeGeluExperts {
+            experts,
+            input: &x,
+            input_rot: &x,
+            topk_indices: &x,
+            topk_weights: &x,
+            expert_scales: &x,
+            expert_scales_host: &scales_host,
+            gate: &x,
+            up: &x,
+            hidden: &x,
+            out: &x,
+            hidden_dim: 8,
+            expert_dim: 4,
+            k_top: 1,
+        });
     }
 }

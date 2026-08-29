@@ -20,6 +20,7 @@ use hipfire_arch_qwen35::qwen35::{
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::KvCache;
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::Gpu;
@@ -125,7 +126,7 @@ fn run_single_gpu(path: &str, prompt_tokens: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>
     }
     scratch.free_gpu(&mut gpu);
     dn.free_gpu(&mut gpu);
-    kv.free_gpu(&mut gpu);
+    let _ = kv.free_gpu(&mut gpu);
     weights.free_gpu(&mut gpu);
     gpu.drain_pool();
     (tokens, all_logits)

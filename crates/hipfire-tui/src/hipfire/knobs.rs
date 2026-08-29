@@ -124,13 +124,31 @@ pub const KNOBS: &[KnobInfo] = &[
         ],
     },
     KnobInfo {
+        key: "reasoning_effort",
+        title: "Reasoning effort",
+        summary: "How hard the model is told to think, in its own vocabulary.",
+        effect: "Shapes the reasoning up front by setting the model's native effort level, rather than truncating it after the fact. On Qwen3.8 this injects the card's effort instruction; medium is deliberately the unsteered baseline (no instruction at all).",
+        default: "auto",
+        when: "Prefer this over thinking_budget on any model that has it — lowering effort actually shortens the reasoning, where lowering the budget just cuts it off.",
+        note: Some("The offered levels come from the MODEL, probed from its chat template at load, so they differ per model: Qwen3.8 has low/medium/xhigh and rejects high/max outright. A level the model lacks is projected UP to its next real one (high -> xhigh), never down. When a model has no native effort, this falls back to the thinking_budget ladder."),
+        options: &[
+            ("auto", "Leave the template's own default in force (Qwen3.8: xhigh)."),
+            ("none", "No thinking — closed think block; see the thinking knob."),
+            ("low", "Brief, focused reasoning; straight to the conclusion."),
+            ("medium", "The model's unsteered baseline — no effort instruction."),
+            ("high", "Projected up to the model's next real rung if it has no 'high'."),
+            ("xhigh", "Thorough analysis: validate assumptions, weigh alternatives."),
+            ("max", "Saturates at the model's top rung."),
+        ],
+    },
+    KnobInfo {
         key: "thinking_budget",
         title: "Reasoning budget",
         summary: "Named per-turn cap on tokens the model may spend inside <think>.",
         effect: "Higher budgets allow deeper reasoning at the cost of latency; lower budgets force the model to commit to an answer sooner. Picks a preset instead of a raw token count.",
         default: "med",
         when: "med for everyday use; low for snappy chat; high/xhigh/max for hard reasoning; uncapped only if latency is no concern.",
-        note: Some("Drives max_think_tokens unless a raw max_think_tokens override is set (the advanced knob wins). Only applies when thinking is on; thinking=off caps reasoning to a single token regardless."),
+        note: Some("A CAP, not a reasoning dial — it truncates, it does not shape. On a model with a native reasoning.effort (Qwen3.8, DeepSeek4) set the effort instead: a budget below what the chosen effort spends force-closes <think> mid-thought, so you pay the deep reasoning and lose the conclusion. Effort-native models therefore leave this uncapped by default. Drives max_think_tokens unless a raw max_think_tokens override is set (the advanced knob wins). Only applies when thinking is on; thinking=off caps reasoning to a single token regardless."),
         options: &[
             ("low", "512 tokens — quick answers, minimal reasoning."),
             ("med", "2048 tokens — the default; balanced reasoning vs latency."),
@@ -177,25 +195,25 @@ pub const KNOBS: &[KnobInfo] = &[
     KnobInfo {
         key: "mtp_mode",
         title: "Multi-token prediction (MTP)",
-        summary: "Uses a model's MTP head to predict several tokens per step where supported.",
-        effect: "Can raise decode throughput on MTP-capable models with no correctness cost; a no-op on models without an MTP head.",
+        summary: "Uses DeepSeek's in-weights MTP head to propose several tokens per step.",
+        effect: "Can raise DeepSeek decode throughput with no correctness cost. Qwen native MTP is disabled pending SPEC-003: on rejects; auto and off use AR.",
         default: "auto",
-        when: "Leave on auto; force on/off only when A/B-testing throughput.",
-        note: None,
+        when: "Leave on auto for DeepSeek; use off for AR A/B tests. Do not enable it for Qwen.",
+        note: Some("DeepSeek reads the load-resolved MTP K from immutable model metadata. Qwen on rejects before native-head preflight, open, or GPU upload."),
         options: &[
             ("off", "No multi-token prediction."),
-            ("on", "Force the MTP head where the model has one."),
-            ("auto", "Use MTP when supported, else single-token."),
+            ("on", "Force DeepSeek MTP; Qwen rejects pending SPEC-003."),
+            ("auto", "Use DeepSeek MTP when weights are present; Qwen stays AR."),
         ],
     },
     KnobInfo {
         key: "mtp_k",
         title: "MTP depth (K)",
-        summary: "How many tokens the MTP head proposes per step.",
-        effect: "Higher K can accept more per step (faster) but risks lower acceptance on hard text. Only used when MTP is active.",
+        summary: "How many tokens DeepSeek's MTP head proposes per step.",
+        effect: "Higher K can accept more per step (faster) but risks lower acceptance on hard text. Only used by active DeepSeek MTP.",
         default: "3",
-        when: "Tune only when measuring MTP throughput; the default is a safe middle.",
-        note: None,
+        when: "Tune only when measuring DeepSeek MTP throughput; the default is a safe middle.",
+        note: Some("`HIPFIRE_MTP_K` overrides CLI and config; the resolved value is fixed at model load."),
         options: &[],
     },
     KnobInfo {
@@ -411,16 +429,33 @@ mod tests {
     fn load_bearing_interactions_are_documented() {
         // The two interactions this phase exists to surface.
         assert!(
-            knob_info("dflash_mode").unwrap().note.unwrap().contains("thinking"),
+            knob_info("dflash_mode")
+                .unwrap()
+                .note
+                .unwrap()
+                .contains("thinking"),
             "dflash note must mention the thinking interaction"
         );
         assert!(
-            knob_info("thinking").unwrap().note.unwrap().to_lowercase().contains("dflash")
-                || knob_info("thinking").unwrap().note.unwrap().contains("spec-decode"),
+            knob_info("thinking")
+                .unwrap()
+                .note
+                .unwrap()
+                .to_lowercase()
+                .contains("dflash")
+                || knob_info("thinking")
+                    .unwrap()
+                    .note
+                    .unwrap()
+                    .contains("spec-decode"),
             "thinking note must mention the dflash interaction"
         );
         assert!(
-            knob_info("kv_cache").unwrap().note.unwrap().contains("inherit"),
+            knob_info("kv_cache")
+                .unwrap()
+                .note
+                .unwrap()
+                .contains("inherit"),
             "kv_cache note must explain auto = inherit"
         );
     }

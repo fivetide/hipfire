@@ -8,6 +8,40 @@ use hip_bridge::{Graph, GraphExec, HipResult, HipRuntime, Stream};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
+/// Set once any hipGraph is instantiated in this process.
+///
+/// A captured graph's nodes embed the device pointers that were live at
+/// capture time. Releasing one of those buffers later makes every subsequent
+/// replay read freed memory, which surfaces as
+/// `HipError(700): illegal memory access` at the next synchronisation point —
+/// typically somewhere unrelated, because the fault is reported late.
+///
+/// `scratch::grow_scratch_buffer` consults this before releasing a replaced
+/// scratch buffer: architectures that never capture (Muse Glimmer has no
+/// hipGraph decode path by design) get the memory back, while architectures
+/// that do capture (qwen35's verify / replay / AR-forward graphs) keep the old
+/// buffer alive exactly as before. Freeing under an active graph was measured
+/// to break qwen35 outright — every turn of a 4-turn DFlash session returned
+/// empty with `spec_step: HipError(700) ... reset_recurrent`, while the same
+/// build with the free suppressed ran 4/4 at 68.4 tok/s.
+///
+/// Releasing those buffers properly requires invalidating the captured graphs
+/// first (`invalidate_graph_state` / `drop_captured_graph`) so they re-capture
+/// against the new pointers. That is a larger change than a leak fix and owes
+/// its own per-arch gate, so it is deliberately not attempted here.
+static ANY_GRAPH_CAPTURED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// True once any hipGraph has been instantiated in this process.
+pub(crate) fn any_graph_captured() -> bool {
+    ANY_GRAPH_CAPTURED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Latch the graph-captured flag. Called from every graph instantiation site.
+pub(crate) fn mark_graph_captured() {
+    ANY_GRAPH_CAPTURED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 // Thread-local cache of the last device id bound on this thread.
 // Shared with `Gpu::bind_thread` / `Gpu::bind_thread_or_warn` in dispatch.rs.
 thread_local! {
@@ -113,6 +147,22 @@ impl GraphState {
         hip.stream_begin_capture(stream, 0) // 0 = hipStreamCaptureModeGlobal
     }
 
+    /// Begin a graph capture that may contain system-scope coordination with
+    /// independently captured peer-device streams. ROCm rejects that shape in
+    /// Global mode; Relaxed mode keeps each rank graph independent while the
+    /// captured signal kernels provide the explicit ordering contract.
+    pub fn begin_graph_capture_relaxed(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        bind_thread(hip, device_id)?;
+        self.capture_blobs.clear();
+        self.capture_mode = true;
+        hip.stream_begin_capture(stream, 2) // 2 = hipStreamCaptureModeRelaxed
+    }
+
     /// End capture, instantiate the graph for replay.
     pub fn end_graph_capture(
         &mut self,
@@ -124,6 +174,7 @@ impl GraphState {
         self.capture_mode = false;
         let graph = hip.stream_end_capture(stream)?;
         let exec = hip.graph_instantiate(&graph)?;
+        mark_graph_captured();
         self.captured_graph = Some(graph);
         self.graph_exec = Some(exec);
         // Take OWNERSHIP of this graph's kernarg blobs out of the shared
@@ -134,7 +185,6 @@ impl GraphState {
         self.ar_forward_blobs = std::mem::take(&mut self.capture_blobs);
         Ok(())
     }
-
     /// Replay the captured graph.
     pub fn graph_launch(&self, hip: &HipRuntime, device_id: i32, stream: &Stream) -> HipResult<()> {
         bind_thread(hip, device_id)?;
@@ -184,17 +234,31 @@ impl GraphState {
 
     /// Destroy the captured graph and free all retained kernarg blobs.
     pub fn graph_destroy(&mut self, hip: &HipRuntime, device_id: i32) {
-        bind_thread_or_warn(hip, device_id);
+        let _ = self.graph_destroy_checked(hip, device_id);
+    }
+
+    /// Fallible graph teardown for reset/unload owners that must surface HIP
+    /// destruction failures instead of treating them as a successful reset.
+    pub fn graph_destroy_checked(&mut self, hip: &HipRuntime, device_id: i32) -> HipResult<()> {
+        bind_thread(hip, device_id)?;
+        let mut first_error = None;
         if let Some(exec) = self.graph_exec.take() {
-            let _ = hip.graph_exec_destroy(exec);
+            if let Err(error) = hip.graph_exec_destroy(exec) {
+                first_error = Some(error);
+            }
         }
         if let Some(graph) = self.captured_graph.take() {
-            let _ = hip.graph_destroy(graph);
+            if let Err(error) = hip.graph_destroy(graph) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
         self.capture_blobs.clear();
         self.ar_forward_blobs.clear();
         self.ar_forward_kernel_dirty = true;
         self.ar_forward_replay_enabled = false;
+        first_error.map_or(Ok(()), Err)
     }
 
     // ── Per-B verify-forward graph cache ─────────────────────────────────
@@ -263,6 +327,7 @@ impl GraphState {
         self.capture_mode = false;
         let graph = hip.stream_end_capture(stream)?;
         let exec = hip.graph_instantiate(&graph)?;
+        mark_graph_captured();
         let blobs = std::mem::take(&mut self.capture_blobs);
         self.verify.cache.insert(b, (graph, exec, blobs));
         Ok(())
@@ -302,14 +367,28 @@ impl GraphState {
 
     /// Destroy all cached verify graphs and their blobs.
     pub fn verify_graph_destroy_all(&mut self, hip: &HipRuntime, device_id: i32) {
-        bind_thread_or_warn(hip, device_id);
+        let _ = self.verify_graph_destroy_all_checked(hip, device_id);
+    }
+
+    pub fn verify_graph_destroy_all_checked(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+    ) -> HipResult<()> {
+        bind_thread(hip, device_id)?;
+        let mut first_error = None;
         for (_, (graph, exec, _blobs)) in self.verify.cache.drain() {
-            let _ = hip.graph_exec_destroy(exec);
-            let _ = hip.graph_destroy(graph);
+            if let Err(error) = hip.graph_exec_destroy(exec) {
+                first_error.get_or_insert(error);
+            }
+            if let Err(error) = hip.graph_destroy(graph) {
+                first_error.get_or_insert(error);
+            }
         }
         self.verify.warmed_up.clear();
         self.verify.lmhead_argmax.clear();
         self.verify.capturing = None;
+        first_error.map_or(Ok(()), Err)
     }
 
     // ── Replay-graph cache (tape replay after verify) ────────────────────
@@ -369,6 +448,7 @@ impl GraphState {
         self.capture_mode = false;
         let graph = hip.stream_end_capture(stream)?;
         let exec = hip.graph_instantiate(&graph)?;
+        mark_graph_captured();
         let blobs = std::mem::take(&mut self.capture_blobs);
         self.replay.cache.insert(n_steps, (graph, exec, blobs));
         Ok(())
@@ -398,12 +478,26 @@ impl GraphState {
 
     /// Destroy all cached replay graphs and their blobs.
     pub fn replay_graph_destroy_all(&mut self, hip: &HipRuntime, device_id: i32) {
-        bind_thread_or_warn(hip, device_id);
+        let _ = self.replay_graph_destroy_all_checked(hip, device_id);
+    }
+
+    pub fn replay_graph_destroy_all_checked(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+    ) -> HipResult<()> {
+        bind_thread(hip, device_id)?;
+        let mut first_error = None;
         for (_, (graph, exec, _blobs)) in self.replay.cache.drain() {
-            let _ = hip.graph_exec_destroy(exec);
-            let _ = hip.graph_destroy(graph);
+            if let Err(error) = hip.graph_exec_destroy(exec) {
+                first_error.get_or_insert(error);
+            }
+            if let Err(error) = hip.graph_destroy(graph) {
+                first_error.get_or_insert(error);
+            }
         }
         self.replay.warmed_up.clear();
         self.replay.capturing = None;
+        first_error.map_or(Ok(()), Err)
     }
 }

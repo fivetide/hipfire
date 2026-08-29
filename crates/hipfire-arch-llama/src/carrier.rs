@@ -1,7 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 use crate::dspark_body::Qwen3DrafterAssets;
 use crate::Llama;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::dspark_core::DsparkWeights;
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::llama::{
     ForwardScratch, KvCache, KvDims, KvLayers, KvTarget, LlamaConfig, LlamaWeights,
 };
@@ -26,46 +31,262 @@ pub struct LlamaBundle {
     pub dspark_assets: Option<Qwen3DrafterAssets>,
 }
 
-/// Build the LLaMA GPU bundle from an HFQ source.
-pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, String> {
-    let ModelSource::Hfq(mut hfq) = src else {
-        return Err("llama: directory source unsupported".into());
-    };
-    let config = <Llama as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
-    let weights = <Llama as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
-    // Size scratch (flash-attention partials) for the runtime KV cap so the
-    // asym/flash attends, which index partials by ceil(physical_cap/128), don't
-    // overflow it (the trait `new_state` only knows the model's declared max).
-    let scratch = ForwardScratch::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
-        .map_err(|e| format!("llama: ForwardScratch::new_with_max_seq failed: {e:?}"))?;
-    let dims = KvDims {
-        layers: KvLayers::Flat(config.n_layers),
-        n_kv_heads: config.n_kv_heads,
-        head_dim: config.head_dim,
-        max_seq: ctx.max_seq,
-        physical_cap: None,
-    };
-    let kv = KvCache::from_mode(
-        hipfire_runtime::kv_mode::resolve(
-            "",
-            &hipfire_runtime::kv_mode::LLAMA_HFQ_POLICY,
-            config.head_dim,
-        )
-        .mode,
-        KvTarget::Single(ctx.gpu),
-        &dims,
-    )
-    .map_err(|e| format!("llama: KvCache::from_mode failed: {e}"))?;
-    Ok(LlamaBundle {
-        config,
-        weights,
-        scratch,
-        kv,
-        dflash_extract_layers: Vec::new(),
-        dspark_weights: None,
-        dspark_assets: None,
-    })
+/// Constructor-local owner for the LLaMA target resources. GPU buffers have
+/// no Drop, so each completed allocation is published into the staging
+/// struct immediately and freed explicitly on every error path — including
+/// the deterministic generic-DFlash construction faults armed between
+/// [`GenericDflashConstructionStage::TargetWeights`] /
+/// [`GenericDflashConstructionStage::TargetKv`] adoptions — while the
+/// original error stays primary. Success consumes the staging exactly once.
+struct LlamaBundleStaging {
+    config: Option<LlamaConfig>,
+    weights: Option<LlamaWeights>,
+    scratch: Option<ForwardScratch>,
+    kv: Option<KvCache>,
 }
+
+impl LlamaBundleStaging {
+    fn new() -> Self {
+        Self {
+            config: None,
+            weights: None,
+            scratch: None,
+            kv: None,
+        }
+    }
+
+    /// Release every adopted resource on this GPU. `Option::take` moves each
+    /// owner out exactly once, so a caller returning the original error after
+    /// this can never double-free.
+    fn free_gpu(&mut self, gpu: &mut rdna_compute::Gpu) {
+        if let Some(kv) = self.kv.take() {
+            kv.free_gpu(gpu);
+        }
+        if let Some(scratch) = self.scratch.take() {
+            scratch.free_gpu(gpu);
+        }
+        if let Some(weights) = self.weights.take() {
+            weights.free_gpu(gpu);
+        }
+    }
+
+    fn into_bundle(mut self) -> LlamaBundle {
+        LlamaBundle {
+            config: self.config.take().expect("staged LLaMA config"),
+            weights: self.weights.take().expect("staged LLaMA weights"),
+            scratch: self.scratch.take().expect("staged LLaMA scratch"),
+            kv: self.kv.take().expect("staged LLaMA KV cache"),
+            dflash_extract_layers: Vec::new(),
+            dspark_weights: None,
+            dspark_assets: None,
+        }
+    }
+}
+
+/// Build the LLaMA GPU bundle from an HFQ or safetensors-directory source.
+///
+/// Verbatim relocation of the carrier's `(config, weights, kv, scratch)`
+/// seam: HFQ via `Architecture` trait, Dir via ParoQuant loaders. Error
+/// strings are byte-identical to the prior inline carrier block. Every
+/// completed resource is staged and freed on any later failure, and the
+/// generic-DFlash `TargetWeights` / `TargetKv` construction faults fire
+/// immediately after the named resource is adopted so the staging rollback
+/// owns the fault.
+pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, String> {
+    let mut staged = LlamaBundleStaging::new();
+    match src {
+        ModelSource::Hfq(mut hfq) => {
+            let config =
+                <Llama as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
+            staged.config = Some(config);
+            let weights = <Llama as Architecture>::load_weights(
+                &mut hfq,
+                staged.config.as_ref().expect("staged LLaMA config"),
+                ctx.gpu,
+            )?;
+            hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
+            staged.weights = Some(weights);
+            #[cfg(feature = "dflash-fault-inject")]
+            if let Err(error) =
+                hipfire_runtime::dflash_generic::generic_dflash_construction_boundary(
+                    hipfire_runtime::dflash_generic::GenericDflashConstructionStage::TargetWeights,
+                )
+            {
+                staged.free_gpu(ctx.gpu);
+                return Err(error);
+            }
+            // Size scratch (flash-attention partials) for the runtime KV cap so the
+            // asym/flash attends, which index partials by ceil(physical_cap/128), don't
+            // overflow it (the trait `new_state` only knows the model's declared max).
+            let scratch = match ForwardScratch::new_with_max_seq(
+                ctx.gpu,
+                staged.config.as_ref().expect("staged LLaMA config"),
+                ctx.max_seq,
+            ) {
+                Ok(scratch) => scratch,
+                Err(error) => {
+                    staged.free_gpu(ctx.gpu);
+                    return Err(format!(
+                        "llama: ForwardScratch::new_with_max_seq failed: {error:?}"
+                    ));
+                }
+            };
+            staged.scratch = Some(scratch);
+            let dims = KvDims {
+                layers: KvLayers::Flat(
+                    staged
+                        .config
+                        .as_ref()
+                        .expect("staged LLaMA config")
+                        .n_layers,
+                ),
+                n_kv_heads: staged
+                    .config
+                    .as_ref()
+                    .expect("staged LLaMA config")
+                    .n_kv_heads,
+                head_dim: staged
+                    .config
+                    .as_ref()
+                    .expect("staged LLaMA config")
+                    .head_dim,
+                max_seq: ctx.max_seq,
+                physical_cap: None,
+            };
+            let kv = match <KvCache as KvCacheExt>::from_mode(
+                hipfire_runtime::kv_mode::resolve(
+                    ctx.kv_mode_override.unwrap_or(""),
+                    &hipfire_runtime::kv_mode::LLAMA_HFQ_POLICY,
+                    staged
+                        .config
+                        .as_ref()
+                        .expect("staged LLaMA config")
+                        .head_dim,
+                )
+                .mode,
+                KvTarget::Single(ctx.gpu),
+                &dims,
+            ) {
+                Ok(kv) => kv,
+                Err(error) => {
+                    staged.free_gpu(ctx.gpu);
+                    return Err(format!(
+                        "llama: <KvCache as KvCacheExt>::from_mode failed: {error}"
+                    ));
+                }
+            };
+            staged.kv = Some(kv);
+            #[cfg(feature = "dflash-fault-inject")]
+            if let Err(error) =
+                hipfire_runtime::dflash_generic::generic_dflash_construction_boundary(
+                    hipfire_runtime::dflash_generic::GenericDflashConstructionStage::TargetKv,
+                )
+            {
+                staged.free_gpu(ctx.gpu);
+                return Err(error);
+            }
+        }
+        ModelSource::Dir(source) => {
+            let config = hipfire_runtime::hfq::config_from_safetensors_llama(&source)
+                .map_err(|e| format!("failed to parse LLaMA/Qwen3 config from config.json: {e}"))?;
+            staged.config = Some(config);
+            let weights = hipfire_runtime::hfq::load_weights_paroquant_llama(
+                &source,
+                staged.config.as_ref().expect("staged LLaMA config"),
+                ctx.gpu,
+            )
+            .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
+            hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
+            staged.weights = Some(weights);
+            #[cfg(feature = "dflash-fault-inject")]
+            if let Err(error) =
+                hipfire_runtime::dflash_generic::generic_dflash_construction_boundary(
+                    hipfire_runtime::dflash_generic::GenericDflashConstructionStage::TargetWeights,
+                )
+            {
+                staged.free_gpu(ctx.gpu);
+                return Err(error);
+            }
+            // Replicate carriers.rs `resolve_kv_mode` warning path verbatim.
+            let kv_mode_str = ctx
+                .kv_mode_override
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone());
+            let rr = hipfire_runtime::kv_mode::resolve(
+                &kv_mode_str,
+                &hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY,
+                staged
+                    .config
+                    .as_ref()
+                    .expect("staged LLaMA config")
+                    .head_dim,
+            );
+            if let Some(w) = rr.warning {
+                eprintln!(
+                    "  KV cache: {w} (site {})",
+                    hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY.site
+                );
+            }
+            let dims = KvDims {
+                layers: KvLayers::Flat(
+                    staged
+                        .config
+                        .as_ref()
+                        .expect("staged LLaMA config")
+                        .n_layers,
+                ),
+                n_kv_heads: staged
+                    .config
+                    .as_ref()
+                    .expect("staged LLaMA config")
+                    .n_kv_heads,
+                head_dim: staged
+                    .config
+                    .as_ref()
+                    .expect("staged LLaMA config")
+                    .head_dim,
+                max_seq: ctx.max_seq,
+                physical_cap: Some(ctx.max_seq),
+            };
+            let kv =
+                match <KvCache as KvCacheExt>::from_mode(rr.mode, KvTarget::Single(ctx.gpu), &dims)
+                {
+                    Ok(kv) => kv,
+                    Err(error) => {
+                        staged.free_gpu(ctx.gpu);
+                        return Err(format!("KvCache: {error}"));
+                    }
+                };
+            staged.kv = Some(kv);
+            #[cfg(feature = "dflash-fault-inject")]
+            if let Err(error) =
+                hipfire_runtime::dflash_generic::generic_dflash_construction_boundary(
+                    hipfire_runtime::dflash_generic::GenericDflashConstructionStage::TargetKv,
+                )
+            {
+                staged.free_gpu(ctx.gpu);
+                return Err(error);
+            }
+            let scratch = match ForwardScratch::new_with_max_seq(
+                ctx.gpu,
+                staged.config.as_ref().expect("staged LLaMA config"),
+                ctx.max_seq,
+            ) {
+                Ok(scratch) => scratch,
+                Err(error) => {
+                    staged.free_gpu(ctx.gpu);
+                    return Err(format!("ForwardScratch::new_with_max_seq: {error:?}"));
+                }
+            };
+            staged.scratch = Some(scratch);
+        }
+    };
+    Ok(staged.into_bundle())
+}
+
+/// Alias matching the `load_<arch>_bundle` naming convention in the task.
+pub use load_bundle as load_llama_bundle;
 
 impl LlamaBundle {
     /// Set the decoder-layer indices whose residual hidden states the

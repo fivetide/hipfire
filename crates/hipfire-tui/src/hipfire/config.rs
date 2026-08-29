@@ -2,12 +2,11 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire - see LICENSE and NOTICE in the project root.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
-use serde_json::Value;
+use hipfire_config::{
+    field, load_catalog, load_global, resolve, ConfigFormat, ConfigPaths, ConfigValue, NamedLayer,
+};
 
 use super::HipfirePaths;
 
@@ -17,7 +16,7 @@ pub struct ConfigState {
     pub port: u16,
     pub default_model: String,
     pub values: BTreeMap<String, String>,
-    /// Keys explicitly present in `~/.hipfire/config.json` — i.e. user overrides,
+    /// Keys explicitly present in `~/.hipfire/config.toml` — i.e. user overrides,
     /// as opposed to inherited/hardcoded defaults. `values` always carries every
     /// default key merged with the disk overlay, so this set is the only way to
     /// tell an override apart from a default (drives reset gating + the 5c
@@ -35,25 +34,24 @@ impl ConfigState {
         let mut loaded_from_disk = false;
         let mut warning = None;
 
-        match fs::read_to_string(&paths.config) {
-            Ok(raw) => match serde_json::from_str::<Value>(&raw) {
-                Ok(Value::Object(map)) => {
-                    loaded_from_disk = true;
-                    for (k, v) in map {
-                        overrides.insert(k.clone());
-                        values.insert(k, value_to_string(&v));
+        match load_global(&ConfigPaths::under(&paths.root)) {
+            Ok(loaded) => {
+                loaded_from_disk = loaded.format != ConfigFormat::Empty;
+                for (canonical, value) in loaded.layer.values {
+                    if let Some(schema) = field(&canonical) {
+                        overrides.insert(schema.legacy_key.to_owned());
+                        values.insert(schema.legacy_key.to_owned(), value_to_string(&value));
                     }
                 }
-                Ok(_) => warning = Some("config.json is not an object; using defaults".into()),
-                Err(err) => warning = Some(format!("config parse error: {err}")),
-            },
-            Err(_) => {}
+                if !loaded.warnings.is_empty() {
+                    warning = Some(loaded.warnings.join("; "));
+                }
+            }
+            Err(error) => warning = Some(format!("config parse error: {error}")),
         }
 
-        let per_model_count = fs::read_to_string(&paths.per_model_config)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-            .and_then(|v| v.as_object().map(|m| m.len()))
+        let per_model_count = load_catalog(&ConfigPaths::under(&paths.root))
+            .map(|loaded| loaded.catalog.models.len())
             .unwrap_or(0);
 
         let host = values
@@ -81,7 +79,7 @@ impl ConfigState {
         }
     }
 
-    /// True when `key` is an explicit user override in config.json (vs an
+    /// True when `key` is an explicit user override in config.toml (vs an
     /// inherited/hardcoded default). Drives reset gating ("already default") and
     /// the override marker in the Settings view.
     pub fn is_override(&self, key: &str) -> bool {
@@ -115,6 +113,7 @@ impl ConfigState {
             Some("prefill_compression"), // Prefill (pflash)
             Some("kv_cache"),
             Some("thinking"),
+            Some("reasoning_effort"),
             Some("thinking_budget"),
             None, // Serve host:port (composite)
         ]
@@ -125,12 +124,12 @@ impl ConfigState {
     /// CLI warning (`prefill_compression=… but prefill_drafter is unset`). Surfaced
     /// honestly in the easy row + as a toast when the user enables compression.
     ///
-    /// Scope: this reflects the GLOBAL config (`~/.hipfire/config.json`), which is
+    /// Scope: this reflects the GLOBAL config (`~/.hipfire/config.toml`), which is
     /// what the Settings tab edits — like every other row here. A per-model
     /// override (`hipfire config <tag> set prefill_drafter …`, counted in
     /// `per_model_count`) is resolved by the daemon at serve time and is NOT
     /// layered in here; the daemon's own gate is the final word. Empty-string =
-    /// disabled matches bun exactly (`"" disables`).
+    /// disabled matches the shared schema exactly (`"" disables`).
     pub fn pflash_needs_drafter(&self) -> bool {
         let compression = self
             .values
@@ -153,14 +152,15 @@ impl ConfigState {
     /// changed in easy mode too, not just advanced.
     pub fn easy_override_state(&self) -> Vec<bool> {
         vec![
-            self.is_override("default_model"),                       // Model
-            self.is_override("max_seq"),                             // Context
-            self.is_override("dflash_mode"),                         // Spec decode
-            self.is_override("prefill_compression"),                 // Prefill
-            self.is_override("kv_cache"),                            // KV cache
-            self.is_override("thinking"),                            // Thinking
-            self.is_override("thinking_budget"),                     // Reasoning budget
-            self.is_override("host") || self.is_override("port"),    // Serve
+            self.is_override("default_model"),                    // Model
+            self.is_override("max_seq"),                          // Context
+            self.is_override("dflash_mode"),                      // Spec decode
+            self.is_override("prefill_compression"),              // Prefill
+            self.is_override("kv_cache"),                         // KV cache
+            self.is_override("thinking"),                         // Thinking
+            self.is_override("reasoning_effort"),                 // Reasoning effort
+            self.is_override("thinking_budget"),                  // Reasoning budget
+            self.is_override("host") || self.is_override("port"), // Serve
         ]
     }
 
@@ -176,6 +176,7 @@ impl ConfigState {
             "prefill_compression", // Prefill
             "kv_cache",            // KV cache
             "thinking",            // Thinking
+            "reasoning_effort",    // Reasoning effort
             "thinking_budget",     // Reasoning budget
             "host",                // Serve
         ]
@@ -238,12 +239,20 @@ impl ConfigState {
                 "Whether reasoning models emit a hidden think block.",
             ),
             (
+                "Reasoning effort",
+                self.values
+                    .get("reasoning_effort")
+                    .cloned()
+                    .unwrap_or_else(|| "auto".into()),
+                "How hard the model is told to think, in its own vocabulary.",
+            ),
+            (
                 "Reasoning budget",
                 self.values
                     .get("thinking_budget")
                     .cloned()
                     .unwrap_or_else(|| "med".into()),
-                "Named <think> token cap (low/med/high/xhigh/max/uncapped).",
+                "A CAP, not a dial — truncates. Prefer effort where the model has one.",
             ),
             (
                 "Serve",
@@ -255,60 +264,49 @@ impl ConfigState {
 }
 
 fn defaults() -> BTreeMap<String, String> {
-    [
-        ("kv_cache", "auto"),
-        ("kv_adaptive", "off"),
-        ("flash_mode", "auto"),
-        ("default_model", "qwen3.5:9b"),
-        ("temperature", "0.3"),
-        ("top_p", "0.8"),
-        ("repeat_penalty", "1.05"),
-        ("max_tokens", "4096"),
-        ("max_seq", "32768"),
-        ("thinking", "on"),
-        ("thinking_budget", "med"),
-        ("max_think_tokens", "2048"),
-        ("max_total_think_tokens", "0"),
-        ("host", "0.0.0.0"),
-        ("port", "11435"),
-        ("idle_timeout", "300"),
-        ("dflash_mode", "off"),
-        ("dflash_adaptive_b", "true"),
-        ("dflash_ngram_block", "auto"),
-        ("cask", "false"),
-        ("cask_budget", "512"),
-        ("cask_beta", "128"),
-        ("cask_auto_attach", "true"),
-        ("prompt_normalize", "true"),
-        ("mmq_screen", "auto"),
-        ("prefill_compression", "off"),
-        // pflash (prefill KV compression). Compression no-ops without a drafter.
-        ("prefill_drafter", ""),
-        ("prefill_threshold", "32768"),
-        ("mtp_mode", "auto"),
-        ("mtp_k", "3"),
-        // Mirror bun CONFIG_DEFAULTS for the remaining surfaced keys.
-        ("chat_template", ""),
-        ("default_chatml", "true"),
-    ]
-    .into_iter()
-    .map(|(k, v)| (k.to_string(), v.to_string()))
-    .collect()
+    resolve(Vec::<NamedLayer>::new())
+        .expect("shared built-in config schema validates")
+        .legacy_values()
+        .into_iter()
+        .map(|(key, value)| (key, value_to_string(&value)))
+        .collect()
 }
 
-fn value_to_string(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        Value::Number(n) => n.to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Null => String::new(),
-        _ => v.to_string(),
+fn value_to_string(value: &ConfigValue) -> String {
+    match value {
+        ConfigValue::String(value) => value.clone(),
+        ConfigValue::Integer(value) => value.to_string(),
+        ConfigValue::Float(value) => value.to_string(),
+        ConfigValue::Bool(value) => value.to_string(),
+        ConfigValue::Null => String::new(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four easy-mode lists are positional: row i in `easy_rows` is edited
+    /// through `easy_keys[i]`, marked by `easy_override_state[i]`, and
+    /// explained by `easy_help_keys[i]`. Nothing but this test stops them
+    /// drifting — adding a row to three of the four silently misattributes
+    /// every row after it.
+    #[test]
+    fn easy_mode_lists_stay_positionally_parallel() {
+        let c = state_with(&[]);
+        let n = c.easy_rows().len();
+        assert_eq!(c.easy_keys().len(), n, "easy_keys drifted from easy_rows");
+        assert_eq!(
+            c.easy_override_state().len(),
+            n,
+            "easy_override_state drifted from easy_rows"
+        );
+        assert_eq!(
+            c.easy_help_keys().len(),
+            n,
+            "easy_help_keys drifted from easy_rows"
+        );
+    }
 
     /// A ConfigState seeded from an explicit value map (defaults overlaid).
     fn state_with(pairs: &[(&str, &str)]) -> ConfigState {
@@ -334,7 +332,10 @@ mod tests {
     fn pflash_needs_drafter_logic() {
         // 5d honest state: compression on + no drafter -> warns; with a drafter,
         // or compression off, -> fine.
-        assert!(!state_with(&[]).pflash_needs_drafter(), "off by default = fine");
+        assert!(
+            !state_with(&[]).pflash_needs_drafter(),
+            "off by default = fine"
+        );
         assert!(
             state_with(&[("prefill_compression", "auto")]).pflash_needs_drafter(),
             "auto without drafter needs one"
@@ -344,8 +345,11 @@ mod tests {
             "always without drafter needs one"
         );
         assert!(
-            !state_with(&[("prefill_compression", "auto"), ("prefill_drafter", "/d.hfq")])
-                .pflash_needs_drafter(),
+            !state_with(&[
+                ("prefill_compression", "auto"),
+                ("prefill_drafter", "/d.hfq")
+            ])
+            .pflash_needs_drafter(),
             "auto WITH a drafter is fine"
         );
     }
@@ -359,16 +363,27 @@ mod tests {
             .into_iter()
             .find(|(label, _, _)| *label == "Prefill")
             .expect("Prefill easy row present");
-        assert!(prefill.1.contains("needs drafter"), "no-op state shown: {}", prefill.1);
+        assert!(
+            prefill.1.contains("needs drafter"),
+            "no-op state shown: {}",
+            prefill.1
+        );
 
         // With a drafter set, the hint goes away.
-        let st2 = state_with(&[("prefill_compression", "auto"), ("prefill_drafter", "/d.hfq")]);
+        let st2 = state_with(&[
+            ("prefill_compression", "auto"),
+            ("prefill_drafter", "/d.hfq"),
+        ]);
         let prefill2 = st2
             .easy_rows()
             .into_iter()
             .find(|(label, _, _)| *label == "Prefill")
             .unwrap();
-        assert!(!prefill2.1.contains("needs drafter"), "hint cleared: {}", prefill2.1);
+        assert!(
+            !prefill2.1.contains("needs drafter"),
+            "hint cleared: {}",
+            prefill2.1
+        );
     }
 
     #[test]

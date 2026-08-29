@@ -15,9 +15,11 @@
 //!         --example test_qwen35_state_multi -- \
 //!         ~/.hipfire/models/qwen3.5-0.8b.mq4
 
+use hipfire_arch_qwen35::arch::qwen35_la_devices;
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35ScratchSet, StateQuant};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::KvCache;
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::multi_gpu::Gpus;
 use std::path::Path;
 
@@ -113,6 +115,10 @@ fn main() {
         .filter(|t| **t == LayerType::LinearAttention)
         .count();
     assert_eq!(dn.s_matrices.len(), n_la);
+    // STEP-003: the constructor returns the state-manifest-derived placement;
+    // independently resolve it here to pin that contract.
+    let expected_la_to_device = qwen35_la_devices(&config, &gpus);
+    assert_eq!(la_to_device, expected_la_to_device);
     assert_eq!(la_to_device.len(), n_la);
     println!("  n_la={n_la}, la_to_device={:?}", la_to_device);
     let probe_la = [0usize, n_la / 2, n_la - 1];
