@@ -60,6 +60,58 @@ def _change_set(document: dict, group_id: str) -> dict:
     return next(row for row in document["change_sets"] if row["id"] == group_id)
 
 
+def load_tracker() -> dict:
+    return json.loads(TRACKER.read_text(encoding="utf-8"))
+
+
+def change_set(document: dict, group_id: str) -> dict:
+    return _change_set(document, group_id)
+
+
+def test_g1_g5_consistent_delivery_dependencies():
+    tracker = load_tracker()
+    expected = {
+        "G1": ["G0"],
+        "G2": ["G1"],
+        "G3": ["G1"],
+        "G4": ["G0"],
+        "G5": ["G1", "G2", "G3"],
+    }
+    for group_id, dependencies in expected.items():
+        group = change_set(tracker, group_id)
+        assert group["depends_on"] == dependencies
+        assert group["can_develop_after"] == dependencies
+        assert group["parallel_lane"]["can_develop_after"] == dependencies
+    assert change_set(tracker, "G5")["merge_waits_on"] == ["G1", "G2", "G3"]
+    assert "qwen3.6:35b-a3b" in change_set(tracker, "G5")["production_route"]
+    assert "qwen3.6:35b-a3b" in change_set(tracker, "G5")["delivery_contract"]["production_route"]
+    for group_id in ("G1", "G2"):
+        assert set(change_set(tracker, group_id)["delivery_contract"]["required_registry_tags"]) >= {
+            "qwen3.6:27b",
+            "qwen3.6:35b-a3b",
+        }
+
+    seam_consumers = {
+        gate["id"]: set(gate["consumers"]) for gate in tracker["seam_gates"]
+    }
+    assert {"G2", "G3", "G5"} <= seam_consumers["S-TOPOLOGY"]
+    assert "G5" in seam_consumers["S-ADMISSION"]
+    assert "G5" in seam_consumers["S-MANIFEST"]
+    assert "G5" in seam_consumers["S-LOAD"]
+
+
+def test_historical_pr_disposition_is_pinned():
+    tracker = load_tracker()
+    disposition = tracker["branch_provenance"]["historical_pr_disposition"]
+    assert disposition["transiently_merged_then_reverted"] == ["#673", "#674", "#676"]
+    assert disposition["stale_open_drafts"] == ["#675", "#677"]
+    assert disposition["rollback_commit"] == "a0fca0d6db3f9584f1ddac7f7a940fece74d3900"
+    assert disposition["archive_commit"] == "541b33c33e235efadeec67aac1da766c085cc67f"
+    assert disposition["evidence_disposition"] == "historical/rerun_required"
+
+
+
+
 def test_g1_g5_require_consistent_delivery_contract(tmp_path: Path):
     document = json.loads(TRACKER.read_text(encoding="utf-8"))
     del _change_set(document, "G1")["delivery_contract"]
@@ -551,9 +603,9 @@ def test_development_gate_map_is_exact(tmp_path: Path):
         "G0": [],
         "G1": ["G0"],
         "G2": ["G1"],
-        "G3": ["G0"],
+        "G3": ["G1"],
         "G4": ["G0"],
-        "G5": ["G0"],
+        "G5": ["G1", "G2", "G3"],
         "G6": ["G5"],
         "G7": ["G5"],
         "G8": ["G5"],
@@ -1204,13 +1256,14 @@ def test_duplicated_source_of_truth_drift_rejected():
     ]
     for pattern in forbidden_patterns:
         assert pattern not in checker_text, f"checker still contains duplicated source-of-truth {pattern!r}"
-    # Also ensure tracker and checker agree on G1->G3->G5 chain without duplication
+    # Also ensure tracker and checker agree on the G1/G2/G3 -> G5 DAG.
     document = json.loads(TRACKER.read_text(encoding="utf-8"))
     g1 = next(g for g in document["change_sets"] if g["id"] == "G1")
     g3 = next(g for g in document["change_sets"] if g["id"] == "G3")
     g5 = next(g for g in document["change_sets"] if g["id"] == "G5")
-    assert g3["depends_on"] == ["G1"], "G3 must depend on G1 for landing chain"
-    assert g5["depends_on"] == ["G3"], "G5 must depend on G3 for landing chain"
-    assert "G3" in g5["merge_waits_on"], "G5 must merge-wait on G3"
+    assert g1["depends_on"] == ["G0"], "G1 must depend on G0"
+    assert g3["depends_on"] == ["G1"], "G3 must depend on G1"
+    assert g5["depends_on"] == ["G1", "G2", "G3"], "G5 must depend on G1, G2, and G3"
+    assert g5["merge_waits_on"] == ["G1", "G2", "G3"], "G5 must merge-wait on G1, G2, and G3"
     assert "S-TOPOLOGY" in g3["consumed_seam_gates"], "G3 must consume S-TOPOLOGY"
     assert "S-MANIFEST" in g5["consumed_seam_gates"], "G5 must consume S-MANIFEST"

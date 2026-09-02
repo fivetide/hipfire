@@ -22,7 +22,22 @@
       "084dbebda9c72116fc9b4819f85ec2e15aa31344",
       "bac02a1a22a55922ea057e9a98f68cb3ab93ac02"
     ],
-    "rule": "G0 starts at series_origin_ref; every later promoted group/campaign records the then-current upstream base and must use a pinned 40-hex commit."
+    "rule": "G0 starts at series_origin_ref; every later promoted group/campaign records the then-current upstream base and must use a pinned 40-hex commit.",
+    "historical_pr_disposition": {
+      "transiently_merged_then_reverted": [
+        "#673",
+        "#674",
+        "#676"
+      ],
+      "stale_open_drafts": [
+        "#675",
+        "#677"
+      ],
+      "rollback_commit": "a0fca0d6db3f9584f1ddac7f7a940fece74d3900",
+      "archive_commit": "541b33c33e235efadeec67aac1da766c085cc67f",
+      "evidence_disposition": "historical/rerun_required",
+      "rule": "All associated PR, branch, and archive evidence is historical or rerun-required and cannot promote current status."
+    }
   },
   "authority": {
     "tracker": "docs/device-mesh-port-tracker.json",
@@ -153,7 +168,7 @@
     "one_row_rule": "Completion rows remain one-per-obligation for unambiguous mapping; this does not constrain PR size or independently complete a milestone.",
     "grouping_rule": "Each domain obligation ID appears exactly once across grouped change sets, evidence campaigns, and final closure. legacy_pr_ids are provenance only.",
     "completion_promotion_rule": "Only current durable evidence with nonempty non-host-local references can promote a group, campaign, or final closure. Durable references must exist on disk or be immutable GitHub commit/blob URLs with 40-hex objects; nonexistent paths, Cargo.toml-as-report, malformed hash URLs, and host-local/.agent-progress references never promote. Historical, semantics-only, emulated, failed, hardware_blocked, and host-local evidence never promotes.",
-    "parallel_lane_rule": "Canonical landing chain is G1(hipfire-pr-673) -> G3(hipfire-pr-675) -> G5(hipfire-pr-677); G2(hipfire-pr-674) is a sibling after G1 and a semantic prerequisite before complete production multi-device enablement, not a prerequisite for G3. G3 and G4 may develop in parallel after authority; the interface-safe part of G5 may develop after authority (after G1 topology) while merge waits on its manifest seam S-MANIFEST. G6-G11 fan out after their consumed G5 seams. G13-G15 are implementation-only; physical campaigns follow them.",
+    "parallel_lane_rule": "Strict production order is G1 topology/load preservation -> concurrent G2 source-aware admission and G3 Single manifest/load transaction, with independent G4 lifecycle work after authority -> G5 sealed qwen3.6:35b-a3b production route. G6-G11 fan out after their consumed G5 seams; G13-G15 remain implementation-only and physical campaigns follow them.",
     "can_develop_after": {
       "G0": [],
       "G1": [
@@ -163,13 +178,15 @@
         "G1"
       ],
       "G3": [
-        "G0"
+        "G1"
       ],
       "G4": [
         "G0"
       ],
       "G5": [
-        "G0"
+        "G1",
+        "G2",
+        "G3"
       ],
       "G6": [
         "G5"
@@ -4761,7 +4778,8 @@
       "producer": "G1",
       "consumers": [
         "G2",
-        "G3"
+        "G3",
+        "G5"
       ],
       "status": "proposed",
       "contract": "One hardware owner exposes named DeviceMesh topology.",
@@ -4773,6 +4791,7 @@
       "kind": "admission",
       "producer": "G2",
       "consumers": [
+        "G5",
         "G13",
         "G14",
         "G15"
@@ -4801,6 +4820,7 @@
       "kind": "load",
       "producer": "G3",
       "consumers": [
+        "G5",
         "G8"
       ],
       "status": "proposed",
@@ -5131,9 +5151,9 @@
     },
     {
       "id": "G1",
-      "title": "Sole hardware owner plus named DeviceMesh topology",
-      "scope": "Move Gpus/collectives into hipfire-hardware and add named rectangular DeviceMesh.",
-      "non_goals": "No policy, family behavior, allocation, generation, ragged topology, or runtime re-export.",
+      "title": "Topology cutover with production load preservation",
+      "scope": "Introduce named DeviceMesh topology inside the existing hipfire_runtime::multi_gpu owner and make the current model-loading topology path consume it without changing which models or topologies load.",
+      "non_goals": "No new crate or compatibility re-export, model capability policy change, manifest, family, request lifecycle, typed MoE, axis enablement, or physical multi-device claim from emulation.",
       "obligation_ids": [
         "TOPOLOGY"
       ],
@@ -5147,13 +5167,13 @@
       "produced_seam_gates": [
         "S-TOPOLOGY"
       ],
-      "source_assumption": "Hardware ownership and topology can be reviewed as one leaf cutover.",
-      "sole_owner": "hipfire-hardware integration owner.",
-      "production_route": "Current no-GPU structural route plus CPU topology contracts.",
+      "source_assumption": "Current-master topology, resolved device selection, and peer-lease behavior can be cut over to one DeviceMesh authority without changing admitted models or production routes.",
+      "sole_owner": "hipfire_runtime::multi_gpu::Gpus owns devices, allocation, peer ownership, and collectives; DeviceMesh is the sole topology authority.",
+      "production_route": "Current production model-loading route consumes DeviceMesh while preserving every intersected Single/PP/TP/EP route.",
       "positive_evidence": [
         {
           "classification": "rerun_required",
-          "assertion": "Branch behavior is forensic source only and must be rerun through the current upstream route.",
+          "assertion": "The complete current-master versus final-head preservation matrix must rerun every intersected Single/PP/TP/EP route, including fresh-daemon qwen3.6:27b and qwen3.6:35b-a3b load/generate/unload, text artifacts with vision_config but no tower, and four synchronized cycles with stable ownership and memory.",
           "references": [
             "docs/device-mesh-port-tracker.json",
             "TOPOLOGY"
@@ -5164,7 +5184,7 @@
       "negative_evidence": [
         {
           "classification": "historical",
-          "assertion": "Branch commits and reports are immutable provenance, not current upstream acceptance.",
+          "assertion": "Historical branch, PR, and archive evidence from the reverted stack is forensic only; every production preservation claim requires a current-tree rerun.",
           "references": [
             "docs/device-mesh-port-tracker.json",
             "TOPOLOGY"
@@ -5173,26 +5193,28 @@
         }
       ],
       "side_effect_assertions": [
+        "No topology or loader change may alter a retained model route, admitted device selection, or peer lease without rerunning every intersected production cell.",
+        "Pure mesh construction performs no allocation or collective, and a failed candidate load leaves the active model usable with no hidden topology side effect.",
         "No completion status may be promoted from historical, semantics-only, emulated, failed, or hardware-blocked evidence.",
-        "No change set may create a second validation-route or admission authority."
+        "No change set may create a second validation-route or topology/admission authority."
       ],
       "revert_identity": {
         "change_set_id": "G1",
-        "identity": "G1:single-grouped-change-set-revert",
+        "identity": "G1:topology-load-preservation-final-head",
         "strategy": "revert-entire-grouped-change-set",
-        "scope": "Revert G1 as one coherent unit; do not split its obligations into another authority."
+        "scope": "Revert the complete G1 topology and production load-preservation head as one coherent unit; do not split topology, device selection, or collective ownership."
       },
       "parallel_lane": {
-        "name": "hardware-topology",
+        "name": "topology-load-preservation",
         "integration_mode": "serialized-shared-file-owner",
         "can_develop_after": [
           "G0"
         ],
         "merge_waits_on": []
       },
-      "shared_file_integration_owner": "hipfire-hardware integration owner.",
-      "acceptance": "One Gpus owner, coordinate/group/stage/epoch invariants, and Single equivalence pass.",
-      "stop_condition": "Stop on lost upstream feature, old owner/re-export, or carrier/allocation knowledge in topology.",
+      "shared_file_integration_owner": "hipfire_runtime::multi_gpu::Gpus and DeviceMesh topology owner.",
+      "acceptance": "Static mesh, epoch, coordinate, group, and physical-identity contracts hold; one Gpus/topology owner remains; every intersected Single/PP/TP/EP route preserves qwen3.6:27b and qwen3.6:35b-a3b load/generate/unload behavior across four cycles; failed candidate load preserves the active model.",
+      "stop_condition": "Stop on any model-load regression, changed admitted route, second topology owner, new crate, changed Gpus ABI, lost peer lease, hidden allocation during mesh construction, or physical claim based on emulation.",
       "status": "blocked",
       "implementation_class": "port",
       "confidence": "high",
@@ -5207,14 +5229,24 @@
           "all-current-master-intersected-tp-routes",
           "all-current-master-intersected-ep-routes"
         ],
-        "positive_probe": "Load, generate, unload, and reload qwen3.6:27b and qwen3.6:35b-a3b through fresh daemons while consuming DeviceMesh",
+        "positive_probe": "Run the complete current-master versus final-head load-preservation matrix on fresh daemons: qwen3.6:27b and qwen3.6:35b-a3b load, generate, unload, and reload; retain text/VL classification, route-specific parity, and four-cycle ownership/memory observations",
         "negative_or_fault_probes": [
-          "A failed candidate load preserves the active prior model and performs no hidden topology side effect"
+          "A failed candidate load preserves the active prior model, performs no hidden topology side effect, and leaves the prior route reusable"
         ],
-        "lifecycle_observations": ["load", "generate", "unload", "reload"],
-        "required_registry_tags": ["qwen3.6:27b", "qwen3.6:35b-a3b"],
+        "lifecycle_observations": [
+          "load",
+          "generate",
+          "unload",
+          "reload"
+        ],
+        "required_registry_tags": [
+          "qwen3.6:27b",
+          "qwen3.6:35b-a3b"
+        ],
         "validation_route": "docs/VALIDATION.md#device-mesh-g1-g5-routes",
-        "evidence_classes": ["rerun_required"],
+        "evidence_classes": [
+          "rerun_required"
+        ],
         "receipt_refs": []
       },
       "delivery_kind": "change_set",
@@ -5227,9 +5259,9 @@
     },
     {
       "id": "G2",
-      "title": "Source-aware capability policy and effective-mesh admission",
-      "scope": "Publish source-aware policy, effective-mesh admission, dense-EP normalization, and refusal ordering.",
-      "non_goals": "No manifest planning, family loading, axis enablement, silent fallback, or GPU creation.",
+      "title": "Source-aware admission cutover with repeated load preservation",
+      "scope": "Classify a retained source once, decide one effective topology before destructive side effects, and preserve every topology and carrier behavior served by current master.",
+      "non_goals": "No manifest planning, family cutover, new axis, silent fallback, second capability table, or destructive validation probe before admission succeeds.",
       "obligation_ids": [
         "PAR-001",
         "CAP-001",
@@ -5245,13 +5277,13 @@
       "produced_seam_gates": [
         "S-ADMISSION"
       ],
-      "source_assumption": "Carrier/source classification precedes normalization and allocation.",
-      "sole_owner": "hipfire-loader admission owner.",
-      "production_route": "CPU/no-allocation loader boundary.",
+      "source_assumption": "Actual source tensors, not configuration metadata or arch ID alone, determine carrier classification before normalization, admission, and allocation.",
+      "sole_owner": "hipfire-loader admission owner; one source/variant/effective-mesh decision is consumed by the existing load route.",
+      "production_route": "Current production loading classifies each source once and admits one effective mesh before prior-model teardown, VMM/remap, allocation, carrier entry, or collective creation.",
       "positive_evidence": [
         {
           "classification": "rerun_required",
-          "assertion": "Branch behavior is forensic source only and must be rerun through the current upstream route.",
+          "assertion": "The complete G1 production load-preservation matrix must be repeated on G2's final head, with source-aware classification and effective-mesh admission on every intersected Single/PP/TP/EP route.",
           "references": [
             "docs/device-mesh-port-tracker.json",
             "PAR-001",
@@ -5264,7 +5296,7 @@
       "negative_evidence": [
         {
           "classification": "historical",
-          "assertion": "Branch commits and reports are immutable provenance, not current upstream acceptance.",
+          "assertion": "Historical branch, PR, and archive evidence from the reverted stack is forensic only; admission and load-preservation claims require a current-tree rerun.",
           "references": [
             "docs/device-mesh-port-tracker.json",
             "PAR-001",
@@ -5275,26 +5307,28 @@
         }
       ],
       "side_effect_assertions": [
+        "Classification and refusal occur before prior-model teardown, slot/PFlash reset, VMM initialization, remap, GPU allocation, carrier entry, collective creation, or cache mutation.",
+        "A refusal preserves the active prior model, and changing the source path after admission cannot trigger a second classification.",
         "No completion status may be promoted from historical, semantics-only, emulated, failed, or hardware-blocked evidence.",
         "No change set may create a second validation-route or admission authority."
       ],
       "revert_identity": {
         "change_set_id": "G2",
-        "identity": "G2:single-grouped-change-set-revert",
+        "identity": "G2:source-aware-admission-load-preservation-final-head",
         "strategy": "revert-entire-grouped-change-set",
-        "scope": "Revert G2 as one coherent unit; do not split its obligations into another authority."
+        "scope": "Revert the complete G2 source-aware admission and repeated load-preservation head as one coherent unit; do not split classification or refusal ownership."
       },
       "parallel_lane": {
-        "name": "admission",
+        "name": "admission-load-preservation",
         "integration_mode": "serialized-shared-file-owner",
         "can_develop_after": [
           "G1"
         ],
         "merge_waits_on": []
       },
-      "shared_file_integration_owner": "hipfire-loader admission owner.",
-      "acceptance": "All unsupported cells and TP\u00d7EP refusal occur before allocation.",
-      "stop_condition": "Stop on arch_id-only classification, bypass, or duplicate policy table.",
+      "shared_file_integration_owner": "hipfire-loader source-aware admission owner.",
+      "acceptance": "The complete G1 matrix repeats on G2's final head; both registry sentinels load/generate/unload on fresh daemons; embedded vision metadata without a tower remains text; unsupported or contradictory cells refuse before every destructive side effect; the prior model remains usable and no second classification occurs.",
+      "stop_condition": "Stop on config-only VL classification, arch-ID-only policy, any bypass or reclassification, refusal after destructive side effects, lost current-master topology, self-refusing VMM commit, or uninspected hardware output.",
       "status": "blocked",
       "implementation_class": "port",
       "confidence": "high",
@@ -5309,15 +5343,25 @@
           "all-current-master-intersected-tp-routes",
           "all-current-master-intersected-ep-routes"
         ],
-        "positive_probe": "Classify once, admit an effective mesh, then load, generate, unload, and reload qwen3.6:27b and qwen3.6:35b-a3b through fresh daemons",
+        "positive_probe": "Repeat the complete G1 load-preservation matrix on fresh daemons after one source classification and effective-mesh admission: qwen3.6:27b and qwen3.6:35b-a3b load, generate, unload, and reload",
         "negative_or_fault_probes": [
-          "Unsupported or contradictory source/topology refusal performs zero side effects and preserves the active prior model",
-          "Changing the source path after admission does not trigger a second classification"
+          "Unsupported or contradictory source/topology refusal performs zero prior-model teardown, allocation, VMM initialization, remap, carrier, collective, or cache side effects and preserves the active prior model",
+          "Changing the source path after admission does not trigger a second classification or reopen the admission decision"
         ],
-        "lifecycle_observations": ["load", "generate", "unload", "reload"],
-        "required_registry_tags": ["qwen3.6:27b", "qwen3.6:35b-a3b"],
+        "lifecycle_observations": [
+          "load",
+          "generate",
+          "unload",
+          "reload"
+        ],
+        "required_registry_tags": [
+          "qwen3.6:27b",
+          "qwen3.6:35b-a3b"
+        ],
         "validation_route": "docs/VALIDATION.md#device-mesh-g1-g5-routes",
-        "evidence_classes": ["rerun_required"],
+        "evidence_classes": [
+          "rerun_required"
+        ],
         "receipt_refs": []
       },
       "delivery_kind": "change_set",
@@ -5330,9 +5374,9 @@
     },
     {
       "id": "G3",
-      "title": "Manifest planning and transactional model-loading pilot",
-      "scope": "Compile pure manifests and pilot transactional LLaMA WeightStore loading.",
-      "non_goals": "No family-wide migration, typed free, second lifecycle owner, or planner GPU I/O.",
+      "title": "Manifest and complete production Single load transaction",
+      "scope": "Load one real Single LLaMA-family model through pure manifest planning, transactional fulfillment, typed assembly, production generation, an existing-reset smoke, failure recovery, and unload under one ArchModel owner.",
+      "non_goals": "No family-wide manifest migration or non-Single fulfillment, planner GPU/file I/O, second loaded-model or teardown owner, request/cache/session resource ownership, or fallback from a failed manifest route into the legacy loader.",
       "obligation_ids": [
         "MANIFEST-PLANNER",
         "WEIGHTSTORE-PILOT",
@@ -5349,13 +5393,13 @@
         "S-MANIFEST",
         "S-LOAD"
       ],
-      "source_assumption": "Placement consumes admitted topology and store resources remain under ArchModel.",
-      "sole_owner": "Manifest/WeightStore owner beneath ArchModel.",
-      "production_route": "CPU planner and current LLaMA fault route.",
+      "source_assumption": "Placement consumes the G1 DeviceMesh topology; ArchModel remains sole owner of model resources while request/session/cache resources remain with G4 lifecycle ownership.",
+      "sole_owner": "ArchModel owns Manifest/WeightStore acquisition, publication, rollback, and unload; the planner remains pure and request/session/cache remain under G4.",
+      "production_route": "Current production Single LLaMA route through pure manifest planning, transactional fulfillment, typed assembly, generation, reset, unload, and immediate reload.",
       "positive_evidence": [
         {
           "classification": "rerun_required",
-          "assertion": "Branch behavior is forensic source only and must be rerun through the current upstream route.",
+          "assertion": "A pinned plain-LLaMA fixture must compare validation-only and production manifest routes at every committed position, including token IDs, logits, KV bytes/offsets, position counters, aliases, route identity, and coherent generation/reset/unload/reload.",
           "references": [
             "docs/device-mesh-port-tracker.json",
             "MANIFEST-PLANNER",
@@ -5368,7 +5412,7 @@
       "negative_evidence": [
         {
           "classification": "historical",
-          "assertion": "Branch commits and reports are immutable provenance, not current upstream acceptance.",
+          "assertion": "Historical branch, PR, and archive evidence from the reverted stack is forensic only; complete Single transaction claims require a current-tree rerun.",
           "references": [
             "docs/device-mesh-port-tracker.json",
             "MANIFEST-PLANNER",
@@ -5379,26 +5423,28 @@
         }
       ],
       "side_effect_assertions": [
+        "No model-owned weight, scratch, KV, sidecar, pool, position, alias, or attachment resource may escape ArchModel publication/rollback/unload ownership.",
+        "Request-, cache-, and session-owned resources remain exclusively under G4; a failed manifest route cannot fall back silently or publish a partial model.",
         "No completion status may be promoted from historical, semantics-only, emulated, failed, or hardware-blocked evidence.",
-        "No change set may create a second validation-route or admission authority."
+        "No change set may create a second load, rollback, or validation-route authority."
       ],
       "revert_identity": {
         "change_set_id": "G3",
-        "identity": "G3:single-grouped-change-set-revert",
+        "identity": "G3:single-manifest-load-transaction-final-head",
         "strategy": "revert-entire-grouped-change-set",
-        "scope": "Revert G3 as one coherent unit; do not split its obligations into another authority."
+        "scope": "Revert the complete G3 Single manifest/load transaction as one coherent unit; do not split planning, fulfillment, publication, rollback, or unload ownership."
       },
       "parallel_lane": {
-        "name": "manifest-loading",
+        "name": "single-manifest-load-transaction",
         "integration_mode": "serialized-shared-file-owner",
         "can_develop_after": [
-          "G0"
+          "G1"
         ],
         "merge_waits_on": []
       },
-      "shared_file_integration_owner": "Manifest/WeightStore owner beneath ArchModel.",
-      "acceptance": "Planner, rollback, origin, and unload contracts prove one owner.",
-      "stop_condition": "Stop if store outlives/frees outside ArchModel or needs family policy.",
+      "shared_file_integration_owner": "ArchModel Manifest/WeightStore owner.",
+      "acceptance": "A pinned plain-LLaMA fixture passes validation-only versus production per-position parity; production load, generation, reset, unload, and immediate retry succeed; every injected source/dtype/payload/allocation/assembly/attachment/publication fault rolls back to the warm baseline with no double free; origin mismatch performs zero frees.",
+      "stop_condition": "Stop if a store outlives ArchModel, a tied alias becomes an independent owner, a resource is absent from the transaction inventory, a failed pilot falls back silently, or the production daemon is not exercised.",
       "status": "blocked",
       "implementation_class": "port",
       "confidence": "high",
@@ -5407,20 +5453,31 @@
       "delivery_contract": {
         "final_composition_verified": false,
         "production_route": "Single LLaMA manifest pilot through pure planning, transactional fulfillment, typed assembly, generation, reset, unload, and immediate reload",
-        "retained_routes": ["all-current-master-intersected-single-routes"],
-        "positive_probe": "Pinned plain-LLaMA HFQ fixture through manifest planning, production load, generation, reset, unload, and immediate reload",
+        "retained_routes": [
+          "all-current-master-intersected-single-routes"
+        ],
+        "positive_probe": "Pinned plain-LLaMA HFQ fixture through validation-only versus production manifest routes, production load, generation, reset, unload, immediate reload, and coherent inspected output",
         "fixture_identity": {
           "model_ref": "https://github.com/warpfront/hipfire/blob/a29c7575c90f613ced5f01b221778dc688bca592/registry/v1.json",
           "model_tag": "qwen3:0.6b",
           "prompt_ref": "https://github.com/warpfront/hipfire/blob/a29c7575c90f613ced5f01b221778dc688bca592/benchmarks/prompts/bare_factual.txt"
         },
         "negative_or_fault_probes": [
-          "Deterministic source, dtype, payload, upload, allocation, assembly, attachment, and publication fault matrix rolls back every owner and permits an immediate retry"
+          "Deterministic source, dtype, payload, embedding, representative-layer, final-norm, output-head, KV, scratch, sidecar/pool/position, assembly, attachment, and publication faults roll back every owner to baseline and permit an immediate retry"
         ],
-        "lifecycle_observations": ["load", "generate", "reset", "unload", "reload", "immediate retry"],
+        "lifecycle_observations": [
+          "load",
+          "generate",
+          "reset",
+          "unload",
+          "reload",
+          "immediate retry"
+        ],
         "required_registry_tags": [],
         "validation_route": "docs/VALIDATION.md#device-mesh-g1-g5-routes",
-        "evidence_classes": ["rerun_required"],
+        "evidence_classes": [
+          "rerun_required"
+        ],
         "receipt_refs": []
       },
       "delivery_kind": "change_set",
@@ -5428,14 +5485,14 @@
       "head_commit": "2458ef5df258a4ed190ec3b5462ce4caa53df0d6",
       "merge_commit": null,
       "can_develop_after": [
-        "G0"
+        "G1"
       ]
     },
     {
       "id": "G4",
-      "title": "Reset, abort, parser, and terminal lifecycle contracts",
-      "scope": "Port reset, abort, parser finalization, metadata, eviction, and transactional target lifecycle through current engine/generation owners.",
-      "non_goals": "No second terminal/reset/cache authority, typed family cutover, or COR-007 pass claim.",
+      "title": "Complete request/session lifecycle transaction",
+      "scope": "Every touched request reaches exactly one committed or aborted terminal outcome, and reset/abort leaves its model and session reusable through the existing engine/generation authority.",
+      "non_goals": "No second scheduler, reset, cache, parser, terminal, or HTTP authority, family typed-forward cutover, conversion of previously successful current-master requests into errors, or COR-007 completion claim.",
       "obligation_ids": [
         "COR-001",
         "COR-002",
@@ -5453,13 +5510,13 @@
       "produced_seam_gates": [
         "S-RESET"
       ],
-      "source_assumption": "Request state and terminal ownership are independent of the mesh foundation.",
-      "sole_owner": "hipfire-engine plus hipfire-generate lifecycle owner.",
-      "production_route": "Current terminal-control, reset, serve-multiturn, and load fault routes.",
+      "source_assumption": "Existing hipfire-engine and hipfire-generate authorities can own one request/session terminal transaction without mesh or model-load ownership changes.",
+      "sole_owner": "hipfire-engine and hipfire-generate exclusively own request scheduling, parser, reset, cache, session, abort, terminal, and HTTP lifecycle.",
+      "production_route": "Current production request/session route from start through one client-commit or rollback terminal, reset/abort, cache, unload, and HTTP completion.",
       "positive_evidence": [
         {
           "classification": "rerun_required",
-          "assertion": "Branch behavior is forensic source only and must be rerun through the current upstream route.",
+          "assertion": "The complete current request/session matrix must rerun every touched GenerationRoute and applicable Single/PP/TP/EP/slot mode through normal completion, commit, cancellation, errors, parser framing, overflow, reset, abort, unload, and HTTP completion.",
           "references": [
             "docs/device-mesh-port-tracker.json",
             "COR-001",
@@ -5474,7 +5531,7 @@
       "negative_evidence": [
         {
           "classification": "historical",
-          "assertion": "Branch commits and reports are immutable provenance, not current upstream acceptance.",
+          "assertion": "Historical branch, PR, and archive evidence from the reverted stack is forensic only; lifecycle and non-hang claims require a current-tree rerun.",
           "references": [
             "docs/device-mesh-port-tracker.json",
             "COR-001",
@@ -5487,26 +5544,28 @@
         }
       ],
       "side_effect_assertions": [
+        "Every touched request emits exactly one terminal in order; failure, cancellation, or rollback publishes no done, history, cache, or tool output and leaves no stale request owner.",
+        "Reset and abort clear all touched model/session state, invalidate cache/graph/replay state, and preserve paired unload accounting.",
         "No completion status may be promoted from historical, semantics-only, emulated, failed, or hardware-blocked evidence.",
-        "No change set may create a second validation-route or admission authority."
+        "No change set may create a second scheduler, parser, reset, cache, terminal, or HTTP authority."
       ],
       "revert_identity": {
         "change_set_id": "G4",
-        "identity": "G4:single-grouped-change-set-revert",
+        "identity": "G4:request-session-lifecycle-final-head",
         "strategy": "revert-entire-grouped-change-set",
-        "scope": "Revert G4 as one coherent unit; do not split its obligations into another authority."
+        "scope": "Revert the complete G4 request/session lifecycle transaction as one coherent unit; do not split scheduler, parser, reset, cache, session, terminal, or HTTP ownership."
       },
       "parallel_lane": {
-        "name": "reset-lifecycle",
+        "name": "request-session-lifecycle",
         "integration_mode": "serialized-shared-file-owner",
         "can_develop_after": [
           "G0"
         ],
         "merge_waits_on": []
       },
-      "shared_file_integration_owner": "hipfire-engine plus hipfire-generate lifecycle owner.",
-      "acceptance": "Metadata, reset, parser, eviction, and target rollback leave no stale owner or duplicate terminal.",
-      "stop_condition": "Stop on missing current route, hidden state residue, or a family-specific terminal owner.",
+      "shared_file_integration_owner": "hipfire-engine and hipfire-generate request/session lifecycle owner.",
+      "acceptance": "Every touched route passes normal completion, commit/late commit, cancellation, model error, malformed parser output, overflow, second-turn prefix reuse, reset after each outcome, injected reset error, unload, and HTTP battery/chain/session completion with exactly one terminal and no stale cache/history/owner.",
+      "stop_condition": "Stop on a duplicate or missing terminal, success before acknowledgement, abort before rollback, incomplete parser consumption, stale cache publication, reset reported successful after an error, HTTP hang, or current behavior regression.",
       "status": "blocked",
       "implementation_class": "port",
       "confidence": "high",
@@ -5521,15 +5580,30 @@
           "all-current-master-intersected-tp-routes",
           "all-current-master-intersected-ep-routes"
         ],
-        "positive_probe": "Request start, client commit, reset, abort, chain/session, and HTTP completion battery across current production routes",
+        "positive_probe": "Request start, client commit, reset, abort, parser/tool/reasoning completion, chain/session, unload, and HTTP completion battery across current production routes",
         "negative_or_fault_probes": [
-          "Error, cancellation, or rollback emits exactly one terminal and leaves no cache/history publication or stale request owner",
-          "Reset after success, abort, and failure leaves the model and session reusable"
+          "Error, cancellation, or rollback emits exactly one terminal after synchronized rollback and leaves no cache/history/tool publication or stale request owner",
+          "Reset after success, abort, and failure leaves the model and session reusable; HTTP completion does not hang"
         ],
-        "lifecycle_observations": ["start", "commit", "reset", "abort", "chain/session", "HTTP completion"],
-        "required_registry_tags": ["qwen3.6:27b", "qwen3.6:35b-a3b"],
+        "lifecycle_observations": [
+          "start",
+          "commit",
+          "reset",
+          "abort",
+          "parser",
+          "cache",
+          "chain/session",
+          "unload",
+          "HTTP completion"
+        ],
+        "required_registry_tags": [
+          "qwen3.6:27b",
+          "qwen3.6:35b-a3b"
+        ],
         "validation_route": "docs/VALIDATION.md#device-mesh-g1-g5-routes",
-        "evidence_classes": ["rerun_required"],
+        "evidence_classes": [
+          "rerun_required"
+        ],
         "receipt_refs": []
       },
       "delivery_kind": "change_set",
@@ -5542,35 +5616,43 @@
     },
     {
       "id": "G5",
-      "title": "Collective-aware MoE Step architecture and sealed expert ownership",
-      "scope": "Add collective-aware parallel/MoE Steps and one sealed expert ownership plan.",
-      "non_goals": "No family production cutover, WeightStore representation leak, handwritten collective hint, or dense EP admission.",
+      "title": "Sealed MoE execution with production Qwen-family A3B consumer",
+      "scope": "Provide manifest-derived sealed MoE ownership and exact typed execution semantics through the current production Qwen-family A3B route with numerical/state parity, lifecycle coverage, and physical collective evidence for every physical multi-device claim.",
+      "non_goals": "No general family cutover beyond the selected Qwen-family A3B consumer, new dense-EP policy or PP/TP/EP cell, WeightStore representation leak, generic fusion without an explicit semantic contract, or production fallback/environment toggle retaining the unsealed route.",
       "obligation_ids": [
         "STEP-MOE-SUBSTRATE",
         "STEP-002",
         "STEP-002R"
       ],
       "depends_on": [
+        "G1",
+        "G2",
         "G3"
       ],
       "merge_waits_on": [
+        "G1",
+        "G2",
         "G3"
       ],
       "consumed_seam_gates": [
-        "S-MANIFEST"
+        "S-TOPOLOGY",
+        "S-ADMISSION",
+        "S-MANIFEST",
+        "S-LOAD"
       ],
       "produced_seam_gates": [
         "S-MOE"
       ],
-      "source_assumption": "Interface-safe Step types may develop after topology while production merge waits for manifest seam.",
-      "sole_owner": "Executor steward and sealed expert-plan owner.",
-      "production_route": "Focused CPU executor and fault/owner route.",
+      "source_assumption": "Manifest-derived ownership and typed execution consume accepted G1 topology, G2 admission, and G3 Single load seams; production qwen3.6:35b-a3b is the canonical consumer.",
+      "sole_owner": "Executor steward owns sealed expert-plan execution; ArchModel owns model resources and hipfire_runtime::multi_gpu owns topology, devices, and collectives; no family-owned allocator, expert placement, collective, or teardown.",
+      "production_route": "Current production registry qwen3.6:35b-a3b route with manifest-derived sealed MoE ownership, typed collectives, numerical/state parity, lifecycle, and physical evidence.",
       "positive_evidence": [
         {
           "classification": "rerun_required",
-          "assertion": "Branch behavior is forensic source only and must be rerun through the current upstream route.",
+          "assertion": "The final composed G5 head must close every #677 blocker and rerun the sealed production qwen3.6:35b-a3b route with per-position numerical/state, ownership, lifecycle, and collective evidence.",
           "references": [
             "docs/device-mesh-port-tracker.json",
+            "#677",
             "STEP-MOE-SUBSTRATE",
             "STEP-002",
             "STEP-002R"
@@ -5581,39 +5663,46 @@
       "negative_evidence": [
         {
           "classification": "historical",
-          "assertion": "Branch commits and reports are immutable provenance, not current upstream acceptance.",
+          "assertion": "Historical #673/#674/#675/#676/#677 branch and PR evidence, including the archive, is forensic only; every G5 production claim is historical or rerun-required until current physical evidence exists.",
           "references": [
             "docs/device-mesh-port-tracker.json",
-            "STEP-MOE-SUBSTRATE",
-            "STEP-002",
-            "STEP-002R"
+            "#673",
+            "#674",
+            "#675",
+            "#676",
+            "#677"
           ],
           "qualifies_for_completion": false
         }
       ],
       "side_effect_assertions": [
-        "No completion status may be promoted from historical, semantics-only, emulated, failed, or hardware-blocked evidence.",
-        "No change set may create a second validation-route or admission authority."
+        "Every #677 blocker is fail-closed: malformed plans, capacity, dtype/signature, combine/residual, rank/device identity, alias, rollback/unload, stale-table, and sealing failures perform no hidden launch/allocation and permit retry.",
+        "No completion status may be promoted from historical, semantics-only, emulated, failed, or hardware-blocked evidence; physical collective evidence requires the maintained route and distinct-GPU identities.",
+        "No change set may create a second allocator, expert-placement, collective-membership, teardown, or validation-route authority."
       ],
       "revert_identity": {
         "change_set_id": "G5",
-        "identity": "G5:single-grouped-change-set-revert",
+        "identity": "G5:sealed-moe-qwen3.6-35b-a3b-production-final-head",
         "strategy": "revert-entire-grouped-change-set",
-        "scope": "Revert G5 as one coherent unit; do not split its obligations into another authority."
+        "scope": "Revert the complete G5 sealed MoE and qwen3.6:35b-a3b production deliverable as one coherent unit; do not split expert ownership, collective, rollback, or sealing authority."
       },
       "parallel_lane": {
-        "name": "moe-step-interface",
+        "name": "sealed-moe-qwen3.6-35b-a3b-production",
         "integration_mode": "serialized-shared-file-owner",
         "can_develop_after": [
-          "G0"
+          "G1",
+          "G2",
+          "G3"
         ],
         "merge_waits_on": [
+          "G1",
+          "G2",
           "G3"
         ]
       },
-      "shared_file_integration_owner": "Executor steward and sealed expert-plan owner.",
-      "acceptance": "Exactly-once routed collectives, expert shape/owner, deterministic assignment, and rollback pass.",
-      "stop_condition": "Stop on flat-device inference, duplicate reduction, or independent family expert free.",
+      "shared_file_integration_owner": "Sealed executor steward with ArchModel and hipfire_runtime::multi_gpu ownership boundaries.",
+      "acceptance": "Sealed production qwen3.6:35b-a3b closes every #677 blocker and compares validation-only old versus production sealed routes at each committed token/logit/router/expert/activation/combine/residual/KV/state/position/collective/mesh identity; load/prefill/decode/generate/reset/abort/unload/reload and malformed/fault rollback pass; physical claims require maintained distinct-GPU evidence.",
+      "stop_condition": "Stop on any remaining #677 blocker, family-side ownership, generic-backend arithmetic drift, unsealed production path, missing production A3B route, absent per-position state oracle, or emulation presented as physical evidence.",
       "status": "blocked",
       "implementation_class": "port",
       "confidence": "high",
@@ -5628,15 +5717,30 @@
           "all-current-master-intersected-tp-routes",
           "all-current-master-intersected-ep-routes"
         ],
-        "positive_probe": "Load, prefill, decode, generate, reset, unload, and reload qwen3.6:35b-a3b through the sealed production route",
+        "positive_probe": "Load, prefill, decode, generate, reset, abort, unload, and reload registry qwen3.6:35b-a3b through the sealed production route with per-position numerical/state and collective identity comparisons",
         "negative_or_fault_probes": [
-          "Malformed plan or pointer-table, allocation, or collective fault performs zero launches/allocations, rolls back every owner, and permits an immediate retry",
-          "A failed candidate load preserves the active prior model and performs no hidden topology side effect"
+          "Malformed plan or pointer-table, capacity, allocation, or collective fault performs zero launches/allocations, rolls back every owner, and permits an immediate retry",
+          "Every #677 blocker is checked on the production sealed route; a failed candidate load preserves the active prior model and performs no hidden topology side effect"
         ],
-        "lifecycle_observations": ["load", "prefill", "decode", "generate", "reset", "abort", "unload", "reload"],
-        "required_registry_tags": ["qwen3.6:27b", "qwen3.6:35b-a3b"],
+        "lifecycle_observations": [
+          "load",
+          "prefill",
+          "decode",
+          "generate",
+          "reset",
+          "abort",
+          "unload",
+          "reload",
+          "immediate retry"
+        ],
+        "required_registry_tags": [
+          "qwen3.6:27b",
+          "qwen3.6:35b-a3b"
+        ],
         "validation_route": "docs/VALIDATION.md#device-mesh-g1-g5-routes",
-        "evidence_classes": ["hardware_blocked"],
+        "evidence_classes": [
+          "hardware_blocked"
+        ],
         "receipt_refs": []
       },
       "delivery_kind": "change_set",
@@ -5644,7 +5748,9 @@
       "head_commit": "26fe251394499721679ae6a05a221d8f4997e3ab",
       "merge_commit": null,
       "can_develop_after": [
-        "G0"
+        "G1",
+        "G2",
+        "G3"
       ]
     },
     {
