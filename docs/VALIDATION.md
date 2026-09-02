@@ -109,6 +109,28 @@ Use only when the claim class below names them. They are not universal.
 | MQ4R **runtime** automatic Redline default | Source predicate `mq4r_redline_default` in `crates/hipfire-runtime/src/config.rs`; policy in [`REDLINE.md`](REDLINE.md) | **Only** current automatic runtime predicate. Runtime-only: exact GPU arch `gfx1100`, `gfx1151`, or `gfx1201`; PP=1; TP=1; case-insensitive `.mq4r` → retained PM4/Auto unless disabled with the config wizard's built-in `hip` profile, another explicit backend selection, or `HIPFIRE_REPLAY_BACKEND=hip`. Model-family agnostic (no `arch_id` gate). `gfx1200` and all other arches remain opt-in. Existing LFM `.mq4` registry evidence is not auto-selected because it is not `.mq4r`, not because LFM is categorically exempt; any usable non-default retained route must still prove route support and fail closed when unsupported. **Not** registry admission, **not** Section 7 certification, and **not** a sealed-fixture claim for every default-eligible `.mq4r` model. |
 | Unknown surface | **Blocked** until an owner adds a row here | Fail closed |
 
+## Device-mesh G1–G5 routes
+
+This is the maintained, claim-scoped route authority for the G1–G5
+delivery contracts in [`device-mesh-port-tracker.json`](device-mesh-port-tracker.json).
+Each row is an independent evidence boundary; these rows do not form a
+universal gate. Numerical/state evidence and user-facing semantics are
+separate claims, and a user route cannot substitute for a required
+numerical/state oracle.
+
+| Claim | Required numerical/state route | Required user route | Negative/fault route | Physical rule |
+|---|---|---|---|---|
+| G1 topology/load preservation | current-master versus final-head route-specific load/layout/parity oracle for every intersected Single/PP/TP/EP route | fresh-daemon registry runs for `qwen3.6:27b` and `qwen3.6:35b-a3b` | failed candidate load preserves prior model and has zero hidden topology side effects | emulation is non-physical; distinct-GPU topology claims require at least two physical GPUs |
+| G2 admission | current-master effective-route/cell matrix | same two registry runs on G2 final head | refusal ledger before teardown/VMM/remap/allocation/carrier/collective | physical axis claims require exact topology identities |
+| G3 manifest/load | pinned legacy validation-only versus production manifest per-position token/logit/KV/state oracle | production Single LLaMA load/generate/reset/unload/reload | staged allocation fault matrix with immediate retry | Single evidence makes no multi-device claim |
+| G4 lifecycle | fresh-state equality plus terminal/state oracle | `serve_harness.py` battery/chain/session and direct commit/abort protocol | cancellation/parser/reset/overflow/load-error matrix | multi-device lifecycle claims require physical topology; Redline only when its boundaries change |
+| G5 sealed MoE | validation-only old versus sealed `qwen3.6:35b-a3b` per-position route/expert/logit/state/collective oracle | production load/prefill/decode/reset/unload/reload | every #677 blocker plus allocation/table/collective fault injection | physical completion requires distinct RCCL-capable GPUs and exact PCI/gfx/ROCm/RCCL identity |
+
+Missing route-specific or physical evidence leaves only that claim blocked; it
+is never replaced by `serve_harness`, emulation, Cargo tests, or retired
+coherence scripts. A semantics-only or emulated result may document behavior,
+but it cannot establish numerical/state parity or a physical topology claim.
+
 ## Retired coherence-gate scripts
 
 The fixed `scripts/coherence-gate-*.sh` batteries are **retired as current

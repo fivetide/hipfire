@@ -15,6 +15,7 @@ CHECKER = REPO / "scripts" / "check-device-mesh-port-tracker.py"
 TRACKER = REPO / "docs" / "device-mesh-port-tracker.json"
 INVALID_FIXTURE = REPO / "tests" / "fixtures" / "device-mesh-port-tracker.invalid.json"
 INDEX = REPO / "docs" / "INDEX.md"
+VALIDATION = REPO / "docs" / "VALIDATION.md"
 
 
 def _run_checker(path: Path) -> subprocess.CompletedProcess[str]:
@@ -66,6 +67,18 @@ def load_tracker() -> dict:
 
 def change_set(document: dict, group_id: str) -> dict:
     return _change_set(document, group_id)
+
+def test_g1_g5_delivery_contracts_link_to_maintained_validation_routes():
+    body = VALIDATION.read_text(encoding="utf-8")
+    heading = "## Device-mesh G1–G5 routes"
+    assert heading in body
+    expected_route = "docs/VALIDATION.md#device-mesh-g1-g5-routes"
+    tracker = load_tracker()
+    for group_id in ("G1", "G2", "G3", "G4", "G5"):
+        assert (
+            change_set(tracker, group_id)["delivery_contract"]["validation_route"]
+            == expected_route
+        )
 
 
 def test_g1_g5_consistent_delivery_dependencies():
