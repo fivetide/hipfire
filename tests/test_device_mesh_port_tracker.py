@@ -56,6 +56,49 @@ def _write_document(document: dict, path: Path) -> Path:
     path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
     return path
 
+def _change_set(document: dict, group_id: str) -> dict:
+    return next(row for row in document["change_sets"] if row["id"] == group_id)
+
+
+def test_g1_g5_require_consistent_delivery_contract(tmp_path: Path):
+    document = json.loads(TRACKER.read_text(encoding="utf-8"))
+    del _change_set(document, "G1")["delivery_contract"]
+    result = _run_checker(_write_document(document, tmp_path / "missing-delivery-contract.json"))
+    output = result.stdout + result.stderr
+    assert "G1.delivery_contract must be an object" in output
+
+
+def test_partial_pr_evidence_cannot_complete_group(tmp_path: Path):
+    document = json.loads(TRACKER.read_text(encoding="utf-8"))
+    g1 = _change_set(document, "G1")
+    g1["status"] = "complete"
+    g1["delivery_contract"]["final_composition_verified"] = False
+    result = _run_checker(_write_document(document, tmp_path / "partial-composition.json"))
+    output = result.stdout + result.stderr
+    assert "G1 complete requires final_composition_verified=true" in output
+
+
+def test_physical_claim_requires_validation_route(tmp_path: Path):
+    document = json.loads(TRACKER.read_text(encoding="utf-8"))
+    g5 = _change_set(document, "G5")
+    g5["delivery_contract"]["evidence_classes"] = ["physical"]
+    g5["delivery_contract"]["validation_route"] = ""
+    result = _run_checker(_write_document(document, tmp_path / "missing-physical-route.json"))
+    output = result.stdout + result.stderr
+    assert "G5 physical evidence requires validation_route" in output
+
+
+def test_emulation_cannot_close_physical_row(tmp_path: Path):
+    document = json.loads(TRACKER.read_text(encoding="utf-8"))
+    g5 = _change_set(document, "G5")
+    g5["status"] = "complete"
+    g5["delivery_contract"]["final_composition_verified"] = True
+    g5["delivery_contract"]["evidence_classes"] = ["emulated"]
+    result = _run_checker(_write_document(document, tmp_path / "emulated-physical-close.json"))
+    output = result.stdout + result.stderr
+    assert "G5 complete physical route cannot rely on emulated evidence" in output
+
+
 
 def _materialize_authority_evidence(document: dict) -> None:
     group = next(item for item in document["change_sets"] if item["id"] == "G0")
@@ -339,6 +382,13 @@ def _satisfy_all_prerequisites(document: dict) -> None:
                 "qualifies_for_completion": True,
             }
         ]
+        if change_set["id"] in {"G1", "G2", "G3", "G4", "G5"}:
+            contract = change_set["delivery_contract"]
+            contract["final_composition_verified"] = True
+            contract["receipt_refs"] = [artifact]
+            contract["evidence_classes"] = (
+                ["current", "physical"] if change_set["id"] == "G5" else ["current"]
+            )
     for index, campaign in enumerate(document["evidence_campaigns"], start=201):
         campaign["status"] = "complete"
         campaign["evidence_disposition"] = "current"

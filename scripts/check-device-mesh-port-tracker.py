@@ -32,8 +32,9 @@ FORBIDDEN_BOUNDARIES = (
     "084dbebda9c72116fc9b4819f85ec2e15aa31344",
     "bac02a1a22a55922ea057e9a98f68cb3ab93ac02",
 )
-SCHEMA = "hipfire.device_mesh.port_tracker.v2"
-SCHEMA_VERSION = 2
+SCHEMA = "hipfire.device_mesh.port_tracker.v3"
+SCHEMA_VERSION = 3
+CONSISTENT_DELIVERY_GROUPS = frozenset({"G1", "G2", "G3", "G4", "G5"})
 ALLOWED_OBLIGATION_STATUSES = frozenset({"complete", "ready", "blocked"})
 ALLOWED_DELIVERY_KINDS = frozenset({"change_set", "evidence_campaign", "final_closure"})
 ALLOWED_CHANGE_SET_STATUSES = frozenset({"implemented", "in_review", "complete", "ready", "blocked"})
@@ -180,6 +181,17 @@ def _artifact_reference(value: Any) -> bool:
         return False
     return True
 
+def _receipt_reference(value: Any) -> bool:
+    """Return whether a receipt points to current, durable evidence."""
+    if not _durable_reference(value):
+        return False
+    if isinstance(value, str) and value.startswith("git:"):
+        return True
+    parsed = urlparse(value)
+    if parsed.netloc == "github.com" and parsed.path.startswith(("/warpfront/hipfire/issues/", "/warpfront/hipfire/pull/")):
+        return False
+    return _artifact_reference(value)
+
 
 def _check_physical_identity(
     identity: Any,
@@ -302,6 +314,144 @@ def _check_evidence_entry(entry: Any, label: str, errors: list[str]) -> None:
                     pass
 
 
+def _check_delivery_contract(
+    group: dict[str, Any],
+    label: str,
+    errors: list[str],
+    *,
+    change_sets: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    contract = group.get("delivery_contract")
+    if not isinstance(contract, dict):
+        errors.append(f"{label}.delivery_contract must be an object")
+        return
+
+    final_composition_verified = contract.get("final_composition_verified")
+    if not isinstance(final_composition_verified, bool):
+        errors.append(f"{label} delivery_contract.final_composition_verified must be a boolean")
+
+    for field in ("production_route", "positive_probe", "validation_route"):
+        if not _nonempty(contract.get(field)):
+            errors.append(f"{label} delivery_contract.{field} must be a non-empty string")
+
+    for field in ("retained_routes", "negative_or_fault_probes", "lifecycle_observations", "evidence_classes"):
+        if not _strings(contract.get(field), nonempty=True):
+            errors.append(f"{label} delivery_contract.{field} must be an array of non-empty strings")
+
+    required_registry_tags = contract.get("required_registry_tags")
+    if label == "G3" and required_registry_tags == []:
+        pass
+    elif not _strings(required_registry_tags, nonempty=True):
+        errors.append(f"{label} delivery_contract.required_registry_tags must be an array of non-empty strings")
+
+    receipt_refs = contract.get("receipt_refs")
+    if not _strings(receipt_refs):
+        errors.append(f"{label} delivery_contract.receipt_refs must be an array of strings")
+        receipt_refs = []
+    if any(_host_local(value) for value in receipt_refs):
+        errors.append(f"{label} delivery_contract.receipt_refs must not contain a host-local path")
+    if any(".agent-progress" in value for value in receipt_refs):
+        errors.append(f"{label} delivery_contract.receipt_refs must not contain a local-only .agent-progress reference")
+
+    evidence_classes = contract.get("evidence_classes")
+    if not isinstance(evidence_classes, list):
+        evidence_classes = []
+    allowed_classes = ALLOWED_EVIDENCE_CLASSES | {"physical"}
+    invalid_classes = [value for value in evidence_classes if not isinstance(value, str) or value not in allowed_classes]
+    if invalid_classes:
+        errors.append(f"{label} delivery_contract.evidence_classes contains an unsupported class")
+
+    status = group.get("status")
+    if status == "complete" and final_composition_verified is not True:
+        errors.append(f"{label} complete requires final_composition_verified=true")
+    if status == "complete":
+        if not any(_receipt_reference(value) for value in receipt_refs):
+            errors.append(f"{label} complete requires a qualifying current durable receipt")
+        if any(isinstance(value, str) and value in BAD_COMPLETION_CLASSES for value in evidence_classes):
+            errors.append(f"{label} complete evidence classes cannot promote a milestone")
+
+    validation_route = contract.get("validation_route")
+    if "physical" in evidence_classes and not _nonempty(validation_route):
+        errors.append(f"{label} physical evidence requires validation_route")
+    if label == "G5" and status == "complete" and evidence_classes and all(value == "emulated" for value in evidence_classes):
+        errors.append(f"{label} complete physical route cannot rely on emulated evidence")
+    if label == "G5" and status == "complete" and "physical" not in evidence_classes:
+        errors.append(f"{label} complete physical route requires physical evidence")
+
+    route = contract.get("production_route")
+    route_text = route.lower() if isinstance(route, str) else ""
+    if label == "G1":
+        if "devicemesh" not in route_text:
+            errors.append("G1 delivery_contract production_route must consume DeviceMesh")
+        required_routes = {
+            "all-current-master-intersected-single-routes",
+            "all-current-master-intersected-pp-routes",
+            "all-current-master-intersected-tp-routes",
+            "all-current-master-intersected-ep-routes",
+        }
+        retained_routes = contract.get("retained_routes")
+        if isinstance(retained_routes, list):
+            for retained_route in sorted(
+                required_routes
+                - {value for value in retained_routes if isinstance(value, str)}
+            ):
+                errors.append(f"G1 delivery_contract.retained_routes missing {retained_route}")
+        observations = contract.get("lifecycle_observations")
+        if isinstance(observations, list):
+            observed = {item.lower() for item in observations if isinstance(item, str)}
+            for lifecycle in ("load", "generate", "unload", "reload"):
+                if lifecycle not in observed:
+                    errors.append(f"G1 delivery_contract.lifecycle_observations missing {lifecycle}")
+    elif label == "G2":
+        if "classif" not in route_text or "effective" not in route_text or "mesh" not in route_text:
+            errors.append("G2 delivery_contract production_route must classify once and admit an effective mesh")
+        probes = contract.get("negative_or_fault_probes")
+        probe_text = " ".join(probe.lower() for probe in probes if isinstance(probe, str)) if isinstance(probes, list) else ""
+        if "side effect" not in probe_text or "prior model" not in probe_text:
+            errors.append("G2 delivery_contract negative_or_fault_probes must cover zero-side-effect refusal and prior-model preservation")
+    elif label == "G3":
+        if "single" not in route_text or "llama" not in route_text:
+            errors.append("G3 delivery_contract production_route must remain a Single LLaMA pilot")
+        if required_registry_tags == []:
+            fixture_text = " ".join(
+                value.lower()
+                for value in (route, contract.get("positive_probe"))
+                if isinstance(value, str)
+            )
+            if not all(term in fixture_text for term in ("pinned", "llama", "fixture")):
+                errors.append("G3 empty required_registry_tags require a separately pinned LLaMA fixture")
+        probes = contract.get("negative_or_fault_probes")
+        probe_text = " ".join(probe.lower() for probe in probes if isinstance(probe, str)) if isinstance(probes, list) else ""
+        if "fault" not in probe_text or "retry" not in probe_text:
+            errors.append("G3 delivery_contract negative_or_fault_probes must cover the fault matrix and immediate retry")
+        if change_sets is not None:
+            g2 = change_sets.get("G2")
+            if not isinstance(g2, dict) or not _satisfied(g2.get("status")):
+                if "single" not in route_text or "llama" not in route_text:
+                    errors.append("G3 non-Single production claim requires G2 completion")
+    elif label == "G4":
+        if not all(term in route_text for term in ("request", "commit", "rollback")):
+            errors.append("G4 delivery_contract production_route must cover request commit and rollback")
+        owner_text = str(group.get("sole_owner", "")).lower()
+        if "engine" not in owner_text or "generate" not in owner_text:
+            errors.append("G4 delivery_contract must retain engine/generate ownership")
+        if "model" in owner_text or re.search(r"\bload(?:er|ing)?\b", owner_text):
+            errors.append("G4 delivery_contract must not claim model-load ownership")
+        observations = contract.get("lifecycle_observations")
+        observed = {item.lower() for item in observations if isinstance(item, str)} if isinstance(observations, list) else set()
+        for lifecycle in ("reset", "abort", "chain/session", "http"):
+            if not any(lifecycle in item for item in observed):
+                errors.append(f"G4 delivery_contract.lifecycle_observations missing {lifecycle}")
+    elif label == "G5":
+        if "qwen3.6:35b-a3b" not in route_text:
+            errors.append("G5 delivery_contract production_route must name qwen3.6:35b-a3b")
+
+    if label in {"G1", "G2", "G5"} and isinstance(required_registry_tags, list):
+        for tag in ("qwen3.6:27b", "qwen3.6:35b-a3b"):
+            if tag not in required_registry_tags:
+                errors.append(f"{label} delivery_contract.required_registry_tags must include {tag}")
+
+
 def _check_dag(graph: dict[str, list[str]], label: str, errors: list[str]) -> None:
     visiting: set[str] = set()
     visited: set[str] = set()
@@ -395,8 +545,8 @@ def _validate_tracker(document: Any) -> list[str]:
     if not isinstance(policy, dict):
         errors.append("missing advancement policy metadata")
     else:
-        if policy.get("max_completion_rows_per_pr") != 1:
-            errors.append("advancement policy max_completion_rows_per_pr must be exactly 1")
+        if "max_completion_rows_per_pr" in policy:
+            errors.append("advancement policy max_completion_rows_per_pr is obsolete; use consistent-deliverable rules")
         if policy.get("completion_field") != "advancement.completion_rows":
             errors.append("advancement policy completion_field must name advancement.completion_rows")
         if policy.get("status_semantics") != "dependency_gated_no_merge_claim":
@@ -423,15 +573,14 @@ def _validate_tracker(document: Any) -> list[str]:
                     errors.append(f"policy can_develop_after {gid} must be an array of strings")
                 if gid in deps:
                     errors.append(f"policy can_develop_after {gid} cannot depend on itself")
-        for key in ("grouping_rule", "completion_promotion_rule", "parallel_lane_rule", "branch_evidence_rule", "one_row_rule"):
+        for key in ("grouping_rule", "completion_promotion_rule", "parallel_lane_rule", "branch_evidence_rule", "one_row_rule", "consistent_deliverable_rule", "merge_boundary_rule", "receipt_invalidation_rule"):
             if not _nonempty(policy.get(key)):
                 errors.append(f"policy {key} must be non-empty")
-        # one_row_rule must clarify one-row-per-obligation enforceability
         one_row = policy.get("one_row_rule", "")
-        if "one" not in one_row.lower() or "obligation" not in one_row.lower():
-            errors.append("policy one_row_rule must describe one-row-per-obligation semantics")
-        if "base-diff" not in one_row.lower() and "base_diff" not in one_row.lower() and "base diff" not in one_row.lower():
-            errors.append("policy one_row_rule must mention base-diff limitation for enforceability")
+        if any(term in one_row.lower() for term in ("per pr", "per-pr", "pr may advance")):
+            errors.append("policy one_row_rule must not constrain PR size or milestone composition")
+
+
 
     legacy_inventory = document.get("legacy_pr_inventory")
     if not isinstance(legacy_inventory, list) or not all(_nonempty(v) for v in legacy_inventory):
@@ -889,6 +1038,10 @@ def _validate_tracker(document: Any) -> list[str]:
         for oid in mapped:
             if oid not in by_id:
                 errors.append(f"unexpected mapped obligation {oid}")
+        for gid in sorted(CONSISTENT_DELIVERY_GROUPS):
+            group = change_by_id.get(gid)
+            if group is not None:
+                _check_delivery_contract(group, gid, errors, change_sets=change_by_id)
 
     # G0 authority must start at series_origin_ref
     if "G0" in change_by_id:

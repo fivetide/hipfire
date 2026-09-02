@@ -1,6 +1,6 @@
 {
-  "schema": "hipfire.device_mesh.port_tracker.v2",
-  "schema_version": 2,
+  "schema": "hipfire.device_mesh.port_tracker.v3",
+  "schema_version": 3,
   "title": "Upstream-native device-mesh port authority and grouped domain-obligation tracker",
   "purpose": "Single machine-readable authority retaining domain/task proof obligations while grouping review/revert boundaries. It records intent and evidence state; it never promotes branch evidence or creates an admission.",
   "upstream": {
@@ -92,7 +92,6 @@
     "PR-36"
   ],
   "policy": {
-    "max_completion_rows_per_pr": 1,
     "completion_field": "advancement.completion_rows",
     "status_semantics": "dependency_gated_no_merge_claim",
     "status_definitions": {
@@ -146,7 +145,10 @@
       "final_closure"
     ],
     "branch_evidence_rule": "Branch reports and measurements remain historical provenance. A rerun_required row needs a durable current-tree report before completion; hardware_blocked rows require the distinct physical topology named by their contract.",
-    "one_row_rule": "A PR may advance completion for at most one atomic tracker row. Dependency or evidence metadata may be synchronized without advancing another row.",
+    "consistent_deliverable_rule": "A G1-G5 milestone is promoted only from its final composed current-master head after its complete production, regression, fault, lifecycle, and evidence matrix passes. Internal commits and optional partial PRs contribute evidence but never complete the milestone independently.",
+    "merge_boundary_rule": "The merge boundary is the smallest end-to-end production capability that leaves master usable; PR size and obligation count do not determine acceptance.",
+    "receipt_invalidation_rule": "Changing a consumed producer commit, production route, fixture identity, comparator, or validation route invalidates descendant receipts and requires rerun.",
+    "one_row_rule": "Completion rows remain one-per-obligation for unambiguous mapping; this does not constrain PR size or independently complete a milestone.",
     "grouping_rule": "Each domain obligation ID appears exactly once across grouped change sets, evidence campaigns, and final closure. legacy_pr_ids are provenance only.",
     "completion_promotion_rule": "Only current durable evidence with nonempty non-host-local references can promote a group, campaign, or final closure. Historical, semantics-only, emulated, failed, hardware-blocked, and host-local evidence never promotes.",
     "parallel_lane_rule": "G3 and G4 may develop in parallel after authority; the interface-safe part of G5 may develop after topology while merge waits on its manifest seam. G13-G15 are implementation-only; physical campaigns follow them."
@@ -4996,6 +4998,25 @@
       "confidence": "high",
       "evidence_disposition": "rerun_required",
       "completion_evidence": [],
+      "delivery_contract": {
+        "final_composition_verified": false,
+        "production_route": "Current production model loading consumes DeviceMesh without changing supported Single/PP/TP/EP routes",
+        "retained_routes": [
+          "all-current-master-intersected-single-routes",
+          "all-current-master-intersected-pp-routes",
+          "all-current-master-intersected-tp-routes",
+          "all-current-master-intersected-ep-routes"
+        ],
+        "positive_probe": "Load, generate, unload, and reload qwen3.6:27b and qwen3.6:35b-a3b through fresh daemons while consuming DeviceMesh",
+        "negative_or_fault_probes": [
+          "A failed candidate load preserves the active prior model and performs no hidden topology side effect"
+        ],
+        "lifecycle_observations": ["load", "generate", "unload", "reload"],
+        "required_registry_tags": ["qwen3.6:27b", "qwen3.6:35b-a3b"],
+        "validation_route": "docs/VALIDATION.md#device-mesh-g1-g5-routes",
+        "evidence_classes": ["rerun_required"],
+        "receipt_refs": []
+      },
       "delivery_kind": "change_set",
       "upstream_base_commit": null,
       "head_commit": null,
@@ -5076,6 +5097,26 @@
       "confidence": "high",
       "evidence_disposition": "rerun_required",
       "completion_evidence": [],
+      "delivery_contract": {
+        "final_composition_verified": false,
+        "production_route": "Classify each source once and admit one effective mesh before destructive side effects in current production loading",
+        "retained_routes": [
+          "all-current-master-intersected-single-routes",
+          "all-current-master-intersected-pp-routes",
+          "all-current-master-intersected-tp-routes",
+          "all-current-master-intersected-ep-routes"
+        ],
+        "positive_probe": "Classify once, admit an effective mesh, then load, generate, unload, and reload qwen3.6:27b and qwen3.6:35b-a3b through fresh daemons",
+        "negative_or_fault_probes": [
+          "Unsupported or contradictory source/topology refusal performs zero side effects and preserves the active prior model",
+          "Changing the source path after admission does not trigger a second classification"
+        ],
+        "lifecycle_observations": ["load", "generate", "unload", "reload"],
+        "required_registry_tags": ["qwen3.6:27b", "qwen3.6:35b-a3b"],
+        "validation_route": "docs/VALIDATION.md#device-mesh-g1-g5-routes",
+        "evidence_classes": ["rerun_required"],
+        "receipt_refs": []
+      },
       "delivery_kind": "change_set",
       "upstream_base_commit": null,
       "head_commit": null,
@@ -5157,6 +5198,20 @@
       "confidence": "high",
       "evidence_disposition": "rerun_required",
       "completion_evidence": [],
+      "delivery_contract": {
+        "final_composition_verified": false,
+        "production_route": "Single LLaMA manifest pilot through pure planning, transactional fulfillment, typed assembly, generation, reset, unload, and immediate reload",
+        "retained_routes": ["all-current-master-intersected-single-routes"],
+        "positive_probe": "Pinned plain-LLaMA HFQ fixture through manifest planning, production load, generation, reset, unload, and immediate reload",
+        "negative_or_fault_probes": [
+          "Deterministic source, dtype, payload, upload, allocation, assembly, attachment, and publication fault matrix rolls back every owner and permits an immediate retry"
+        ],
+        "lifecycle_observations": ["load", "generate", "reset", "unload", "reload", "immediate retry"],
+        "required_registry_tags": [],
+        "validation_route": "docs/VALIDATION.md#device-mesh-g1-g5-routes",
+        "evidence_classes": ["rerun_required"],
+        "receipt_refs": []
+      },
       "delivery_kind": "change_set",
       "upstream_base_commit": null,
       "head_commit": null,
@@ -5243,6 +5298,26 @@
       "confidence": "high",
       "evidence_disposition": "rerun_required",
       "completion_evidence": [],
+      "delivery_contract": {
+        "final_composition_verified": false,
+        "production_route": "Request start through client commit or rollback terminal in the existing hipfire-engine and hipfire-generate lifecycle owners",
+        "retained_routes": [
+          "all-current-master-intersected-single-routes",
+          "all-current-master-intersected-pp-routes",
+          "all-current-master-intersected-tp-routes",
+          "all-current-master-intersected-ep-routes"
+        ],
+        "positive_probe": "Request start, client commit, reset, abort, chain/session, and HTTP completion battery across current production routes",
+        "negative_or_fault_probes": [
+          "Error, cancellation, or rollback emits exactly one terminal and leaves no cache/history publication or stale request owner",
+          "Reset after success, abort, and failure leaves the model and session reusable"
+        ],
+        "lifecycle_observations": ["start", "commit", "reset", "abort", "chain/session", "HTTP completion"],
+        "required_registry_tags": ["qwen3.6:27b", "qwen3.6:35b-a3b"],
+        "validation_route": "docs/VALIDATION.md#device-mesh-g1-g5-routes",
+        "evidence_classes": ["rerun_required"],
+        "receipt_refs": []
+      },
       "delivery_kind": "change_set",
       "upstream_base_commit": null,
       "head_commit": null,
@@ -5327,6 +5402,26 @@
       "confidence": "high",
       "evidence_disposition": "rerun_required",
       "completion_evidence": [],
+      "delivery_contract": {
+        "final_composition_verified": false,
+        "production_route": "Sealed production qwen3.6:35b-a3b route with manifest-derived MoE ownership and typed collectives",
+        "retained_routes": [
+          "all-current-master-intersected-single-routes",
+          "all-current-master-intersected-pp-routes",
+          "all-current-master-intersected-tp-routes",
+          "all-current-master-intersected-ep-routes"
+        ],
+        "positive_probe": "Load, prefill, decode, generate, reset, unload, and reload qwen3.6:35b-a3b through the sealed production route",
+        "negative_or_fault_probes": [
+          "Malformed plan or pointer-table, allocation, or collective fault performs zero launches/allocations, rolls back every owner, and permits an immediate retry",
+          "A failed candidate load preserves the active prior model and performs no hidden topology side effect"
+        ],
+        "lifecycle_observations": ["load", "prefill", "decode", "generate", "reset", "abort", "unload", "reload"],
+        "required_registry_tags": ["qwen3.6:27b", "qwen3.6:35b-a3b"],
+        "validation_route": "docs/VALIDATION.md#device-mesh-g1-g5-routes",
+        "evidence_classes": ["hardware_blocked"],
+        "receipt_refs": []
+      },
       "delivery_kind": "change_set",
       "upstream_base_commit": null,
       "head_commit": null,
