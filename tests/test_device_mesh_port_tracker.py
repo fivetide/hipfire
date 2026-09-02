@@ -70,7 +70,9 @@ def change_set(document: dict, group_id: str) -> dict:
 
 def test_g1_g5_delivery_contracts_link_to_maintained_validation_routes():
     body = VALIDATION.read_text(encoding="utf-8")
+    anchor = '<a id="device-mesh-g1-g5-routes"></a>'
     heading = "## Device-mesh G1–G5 routes"
+    assert anchor in body
     assert heading in body
     expected_route = "docs/VALIDATION.md#device-mesh-g1-g5-routes"
     tracker = load_tracker()
