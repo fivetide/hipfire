@@ -1,0 +1,25 @@
+{
+  "schema": "hipfire.device_mesh.delivery_receipt.v1",
+  "milestone_id": "G2",
+  "producer_commit": "2222222222222222222222222222222222222222",
+  "upstream_base_commit": "6163369329d3b076376286a00c13cadbae069ecc",
+  "validation_route": "docs/VALIDATION.md#device-mesh-g1-g5-routes",
+  "production_route": "Classify each source once and admit one effective mesh before destructive side effects in current production loading",
+  "evidence_disposition": "current",
+  "evidence_classes": ["current"],
+  "physical": false,
+  "fixture_identity": {},
+  "positive_probe": "Repeat the complete G1 load-preservation matrix on fresh daemons after one source classification and effective-mesh admission: qwen3.6:27b and qwen3.6:35b-a3b load, generate, unload, and reload",
+  "negative_or_fault_probes": [
+    "Unsupported or contradictory source/topology refusal performs zero prior-model teardown, allocation, VMM initialization, remap, carrier, collective, or cache side effects and preserves the active prior model",
+    "Changing the source path after admission does not trigger a second classification or reopen the admission decision"
+  ],
+  "sole_owner": "hipfire-loader admission owner; one source/variant/effective-mesh decision is consumed by the existing load route.",
+  "revert_identity": {
+    "change_set_id": "G2",
+    "identity": "G2:source-aware-admission-load-preservation-final-head",
+    "strategy": "revert-entire-grouped-change-set",
+    "scope": "Revert the complete G2 source-aware admission and repeated load-preservation head as one coherent unit; do not split classification or refusal ownership."
+  },
+  "final_composition_verified": true
+}

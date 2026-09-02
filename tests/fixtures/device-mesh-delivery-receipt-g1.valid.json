@@ -1,0 +1,24 @@
+{
+  "schema": "hipfire.device_mesh.delivery_receipt.v1",
+  "milestone_id": "G1",
+  "producer_commit": "1111111111111111111111111111111111111111",
+  "upstream_base_commit": "6163369329d3b076376286a00c13cadbae069ecc",
+  "validation_route": "docs/VALIDATION.md#device-mesh-g1-g5-routes",
+  "production_route": "Current production model loading consumes DeviceMesh without changing supported Single/PP/TP/EP routes",
+  "evidence_disposition": "current",
+  "evidence_classes": ["current"],
+  "physical": false,
+  "fixture_identity": {},
+  "positive_probe": "Run the complete current-master versus final-head load-preservation matrix on fresh daemons: qwen3.6:27b and qwen3.6:35b-a3b load, generate, unload, and reload; retain text/VL classification, route-specific parity, and four-cycle ownership/memory observations",
+  "negative_or_fault_probes": [
+    "A failed candidate load preserves the active prior model, performs no hidden topology side effect, and leaves the prior route reusable"
+  ],
+  "sole_owner": "hipfire_runtime::multi_gpu::Gpus owns devices, allocation, peer ownership, and collectives; DeviceMesh is the sole topology authority.",
+  "revert_identity": {
+    "change_set_id": "G1",
+    "identity": "G1:topology-load-preservation-final-head",
+    "strategy": "revert-entire-grouped-change-set",
+    "scope": "Revert the complete G1 topology and production load-preservation head as one coherent unit; do not split topology, device selection, or collective ownership."
+  },
+  "final_composition_verified": true
+}

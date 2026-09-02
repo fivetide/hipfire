@@ -17,6 +17,21 @@ INVALID_FIXTURE = REPO / "tests" / "fixtures" / "device-mesh-port-tracker.invali
 INDEX = REPO / "docs" / "INDEX.md"
 VALIDATION = REPO / "docs" / "VALIDATION.md"
 
+DELIVERY_RECEIPTS = {
+    "G1": "tests/fixtures/device-mesh-delivery-receipt-g1.valid.json",
+    "G2": "tests/fixtures/device-mesh-delivery-receipt-g2.valid.json",
+    "G3": "tests/fixtures/device-mesh-delivery-receipt-g3.valid.json",
+    "G4": "tests/fixtures/device-mesh-delivery-receipt-g4.valid.json",
+    "G5": "tests/fixtures/device-mesh-delivery-receipt-g5.valid.json",
+}
+DELIVERY_RECEIPT_COMMITS = {
+    "G1": "1" * 40,
+    "G2": "2" * 40,
+    "G3": "3" * 40,
+    "G4": "4" * 40,
+    "G5": "5" * 40,
+}
+
 
 def _run_checker(path: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -167,6 +182,77 @@ def test_partial_in_review_cannot_unlock_group(tmp_path: Path):
     assert result.returncode != 0
     assert "G1 in_review requires final_composition_verified=true" in output
     assert "G1 in_review requires a qualifying current durable receipt" in output
+
+def test_structured_delivery_receipts_match_final_group_contract(tmp_path: Path):
+    document = load_tracker()
+    _satisfy_all_prerequisites(document)
+    result = _run_checker(_write_document(document, tmp_path / "structured-receipts.json"))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_delivery_receipt_mutations_fail_closed(tmp_path: Path):
+    base = load_tracker()
+    _satisfy_all_prerequisites(base)
+    cases = (
+        (
+            "stale-producer",
+            lambda document: change_set(document, "G1").update(merge_commit="a" * 40),
+            "G1 delivery receipt producer_commit does not match",
+        ),
+        (
+            "stale-base",
+            lambda document: change_set(document, "G1").update(upstream_base_commit="b" * 40),
+            "G1 delivery receipt upstream_base_commit does not match",
+        ),
+        (
+            "wrong-milestone",
+            lambda document: change_set(document, "G1")["delivery_contract"].update(
+                receipt_refs=[DELIVERY_RECEIPTS["G2"]]
+            ),
+            "G1 delivery receipt milestone_id does not match",
+        ),
+        (
+            "wrong-route",
+            lambda document: change_set(document, "G1")["delivery_contract"].update(
+                production_route="Current production model loading consumes DeviceMesh with a wrong route"
+            ),
+            "G1 delivery receipt production_route does not match",
+        ),
+        (
+            "unrelated-artifact",
+            lambda document: change_set(document, "G1")["delivery_contract"].update(
+                receipt_refs=["tests/fixtures/device-mesh-port-tracker.invalid.json"]
+            ),
+            "G1 delivery receipt schema does not match",
+        ),
+        (
+            "malformed-json",
+            lambda document: change_set(document, "G1")["delivery_contract"].update(
+                receipt_refs=["tests/fixtures/device-mesh-delivery-receipt.malformed.json"]
+            ),
+            "G1 delivery_contract receipt reference 'tests/fixtures/device-mesh-delivery-receipt.malformed.json' must contain a JSON object",
+        ),
+    )
+    for name, mutation, marker in cases:
+        document = json.loads(json.dumps(base))
+        mutation(document)
+        result = _run_checker(_write_document(document, tmp_path / f"receipt-{name}.json"))
+        output = result.stdout + result.stderr
+        assert result.returncode != 0
+        assert marker in output, f"missing receipt diagnostic {marker!r}:\n{output}"
+
+
+def test_g5_in_review_requires_physical_evidence(tmp_path: Path):
+    document = load_tracker()
+    _satisfy_all_prerequisites(document)
+    g5 = change_set(document, "G5")
+    g5["status"] = "in_review"
+    g5["merge_commit"] = None
+    g5["delivery_contract"]["evidence_classes"] = ["current"]
+    result = _run_checker(_write_document(document, tmp_path / "g5-in-review-no-physical.json"))
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "G5 in_review physical route requires physical evidence" in output
 
 def test_g5_substrate_is_dag_gated_and_expert_partitioned():
     tracker = load_tracker()
@@ -451,7 +537,6 @@ def test_series_origin_and_future_base_identity_rules(tmp_path: Path):
         assert marker in output, f"missing base diagnostic {marker!r}:\n{output}"
 
     future = json.loads(TRACKER.read_text(encoding="utf-8"))
-    _satisfy_all_prerequisites(future)
     next(group for group in future["change_sets"] if group["id"] == "G1")[
         "upstream_base_commit"
     ] = "c" * 40
@@ -538,11 +623,21 @@ def _satisfy_all_prerequisites(document: dict) -> None:
                 obligation["campaign_id"], [obligation["id"]]
             )
     for index, change_set in enumerate(document["change_sets"], start=1):
-        change_set["status"] = "in_review" if change_set["id"] == "G0" else "complete"
+        group_id = change_set["id"]
+        change_set["status"] = "in_review" if group_id == "G0" else "complete"
         change_set["evidence_disposition"] = "current"
         change_set["upstream_base_commit"] = base_commit
-        change_set["head_commit"] = "a" * 40 if change_set["id"] == "G0" else f"{index:040x}"
-        change_set["merge_commit"] = None if change_set["id"] == "G0" else f"{index + 100:040x}"
+        delivery_commit = DELIVERY_RECEIPT_COMMITS.get(group_id)
+        change_set["head_commit"] = (
+            "a" * 40
+            if group_id == "G0"
+            else delivery_commit or f"{index:040x}"
+        )
+        change_set["merge_commit"] = (
+            None
+            if group_id == "G0"
+            else delivery_commit or f"{index + 100:040x}"
+        )
         change_set["completion_evidence"] = [
             {
                 "classification": "current",
@@ -551,12 +646,12 @@ def _satisfy_all_prerequisites(document: dict) -> None:
                 "qualifies_for_completion": True,
             }
         ]
-        if change_set["id"] in {"G1", "G2", "G3", "G4", "G5"}:
+        if group_id in DELIVERY_RECEIPTS:
             contract = change_set["delivery_contract"]
             contract["final_composition_verified"] = True
-            contract["receipt_refs"] = [artifact]
+            contract["receipt_refs"] = [DELIVERY_RECEIPTS[group_id]]
             contract["evidence_classes"] = (
-                ["current", "physical"] if change_set["id"] == "G5" else ["current"]
+                ["current", "physical"] if group_id == "G5" else ["current"]
             )
     for index, campaign in enumerate(document["evidence_campaigns"], start=201):
         campaign["status"] = "complete"

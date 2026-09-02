@@ -1,0 +1,26 @@
+{
+  "schema": "hipfire.device_mesh.delivery_receipt.v1",
+  "milestone_id": "G5",
+  "producer_commit": "5555555555555555555555555555555555555555",
+  "upstream_base_commit": "6163369329d3b076376286a00c13cadbae069ecc",
+  "validation_route": "docs/VALIDATION.md#device-mesh-g1-g5-routes",
+  "production_route": "Sealed production qwen3.6:35b-a3b route with manifest-derived MoE ownership and typed collectives",
+  "evidence_disposition": "current",
+  "evidence_classes": ["current", "physical"],
+  "physical": true,
+  "fixture_identity": {},
+  "positive_probe": "Load, prefill, decode, generate, reset, abort, unload, and reload registry qwen3.6:35b-a3b through the sealed production route with per-position numerical/state and collective identity comparisons",
+  "negative_or_fault_probes": [
+    "Malformed plan or pointer-table, capacity, allocation, or collective fault performs zero launches/allocations, rolls back every owner, and permits an immediate retry",
+    "Every #677 blocker is checked on the production sealed route; a failed candidate load preserves the active prior model and performs no hidden topology side effect",
+    "Rank-local expert computation assigns each expert only to its owning rank (not all ranks computing every expert), and shard-local TP expert dimensions are mandatory; any violation fails closed."
+  ],
+  "sole_owner": "Executor steward owns sealed expert-plan execution; ArchModel owns model resources and hipfire_runtime::multi_gpu owns topology, devices, and collectives; no family-owned allocator, expert placement, collective, or teardown.",
+  "revert_identity": {
+    "change_set_id": "G5",
+    "identity": "G5:sealed-moe-qwen3.6-35b-a3b-production-final-head",
+    "strategy": "revert-entire-grouped-change-set",
+    "scope": "Revert the complete G5 sealed MoE and qwen3.6:35b-a3b production deliverable as one coherent unit; do not split expert ownership, collective, rollback, or sealing authority."
+  },
+  "final_composition_verified": true
+}

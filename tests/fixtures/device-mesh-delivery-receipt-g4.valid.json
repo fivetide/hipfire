@@ -1,0 +1,25 @@
+{
+  "schema": "hipfire.device_mesh.delivery_receipt.v1",
+  "milestone_id": "G4",
+  "producer_commit": "4444444444444444444444444444444444444444",
+  "upstream_base_commit": "6163369329d3b076376286a00c13cadbae069ecc",
+  "validation_route": "docs/VALIDATION.md#device-mesh-g1-g5-routes",
+  "production_route": "Request start through client commit or rollback terminal in the existing hipfire-engine and hipfire-generate lifecycle owners",
+  "evidence_disposition": "current",
+  "evidence_classes": ["current"],
+  "physical": false,
+  "fixture_identity": {},
+  "positive_probe": "Request start, client commit, reset, abort, parser/tool/reasoning completion, chain/session, unload, and HTTP completion battery across current production routes",
+  "negative_or_fault_probes": [
+    "Error, cancellation, or rollback emits exactly one terminal after synchronized rollback and leaves no cache/history/tool publication or stale request owner",
+    "Reset after success, abort, and failure leaves the model and session reusable; HTTP completion does not hang"
+  ],
+  "sole_owner": "hipfire-engine and hipfire-generate exclusively own request scheduling, parser, reset, cache, session, abort, terminal, and HTTP lifecycle.",
+  "revert_identity": {
+    "change_set_id": "G4",
+    "identity": "G4:request-session-lifecycle-final-head",
+    "strategy": "revert-entire-grouped-change-set",
+    "scope": "Revert the complete G4 request/session lifecycle transaction as one coherent unit; do not split scheduler, parser, reset, cache, session, terminal, or HTTP ownership."
+  },
+  "final_composition_verified": true
+}

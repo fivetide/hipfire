@@ -1,0 +1,28 @@
+{
+  "schema": "hipfire.device_mesh.delivery_receipt.v1",
+  "milestone_id": "G3",
+  "producer_commit": "3333333333333333333333333333333333333333",
+  "upstream_base_commit": "6163369329d3b076376286a00c13cadbae069ecc",
+  "validation_route": "docs/VALIDATION.md#device-mesh-g1-g5-routes",
+  "production_route": "Single LLaMA manifest pilot through pure planning, transactional fulfillment, typed assembly, generation, reset, unload, and immediate reload",
+  "evidence_disposition": "current",
+  "evidence_classes": ["current"],
+  "physical": false,
+  "fixture_identity": {
+    "model_ref": "https://github.com/warpfront/hipfire/blob/a29c7575c90f613ced5f01b221778dc688bca592/registry/v1.json",
+    "model_tag": "qwen3:0.6b",
+    "prompt_ref": "https://github.com/warpfront/hipfire/blob/a29c7575c90f613ced5f01b221778dc688bca592/benchmarks/prompts/bare_factual.txt"
+  },
+  "positive_probe": "Pinned plain-LLaMA HFQ fixture through validation-only versus production manifest routes, production load, generation, reset, unload, immediate reload, and coherent inspected output",
+  "negative_or_fault_probes": [
+    "Deterministic source, dtype, payload, embedding, representative-layer, final-norm, output-head, KV, scratch, sidecar/pool/position, assembly, attachment, and publication faults roll back every owner to baseline and permit an immediate retry"
+  ],
+  "sole_owner": "ArchModel owns Manifest/WeightStore acquisition, publication, rollback, and unload; the planner remains pure and request/session/cache remain under G4.",
+  "revert_identity": {
+    "change_set_id": "G3",
+    "identity": "G3:single-manifest-load-transaction-final-head",
+    "strategy": "revert-entire-grouped-change-set",
+    "scope": "Revert the complete G3 Single manifest/load transaction as one coherent unit; do not split planning, fulfillment, publication, rollback, or unload ownership."
+  },
+  "final_composition_verified": true
+}

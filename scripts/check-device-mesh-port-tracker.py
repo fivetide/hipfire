@@ -23,7 +23,7 @@ import json
 import re
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 SERIES_ORIGIN_REF = "6163369329d3b076376286a00c13cadbae069ecc"
 FORBIDDEN_BOUNDARIES = (
@@ -36,6 +36,7 @@ FORBIDDEN_BOUNDARIES = (
 SCHEMA = "hipfire.device_mesh.port_tracker.v3"
 SCHEMA_VERSION = 3
 CONSISTENT_DELIVERY_GROUPS = frozenset({"G1", "G2", "G3", "G4", "G5"})
+DELIVERY_RECEIPT_SCHEMA = "hipfire.device_mesh.delivery_receipt.v1"
 ALLOWED_OBLIGATION_STATUSES = frozenset({"complete", "ready", "blocked"})
 ALLOWED_DELIVERY_KINDS = frozenset({"change_set", "evidence_campaign", "final_closure"})
 ALLOWED_CHANGE_SET_STATUSES = frozenset({"implemented", "in_review", "complete", "ready", "blocked"})
@@ -227,6 +228,87 @@ def _receipt_reference(value: Any) -> bool:
             return False
     return _artifact_reference(value)
 
+def _load_delivery_receipt(value: str) -> dict[str, Any] | None:
+    parsed = urlparse(value)
+    if parsed.scheme in {"http", "https"}:
+        parts = _same_repo_blob_parts(value)
+        if parts is None:
+            return None
+        commit, path = parts
+        try:
+            result = subprocess.run(
+                ["git", "show", f"{commit}:{unquote(path)}"],
+                cwd=_repo_root(),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except (OSError, UnicodeDecodeError):
+            return None
+        if result.returncode != 0:
+            return None
+        raw = result.stdout
+    else:
+        try:
+            raw = (_repo_root() / value).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return None
+    try:
+        receipt = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return receipt if isinstance(receipt, dict) else None
+
+
+def _check_delivery_receipt(
+    value: Any,
+    group: dict[str, Any],
+    contract: dict[str, Any],
+    label: str,
+    errors: list[str],
+) -> bool:
+    if not _receipt_reference(value):
+        errors.append(
+            f"{label} delivery_contract receipt reference {value!r} must be an existing artifact or immutable same-repository blob"
+        )
+        return False
+    receipt = _load_delivery_receipt(value)
+    if receipt is None:
+        errors.append(
+            f"{label} delivery_contract receipt reference {value!r} must contain a JSON object"
+        )
+        return False
+
+    valid = True
+
+    def require(field: str, expected: Any) -> None:
+        nonlocal valid
+        if receipt.get(field) != expected:
+            errors.append(
+                f"{label} delivery receipt {field} does not match its owning group/contract"
+            )
+            valid = False
+
+    require("schema", DELIVERY_RECEIPT_SCHEMA)
+    require("milestone_id", label)
+    require("producer_commit", _owner_commit(group))
+    require("upstream_base_commit", group.get("upstream_base_commit"))
+    require("validation_route", contract.get("validation_route"))
+    require("production_route", contract.get("production_route"))
+    require("evidence_disposition", group.get("evidence_disposition"))
+    evidence_classes = contract.get("evidence_classes")
+    if not isinstance(evidence_classes, list):
+        evidence_classes = []
+    require("evidence_classes", evidence_classes)
+    require("physical", "physical" in evidence_classes)
+    require("fixture_identity", contract.get("fixture_identity", {}))
+    require("positive_probe", contract.get("positive_probe"))
+    require("negative_or_fault_probes", contract.get("negative_or_fault_probes"))
+    require("sole_owner", group.get("sole_owner"))
+    require("revert_identity", group.get("revert_identity"))
+    require("final_composition_verified", True)
+    return valid
+
 
 def _check_physical_identity(
     identity: Any,
@@ -401,17 +483,21 @@ def _check_delivery_contract(
     if promoted and final_composition_verified is not True:
         errors.append(f"{label} {status} requires final_composition_verified=true")
     if promoted:
-        if not any(_receipt_reference(value) for value in receipt_refs):
+        receipts_valid = bool(receipt_refs)
+        for value in receipt_refs:
+            if not _check_delivery_receipt(value, group, contract, label, errors):
+                receipts_valid = False
+        if not receipts_valid:
             errors.append(f"{label} {status} requires a qualifying current durable receipt")
         if any(isinstance(value, str) and value in BAD_COMPLETION_CLASSES for value in evidence_classes):
             errors.append(f"{label} {status} evidence classes cannot promote a milestone")
     validation_route = contract.get("validation_route")
     if "physical" in evidence_classes and not _nonempty(validation_route):
         errors.append(f"{label} physical evidence requires validation_route")
-    if label == "G5" and status == "complete" and evidence_classes and all(value == "emulated" for value in evidence_classes):
-        errors.append(f"{label} complete physical route cannot rely on emulated evidence")
-    if label == "G5" and status == "complete" and "physical" not in evidence_classes:
-        errors.append(f"{label} complete physical route requires physical evidence")
+    if label == "G5" and promoted and evidence_classes and all(value == "emulated" for value in evidence_classes):
+        errors.append(f"{label} {status} physical route cannot rely on emulated evidence")
+    if label == "G5" and promoted and "physical" not in evidence_classes:
+        errors.append(f"{label} {status} physical route requires physical evidence")
 
     route = contract.get("production_route")
     route_text = route.lower() if isinstance(route, str) else ""
