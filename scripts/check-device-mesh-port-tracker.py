@@ -412,14 +412,26 @@ def _check_delivery_contract(
     elif label == "G3":
         if "single" not in route_text or "llama" not in route_text:
             errors.append("G3 delivery_contract production_route must remain a Single LLaMA pilot")
-        if required_registry_tags == []:
-            fixture_text = " ".join(
-                value.lower()
-                for value in (route, contract.get("positive_probe"))
-                if isinstance(value, str)
+        fixture_identity = contract.get("fixture_identity")
+        fixture_url = urlparse(fixture_identity) if isinstance(fixture_identity, str) else None
+        pinned_fixture = (
+            isinstance(fixture_identity, str)
+            and not _host_local(fixture_identity)
+            and _receipt_reference(fixture_identity)
+            and fixture_url is not None
+            and fixture_url.scheme == "https"
+            and fixture_url.netloc == "github.com"
+            and bool(
+                re.fullmatch(
+                    r"/warpfront/hipfire/blob/[0-9a-fA-F]{40}/.+",
+                    fixture_url.path,
+                )
             )
-            if not all(term in fixture_text for term in ("pinned", "llama", "fixture")):
-                errors.append("G3 empty required_registry_tags require a separately pinned LLaMA fixture")
+            and "llama" in fixture_url.path.lower()
+            and "fixture" in fixture_url.path.lower()
+        )
+        if not pinned_fixture:
+            errors.append("G3 delivery_contract.fixture_identity must be an immutable durable reference")
         probes = contract.get("negative_or_fault_probes")
         probe_text = " ".join(probe.lower() for probe in probes if isinstance(probe, str)) if isinstance(probes, list) else ""
         if "fault" not in probe_text or "retry" not in probe_text:

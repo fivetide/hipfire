@@ -98,6 +98,16 @@ def test_emulation_cannot_close_physical_row(tmp_path: Path):
     output = result.stdout + result.stderr
     assert "G5 complete physical route cannot rely on emulated evidence" in output
 
+def test_empty_registry_tags_require_pinned_g3_fixture(tmp_path: Path):
+    document = json.loads(TRACKER.read_text(encoding="utf-8"))
+    g3 = _change_set(document, "G3")
+    g3["delivery_contract"]["required_registry_tags"] = []
+    g3["delivery_contract"]["fixture_identity"] = "/tmp/g3-llama-fixture.json"
+    result = _run_checker(_write_document(document, tmp_path / "unpinned-g3-fixture.json"))
+    output = result.stdout + result.stderr
+    assert "G3 delivery_contract.fixture_identity must be an immutable durable reference" in output
+
+
 
 
 def _materialize_authority_evidence(document: dict) -> None:

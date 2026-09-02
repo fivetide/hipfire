@@ -5409,6 +5409,7 @@
         "production_route": "Single LLaMA manifest pilot through pure planning, transactional fulfillment, typed assembly, generation, reset, unload, and immediate reload",
         "retained_routes": ["all-current-master-intersected-single-routes"],
         "positive_probe": "Pinned plain-LLaMA HFQ fixture through manifest planning, production load, generation, reset, unload, and immediate reload",
+        "fixture_identity": "https://github.com/warpfront/hipfire/blob/6163369329d3b076376286a00c13cadbae069ecc/tests/fixtures/g3-llama-hfq.json",
         "negative_or_fault_probes": [
           "Deterministic source, dtype, payload, upload, allocation, assembly, attachment, and publication fault matrix rolls back every owner and permits an immediate retry"
         ],
