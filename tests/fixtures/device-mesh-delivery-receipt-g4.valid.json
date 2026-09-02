@@ -32,14 +32,13 @@
       "prompt_md5": "22222222222222222222222222222222",
       "binary_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
       "config_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
-      "gpu_ids": [
-        "gfx1151-gpu-0"
-      ],
+      "gpu_ids": ["gfx1151-gpu-0"],
       "topology": "single-gpu",
       "gpu_arch": "gfx1151",
       "rocm_version": "7.0.0",
       "rccl_version": "not-used",
-      "evidence_class": "current"
+      "evidence_class": "current",
+      "report_refs": ["tests/fixtures/device-mesh-port-tracker.invalid.json"]
     },
     {
       "model_tag": "qwen3.6:35b-a3b",
@@ -47,14 +46,30 @@
       "prompt_md5": "66666666666666666666666666666666",
       "binary_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
       "config_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-      "gpu_ids": [
-        "gfx1151-gpu-0"
-      ],
+      "gpu_ids": ["gfx1151-gpu-0"],
       "topology": "single-gpu",
       "gpu_arch": "gfx1151",
       "rocm_version": "7.0.0",
       "rccl_version": "not-used",
-      "evidence_class": "current"
+      "evidence_class": "current",
+      "report_refs": ["tests/fixtures/device-mesh-port-tracker.invalid.json"]
+    }
+  ],
+  "positive_result": {
+    "command": "Request start, client commit, reset, abort, parser/tool/reasoning completion, chain/session, unload, and HTTP completion battery across current production routes",
+    "status": "pass",
+    "report_refs": ["tests/fixtures/device-mesh-port-tracker.invalid.json"]
+  },
+  "negative_results": [
+    {
+      "command": "Error, cancellation, or rollback emits exactly one terminal after synchronized rollback and leaves no cache/history/tool publication or stale request owner",
+      "status": "pass",
+      "report_refs": ["tests/fixtures/device-mesh-port-tracker.invalid.json"]
+    },
+    {
+      "command": "Reset after success, abort, and failure leaves the model and session reusable; HTTP completion does not hang",
+      "status": "pass",
+      "report_refs": ["tests/fixtures/device-mesh-port-tracker.invalid.json"]
     }
   ],
   "fixture_identity": {},

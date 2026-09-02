@@ -8,9 +8,7 @@
   "evidence_disposition": "current",
   "evidence_classes": ["current"],
   "physical": false,
-  "retained_routes": [
-    "all-current-master-intersected-single-routes"
-  ],
+  "retained_routes": ["all-current-master-intersected-single-routes"],
   "lifecycle_observations": [
     "load",
     "generate",
@@ -26,14 +24,25 @@
       "prompt_md5": "22222222222222222222222222222222",
       "binary_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
       "config_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
-      "gpu_ids": [
-        "gfx1151-gpu-0"
-      ],
+      "gpu_ids": ["gfx1151-gpu-0"],
       "topology": "single-gpu",
       "gpu_arch": "gfx1151",
       "rocm_version": "7.0.0",
       "rccl_version": "not-used",
-      "evidence_class": "current"
+      "evidence_class": "current",
+      "report_refs": ["tests/fixtures/device-mesh-port-tracker.invalid.json"]
+    }
+  ],
+  "positive_result": {
+    "command": "Pinned plain-LLaMA HFQ fixture through validation-only versus production manifest routes, production load, generation, reset, unload, immediate reload, and coherent inspected output",
+    "status": "pass",
+    "report_refs": ["tests/fixtures/device-mesh-port-tracker.invalid.json"]
+  },
+  "negative_results": [
+    {
+      "command": "Deterministic source, dtype, payload, embedding, representative-layer, final-norm, output-head, KV, scratch, sidecar/pool/position, assembly, attachment, and publication faults roll back every owner to baseline and permit an immediate retry",
+      "status": "pass",
+      "report_refs": ["tests/fixtures/device-mesh-port-tracker.invalid.json"]
     }
   ],
   "fixture_identity": {

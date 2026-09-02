@@ -32,15 +32,13 @@
       "prompt_md5": "22222222222222222222222222222222",
       "binary_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
       "config_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
-      "gpu_ids": [
-        "gfx1151-gpu-0",
-        "gfx1151-gpu-1"
-      ],
+      "gpu_ids": ["gfx1151-gpu-0", "gfx1151-gpu-1"],
       "topology": "dual-gpu",
       "gpu_arch": "gfx1151",
       "rocm_version": "7.0.0",
       "rccl_version": "2.20.5",
-      "evidence_class": "physical"
+      "evidence_class": "physical",
+      "report_refs": ["tests/fixtures/device-mesh-port-tracker.invalid.json"]
     },
     {
       "model_tag": "qwen3.6:35b-a3b",
@@ -48,15 +46,35 @@
       "prompt_md5": "66666666666666666666666666666666",
       "binary_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
       "config_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-      "gpu_ids": [
-        "gfx1151-gpu-0",
-        "gfx1151-gpu-1"
-      ],
+      "gpu_ids": ["gfx1151-gpu-0", "gfx1151-gpu-1"],
       "topology": "dual-gpu",
       "gpu_arch": "gfx1151",
       "rocm_version": "7.0.0",
       "rccl_version": "2.20.5",
-      "evidence_class": "physical"
+      "evidence_class": "physical",
+      "report_refs": ["tests/fixtures/device-mesh-port-tracker.invalid.json"]
+    }
+  ],
+  "positive_result": {
+    "command": "Load, prefill, decode, generate, reset, abort, unload, and reload registry qwen3.6:35b-a3b through the sealed production route with per-position numerical/state and collective identity comparisons",
+    "status": "pass",
+    "report_refs": ["tests/fixtures/device-mesh-port-tracker.invalid.json"]
+  },
+  "negative_results": [
+    {
+      "command": "Malformed plan or pointer-table, capacity, allocation, or collective fault performs zero launches/allocations, rolls back every owner, and permits an immediate retry",
+      "status": "pass",
+      "report_refs": ["tests/fixtures/device-mesh-port-tracker.invalid.json"]
+    },
+    {
+      "command": "Every #677 blocker is checked on the production sealed route; a failed candidate load preserves the active prior model and performs no hidden topology side effect",
+      "status": "pass",
+      "report_refs": ["tests/fixtures/device-mesh-port-tracker.invalid.json"]
+    },
+    {
+      "command": "Rank-local expert computation assigns each expert only to its owning rank (not all ranks computing every expert), and shard-local TP expert dimensions are mandatory; any violation fails closed.",
+      "status": "pass",
+      "report_refs": ["tests/fixtures/device-mesh-port-tracker.invalid.json"]
     }
   ],
   "fixture_identity": {},

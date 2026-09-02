@@ -260,6 +260,23 @@ def _load_delivery_receipt(value: str) -> dict[str, Any] | None:
         return None
     return receipt if isinstance(receipt, dict) else None
 
+def _check_delivery_report_refs(
+    refs: Any,
+    label: str,
+    errors: list[str],
+) -> bool:
+    if not _strings(refs, nonempty=True):
+        errors.append(f"{label} report_refs must be a non-empty array")
+        return False
+    valid = True
+    for ref in refs:
+        if not _artifact_reference(ref):
+            errors.append(
+                f"{label} report_refs entry {ref!r} must be a durable report artifact"
+            )
+            valid = False
+    return valid
+
 def _check_run_identity(
     row: Any,
     label: str,
@@ -290,8 +307,29 @@ def _check_run_identity(
         errors.append(
             f"{prefix}.evidence_class must be current or physical"
         )
+    _check_delivery_report_refs(row.get("report_refs"), f"{prefix}", errors)
     return row
 
+
+def _check_delivery_result(
+    result: Any,
+    label: str,
+    expected_command: Any,
+    errors: list[str],
+) -> bool:
+    if not isinstance(result, dict):
+        errors.append(f"{label} must be an object")
+        return False
+    valid = True
+    if result.get("command") != expected_command:
+        errors.append(f"{label} command does not match its owning contract")
+        valid = False
+    if result.get("status") != "pass":
+        errors.append(f"{label} status must be pass")
+        valid = False
+    if not _check_delivery_report_refs(result.get("report_refs"), label, errors):
+        valid = False
+    return valid
 
 def _check_delivery_receipt(
     value: Any,
@@ -340,6 +378,49 @@ def _check_delivery_receipt(
     require("sole_owner", group.get("sole_owner"))
     require("revert_identity", group.get("revert_identity"))
     require("final_composition_verified", True)
+    if not _check_delivery_result(
+        receipt.get("positive_result"),
+        f"{label} delivery receipt positive_result",
+        contract.get("positive_probe"),
+        errors,
+    ):
+        valid = False
+
+    expected_negative = contract.get("negative_or_fault_probes")
+    if not isinstance(expected_negative, list):
+        expected_negative = []
+    negative_results = receipt.get("negative_results")
+    if not isinstance(negative_results, list) or not negative_results:
+        errors.append(
+            f"{label} delivery receipt negative_results must be a non-empty array"
+        )
+        valid = False
+    else:
+        commands = [
+            result.get("command") if isinstance(result, dict) else None
+            for result in negative_results
+        ]
+        for command in expected_negative:
+            if commands.count(command) != 1:
+                errors.append(
+                    f"{label} delivery receipt negative_results must cover each negative_or_fault_probe exactly once"
+                )
+                valid = False
+        for index, result in enumerate(negative_results):
+            command = result.get("command") if isinstance(result, dict) else None
+            if command not in expected_negative:
+                errors.append(
+                    f"{label} delivery receipt negative_results[{index}] command is not an owning negative_or_fault_probe"
+                )
+            expected_command = command if command in expected_negative else None
+            if not _check_delivery_result(
+                result,
+                f"{label} delivery receipt negative_results[{index}]",
+                expected_command,
+                errors,
+            ):
+                valid = False
+
 
     retained_routes = receipt.get("retained_routes")
     expected_routes = contract.get("retained_routes")
