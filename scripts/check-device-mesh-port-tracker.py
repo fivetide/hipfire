@@ -210,14 +210,21 @@ def _artifact_reference(value: Any) -> bool:
     return True
 
 def _receipt_reference(value: Any) -> bool:
-    """Return whether a receipt points to current, durable evidence."""
-    if not _durable_reference(value):
+    """Return whether a delivery receipt names a resolvable report artifact.
+
+    A bare commit identifies code history, not the receipt/report that records
+    the qualifying validation result.  Delivery contracts therefore accept
+    only an existing repository artifact or a resolvable same-repository
+    immutable GitHub blob.
+    """
+    if not _nonempty(value) or _host_local(value):
         return False
     if isinstance(value, str) and value.startswith("git:"):
-        return True
-    parsed = urlparse(value)
-    if parsed.netloc == "github.com" and parsed.path.startswith(("/warpfront/hipfire/issues/", "/warpfront/hipfire/pull/")):
         return False
+    parsed = urlparse(value)
+    if parsed.scheme in {"http", "https"} and parsed.netloc == "github.com":
+        if re.fullmatch(r"/warpfront/hipfire/commit/[0-9a-fA-F]{40}/?", parsed.path):
+            return False
     return _artifact_reference(value)
 
 
@@ -390,14 +397,14 @@ def _check_delivery_contract(
         errors.append(f"{label} delivery_contract.evidence_classes contains an unsupported class")
 
     status = group.get("status")
-    if status == "complete" and final_composition_verified is not True:
-        errors.append(f"{label} complete requires final_composition_verified=true")
-    if status == "complete":
+    promoted = status in {"complete", "in_review"}
+    if promoted and final_composition_verified is not True:
+        errors.append(f"{label} {status} requires final_composition_verified=true")
+    if promoted:
         if not any(_receipt_reference(value) for value in receipt_refs):
-            errors.append(f"{label} complete requires a qualifying current durable receipt")
+            errors.append(f"{label} {status} requires a qualifying current durable receipt")
         if any(isinstance(value, str) and value in BAD_COMPLETION_CLASSES for value in evidence_classes):
-            errors.append(f"{label} complete evidence classes cannot promote a milestone")
-
+            errors.append(f"{label} {status} evidence classes cannot promote a milestone")
     validation_route = contract.get("validation_route")
     if "physical" in evidence_classes and not _nonempty(validation_route):
         errors.append(f"{label} physical evidence requires validation_route")

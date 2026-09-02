@@ -115,6 +115,59 @@ def test_g1_g5_consistent_delivery_dependencies():
     assert "G5" in seam_consumers["S-LOAD"]
 
 
+def test_g7_is_an_exact_g4_g5_sibling_and_keeps_cor007_owner():
+    tracker = load_tracker()
+    g7 = change_set(tracker, "G7")
+    assert g7["depends_on"] == ["G4", "G5"]
+    assert g7["consumed_seam_gates"] == ["S-MOE", "S-RESET"]
+    assert "G6" not in g7["depends_on"]
+    assert "S-GEMMA" not in g7["consumed_seam_gates"]
+    assert "COR-007" in g7["obligation_ids"]
+    cor007 = next(row for row in tracker["obligations"] if row["id"] == "COR-007")
+    assert cor007["delivery_owner"] == {"kind": "change_set", "id": "G7"}
+    gemma = next(gate for gate in tracker["seam_gates"] if gate["id"] == "S-GEMMA")
+    assert gemma["consumers"] == ["G12"]
+
+
+def test_delivery_receipts_reject_bare_invented_and_real_commits(tmp_path: Path):
+    document = load_tracker()
+    g1 = change_set(document, "G1")
+    g1["status"] = "in_review"
+    g1["delivery_contract"]["final_composition_verified"] = True
+    real_commit = document["upstream"]["series_origin_ref"]
+    cases = (
+        ("invented-git", "git:" + "f" * 40),
+        ("real-git", "git:" + real_commit),
+        (
+            "invented-url",
+            "https://github.com/warpfront/hipfire/commit/" + "f" * 40,
+        ),
+        (
+            "real-url",
+            "https://github.com/warpfront/hipfire/commit/" + real_commit,
+        ),
+    )
+    for name, reference in cases:
+        candidate = json.loads(json.dumps(document))
+        change_set(candidate, "G1")["delivery_contract"]["receipt_refs"] = [reference]
+        result = _run_checker(_write_document(candidate, tmp_path / f"{name}.json"))
+        output = result.stdout + result.stderr
+        assert result.returncode != 0
+        assert "G1 in_review requires a qualifying current durable receipt" in output
+
+
+def test_partial_in_review_cannot_unlock_group(tmp_path: Path):
+    document = load_tracker()
+    g1 = change_set(document, "G1")
+    g1["status"] = "in_review"
+    g1["delivery_contract"]["final_composition_verified"] = False
+    g1["delivery_contract"]["receipt_refs"] = []
+    result = _run_checker(_write_document(document, tmp_path / "partial-in-review.json"))
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "G1 in_review requires final_composition_verified=true" in output
+    assert "G1 in_review requires a qualifying current durable receipt" in output
+
 def test_g5_substrate_is_dag_gated_and_expert_partitioned():
     tracker = load_tracker()
     substrate = next(
