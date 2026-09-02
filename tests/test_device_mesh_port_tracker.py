@@ -102,10 +102,22 @@ def test_empty_registry_tags_require_pinned_g3_fixture(tmp_path: Path):
     document = json.loads(TRACKER.read_text(encoding="utf-8"))
     g3 = _change_set(document, "G3")
     g3["delivery_contract"]["required_registry_tags"] = []
-    g3["delivery_contract"]["fixture_identity"] = "/tmp/g3-llama-fixture.json"
+    g3["delivery_contract"]["fixture_identity"]["model_ref"] = "/tmp/g3-llama-fixture.json"
     result = _run_checker(_write_document(document, tmp_path / "unpinned-g3-fixture.json"))
     output = result.stdout + result.stderr
-    assert "G3 delivery_contract.fixture_identity must be an immutable durable reference" in output
+    assert "G3 delivery_contract.fixture_identity.model_ref must be an immutable durable reference" in output
+
+
+def test_nonexistent_pinned_g3_fixture_blob_is_rejected(tmp_path: Path):
+    document = json.loads(TRACKER.read_text(encoding="utf-8"))
+    g3 = _change_set(document, "G3")
+    g3["delivery_contract"]["fixture_identity"]["model_ref"] = (
+        "https://github.com/warpfront/hipfire/blob/"
+        "a29c7575c90f613ced5f01b221778dc688bca592/registry/missing.json"
+    )
+    result = _run_checker(_write_document(document, tmp_path / "nonexistent-g3-fixture.json"))
+    output = result.stdout + result.stderr
+    assert "G3 delivery_contract.fixture_identity.model_ref must resolve to an existing immutable repository blob" in output
 
 
 

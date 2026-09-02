@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import subprocess
 import json
 import re
 from pathlib import Path
@@ -100,6 +101,33 @@ def _hex_digest(value: Any, length: int) -> bool:
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
+def _same_repo_blob_parts(value: Any) -> tuple[str, str] | None:
+    if not isinstance(value, str):
+        return None
+    parsed = urlparse(value)
+    if parsed.netloc != "github.com" or parsed.scheme not in {"http", "https"}:
+        return None
+    match = re.fullmatch(r"/warpfront/hipfire/blob/([0-9a-fA-F]{40})/(.+)", parsed.path)
+    return match.groups() if match else None
+
+
+def _immutable_blob_reference(value: Any) -> bool:
+    parts = _same_repo_blob_parts(value)
+    if parts is None:
+        return False
+    commit, path = parts
+    try:
+        result = subprocess.run(
+            ["git", "cat-file", "-e", f"{commit}:{path}"],
+            cwd=_repo_root(),
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
 
 def _durable_reference(value: Any) -> bool:
     """Durable references are immutable and auditable.
@@ -124,9 +152,9 @@ def _durable_reference(value: Any) -> bool:
         # commit with 40-hex
         if re.fullmatch(r"/warpfront/hipfire/commit/[0-9a-fA-F]{40}/?", path):
             return True
-        # blob with 40-hex and file path
-        if re.fullmatch(r"/warpfront/hipfire/blob/[0-9a-fA-F]{40}/.+", path):
-            return True
+        # Same-repository immutable blobs must resolve in the local object database.
+        if _same_repo_blob_parts(value) is not None:
+            return _immutable_blob_reference(value)
         # pull/issues are durable historical links (mutable but allowed for non-artifact)
         if re.fullmatch(r"/warpfront/hipfire/(pull|issues)/\d+/?", path):
             return True
@@ -413,25 +441,26 @@ def _check_delivery_contract(
         if "single" not in route_text or "llama" not in route_text:
             errors.append("G3 delivery_contract production_route must remain a Single LLaMA pilot")
         fixture_identity = contract.get("fixture_identity")
-        fixture_url = urlparse(fixture_identity) if isinstance(fixture_identity, str) else None
-        pinned_fixture = (
-            isinstance(fixture_identity, str)
-            and not _host_local(fixture_identity)
-            and _receipt_reference(fixture_identity)
-            and fixture_url is not None
-            and fixture_url.scheme == "https"
-            and fixture_url.netloc == "github.com"
-            and bool(
-                re.fullmatch(
-                    r"/warpfront/hipfire/blob/[0-9a-fA-F]{40}/.+",
-                    fixture_url.path,
-                )
-            )
-            and "llama" in fixture_url.path.lower()
-            and "fixture" in fixture_url.path.lower()
-        )
-        if not pinned_fixture:
-            errors.append("G3 delivery_contract.fixture_identity must be an immutable durable reference")
+        if not isinstance(fixture_identity, dict):
+            errors.append("G3 delivery_contract.fixture_identity must be an object with model_ref, model_tag, and prompt_ref")
+        else:
+            for field in ("model_ref", "prompt_ref"):
+                reference = fixture_identity.get(field)
+                parts = _same_repo_blob_parts(reference)
+                if _host_local(reference):
+                    errors.append(f"G3 delivery_contract.fixture_identity.{field} must not be host-local")
+                if (
+                    not isinstance(reference, str)
+                    or parts is None
+                    or urlparse(reference).scheme != "https"
+                ):
+                    errors.append(f"G3 delivery_contract.fixture_identity.{field} must be an immutable durable reference")
+                elif not _immutable_blob_reference(reference):
+                    errors.append(f"G3 delivery_contract.fixture_identity.{field} must resolve to an existing immutable repository blob")
+            if not _nonempty(fixture_identity.get("model_tag")) and not _nonempty(
+                fixture_identity.get("architecture")
+            ):
+                errors.append("G3 delivery_contract.fixture_identity must name model_tag or architecture")
         probes = contract.get("negative_or_fault_probes")
         probe_text = " ".join(probe.lower() for probe in probes if isinstance(probe, str)) if isinstance(probes, list) else ""
         if "fault" not in probe_text or "retry" not in probe_text:
