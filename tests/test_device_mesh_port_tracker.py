@@ -100,6 +100,33 @@ def test_g1_g5_consistent_delivery_dependencies():
     assert "G5" in seam_consumers["S-LOAD"]
 
 
+def test_g5_substrate_is_dag_gated_and_expert_partitioned():
+    tracker = load_tracker()
+    substrate = next(
+        row for row in tracker["obligations"] if row["id"] == "STEP-MOE-SUBSTRATE"
+    )
+    provenance = substrate["provenance"]["upstream_counterpart"].lower()
+    evidence_route = substrate["evidence"]["route"].lower()
+    assert "g1+g2+g3 consistent-deliverable dag" in provenance
+    assert "no interface-only pre-manifest or pre-g2 carve-out" in provenance
+    assert "g1+g2+g3 consistent-deliverable route" in evidence_route
+
+    g5 = change_set(tracker, "G5")
+    contract_probe_text = " ".join(
+        g5["delivery_contract"]["negative_or_fault_probes"]
+    ).lower()
+    assert "rank-local expert computation" in contract_probe_text
+    assert "not all ranks computing every expert" in contract_probe_text
+    assert "shard-local tp expert dimensions" in contract_probe_text
+    acceptance = g5["acceptance"].lower()
+    stop_condition = g5["stop_condition"].lower()
+    assert "rank-local expert computation" in acceptance
+    assert "not all ranks computing every expert" in acceptance
+    assert "shard-local tp expert dimensions" in acceptance
+    assert "all-rank expert computation" in stop_condition
+    assert "non-shard-local tp expert dimensions" in stop_condition
+
+
 def test_historical_pr_disposition_is_pinned():
     tracker = load_tracker()
     disposition = tracker["branch_provenance"]["historical_pr_disposition"]

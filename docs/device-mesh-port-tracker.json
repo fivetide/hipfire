@@ -1060,12 +1060,12 @@
           "crates/hipfire-dispatch/src/pipeline/steps.rs",
           "crates/hipfire-dispatch/src/families/moe.rs"
         ],
-        "upstream_counterpart": "Upstream Step has only single-device vocabulary; interface-safe executor types can be developed before manifest fulfillment merges."
+        "upstream_counterpart": "Upstream Step has only single-device vocabulary; G5's substrate is admitted only through the G1+G2+G3 consistent-deliverable DAG after topology, source-aware admission, and complete Single manifest/load transaction; no interface-only pre-manifest or pre-G2 carve-out is accepted."
       },
       "evidence": {
         "disposition": "rerun_required",
         "branch_record": "historical",
-        "route": "Interface-safe Step contract route; merge consumes the manifest seam.",
+        "route": "Full G1+G2+G3 consistent-deliverable route through source-aware admission, manifest fulfillment, and sealed production consumer; all evidence is current-tree rerun-required.",
         "fixture_refs": [],
         "report_refs": [],
         "classification": "rerun_required"
@@ -5701,8 +5701,8 @@
         ]
       },
       "shared_file_integration_owner": "Sealed executor steward with ArchModel and hipfire_runtime::multi_gpu ownership boundaries.",
-      "acceptance": "Sealed production qwen3.6:35b-a3b closes every #677 blocker and compares validation-only old versus production sealed routes at each committed token/logit/router/expert/activation/combine/residual/KV/state/position/collective/mesh identity; load/prefill/decode/generate/reset/abort/unload/reload and malformed/fault rollback pass; physical claims require maintained distinct-GPU evidence.",
-      "stop_condition": "Stop on any remaining #677 blocker, family-side ownership, generic-backend arithmetic drift, unsealed production path, missing production A3B route, absent per-position state oracle, or emulation presented as physical evidence.",
+      "acceptance": "Sealed production qwen3.6:35b-a3b closes every #677 blocker and compares validation-only old versus production sealed routes at each committed token/logit/router/expert/activation/combine/residual/KV/state/position/collective/mesh identity; rank-local expert computation (not all ranks computing every expert) and shard-local TP expert dimensions are preserved; load/prefill/decode/generate/reset/abort/unload/reload and malformed/fault rollback pass; physical claims require maintained distinct-GPU evidence.",
+      "stop_condition": "Stop on any remaining #677 blocker, family-side ownership, generic-backend arithmetic drift, all-rank expert computation, non-shard-local TP expert dimensions, unsealed production path, missing production A3B route, absent per-position state oracle, or emulation presented as physical evidence.",
       "status": "blocked",
       "implementation_class": "port",
       "confidence": "high",
@@ -5720,7 +5720,8 @@
         "positive_probe": "Load, prefill, decode, generate, reset, abort, unload, and reload registry qwen3.6:35b-a3b through the sealed production route with per-position numerical/state and collective identity comparisons",
         "negative_or_fault_probes": [
           "Malformed plan or pointer-table, capacity, allocation, or collective fault performs zero launches/allocations, rolls back every owner, and permits an immediate retry",
-          "Every #677 blocker is checked on the production sealed route; a failed candidate load preserves the active prior model and performs no hidden topology side effect"
+          "Every #677 blocker is checked on the production sealed route; a failed candidate load preserves the active prior model and performs no hidden topology side effect",
+          "Rank-local expert computation assigns each expert only to its owning rank (not all ranks computing every expert), and shard-local TP expert dimensions are mandatory; any violation fails closed."
         ],
         "lifecycle_observations": [
           "load",
