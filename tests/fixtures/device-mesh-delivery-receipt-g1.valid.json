@@ -34,7 +34,10 @@
       "gpu_arch": "gfx1151",
       "rocm_version": "7.0.0",
       "rccl_version": "not-used",
-      "evidence_class": "current"
+      "evidence_class": "current",
+      "report_refs": [
+        "tests/fixtures/device-mesh-port-tracker.invalid.json"
+      ]
     },
     {
       "model_tag": "qwen3.6:35b-a3b",
@@ -49,7 +52,26 @@
       "gpu_arch": "gfx1151",
       "rocm_version": "7.0.0",
       "rccl_version": "not-used",
-      "evidence_class": "current"
+      "evidence_class": "current",
+      "report_refs": [
+        "tests/fixtures/device-mesh-port-tracker.invalid.json"
+      ]
+    }
+  ],
+  "positive_result": {
+    "command": "Run the complete current-master versus final-head load-preservation matrix on fresh daemons: qwen3.6:27b and qwen3.6:35b-a3b load, generate, unload, and reload; retain text/VL classification, route-specific parity, and four-cycle ownership/memory observations",
+    "status": "pass",
+    "report_refs": [
+      "tests/fixtures/device-mesh-port-tracker.invalid.json"
+    ]
+  },
+  "negative_results": [
+    {
+      "command": "A failed candidate load preserves the active prior model, performs no hidden topology side effect, and leaves the prior route reusable",
+      "status": "pass",
+      "report_refs": [
+        "tests/fixtures/device-mesh-port-tracker.invalid.json"
+      ]
     }
   ],
   "fixture_identity": {},

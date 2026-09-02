@@ -257,7 +257,11 @@ def test_delivery_receipt_run_identity_mutations_fail_closed(tmp_path: Path):
         (
             "missing-tag",
             lambda document: change_set(document, "G1")["delivery_contract"].update(
-                required_registry_tags=["qwen3.6:27b", "missing:model"]
+                required_registry_tags=[
+                    "qwen3.6:27b",
+                    "qwen3.6:35b-a3b",
+                    "missing:model",
+                ]
             ),
             "G1 delivery receipt missing run identity for required registry tag missing:model",
         ),
@@ -287,6 +291,27 @@ def test_delivery_receipt_run_identity_mutations_fail_closed(tmp_path: Path):
                 ]
             ),
             "G1 delivery receipt lifecycle_observations must cover owning contract",
+        ),
+        (
+            "synthetic-identities",
+            lambda document: change_set(document, "G1")["delivery_contract"].update(
+                receipt_refs=["tests/fixtures/device-mesh-delivery-receipt-g1.synthetic.json"]
+            ),
+            "G1 delivery receipt run_identities[0] report_refs must be a non-empty array",
+        ),
+        (
+            "mismatched-command",
+            lambda document: change_set(document, "G1")["delivery_contract"].update(
+                receipt_refs=["tests/fixtures/device-mesh-delivery-receipt-g1.bad-command.json"]
+            ),
+            "G1 delivery receipt positive_result command does not match its owning contract",
+        ),
+        (
+            "failed-result",
+            lambda document: change_set(document, "G1")["delivery_contract"].update(
+                receipt_refs=["tests/fixtures/device-mesh-delivery-receipt-g1.failed-result.json"]
+            ),
+            "G1 delivery receipt positive_result status must be pass",
         ),
         (
             "fake-physical",
