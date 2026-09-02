@@ -24,6 +24,7 @@ DELIVERY_RECEIPTS = {
     "G4": "tests/fixtures/device-mesh-delivery-receipt-g4.valid.json",
     "G5": "tests/fixtures/device-mesh-delivery-receipt-g5.valid.json",
 }
+BAD_HASH_RECEIPT = "tests/fixtures/device-mesh-delivery-receipt-g1.bad-hash.json"
 DELIVERY_RECEIPT_COMMITS = {
     "G1": "1" * 40,
     "G2": "2" * 40,
@@ -240,6 +241,71 @@ def test_delivery_receipt_mutations_fail_closed(tmp_path: Path):
         output = result.stdout + result.stderr
         assert result.returncode != 0
         assert marker in output, f"missing receipt diagnostic {marker!r}:\n{output}"
+
+
+def test_delivery_receipt_run_identity_mutations_fail_closed(tmp_path: Path):
+    base = load_tracker()
+    _satisfy_all_prerequisites(base)
+    cases = (
+        (
+            "bad-hash",
+            lambda document: change_set(document, "G1")["delivery_contract"].update(
+                receipt_refs=[BAD_HASH_RECEIPT]
+            ),
+            "G1 delivery receipt run_identities[0].model_sha256 must be 64-hex",
+        ),
+        (
+            "missing-tag",
+            lambda document: change_set(document, "G1")["delivery_contract"].update(
+                required_registry_tags=["qwen3.6:27b", "missing:model"]
+            ),
+            "G1 delivery receipt missing run identity for required registry tag missing:model",
+        ),
+        (
+            "fixture-tag",
+            lambda document: change_set(document, "G3")["delivery_contract"][
+                "fixture_identity"
+            ].update(model_tag="wrong:model"),
+            "G3 delivery receipt missing run identity for fixture model_tag wrong:model",
+        ),
+        (
+            "missing-route",
+            lambda document: change_set(document, "G1")["delivery_contract"].update(
+                retained_routes=[
+                    *change_set(document, "G1")["delivery_contract"]["retained_routes"],
+                    "uncovered-route",
+                ]
+            ),
+            "G1 delivery receipt retained_routes must cover owning contract",
+        ),
+        (
+            "missing-lifecycle",
+            lambda document: change_set(document, "G1")["delivery_contract"].update(
+                lifecycle_observations=[
+                    *change_set(document, "G1")["delivery_contract"]["lifecycle_observations"],
+                    "uncovered-lifecycle",
+                ]
+            ),
+            "G1 delivery receipt lifecycle_observations must cover owning contract",
+        ),
+        (
+            "fake-physical",
+            lambda document: change_set(document, "G5")["delivery_contract"].update(
+                receipt_refs=[
+                    "tests/fixtures/device-mesh-delivery-receipt-g5.fake-physical.json"
+                ]
+            ),
+            "G5 delivery receipt requires a physical run identity with at least two distinct GPUs and RCCL",
+        ),
+    )
+    for name, mutation, marker in cases:
+        document = json.loads(json.dumps(base))
+        mutation(document)
+        result = _run_checker(_write_document(document, tmp_path / f"run-{name}.json"))
+        output = result.stdout + result.stderr
+        assert result.returncode != 0
+        assert marker in output, f"missing run identity diagnostic {marker!r}:\n{output}"
+
 
 
 def test_g5_in_review_requires_physical_evidence(tmp_path: Path):

@@ -43,6 +43,7 @@ ALLOWED_CHANGE_SET_STATUSES = frozenset({"implemented", "in_review", "complete",
 ALLOWED_CLASSES = frozenset({"port", "superseded", "already_upstream", "historical_evidence_only", "needs_design"})
 ALLOWED_DISPOSITIONS = frozenset({"not_applicable", "current", "historical", "rerun_required", "hardware_blocked"})
 ALLOWED_EVIDENCE_CLASSES = frozenset({"current", "historical", "rerun_required", "hardware_blocked", "semantics_only", "emulated", "failed"})
+ALLOWED_RUN_EVIDENCE_CLASSES = frozenset({"current", "physical"})
 ALLOWED_BRANCH_RECORDS = frozenset({"none", "historical"})
 ALLOWED_CONFIDENCE = frozenset({"high", "medium", "low"})
 ALLOWED_GATE_STATUSES = frozenset({"available", "complete", "proposed", "blocked"})
@@ -259,6 +260,38 @@ def _load_delivery_receipt(value: str) -> dict[str, Any] | None:
         return None
     return receipt if isinstance(receipt, dict) else None
 
+def _check_run_identity(
+    row: Any,
+    label: str,
+    index: int,
+    errors: list[str],
+) -> dict[str, Any] | None:
+    prefix = f"{label} delivery receipt run_identities[{index}]"
+    if not isinstance(row, dict):
+        errors.append(f"{prefix} must be an object")
+        return None
+    for field in ("model_tag", "topology", "gpu_arch", "rocm_version", "rccl_version"):
+        if not _nonempty(row.get(field)):
+            errors.append(f"{prefix}.{field} must be a non-empty string")
+    for field, length in (
+        ("model_sha256", 64),
+        ("prompt_md5", 32),
+        ("binary_sha256", 64),
+        ("config_sha256", 64),
+    ):
+        if not _hex_digest(row.get(field), length):
+            errors.append(f"{prefix}.{field} must be {length}-hex")
+    gpu_ids = row.get("gpu_ids")
+    if not _strings(gpu_ids, nonempty=True):
+        errors.append(f"{prefix}.gpu_ids must be a non-empty array of strings")
+    elif len(gpu_ids) != len(set(gpu_ids)):
+        errors.append(f"{prefix}.gpu_ids must contain distinct identities")
+    if row.get("evidence_class") not in ALLOWED_RUN_EVIDENCE_CLASSES:
+        errors.append(
+            f"{prefix}.evidence_class must be current or physical"
+        )
+    return row
+
 
 def _check_delivery_receipt(
     value: Any,
@@ -307,6 +340,83 @@ def _check_delivery_receipt(
     require("sole_owner", group.get("sole_owner"))
     require("revert_identity", group.get("revert_identity"))
     require("final_composition_verified", True)
+
+    retained_routes = receipt.get("retained_routes")
+    expected_routes = contract.get("retained_routes")
+    if (
+        not _strings(retained_routes, nonempty=True)
+        or not isinstance(expected_routes, list)
+        or not set(expected_routes).issubset(retained_routes)
+    ):
+        errors.append(
+            f"{label} delivery receipt retained_routes must cover owning contract"
+        )
+        valid = False
+
+    lifecycle_observations = receipt.get("lifecycle_observations")
+    expected_lifecycle = contract.get("lifecycle_observations")
+    if (
+        not _strings(lifecycle_observations, nonempty=True)
+        or not isinstance(expected_lifecycle, list)
+        or not set(expected_lifecycle).issubset(lifecycle_observations)
+    ):
+        errors.append(
+            f"{label} delivery receipt lifecycle_observations must cover owning contract"
+        )
+        valid = False
+
+    run_identities = receipt.get("run_identities")
+    run_rows: list[dict[str, Any]] = []
+    if not isinstance(run_identities, list) or not run_identities:
+        errors.append(
+            f"{label} delivery receipt run_identities must be a non-empty array"
+        )
+        valid = False
+    else:
+        for index, row in enumerate(run_identities):
+            before = len(errors)
+            checked = _check_run_identity(row, label, index, errors)
+            if checked is not None and len(errors) == before:
+                run_rows.append(checked)
+
+    required_tags = contract.get("required_registry_tags")
+    if isinstance(required_tags, list):
+        for tag in required_tags:
+            if not any(row.get("model_tag") == tag for row in run_rows):
+                errors.append(
+                    f"{label} delivery receipt missing run identity for required registry tag {tag}"
+                )
+                valid = False
+    if label == "G3":
+        fixture_identity = contract.get("fixture_identity")
+        fixture_tag = (
+            fixture_identity.get("model_tag")
+            if isinstance(fixture_identity, dict)
+            else None
+        )
+        if _nonempty(fixture_tag) and not any(
+            row.get("model_tag") == fixture_tag for row in run_rows
+        ):
+            errors.append(
+                f"{label} delivery receipt missing run identity for fixture model_tag {fixture_tag}"
+            )
+            valid = False
+
+    if label == "G5" and "physical" in evidence_classes:
+        if not any(
+            isinstance(row.get("gpu_ids"), list)
+            and len(row["gpu_ids"]) >= 2
+            and len(row["gpu_ids"]) == len(set(row["gpu_ids"]))
+            and isinstance(row.get("rccl_version"), str)
+            and row["rccl_version"].strip().lower() != "not-used"
+            and row.get("evidence_class") == "physical"
+            for row in run_rows
+        ):
+            errors.append(
+                f"{label} delivery receipt requires a physical run identity with at least two distinct GPUs and RCCL"
+            )
+            valid = False
+
     return valid
 
 

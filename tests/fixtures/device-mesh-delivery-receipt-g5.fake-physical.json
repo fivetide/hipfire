@@ -32,14 +32,11 @@
       "prompt_md5": "22222222222222222222222222222222",
       "binary_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
       "config_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
-      "gpu_ids": [
-        "gfx1151-gpu-0",
-        "gfx1151-gpu-1"
-      ],
-      "topology": "dual-gpu",
-      "gpu_arch": "gfx1151",
-      "rocm_version": "7.0.0",
-      "rccl_version": "2.20.5",
+      "gpu_ids": ["fake-gpu-0"],
+      "topology": "single-gpu",
+      "gpu_arch": "fake-arch",
+      "rocm_version": "fake-rocm",
+      "rccl_version": "not-used",
       "evidence_class": "physical"
     },
     {
@@ -48,14 +45,11 @@
       "prompt_md5": "66666666666666666666666666666666",
       "binary_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
       "config_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-      "gpu_ids": [
-        "gfx1151-gpu-0",
-        "gfx1151-gpu-1"
-      ],
-      "topology": "dual-gpu",
-      "gpu_arch": "gfx1151",
-      "rocm_version": "7.0.0",
-      "rccl_version": "2.20.5",
+      "gpu_ids": ["fake-gpu-0"],
+      "topology": "single-gpu",
+      "gpu_arch": "fake-arch",
+      "rocm_version": "fake-rocm",
+      "rccl_version": "not-used",
       "evidence_class": "physical"
     }
   ],

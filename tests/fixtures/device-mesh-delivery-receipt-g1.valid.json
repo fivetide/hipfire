@@ -8,6 +8,50 @@
   "evidence_disposition": "current",
   "evidence_classes": ["current"],
   "physical": false,
+  "retained_routes": [
+    "all-current-master-intersected-single-routes",
+    "all-current-master-intersected-pp-routes",
+    "all-current-master-intersected-tp-routes",
+    "all-current-master-intersected-ep-routes"
+  ],
+  "lifecycle_observations": [
+    "load",
+    "generate",
+    "unload",
+    "reload"
+  ],
+  "run_identities": [
+    {
+      "model_tag": "qwen3.6:27b",
+      "model_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "prompt_md5": "22222222222222222222222222222222",
+      "binary_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "config_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "gpu_ids": [
+        "gfx1151-gpu-0"
+      ],
+      "topology": "single-gpu",
+      "gpu_arch": "gfx1151",
+      "rocm_version": "7.0.0",
+      "rccl_version": "not-used",
+      "evidence_class": "current"
+    },
+    {
+      "model_tag": "qwen3.6:35b-a3b",
+      "model_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+      "prompt_md5": "66666666666666666666666666666666",
+      "binary_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+      "config_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+      "gpu_ids": [
+        "gfx1151-gpu-0"
+      ],
+      "topology": "single-gpu",
+      "gpu_arch": "gfx1151",
+      "rocm_version": "7.0.0",
+      "rccl_version": "not-used",
+      "evidence_class": "current"
+    }
+  ],
   "fixture_identity": {},
   "positive_probe": "Run the complete current-master versus final-head load-preservation matrix on fresh daemons: qwen3.6:27b and qwen3.6:35b-a3b load, generate, unload, and reload; retain text/VL classification, route-specific parity, and four-cycle ownership/memory observations",
   "negative_or_fault_probes": [
