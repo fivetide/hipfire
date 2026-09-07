@@ -777,6 +777,13 @@ impl LlamaBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes the pinned-fixture GPU evidence tests: hipMemGetInfo is
+    /// device-global, so parallel GPU tests in the same process would corrupt
+    /// the VRAM measurements and add noise to the load/unload cycle floors.
+    static GPU_EVIDENCE_LOCK: Mutex<()> = Mutex::new(());
+
     use hipfire_runtime::arch_model::ArchModel;
     use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqFile, HfqMemTensor};
     use hipfire_runtime::kv_backend::KvBackend;
@@ -938,6 +945,7 @@ mod tests {
             kv_backend: KvBackend::Contiguous,
             kv_adaptive_override: None,
             state_quant_override: None,
+            vision_path: None,
             cask,
             pp: 1,
             spec: SpecLoadCfg::default(),
@@ -1264,6 +1272,9 @@ mod tests {
     /// block is printed for the evidence run.
     #[test]
     fn pinned_fixture_manifest_legacy_parity_oracle() {
+        let _gpu_evidence_guard = GPU_EVIDENCE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let fixture = std::env::var("HIPFIRE_G3_FIXTURE").unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_default();
             format!("{home}/.hipfire/models/qwen3-0.6b-llama.mq4")
@@ -1501,6 +1512,9 @@ mod tests {
     /// absent.
     #[test]
     fn pinned_fixture_lifecycle_fault_retry_reload() {
+        let _gpu_evidence_guard = GPU_EVIDENCE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(fixture) = pinned_fixture_path() else {
             return;
         };
@@ -1631,6 +1645,9 @@ mod tests {
     /// decode works through the same weights path the manifest route replaces.
     #[test]
     fn production_awq_sidecar_loads_and_decodes_on_gpu_through_legacy_route() {
+        let _gpu_evidence_guard = GPU_EVIDENCE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Ok(mut gpu) = rdna_compute::Gpu::init() else {
             return;
         };
@@ -1681,6 +1698,9 @@ mod tests {
     /// legacy-route cycle test documents that identical behaviour.
     #[test]
     fn pinned_fixture_repeated_load_unload_cycles_leak_nothing() {
+        let _gpu_evidence_guard = GPU_EVIDENCE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(fixture) = pinned_fixture_path() else {
             return;
         };
@@ -1764,6 +1784,9 @@ mod tests {
     /// behaves no worse than the legacy loader it replaces.
     #[test]
     fn pinned_fixture_legacy_route_cycles_vram_bounded() {
+        let _gpu_evidence_guard = GPU_EVIDENCE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(fixture) = pinned_fixture_path() else {
             return;
         };
@@ -1783,7 +1806,7 @@ mod tests {
             let scratch =
                 ForwardScratch::new_with_max_seq(&mut gpu, &config, 64).expect("legacy scratch");
             let dims = llama_kv_dims(&config, 64, None);
-            let mut kv =
+            let kv =
                 <KvCache as KvCacheExt>::from_mode(KvMode::Q8, KvTarget::Single(&mut gpu), &dims)
                     .expect("legacy KV");
             let (free1, _) = gpu.hip.get_vram_info().expect("vram after load");
