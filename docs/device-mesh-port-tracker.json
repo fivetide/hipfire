@@ -15,7 +15,7 @@
       "G1 #681 merged on master; tracker acceptance remains unchanged and unclaimed.",
       "G2 #682 remains open against master; head 95e0e654 is on beta and is not a milestone acceptance.",
       "G3 #704 is ready on beta at head 1e68f8181; this is a map-only commit with no new numerical hardware evidence and does not substitute for the accepted G3 prerequisite.",
-      "G4 local branch replan/g4-error-ownership is based on beta; it is not an implementation or acceptance claim.",
+      "G4 first independent allocation-error fix is open as #731 against beta at 0c76c3470afe8da862b25d7f34b21669ce6dd9d2 (replan/g4-error-ownership): owning prefill scratch rollback, reproduced GPU fault/retry, and seven completed serving turns. This is scoped PR evidence only; G4 milestone status, completion evidence, and receipts remain unchanged.",
       "Historical #675 is closed and #677 remains stale; their provenance and evidence remain non-promoting."
     ]
   },
