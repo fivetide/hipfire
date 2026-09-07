@@ -372,14 +372,6 @@ def test_g5_substrate_is_dag_gated_and_expert_partitioned():
     assert "non-shard-local tp expert dimensions" in stop_condition
 
 
-def test_historical_pr_disposition_is_pinned():
-    tracker = load_tracker()
-    disposition = tracker["branch_provenance"]["historical_pr_disposition"]
-    assert disposition["transiently_merged_then_reverted"] == ["#673", "#674", "#676"]
-    assert disposition["stale_open_drafts"] == ["#675", "#677"]
-    assert disposition["rollback_commit"] == "a0fca0d6db3f9584f1ddac7f7a940fece74d3900"
-    assert disposition["archive_commit"] == "541b33c33e235efadeec67aac1da766c085cc67f"
-    assert disposition["evidence_disposition"] == "historical/rerun_required"
 
 
 

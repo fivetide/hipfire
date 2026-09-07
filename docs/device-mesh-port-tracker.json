@@ -5,8 +5,19 @@
   "purpose": "Single machine-readable authority retaining domain/task proof obligations while grouping review/revert boundaries. It records intent and evidence state; it never promotes branch evidence or creates an admission.",
   "upstream": {
     "remote": "upstream",
-    "branch": "master",
-    "series_origin_ref": "6163369329d3b076376286a00c13cadbae069ecc"
+    "branch": "beta",
+    "series_origin_ref": "6163369329d3b076376286a00c13cadbae069ecc",
+    "integration_base_commit": "febf298a22862b24ab6bb709546499f23f07676b",
+    "release_branch": "master",
+    "release_head_commit": "f4e1412e81b84e35934ba51fb453d329f4c2f041",
+    "integration_status": "upstream/beta is the current G2/G3 integration line. Today's beta line does not contain the accepted G2/G4/G5 prerequisite composition and does not claim G3 or G5 acceptance; upstream/master remains the release destination. This working-line reference does not promote any G1-G5 milestone: final composed heads still require complete final-head reruns and accepted structured receipts.",
+    "integration_records": [
+      "G1 #681 merged on master; tracker acceptance remains unchanged and unclaimed.",
+      "G2 #682 remains open against master; head 95e0e654 is on beta and is not a milestone acceptance.",
+      "G3 #704 is ready on beta at head 1e68f8181; this is a map-only commit with no new numerical hardware evidence and does not substitute for the accepted G3 prerequisite.",
+      "G4 local branch replan/g4-error-ownership is based on beta; it is not an implementation or acceptance claim.",
+      "Historical #675 is closed and #677 remains stale; their provenance and evidence remain non-promoting."
+    ]
   },
   "branch_provenance": {
     "common_upstream_base": "78065c084c1c67f64d282bd904b1b28cd94aca42",
@@ -30,8 +41,10 @@
         "#676"
       ],
       "stale_open_drafts": [
-        "#675",
         "#677"
+      ],
+      "closed_historical": [
+        "#675"
       ],
       "rollback_commit": "a0fca0d6db3f9584f1ddac7f7a940fece74d3900",
       "archive_commit": "541b33c33e235efadeec67aac1da766c085cc67f",
@@ -162,7 +175,7 @@
       "final_closure"
     ],
     "branch_evidence_rule": "Branch reports and measurements remain historical provenance. A rerun_required row needs a durable current-tree report before completion; hardware_blocked rows require the distinct physical topology named by their contract. Repository report paths must exist and be approved report-like artifacts under docs/, tests/, or benchmarks/ (not Cargo.toml, crates/, or other source/config); GitHub commit/blob URLs must contain an immutable 40-hex commit and valid structure; bogus hashes and local-only .agent-progress paths are rejected.",
-    "consistent_deliverable_rule": "A G1-G5 milestone is promoted only from its final composed current-master head after its complete production, regression, fault, lifecycle, and evidence matrix passes. Internal commits and optional partial PRs contribute evidence but never complete the milestone independently. Its delivery_contract receipt_refs must name an existing structured hipfire.device_mesh.delivery_receipt.v1 report artifact or a resolvable immutable same-repository GitHub blob, not a bare commit; the receipt must match the owning final head, routes, evidence disposition/classes, probes, ownership, and composition, and carry pinned run_identities for every required registry tag.",
+    "consistent_deliverable_rule": "A G1-G5 milestone is promoted only from its final composed current-beta head after its complete production, regression, fault, lifecycle, and evidence matrix passes. Internal commits and optional partial PRs contribute evidence but never complete the milestone independently. Its delivery_contract receipt_refs must name an existing structured hipfire.device_mesh.delivery_receipt.v1 report artifact or a resolvable immutable same-repository GitHub blob, not a bare commit; the receipt must match the owning final head, routes, evidence disposition/classes, probes, ownership, and composition, and carry pinned run_identities for every required registry tag.",
     "merge_boundary_rule": "The merge boundary is the smallest end-to-end production capability that leaves master usable; PR size and obligation count do not determine acceptance.",
     "receipt_invalidation_rule": "Changing a consumed producer commit, production route, fixture identity, comparator, or validation route invalidates descendant receipts and requires rerun.",
     "one_row_rule": "Completion rows remain one-per-obligation for unambiguous mapping; this does not constrain PR size or independently complete a milestone.",
@@ -5166,13 +5179,13 @@
       "produced_seam_gates": [
         "S-TOPOLOGY"
       ],
-      "source_assumption": "Current-master topology, resolved device selection, and peer-lease behavior can be cut over to one DeviceMesh authority without changing admitted models or production routes.",
+      "source_assumption": "Current-beta topology, resolved device selection, and peer-lease behavior can be cut over to one DeviceMesh authority without changing admitted models or production routes.",
       "sole_owner": "hipfire_runtime::multi_gpu::Gpus owns devices, allocation, peer ownership, and collectives; DeviceMesh is the sole topology authority.",
       "production_route": "Current production model-loading route consumes DeviceMesh while preserving every intersected Single/PP/TP/EP route.",
       "positive_evidence": [
         {
           "classification": "rerun_required",
-          "assertion": "The complete current-master versus final-head preservation matrix must rerun every intersected Single/PP/TP/EP route, including fresh-daemon qwen3.6:27b and qwen3.6:35b-a3b load/generate/unload, text artifacts with vision_config but no tower, and four synchronized cycles with stable ownership and memory.",
+          "assertion": "The complete current-beta versus final-head preservation matrix must rerun every intersected Single/PP/TP/EP route, including fresh-daemon qwen3.6:27b and qwen3.6:35b-a3b load/generate/unload, text artifacts with vision_config but no tower, and four synchronized cycles with stable ownership and memory.",
           "references": [
             "docs/device-mesh-port-tracker.json",
             "TOPOLOGY"
@@ -5228,7 +5241,7 @@
           "all-current-master-intersected-tp-routes",
           "all-current-master-intersected-ep-routes"
         ],
-        "positive_probe": "Run the complete current-master versus final-head load-preservation matrix on fresh daemons: qwen3.6:27b and qwen3.6:35b-a3b load, generate, unload, and reload; retain text/VL classification, route-specific parity, and four-cycle ownership/memory observations",
+        "positive_probe": "Run the complete current-beta versus final-head load-preservation matrix on fresh daemons: qwen3.6:27b and qwen3.6:35b-a3b load, generate, unload, and reload; retain text/VL classification, route-specific parity, and four-cycle ownership/memory observations",
         "negative_or_fault_probes": [
           "A failed candidate load preserves the active prior model, performs no hidden topology side effect, and leaves the prior route reusable"
         ],
