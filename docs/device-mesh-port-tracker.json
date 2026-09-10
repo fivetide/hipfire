@@ -7,15 +7,16 @@
     "remote": "upstream",
     "branch": "beta",
     "series_origin_ref": "6163369329d3b076376286a00c13cadbae069ecc",
-    "integration_base_commit": "febf298a22862b24ab6bb709546499f23f07676b",
+    "integration_base_commit": "b8092f7c7fe0eb3dabccc28e8993ee10c3465fc6",
     "release_branch": "master",
     "release_head_commit": "f4e1412e81b84e35934ba51fb453d329f4c2f041",
-    "integration_status": "upstream/beta is the current G2/G3 integration line. Today's beta line does not contain the accepted G2/G4/G5 prerequisite composition and does not claim G3 or G5 acceptance; upstream/master remains the release destination. This working-line reference does not promote any G1-G5 milestone: final composed heads still require complete final-head reruns and accepted structured receipts.",
+    "integration_status": "upstream/beta is the current composed integration line and contains the upstream-native G2 and G3 work plus the first G4.1 and G4.2 constituent transactions. Upstream/master remains the release destination. Integration, GitHub PR state, constituent evidence, and milestone acceptance remain separate: no G1-G5 milestone is promoted here without a complete final-head matrix and accepted structured receipt.",
     "integration_records": [
-      "G1 #681 merged on master; tracker acceptance remains unchanged and unclaimed.",
-      "G2 #682 remains open against master; head 95e0e654 is on beta and is not a milestone acceptance.",
-      "G3 #704 is ready on beta at head 1e68f8181; this is a map-only commit with no new numerical hardware evidence and does not substitute for the accepted G3 prerequisite.",
-      "G4 first independent allocation-error fix is open as #731 against beta at 0c76c3470afe8da862b25d7f34b21669ce6dd9d2 (replan/g4-error-ownership): owning prefill scratch rollback, reproduced GPU fault/retry, and seven completed serving turns. This is scoped PR evidence only; G4 milestone status, completion evidence, and receipts remain unchanged.",
+      "G1 #681 merged on master at 8cd15a62b593e950b6fe0082b88bb79d122d1dc2 and is present on beta; tracker milestone acceptance remains unchanged and unclaimed.",
+      "G2 #682 remains open against master with changes requested and behind status, while its exact head 95e0e654e59a3892777a6fc73894006a576c6e43 was maintainer-integrated into beta through staging commit 4d0e0a1b4. Related admission-refusal PR #687 remains open against master while its content is integrated into beta at 0297aed6b. Neither GitHub state nor beta integration alone promotes G2.",
+      "G3 #704 was closed as ported rather than merged unchanged. The maintainer-integrated, review-corrected Single plain-LLaMA manifest/load pilot is on beta at 35dbd64a3; master remains unchanged. Its current numerical, lifecycle, rollback, and serving evidence is integration evidence, while tracker promotion still requires an accepted structured receipt bound to the final composed head.",
+      "G4.1 consists of #731 merged into beta at af3990571 and #735 closed as ported and integrated at 800ddf740. Maintainer-composed hardware rollback/retry and decoded-serving evidence closes those construction constituents only; complete G4 lifecycle acceptance remains blocked.",
+      "G4.2 #736 was closed as ported and maintainer-integrated with review corrections into beta at 24fc65c45. Its DFlash construction evidence closes that constituent only; complete G4 lifecycle acceptance remains blocked.",
       "Historical #675 is closed and #677 remains stale; their provenance and evidence remain non-promoting."
     ]
   },
