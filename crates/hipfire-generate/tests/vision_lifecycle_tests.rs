@@ -689,7 +689,6 @@ fn child_vl_matrix() {
     spawn_abort_injector();
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init");
     warm_first_alloc(&mut gpu);
-    let vram_base = vram_free_bytes(&gpu);
 
     let mut m = admit_and_load(
         &mut gpu,
@@ -700,6 +699,11 @@ fn child_vl_matrix() {
     );
     emit_marker("SECTION load-ok");
     let prompt = "Describe this image in detail.";
+    // Warmup turn BEFORE the VRAM baseline: first-use kernel compiles land
+    // here, so later per-turn/unload accounting measures owned state only.
+    // Attempt 99 is unique to this throwaway turn (parent never aborts it).
+    vl_turn(&mut m, &mut gpu, "g48-vl-warm", 99, &image, prompt, 8, true);
+    let vram_base = vram_free_bytes(&gpu);
 
     // T1 baseline; T2 cancel-before-prefill; T3 injected prefill fault;
     // T4 reuse-after-fault.
@@ -813,7 +817,6 @@ fn child_dots_matrix() {
     spawn_abort_injector();
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init");
     warm_first_alloc(&mut gpu);
-    let vram_base = vram_free_bytes(&gpu);
 
     // max_seq 8192: the smoke image yields 4880 visual tokens plus prompt,
     // so 2048 would trip the KV-budget guard before prefill.
@@ -826,6 +829,11 @@ fn child_dots_matrix() {
     );
     emit_marker("SECTION load-ok");
     let prompt = "Transcribe all visible text in reading order.";
+    // Warmup turn BEFORE the VRAM baseline: first-use kernel compiles land
+    // here (rope/attention/gather kernels compile on first use), so later
+    // per-turn/unload accounting measures owned state only.
+    dots_turn(&mut m, &mut gpu, "g48-dots-warm", 100, &image, prompt, 16, true);
+    let vram_base = vram_free_bytes(&gpu);
 
     // AR: baseline, prefill cancel, prefill fault, reuse; argmax fault,
     // reuse; decode fault, reuse; decode cancel, reuse.
@@ -871,6 +879,9 @@ fn child_dots_matrix() {
         "ngram speculator must load for the spec phase"
     );
     emit_marker("SECTION reload-spec-ok");
+    // Warmup spec turn: first-use verify-path kernels/scratch land here so
+    // the final unload accounting (against the phase-1 baseline) stays clean.
+    dots_turn(&mut m, &mut gpu, "g48-dots-swarm", 114, &image, prompt, 16, true);
     dots_turn(&mut m, &mut gpu, "g48-dots-s1", 111, &image, prompt, 16, true);
     std::env::set_var("HIPFIRE_DOTS_FAULT", "spec");
     dots_turn(&mut m, &mut gpu, "g48-dots-s2", 112, &image, prompt, 16, false);
