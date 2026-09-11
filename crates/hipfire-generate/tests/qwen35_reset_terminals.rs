@@ -433,3 +433,165 @@ fn attest_pp_all_devices_ok_attests() {
     assert!(ep.rolled_back);
     assert!(ep.context.is_none());
 }
+
+/// S1/S2 shape since E3: attested rollback renders `rolled_back=true` with
+/// the message verbatim. Class/retryable unchanged (`internal`/false).
+#[test]
+fn qwen_single_prefill_fail_error_shape_attested() {
+    let _guard = lock();
+    let id = "g47-s1-attested";
+    fresh_controlled_attempt(id, 71_009);
+    let mut sink = Vec::new();
+    {
+        let _scope = GenerationRouteScope::enter(GenerationRoute::QwenAr, id);
+        emit_generation_start(GenerationRoute::QwenAr, &mut sink, id, false);
+        let ep = RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        };
+        emit_fail_closed_error(
+            &mut sink,
+            Some(id),
+            "forward_prefill_batch: injected",
+            "internal",
+            false,
+            &ep,
+        );
+    }
+    let events = parse_lines(&sink);
+    let errors: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["type"] == "error")
+        .collect();
+    assert_eq!(errors.len(), 1, "S1 must emit exactly one error: {events:?}");
+    assert_eq!(errors[0]["message"], "forward_prefill_batch: injected");
+    assert_eq!(errors[0]["class"], "internal");
+    assert_eq!(errors[0]["retryable"], false);
+    assert_eq!(errors[0]["rolled_back"], true);
+    assert!(
+        events.iter().all(|event| event["type"] != "done"),
+        "S1 must not emit done: {events:?}"
+    );
+    teardown();
+}
+
+/// S4 shape since E3: attested rollback keeps `transient`/retryable and
+/// flips only `rolled_back` to true.
+#[test]
+fn qwen_single_downshift_fail_error_shape_attested() {
+    let _guard = lock();
+    let id = "g47-s4-attested";
+    fresh_controlled_attempt(id, 71_010);
+    let mut sink = Vec::new();
+    {
+        let _scope = GenerationRouteScope::enter(GenerationRoute::QwenAr, id);
+        emit_generation_start(GenerationRoute::QwenAr, &mut sink, id, false);
+        let ep = RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        };
+        emit_fail_closed_error(
+            &mut sink,
+            Some(id),
+            "adaptive KV transition failed during decode: injected",
+            "transient",
+            true,
+            &ep,
+        );
+    }
+    let events = parse_lines(&sink);
+    let errors: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["type"] == "error")
+        .collect();
+    assert_eq!(errors.len(), 1, "S4 must emit exactly one error: {events:?}");
+    assert_eq!(errors[0]["class"], "transient");
+    assert_eq!(errors[0]["retryable"], true);
+    assert_eq!(errors[0]["rolled_back"], true);
+    assert!(
+        events.iter().all(|event| event["type"] != "done"),
+        "S4 must not emit done: {events:?}"
+    );
+    teardown();
+}
+
+/// Injected after-first-decode seam, single-AR terminal: `gpu`/retryable
+/// error with attested `rolled_back=true`, matching the prefill seam.
+#[test]
+fn qwen_single_injected_first_decode_shape_attested() {
+    let _guard = lock();
+    let id = "g47-seam-decode";
+    fresh_controlled_attempt(id, 71_011);
+    let mut sink = Vec::new();
+    {
+        let _scope = GenerationRouteScope::enter(GenerationRoute::QwenAr, id);
+        emit_generation_start(GenerationRoute::QwenAr, &mut sink, id, false);
+        let ep = RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        };
+        emit_fail_closed_error(
+            &mut sink,
+            Some(id),
+            "injected fault after first decode",
+            "gpu",
+            true,
+            &ep,
+        );
+    }
+    let events = parse_lines(&sink);
+    let errors: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["type"] == "error")
+        .collect();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0]["message"], "injected fault after first decode");
+    assert_eq!(errors[0]["class"], "gpu");
+    assert_eq!(errors[0]["retryable"], true);
+    assert_eq!(errors[0]["rolled_back"], true);
+    assert!(
+        events.iter().all(|event| event["type"] != "done"),
+        "seam must not emit done: {events:?}"
+    );
+    teardown();
+}
+
+/// Injected after-first-decode seam, PP terminal: same classification through
+/// the pipeline-parallel route with attested `rolled_back=true`.
+#[test]
+fn pp_injected_first_decode_shape_attested() {
+    let _guard = lock();
+    let id = "g47-pp-seam-decode";
+    fresh_controlled_attempt(id, 71_012);
+    let mut sink = Vec::new();
+    {
+        let _scope = GenerationRouteScope::enter(GenerationRoute::PipelineParallel, id);
+        emit_generation_start(GenerationRoute::PipelineParallel, &mut sink, id, false);
+        let ep = RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        };
+        emit_fail_closed_error_for_route(
+            GenerationRoute::PipelineParallel,
+            &mut sink,
+            Some(id),
+            "injected fault after first decode",
+            "gpu",
+            true,
+            &ep,
+        );
+    }
+    let events = parse_lines(&sink);
+    let errors: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["type"] == "error")
+        .collect();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0]["message"], "injected fault after first decode");
+    assert_eq!(errors[0]["rolled_back"], true);
+    assert!(
+        events.iter().all(|event| event["type"] != "done"),
+        "seam must not emit done: {events:?}"
+    );
+    teardown();
+}
