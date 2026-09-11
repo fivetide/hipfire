@@ -2551,8 +2551,9 @@ pub fn generate(
     // budget+beta+safety regardless of conversation length, so reset never
     // needs to fire — eviction reclaims slots after each token. When eviction
     // is OFF, physical grows unbounded up to max_seq; reset when we'd overrun.
-    let tokenizer = m.tokenizer.as_ref().unwrap();
-    let prompt_est = tokenizer.encode(prompt).len() + 20;
+    // Borrow `tokenizer` per-use (never held across whole-`m` calls): the
+    // context-full reset below reborrows `m` through the canonical reset.
+    let prompt_est = m.tokenizer.as_ref().unwrap().encode(prompt).len() + 20;
     if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
         .ok()
         .as_deref()
@@ -2599,28 +2600,24 @@ pub fn generate(
         }
         // Zero DeltaNet state on reset. qwen35 recurrent state lives in the
         // bundle (ModelState::Qwen35), not the always-None m.dn_state/m.kv_cache.
-        // Use the canonical reset so newly added recurrent buffers (notably the
-        // Q8 error-feedback residual) cannot leak across rollover boundaries.
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            if let Err(e) = b.dn_state.reset(gpu) {
-                // G4.7: attest the reset attempt (invalidate + sync) so the
-                // terminal reports whether retry is safe.
-                // No bundle borrows live here yet (kv/dn bind later); the
-                // diverging return ends the `tokenizer` loan.
-                let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
-                crate::common::emit_fail_closed_error(
-                    stdout,
-                    Some(id),
-                    &format!("context reset failed: {e}"),
-                    "gpu",
-                    true,
-                    &ep,
-                );
-                return;
-            }
-            b.kv_cache.compact_offset = 0;
+        // Canonical reset (G4.7 E4): replaces `dn_state.reset` so all four
+        // buffers (notably the Q8 error-feedback residual) accumulate errors
+        // instead of short-circuiting; KV compact_offset is handled inside.
+        // Single path only (pp>1 never reaches this route). Llama/adaptive
+        // arms below are unchanged.
+        if let Err(e) = crate::common::reset_qwen35_recurrent(m, gpu) {
+            // G4.7: attest the reset attempt (invalidate + sync) so the
+            // terminal reports whether retry is safe.
+            let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+            crate::common::emit_fail_closed_error(
+                stdout,
+                Some(id),
+                &format!("context reset failed: {e}"),
+                "gpu",
+                true,
+                &ep,
+            );
+            return;
         }
         if let Some(b) = m.state.as_mut().and_then(|s| {
             (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()
@@ -2637,6 +2634,7 @@ pub fn generate(
             }
         }
     }
+    let tokenizer = m.tokenizer.as_ref().unwrap();
 
     // `nl` is needed for the trailer write after natural <|im_end|>
     // termination; `im_end` derives the EOS-check token id. Other
@@ -3488,9 +3486,10 @@ pub fn generate(
         }
         // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
         // the always-None m.dn_state/m.kv_cache. Canonical reset — no m-derived
-        // loan spans this block (last `tokenizer` use is above), so the
-        // whole-`m` call compiles. Error accumulation replaces the swallowed
-        // memsets; on failure fail closed rather than serving over dirty state.
+        // loan spans this block (the `tokenizer` rebind below keeps later uses
+        // on a fresh loan), so the whole-`m` call compiles. Error accumulation
+        // replaces the swallowed memsets; on failure fail closed rather than
+        // serving over dirty state.
         if let Err(e) = crate::common::reset_qwen35_recurrent(m, gpu) {
             let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
             crate::common::emit_fail_closed_error(
@@ -3767,9 +3766,8 @@ pub fn generate(
                             // attested rollback. Keeps `transient`/retryable;
                             // only `rolled_back` is now attested.
                             let _ = (kv, dn, weights, config, scratch);
-                            let ep = crate::common::production_fail_closed_rollback(
-                                m, gpu, None, None,
-                            );
+                            let ep =
+                                crate::common::production_fail_closed_rollback(m, gpu, None, None);
                             crate::common::emit_fail_closed_error(
                                 stdout,
                                 Some(id),
@@ -3859,9 +3857,8 @@ pub fn generate(
                             // only `rolled_back` is now attested.
                             // maybe_downshift already poisons on partial failure; surface hard.
                             let _ = (kv, dn, weights, config, scratch);
-                            let ep = crate::common::production_fail_closed_rollback(
-                                m, gpu, None, None,
-                            );
+                            let ep =
+                                crate::common::production_fail_closed_rollback(m, gpu, None, None);
                             crate::common::emit_fail_closed_error(
                                 stdout,
                                 Some(id),
@@ -4341,9 +4338,7 @@ pub fn generate(
                         // turn would prefill over drifted state). Keeps
                         // `transient`/retryable; only `rolled_back` attested.
                         let _ = (kv, dn, weights, config, scratch);
-                        let ep = crate::common::production_fail_closed_rollback(
-                            m, gpu, None, None,
-                        );
+                        let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
                         crate::common::emit_fail_closed_error(
                             stdout,
                             Some(id),

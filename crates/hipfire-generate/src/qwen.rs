@@ -4440,8 +4440,9 @@ pub fn generate_multi(
     // byte-identical at temp>0.
     request_seed: u64,
 ) {
-    let tokenizer = m.tokenizer.as_ref().unwrap();
-    let prompt_est = tokenizer.encode(prompt).len() + 20;
+    // Borrow `tokenizer` per-use (never held across whole-`m` calls): the
+    // pre-prefill resets below reborrow `m` through the canonical reset.
+    let prompt_est = m.tokenizer.as_ref().unwrap().encode(prompt).len() + 20;
     if m.seq_pos
         .saturating_add(prompt_est)
         .saturating_add(max_tokens)
@@ -4455,63 +4456,21 @@ pub fn generate_multi(
         m.conversation_tokens.clear();
         free_checkpoints(&mut m.prefill_checkpoints, gpu);
         free_checkpoints(&mut m.dflash_checkpoints, gpu);
-        // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
-        // the always-None m.dn_state/m.kv_cache. Inlined (disjoint field access)
-        // because a `&tokenizer` borrow of `m` is live here; covers both the
-        // pp>1 per-LA-device path and the single-GPU path.
-        if m.pp > 1 {
-            if let (Some(b), Some(gpus), Some(la)) = (
-                m.state.as_mut().and_then(|s| {
-                    (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-                }),
-                m.pp_gpus.as_mut(),
-                m.pp_dn_la_to_device.as_ref(),
-            ) {
-                let dn = &b.dn_state;
-                for (i, s) in dn.s_matrices.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for (i, s) in dn.s_scales.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for (i, s) in dn.conv_states.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                // multi-GPU currently leaves s_ef_residual empty; loop is a no-op then,
-                // but keeps single-GPU parity if EF is ever wired per-device.
-                for (i, s) in dn.s_ef_residual.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+        // Canonical recurrent reset (G4.7 E4): pp-aware, accumulates every
+        // bind/memset error instead of swallowing them. KV compact_offset is
+        // handled inside. On failure fail closed rather than serving over
+        // dirty state (practically unreachable on healthy GPUs).
+        if let Err(e) = crate::common::reset_qwen35_recurrent(m, gpu) {
+            let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+            let mut msg = format!("context reset failed: {e}");
+            if !ep.rolled_back {
+                if let Some(ctx) = ep.context.as_ref() {
+                    msg = format!("{msg} ({ctx})");
                 }
             }
-        } else if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_ef_residual {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            b.kv_cache.compact_offset = 0;
+            emit_active_attempt_error(stdout, Some(id), &msg, "gpu", true, ep.rolled_back);
+            let _ = stdout.flush();
+            return;
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
             if let Some(b) = m.state.as_mut().and_then(|s| {
@@ -4523,6 +4482,7 @@ pub fn generate_multi(
             }
         }
     }
+    let tokenizer = m.tokenizer.as_ref().unwrap();
 
     let im_end = tokenizer.encode("<|im_end|>");
     let nl = tokenizer.encode("\n");
@@ -4733,71 +4693,33 @@ pub fn generate_multi(
     // re-rendered every turn, so turn 2+ must cold-reset BEFORE the budget guard
     // + prefill — otherwise the full render appends to the prior turn's dirty
     // KV / DeltaNet / checkpoint state (stale recurrent state → drift; the
-    // system prompt was also being silently dropped on turn 2+). Same DN/KV
-    // core as `production_pp_fail_closed_rollback` (G4.7), written inline
-    // because a `&tokenizer` borrow of `m` is live here. Same shape as the
-    // context-full reset at the top of this fn and generate()'s `jinja_active &&
-    // seq_pos > 0` block.
+    // system prompt was also being silently dropped on turn 2+). DN/KV core
+    // is the canonical `reset_qwen35_recurrent` (G4.7 E4); the `tokenizer`
+    // rebind below keeps its loan from spanning the whole-`m` call. Same
+    // shape as the context-full reset at the top of this fn and generate()'s
+    // `jinja_active && seq_pos > 0` block.
     if try_jinja && m.seq_pos > 0 {
         m.seq_pos = 0;
         m.conversation_tokens.clear();
         free_checkpoints(&mut m.prefill_checkpoints, gpu);
         free_checkpoints(&mut m.dflash_checkpoints, gpu);
-        // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
-        // the always-None m.dn_state/m.kv_cache. Covers pp>1 + single-GPU.
-        if m.pp > 1 {
-            if let (Some(b), Some(gpus), Some(la)) = (
-                m.state.as_mut().and_then(|s| {
-                    (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-                }),
-                m.pp_gpus.as_mut(),
-                m.pp_dn_la_to_device.as_ref(),
-            ) {
-                let dn = &b.dn_state;
-                for (i, s) in dn.s_matrices.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for (i, s) in dn.s_scales.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for (i, s) in dn.conv_states.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                // multi-GPU currently leaves s_ef_residual empty; loop is a no-op then,
-                // but keeps single-GPU parity if EF is ever wired per-device.
-                for (i, s) in dn.s_ef_residual.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+        // Canonical recurrent reset (G4.7 E4): pp-aware, accumulates every
+        // bind/memset error instead of swallowing them. KV compact_offset is
+        // handled inside. No m-derived loan spans this block (the `tokenizer`
+        // borrow below starts after it), so the whole-`m` call compiles. On
+        // failure fail closed rather than serving over dirty state
+        // (practically unreachable on healthy GPUs).
+        if let Err(e) = crate::common::reset_qwen35_recurrent(m, gpu) {
+            let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+            let mut msg = format!("prompt-cache reset failed: {e}");
+            if !ep.rolled_back {
+                if let Some(ctx) = ep.context.as_ref() {
+                    msg = format!("{msg} ({ctx})");
                 }
             }
-        } else if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_ef_residual {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            b.kv_cache.compact_offset = 0;
+            emit_active_attempt_error(stdout, Some(id), &msg, "gpu", true, ep.rolled_back);
+            let _ = stdout.flush();
+            return;
         }
         if let Some(b) = m.state.as_mut().and_then(|s| {
             (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()
@@ -4805,6 +4727,10 @@ pub fn generate_multi(
             b.kv.compact_offset = 0;
         }
     }
+    // Rebind `tokenizer` past the cold-reset above: the pre-reset borrow
+    // ended at its last use, and this fresh borrow starts after the
+    // whole-`m` canonical reset call, so no loan spans it.
+    let tokenizer = m.tokenizer.as_ref().unwrap();
 
     let trailer = nl.len();
     if m.seq_pos
