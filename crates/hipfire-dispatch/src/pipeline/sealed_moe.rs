@@ -26,6 +26,26 @@ const GROUPED_BLOCK_M: usize = super::MOE_GROUPED_BLOCK_M;
 static NEXT_INVOCATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_TABLE_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(feature = "serve-fault-inject")]
+thread_local! {
+    static FAULT_AFTER_EXPERT_MUTATION_ARMED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(feature = "serve-fault-inject")]
+pub fn arm_fault_after_expert_mutation(armed: bool) {
+    FAULT_AFTER_EXPERT_MUTATION_ARMED.with(|cell| cell.set(armed));
+}
+
+#[cfg(feature = "serve-fault-inject")]
+pub fn take_fault_after_expert_mutation() -> bool {
+    FAULT_AFTER_EXPERT_MUTATION_ARMED.with(|cell| {
+        let armed = cell.get();
+        cell.set(false);
+        armed
+    })
+}
+
 /// Checked upper bound for padded grouped rows. Every active expert can add
 /// at most `block - 1` padding rows; the result is rounded up to a complete
 /// tile because grouped kernels index one tile id per block.
@@ -1485,9 +1505,12 @@ fn validate_prefill(
         params.m_total_max,
         "prefill sorted slots",
     )?;
+    let expert_tile_bytes = (params.m_total_max / GROUPED_BLOCK_M)
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| invalid("prefill expert tile capacity overflows"))?;
     require_elements(
         params.expert_tile_ids,
-        params.m_total_max,
+        expert_tile_bytes,
         "prefill expert tiles",
     )?;
     require_elements(

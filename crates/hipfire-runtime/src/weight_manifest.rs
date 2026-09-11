@@ -925,11 +925,14 @@ fn source_shape_matches(
 fn validate_expert_sources(spec: &ExpertGroupSpec, manifest: &[WeightEntry]) -> Result<(), String> {
     let context = expert_context(spec);
     let router = manifest_entry(spec, manifest, "router", &spec.router)?;
-    if !matches!(router.logical_shape.len(), 1 | 2)
-        || router.logical_shape.last() != Some(&spec.n_experts)
-    {
+    let router_shape_matches = match router.logical_shape.as_slice() {
+        [n_experts] => *n_experts == spec.n_experts,
+        [n_experts, _hidden] => *n_experts == spec.n_experts,
+        _ => false,
+    };
+    if !router_shape_matches {
         return Err(format!(
-            "{context}: router '{}' shape {:?} must end in n_experts={}",
+            "{context}: router '{}' shape {:?} must start with n_experts={}",
             router.name, router.logical_shape, spec.n_experts
         ));
     }
@@ -1123,7 +1126,7 @@ mod tests {
     #[test]
     fn expert_source_identity_and_shape_are_checked() {
         let manifest = vec![
-            WeightEntry::layer("router", 0, vec![8, 4], DType::F16, ShardPolicy::Replicate),
+            WeightEntry::layer("router", 0, vec![4, 8], DType::F16, ShardPolicy::Replicate),
             WeightEntry::layer(
                 "gate_up",
                 0,
@@ -1395,7 +1398,7 @@ mod tests {
         let mut manifest = vec![WeightEntry::layer(
             "router",
             0,
-            vec![8, 4],
+            vec![4, 8],
             DType::F16,
             ShardPolicy::Replicate,
         )];

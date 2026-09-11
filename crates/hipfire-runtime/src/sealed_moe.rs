@@ -1745,7 +1745,7 @@ mod tests {
             assign: ExpertAssign::Stride,
         };
         let manifest = vec![
-            WeightEntry::layer("router", 0, vec![2, 4], DType::F32, ShardPolicy::Replicate),
+            WeightEntry::layer("router", 0, vec![4, 2], DType::F32, ShardPolicy::Replicate),
             WeightEntry::layer("gate", 0, vec![4, 2, 2], DType::F32, expert_policy.clone()),
             WeightEntry::layer("up", 0, vec![4, 2, 2], DType::F32, expert_policy.clone()),
             WeightEntry::layer("down", 0, vec![4, 2, 2], DType::F32, expert_policy),
@@ -1802,7 +1802,7 @@ mod tests {
                 ExpertSourceMetadata::new(
                     "router",
                     "fixture-v1",
-                    vec![2, 4],
+                    vec![4, 2],
                     DType::F32,
                     32,
                     16,
@@ -2648,7 +2648,7 @@ mod tests {
     fn fused_gate_up_source_seals_two_logical_halves_with_shared_identity() {
         let mesh = DeviceMesh::single().unwrap();
         let manifest = vec![
-            WeightEntry::layer("router", 0, vec![1, 2], DType::F32, ShardPolicy::Replicate),
+            WeightEntry::layer("router", 0, vec![2, 1], DType::F32, ShardPolicy::Replicate),
             WeightEntry::layer(
                 "gate_up",
                 0,
@@ -2692,7 +2692,7 @@ mod tests {
             ExpertSourceMetadata::new(
                 "router",
                 "fused-v1",
-                vec![1, 2],
+                vec![2, 1],
                 DType::F32,
                 8,
                 8,

@@ -107,6 +107,7 @@ pub struct Observation {
     pub sequence: String,
     pub kind: String,
     pub layer: usize,
+    #[serde(rename = "position_index")]
     pub position: usize,
     #[serde(flatten)]
     pub snapshot: Snapshot,

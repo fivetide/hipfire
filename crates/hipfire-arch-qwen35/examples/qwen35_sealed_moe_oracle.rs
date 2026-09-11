@@ -262,6 +262,17 @@ fn forward_prefill(
     if tokens.is_empty() {
         return Ok(());
     }
+    if chunk == 1 {
+        for (offset, &token) in tokens.iter().enumerate() {
+            let position = start
+                .checked_add(offset)
+                .ok_or_else(|| "single-token prefill position overflow".to_string())?;
+            hipfire_arch_qwen35::qwen35::oracle::set_decode_position(position)?;
+            qwen35::forward_scratch(gpu, weights, config, token, position, kv, dn, scratch)
+                .map_err(|e| format!("single-token prefill at position {position}: {e:?}"))?;
+        }
+        return Ok(());
+    }
     qwen35::forward_prefill_batch_capped(
         gpu, weights, config, tokens, start, kv, dn, scratch, None, None, None, None, chunk,
     )

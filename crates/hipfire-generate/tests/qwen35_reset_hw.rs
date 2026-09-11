@@ -218,7 +218,12 @@ fn token_text(events: &[&Value]) -> String {
 }
 
 fn load_req(model: &str, pp: Option<u64>) -> Value {
-    let mut params = serde_json::json!({ "max_seq": 2048 });
+    let mut params = serde_json::json!({
+        "max_seq": 2048,
+        "dflash_mode": "off",
+        "mtp_mode": "off",
+        "ngram_draft": false,
+    });
     if let Some(pp) = pp {
         params["pp"] = pp.into();
     }
