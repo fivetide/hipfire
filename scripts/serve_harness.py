@@ -2197,6 +2197,53 @@ def _self_test_g45_cache_store_log_check():
     assert _count_qwen_cache_stores("malformed tool protocol\n") == 0
     print("serve_harness: g45-cache-store-log-check self-test OK", flush=True)
 
+def _self_test_g45_torn_stream_and_error_mapping():
+    """GPU-free: torn streams never raise and never synthesize a terminal;
+    the serve-log envelope maps them to exactly one error terminal."""
+    import http.client
+    t0 = time.time()
+    # Clean EOF with no DONE and no terminal: honest wire state, no synthesis.
+    torn = _fold_chat_sse_chunks([b"data: " + json.dumps(_g45_chunk({"content": "part"})).encode("utf-8")], t0)
+    assert torn["saw_done"] is False and torn["stream_error"] is None, torn
+    assert torn["terminal_count"] == 0 and torn["finish"] is None, torn
+    assert "".join(torn["ans"]) == "part", torn
+    # Abrupt close mid-stream: exception recorded, partial bytes still folded.
+    partial = b"data: " + json.dumps(_g45_chunk({"content": "late-part"})).encode("utf-8") + b"\n"
+    def raising():
+        yield b"data: " + json.dumps(_g45_chunk({"content": "early"})).encode("utf-8") + b"\n"
+        raise http.client.IncompleteRead(partial=partial, expected=128)
+    cut = _fold_chat_sse_chunks(raising(), t0)
+    assert cut["stream_error"] is not None and "IncompleteRead" in cut["stream_error"], cut
+    assert "".join(cut["ans"]) == "earlylate-part", cut
+    assert cut["terminal_count"] == 0 and cut["saw_done"] is False, cut
+    # Daemon error envelope maps a terminal-less row to exactly one terminal.
+    log_slice = (
+        "[qwen-cache GEN-ENTRY] conv_tok=156 seq_pos=156\n"
+        "[hipfire] streaming completion failed: daemon error: "
+        "[validation retryable=false rolled_back=true attempt=2] "
+        "open think span at end of generation (validation)\n"
+    )
+    row = {"finish": None, "terminal_count": 0, "terminal_reasons": [],
+           "post_terminal_bytes": 0, "tool_calls": [], "saw_done": False,
+           "stream_error": None}
+    assert _apply_daemon_error_terminal(row, log_slice) is True, row
+    assert row["finish"] == "error" and row["terminal_count"] == 1, row
+    assert row["terminal_reasons"] == ["error"], row
+    assert row["rolled_back"] is True and row["retryable"] is False, row
+    assert row["attempt"] == 2 and row["error_class"] == "validation", row
+    assert "open think span" in row["daemon_error"], row
+    # Never overrides a terminal already seen on the wire.
+    wired = {"finish": "length", "terminal_count": 1, "terminal_reasons": ["length"],
+             "post_terminal_bytes": 0, "tool_calls": []}
+    assert _apply_daemon_error_terminal(wired, log_slice) is False, wired
+    assert wired["finish"] == "length" and "daemon_error" not in wired, wired
+    # No envelope, no mapping.
+    bare = {"finish": None, "terminal_count": 0, "terminal_reasons": [],
+            "post_terminal_bytes": 0, "tool_calls": []}
+    assert _apply_daemon_error_terminal(bare, "unrelated log noise\n") is False, bare
+    assert bare["finish"] is None and bare["terminal_count"] == 0, bare
+    print("serve_harness: g45-torn-stream-error-mapping self-test OK", flush=True)
+
 def _project_mtp_ngram_timings(timings):
     """Project MTP/ngram timing fields from a daemon timings object for report rows.
 
@@ -2574,6 +2621,44 @@ def _count_qwen_cache_stores(text):
     return len(_QWEN_CACHE_STORE_RE.findall(text or ""))
 
 
+_DAEMON_ERROR_RE = re.compile(
+    r"streaming completion failed: daemon error: "
+    r"\[(\w+) retryable=(\w+) rolled_back=(\w+) attempt=(\d+)\] (.*)"
+)
+
+
+def _apply_daemon_error_terminal(row, log_slice):
+    """Map a torn stream onto the daemon error terminal in the serve log.
+
+    A daemon error terminal (malformed protocol, open think) tears the SSE
+    stream down with no terminal frame, so the row legitimately shows
+    ``terminal_count == 0`` / ``finish is None``. When the step's serve-log
+    slice contains exactly the matching ``streaming completion failed:
+    daemon error:`` envelope, attribute the torn stream to it: set
+    ``finish="error"``, count the one terminal, and keep the envelope's
+    message, class, retryable/rolled_back flags, and attempt on the row.
+    Never overrides a terminal already seen on the wire. Returns True when
+    applied, False when there is nothing to map (wire terminal present or
+    no envelope in the slice).
+    """
+    if row.get("terminal_count"):
+        return False
+    match = None
+    for match in _DAEMON_ERROR_RE.finditer(log_slice or ""):
+        pass
+    if match is None:
+        return False
+    row["finish"] = "error"
+    row["terminal_count"] = 1
+    row["terminal_reasons"] = ["error"]
+    row["error_class"] = match.group(1)
+    row["retryable"] = (match.group(2) == "true")
+    row["rolled_back"] = (match.group(3) == "true")
+    row["attempt"] = int(match.group(4))
+    row["daemon_error"] = match.group(5).strip()
+    return True
+
+
 def _assert_g45_fail_closed_row(row, step, allowed):
     """Assert one fail-closed parser terminal: exactly one terminal, no tool
     release, a non-storing finish class, and no late bytes after it.
@@ -2619,11 +2704,14 @@ def _run_g45_fail_closed_session(cfg, args, scenario):
     follow-up context). ``kind: fail_closed`` steps assert the G4.5 terminal
     boundary via :func:`_assert_g45_fail_closed_row`; ``kind: positive``
     steps assert a storing-capable terminal with the same cardinality shape.
-    With ``HIPFIRE_QWEN_CACHE_TRACE=1`` and a spawned serve, each step's
-    serve-log slice must add zero ``[qwen-cache store]`` lines for
-    fail-closed steps; the seed positive control makes absence meaningful
-    (a zero-store seed prints a vacuous-control warning instead of passing
-    silently).
+    A daemon error terminal tears the SSE stream down with no terminal
+    frame, so a terminal-less fail-closed row is attributed through its
+    serve-log slice (:func:`_apply_daemon_error_terminal`) — a torn stream
+    with no matching envelope fails instead of passing silently. With
+    ``HIPFIRE_QWEN_CACHE_TRACE=1`` and a spawned serve, each step's slice
+    must additionally add zero ``[qwen-cache store]`` lines for fail-closed
+    steps; the seed positive control makes absence meaningful (a zero-store
+    seed prints a vacuous-control warning instead of passing silently).
     """
     steps = scenario.get("steps") or []
     if not steps:
@@ -2631,7 +2719,8 @@ def _run_g45_fail_closed_session(cfg, args, scenario):
     log_path = getattr(args, "serve_log", None) or "/tmp/serve_harness.serve.log"
     no_spawn = bool(getattr(args, "no_spawn", False))
     trace_on = os.environ.get("HIPFIRE_QWEN_CACHE_TRACE") == "1"
-    want_log = trace_on and not no_spawn and os.path.exists(log_path)
+    want_slice = not no_spawn and os.path.exists(log_path)
+    want_log = want_slice and trace_on
     if trace_on and not want_log:
         print("g45: HIPFIRE_QWEN_CACHE_TRACE=1 but no spawned serve log at "
               f"{log_path} — cache-publication check SKIPPED", flush=True)
@@ -2643,7 +2732,7 @@ def _run_g45_fail_closed_session(cfg, args, scenario):
         prompt = step.get("content") or ""
         tools = step.get("tools")
         allowed = step.get("expect_finish") or (["stop"] if kind == "positive" else ["error", "length"])
-        log_offset = _serve_log_offset(log_path) if want_log else 0
+        log_offset = _serve_log_offset(log_path) if want_slice else 0
         r = send(cfg, [{"role": "user", "content": prompt}],
                  tools=tools,
                  max_tokens=step.get("max_tokens"),
@@ -2651,6 +2740,7 @@ def _run_g45_fail_closed_session(cfg, args, scenario):
         r["prompt_md5"] = step.get("prompt_md5") or hashlib.md5(prompt.encode("utf-8")).hexdigest()
         r["step"] = name
         r["g45_kind"] = kind
+        log_slice = _serve_log_text(log_path, log_offset) if want_slice else ""
         if kind == "positive":
             if r.get("finish") not in allowed:
                 raise AssertionError(
@@ -2665,9 +2755,16 @@ def _run_g45_fail_closed_session(cfg, args, scenario):
                     f"late_bytes={r.get('post_terminal_bytes')}"
                 )
         else:
+            if not r.get("terminal_count"):
+                if not want_slice or not _apply_daemon_error_terminal(r, log_slice):
+                    raise AssertionError(
+                        f"g45 {name}: torn stream with no daemon error terminal "
+                        f"in the serve log (saw_done={r.get('saw_done')} "
+                        f"stream_error={r.get('stream_error')!r})"
+                    )
             _assert_g45_fail_closed_row(r, name, allowed)
         if want_log:
-            stores = _count_qwen_cache_stores(_serve_log_text(log_path, log_offset))
+            stores = _count_qwen_cache_stores(log_slice)
             r["qwen_cache_stores"] = stores
             if kind == "positive" and seed_stores is None and idx == 0:
                 seed_stores = stores
@@ -2720,17 +2817,45 @@ def _fold_chat_sse_chunks(line_iter, t0):
     (distinct values in arrival order), and ``post_terminal_bytes``
     (content / reasoning / tool-delta payload bytes arriving after the first
     terminal chunk). Accepts ``bytes`` or ``str`` lines; stops at ``[DONE]``.
+
+    A daemon error terminal tears the stream down with no terminal frame
+    (``ResponseChunk::fail`` — no success/error frame is appended), so the
+    iterator may end cleanly without ``[DONE]`` or raise mid-stream
+    (``IncompleteRead`` carries the torn bytes in ``partial``). Both are
+    folded, never raised: ``saw_done`` reports a clean ``[DONE]`` end and
+    ``stream_error`` carries the iterator exception, if any. Attributing a
+    torn stream to the daemon error terminal is the runner's job
+    (:func:`_apply_daemon_error_terminal`, via the serve log) — the fold
+    itself never synthesizes a terminal.
     """
     ttft = None; think = []; ans = []
     tool_acc = {}
     usage = {}; timings = {}; finish = None; completion_id = None
     terminal_count = 0; terminal_reasons = []; post_terminal_bytes = 0
-    seen_terminal = False
-    for raw in line_iter:
+    seen_terminal = False; saw_done = False; stream_error = None
+    pending = []
+    it = iter(line_iter)
+    while True:
+        if pending:
+            raw = pending.pop(0)
+        else:
+            try:
+                raw = next(it)
+            except StopIteration:
+                break
+            except Exception as e:
+                stream_error = f"{type(e).__name__}: {e}"
+                partial = getattr(e, "partial", None)
+                if partial:
+                    pending.extend(partial.splitlines(keepends=True))
+                    continue
+                break
         line = raw.decode("utf-8", "ignore").strip() if isinstance(raw, bytes) else raw.strip()
         if not line.startswith("data:"): continue
         p = line[5:].strip()
-        if p == "[DONE]": break
+        if p == "[DONE]":
+            saw_done = True
+            break
         try: ck = json.loads(p)
         except Exception: continue
         if isinstance(ck.get("id"), str):
@@ -2769,6 +2894,7 @@ def _fold_chat_sse_chunks(line_iter, t0):
         "completion_id": completion_id, "terminal_count": terminal_count,
         "terminal_reasons": terminal_reasons,
         "post_terminal_bytes": post_terminal_bytes,
+        "saw_done": saw_done, "stream_error": stream_error,
     }
 
 
@@ -2789,6 +2915,8 @@ def send(cfg, messages, tools=None, max_tokens=None, max_think_tokens=None):
     terminal_count = folded["terminal_count"]
     terminal_reasons = folded["terminal_reasons"]
     post_terminal_bytes = folded["post_terminal_bytes"]
+    saw_done = folded["saw_done"]
+    stream_error = folded["stream_error"]
     wall = time.time() - t0
     dtoks = usage.get("completion_tokens", 0)
     decode_ts = timings.get("decode_tok_s")
@@ -2835,6 +2963,8 @@ def send(cfg, messages, tools=None, max_tokens=None, max_think_tokens=None):
         "terminal_count": terminal_count,
         "terminal_reasons": terminal_reasons,
         "post_terminal_bytes": post_terminal_bytes,
+        "saw_done": saw_done,
+        "stream_error": stream_error,
     }
 
 
@@ -3515,6 +3645,7 @@ def main():
         _self_test_g45_terminal_accounting()
         _self_test_g45_fail_closed_assertions()
         _self_test_g45_cache_store_log_check()
+        _self_test_g45_torn_stream_and_error_mapping()
         return
     if not args.model:
         ap.error("--model is required unless --self-test")

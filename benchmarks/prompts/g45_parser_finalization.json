@@ -17,8 +17,10 @@
         {"type": "function", "function": {"name": "read", "description": "Read the contents of a file from disk", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute path to the file"}}, "required": ["path"]}}},
         {"type": "function", "function": {"name": "bash", "description": "Execute a shell command", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The command to run"}}, "required": ["command"]}}}
       ],
-      "max_tokens": 64,
-      "expect_finish": ["error", "length"]
+      "max_tokens": 48,
+      "max_think_tokens": 1,
+      "expect_finish": ["error", "length"],
+      "why": "max_think_tokens=1 disables thinking so the 48-token budget truncates inside the tool-call JSON body (gfx1201: think+call was ~40 tok with thinking on, which stranded the turn in open-think instead). The 200-char hint keeps a complete call well above 48 tokens."
     },
     {
       "name": "open_think",
