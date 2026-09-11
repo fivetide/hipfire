@@ -375,37 +375,32 @@ pub fn ep_serve_qwen35_dense_tp(
     }
 
     // This route replays the complete rendered conversation each request.
-    if let Some(EpState { gpus, inner }) = m.ep.as_mut() {
-        if let EpArch::Qwen35DenseTp { dn_states, .. } = inner {
-            for (rank, state) in dn_states.iter_mut().enumerate() {
-                let gpu = &mut gpus.devices[rank];
-                if let Err(e) = gpu.bind_thread() {
-                    emit_active_attempt_error(
-                        stdout,
-                        Some(id),
-                        &format!("dense TP bind_thread rank {rank}: {e:?}"),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    return;
+    // Any pre-request reset failure is terminal too: the EP epilogue below
+    // re-runs the reset and attests every rank before exposing the error.
+    let reset_error = {
+        let mut error = None;
+        if let Some(EpState { gpus, inner }) = m.ep.as_mut() {
+            if let EpArch::Qwen35DenseTp { dn_states, .. } = inner {
+                for (rank, state) in dn_states.iter_mut().enumerate() {
+                    let gpu = &mut gpus.devices[rank];
+                    if let Err(e) = gpu.bind_thread() {
+                        error = Some(format!("dense TP bind_thread rank {rank}: {e:?}"));
+                        break;
+                    }
+                    if let Err(e) = state.reset(gpu) {
+                        error = Some(format!("dense TP state reset rank {rank}: {e:?}"));
+                        break;
+                    }
+                    gpu.invalidate_graph_state();
                 }
-                if let Err(e) = state.reset(gpu) {
-                    emit_active_attempt_error(
-                        stdout,
-                        Some(id),
-                        &format!("dense TP state reset rank {rank}: {e:?}"),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    return;
-                }
-                gpu.invalidate_graph_state();
             }
         }
+        error
+    };
+    if let Some(error) = reset_error {
+        dense_tp_fail_closed_error(m, stdout, id, &error, "validation", false);
+        let _ = stdout.flush();
+        return;
     }
     m.seq_pos = 0;
     m.conversation_tokens.clear();
@@ -428,12 +423,12 @@ pub fn ep_serve_qwen35_dense_tp(
             qwen35::prefill_max_batch_tp(&gpus.devices[0], gpus.devices.len()).max(1)
         }
         None => {
-            crate::ar::emit_active_route_error(
+            dense_tp_fail_closed_error(
+                m,
                 stdout,
-                Some(id),
+                id,
                 "dense TP serve without EP state",
                 "validation",
-                false,
                 false,
             );
             let _ = stdout.flush();
@@ -453,6 +448,14 @@ pub fn ep_serve_qwen35_dense_tp(
         }
         let result = {
             let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
+                dense_tp_fail_closed_error(
+                    m,
+                    stdout,
+                    id,
+                    "dense TP prefill without EP state",
+                    "validation",
+                    false,
+                );
                 return;
             };
             let EpArch::Qwen35DenseTp {
@@ -464,12 +467,12 @@ pub fn ep_serve_qwen35_dense_tp(
                 scratches,
             } = inner
             else {
-                crate::ar::emit_active_route_error(
+                dense_tp_fail_closed_error(
+                    m,
                     stdout,
-                    Some(id),
+                    id,
                     "EP arch mismatch (expected dense Qwen TP)",
                     "validation",
-                    false,
                     false,
                 );
                 return;
@@ -487,12 +490,12 @@ pub fn ep_serve_qwen35_dense_tp(
             )
         };
         if let Err(e) = result {
-            crate::ar::emit_active_route_error(
+            dense_tp_fail_closed_error(
+                m,
                 stdout,
-                Some(id),
+                id,
                 &format!("dense TP prefill: {e:?}"),
                 "validation",
-                false,
                 false,
             );
             let _ = stdout.flush();
@@ -504,38 +507,26 @@ pub fn ep_serve_qwen35_dense_tp(
     m.conversation_tokens.extend_from_slice(prompt_ids);
     m.seq_pos = prompt_n;
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
-    let mut logits = {
+    let logits_result: Result<Vec<f32>, String> = (|| {
         let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
-            return;
+            return Err("dense TP first-logits without EP state".to_string());
         };
         let EpArch::Qwen35DenseTp { scratches, .. } = inner else {
-            return;
+            return Err("EP arch mismatch (expected dense Qwen TP)".to_string());
         };
         if let Err(e) = gpus.devices[0].bind_thread() {
-            crate::ar::emit_active_route_error(
-                stdout,
-                Some(id),
-                &format!("dense TP first-logits bind_thread: {e:?}"),
-                "validation",
-                false,
-                false,
-            );
+            return Err(format!("dense TP first-logits bind_thread: {e:?}"));
+        }
+        gpus.devices[0]
+            .download_f32(&scratches[0].logits)
+            .map_err(|e| format!("dense TP first-logits download: {e:?}"))
+    })();
+    let mut logits = match logits_result {
+        Ok(logits) => logits,
+        Err(message) => {
+            dense_tp_fail_closed_error(m, stdout, id, &message, "validation", false);
             let _ = stdout.flush();
             return;
-        }
-        match gpus.devices[0].download_f32(&scratches[0].logits) {
-            Ok(v) => v,
-            Err(e) => {
-                crate::ar::emit_active_route_error(
-                    stdout,
-                    Some(id),
-                    &format!("dense TP first-logits download: {e:?}"),
-                    "validation",
-                    false,
-                    false,
-                );
-                return;
-            }
         }
     };
 
@@ -568,9 +559,9 @@ pub fn ep_serve_qwen35_dense_tp(
 
         // KV write before any client-visible classify/emit (same contract as AR).
         let write_pos = m.seq_pos;
-        let forward = {
+        let forward_result: Result<(), String> = (|| {
             let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
-                return;
+                return Err("dense TP decode without EP state".to_string());
             };
             let EpArch::Qwen35DenseTp {
                 shard,
@@ -581,21 +572,23 @@ pub fn ep_serve_qwen35_dense_tp(
                 scratches,
             } = inner
             else {
-                return;
+                return Err("EP arch mismatch (expected dense Qwen TP)".to_string());
             };
             qwen35::forward_scratch_dense_tp(
-                gpus, shard, weights, configs, next, write_pos, kv_caches, dn_states, scratches,
+                gpus,
+                shard,
+                weights,
+                configs,
+                next,
+                write_pos,
+                kv_caches,
+                dn_states,
+                scratches,
             )
-        };
-        if let Err(e) = forward {
-            crate::ar::emit_active_route_error(
-                stdout,
-                Some(id),
-                &format!("dense TP decode: {e:?}"),
-                "validation",
-                false,
-                false,
-            );
+            .map_err(|e| format!("dense TP decode: {e:?}"))
+        })();
+        if let Err(message) = forward_result {
+            dense_tp_fail_closed_error(m, stdout, id, &message, "validation", false);
             return;
         }
 
@@ -623,15 +616,14 @@ pub fn ep_serve_qwen35_dense_tp(
         ) {
             Ok(stop) => stop,
             Err(err) => {
-                crate::ar::emit_active_route_error(
+                dense_tp_fail_closed_error(
+                    m,
                     stdout,
-                    Some(id),
+                    id,
                     &format!("dense TP semantic classify: {err}"),
                     "validation",
                     false,
-                    false,
                 );
-                let _ = stdout.flush();
                 return;
             }
         };
@@ -674,38 +666,25 @@ pub fn ep_serve_qwen35_dense_tp(
             break;
         }
 
-        logits = {
+        let logits_result: Result<Vec<f32>, String> = (|| {
             let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
-                return;
+                return Err("dense TP decode logits without EP state".to_string());
             };
             let EpArch::Qwen35DenseTp { scratches, .. } = inner else {
-                return;
+                return Err("EP arch mismatch (expected dense Qwen TP)".to_string());
             };
             if let Err(e) = gpus.devices[0].bind_thread() {
-                crate::ar::emit_active_route_error(
-                    stdout,
-                    Some(id),
-                    &format!("dense TP decode logits bind_thread: {e:?}"),
-                    "validation",
-                    false,
-                    false,
-                );
-                let _ = stdout.flush();
-                return;
+                return Err(format!("dense TP decode logits bind_thread: {e:?}"));
             }
-            match gpus.devices[0].download_f32(&scratches[0].logits) {
-                Ok(v) => v,
-                Err(e) => {
-                    crate::ar::emit_active_route_error(
-                        stdout,
-                        Some(id),
-                        &format!("dense TP decode logits download: {e:?}"),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    return;
-                }
+            gpus.devices[0]
+                .download_f32(&scratches[0].logits)
+                .map_err(|e| format!("dense TP decode logits download: {e:?}"))
+        })();
+        logits = match logits_result {
+            Ok(logits) => logits,
+            Err(message) => {
+                dense_tp_fail_closed_error(m, stdout, id, &message, "validation", false);
+                return;
             }
         };
     }
@@ -715,15 +694,14 @@ pub fn ep_serve_qwen35_dense_tp(
     let (finish, _visible) = match semantic.finish(stdout, hit_length_cap) {
         Ok(pair) => pair,
         Err(err) => {
-            crate::ar::emit_active_route_error(
+            dense_tp_fail_closed_error(
+                m,
                 stdout,
-                Some(id),
+                id,
                 &format!("dense TP semantic finish: {err}"),
                 "validation",
                 false,
-                false,
             );
-            let _ = stdout.flush();
             return;
         }
     };
@@ -803,9 +781,9 @@ pub fn ep_emit_done(
     }
 }
 
-/// Full EP route-complete abort reset: per-rank bind + cursor reset + decode
+/// Full EP route-complete abort reset: per-rank bind + cursor reset + KV/DeltaNet
 /// cache zero + graph invalidate, then device_synchronize on every rank.
-/// `rolled_back` is true only when every bind/reset and synchronize succeeds.
+/// `rolled_back` is true only when every bind/reset/clear and synchronize succeeds.
 pub fn ep_reset_after_abort(m: &mut LoadedModel) -> RollbackEpilogue {
     let mut first_err: Option<String> = None;
     if let Some(ep) = m.ep.as_mut() {
@@ -842,8 +820,27 @@ pub fn ep_reset_after_abort(m: &mut LoadedModel) -> RollbackEpilogue {
                     dev.invalidate_graph_state();
                 }
             }
-            EpArch::Qwen35DenseTp { dn_states, .. } => {
-                for (rank, state) in dn_states.iter_mut().enumerate() {
+            EpArch::Qwen35DenseTp {
+                dn_states,
+                kv_caches,
+                ..
+            } => {
+                let rank_count = gpus.devices.len();
+                if dn_states.len() != rank_count {
+                    push_reset_err(
+                        &mut first_err,
+                        "dense qwen TP DN state rank count",
+                        format!("got {}, expected {rank_count}", dn_states.len()),
+                    );
+                }
+                if kv_caches.len() != rank_count {
+                    push_reset_err(
+                        &mut first_err,
+                        "dense qwen TP KV cache rank count",
+                        format!("got {}, expected {rank_count}", kv_caches.len()),
+                    );
+                }
+                for rank in 0..rank_count {
                     let gpu = &mut gpus.devices[rank];
                     if let Err(e) = gpu.bind_thread() {
                         push_reset_err(
@@ -852,11 +849,34 @@ pub fn ep_reset_after_abort(m: &mut LoadedModel) -> RollbackEpilogue {
                             e,
                         );
                     }
-                    if let Err(e) = state.reset(gpu) {
+                    if let Some(state) = dn_states.get_mut(rank) {
+                        if let Err(e) = state.reset(gpu) {
+                            push_reset_err(
+                                &mut first_err,
+                                &format!("dense qwen TP rank{rank} state reset"),
+                                e,
+                            );
+                        }
+                    } else {
                         push_reset_err(
                             &mut first_err,
-                            &format!("dense qwen TP rank{rank} state reset"),
-                            e,
+                            &format!("dense qwen TP rank{rank} state"),
+                            "missing",
+                        );
+                    }
+                    if let Some(kv) = kv_caches.get_mut(rank) {
+                        if let Err(e) = kv.clear_gpu(gpu) {
+                            push_reset_err(
+                                &mut first_err,
+                                &format!("dense qwen TP rank{rank} KV clear"),
+                                e,
+                            );
+                        }
+                    } else {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("dense qwen TP rank{rank} KV cache"),
+                            "missing",
                         );
                     }
                     gpu.invalidate_graph_state();
@@ -893,6 +913,21 @@ pub fn ep_reset_after_abort(m: &mut LoadedModel) -> RollbackEpilogue {
             context: first_err.or_else(|| Some("EP abort reset could not be attested".into())),
         }
     }
+}
+
+/// Reset dense-TP state on every rank before publishing one fail-closed error.
+/// The common dispatcher selects the EP all-rank epilogue without requiring a
+/// separate daemon GPU handle.
+fn dense_tp_fail_closed_error(
+    m: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    message: &str,
+    class: &str,
+    retryable: bool,
+) {
+    let ep = crate::common::reset_mesh_request_state(m, None);
+    emit_fail_closed_error(stdout, Some(id), message, class, retryable, &ep);
 }
 
 /// EP cancel terminal: reset/sync first, then emit attempt-correlated
@@ -4476,13 +4511,8 @@ pub fn generate_multi(
         // handled inside. On failure fail closed rather than serving over
         // dirty state (practically unreachable on healthy GPUs).
         if let Err(e) = crate::common::reset_qwen35_recurrent(m, gpu) {
-            let ep = crate::common::production_pp_fail_closed_rollback(m, gpu);
-            let mut msg = format!("context reset failed: {e}");
-            if !ep.rolled_back {
-                if let Some(ctx) = ep.context.as_ref() {
-                    msg = format!("{msg} ({ctx})");
-                }
-            }
+            let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
+            let msg = format!("context reset failed: {e}");
             emit_fail_closed_error_for_route(
                 crate::ar::GenerationRoute::PipelineParallel,
                 stdout,
@@ -4733,13 +4763,8 @@ pub fn generate_multi(
         // failure fail closed rather than serving over dirty state
         // (practically unreachable on healthy GPUs).
         if let Err(e) = crate::common::reset_qwen35_recurrent(m, gpu) {
-            let ep = crate::common::production_pp_fail_closed_rollback(m, gpu);
-            let mut msg = format!("prompt-cache reset failed: {e}");
-            if !ep.rolled_back {
-                if let Some(ctx) = ep.context.as_ref() {
-                    msg = format!("{msg} ({ctx})");
-                }
-            }
+            let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
+            let msg = format!("prompt-cache reset failed: {e}");
             emit_fail_closed_error_for_route(
                 crate::ar::GenerationRoute::PipelineParallel,
                 stdout,
@@ -4900,7 +4925,7 @@ pub fn generate_multi(
         // G4.7: attested PP rollback covers every device (DN/KV/host reset +
         // per-device graph invalidate + per-device sync). Terminal identical
         // except `rolled_back` is now attested.
-        let ep = production_pp_fail_closed_rollback(m, gpu);
+        let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
         emit_fail_closed_error_for_route(
             crate::ar::GenerationRoute::PipelineParallel,
             stdout,
@@ -4920,7 +4945,7 @@ pub fn generate_multi(
     // serve-fault-inject hook by `test_fault_after_prefill:true`; the daemon
     // guard disarms the leftover arm on request end.
     if crate::common::take_generation_fault_after_prefill() {
-        let ep = production_pp_fail_closed_rollback(m, gpu);
+        let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
         emit_fail_closed_error_for_route(
             crate::ar::GenerationRoute::PipelineParallel,
             stdout,
@@ -4934,9 +4959,9 @@ pub fn generate_multi(
     }
 
     if check_abort(id) {
-        // G4.7: single PP helper subsumes the macro (per-device DN clear)
-        // and the single-GPU rollback (graphs/sync on `gpu` only).
-        let ep = production_pp_fail_closed_rollback(m, gpu);
+        // G4.9: the mesh dispatcher resets recurrent state and attests
+        // graph invalidation + synchronization on every PP device.
+        let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
         emit_pipeline_cancel_after_rollback(stdout, id, 0, &ep);
         return;
     }
@@ -5027,9 +5052,9 @@ pub fn generate_multi(
 
     while generated < max_tokens {
         if check_abort(id) {
-            // G4.7: single PP helper subsumes the macro (per-device DN clear)
-            // and the single-GPU rollback (graphs/sync on `gpu` only).
-            let ep = production_pp_fail_closed_rollback(m, gpu);
+            // G4.9: the mesh dispatcher resets recurrent state and attests
+            // graph invalidation + synchronization on every PP device.
+            let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
             emit_pipeline_cancel_after_rollback(stdout, id, generated, &ep);
             return;
         }
@@ -5058,7 +5083,7 @@ pub fn generate_multi(
             // G4.7: attested PP rollback covers every device (DN/KV/host reset +
             // per-device graph invalidate + per-device sync). Terminal identical
             // except `rolled_back` is now attested.
-            let ep = production_pp_fail_closed_rollback(m, gpu);
+            let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
             emit_fail_closed_error_for_route(
                 crate::ar::GenerationRoute::PipelineParallel,
                 stdout,
@@ -5074,7 +5099,7 @@ pub fn generate_multi(
         // Test-only fault seam (G4.7): fires after the first decode forward's
         // actual GPU/KV mutation, before any token visibility.
         if generated == 1 && crate::common::take_generation_fault_after_first_decode() {
-            let ep = production_pp_fail_closed_rollback(m, gpu);
+            let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
             emit_fail_closed_error_for_route(
                 crate::ar::GenerationRoute::PipelineParallel,
                 stdout,
@@ -5213,7 +5238,7 @@ pub fn generate_multi(
                             streamed_tokens.push(t);
                         },
                     ) {
-                        let ep = production_pp_fail_closed_rollback(m, gpu);
+                        let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
                         emit_fail_closed_error_for_route(
                             crate::ar::GenerationRoute::PipelineParallel,
                             stdout,
@@ -5384,7 +5409,7 @@ pub fn generate_multi(
                             streamed_tokens.push(tok);
                         },
                     ) {
-                        let ep = production_pp_fail_closed_rollback(m, gpu);
+                        let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
                         emit_fail_closed_error_for_route(
                             crate::ar::GenerationRoute::PipelineParallel,
                             stdout,
@@ -5525,7 +5550,7 @@ pub fn generate_multi(
                     m.conversation_tokens.push(t);
                 },
             ) {
-                let ep = production_pp_fail_closed_rollback(m, gpu);
+                let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
                 emit_fail_closed_error_for_route(
                     crate::ar::GenerationRoute::PipelineParallel,
                     stdout,
@@ -5577,9 +5602,9 @@ pub fn generate_multi(
     });
     let decision = await_client_terminal_commit(stdout, id, &pending_done);
     if decision != ClientTerminalDecision::Commit {
-        // G4.7: single PP helper subsumes the macro (per-device DN clear)
-        // and the single-GPU rollback (graphs/sync on `gpu` only).
-        let ep = production_pp_fail_closed_rollback(m, gpu);
+        // G4.9: the mesh dispatcher resets recurrent state and attests graph
+        // invalidation + synchronization on every PP device.
+        let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
         emit_pipeline_cancel_after_rollback(stdout, id, generated, &ep);
         return;
     }
@@ -5589,6 +5614,72 @@ pub fn generate_multi(
         &pending_done,
     );
 }
+/// Mesh-carrier entry point for the existing pipeline-parallel Qwen route.
+///
+/// G4.9 deliberately keeps the proven `generate_multi` loop and its wire
+/// behavior. This named carrier is the lifecycle boundary used by dispatch;
+/// all reset/terminal ownership remains in the existing route implementation.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_mesh_carrier(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    pflash_state: Option<&mut hipfire_pflash::pflash::PflashState>,
+    pflash_cfg: Option<&hipfire_pflash::pflash::PflashConfig>,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    budget_alert_at_tok: usize,
+    budget_alert_text: &str,
+    max_think_tokens: usize,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    stop: &[String],
+    reasoning_effort: Option<&str>,
+    enable_thinking: bool,
+    request_seed: u64,
+) {
+    generate_multi(
+        m,
+        gpu,
+        pflash_state,
+        pflash_cfg,
+        stdout,
+        id,
+        prompt,
+        system_prompt,
+        temp,
+        top_p,
+        top_k,
+        min_p,
+        max_tokens,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty,
+        frequency_penalty,
+        budget_alert_at_tok,
+        budget_alert_text,
+        max_think_tokens,
+        assistant_prefix,
+        tools,
+        messages_history,
+        stop,
+        reasoning_effort,
+        enable_thinking,
+        request_seed,
+    );
+}
+
 
 // --- Auto-appended shared helpers (shared-temp, dedup at merge) ---
 
