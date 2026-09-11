@@ -5011,7 +5011,7 @@ pub fn generate(
             new_tokens.len(),
         );
         let (mut next_token, sampled_rng) = if batched_prefill {
-            llama::forward_prefill_batch(
+            if let Err(e) = llama::forward_prefill_batch(
                 gpu,
                 weights,
                 config,
@@ -5020,10 +5020,21 @@ pub fn generate(
                 kv,
                 scratch,
                 None,
-            )
-            .unwrap();
+            ) {
+                // Prefill wrote partial KV rows: full fail-closed rollback +
+                // one correlated error (no `done`, no cache store).
+                let _ = (config, weights, scratch, kv);
+                crate::dense::dense_fail_closed_error(
+                    m,
+                    gpu,
+                    stdout,
+                    id,
+                    &format!("llama prefill (forward_prefill_batch) failed: {e:?}"),
+                );
+                return;
+            }
             let sample_seed = llama_prefill_sample_seed(rng_state, new_tokens.len(), temp);
-            gpu.sample_top_p(
+            match gpu.sample_top_p(
                 &scratch.logits,
                 &scratch.sample_buf,
                 &scratch.repeat_buf,
@@ -5033,21 +5044,57 @@ pub fn generate(
                 sample_seed,
                 0,
                 1.0,
-            )
-            .unwrap()
+            ) {
+                Ok(sampled) => sampled,
+                Err(e) => {
+                    let _ = (config, weights, scratch, kv);
+                    crate::dense::dense_fail_closed_error(
+                        m,
+                        gpu,
+                        stdout,
+                        id,
+                        &format!("llama prefill (sample_top_p) failed: {e:?}"),
+                    );
+                    return;
+                }
+            }
         } else {
             for (i, &tok) in new_tokens.iter().enumerate() {
                 let pos = m.seq_pos + i;
-                let (_, rng) = llama::forward_scratch(
+                match llama::forward_scratch(
                     gpu, weights, config, tok, pos, kv, scratch, temp, top_p, rng_state, 0, 1.0,
-                )
-                .unwrap();
-                rng_state = rng;
+                ) {
+                    Ok((_, rng)) => {
+                        rng_state = rng;
+                    }
+                    Err(e) => {
+                        let _ = (config, weights, scratch, kv);
+                        crate::dense::dense_fail_closed_error(
+                            m,
+                            gpu,
+                            stdout,
+                            id,
+                            &format!("llama prefill (forward_scratch) failed: {e:?}"),
+                        );
+                        return;
+                    }
+                }
             }
             let mut out_bytes = [0u8; 8];
-            gpu.hip
+            if let Err(e) = gpu
+                .hip
                 .memcpy_dtoh(&mut out_bytes, &scratch.sample_buf.buf)
-                .unwrap();
+            {
+                let _ = (config, weights, scratch, kv);
+                crate::dense::dense_fail_closed_error(
+                    m,
+                    gpu,
+                    stdout,
+                    id,
+                    &format!("llama prefill (sample download) failed: {e:?}"),
+                );
+                return;
+            }
             (
                 u32::from_ne_bytes([out_bytes[0], out_bytes[1], out_bytes[2], out_bytes[3]]),
                 u32::from_ne_bytes([out_bytes[4], out_bytes[5], out_bytes[6], out_bytes[7]]),
@@ -5058,6 +5105,14 @@ pub fn generate(
         m.seq_pos += new_tokens.len();
         m.conversation_tokens.extend_from_slice(&new_tokens);
         let ngram_scope_start_llama = m.conversation_tokens.len() - this_turn_prompt_len_llama;
+        // Test-only fault seam (G4.10): fires after prefill GPU/KV mutation,
+        // before any token visibility. Same production fail-closed terminal
+        // as the dense family loops.
+        if take_generation_fault_after_prefill() {
+            let _ = (config, weights, scratch, kv);
+            crate::dense::dense_fail_closed_error(m, gpu, stdout, id, "injected fault after prefill");
+            return;
+        }
         // Prefill ends here: prompt is processed AND first token is ready (D2H
         // sync is the user-observable "time to first token" boundary). Decode
         // below measures the pure forward+sample steady-state.
@@ -5074,6 +5129,15 @@ pub fn generate(
         let mut filter = EosFilter::new(EosFilterConfig::default());
 
         for _ in 0..max_tokens {
+            // Decode-side abort check (mirrors the Qwen AR loop): a client
+            // cancel bails at the next iteration with an attested
+            // aborted+done pair instead of burning max_tokens of decode.
+            if check_abort(id) {
+                let _ = (config, weights, scratch, kv);
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+                return;
+            }
             generated += 1;
             m.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
@@ -5106,16 +5170,27 @@ pub fn generate(
                 ngram_scope_start_llama.max(m.conversation_tokens.len().saturating_sub(rw));
             let hist_slice = &m.conversation_tokens[scope_start..];
             let hist_bytes: Vec<u8> = hist_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
-            gpu.hip
+            if let Err(e) = gpu
+                .hip
                 .memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes)
-                .unwrap();
+            {
+                let _ = (config, weights, scratch, kv);
+                crate::dense::dense_fail_closed_error(
+                    m,
+                    gpu,
+                    stdout,
+                    id,
+                    &format!("llama decode (repeat upload) failed: {e:?}"),
+                );
+                return;
+            }
 
             // Write K/V for this token FIRST so the next turn's context is
             // always fully populated. The sampled next_token from this call
             // is discarded when we break on im_end/eos — wasteful by one
             // launch but avoids a KV cache gap at the terminator.
             let pos = m.seq_pos + generated - 1;
-            let (tok, rng) = llama::forward_scratch(
+            let (tok, rng) = match llama::forward_scratch(
                 gpu,
                 weights,
                 config,
@@ -5128,8 +5203,20 @@ pub fn generate(
                 rng_state,
                 hist_slice.len(),
                 repeat_penalty,
-            )
-            .unwrap();
+            ) {
+                Ok(sampled) => sampled,
+                Err(e) => {
+                    let _ = (config, weights, scratch, kv);
+                    crate::dense::dense_fail_closed_error(
+                        m,
+                        gpu,
+                        stdout,
+                        id,
+                        &format!("llama decode (forward_scratch) failed: {e:?}"),
+                    );
+                    return;
+                }
+            };
 
             if next_token == config.eos_token {
                 break;
@@ -5141,6 +5228,13 @@ pub fn generate(
                 break;
             }
 
+            // Test-only fault seam (G4.10): fires after the first decode
+            // step's GPU/KV mutation. Same production fail-closed terminal.
+            if generated == 1 && take_generation_fault_after_first_decode() {
+                let _ = (config, weights, scratch, kv);
+                crate::dense::dense_fail_closed_error(m, gpu, stdout, id, "injected fault after first decode");
+                return;
+            }
             next_token = tok;
             rng_state = rng;
         }
@@ -5149,11 +5243,24 @@ pub fn generate(
         // ChatML \n boundary — run through forward to keep KV cache in sync
         if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
             for &t in &nl {
-                let (_, rng2) = llama::forward_scratch(
+                match llama::forward_scratch(
                     gpu, weights, config, t, m.seq_pos, kv, scratch, temp, top_p, rng_state, 0, 1.0,
-                )
-                .unwrap();
-                rng_state = rng2;
+                ) {
+                    Ok((_, rng)) => {
+                        rng_state = rng;
+                    }
+                    Err(e) => {
+                        let _ = (config, weights, scratch, kv);
+                        crate::dense::dense_fail_closed_error(
+                            m,
+                            gpu,
+                            stdout,
+                            id,
+                            &format!("llama trailer (forward_scratch) failed: {e:?}"),
+                        );
+                        return;
+                    }
+                }
                 m.seq_pos += 1;
                 m.conversation_tokens.push(t);
             }
@@ -5205,7 +5312,12 @@ pub fn generate(
         match await_client_terminal_commit(stdout, id, &pending_done) {
             ClientTerminalDecision::Commit => emit_active_route_done(stdout, id, &pending_done),
             ClientTerminalDecision::Abort => {
-                emit_aborted_terminal_after_abort(stdout, id, generated);
+                // Abort after commit: full fail-closed rollback first, then
+                // the attested aborted+done pair (or a single unattested
+                // error when rollback cannot be attested).
+                let _ = (config, weights, scratch, kv);
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             }
         }
     }

@@ -1454,6 +1454,45 @@ pub fn maybe_inject_fault_after_prefill_dflash(
     true
 }
 
+// ── G4.10 generation-fault hooks (test-only) ──
+
+// Test-only fault points for the dense/AR generation loops.
+//
+// Always compiled (unlike the `serve-fault-inject` wire hook) so ignored GPU
+// tests can arm faults without feature flags. Production never arms these;
+// an unarmed `take_*` is one thread-local load with no behavior change.
+// Both points are one-shot: taking an armed fault disarms it.
+std::thread_local! {
+    static GENERATION_FAULT_AFTER_PREFILL: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static GENERATION_FAULT_AFTER_FIRST_DECODE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Arm (or disarm) the after-prefill fault.
+#[doc(hidden)]
+pub fn arm_generation_fault_after_prefill(armed: bool) {
+    GENERATION_FAULT_AFTER_PREFILL.with(|c| c.set(armed));
+}
+
+/// Take the armed after-prefill fault, disarming it.
+#[doc(hidden)]
+pub fn take_generation_fault_after_prefill() -> bool {
+    GENERATION_FAULT_AFTER_PREFILL.with(|c| c.replace(false))
+}
+
+/// Arm (or disarm) the after-first-decode fault.
+#[doc(hidden)]
+pub fn arm_generation_fault_after_first_decode(armed: bool) {
+    GENERATION_FAULT_AFTER_FIRST_DECODE.with(|c| c.set(armed));
+}
+
+/// Take the armed after-first-decode fault, disarming it.
+#[doc(hidden)]
+pub fn take_generation_fault_after_first_decode() -> bool {
+    GENERATION_FAULT_AFTER_FIRST_DECODE.with(|c| c.replace(false))
+}
+
 // ── test-support helpers, moved with the daemon test modules ──
 
 /// Pure attestation combiner for unit tests / failure injection: every required
