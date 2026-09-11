@@ -1327,6 +1327,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-qwen4"
+version = "0.3.1"
+dependencies = [
+ "hip-bridge",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-toy"
 version = "0.3.1"
 dependencies = [
@@ -1556,6 +1566,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "ureq",
 ]
 
 [[package]]

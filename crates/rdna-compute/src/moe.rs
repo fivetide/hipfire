@@ -1522,11 +1522,7 @@ impl Gpu {
         assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(cache.dtype, DType::F16);
         let symbol = "deepseek4_topk_kv_gather_f16_buf";
-        self.ensure_kernel(
-            symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
-            symbol,
-        )?;
+        self.ensure_kernel(symbol, kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC, symbol)?;
         let cp = cache.buf.as_ptr();
         let ip = topk_idx.buf.as_ptr();
         let op = out.buf.as_ptr();
@@ -1582,11 +1578,7 @@ impl Gpu {
         assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(cache.dtype, DType::F16);
         let symbol = "deepseek4_topk_kv_gather_identity_f16_buf";
-        self.ensure_kernel(
-            symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
-            symbol,
-        )?;
+        self.ensure_kernel(symbol, kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC, symbol)?;
         let cp = cache.buf.as_ptr();
         let op = out.buf.as_ptr();
         let kbp = k_buf.buf.as_ptr();
@@ -1635,11 +1627,7 @@ impl Gpu {
         assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(cache.dtype, DType::F16);
         let symbol = "deepseek4_topk_kv_gather_batched_tiled_f16";
-        self.ensure_kernel(
-            symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
-            symbol,
-        )?;
+        self.ensure_kernel(symbol, kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC, symbol)?;
         let cp = cache.buf.as_ptr();
         let ip = topk_idx.buf.as_ptr();
         let op = out.buf.as_ptr();
@@ -1702,11 +1690,7 @@ impl Gpu {
         assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(cache.dtype, DType::F16);
         let symbol = "deepseek4_topk_kv_gather_identity_batched_f16";
-        self.ensure_kernel(
-            symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
-            symbol,
-        )?;
+        self.ensure_kernel(symbol, kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC, symbol)?;
         let cp = cache.buf.as_ptr();
         let op = out.buf.as_ptr();
         let mut k = k_active;
@@ -1738,5 +1722,433 @@ impl Gpu {
                 b
             },
         )
+    }
+    /// Qwen4's fixed 512-way/top-10 GPU router.  The incumbent k=8 routers
+    /// remain separate symbols and launchers.
+    pub fn moe_router_softmax_top10_f32(
+        &mut self,
+        logits: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w: &GpuTensor,
+        tokens: usize,
+        normalize_topk_prob: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "moe_router_softmax_top10_f32";
+        self.ensure_kernel(FUNC, kernels::MOE_ROUTER_SOFTMAX_TOP10_F32_SRC, FUNC)?;
+        let lp = logits.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let ne = 512i32;
+        let kt = 10i32;
+        let norm = i32::from(normalize_topk_prob);
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &ne as *const _ as *mut c_void,
+            &kt as *const _ as *mut c_void,
+            &norm as *const _ as *mut c_void,
+        ];
+        let bytes = (tokens * 512 + tokens * 10 * 2) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [tokens as u32, 1, 1],
+            [512, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_i32(ne);
+                b.push_i32(kt);
+                b.push_i32(norm);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Qwen4 indexed combine.  `expert_outputs` stays unweighted until this
+    /// single fixed-ten reduction.
+    pub fn moe_down_combine_top10_batched(
+        &mut self,
+        expert_outputs: &GpuTensor,
+        topk_weights: &GpuTensor,
+        residual: &GpuTensor,
+        hidden: usize,
+        tokens: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "moe_down_combine_top10_batched";
+        self.ensure_kernel(FUNC, kernels::MOE_DOWN_COMBINE_TOP10_BATCHED_SRC, FUNC)?;
+        let ep = expert_outputs.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let rp = residual.buf.as_ptr();
+        let hv = hidden as i32;
+        let tv = tokens as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &hv as *const _ as *mut c_void,
+            &tv as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid_x = (hidden as u32).div_ceil(block);
+        let bytes = (tokens * 10 * hidden + tokens * 10 + 2 * tokens * hidden) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [grid_x, tokens as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(wp);
+                b.push_ptr(rp);
+                b.push_i32(hv);
+                b.push_i32(tv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Qwen4 grouped combine.  `inverse_perm` is the sealed flat-to-grouped
+    /// map and invalid rows are ignored by the bounds-safe kernel.
+    pub fn moe_down_combine_grouped_top10(
+        &mut self,
+        grouped_down: &GpuTensor,
+        inverse_perm: &GpuTensor,
+        topk_weights: &GpuTensor,
+        residual: &GpuTensor,
+        hidden: usize,
+        grouped_rows: usize,
+        tokens: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "moe_down_combine_grouped_top10";
+        self.ensure_kernel(FUNC, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, FUNC)?;
+        let gp = grouped_down.buf.as_ptr();
+        let ip = inverse_perm.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let rp = residual.buf.as_ptr();
+        let hv = hidden as i32;
+        let gr = grouped_rows as i32;
+        let tv = tokens as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &gp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &hv as *const _ as *mut c_void,
+            &gr as *const _ as *mut c_void,
+            &tv as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid_x = (hidden as u32).div_ceil(block);
+        let bytes = (grouped_rows * hidden + tokens * 10 + tokens * 10 + 2 * tokens * hidden) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [grid_x, tokens as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(rp);
+                b.push_i32(hv);
+                b.push_i32(gr);
+                b.push_i32(tv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Qwen4's independent top-10 scatter entry.  The implementation shares
+    /// the proven single-CTA body through a new symbol; no k=8 launch is
+    /// widened.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_scatter_fused_top10(
+        &mut self,
+        topk_indices: &GpuTensor,
+        expert_token_counts: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        inverse_perm: &GpuTensor,
+        total_slots: usize,
+        num_experts: usize,
+        grouped_rows: usize,
+        block_m: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "moe_scatter_fused_top10";
+        self.ensure_kernel(FUNC, kernels::MOE_SCATTER_FUSED_TOP10_SRC, FUNC)?;
+        let ip = topk_indices.buf.as_ptr();
+        let cp = expert_token_counts.buf.as_ptr();
+        let op = expert_offsets.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let invp = inverse_perm.buf.as_ptr();
+        let ts = total_slots as i32;
+        let ne = num_experts as i32;
+        let gr = grouped_rows as i32;
+        let bm = block_m as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ip as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &invp as *const _ as *mut c_void,
+            &ts as *const _ as *mut c_void,
+            &ne as *const _ as *mut c_void,
+            &gr as *const _ as *mut c_void,
+            &bm as *const _ as *mut c_void,
+        ];
+        let lds_bytes = (num_experts * 4) as u32;
+        let bytes = (total_slots + 2 * num_experts + 2 * total_slots + num_experts) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
+        let result =
+            self.launch_maybe_blob(FUNC, [1, 1, 1], [256, 1, 1], lds_bytes, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip);
+                b.push_ptr(cp);
+                b.push_ptr(op);
+                b.push_ptr(sp);
+                b.push_ptr(tp);
+                b.push_ptr(invp);
+                b.push_i32(ts);
+                b.push_i32(ne);
+                b.push_i32(gr);
+                b.push_i32(bm);
+                b
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Qwen4's independent top-10 gate/up unscatter entry.  The underlying
+    /// permutation body has a dynamic K_TOP argument; this wrapper supplies
+    /// the sealed value and uses a distinct symbol.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_gate_up_unscatter_top10(
+        &mut self,
+        grouped_gate_up: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        mi: usize,
+        grouped_rows: usize,
+        tokens: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "moe_gate_up_unscatter_top10";
+        self.ensure_kernel(FUNC, kernels::MOE_GATE_UP_UNSCATTER_TOP10_SRC, FUNC)?;
+        let yp = grouped_gate_up.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let gp = gate.buf.as_ptr();
+        let up_ptr = up.buf.as_ptr();
+        let mi_val = mi as i32;
+        let kt_val = 10i32;
+        let rows_val = grouped_rows as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &yp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &up_ptr as *const _ as *mut c_void,
+            &mi_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+            &rows_val as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid_y = (mi as u32).div_ceil(block);
+        let bytes = (grouped_rows * 2 * mi + tokens * 10 * 2 * mi + grouped_rows) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [grouped_rows as u32, grid_y, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(yp);
+                b.push_ptr(sp);
+                b.push_ptr(gp);
+                b.push_ptr(up_ptr);
+                b.push_i32(mi_val);
+                b.push_i32(kt_val);
+                b.push_i32(rows_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Qwen4 qt3/Q8F16 indexed down.  The kernel writes unweighted expanded
+    /// rows; `moe_down_combine_top10_batched` owns all route weighting.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q8_0_moe_down_top10_indexed_batched_expanded(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        hidden_batch: &GpuTensor,
+        expert_outputs: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        n_exp: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "gemv_q8_0_moe_down_top10_indexed_batched_expanded";
+        self.ensure_kernel(
+            FUNC,
+            kernels::GEMV_Q8_0_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC,
+            FUNC,
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = hidden_batch.buf.as_ptr();
+        let yp = expert_outputs.buf.as_ptr();
+        let mv = m as i32;
+        let kv = k as i32;
+        let nv = batch_size as i32;
+        let nev = n_exp as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &nv as *const _ as *mut c_void,
+            &nev as *const _ as *mut c_void,
+        ];
+        let bytes = batch_size * 10 * (m * k / 32 * 34 + k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [m as u32, 10, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b.push_i32(nev);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Qwen4 qt3/Q8F16 grouped down.  This correctness-first launcher keeps
+    /// K=640 as-is rather than forcing it through a 256-wide MQ geometry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q8_0_moe_grouped_top10(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+        x_src_rows: usize,
+        n_exp: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "gemm_q8_0_moe_grouped_top10";
+        self.ensure_kernel(FUNC, kernels::GEMM_Q8_0_MOE_GROUPED_TOP10_SRC, FUNC)?;
+        let ep = expert_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_src.buf.as_ptr();
+        let yp = y_grouped.buf.as_ptr();
+        let mv = m as i32;
+        let kv = k as i32;
+        let rd = x_row_div as i32;
+        let gr = grouped_rows as i32;
+        let xr = x_src_rows as i32;
+        let ne = n_exp as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &rd as *const _ as *mut c_void,
+            &gr as *const _ as *mut c_void,
+            &xr as *const _ as *mut c_void,
+            &ne as *const _ as *mut c_void,
+        ];
+        let bytes = grouped_rows * m * 4 + grouped_rows * k * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [m as u32, grouped_rows.div_ceil(16) as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(tp);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(rd);
+                b.push_i32(gr);
+                b.push_i32(xr);
+                b.push_i32(ne);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 }

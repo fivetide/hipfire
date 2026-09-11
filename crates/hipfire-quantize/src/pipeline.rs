@@ -162,6 +162,36 @@ pub(crate) fn run() {
         }
     }
 
+    // ── Native Qwen4/Qwen3.8-Flash-Next streaming artifact ──────────────
+    // This is a dedicated transactional producer.  Keep it ahead of the
+    // legacy format handlers so no old Qwen3.5/MTP extraction path can
+    // partially consume the source.
+    if args.qwen4_flash_next {
+        let input = args
+            .input
+            .as_deref()
+            .expect("--input is required with --qwen4-flash-next");
+        match crate::qwen4::run_cli(Path::new(input), Path::new(&args.output)) {
+            Ok(summary) => {
+                eprintln!(
+                    "qwen4: wrote {} ({} entries: {} experts, {} PLE shards; \
+                     resident={} bytes, external PLE={} bytes)",
+                    args.output,
+                    summary.entries,
+                    summary.expert_entries,
+                    summary.ple_shards,
+                    summary.resident_bytes,
+                    summary.external_ple_bytes
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("error: qwen4 streaming pack: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     // ── Strict validation before worker threads ──────────────────────────
     // Unknown class/dtype tokens must fail before rayon spawn, and CLI/env
     // parsers must share the same strict set.

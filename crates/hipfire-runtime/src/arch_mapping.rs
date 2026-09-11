@@ -81,12 +81,15 @@ pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
     ("muse_glimmer_text", 14),
     // arch 15 — maple (Maple-Preview 20B-A1B, natively-ternary 256-expert MoE)
     ("maple", 15),
+    // arch 16 — Qwen3.8-Flash-Next / Qwen4 experimental text trunk
+    ("qwen4_exp", 16),
+    ("qwen4_exp_text", 16),
     // arch 22 — gemma4 EAGLE drafter (single-block spec-decode head for arch 13)
     ("gemma4_unified_assistant", 22),
     // arch 23 — muse_glimmer DFlash drafter
     ("muse_glimmer_assistant", 23),
     // arch 40 — flux MMDiT diffusion trunk (image-gen component block 40–47;
-    // high by design so the sequential primary range 16–19 stays free for
+    // high by design so the sequential primary range 17–19 stays free for
     // future text arches; never a chat-serve trunk — see
     // docs/architecture-ids.md § Image-generation component ids)
     ("flux", 40),
@@ -125,4 +128,21 @@ pub fn supported_model_types() -> Vec<&'static str> {
 /// Human-readable, comma-joined list for `eprintln!` diagnostics.
 pub fn supported_model_types_display() -> String {
     supported_model_types().join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lookup_model_type;
+
+    #[test]
+    fn qwen4_outer_and_text_model_types_share_reserved_architecture_id() {
+        assert_eq!(lookup_model_type("qwen4_exp"), Some(16));
+        assert_eq!(lookup_model_type("qwen4_exp_text"), Some(16));
+    }
+
+    #[test]
+    fn qwen4_near_misses_fail_closed() {
+        assert_eq!(lookup_model_type("qwen4"), None);
+        assert_eq!(lookup_model_type("qwen4_exp_moe"), None);
+    }
 }

@@ -34,6 +34,7 @@ pub mod profile;
 pub mod profile_rocprof;
 pub mod profiler;
 pub mod qwen35_fa_batch;
+pub mod qwen4_ple_ops;
 pub mod rdna;
 pub mod replay;
 pub mod sampling;

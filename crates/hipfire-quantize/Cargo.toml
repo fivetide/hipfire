@@ -23,6 +23,7 @@ rayon = "1"
 libc = "0.2"
 hipfire-reap = { path = "../hipfire-reap" }
 hipfire-runtime = { path = "../hipfire-runtime", default-features = false }
+ureq = "3"
 
 [dev-dependencies]
 tempfile = "3"

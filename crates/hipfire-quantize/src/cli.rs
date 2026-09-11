@@ -34,7 +34,10 @@ use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
     about = "Quantize Hugging Face safetensors or GGUF weights into Hipfire HFQ"
 )]
 pub(crate) struct QuantizeArgs {
-    /// Hugging Face model directory, model ID, or GGUF file. Not used by
+    /// Hugging Face model directory, model ID, or GGUF file. For
+    /// `--qwen4-flash-next`, use a local directory/file or the immutable
+    /// remote form `hf://OWNER/REPO@40_HEX_REVISION`; floating refs such as
+    /// `main`, tags, and short revisions are rejected. Not used by
     /// `--flux-pipe`, which names its own input.
     #[arg(
         long,
@@ -42,6 +45,12 @@ pub(crate) struct QuantizeArgs {
         required_unless_present = "flux_pipe"
     )]
     pub input: Option<String>,
+
+    /// Produce the native Qwen4/Qwen3.8-Flash-Next streaming artifact.  This
+    /// transactional path always includes typed PLE metadata, all PLE shards,
+    /// and native MTP experts; legacy recipe flags are ignored.
+    #[arg(long, conflicts_with = "flux_pipe")]
+    pub qwen4_flash_next: bool,
 
     /// Destination HFQ file.
     #[arg(long, value_name = "PATH")]

@@ -4,18 +4,54 @@
 //! Reads config.json for architecture detection and quantization config.
 //! Mmaps .safetensors files and serves tensor data by name.
 
-use crate::model_source::{ModelSource, QuantConfig, TensorInfo};
+use crate::model_source::{
+    capture_file_identity, read_file_exact_at, ModelSource, QuantConfig, SourceError,
+    SourceFileIdentity, SourceFormat, SourceIdentity, SourceRangeDescriptor, SourceRangeIdentity,
+    SourceReader, SourceReaderImpl, TensorInfo,
+};
 use half::bf16;
 use memmap2::Mmap;
 use safetensors::SafeTensors;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Read as _;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 struct SafetensorsFile {
     _file: File,
     mmap: Mmap,
+}
+
+/// Positional reader for one safetensors shard. The reader retains the
+/// complete source seal but only one file handle: each descriptor identifies
+/// its shard, and every read rechecks that shard's identity before pread.
+struct SafetensorsRangeReader {
+    identity: Arc<SourceIdentity>,
+    file: File,
+    file_identity: SourceFileIdentity,
+}
+
+impl SourceReaderImpl for SafetensorsRangeReader {
+    fn identity(&self) -> &SourceIdentity {
+        self.identity.as_ref()
+    }
+
+    fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), SourceError> {
+        // The source seal covers the whole shard set. A changed non-selected
+        // shard still invalidates descriptors because the source is one
+        // immutable inventory, not an unbound collection of files.
+        for expected in &self.identity.files {
+            let actual = capture_file_identity(&expected.canonical_path)?;
+            if &actual != expected {
+                return Err(SourceError::IdentityChanged {
+                    expected: expected.clone(),
+                    actual,
+                });
+            }
+        }
+        read_file_exact_at(&self.file, &self.file_identity, offset, dst)
+    }
 }
 
 pub struct SafetensorsSource {
@@ -26,6 +62,8 @@ pub struct SafetensorsSource {
     metadata_json_cached: String,
     arch_id: u32,
     quant_config: Option<QuantConfig>,
+    source_identity: Arc<SourceIdentity>,
+    range_readers: Vec<SourceReader>,
 }
 
 impl SafetensorsSource {
@@ -62,25 +100,72 @@ impl SafetensorsSource {
         }
 
         let mut files = Vec::new();
+        let mut file_identities = Vec::new();
         let mut tensors = Vec::new();
         let mut tensor_map = HashMap::new();
 
         for (file_idx, st_path) in st_paths.iter().enumerate() {
+            let file_identity = capture_file_identity(st_path)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             let file = File::open(st_path)?;
             let mmap = unsafe { Mmap::map(&file)? };
 
             let parsed = SafeTensors::deserialize(&mmap)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             let mmap_start = mmap.as_ptr() as usize;
             for (name, view) in parsed.iter() {
+                if tensor_map.contains_key(name) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        SourceError::DuplicateTensor {
+                            name: name.to_string(),
+                        },
+                    ));
+                }
                 let data_offset = (view.data().as_ptr() as usize)
                     .checked_sub(mmap_start)
                     .ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
                             format!("safetensors tensor {name} is outside its mmap"),
                         )
                     })?;
+                let data_offset_u64 = u64::try_from(data_offset).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        SourceError::Overflow {
+                            offset: u64::MAX,
+                            length: view.data().len() as u64,
+                        }
+                        .to_string(),
+                    )
+                })?;
+                let data_size_u64 = u64::try_from(view.data().len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "safetensors tensor is too large for a checked range",
+                    )
+                })?;
+                let end = data_offset_u64.checked_add(data_size_u64).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        SourceError::Overflow {
+                            offset: data_offset_u64,
+                            length: data_size_u64,
+                        }
+                        .to_string(),
+                    )
+                })?;
+                if end > file_identity.len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "safetensors tensor {name} range [{data_offset_u64}, {end}) \
+                             exceeds shard length {}",
+                            file_identity.len
+                        ),
+                    ));
+                }
                 let tensor_idx = tensors.len();
                 let info = TensorInfo {
                     name: name.to_string(),
@@ -94,9 +179,44 @@ impl SafetensorsSource {
                 tensor_map.insert(name.to_string(), (file_idx, tensor_idx));
             }
 
+            file_identities.push(file_identity);
             files.push(SafetensorsFile { _file: file, mmap });
         }
 
+        let source_identity = Arc::new(SourceIdentity {
+            canonical_path: std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()),
+            format: SourceFormat::Safetensors,
+            files: file_identities.clone(),
+            metadata_json: metadata_json_cached.clone(),
+            manifest: tensors
+                .iter()
+                .map(|info| {
+                    let &(file_index, _) = tensor_map
+                        .get(&info.name)
+                        .expect("tensor map populated with every tensor");
+                    SourceRangeIdentity {
+                        name: info.name.clone(),
+                        file_index,
+                        offset: info.data_offset as u64,
+                        length: info.data_size as u64,
+                        dtype: info.dtype.clone(),
+                        logical_shape: info.shape.clone(),
+                    }
+                })
+                .collect(),
+        });
+        let range_readers = files
+            .iter()
+            .enumerate()
+            .map(|(file_idx, file)| {
+                let reader_file = file._file.try_clone()?;
+                Ok(SourceReader::from_inner(SafetensorsRangeReader {
+                    identity: source_identity.clone(),
+                    file: reader_file,
+                    file_identity: file_identities[file_idx].clone(),
+                }))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
         tracing::debug!(
             model_dir = %dir.display(),
             shard_count = files.len(),
@@ -114,9 +234,15 @@ impl SafetensorsSource {
             metadata_json_cached,
             arch_id,
             quant_config,
+            source_identity,
+            range_readers,
         })
     }
 
+    /// Immutable source seal shared by all descriptors from this shard set.
+    pub fn source_identity(&self) -> &SourceIdentity {
+        self.source_identity.as_ref()
+    }
     /// Public accessor so `loader_api` doesn't need the `ModelSource` trait in scope.
     pub fn arch_id(&self) -> u32 {
         self.arch_id
@@ -149,6 +275,27 @@ impl ModelSource for SafetensorsSource {
     fn tensor_info(&self, name: &str) -> Option<&TensorInfo> {
         let &(_file_idx, tensor_idx) = self.tensor_map.get(name)?;
         Some(&self.tensors[tensor_idx])
+    }
+    fn tensor_range(&self, name: &str) -> Result<Option<SourceRangeDescriptor>, SourceError> {
+        let Some(&(file_idx, tensor_idx)) = self.tensor_map.get(name) else {
+            return Ok(None);
+        };
+        let info = &self.tensors[tensor_idx];
+        SourceRangeDescriptor::from_parts(
+            self.source_identity.clone(),
+            u64::try_from(info.data_offset).map_err(|_| SourceError::Overflow {
+                offset: u64::MAX,
+                length: info.data_size as u64,
+            })?,
+            u64::try_from(info.data_size).map_err(|_| SourceError::Overflow {
+                offset: info.data_offset as u64,
+                length: u64::MAX,
+            })?,
+            info.dtype.clone(),
+            info.shape.clone(),
+            self.range_readers[file_idx].clone(),
+        )
+        .map(Some)
     }
 
     /// `MADV_DONTNEED` over the tensor's mmap range.
@@ -495,6 +642,14 @@ mod tests {
         assert_eq!(derive_arch_id(&json!({ "model_type": "lfm2_moe" })), 11);
         assert_eq!(derive_arch_id(&json!({ "model_type": "lfm2" })), 11);
         assert_eq!(derive_arch_id(&json!({ "model_type": "cohere2_moe" })), 12);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "qwen4_exp" })), 16);
+        assert_eq!(
+            derive_arch_id(&json!({
+                "model_type": "qwen4_exp",
+                "text_config": { "model_type": "qwen4_exp_text" }
+            })),
+            16
+        );
     }
 
     /// A diffusers FLUX transformer component config (`model_type: "flux"`)

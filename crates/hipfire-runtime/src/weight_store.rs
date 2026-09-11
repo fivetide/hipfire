@@ -17,7 +17,8 @@
 //! assembling typed weights, and therefore removes the cell from the store's
 //! cleanup set.
 use crate::device_mesh::{DeviceMesh, MeshEpoch};
-use crate::weight_manifest::{placement_devices, ShardPolicy, WeightEntry};
+use crate::model_source::{SourcePayload, SourceRangeDescriptor};
+use crate::weight_manifest::{placement_devices, ShardPolicy, WeightEntry, WeightResidency};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
 
@@ -277,6 +278,9 @@ impl std::error::Error for FulfillError {}
 pub struct WeightStore {
     placements: HashMap<WeightPlacementKey, WeightHandle>,
     projections: HashMap<WeightPlacementKey, WeightProjection>,
+    /// External row descriptors are census entries, not handles. They are
+    /// intentionally absent from `placements` and the allocation journal.
+    external_rows: HashMap<WeightPlacementKey, SourceRangeDescriptor>,
     /// Every inserted identity in allocation order. Entries taken by assembly
     /// stay journaled; rollback skips keys that are no longer resident, so a
     /// key is freed at most once.
@@ -332,6 +336,27 @@ impl WeightLoadTransaction {
         self.store
             .as_ref()
             .and_then(|store| store.get(name, layer, device))
+    }
+    /// Return the sealed source range recorded for an external-row entry.
+    /// External rows deliberately have no `WeightHandle`.
+    pub fn external_descriptor(
+        &self,
+        name: &str,
+        layer: Option<usize>,
+        device: usize,
+    ) -> Option<&SourceRangeDescriptor> {
+        self.store
+            .as_ref()
+            .and_then(|store| store.external_descriptor(name, layer, device))
+    }
+
+    pub fn external_rows_len(&self) -> usize {
+        self.store
+            .as_ref()
+            .map_or(0, WeightStore::external_rows_len)
+    }
+    pub fn inventory_len(&self) -> usize {
+        self.store.as_ref().map_or(0, WeightStore::inventory_len)
     }
 
     pub fn projection(
@@ -400,6 +425,7 @@ impl WeightStore {
         Self {
             placements: HashMap::new(),
             projections: HashMap::new(),
+            external_rows: HashMap::new(),
             journal: Vec::new(),
             aliases: HashMap::new(),
             origin: Some(origin),
@@ -437,6 +463,33 @@ impl WeightStore {
         self.projections
             .get(&WeightPlacementKey::new(name, layer, device))
     }
+    /// Return the sealed source range recorded for an external-row entry.
+    pub fn external_descriptor(
+        &self,
+        name: &str,
+        layer: Option<usize>,
+        device: usize,
+    ) -> Option<&SourceRangeDescriptor> {
+        self.external_rows
+            .get(&WeightPlacementKey::new(name, layer, device))
+    }
+
+    pub fn external_rows_len(&self) -> usize {
+        self.external_rows.len()
+    }
+
+    /// External rows have no placement handles; callers that need to inspect
+    /// their source identities use [`Self::external_descriptor`].
+    pub fn external_devices_for(&self, name: &str, layer: Option<usize>) -> Vec<usize> {
+        let mut devices: Vec<_> = self
+            .external_rows
+            .keys()
+            .filter(|key| key.name == name && key.layer == layer)
+            .map(|key| key.device)
+            .collect();
+        devices.sort_unstable();
+        devices
+    }
 
     pub fn devices_for(&self, name: &str, layer: Option<usize>) -> Vec<usize> {
         let mut devices: Vec<_> = self
@@ -450,7 +503,8 @@ impl WeightStore {
     }
 
     /// Retained provenance census size: every fulfilled identity's projection,
-    /// including cells whose handles assembly already took. Owns nothing.
+    /// including external descriptors and cells whose handles assembly
+    /// already took. Owns nothing.
     pub fn inventory_len(&self) -> usize {
         self.projections.len()
     }
@@ -468,7 +522,7 @@ impl WeightStore {
         handle: WeightHandle,
         projection: WeightProjection,
     ) -> Result<(), WeightStoreError> {
-        if self.placements.contains_key(&key) {
+        if self.placements.contains_key(&key) || self.external_rows.contains_key(&key) {
             return Err(WeightStoreError::DuplicatePlacement(key));
         }
         if let WeightHandle::Alias(source) = &handle {
@@ -476,6 +530,24 @@ impl WeightStore {
         }
         self.journal.push(key.clone());
         self.placements.insert(key.clone(), handle);
+        self.projections.insert(key, projection);
+        Ok(())
+    }
+    /// Record an external range in the census without creating a placement
+    /// handle or journal entry.
+    fn record_external(
+        &mut self,
+        key: WeightPlacementKey,
+        descriptor: SourceRangeDescriptor,
+        projection: WeightProjection,
+    ) -> Result<(), WeightStoreError> {
+        if self.placements.contains_key(&key)
+            || self.external_rows.contains_key(&key)
+            || self.projections.contains_key(&key)
+        {
+            return Err(WeightStoreError::DuplicatePlacement(key));
+        }
+        self.external_rows.insert(key.clone(), descriptor);
         self.projections.insert(key, projection);
         Ok(())
     }
@@ -661,7 +733,7 @@ fn target_error(mesh: &DeviceMesh) -> Option<FulfillError> {
         layer: None,
         device: 0,
         reason: format!(
-            "plain LLaMA Single fulfillment requires one logical device, got {}",
+            "Single fulfillment requires one logical device, got {}",
             mesh.n_devices()
         ),
     })
@@ -683,6 +755,175 @@ pub fn upload_pooled_bytes(
 ) -> hip_bridge::HipResult<GpuTensor> {
     let mut tensor = gpu.alloc_tensor(&[bytes.len()], DType::Raw)?;
     if let Err(error) = gpu.hip.memcpy_htod(&tensor.buf, bytes) {
+        let _ = gpu.free_tensor(tensor);
+        return Err(error);
+    }
+    tensor.shape = logical_shape.to_vec();
+    Ok(tensor)
+}
+/// Maximum host staging allocation for a range upload. The final device tensor
+/// is allocated once; only this bounded staging buffer is proportional to the
+/// source range.
+pub const RANGE_UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+fn next_range_chunk(offset: usize, total_len: usize, alignment: usize) -> usize {
+    debug_assert!(alignment > 0);
+    debug_assert!(offset < total_len);
+    let max_chunk = (RANGE_UPLOAD_CHUNK_BYTES / alignment).max(1) * alignment;
+    (total_len - offset).min(max_chunk)
+}
+
+fn source_dtype(dtype: &str) -> Result<DType, String> {
+    let normalized = dtype.trim().to_ascii_uppercase();
+    let parsed = match normalized.as_str() {
+        "F32" | "FLOAT32" => DType::F32,
+        "F16" | "FLOAT16" | "FP16" => DType::F16,
+        "BF16" | "BFLOAT16" => DType::BF16,
+        "Q4K" => DType::Q4K,
+        "Q6K" => DType::Q6K,
+        "Q8_0" | "Q8-0" => DType::Q8_0,
+        "Q4F16G64" => DType::Q4F16G64,
+        "Q4F16G32" => DType::Q4F16G32,
+        "Q8HFQ" => DType::Q8HFQ,
+        "HFQ4G256" => DType::HFQ4G256,
+        "HFQ4G128" => DType::HFQ4G128,
+        "HFQ3G256" => DType::HFQ3G256,
+        "HFQ3G128" => DType::HFQ3G128,
+        "HFQ2G256" => DType::HFQ2G256,
+        "HFQ2G128" => DType::HFQ2G128,
+        "TQ2G128" => DType::TQ2G128,
+        "BQ1G128" => DType::BQ1G128,
+        "HFQ6G256" => DType::HFQ6G256,
+        "MQ4G256" => DType::MQ4G256,
+        "MQ4G256V2" => DType::MQ4G256V2,
+        "MQ4CG256" => DType::MQ4CG256,
+        "MQ6G256V2" => DType::MQ6G256V2,
+        "MQ5G256V2" => DType::MQ5G256V2,
+        "MQ3G256V2" => DType::MQ3G256V2,
+        "MQ2G256V2" => DType::MQ2G256V2,
+        "MQ4G128" => DType::MQ4G128,
+        "MQ8G256" => DType::MQ8G256,
+        "MQ6G256" => DType::MQ6G256,
+        "MQ5G256" => DType::MQ5G256,
+        "MQ3G256" => DType::MQ3G256,
+        "MQ2G256" => DType::MQ2G256,
+        "MQ2G256LLOYD" => DType::MQ2G256Lloyd,
+        "MQ2G256LLOYDU" => DType::MQ2G256LloydU,
+        "MQ3G256LLOYD" => DType::MQ3G256Lloyd,
+        "MQ4G256LLOYD" => DType::MQ4G256Lloyd,
+        "MQ2G256GL" => DType::MQ2G256GL,
+        "MQ3G256GL" => DType::MQ3G256GL,
+        "HFP4G32" => DType::HFP4G32,
+        "MFP4G32" => DType::MFP4G32,
+        "MFP4G32LLOYD" => DType::MFP4G32Lloyd,
+        "MFP4G32P" => DType::MFP4G32P,
+        "MFP4G32E8" => DType::MFP4G32E8,
+        "MFP4G32E8SOA" => DType::MFP4G32E8SOA,
+        "MFP3G32E8" => DType::MFP3G32E8,
+        "MFP2G32E8" => DType::MFP2G32E8,
+        "PAROQ4G128" => DType::ParoQ4G128,
+        "RAW" => DType::Raw,
+        _ => {
+            return Err(format!("unsupported source dtype '{dtype}'"));
+        }
+    };
+    Ok(parsed)
+}
+
+fn quant_block_bytes(dtype: DType) -> usize {
+    match dtype {
+        DType::Q4K => 144,
+        DType::Q6K => 210,
+        DType::HFQ4G256 | DType::MQ4G256 | DType::MQ4G256V2 => 136,
+        DType::MQ4CG256 => 136,
+        DType::HFQ6G256 | DType::MQ6G256 | DType::MQ6G256V2 => 200,
+        DType::Q8_0 => 34,
+        DType::Q4F16G64 => 36,
+        DType::Q4F16G32 => 20,
+        DType::HFQ4G128 | DType::MQ4G128 => 72,
+        DType::HFQ3G256 | DType::MQ3G256 | DType::MQ3G256V2 => 104,
+        DType::HFQ3G128 => 56,
+        DType::HFQ2G256
+        | DType::MQ2G256
+        | DType::MQ2G256V2
+        | DType::MQ2G256Lloyd
+        | DType::MQ2G256LloydU
+        | DType::MQ2G256GL => 72,
+        DType::MQ5G256 | DType::MQ5G256V2 => 168,
+        DType::MQ8G256 => 258,
+        DType::MQ3G256Lloyd | DType::MQ3G256GL => 112,
+        DType::MQ4G256Lloyd => 160,
+        DType::HFP4G32
+        | DType::MFP4G32
+        | DType::MFP4G32Lloyd
+        | DType::MFP4G32P
+        | DType::MFP4G32E8
+        | DType::MFP4G32E8SOA => 16,
+        DType::MFP3G32E8 => 13,
+        DType::MFP2G32E8 => 9,
+        DType::HFQ2G128 => 40,
+        DType::TQ2G128 => 34,
+        DType::BQ1G128 => 18,
+        DType::F32 => 4,
+        DType::F16 | DType::BF16 => 2,
+        DType::ParoQ4G128 => 72,
+        DType::Raw => 1,
+        // Keep this arm in sync if a new storage dtype is added. `size()` is
+        // a conservative byte alignment for formats without a block codec.
+        other => other.size(),
+    }
+}
+
+fn expected_float_bytes(shape: &[usize], dtype: DType) -> Option<usize> {
+    if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
+        return None;
+    }
+    shape
+        .iter()
+        .try_fold(1usize, |product, &dim| product.checked_mul(dim))
+        .and_then(|elements| elements.checked_mul(dtype.size()))
+}
+
+fn upload_range_pooled(
+    gpu: &mut Gpu,
+    descriptor: &SourceRangeDescriptor,
+    dtype: DType,
+    logical_shape: &[usize],
+) -> Result<GpuTensor, String> {
+    let payload_len = usize::try_from(descriptor.length)
+        .map_err(|_| "source range length does not fit usize".to_string())?;
+    if payload_len == 0 {
+        return Err("source range has zero length".to_string());
+    }
+    let alignment = quant_block_bytes(dtype);
+    if payload_len % alignment != 0 {
+        return Err(format!(
+            "source range length {payload_len} is not aligned to {alignment}-byte blocks for {dtype:?}"
+        ));
+    }
+    let mut tensor = gpu
+        .alloc_tensor(&[payload_len], DType::Raw)
+        .map_err(|error| format!("pooled allocation failed: {error}"))?;
+    let result = (|| {
+        let mut offset = 0usize;
+        let mut staging = vec![0u8; next_range_chunk(0, payload_len, alignment)];
+        while offset < payload_len {
+            let chunk_len = next_range_chunk(offset, payload_len, alignment);
+            let chunk = &mut staging[..chunk_len];
+            let absolute_offset = descriptor
+                .offset
+                .checked_add(offset as u64)
+                .ok_or_else(|| "source range offset overflow".to_string())?;
+            descriptor
+                .read_exact_at(absolute_offset, chunk)
+                .map_err(|error| format!("source range read failed: {error}"))?;
+            gpu.hip
+                .memcpy_htod_offset(&tensor.buf, offset, chunk)
+                .map_err(|error| format!("pooled chunk upload failed: {error}"))?;
+            offset += chunk_len;
+        }
+        Ok::<(), String>(())
+    })();
+    if let Err(error) = result {
         let _ = gpu.free_tensor(tensor);
         return Err(error);
     }
@@ -766,6 +1007,16 @@ where
             return Err(rollback_fulfill_error(store, gpu, error));
         }
         let key = WeightPlacementKey::new(&entry.name, entry.layer, 0);
+        if entry.residency.is_external() {
+            return Err(rollback_fulfill_error(
+                store,
+                gpu,
+                fulfill_entry_error(
+                    entry,
+                    "external rows require fulfill_manifest_from_payloads",
+                ),
+            ));
+        }
         if let ShardPolicy::Tied {
             source: source_name,
         } = &entry.policy
@@ -893,6 +1144,490 @@ where
     Ok(WeightLoadTransaction::new(store))
 }
 
+fn fulfill_entry_error(entry: &WeightEntry, reason: impl Into<String>) -> FulfillError {
+    FulfillError {
+        name: entry.name.clone(),
+        layer: entry.layer,
+        device: 0,
+        reason: reason.into(),
+    }
+}
+
+fn validate_payload_shape(entry: &WeightEntry, shape: &[usize]) -> Result<(), String> {
+    if shape != entry.logical_shape.as_slice() {
+        return Err(format!(
+            "source logical shape {:?} does not match manifest {:?}",
+            shape, entry.logical_shape
+        ));
+    }
+    Ok(())
+}
+
+fn validate_external_range(
+    entry: &WeightEntry,
+    dtype: DType,
+    descriptor: &SourceRangeDescriptor,
+) -> Result<(), String> {
+    let WeightResidency::ExternalRows {
+        row_bytes,
+        valid_rows,
+    } = entry.residency
+    else {
+        return Err("resident entry cannot be fulfilled by an external row range".into());
+    };
+    let physical_rows = entry.logical_shape.first().copied().unwrap_or(0);
+    if valid_rows == 0 || valid_rows > physical_rows {
+        return Err(format!(
+            "external valid_rows={valid_rows} is outside physical rows 1..={physical_rows}"
+        ));
+    }
+    if let Some(width) =
+        matches!(dtype, DType::F32 | DType::F16 | DType::BF16).then_some(dtype.size())
+    {
+        let row_elements = entry.logical_shape[1..]
+            .iter()
+            .try_fold(1usize, |product, &dim| product.checked_mul(dim))
+            .ok_or_else(|| "external row shape overflows usize".to_string())?;
+        let expected_row_bytes = row_elements
+            .checked_mul(width)
+            .ok_or_else(|| "external row byte count overflows usize".to_string())?;
+        if row_bytes != expected_row_bytes {
+            return Err(format!(
+                "external row_bytes={row_bytes}, expected {expected_row_bytes} for {dtype:?}"
+            ));
+        }
+    }
+    let expected_length = row_bytes
+        .checked_mul(physical_rows)
+        .ok_or_else(|| "external range length overflows usize".to_string())?;
+    let actual_length = usize::try_from(descriptor.length)
+        .map_err(|_| "external range length does not fit usize".to_string())?;
+    if actual_length != expected_length {
+        return Err(format!(
+            "external range has {actual_length} bytes, expected {expected_length} \
+             for {physical_rows} physical rows"
+        ));
+    }
+    Ok(())
+}
+
+/// Fulfill a Single manifest from the canonical source payload seam.
+///
+/// Small tensors may be borrowed from a source mmap or owned by the callback.
+/// Large tensors use a checked [`SourceRangeDescriptor`], which is uploaded
+/// through bounded quant-block-aligned staging. External-row entries are
+/// recorded in the transaction census and never become `WeightHandle`s.
+pub fn fulfill_manifest_from_payloads<'a, F>(
+    weights: &[WeightEntry],
+    mesh: &DeviceMesh,
+    n_layers: usize,
+    gpu: &mut Gpu,
+    expected: WeightOrigin,
+    source: F,
+) -> Result<WeightLoadTransaction, FulfillError>
+where
+    F: Fn(&WeightEntry) -> Result<SourcePayload<'a>, String>,
+{
+    if let Some(error) = target_error(mesh) {
+        return Err(error);
+    }
+    if let Err(reason) = crate::weight_manifest::validate_weight_layers(weights, n_layers)
+        .and_then(|_| crate::weight_manifest::validate_manifest(weights, mesh))
+    {
+        return Err(FulfillError {
+            name: "<manifest>".to_string(),
+            layer: None,
+            device: 0,
+            reason,
+        });
+    }
+
+    let origin = WeightOrigin::for_single(mesh, gpu);
+    if origin != expected {
+        return Err(FulfillError {
+            name: "<origin>".to_string(),
+            layer: None,
+            device: 0,
+            reason: format!(
+                "admitted target identity {expected:?} does not match runtime mesh/GPU {origin:?}; refusing before upload"
+            ),
+        });
+    }
+
+    let mut store = WeightStore::with_origin(origin);
+    for entry in weights {
+        let devices = placement_devices(entry, mesh, n_layers);
+        if devices.as_slice() != [0] {
+            return Err(rollback_fulfill_error(
+                store,
+                gpu,
+                fulfill_entry_error(
+                    entry,
+                    format!("Single placement resolved to {:?}, expected [0]", devices),
+                ),
+            ));
+        }
+        let key = WeightPlacementKey::new(&entry.name, entry.layer, 0);
+
+        if let ShardPolicy::Tied {
+            source: source_name,
+        } = &entry.policy
+        {
+            if store
+                .external_descriptor(source_name, entry.layer, 0)
+                .is_some()
+            {
+                return Err(rollback_fulfill_error(
+                    store,
+                    gpu,
+                    fulfill_entry_error(
+                        entry,
+                        format!(
+                            "tied source '{source_name}' is external rows and cannot be aliased"
+                        ),
+                    ),
+                ));
+            }
+            let source_dtype = match store.get(source_name, entry.layer, 0) {
+                Some(WeightHandle::Resident(tensor)) => Some(tensor.dtype),
+                Some(WeightHandle::Alias(_)) | None => None,
+            };
+            let Some(actual_dtype) = source_dtype else {
+                return Err(rollback_fulfill_error(
+                    store,
+                    gpu,
+                    fulfill_entry_error(
+                        entry,
+                        format!(
+                            "tied source '{source_name}' is unresolved or has no actual resident dtype"
+                        ),
+                    ),
+                ));
+            };
+            if !entry.dtype_constraint.accepts(actual_dtype) {
+                return Err(rollback_fulfill_error(
+                    store,
+                    gpu,
+                    fulfill_entry_error(
+                        entry,
+                        format!(
+                            "tied source '{source_name}' actual dtype {actual_dtype:?} \
+                             is excluded by constraint {:?}",
+                            entry.dtype_constraint
+                        ),
+                    ),
+                ));
+            }
+            let projection = projection_for(entry, 0, 1, actual_dtype);
+            if let Err(reason) =
+                store.insert(key, WeightHandle::Alias(source_name.clone()), projection)
+            {
+                return Err(rollback_fulfill_error(
+                    store,
+                    gpu,
+                    fulfill_entry_error(entry, reason.to_string()),
+                ));
+            }
+            continue;
+        }
+
+        let payload = match source(entry) {
+            Ok(payload) => payload,
+            Err(reason) => {
+                return Err(rollback_fulfill_error(
+                    store,
+                    gpu,
+                    fulfill_entry_error(entry, format!("source read failed: {reason}")),
+                ));
+            }
+        };
+        match payload {
+            SourcePayload::Borrowed { info, bytes } => {
+                if entry.residency.is_external() {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(
+                            entry,
+                            "external rows require a checked source range payload",
+                        ),
+                    ));
+                }
+                let dtype = match source_dtype(&info.dtype) {
+                    Ok(dtype) => dtype,
+                    Err(reason) => {
+                        return Err(rollback_fulfill_error(
+                            store,
+                            gpu,
+                            fulfill_entry_error(entry, reason),
+                        ));
+                    }
+                };
+                if let Err(reason) = validate_payload_shape(entry, &info.shape) {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(entry, reason),
+                    ));
+                }
+                if !entry.dtype_constraint.accepts(dtype) {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(
+                            entry,
+                            format!(
+                                "source dtype {dtype:?} violates constraint {:?}",
+                                entry.dtype_constraint
+                            ),
+                        ),
+                    ));
+                }
+                if let Some(expected_bytes) = expected_float_bytes(&info.shape, dtype) {
+                    if expected_bytes != bytes.len() {
+                        return Err(rollback_fulfill_error(
+                            store,
+                            gpu,
+                            fulfill_entry_error(
+                                entry,
+                                format!(
+                                    "source payload has {} bytes, expected {expected_bytes} \
+                                     for {dtype:?} {:?}",
+                                    bytes.len(),
+                                    info.shape
+                                ),
+                            ),
+                        ));
+                    }
+                }
+                let tensor = match upload_pooled_bytes(gpu, bytes, &entry.logical_shape) {
+                    Ok(mut tensor) => {
+                        tensor.dtype = dtype;
+                        tensor
+                    }
+                    Err(error) => {
+                        return Err(rollback_fulfill_error(
+                            store,
+                            gpu,
+                            fulfill_entry_error(entry, format!("pooled upload failed: {error}")),
+                        ));
+                    }
+                };
+                let projection = projection_for(entry, 0, 1, dtype);
+                if let Err(reason) = store.insert(key, WeightHandle::Resident(tensor), projection) {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(entry, reason.to_string()),
+                    ));
+                }
+                if test_support::record_resident_upload() {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(entry, "test fault injected after resident upload"),
+                    ));
+                }
+            }
+            SourcePayload::Owned { info, bytes } => {
+                if entry.residency.is_external() {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(
+                            entry,
+                            "external rows require a checked source range payload",
+                        ),
+                    ));
+                }
+                let dtype = match source_dtype(&info.dtype) {
+                    Ok(dtype) => dtype,
+                    Err(reason) => {
+                        return Err(rollback_fulfill_error(
+                            store,
+                            gpu,
+                            fulfill_entry_error(entry, reason),
+                        ));
+                    }
+                };
+                if let Err(reason) = validate_payload_shape(entry, &info.shape) {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(entry, reason),
+                    ));
+                }
+                if !entry.dtype_constraint.accepts(dtype) {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(
+                            entry,
+                            format!(
+                                "source dtype {dtype:?} violates constraint {:?}",
+                                entry.dtype_constraint
+                            ),
+                        ),
+                    ));
+                }
+                if let Some(expected_bytes) = expected_float_bytes(&info.shape, dtype) {
+                    if expected_bytes != bytes.len() {
+                        return Err(rollback_fulfill_error(
+                            store,
+                            gpu,
+                            fulfill_entry_error(
+                                entry,
+                                format!(
+                                    "source payload has {} bytes, expected {expected_bytes} \
+                                     for {dtype:?} {:?}",
+                                    bytes.len(),
+                                    info.shape
+                                ),
+                            ),
+                        ));
+                    }
+                }
+                let tensor = match upload_pooled_bytes(gpu, &bytes, &entry.logical_shape) {
+                    Ok(mut tensor) => {
+                        tensor.dtype = dtype;
+                        tensor
+                    }
+                    Err(error) => {
+                        return Err(rollback_fulfill_error(
+                            store,
+                            gpu,
+                            fulfill_entry_error(entry, format!("pooled upload failed: {error}")),
+                        ));
+                    }
+                };
+                let projection = projection_for(entry, 0, 1, dtype);
+                if let Err(reason) = store.insert(key, WeightHandle::Resident(tensor), projection) {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(entry, reason.to_string()),
+                    ));
+                }
+                if test_support::record_resident_upload() {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(entry, "test fault injected after resident upload"),
+                    ));
+                }
+            }
+            SourcePayload::Range(descriptor) => {
+                let dtype = match source_dtype(descriptor.dtype()) {
+                    Ok(dtype) => dtype,
+                    Err(reason) => {
+                        return Err(rollback_fulfill_error(
+                            store,
+                            gpu,
+                            fulfill_entry_error(entry, reason),
+                        ));
+                    }
+                };
+                if let Err(reason) = validate_payload_shape(entry, descriptor.logical_shape()) {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(entry, reason),
+                    ));
+                }
+                if !entry.dtype_constraint.accepts(dtype) {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(
+                            entry,
+                            format!(
+                                "source dtype {dtype:?} violates constraint {:?}",
+                                entry.dtype_constraint
+                            ),
+                        ),
+                    ));
+                }
+                if entry.residency.is_external() {
+                    if let Err(reason) = validate_external_range(entry, dtype, &descriptor) {
+                        return Err(rollback_fulfill_error(
+                            store,
+                            gpu,
+                            fulfill_entry_error(entry, reason),
+                        ));
+                    }
+                    let projection = projection_for(entry, 0, 1, dtype);
+                    if let Err(reason) = store.record_external(key, descriptor, projection) {
+                        return Err(rollback_fulfill_error(
+                            store,
+                            gpu,
+                            fulfill_entry_error(entry, reason.to_string()),
+                        ));
+                    }
+                    continue;
+                }
+                let range_len = match usize::try_from(descriptor.length) {
+                    Ok(length) => length,
+                    Err(_) => {
+                        return Err(rollback_fulfill_error(
+                            store,
+                            gpu,
+                            fulfill_entry_error(entry, "source range length does not fit usize"),
+                        ));
+                    }
+                };
+                if let Some(expected_bytes) =
+                    expected_float_bytes(descriptor.logical_shape(), dtype)
+                {
+                    if expected_bytes != range_len {
+                        return Err(rollback_fulfill_error(
+                            store,
+                            gpu,
+                            fulfill_entry_error(
+                                entry,
+                                format!(
+                                    "source range has {range_len} bytes, expected {expected_bytes} \
+                                     for {dtype:?} {:?}",
+                                    descriptor.logical_shape()
+                                ),
+                            ),
+                        ));
+                    }
+                }
+                let tensor =
+                    match upload_range_pooled(gpu, &descriptor, dtype, &entry.logical_shape) {
+                        Ok(mut tensor) => {
+                            tensor.dtype = dtype;
+                            tensor
+                        }
+                        Err(reason) => {
+                            return Err(rollback_fulfill_error(
+                                store,
+                                gpu,
+                                fulfill_entry_error(entry, reason),
+                            ));
+                        }
+                    };
+                let projection = projection_for(entry, 0, 1, dtype);
+                if let Err(reason) = store.insert(key, WeightHandle::Resident(tensor), projection) {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(entry, reason.to_string()),
+                    ));
+                }
+                if test_support::record_resident_upload() {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(entry, "test fault injected after resident upload"),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(WeightLoadTransaction::new(store))
+}
+
 /// Canonical name used by the manifest fulfillment seam. The target is
 /// deliberately Single-only in this pilot; multi-device fulfillment belongs to
 /// the admitted mesh/G5 integration and must not grow a second owner here.
@@ -917,6 +1652,89 @@ mod tests {
     use super::*;
     use crate::device_mesh::DimKind;
     use crate::weight_manifest::{DTypeConstraint, PinTarget, ShardPolicy};
+
+    use crate::model_source::{
+        SourceError, SourceFormat, SourceIdentity, SourcePayload, SourceRangeDescriptor,
+        SourceReader, SourceReaderImpl, TensorInfo,
+    };
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    struct TestRangeReader {
+        identity: SourceIdentity,
+        bytes: Vec<u8>,
+    }
+
+    impl SourceReaderImpl for TestRangeReader {
+        fn identity(&self) -> &SourceIdentity {
+            &self.identity
+        }
+
+        fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), SourceError> {
+            let start = usize::try_from(offset).map_err(|_| SourceError::Overflow {
+                offset,
+                length: dst.len() as u64,
+            })?;
+            let available = self.bytes.len().saturating_sub(start);
+            if available < dst.len() {
+                if available != 0 {
+                    dst[..available].copy_from_slice(&self.bytes[start..]);
+                }
+                return Err(SourceError::ShortRead {
+                    offset,
+                    expected: dst.len(),
+                    actual: available,
+                });
+            }
+            dst.copy_from_slice(&self.bytes[start..start + dst.len()]);
+            Ok(())
+        }
+    }
+
+    fn test_descriptor_with_length(
+        bytes: Vec<u8>,
+        declared_len: u64,
+        dtype: &str,
+        shape: Vec<usize>,
+    ) -> SourceRangeDescriptor {
+        let identity = SourceIdentity {
+            canonical_path: PathBuf::from("/test/source"),
+            format: SourceFormat::Safetensors,
+            files: Vec::new(),
+            metadata_json: "{}".to_string(),
+            manifest: Vec::new(),
+        };
+        let reader = SourceReader::from_inner(TestRangeReader {
+            identity: identity.clone(),
+            bytes,
+        });
+        let identity = Arc::new(identity);
+        SourceRangeDescriptor::from_parts(
+            identity,
+            0,
+            declared_len,
+            dtype.to_string(),
+            shape,
+            reader,
+        )
+        .expect("test descriptor has a checked range")
+    }
+
+    fn test_descriptor(bytes: Vec<u8>, dtype: &str, shape: Vec<usize>) -> SourceRangeDescriptor {
+        let declared_len = u64::try_from(bytes.len()).expect("test bytes fit u64");
+        test_descriptor_with_length(bytes, declared_len, dtype, shape)
+    }
+
+    fn owned_info(name: &str, dtype: &str, shape: &[usize]) -> TensorInfo {
+        TensorInfo {
+            name: name.to_string(),
+            dtype: dtype.to_string(),
+            shape: shape.to_vec(),
+            quant_type: 0xFF,
+            data_offset: 0,
+            data_size: shape.iter().product::<usize>() * 2,
+        }
+    }
 
     fn projection(dtype: DType) -> WeightProjection {
         WeightProjection {
@@ -991,6 +1809,13 @@ mod tests {
         let _taken = store.take("second", None, 0).unwrap();
         let order: Vec<String> = store.journal.iter().map(|key| key.name.clone()).collect();
         assert_eq!(order, vec!["first", "second", "third"]);
+        let reverse: Vec<String> = store
+            .journal
+            .iter()
+            .rev()
+            .map(|key| key.name.clone())
+            .collect();
+        assert_eq!(reverse, vec!["third", "second", "first"]);
     }
 
     #[test]
@@ -1327,5 +2152,97 @@ mod tests {
         assert_eq!(test_support::resident_allocations(), 0);
         assert_eq!(test_support::resident_releases(), 0);
         test_support::reset();
+    }
+    #[test]
+    fn range_chunks_are_bounded_and_quant_block_aligned() {
+        for dtype in [DType::BF16, DType::F32, DType::MQ4G256V2] {
+            let alignment = quant_block_bytes(dtype);
+            let total = RANGE_UPLOAD_CHUNK_BYTES.div_ceil(alignment) * alignment + alignment * 3;
+            let mut offset = 0usize;
+            let mut chunks = 0usize;
+            while offset < total {
+                let chunk = next_range_chunk(offset, total, alignment);
+                assert!(chunk > 0);
+                assert!(chunk <= RANGE_UPLOAD_CHUNK_BYTES);
+                assert_eq!(chunk % alignment, 0);
+                offset += chunk;
+                chunks += 1;
+            }
+            assert_eq!(offset, total);
+            assert!(chunks >= 2);
+        }
+    }
+
+    #[test]
+    fn external_rows_are_census_only_and_do_not_allocate() {
+        let Ok(mut gpu) = Gpu::init() else {
+            return;
+        };
+        test_support::reset();
+        let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
+        let entry = WeightEntry::model("ple", vec![2, 1], DType::BF16, ShardPolicy::Replicate)
+            .external_rows(2, 1);
+        let descriptor = test_descriptor(vec![0; 4], "BF16", vec![2, 1]);
+        let expected = WeightOrigin::for_single(&mesh, &gpu);
+        let transaction =
+            fulfill_manifest_from_payloads(&[entry], &mesh, 1, &mut gpu, expected, |_| {
+                Ok(SourcePayload::Range(descriptor.clone()))
+            })
+            .expect("external range should be recorded without GPU work");
+        assert_eq!(transaction.len(), 0);
+        assert!(transaction.is_empty());
+        assert_eq!(transaction.external_rows_len(), 1);
+        assert!(transaction.get("ple", None, 0).is_none());
+        assert!(transaction.external_descriptor("ple", None, 0).is_some());
+        assert_eq!(transaction.inventory_len(), 1);
+        assert_eq!(test_support::resident_allocations(), 0);
+        assert_eq!(test_support::resident_releases(), 0);
+        transaction
+            .rollback(&mut gpu)
+            .expect("external-only rollback has no resident buffers");
+        assert_eq!(test_support::resident_releases(), 0);
+        test_support::reset();
+    }
+
+    #[test]
+    fn short_range_read_rolls_back_prior_resident_and_partial_tensor() {
+        let Ok(mut gpu) = Gpu::init() else {
+            return;
+        };
+        test_support::reset();
+        let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
+        let entries = vec![
+            WeightEntry::model("first", vec![1], DType::BF16, ShardPolicy::Replicate),
+            WeightEntry::model("second", vec![1], DType::BF16, ShardPolicy::Replicate),
+        ];
+        let short = test_descriptor_with_length(vec![0], 2, "BF16", vec![1]);
+        let expected = WeightOrigin::for_single(&mesh, &gpu);
+        let error =
+            fulfill_manifest_from_payloads(&entries, &mesh, 1, &mut gpu, expected, |entry| {
+                if entry.name == "first" {
+                    Ok(SourcePayload::Owned {
+                        info: owned_info("first", "BF16", &[1]),
+                        bytes: vec![0; 2],
+                    })
+                } else {
+                    Ok(SourcePayload::Range(short.clone()))
+                }
+            })
+            .expect_err("short range read must fail the whole transaction");
+        assert_eq!(error.name, "second");
+        assert!(error.reason.contains("source range read failed"));
+        assert_eq!(
+            test_support::resident_releases(),
+            1,
+            "the earlier resident must be released after the failed range"
+        );
+        test_support::reset();
+    }
+
+    #[test]
+    fn source_dtype_mapping_is_explicit_and_rejects_unknown_formats() {
+        assert_eq!(source_dtype("BF16").unwrap(), DType::BF16);
+        assert_eq!(source_dtype("mq4g256v2").unwrap(), DType::MQ4G256V2);
+        assert!(source_dtype("I64").is_err());
     }
 }

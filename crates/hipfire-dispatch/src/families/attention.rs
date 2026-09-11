@@ -670,23 +670,44 @@ fn dispatch_kv_write(
             ))
         }
         KernelKey::KvWriteQ8_0Batched => {
-            // S6-fa-prep-q8-pair: exact gfx1100 fold of the K+V pair into one
-            // launch. Bit-exact vs the two calls below (same per-block
-            // arithmetic and legacy single-arena addressing); every failed
-            // predicate and HIPFIRE_FA_BATCH_FUSE_OFF=1 keep the old path.
+            // S6-fa-prep-q8-pair is built with the DeltaNet feature that owns
+            // its rdna-compute launcher. Default dispatch builds retain the
+            // established two-launch path.
             let pos = io.positions();
-            if gpu.arch_caps.is_gfx1100() && !gpu.flags.fa_batch_fuse_off {
-                hip!(gpu.kv_cache_write_q8_0_pair_batched(
-                    io.k_cache,
-                    io.v_cache,
-                    io.k,
-                    io.v,
-                    pos,
-                    io.n_kv_heads,
-                    io.head_dim,
-                    io.batch_size,
-                ))
-            } else {
+            #[cfg(feature = "deltanet")]
+            {
+                if gpu.arch_caps.is_gfx1100() && !gpu.flags.fa_batch_fuse_off {
+                    hip!(gpu.kv_cache_write_q8_0_pair_batched(
+                        io.k_cache,
+                        io.v_cache,
+                        io.k,
+                        io.v,
+                        pos,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.batch_size,
+                    ))
+                } else {
+                    hip!(gpu.kv_cache_write_q8_0_batched(
+                        io.k_cache,
+                        io.k,
+                        pos,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.batch_size,
+                    ))?;
+                    hip!(gpu.kv_cache_write_q8_0_batched(
+                        io.v_cache,
+                        io.v,
+                        pos,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.batch_size,
+                    ))
+                }
+            }
+            #[cfg(not(feature = "deltanet"))]
+            {
                 hip!(gpu.kv_cache_write_q8_0_batched(
                     io.k_cache,
                     io.k,

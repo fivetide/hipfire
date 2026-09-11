@@ -24592,6 +24592,63 @@ impl Gpu {
             )
         }
     }
+    /// Native-BF16 weight × F32 input batched GEMM.
+    ///
+    /// `weight` is row-major `[M, K]` BF16, `x` is row-major `[N, K]` F32,
+    /// and `y` is row-major `[N, M]` F32.  The device kernel widens BF16
+    /// values directly, preserving the exact source representation required
+    /// by Qwen4's shared expert.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_xf32_batched(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const KERNEL: &str = "gemm_bf16_xf32_batched";
+        self.ensure_kernel(KERNEL, kernels::GEMM_BF16_XF32_BATCHED_SRC, KERNEL)?;
+        let wp = weight.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mv = m as i32;
+        let kv = k as i32;
+        let nv = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &nv as *const _ as *mut c_void,
+        ];
+        let bytes = batch_size * (m * k * 2 + k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [m as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
 
     /// HFP4G32 / MFP4G32 grouped-WMMA-GEMM for MoE prefill — sister of
     /// `gemm_hfq4g256_moe_grouped_wmma_k2` but on the FP4G32 dequant. Same
@@ -37498,6 +37555,42 @@ impl Gpu {
             "qt=45 gemm_mq4cg256_batched_lmhead: scalar fallback has no mq4c source \
              (GEMM_MQ4CG256_SRC missing) — would mis-decode MQ4C fp16-header groups as v1 f32 header",
         ))
+    }
+    /// Qwen4 fixed top-10 grouped qt44 gate/up entry.  The grouped WMMA
+    /// contraction is independent of K_TOP; this wrapper seals the only
+    /// supported source-row divisor and keeps the old k=8 family unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq4g256v2_moe_grouped_top10(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        if x_row_div != 10 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_mq4g256v2_moe_grouped_top10: x_row_div must be sealed top-k=10",
+            ));
+        }
+        self.gemm_mq4g256v2_moe_grouped_wmma_k2(
+            expert_weight_ptrs,
+            expert_tile_ids,
+            sorted_slot_index,
+            x_src,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            grouped_rows,
+            x_src_rows,
+        )
     }
 }
 

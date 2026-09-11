@@ -8,6 +8,11 @@ use crate::llama::{
     f16_to_f32, EmbeddingFormat, LayerWeights, LlamaConfig, LlamaWeights, ModelArch, WeightTensor,
 };
 use crate::model_load::{load_weights as rt_load_weights, LoadedWeights, WeightSource};
+use crate::model_source::{
+    capture_file_identity, read_file_exact_at, ModelSource, SourceError, SourceFileIdentity,
+    SourceFormat, SourceIdentity, SourceRangeDescriptor, SourceRangeIdentity, SourceReader,
+    SourceReaderImpl,
+};
 use crate::weight_backend::{
     decode_raw_codec, flat_name_candidates, load_embedding, raw_codec, resolve_lm_head,
     reupload_f16_as_f32, HfqBackend, WeightBackend,
@@ -20,6 +25,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Drop page cache for a file byte range via posix_fadvise(FADV_DONTNEED).
 /// On unified-memory APUs (e.g. Strix Halo), mmap'd model data and
@@ -281,6 +287,36 @@ pub struct HfqSourceIdentity {
     pub metadata_json: String,
     pub manifest: Vec<HfqTensorManifestEntry>,
 }
+/// Positional reader for one HFQ container file. The effective source identity
+/// may contain a base and an overlay, but this reader targets exactly one of
+/// those sealed files.
+struct HfqRangeReader {
+    identity: Arc<SourceIdentity>,
+    file: File,
+    file_identity: SourceFileIdentity,
+}
+
+impl SourceReaderImpl for HfqRangeReader {
+    fn identity(&self) -> &SourceIdentity {
+        self.identity.as_ref()
+    }
+
+    fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), SourceError> {
+        // The effective seal includes every participating file. Check all of
+        // them, not only the selected base/overlay shard, so a changed base
+        // cannot be hidden by a still-readable overlay range.
+        for expected in &self.identity.files {
+            let actual = capture_file_identity(&expected.canonical_path)?;
+            if &actual != expected {
+                return Err(SourceError::IdentityChanged {
+                    expected: expected.clone(),
+                    actual,
+                });
+            }
+        }
+        read_file_exact_at(&self.file, &self.file_identity, offset, dst)
+    }
+}
 
 /// Author-recommended sampling defaults baked into a .hfq's
 /// `generation_config` metadata, surfaced by [`HfqFile::recommended_sampling`].
@@ -302,6 +338,9 @@ pub struct HfqFile {
     /// going through this struct (cleanly separates HfqFile's mmap-based
     /// tensor lookup from the pager's pread/io_uring transport).
     path: std::path::PathBuf,
+    /// File identity captured when the container was opened. Range readers
+    /// compare the live file against this seal before every positional read.
+    source_file_identity: SourceFileIdentity,
     /// mmap for tensor data access on discrete-GPU systems where GPU VRAM
     /// is separate from system RAM (no double-buffering cost).
     /// `None` on unified-memory APUs (Strix Halo etc.) where mmap pages
@@ -512,6 +551,8 @@ impl HfqFile {
     /// entry point.
     pub fn open_at_offset(path: &Path, base_offset: u64) -> std::io::Result<Self> {
         let file = File::open(path)?;
+        let source_file_identity = capture_file_identity(path)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         let mmap = unsafe { Mmap::map(&file)? };
         // Sequential access hint: helps the kernel readahead and drop pages sooner.
         #[cfg(unix)]
@@ -524,7 +565,12 @@ impl HfqFile {
             }
         }
 
-        let base = base_offset as usize;
+        let base = usize::try_from(base_offset).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("HfqFile: base offset {base_offset} does not fit usize"),
+            )
+        })?;
         let file_len = mmap.len();
         // A truncated or corrupt container must surface as an error instead of
         // panicking on an out-of-bounds slice: open_at_offset advertises a
@@ -542,7 +588,15 @@ impl HfqFile {
                 Ok(())
             }
         };
-        need(base + 32, "the 32-byte header")?;
+        need(
+            base.checked_add(32).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HfqFile: base offset overflows header range",
+                )
+            })?,
+            "the 32-byte header",
+        )?;
 
         // Parse header (32 bytes) at base offset.
         let magic = &mmap[base..base + 4];
@@ -557,10 +611,32 @@ impl HfqFile {
         let n_tensors = u32::from_le_bytes(mmap[base + 12..base + 16].try_into().unwrap()) as usize;
         // Stored offsets are relative to the container start; rebase to absolute
         // file offsets so all the existing mmap slicing below works unchanged.
-        let metadata_offset =
-            u64::from_le_bytes(mmap[base + 16..base + 24].try_into().unwrap()) as usize + base;
-        let data_offset =
-            u64::from_le_bytes(mmap[base + 24..base + 32].try_into().unwrap()) as usize + base;
+        let metadata_rel = u64::from_le_bytes(mmap[base + 16..base + 24].try_into().unwrap());
+        let data_rel = u64::from_le_bytes(mmap[base + 24..base + 32].try_into().unwrap());
+        let metadata_abs = base_offset.checked_add(metadata_rel).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HfqFile: metadata offset overflows file range",
+            )
+        })?;
+        let data_abs = base_offset.checked_add(data_rel).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HfqFile: data offset overflows file range",
+            )
+        })?;
+        let metadata_offset = usize::try_from(metadata_abs).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HfqFile: metadata offset does not fit usize",
+            )
+        })?;
+        let data_offset = usize::try_from(data_abs).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HfqFile: data offset does not fit usize",
+            )
+        })?;
         // Guard the metadata slice below: a truncated/corrupt container can hold
         // offsets that overrun the file or cross over each other (#578).
         if metadata_offset > data_offset || data_offset > file_len {
@@ -637,8 +713,21 @@ impl HfqFile {
         let metadata_json = String::from_utf8_lossy(&meta_bytes[..json_end]).to_string();
 
         // Parse tensor index (follows metadata JSON)
-        let mut pos = metadata_offset + json_end;
-        need(pos + 4, "the tensor-index count")?;
+        let mut pos = metadata_offset.checked_add(json_end).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HfqFile: metadata/index offset overflows usize",
+            )
+        })?;
+        need(
+            pos.checked_add(4).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HfqFile: tensor-index count offset overflows usize",
+                )
+            })?,
+            "the tensor-index count",
+        )?;
         let idx_n = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()) as usize;
         if idx_n != n_tensors {
             return Err(std::io::Error::new(
@@ -660,6 +749,12 @@ impl HfqFile {
             pos += 2;
             need(pos + name_len, "a tensor name")?;
             let name = String::from_utf8_lossy(&mmap[pos..pos + name_len]).to_string();
+            if tensor_map.contains_key(&name) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    SourceError::DuplicateTensor { name },
+                ));
+            }
             pos += name_len;
             need(pos + 2, "a tensor quant type and dimension count")?;
             let quant_type = mmap[pos];
@@ -675,7 +770,16 @@ impl HfqFile {
             need(pos + 12, "a tensor group and data size")?;
             let group_size = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap());
             pos += 4;
-            let data_size = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
+            let data_size_u64 = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap());
+            let data_size = usize::try_from(data_size_u64).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    SourceError::Overflow {
+                        offset: cumulative_offset as u64,
+                        length: data_size_u64,
+                    },
+                )
+            })?;
             pos += 8;
 
             // Every indexed payload range must lie within the file: a
@@ -712,6 +816,7 @@ impl HfqFile {
         let me = Self {
             _file: file,
             path: path.to_path_buf(),
+            source_file_identity,
             mmap: Some(mmap),
             arch_id,
             metadata_json,
@@ -1281,9 +1386,103 @@ impl HfqFile {
         })
     }
 
-    /// Convenience: load the source identity wrapped in an immutable `Arc`.
-    pub fn load_identity_arc(&self) -> HipResult<std::sync::Arc<HfqSourceIdentity>> {
-        self.load_identity().map(std::sync::Arc::new)
+    /// Build an effective source seal for this HFQ file and any attached
+    /// overlay. A nested overlay cannot be represented by one immutable
+    /// descriptor identity and is refused rather than silently dropping a
+    /// layer of shadowing.
+    fn effective_source_identity(&self) -> Result<Arc<SourceIdentity>, SourceError> {
+        let mut files = vec![self.source_file_identity.clone()];
+        let mut metadata_json = self.metadata_json.clone();
+        let mut manifest = self
+            .tensors
+            .iter()
+            .map(|info| SourceRangeIdentity {
+                name: info.name.clone(),
+                file_index: 0,
+                offset: info.data_offset as u64,
+                length: info.data_size as u64,
+                dtype: quant_type_to_dtype(info.quant_type).to_string(),
+                logical_shape: info.shape.iter().map(|&dim| dim as usize).collect(),
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(overlay) = &self.overlay {
+            if overlay.overlay.is_some() {
+                return Err(SourceError::MissingEffectiveSeal {
+                    reason: "nested HFQ overlays are not sealable".to_string(),
+                });
+            }
+            files.push(overlay.source_file_identity.clone());
+            metadata_json.push_str("\n--hipfire-effective-overlay--\n");
+            metadata_json.push_str(&overlay.metadata_json);
+            for info in &overlay.tensors {
+                // A shadowed name is one effective logical range, not a
+                // duplicate source tensor. Replace the base manifest entry
+                // with the overlay's range while retaining deterministic order.
+                manifest.retain(|entry| entry.name != info.name);
+                manifest.push(SourceRangeIdentity {
+                    name: info.name.clone(),
+                    file_index: 1,
+                    offset: info.data_offset as u64,
+                    length: info.data_size as u64,
+                    dtype: quant_type_to_dtype(info.quant_type).to_string(),
+                    logical_shape: info.shape.iter().map(|&dim| dim as usize).collect(),
+                });
+            }
+        }
+
+        Ok(Arc::new(SourceIdentity {
+            canonical_path: self.source_file_identity.canonical_path.clone(),
+            format: SourceFormat::Hfq,
+            files,
+            metadata_json,
+            manifest,
+        }))
+    }
+
+    /// Immutable effective source seal used by bounded HFQ descriptors.
+    pub fn source_identity(&self) -> Result<Arc<SourceIdentity>, SourceError> {
+        self.effective_source_identity()
+    }
+
+    /// Open a checked positional descriptor for one tensor. The selected
+    /// tensor may come from the base or its attached overlay; its descriptor
+    /// identity records the complete effective source.
+    pub fn tensor_range(&self, name: &str) -> Result<Option<SourceRangeDescriptor>, SourceError> {
+        let (target, file_index) = match self.overlay.as_deref() {
+            Some(overlay) if overlay.resolve_idx(name).is_some() => (overlay, 1usize),
+            _ => (self, 0usize),
+        };
+        let Some(tensor_idx) = target.resolve_idx(name) else {
+            return Ok(None);
+        };
+        let info = &target.tensors[tensor_idx];
+        let source_identity = self.effective_source_identity()?;
+        let file_identity = source_identity
+            .files
+            .get(file_index)
+            .ok_or_else(|| SourceError::MissingEffectiveSeal {
+                reason: format!("HFQ source file index {file_index} is not sealed"),
+            })?
+            .clone();
+        let file = target._file.try_clone().map_err(|source| SourceError::Io {
+            offset: info.data_offset as u64,
+            source,
+        })?;
+        let reader = SourceReader::from_inner(HfqRangeReader {
+            identity: source_identity.clone(),
+            file,
+            file_identity,
+        });
+        SourceRangeDescriptor::from_parts(
+            source_identity,
+            info.data_offset as u64,
+            info.data_size as u64,
+            quant_type_to_dtype(info.quant_type).to_string(),
+            info.shape.iter().map(|&dim| dim as usize).collect(),
+            reader,
+        )
+        .map(Some)
     }
 
     /// Full tensor index of this HFQ file, in on-disk order.
@@ -1318,6 +1517,9 @@ impl crate::model_source::ModelSource for HfqFile {
 
     fn tensor_info(&self, name: &str) -> Option<&crate::model_source::TensorInfo> {
         None // HFQ uses its own HfqTensorInfo type
+    }
+    fn tensor_range(&self, name: &str) -> Result<Option<SourceRangeDescriptor>, SourceError> {
+        HfqFile::tensor_range(self, name)
     }
 
     fn tensor_names(&self) -> Vec<&str> {
@@ -1367,14 +1569,49 @@ impl crate::model_source::ModelSource for HfqFile {
 // mmap. Overlay (REAP) shadowing is not consulted for `tensor_info`; the
 // adapter serves the on-disk index only.
 
-/// Map a packed HFQ `quant_type` byte to the dtype string the arch loaders
-/// dispatch on (F16/F32/BF16). Unknown values map to a marker string the
-/// loaders reject by name.
+/// Map a packed HFQ `quant_type` byte to the source/compute dtype name exposed
+/// by [`crate::model_source::SourceRangeDescriptor`]. Host-decoded records
+/// retain their scalar dtypes; raw records use the canonical [`DType`] variant
+/// name so range fulfillment can validate their format instead of seeing the
+/// old unknown `"?"` marker.
 fn quant_type_to_dtype(quant_type: u8) -> &'static str {
     match quant_type {
+        0 => "Q4F16G64",
         1 => "F16",
         2 => "F32",
+        3 => "Q8_0",
+        4 => "Q4K",
+        5 => "Q8HFQ",
+        6 => "HFQ4G256",
+        7 => "HFQ4G128",
+        8 => "HFQ6G256",
+        9 => "HFQ2G256",
+        10 => "HFQ2G128",
+        11 => "HFQ3G256",
+        12 => "HFQ3G128",
+        13 => "MQ4G256",
+        14 => "MQ8G256",
+        15 => "MQ6G256",
         16 => "BF16",
+        17 => "MQ3G256",
+        18 => "MQ2G256",
+        19 => "MQ2G256Lloyd",
+        20 => "MQ3G256Lloyd",
+        21 => "HFP4G32",
+        24 => "MFP4G32",
+        30 => "MQ4G256Lloyd",
+        38 => "MQ2G256GL",
+        39 => "MQ3G256GL",
+        40 => "TQ2G128",
+        41 => "BQ1G128",
+        44 => "MQ4G256V2",
+        45 => "MQ4CG256",
+        47 => "MQ6G256V2",
+        48 => "MQ5G256V2",
+        49 => "MQ3G256V2",
+        50 => "MQ2G256V2",
+        51 => "MQ2G256LloydU",
+        52 => "I64",
         _ => "?",
     }
 }
@@ -1412,6 +1649,13 @@ impl HfqModelSource {
             .collect();
         Self { hfq, infos, index }
     }
+    pub fn source_identity(&self) -> Result<Arc<SourceIdentity>, SourceError> {
+        self.hfq.source_identity()
+    }
+
+    pub fn tensor_range(&self, name: &str) -> Result<Option<SourceRangeDescriptor>, SourceError> {
+        self.hfq.tensor_range(name)
+    }
 }
 
 impl crate::model_source::ModelSource for HfqModelSource {
@@ -1435,6 +1679,9 @@ impl crate::model_source::ModelSource for HfqModelSource {
 
     fn tensor_info(&self, name: &str) -> Option<&crate::model_source::TensorInfo> {
         self.index.get(name).map(|&i| &self.infos[i])
+    }
+    fn tensor_range(&self, name: &str) -> Result<Option<SourceRangeDescriptor>, SourceError> {
+        HfqModelSource::tensor_range(self, name)
     }
 
     fn tensor_names(&self) -> Vec<&str> {
@@ -2664,6 +2911,27 @@ mod overlay_tests {
     use super::hfq_test_fixture::write_min_hfq;
     use super::*;
     use crate::model_source::ModelSource; // for `tensor_names`
+    #[test]
+    fn duplicate_tensor_names_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicate.hfq");
+        write_min_hfq(
+            &path,
+            9,
+            &[
+                ("A", 3, &[1, 4], &vec![1u8; 4]),
+                ("A", 3, &[1, 4], &vec![2u8; 4]),
+            ],
+        );
+        let err = match HfqFile::open(&path) {
+            Ok(_) => panic!("duplicate tensor names must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("duplicate source tensor"),
+            "got: {err}"
+        );
+    }
 
     #[test]
     fn truncated_container_errors_instead_of_panicking() {

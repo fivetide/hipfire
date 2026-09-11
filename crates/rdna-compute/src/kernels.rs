@@ -1982,6 +1982,10 @@ pub const MOE_TOPK_RENORM_K8_SRC: &str =
 /// Same per-block algorithm; one workgroup per token row.
 pub const MOE_TOPK_RENORM_K8_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/moe_topk_renorm_k8_batched.hip");
+/// Qwen4's fixed 512-expert/top-10 router.  Kept separate from every k=8
+/// source so widening the new grammar cannot change legacy dispatch.
+pub const MOE_ROUTER_SOFTMAX_TOP10_F32_SRC: &str =
+    include_str!("../../../kernels/src/moe_router_softmax_top10_f32.hip");
 
 /// Index-aware MoE gate_up GEMV — reads expert IDs from a device-side
 /// topk_indices buffer and the per-expert weight base from an
@@ -2438,6 +2442,14 @@ pub const GEMV_MQ6G256V2_MOE_GATE_UP_K8_INDEXED_SRC: &str =
 /// V1/V2 header identities remain distinct — wrong dispatch yields fluent corruption.
 pub const GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq4g256v2_moe_gate_up_k8_indexed_batched.hip");
+
+/// Qwen4 top-10 alias of the proven qt44 batched gate/up body.  The source
+/// remains byte-identical, but the entry point is distinct from the incumbent
+/// k=8 route and always receives the sealed top-k=10 ABI.
+pub const GEMV_MQ4G256V2_MOE_GATE_UP_TOP10_INDEXED_BATCHED_SRC: &str = concat!(
+    "#define gemv_mq4g256v2_moe_gate_up_k8_indexed_batched gemv_mq4g256v2_moe_gate_up_top10_indexed_batched\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2_moe_gate_up_k8_indexed_batched.hip")
+);
 
 /// MQ6G256V2 (qt=47) N-batched sister of
 /// [`GEMV_MQ6G256V2_MOE_GATE_UP_K8_INDEXED_SRC`]. Same batched ABI as the
@@ -3056,6 +3068,13 @@ pub const GEMM_Q8_0_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_q8_
 /// × mi] via the inverse permutation in sorted_slot_index.
 pub const MOE_GATE_UP_UNSCATTER_K8_SRC: &str =
     include_str!("../../../kernels/src/moe_gate_up_unscatter_k8.hip");
+/// Qwen4 top-10 alias for the permutation-only gate/up unscatter.  The
+/// k=8 source has a dynamic K_TOP ABI but a separate symbol keeps the sealed
+/// grammar disjoint from the incumbent route.
+pub const MOE_GATE_UP_UNSCATTER_TOP10_SRC: &str = concat!(
+    "#define moe_gate_up_unscatter_k8 moe_gate_up_unscatter_top10\n",
+    include_str!("../../../kernels/src/moe_gate_up_unscatter_k8.hip")
+);
 
 /// Phase D1 (2026-05-26): fused unscatter + SwiGLU + asymmetric clamp.
 /// Replaces `MOE_GATE_UP_UNSCATTER_K8_SRC` followed by
@@ -3086,6 +3105,31 @@ pub const GEMM_Q8_0_MMQ_GFX1030_SRC: &str =
 /// a unique thread).
 pub const MOE_DOWN_COMBINE_GROUPED_K8_SRC: &str =
     include_str!("../../../kernels/src/moe_down_combine_grouped_k8.hip");
+/// Qwen4 top-10 grouped combine.  This source keeps its own fixed ten-slot
+/// grammar; the incumbent grouped k=8 combine remains untouched.
+pub const MOE_DOWN_COMBINE_GROUPED_TOP10_SRC: &str =
+    include_str!("../../../kernels/src/moe_down_combine_grouped_top10.hip");
+
+/// Qwen4 top-10 fused indexed combine.  Route weights are applied once here,
+/// after the unweighted expanded down projection.
+pub const MOE_DOWN_COMBINE_TOP10_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/moe_down_combine_top10_batched.hip");
+
+/// Qwen4 qt3/Q8F16 indexed down projection.  Produces unweighted
+/// `[tokens * 10, M]` rows; route weights belong to the dedicated combine.
+pub const GEMV_Q8_0_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_q8_0_moe_down_top10_indexed_batched_expanded.hip");
+
+/// Qwen4 qt3/Q8F16 grouped down projection.  Uses the same sorted-slot and
+/// tile-id contract as the established grouped WMMA families.
+pub const GEMM_Q8_0_MOE_GROUPED_TOP10_SRC: &str =
+    include_str!("../../../kernels/src/gemm_q8_0_moe_grouped_top10.hip");
+/// Qwen4 alias of the existing bounds-safe scatter body with an independent
+/// entry point.  The old k=8 symbol and launcher are not widened.
+pub const MOE_SCATTER_FUSED_TOP10_SRC: &str = concat!(
+    "#define moe_scatter_fused_k8 moe_scatter_fused_top10\n",
+    include_str!("../../../kernels/src/moe_scatter_fused_k8.hip")
+);
 
 /// Fused single-CTA SGLang-style MoE scatter pipeline: combines
 /// histogram + padded prefix-sum + permutation in one launch. Saves
@@ -6734,6 +6778,10 @@ pub const GEMV_F16_BIAS_XF32_SRC: &str =
 /// keeps the exact downloaded bf16 values (lossless widen = 16-bit shift),
 /// unlike re-quantizing to f16. arch_id 12 (Cohere2-MoE).
 pub const GEMV_BF16_XF32_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_xf32.hip");
+/// Batched BF16-weight × F32-input GEMM used by Qwen4's shared expert.
+/// Weights stay native BF16 and the output is row-major `[N, M]` F32.
+pub const GEMM_BF16_XF32_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16_xf32_batched.hip");
 
 /// DeepSeek V4 SwiGLU with swiglu_limit clamp: silu(min(gate, L)) * clamp(up, ±L)
 /// L = swiglu_limit (DeepSeek V4 config = 10.0).
