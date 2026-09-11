@@ -297,6 +297,82 @@ pub fn production_fail_closed_rollback_live(
     epilogue
 }
 
+/// Pipeline-parallel production fail-closed rollback (G4.7).
+///
+/// Extends [`production_fail_closed_rollback`] — host cursors, asst-turn
+/// cache clear, pp-aware recurrent/DN reset via [`reset_qwen35_recurrent`]
+/// (per-LA-device `bind_thread` + memset with error accumulation), llama KV
+/// arm, checkpoint rings, spec reset, single-`gpu` graph invalidate + sync —
+/// to the full PP device set: captured graphs are invalidated and the device
+/// is synchronized on `gpu` AND every `m.pp_gpus` device, each under its own
+/// `bind_thread`, with every failure accumulated via [`push_reset_err`].
+/// `rolled_back` is true only when every reset and every per-device sync
+/// succeeds.
+///
+/// `gpu` is the daemon's single handle (bound to the same physical device as
+/// `pp_gpus.devices[0]`); the shared HIP heap does not imply shared graph
+/// handles or drained streams, so per-device invalidate + sync is required
+/// (precedent: `ep_reset_after_abort` in qwen.rs).
+///
+/// A missing `pp_gpus` with `pp > 1` is recorded as an attestation error
+/// (fail-closed); with `pp <= 1` this degrades to the single-device rollback.
+pub fn production_pp_fail_closed_rollback(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+) -> RollbackEpilogue {
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    let single = fail_closed_reset_target_and_spec(m, gpu, None, None);
+    let mut first_err: Option<String> = single.context;
+    if m.pp > 1 {
+        match m.pp_gpus.as_mut() {
+            Some(gpus) => {
+                for (rank, dev) in gpus.devices.iter_mut().enumerate() {
+                    if let Err(e) = dev.bind_thread() {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("pp rank{rank} graph bind_thread"),
+                            e,
+                        );
+                    }
+                    dev.invalidate_graph_state();
+                }
+                for (rank, dev) in gpus.devices.iter_mut().enumerate() {
+                    if let Err(e) = dev.bind_thread() {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("pp rank{rank} sync bind_thread"),
+                            e,
+                        );
+                    }
+                    if let Err(e) = dev.hip.device_synchronize() {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("pp rank{rank} device_synchronize"),
+                            e,
+                        );
+                    }
+                }
+            }
+            None => push_reset_err(&mut first_err, "pp_gpus", "pp>1 with no pp_gpus"),
+        }
+    }
+    match first_err {
+        None => RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        },
+        Some(e) => {
+            // Unattested: no replay observation may survive a dirty turn.
+            gpu.replay.invalidate_replay_observation_window();
+            RollbackEpilogue {
+                rolled_back: false,
+                context: Some(e),
+            }
+        }
+    }
+}
+
 fn emit_active_error_route_aware(
     stdout: &mut impl std::io::Write,
     id: Option<&str>,

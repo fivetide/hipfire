@@ -2551,8 +2551,9 @@ pub fn generate(
     // budget+beta+safety regardless of conversation length, so reset never
     // needs to fire — eviction reclaims slots after each token. When eviction
     // is OFF, physical grows unbounded up to max_seq; reset when we'd overrun.
-    let tokenizer = m.tokenizer.as_ref().unwrap();
-    let prompt_est = tokenizer.encode(prompt).len() + 20;
+    // Borrow `tokenizer` per-use (never held across whole-`m` calls): the
+    // context-full reset below reborrows `m` through the canonical reset.
+    let prompt_est = m.tokenizer.as_ref().unwrap().encode(prompt).len() + 20;
     if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
         .ok()
         .as_deref()
@@ -2583,36 +2584,40 @@ pub fn generate(
         // HIPFIRE_DFLASH_CHAT=0), so its drafter state must not survive here.
         if let Some(s) = m.speculator.as_mut() {
             if let Err(e) = s.reset(gpu) {
-                crate::dense::emit_active_attempt_error(
+                // G4.7: attest the reset attempt (invalidate + sync) so the
+                // terminal reports whether retry is safe.
+                let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                crate::common::emit_fail_closed_error(
                     stdout,
                     Some(id),
                     &format!("context reset failed: {e}"),
                     "gpu",
                     true,
-                    false,
+                    &ep,
                 );
                 return;
             }
         }
         // Zero DeltaNet state on reset. qwen35 recurrent state lives in the
         // bundle (ModelState::Qwen35), not the always-None m.dn_state/m.kv_cache.
-        // Use the canonical reset so newly added recurrent buffers (notably the
-        // Q8 error-feedback residual) cannot leak across rollover boundaries.
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            if let Err(e) = b.dn_state.reset(gpu) {
-                crate::dense::emit_active_attempt_error(
-                    stdout,
-                    Some(id),
-                    &format!("context reset failed: {e}"),
-                    "gpu",
-                    true,
-                    false,
-                );
-                return;
-            }
-            b.kv_cache.compact_offset = 0;
+        // Canonical reset (G4.7 E4): replaces `dn_state.reset` so all four
+        // buffers (notably the Q8 error-feedback residual) accumulate errors
+        // instead of short-circuiting; KV compact_offset is handled inside.
+        // Single path only (pp>1 never reaches this route). Llama/adaptive
+        // arms below are unchanged.
+        if let Err(e) = crate::common::reset_qwen35_recurrent(m, gpu) {
+            // G4.7: attest the reset attempt (invalidate + sync) so the
+            // terminal reports whether retry is safe.
+            let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+            crate::common::emit_fail_closed_error(
+                stdout,
+                Some(id),
+                &format!("context reset failed: {e}"),
+                "gpu",
+                true,
+                &ep,
+            );
+            return;
         }
         if let Some(b) = m.state.as_mut().and_then(|s| {
             (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()
@@ -2629,6 +2634,7 @@ pub fn generate(
             }
         }
     }
+    let tokenizer = m.tokenizer.as_ref().unwrap();
 
     // `nl` is needed for the trailer write after natural <|im_end|>
     // termination; `im_end` derives the EOS-check token id. Other
@@ -3464,41 +3470,37 @@ pub fn generate(
         // path is reachable by a DFlash-capable model.
         if let Some(s) = m.speculator.as_mut() {
             if let Err(e) = s.reset(gpu) {
-                crate::dense::emit_active_attempt_error(
+                // G4.7: attest the reset attempt (invalidate + sync) so the
+                // terminal reports whether retry is safe.
+                let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                crate::common::emit_fail_closed_error(
                     stdout,
                     Some(id),
                     &format!("prompt-cache reset failed: {e}"),
                     "gpu",
                     true,
-                    false,
+                    &ep,
                 );
                 return;
             }
         }
         // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
-        // the always-None m.dn_state/m.kv_cache. Inlined (disjoint field access)
-        // because a `&tokenizer` borrow of `m` is live here.
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_ef_residual {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            b.kv_cache.compact_offset = 0;
+        // the always-None m.dn_state/m.kv_cache. Canonical reset — no m-derived
+        // loan spans this block (the `tokenizer` rebind below keeps later uses
+        // on a fresh loan), so the whole-`m` call compiles. Error accumulation
+        // replaces the swallowed memsets; on failure fail closed rather than
+        // serving over dirty state.
+        if let Err(e) = crate::common::reset_qwen35_recurrent(m, gpu) {
+            let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+            crate::common::emit_fail_closed_error(
+                stdout,
+                Some(id),
+                &format!("prompt-cache reset failed: {e}"),
+                "gpu",
+                true,
+                &ep,
+            );
+            return;
         }
         if let Some(b) = m.state.as_mut().and_then(|s| {
             (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()
@@ -3506,6 +3508,11 @@ pub fn generate(
             b.kv.compact_offset = 0;
         }
     }
+    // Rebind `tokenizer` past the cold-reset above: the pre-reset borrow
+    // ended at its last use, and this fresh borrow starts after the
+    // whole-`m` canonical reset call, so no loan spans it. Uses below
+    // resolve to this binding; uses above resolved to the earlier one.
+    let tokenizer = m.tokenizer.as_ref().unwrap();
 
     // KV-budget guard. Without eviction the physical buffer is the hard cap;
     // we must fit prefill + generation + trailer in one allocation. With
@@ -3718,17 +3725,20 @@ pub fn generate(
                     None,
                     qwen35::PREFILL_MAX_BATCH,
                 ) {
-                    let action = qwen_ar_forward_fail_action();
-                    if action.reset_uncommitted_state {
-                        reset_ar_uncommitted_state!();
-                    }
-                    if action.emit_request_error {
-                        write_error(
-                            stdout,
-                            id,
-                            &qwen_ar_forward_fail_message("forward_prefill_batch", e),
-                        );
-                    }
+                    // G4.7 fail-closed: attested rollback + correlated error
+                    // (no done, no cache store). Terminal identical except
+                    // `rolled_back` is now attested. Drops live bundle borrows
+                    // first (diverging block; intact on fallthrough).
+                    let _ = (kv, dn, weights, config, scratch);
+                    let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                    crate::common::emit_fail_closed_error(
+                        stdout,
+                        Some(id),
+                        &qwen_ar_forward_fail_message("forward_prefill_batch", e),
+                        "internal",
+                        false,
+                        &ep,
+                    );
                     return;
                 }
                 m.seq_pos += chunk_len;
@@ -3752,8 +3762,13 @@ pub fn generate(
                                 "[adaptive-kv] maybe_downshift error @ pos {} (eviction prefill): {:?} — poisoning model",
                                 m.seq_pos, e
                             );
-                            reset_ar_uncommitted_state!();
-                            crate::dense::emit_active_attempt_error(
+                            // G4.7 fail-closed: DN already advanced — full
+                            // attested rollback. Keeps `transient`/retryable;
+                            // only `rolled_back` is now attested.
+                            let _ = (kv, dn, weights, config, scratch);
+                            let ep =
+                                crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                            crate::common::emit_fail_closed_error(
                                 stdout,
                                 Some(id),
                                 &format!(
@@ -3761,9 +3776,8 @@ pub fn generate(
                                 ),
                                 "transient",
                                 true,
-                                false,
+                                &ep,
                             );
-                            let _ = stdout.flush();
                             return;
                         }
                     }
@@ -3800,17 +3814,19 @@ pub fn generate(
                 if let Err(e) = qwen35::forward_prefill_batch(
                     gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch, None, None, None, None,
                 ) {
-                    let action = qwen_ar_forward_fail_action();
-                    if action.reset_uncommitted_state {
-                        reset_ar_uncommitted_state!();
-                    }
-                    if action.emit_request_error {
-                        write_error(
-                            stdout,
-                            id,
-                            &qwen_ar_forward_fail_message("forward_prefill_batch", e),
-                        );
-                    }
+                    // G4.7 fail-closed: attested rollback + correlated error
+                    // (no done, no cache store). Terminal identical except
+                    // `rolled_back` is now attested.
+                    let _ = (kv, dn, weights, config, scratch);
+                    let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                    crate::common::emit_fail_closed_error(
+                        stdout,
+                        Some(id),
+                        &qwen_ar_forward_fail_message("forward_prefill_batch", e),
+                        "internal",
+                        false,
+                        &ep,
+                    );
                     return;
                 }
                 m.seq_pos += chunk.len();
@@ -3836,16 +3852,21 @@ pub fn generate(
                                 "[adaptive-kv] maybe_downshift error @ pos {} (prefill): {:?} — poisoning model",
                                 m.seq_pos, e
                             );
+                            // G4.7 fail-closed: DN already advanced — full
+                            // attested rollback. Keeps `transient`/retryable;
+                            // only `rolled_back` is now attested.
                             // maybe_downshift already poisons on partial failure; surface hard.
-                            crate::dense::emit_active_attempt_error(
+                            let _ = (kv, dn, weights, config, scratch);
+                            let ep =
+                                crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                            crate::common::emit_fail_closed_error(
                                 stdout,
                                 Some(id),
                                 &format!("adaptive KV transition failed during prefill: {e}"),
                                 "transient",
                                 true,
-                                false,
+                                &ep,
                             );
-                            let _ = stdout.flush();
                             return;
                         }
                     }
@@ -3894,15 +3915,20 @@ pub fn generate(
                         "[adaptive-kv] maybe_downshift error @ pos {} (post-prefill): {:?} — poisoning model",
                         m.seq_pos, e
                     );
-                    crate::dense::emit_active_attempt_error(
+                    // G4.7 fail-closed: DN already advanced — full attested
+                    // rollback (this site previously had no reset; the next
+                    // turn would prefill over drifted state). Keeps
+                    // `transient`/retryable; only `rolled_back` attested.
+                    let _ = (kv, dn, weights, config, scratch);
+                    let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                    crate::common::emit_fail_closed_error(
                         stdout,
                         Some(id),
                         &format!("adaptive KV transition failed after prefill: {e}"),
                         "transient",
                         true,
-                        false,
+                        &ep,
                     );
-                    let _ = stdout.flush();
                     return;
                 }
             }
@@ -4201,21 +4227,38 @@ pub fn generate(
             if let Err(e) = qwen35::forward_scratch(
                 gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch,
             ) {
-                let action = qwen_ar_forward_fail_action();
-                debug_assert!(!action.emit_failed_token);
-                if action.reset_uncommitted_state {
-                    reset_ar_uncommitted_state!();
-                }
-                if action.emit_request_error {
-                    write_error(
-                        stdout,
-                        id,
-                        &qwen_ar_forward_fail_message("forward_scratch decode", e),
-                    );
-                }
+                // G4.7 fail-closed: attested rollback + correlated error
+                // (no done, no cache store). Terminal identical except
+                // `rolled_back` is now attested.
+                let _ = (kv, dn, weights, config, scratch);
+                let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                crate::common::emit_fail_closed_error(
+                    stdout,
+                    Some(id),
+                    &qwen_ar_forward_fail_message("forward_scratch decode", e),
+                    "internal",
+                    false,
+                    &ep,
+                );
                 return;
             }
             generated += 1;
+            // Test-only fault seam (G4.7, mirrors dense G4.10): fires after the
+            // first decode forward's GPU/KV mutation, before any token
+            // visibility. Same fail-closed terminal as the prefill seam.
+            if generated == 1 && crate::common::take_generation_fault_after_first_decode() {
+                let _ = (kv, dn, weights, config, scratch);
+                let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                crate::common::emit_fail_closed_error(
+                    stdout,
+                    Some(id),
+                    "injected fault after first decode",
+                    "gpu",
+                    true,
+                    &ep,
+                );
+                return;
+            }
             // Incremental UTF-8 + filter routing via producer-owned
             // commit-then-classify. Raw commit (conversation/stream/seq_pos)
             // runs inside the closure before fallible classify; decode delta
@@ -4290,15 +4333,20 @@ pub fn generate(
                             "[adaptive-kv] maybe_downshift error @ pos {} (decode): {:?} — poisoning model",
                             m.seq_pos, e
                         );
-                        crate::dense::emit_active_attempt_error(
+                        // G4.7 fail-closed: DN already advanced — full attested
+                        // rollback (this site previously had no reset; the next
+                        // turn would prefill over drifted state). Keeps
+                        // `transient`/retryable; only `rolled_back` attested.
+                        let _ = (kv, dn, weights, config, scratch);
+                        let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                        crate::common::emit_fail_closed_error(
                             stdout,
                             Some(id),
                             &format!("adaptive KV transition failed during decode: {e}"),
                             "transient",
                             true,
-                            false,
+                            &ep,
                         );
-                        let _ = stdout.flush();
                         return;
                     }
                 }
