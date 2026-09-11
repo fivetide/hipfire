@@ -197,8 +197,13 @@ fn announce_generate_terminal(
 }
 
 // ── serve-fault-inject (test-only; compiled out of production) ─────────
-// One-shot after-prefill GPU fault arm. Armed from generate parse when the
-// feature is on and the request carries test_fault_after_prefill:true.
+// One-shot after-prefill / after-first-decode GPU fault arms. Armed from
+// generate parse when the feature is on and the request carries
+// test_fault_after_prefill:true / test_fault_after_first_decode:true. The
+// G4.10 always-compiled hooks ride the same fields so the PP path (which has
+// no serve-fault-inject hook) is injectable too; the guard disarms every
+// leftover arm on request end so a fired-or-unconsumed arm cannot leak into
+// the next request on this thread.
 
 #[cfg(feature = "serve-fault-inject")]
 struct FaultAfterPrefillGuard;
@@ -206,9 +211,10 @@ struct FaultAfterPrefillGuard;
 impl Drop for FaultAfterPrefillGuard {
     fn drop(&mut self) {
         arm_fault_after_prefill(false);
+        hipfire_generate::common::arm_generation_fault_after_prefill(false);
+        hipfire_generate::common::arm_generation_fault_after_first_decode(false);
     }
 }
-
 #[cfg(feature = "serve-fault-inject")]
 fn write_test_state_snapshot(
     stdout: &mut impl std::io::Write,
@@ -2303,7 +2309,13 @@ fn main() {
                         .get("test_fault_after_prefill")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
+                    let want_decode = msg
+                        .get("test_fault_after_first_decode")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     arm_fault_after_prefill(want);
+                    hipfire_generate::common::arm_generation_fault_after_prefill(want);
+                    hipfire_generate::common::arm_generation_fault_after_first_decode(want_decode);
                     FaultAfterPrefillGuard
                 };
                 // Experimental slot backend dispatches before the ordinary model path.

@@ -12,8 +12,8 @@
 //!   scope is active) with `rolled_back=false`, class `internal`.
 //! - S4 today: `dense::emit_active_attempt_error` with class `transient`,
 //!   retryable, `rolled_back=false`.
-//! - P2 today: route-explicit `emit_generation_error(PipelineParallel, …)`
-//!   with `rolled_back=false`.
+//! - P2 since E2: `emit_fail_closed_error_for_route(PipelineParallel, …)`
+//!   with attested `rolled_back=true`.
 //! - P3 abort today: attested `aborted`+`done(aborted)`; unattested collapses
 //!   to one correlated error (shape pinned via the same emitters
 //!   `emit_pipeline_cancel_after_rollback` uses).
@@ -25,7 +25,7 @@
 
 use hipfire_engine::terminal::*;
 use hipfire_generate::ar::{
-    emit_generation_cancel, emit_generation_error, emit_generation_start, qwen_ar_forward_fail_action,
+    emit_generation_cancel, emit_generation_start, qwen_ar_forward_fail_action,
     qwen_ar_forward_fail_message, write_error, GenerationRoute, GenerationRouteScope,
 };
 use hipfire_generate::common::{
@@ -184,9 +184,10 @@ fn qwen_single_downshift_fail_error_shape_unattested() {
     teardown();
 }
 
-/// P2 prefill shape today: route-explicit PP error with `rolled_back=false`.
+/// P2 prefill shape (E2): attested PP rollback renders `rolled_back=true`
+/// with the message verbatim (no context appended when attested).
 #[test]
-fn pp_prefill_fail_error_shape_unattested() {
+fn pp_prefill_fail_error_shape_attested() {
     let _guard = lock();
     let id = "g47-p2-prefill";
     fresh_controlled_attempt(id, 71_004);
@@ -194,14 +195,18 @@ fn pp_prefill_fail_error_shape_unattested() {
     {
         let _scope = GenerationRouteScope::enter(GenerationRoute::PipelineParallel, id);
         emit_generation_start(GenerationRoute::PipelineParallel, &mut sink, id, false);
-        emit_generation_error(
+        let ep = RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        };
+        emit_fail_closed_error_for_route(
             GenerationRoute::PipelineParallel,
             &mut sink,
             Some(id),
             "forward_prefill_batch_multi: injected",
             "validation",
             false,
-            false,
+            &ep,
         );
     }
     let events = parse_lines(&sink);
@@ -214,8 +219,8 @@ fn pp_prefill_fail_error_shape_unattested() {
     assert_eq!(errors[0]["class"], "validation");
     assert_eq!(errors[0]["retryable"], false);
     assert_eq!(
-        errors[0]["rolled_back"], false,
-        "P2 is unattested today (E2 flips to true)"
+        errors[0]["rolled_back"], true,
+        "P2 is attested since E2"
     );
     assert!(
         events.iter().all(|event| event["type"] != "done"),
@@ -224,9 +229,9 @@ fn pp_prefill_fail_error_shape_unattested() {
     teardown();
 }
 
-/// P2 decode shape today: same contract as P2 prefill with the decode label.
+/// P2 decode shape (E2): same attested contract with the decode label.
 #[test]
-fn pp_decode_fail_error_shape_unattested() {
+fn pp_decode_fail_error_shape_attested() {
     let _guard = lock();
     let id = "g47-p2-decode";
     fresh_controlled_attempt(id, 71_005);
@@ -234,14 +239,18 @@ fn pp_decode_fail_error_shape_unattested() {
     {
         let _scope = GenerationRouteScope::enter(GenerationRoute::PipelineParallel, id);
         emit_generation_start(GenerationRoute::PipelineParallel, &mut sink, id, false);
-        emit_generation_error(
+        let ep = RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        };
+        emit_fail_closed_error_for_route(
             GenerationRoute::PipelineParallel,
             &mut sink,
             Some(id),
             "forward_scratch_multi decode: injected",
             "validation",
             false,
-            false,
+            &ep,
         );
     }
     let events = parse_lines(&sink);
@@ -251,7 +260,7 @@ fn pp_decode_fail_error_shape_unattested() {
         .collect();
     assert_eq!(errors.len(), 1, "P2 must emit exactly one error: {events:?}");
     assert_eq!(errors[0]["message"], "forward_scratch_multi decode: injected");
-    assert_eq!(errors[0]["rolled_back"], false);
+    assert_eq!(errors[0]["rolled_back"], true);
     assert!(
         events.iter().all(|event| event["type"] != "done"),
         "P2 must not emit done: {events:?}"
