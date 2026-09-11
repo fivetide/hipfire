@@ -2171,14 +2171,16 @@ def _self_test_g45_fail_closed_assertions():
         except AssertionError:
             continue
         raise AssertionError(f"g45 gate accepted a {label} row: {row!r}")
-    # tool_calls finish is never a fail-closed terminal even when allowed
-    # lists it (defense in depth against caller typos).
-    try:
-        _assert_g45_fail_closed_row(dict(good, finish="tool_calls"), "probe", ["tool_calls"])
-    except AssertionError:
-        pass
-    else:
-        raise AssertionError("g45 gate accepted finish=tool_calls")
+    # A completed call fails explicitly (tuning signal), even when the
+    # allowed list names tool_calls (defense in depth against typos).
+    for completed in (dict(good, finish="tool_calls"),
+                      dict(good, tool_calls=[{"id": "call_0"}])):
+        try:
+            _assert_g45_fail_closed_row(completed, "probe", ["tool_calls"])
+        except AssertionError as e:
+            assert "call completed; lower max_tokens" in str(e), str(e)
+        else:
+            raise AssertionError(f"g45 gate accepted a completed call: {completed!r}")
     print("serve_harness: g45-fail-closed-assertions self-test OK", flush=True)
 
 
@@ -2670,6 +2672,12 @@ def _assert_g45_fail_closed_row(row, step, allowed):
     Glimmer tool-roundtrip assertions.
     """
     finish = row.get("finish")
+    if finish == "tool_calls" or row.get("tool_calls"):
+        raise AssertionError(
+            f"g45 {step}: call completed; lower max_tokens so the cap "
+            f"truncates inside the tool-call body "
+            f"(finish={finish!r} tool_calls={row.get('tool_calls')!r})"
+        )
     if finish not in allowed:
         raise AssertionError(
             f"g45 {step}: expected fail-closed finish in {sorted(allowed)}, "
@@ -2686,13 +2694,6 @@ def _assert_g45_fail_closed_row(row, step, allowed):
             f"g45 {step}: {row.get('post_terminal_bytes')} late payload bytes "
             f"after the terminal (finish={finish!r})"
         )
-    if row.get("tool_calls"):
-        raise AssertionError(
-            f"g45 {step}: fail-closed terminal released tool calls: "
-            f"{row.get('tool_calls')!r}"
-        )
-    if finish == "tool_calls":
-        raise AssertionError(f"g45 {step}: fail-closed step ended tool_calls")
     return True
 
 
