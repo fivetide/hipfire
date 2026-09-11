@@ -1569,6 +1569,51 @@ pub fn take_generation_fault_after_first_decode() -> bool {
     GENERATION_FAULT_AFTER_FIRST_DECODE.with(|c| c.replace(false))
 }
 
+/// Arm the generation fault hooks from a daemon `generate` request carrying
+/// `test_fault_after_prefill` / `test_fault_after_first_decode` booleans.
+/// Missing or non-boolean fields disarm. Test-only wiring; the hooks are
+/// default-off and one-shot.
+#[doc(hidden)]
+pub fn arm_generation_faults_from_request(msg: &serde_json::Value) {
+    let flag = |k: &str| msg.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+    arm_generation_fault_after_prefill(flag("test_fault_after_prefill"));
+    arm_generation_fault_after_first_decode(flag("test_fault_after_first_decode"));
+}
+
+/// Disarm every generation fault hook on this thread.
+#[doc(hidden)]
+pub fn disarm_generation_faults() {
+    arm_generation_fault_after_prefill(false);
+    arm_generation_fault_after_first_decode(false);
+}
+
+/// Test-only per-request fault arming for the daemon (`serve-fault-inject`):
+/// arms the AR after-prefill hook and the generation hooks from the request's
+/// `test_fault_*` booleans, and disarms all of them on drop so an unconsumed
+/// arm cannot leak into the next request on this thread.
+#[cfg(feature = "serve-fault-inject")]
+#[doc(hidden)]
+pub struct RequestFaultGuard;
+#[cfg(feature = "serve-fault-inject")]
+impl RequestFaultGuard {
+    pub fn arm_from_request(msg: &serde_json::Value) -> Self {
+        let want = msg
+            .get("test_fault_after_prefill")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        crate::ar::arm_fault_after_prefill(want);
+        arm_generation_faults_from_request(msg);
+        Self
+    }
+}
+#[cfg(feature = "serve-fault-inject")]
+impl Drop for RequestFaultGuard {
+    fn drop(&mut self) {
+        crate::ar::arm_fault_after_prefill(false);
+        disarm_generation_faults();
+    }
+}
+
 // ── test-support helpers, moved with the daemon test modules ──
 
 /// Pure attestation combiner for unit tests / failure injection: every required

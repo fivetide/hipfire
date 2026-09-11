@@ -44,7 +44,6 @@ use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
 use hipfire_engine::wire_seed::parse_wire_seed;
 #[cfg(feature = "serve-fault-inject")]
-use hipfire_generate::ar::arm_fault_after_prefill;
 #[cfg(feature = "serve-fault-inject")]
 use hipfire_generate::ar::take_fault_after_prefill;
 use hipfire_generate::ar::{
@@ -197,24 +196,8 @@ fn announce_generate_terminal(
 }
 
 // ── serve-fault-inject (test-only; compiled out of production) ─────────
-// One-shot after-prefill / after-first-decode GPU fault arms. Armed from
-// generate parse when the feature is on and the request carries
-// test_fault_after_prefill:true / test_fault_after_first_decode:true. The
-// G4.10 always-compiled hooks ride the same fields so the PP path (which has
-// no serve-fault-inject hook) is injectable too; the guard disarms every
-// leftover arm on request end so a fired-or-unconsumed arm cannot leak into
-// the next request on this thread.
+// Per-request fault arming lives in hipfire_generate::common::RequestFaultGuard.
 
-#[cfg(feature = "serve-fault-inject")]
-struct FaultAfterPrefillGuard;
-#[cfg(feature = "serve-fault-inject")]
-impl Drop for FaultAfterPrefillGuard {
-    fn drop(&mut self) {
-        arm_fault_after_prefill(false);
-        hipfire_generate::common::arm_generation_fault_after_prefill(false);
-        hipfire_generate::common::arm_generation_fault_after_first_decode(false);
-    }
-}
 #[cfg(feature = "serve-fault-inject")]
 fn write_test_state_snapshot(
     stdout: &mut impl std::io::Write,
@@ -684,7 +667,7 @@ fn receive_startup_config(
             None => DaemonMsg::Regular(msg),
         };
         return Ok(Some((config, Some(pending), false)));
-}
+    }
 }
 
 fn main() {
@@ -2304,20 +2287,8 @@ fn main() {
                     }
                 };
                 #[cfg(feature = "serve-fault-inject")]
-                let _fault_guard = {
-                    let want = msg
-                        .get("test_fault_after_prefill")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let want_decode = msg
-                        .get("test_fault_after_first_decode")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    arm_fault_after_prefill(want);
-                    hipfire_generate::common::arm_generation_fault_after_prefill(want);
-                    hipfire_generate::common::arm_generation_fault_after_first_decode(want_decode);
-                    FaultAfterPrefillGuard
-                };
+                let _fault_guard =
+                    hipfire_generate::common::RequestFaultGuard::arm_from_request(&msg);
                 // Experimental slot backend dispatches before the ordinary model path.
                 // This preserves byte-for-byte default behavior when absent, and in experimental
                 // mode owns exactly one SlotEngine/weight set with no ordinary-model fallback.
@@ -3113,8 +3084,11 @@ fn main() {
                     if ep_batch_eligible {
                         let _ = batch_transition_to_queued(id, gen_attempt_id, admission);
                         if batch_check_abort(id, gen_attempt_id, admission) {
-                            let _scope =
-                                BatchAttemptScope::enter_for_generation(id, gen_attempt_id, admission);
+                            let _scope = BatchAttemptScope::enter_for_generation(
+                                id,
+                                gen_attempt_id,
+                                admission,
+                            );
                             hipfire_generate::ar::emit_generation_start(
                                 hipfire_generate::ar::GenerationRoute::QwenAr,
                                 &mut stdout,
@@ -3255,8 +3229,11 @@ fn main() {
                     if ep_batch_staged {
                         // EP requests without serve_continuous_batch or with excluded features must error.
                         if !ep_batch_eligible {
-                            let _scope =
-                                BatchAttemptScope::enter_for_generation(id, gen_attempt_id, admission);
+                            let _scope = BatchAttemptScope::enter_for_generation(
+                                id,
+                                gen_attempt_id,
+                                admission,
+                            );
                             let ep = hipfire_generate::common::RollbackEpilogue {
                                 rolled_back: true,
                                 context: None,
@@ -3283,8 +3260,11 @@ fn main() {
                         let _ = batch_transition_to_queued(id, gen_attempt_id, admission);
                         // If already aborted, emit cancelled and do not enqueue.
                         if batch_check_abort(id, gen_attempt_id, admission) {
-                            let _scope =
-                                BatchAttemptScope::enter_for_generation(id, gen_attempt_id, admission);
+                            let _scope = BatchAttemptScope::enter_for_generation(
+                                id,
+                                gen_attempt_id,
+                                admission,
+                            );
                             hipfire_generate::ar::emit_generation_start(
                                 hipfire_generate::ar::GenerationRoute::QwenAr,
                                 &mut stdout,
@@ -3469,12 +3449,11 @@ fn main() {
                                         "[batch] impossible arch {} reached scheduler — fail closed",
                                         arch
                                     );
-                                    let _scope =
-                                        BatchAttemptScope::enter_for_generation(
-                                            id,
-                                            gen_attempt_id,
-                                            admission,
-                                        );
+                                    let _scope = BatchAttemptScope::enter_for_generation(
+                                        id,
+                                        gen_attempt_id,
+                                        admission,
+                                    );
                                     let ep = hipfire_generate::common::RollbackEpilogue {
                                         rolled_back: true,
                                         context: None,
@@ -4618,8 +4597,6 @@ mod tests {
         AttemptKey, BatchAttemptScope,
     };
 
-
-
     #[test]
     fn vision_mode_off_drops_even_an_explicit_sidecar() {
         // Hard override, mirroring the `dflash_mode=off` draft guard: a
@@ -4791,8 +4768,7 @@ mod tests {
         ] {
             let id = format!("admission-batch-{offset}");
             let attempt = 70_001 + offset;
-            let admission =
-                batch_announce_terminal(&id, attempt).expect("batch admission");
+            let admission = batch_announce_terminal(&id, attempt).expect("batch admission");
             let mut out = Vec::new();
             emit_batch_admission_error(
                 &mut out,
