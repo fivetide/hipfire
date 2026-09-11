@@ -249,3 +249,65 @@ fn generation_fault_hooks_one_shot_default_off() {
     assert!(!take_generation_fault_after_prefill());
     assert!(!take_generation_fault_after_first_decode());
 }
+
+/// Scripted LLaMA-style success: gen_start → one token → done. Mirrors the
+/// envelope shapes the LLaMA AR loop emits on its clean path (G4.10(b)), so
+/// any success-path byte change from the prefill/decode/cancel reroute
+/// breaks this test.
+#[test]
+fn llama_success_envelope_sequence_byte_stable() {
+    let _guard = lock();
+    let id = "g410b-success";
+    fresh_controlled_attempt(id, 911);
+    let mut output = Vec::new();
+    {
+        let _route = GenerationRouteScope::enter(GenerationRoute::LlamaAr, id);
+        emit_generation_start(GenerationRoute::LlamaAr, &mut output, id, false);
+        let token = serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": " Paris",
+            "attempt_id": active_attempt_id(),
+        });
+        output.extend_from_slice(token.to_string().as_bytes());
+        output.push(b'\n');
+        let pending_done = serde_json::json!({
+            "type": "done",
+            "id": id,
+            "tokens": 1,
+            "tok_s": 10.0,
+            "prefill_tokens": 7,
+            "prefill_ms": 5.0,
+            "prefill_tok_s": 1400.0,
+            "decode_tok_s": 10.0,
+            "ttft_ms": 5.0,
+            "attempt_id": active_attempt_id(),
+        });
+        emit_active_route_done_value(&mut output, &pending_done);
+        assert_eq!(
+            hipfire_generate::ar::active_generation_route(),
+            None,
+            "done must release the route"
+        );
+    }
+    let events = parse_lines(&output);
+    assert_eq!(events.len(), 3, "success emits exactly 3 envelopes: {events:?}");
+    assert_eq!(events[0]["type"], "gen_start");
+    assert_eq!(events[0]["id"], id);
+    assert_eq!(events[0]["attempt_id"], 911);
+    assert_eq!(events[1]["type"], "token");
+    assert_eq!(events[1]["id"], id);
+    assert_eq!(events[1]["text"], " Paris");
+    assert_eq!(events[1]["attempt_id"], 911);
+    assert_eq!(events[2]["type"], "done");
+    assert_eq!(events[2]["id"], id);
+    assert_eq!(events[2]["tokens"], 1);
+    assert_eq!(events[2]["prefill_tokens"], 7);
+    assert_eq!(events[2]["attempt_id"], 911);
+    // Exactly one terminal was claimed: a second claim on the same key fails.
+    assert!(
+        !claim_wire_terminal(id, 911),
+        "success turn must claim exactly one terminal"
+    );
+    fresh_attempt(0);
+}
