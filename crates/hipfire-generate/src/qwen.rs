@@ -52,6 +52,21 @@ use hipfire_pflash;
 use hipfire_runtime::prompt_frame;
 use rdna_compute;
 
+/// Keep host/token publication behind a successful device mutation.
+///
+/// The PP decode/close/nudge/trailer paths all write recurrent/KV state before
+/// exposing their synthetic token. Keeping this sequencing in one inline gate
+/// makes the no-failure-publication contract explicit and testable without HIP.
+#[inline]
+fn publish_after_forward<E>(
+    forward: Result<(), E>,
+    publish: impl FnOnce(),
+) -> Result<(), E> {
+    forward?;
+    publish();
+    Ok(())
+}
+
 /// Expert-parallel streaming generate (task #26, ds4 first). Greedy AR via
 /// `forward_ep` across the EP ranks; logits gathered on rank 0 and sampled on
 /// the host. v1: greedy + basic token streaming (no grammar / tool-calls /
@@ -4461,14 +4476,22 @@ pub fn generate_multi(
         // handled inside. On failure fail closed rather than serving over
         // dirty state (practically unreachable on healthy GPUs).
         if let Err(e) = crate::common::reset_qwen35_recurrent(m, gpu) {
-            let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+            let ep = crate::common::production_pp_fail_closed_rollback(m, gpu);
             let mut msg = format!("context reset failed: {e}");
             if !ep.rolled_back {
                 if let Some(ctx) = ep.context.as_ref() {
                     msg = format!("{msg} ({ctx})");
                 }
             }
-            emit_active_attempt_error(stdout, Some(id), &msg, "gpu", true, ep.rolled_back);
+            emit_fail_closed_error_for_route(
+                crate::ar::GenerationRoute::PipelineParallel,
+                stdout,
+                Some(id),
+                &msg,
+                "gpu",
+                true,
+                &ep,
+            );
             let _ = stdout.flush();
             return;
         }
@@ -4710,14 +4733,22 @@ pub fn generate_multi(
         // failure fail closed rather than serving over dirty state
         // (practically unreachable on healthy GPUs).
         if let Err(e) = crate::common::reset_qwen35_recurrent(m, gpu) {
-            let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+            let ep = crate::common::production_pp_fail_closed_rollback(m, gpu);
             let mut msg = format!("prompt-cache reset failed: {e}");
             if !ep.rolled_back {
                 if let Some(ctx) = ep.context.as_ref() {
                     msg = format!("{msg} ({ctx})");
                 }
             }
-            emit_active_attempt_error(stdout, Some(id), &msg, "gpu", true, ep.rolled_back);
+            emit_fail_closed_error_for_route(
+                crate::ar::GenerationRoute::PipelineParallel,
+                stdout,
+                Some(id),
+                &msg,
+                "gpu",
+                true,
+                &ep,
+            );
             let _ = stdout.flush();
             return;
         }
@@ -5002,12 +5033,46 @@ pub fn generate_multi(
             emit_pipeline_cancel_after_rollback(stdout, id, generated, &ep);
             return;
         }
-        generated += 1;
-        m.conversation_tokens.push(next_token);
-        streamed_tokens.push(next_token);
-        // Test-only fault seam (G4.7, mirrors dense G4.10): fires after the
-        // first decode step's GPU/KV mutation, before any token visibility.
-        // Same PP fail-closed terminal as the prefill seam above.
+        // Commit the sampled token only after its device/KV mutation succeeds.
+        // A forward error therefore cannot publish a token before the
+        // fail-closed terminal. The test seam is deliberately after the real
+        // forward returns successfully, but still before any token visibility.
+        if let Err(e) = publish_after_forward(
+            qwen35::forward_scratch_multi(
+                gpus,
+                weights,
+                config,
+                next_token,
+                m.seq_pos,
+                kv,
+                dn,
+                scratch_set,
+            ),
+            || {
+                m.seq_pos += 1;
+                generated += 1;
+                m.conversation_tokens.push(next_token);
+                streamed_tokens.push(next_token);
+            },
+        ) {
+            // G4.7: attested PP rollback covers every device (DN/KV/host reset +
+            // per-device graph invalidate + per-device sync). Terminal identical
+            // except `rolled_back` is now attested.
+            let ep = production_pp_fail_closed_rollback(m, gpu);
+            emit_fail_closed_error_for_route(
+                crate::ar::GenerationRoute::PipelineParallel,
+                stdout,
+                Some(id),
+                &format!("forward_scratch_multi decode: {}", e),
+                "validation",
+                false,
+                &ep,
+            );
+            let _ = stdout.flush();
+            return;
+        }
+        // Test-only fault seam (G4.7): fires after the first decode forward's
+        // actual GPU/KV mutation, before any token visibility.
         if generated == 1 && crate::common::take_generation_fault_after_first_decode() {
             let ep = production_pp_fail_closed_rollback(m, gpu);
             emit_fail_closed_error_for_route(
@@ -5043,34 +5108,6 @@ pub fn generate_multi(
             let _ = stdout.flush();
         }
 
-        if let Err(e) = qwen35::forward_scratch_multi(
-            gpus,
-            weights,
-            config,
-            next_token,
-            m.seq_pos,
-            kv,
-            dn,
-            scratch_set,
-        ) {
-            // G4.7: attested PP rollback covers every device (DN/KV/host reset +
-            // per-device graph invalidate + per-device sync). Terminal identical
-            // except `rolled_back` is now attested.
-            let ep = production_pp_fail_closed_rollback(m, gpu);
-            emit_fail_closed_error_for_route(
-                crate::ar::GenerationRoute::PipelineParallel,
-                stdout,
-                Some(id),
-                &format!("forward_scratch_multi decode: {}", e),
-                "validation",
-                false,
-                &ep,
-            );
-            let _ = stdout.flush();
-            return;
-        }
-        m.seq_pos += 1;
-
         if next_token == config.eos_token {
             break;
         }
@@ -5094,7 +5131,6 @@ pub fn generate_multi(
                 break;
             }
         }
-
         // max_think_tokens / force-answer enforcement: same decoded-text scan
         // as pp=1, but all recurrent-state writes route through *_multi.
         let force_answer_now = check_force_answer(id);
@@ -5160,21 +5196,36 @@ pub fn generate_multi(
                 let budget_left = max_tokens.saturating_sub(generated);
                 let take = close_tokens.len().min(budget_left);
                 for &t in &close_tokens[..take] {
-                    if let Err(e) = qwen35::forward_scratch_multi(
-                        gpus,
-                        weights,
-                        config,
-                        t,
-                        m.seq_pos,
-                        kv,
-                        dn,
-                        scratch_set,
+                    if let Err(e) = publish_after_forward(
+                        qwen35::forward_scratch_multi(
+                            gpus,
+                            weights,
+                            config,
+                            t,
+                            m.seq_pos,
+                            kv,
+                            dn,
+                            scratch_set,
+                        ),
+                        || {
+                            m.seq_pos += 1;
+                            m.conversation_tokens.push(t);
+                            streamed_tokens.push(t);
+                        },
                     ) {
-                        eprintln!("[daemon] max_think close forward_scratch_multi: {}", e);
-                        break;
+                        let ep = production_pp_fail_closed_rollback(m, gpu);
+                        emit_fail_closed_error_for_route(
+                            crate::ar::GenerationRoute::PipelineParallel,
+                            stdout,
+                            Some(id),
+                            &format!("max_think close forward_scratch_multi: {}", e),
+                            "validation",
+                            false,
+                            &ep,
+                        );
+                        let _ = stdout.flush();
+                        return;
                     }
-                    m.seq_pos += 1;
-                    m.conversation_tokens.push(t);
                     // hunt3 M-C: keep the grammar matcher in sync over force-closed
                     // </think> tokens, exactly as generate() does (~8591). Without
                     // this a tools request that force-closes <think> leaves the
@@ -5182,7 +5233,6 @@ pub fn generate_multi(
                     if grammar_active {
                         grammar_matcher.advance(&tokenizer.decode(&[t]));
                     }
-                    streamed_tokens.push(t);
                     emit_committed_event(
                         stdout,
                         id,
@@ -5317,8 +5367,36 @@ pub fn generate_multi(
                 .saturating_add(nl.len());
             if nudge_len > 0 && need_kv <= m.physical_cap {
                 for &tok in &nudge_tokens[..nudge_len] {
-                    m.conversation_tokens.push(tok);
-                    streamed_tokens.push(tok);
+                    if let Err(e) = publish_after_forward(
+                        qwen35::forward_scratch_multi(
+                            gpus,
+                            weights,
+                            config,
+                            tok,
+                            m.seq_pos,
+                            kv,
+                            dn,
+                            scratch_set,
+                        ),
+                        || {
+                            m.seq_pos += 1;
+                            m.conversation_tokens.push(tok);
+                            streamed_tokens.push(tok);
+                        },
+                    ) {
+                        let ep = production_pp_fail_closed_rollback(m, gpu);
+                        emit_fail_closed_error_for_route(
+                            crate::ar::GenerationRoute::PipelineParallel,
+                            stdout,
+                            Some(id),
+                            &format!("budget_alert forward_scratch_multi: {}", e),
+                            "validation",
+                            false,
+                            &ep,
+                        );
+                        let _ = stdout.flush();
+                        return;
+                    }
                     emit_committed_event(
                         stdout,
                         id,
@@ -5340,20 +5418,6 @@ pub fn generate_multi(
                         );
                         let _ = stdout.flush();
                     }
-                    if let Err(e) = qwen35::forward_scratch_multi(
-                        gpus,
-                        weights,
-                        config,
-                        tok,
-                        m.seq_pos,
-                        kv,
-                        dn,
-                        scratch_set,
-                    ) {
-                        eprintln!("[daemon] budget_alert forward_scratch_multi: {}", e);
-                        break;
-                    }
-                    m.seq_pos += 1;
                     generated += 1;
                 }
             } else if nudge_len < nudge_tokens.len() {
@@ -5445,21 +5509,35 @@ pub fn generate_multi(
     // ChatML \n trailer so the next turn opens cleanly.
     if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
         for &t in &nl {
-            if let Err(e) = qwen35::forward_scratch_multi(
-                gpus,
-                weights,
-                config,
-                t,
-                m.seq_pos,
-                kv,
-                dn,
-                scratch_set,
+            if let Err(e) = publish_after_forward(
+                qwen35::forward_scratch_multi(
+                    gpus,
+                    weights,
+                    config,
+                    t,
+                    m.seq_pos,
+                    kv,
+                    dn,
+                    scratch_set,
+                ),
+                || {
+                    m.seq_pos += 1;
+                    m.conversation_tokens.push(t);
+                },
             ) {
-                eprintln!("[daemon] trailer forward_scratch_multi: {}", e);
-                break;
+                let ep = production_pp_fail_closed_rollback(m, gpu);
+                emit_fail_closed_error_for_route(
+                    crate::ar::GenerationRoute::PipelineParallel,
+                    stdout,
+                    Some(id),
+                    &format!("trailer forward_scratch_multi: {}", e),
+                    "validation",
+                    false,
+                    &ep,
+                );
+                let _ = stdout.flush();
+                return;
             }
-            m.seq_pos += 1;
-            m.conversation_tokens.push(t);
         }
     }
 
@@ -6765,5 +6843,33 @@ mod qwen_lookup_primer_tests {
         );
         assert!(full.reasoning.is_none());
         assert!(qwen_jinja_lookup_turn(&mut cache, &assistant_msg("missing"), &[90]).is_none());
+    }
+}
+#[cfg(test)]
+mod pp_forward_order_tests {
+    use super::publish_after_forward;
+
+    #[test]
+    fn failed_forward_publishes_neither_token_nor_done() {
+        let mut events = Vec::new();
+        let result = publish_after_forward::<&str>(Err("injected"), || {
+            events.push("token");
+            events.push("done");
+        });
+
+        assert_eq!(result, Err("injected"));
+        assert!(
+            events.is_empty(),
+            "a failed forward must not publish token or done: {events:?}"
+        );
+    }
+
+    #[test]
+    fn successful_forward_publishes_once_after_mutation() {
+        let mut events = Vec::new();
+        let result = publish_after_forward::<&str>(Ok(()), || events.push("token"));
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(events, vec!["token"]);
     }
 }

@@ -589,9 +589,17 @@ fn pp_injected_first_decode_shape_attested() {
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0]["message"], "injected fault after first decode");
     assert_eq!(errors[0]["rolled_back"], true);
+    assert_eq!(
+        errors.len(),
+        1,
+        "seam failure must emit exactly one correlated error: {events:?}"
+    );
+    assert_eq!(errors[0]["id"], id);
     assert!(
-        events.iter().all(|event| event["type"] != "done"),
-        "seam must not emit done: {events:?}"
+        events
+            .iter()
+            .all(|event| !matches!(event["type"].as_str(), Some("token" | "committed" | "done"))),
+        "seam failure must not publish token/committed/done: {events:?}"
     );
     teardown();
 }
