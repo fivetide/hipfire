@@ -13,17 +13,17 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hipfire_arch_qwen4::config::Qwen4Config;
 use hipfire_arch_qwen4::weights::Qwen4Manifest;
 use hipfire_runtime::weight_manifest::ShardPolicy;
 use rdna_compute::DType;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::quant_fwht::{gen_fwht_signs, quantize_mq4g128v2, quantize_mq4g256v2};
 use hipfire_quantize::float16::bf16_to_f32;
@@ -54,15 +54,40 @@ const QWEN4_I64_QUANT_TYPE: u8 = 52;
 const MAX_HEADER_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REOPEN_REGION_BYTES: u64 = 64 * 1024 * 1024;
+/// The pinned checkpoint contains 1,658 records: 1,655 BF16 (including the
+/// positively excluded vision tower) and three exact I64 metadata arrays.
+const PINNED_SOURCE_TENSOR_COUNT: usize = 1_658;
+const PINNED_BF16_TENSOR_COUNT: usize = 1_655;
+const PINNED_I64_TENSOR_COUNT: usize = 3;
+const PINNED_VISION_TENSOR_COUNT: usize = 333;
+const PINNED_OUTPUT_ENTRY_COUNT: usize = 1_325;
+// Derived from the pinned config plus all 1,658 safetensors headers.  The
+// payload is not read to compute this value; it is used as a regression anchor
+// for the production preflight's dynamic prediction.
+#[cfg(test)]
+const PINNED_METADATA_BYTES: u64 = 4_000;
+#[cfg(test)]
+const PINNED_INDEX_BYTES: u64 = 116_418;
+#[cfg(test)]
+const PINNED_PAYLOAD_BYTES: u64 = 170_625_677_336;
+#[cfg(test)]
+const PINNED_PREDICTED_OUTPUT_BYTES: u64 = 170_625_800_216;
+const PINNED_SHARD_COUNT: usize = 131;
 /// Default bounded source row chunk.  A gate/up chunk is about 2.5 MiB BF16
 /// and 5 MiB F32; the quantizer's output is smaller still.
 pub(crate) const DEFAULT_ROW_CHUNK: usize = 256;
 const MAX_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
 /// Do not let an accidental CLI value turn a row stream into a tensor buffer.
 const MAX_ROW_CHUNK: usize = 1_024;
+const CAPACITY_OVERRIDE_ENV: &str = "HIPFIRE_QWEN4_CAPACITY_BYTES";
 
 fn qwen4_quantized_dtype(dtype: DType) -> bool {
     matches!(dtype, DType::MQ4G256V2 | DType::MQ4G128V2)
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Qwen4Mode {
+    Production,
+    CompactFixture,
 }
 
 #[derive(Debug)]
@@ -70,6 +95,7 @@ pub(crate) struct Qwen4Options<'a> {
     pub(crate) input: &'a Path,
     pub(crate) output: &'a Path,
     pub(crate) row_chunk: usize,
+    pub(crate) mode: Qwen4Mode,
 }
 
 impl<'a> Qwen4Options<'a> {
@@ -78,6 +104,17 @@ impl<'a> Qwen4Options<'a> {
             input,
             output,
             row_chunk: DEFAULT_ROW_CHUNK,
+            mode: Qwen4Mode::Production,
+        }
+    }
+
+    #[cfg(test)]
+    fn compact_fixture(input: &'a Path, output: &'a Path) -> Self {
+        Self {
+            input,
+            output,
+            row_chunk: 2,
+            mode: Qwen4Mode::CompactFixture,
         }
     }
 }
@@ -90,6 +127,8 @@ pub(crate) struct Qwen4Summary {
     pub(crate) ple_shards: usize,
     pub(crate) resident_bytes: u64,
     pub(crate) external_ple_bytes: u64,
+    pub(crate) predicted_output_bytes: u64,
+    pub(crate) scratch_high_water_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -146,15 +185,25 @@ impl std::error::Error for Qwen4Error {}
 /// CLI-facing producer entry point.  The existing quantizer routes do not call
 /// this function unless `--qwen4-flash-next` is explicitly selected.
 pub(crate) fn run_cli(input: &Path, output: &Path) -> Result<Qwen4Summary, Qwen4Error> {
-    write_qwen4_artifact(&Qwen4Options::new(input, output))
+    run_cli_with_mode(input, output, Qwen4Mode::Production)
+}
+
+pub(crate) fn run_cli_with_mode(
+    input: &Path,
+    output: &Path,
+    mode: Qwen4Mode,
+) -> Result<Qwen4Summary, Qwen4Error> {
+    let mut options = Qwen4Options::new(input, output);
+    options.mode = mode;
+    write_qwen4_artifact(&options)
 }
 
 /// Build one transactional Qwen4 HFQM artifact.
 ///
 /// The writer's index is planned entirely from safetensors headers first.  A
 /// temporary file is written and reopened with the bounded plan reader before
-/// the final rename, so a malformed source or short callback never publishes a
-/// partially written candidate over an existing artifact.
+/// the final rename, so a malformed source or short callback never publishes
+/// a partially written candidate over an existing artifact.
 pub(crate) fn write_qwen4_artifact(options: &Qwen4Options<'_>) -> Result<Qwen4Summary, Qwen4Error> {
     if options.row_chunk == 0 || options.row_chunk > MAX_ROW_CHUNK {
         return Err(Qwen4Error::Invalid(format!(
@@ -162,11 +211,22 @@ pub(crate) fn write_qwen4_artifact(options: &Qwen4Options<'_>) -> Result<Qwen4Su
             options.row_chunk
         )));
     }
+    if options.output.exists() {
+        return Err(Qwen4Error::Invalid(format!(
+            "refusing to replace existing Qwen4 artifact {}",
+            options.output.display()
+        )));
+    }
     let source = source_paths(options.input)?;
+    validate_source_shard_count(&source, options.mode)?;
     let tensors = load_inventory(&source)?;
+    validate_source_inventory(&tensors, options.mode)?;
     let config_value = load_optional_config(&source)?.ok_or_else(|| {
         Qwen4Error::Invalid("Qwen4 input is missing required config.json".to_string())
     })?;
+    if options.mode == Qwen4Mode::CompactFixture {
+        return write_compact_artifact(options, &source, tensors, &config_value);
+    }
     let config = Qwen4Config::from_value(&config_value)
         .map_err(|error| Qwen4Error::Invalid(format!("Qwen4 config is invalid: {error}")))?;
     let manifest = Qwen4Manifest::build(&config).map_err(|error| {
@@ -177,6 +237,13 @@ pub(crate) fn write_qwen4_artifact(options: &Qwen4Options<'_>) -> Result<Qwen4Su
     let ple_metadata = plan.ple_metadata.as_ref().ok_or_else(|| {
         Qwen4Error::Invalid("Qwen4 plan did not produce PLE metadata".to_string())
     })?;
+    if plan.entries.len() != PINNED_OUTPUT_ENTRY_COUNT {
+        return Err(Qwen4Error::Invalid(format!(
+            "Qwen4 output manifest has {} entries, expected pinned {}",
+            plan.entries.len(),
+            PINNED_OUTPUT_ENTRY_COUNT
+        )));
+    }
     let metadata_json = build_metadata(Some(&config_value), &plan, ple_metadata)?;
     if plan.entries.len() > u32::MAX as usize {
         return Err(Qwen4Error::Invalid(format!(
@@ -195,11 +262,15 @@ pub(crate) fn write_qwen4_artifact(options: &Qwen4Options<'_>) -> Result<Qwen4Su
             data_len: entry.data_len,
         })
         .collect();
+    let predicted_output_bytes = predicted_output_bytes(&metadata_json, &stream_entries)?;
+    capacity_preflight(options.output, predicted_output_bytes)?;
+
     let signs1_256 = gen_fwht_signs(42, 256);
     let signs2_256 = gen_fwht_signs(1042, 256);
     let signs1_128 = gen_fwht_signs(43, 128);
     let signs2_128 = gen_fwht_signs(1043, 128);
-    let temporary = temporary_output_path(options.output);
+    let temporary = temporary_output_path(options.output)?;
+    let mut scratch = ScratchTracker::default();
     let write_result = hipfire_runtime::hfq::write_hfqm_package_streaming(
         &temporary,
         QWEN4_ARCH_ID,
@@ -213,6 +284,7 @@ pub(crate) fn write_qwen4_artifact(options: &Qwen4Options<'_>) -> Result<Qwen4Su
                 &signs2_256,
                 &signs1_128,
                 &signs2_128,
+                &mut scratch,
                 writer,
             )
             .map_err(Qwen4Error::into_io)
@@ -225,39 +297,602 @@ pub(crate) fn write_qwen4_artifact(options: &Qwen4Options<'_>) -> Result<Qwen4Su
             error,
         ));
     }
-
-    // Reopen without mmap'ing the large payload.  The plan reader checks the
-    // header/index extents and qwen4_ple schema while retaining only metadata
-    // and index-sized allocations.
-    if let Err(error) = Qwen4ReopenPlan::open(&temporary) {
+    if let Err(error) = sync_file(&temporary) {
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
-    if let Err(error) = fs::rename(&temporary, options.output) {
+    if let Err(error) = source.verify_identity() {
         let _ = fs::remove_file(&temporary);
-        return Err(Qwen4Error::io(
-            format!("publish Qwen4 artifact {}", options.output.display()),
-            error,
-        ));
+        return Err(error);
+    }
+
+    // Reopen without mmap'ing the large payload.  The plan reader checks the
+    // header/index extents, qtypes, shapes, and exact byte ranges against the
+    // precomputed stream plan before retaining only index-sized allocations.
+    let reopened = match Qwen4ReopenPlan::open(&temporary) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
+    if let Err(error) = reopened.validate_against(&metadata_json, &stream_entries) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = publish_qwen4(&temporary, options.output) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
     }
 
     Ok(Qwen4Summary {
         entries: plan.entries.len(),
         resident_entries: plan.resident_entries,
         expert_entries: plan.expert_entries,
-        ple_shards: PLE_SHARD_COUNT,
+        ple_shards: plan.ple_shards,
         resident_bytes: plan.resident_bytes,
         external_ple_bytes: plan.external_ple_bytes,
+        predicted_output_bytes,
+        scratch_high_water_bytes: scratch.high_water,
     })
 }
 
-fn temporary_output_path(output: &Path) -> PathBuf {
+fn write_compact_artifact(
+    options: &Qwen4Options<'_>,
+    source: &SourceSet,
+    tensors: Vec<SourceTensor>,
+    config: &Value,
+) -> Result<Qwen4Summary, Qwen4Error> {
+    let plan = plan_compact_entries(tensors, options.row_chunk)?;
+    let ple = plan
+        .ple_metadata
+        .as_ref()
+        .ok_or_else(|| Qwen4Error::Invalid("compact Qwen4 plan has no PLE metadata".to_string()))?;
+    let metadata_json = build_metadata(Some(config), &plan, ple)?;
+    let stream_entries: Vec<hipfire_runtime::hfq::HfqStreamEntry> = plan
+        .entries
+        .iter()
+        .map(|entry| hipfire_runtime::hfq::HfqStreamEntry {
+            name: entry.name.clone(),
+            quant_type: entry.quant_type,
+            shape: entry.shape.clone(),
+            group_size: entry.group_size,
+            data_len: entry.data_len,
+        })
+        .collect();
+    let predicted_output_bytes = predicted_output_bytes(&metadata_json, &stream_entries)?;
+    capacity_preflight(options.output, predicted_output_bytes)?;
+    let signs1_256 = gen_fwht_signs(42, 256);
+    let signs2_256 = gen_fwht_signs(1042, 256);
+    let signs1_128 = gen_fwht_signs(43, 128);
+    let signs2_128 = gen_fwht_signs(1043, 128);
+    let temporary = temporary_output_path(options.output)?;
+    let mut scratch = ScratchTracker::default();
+    let write_result = hipfire_runtime::hfq::write_hfqm_package_streaming(
+        &temporary,
+        QWEN4_ARCH_ID,
+        &metadata_json,
+        &stream_entries,
+        |index, writer| {
+            stream_entry(
+                &plan.entries[index],
+                options.row_chunk,
+                &signs1_256,
+                &signs2_256,
+                &signs1_128,
+                &signs2_128,
+                &mut scratch,
+                writer,
+            )
+            .map_err(Qwen4Error::into_io)
+        },
+    );
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(Qwen4Error::io(
+            format!("write compact Qwen4 artifact {}", options.output.display()),
+            error,
+        ));
+    }
+    if let Err(error) = sync_file(&temporary) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = source.verify_identity() {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    let reopened = match Qwen4ReopenPlan::open(&temporary) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
+    if let Err(error) = reopened.validate_against(&metadata_json, &stream_entries) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = publish_qwen4(&temporary, options.output) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(Qwen4Summary {
+        entries: plan.entries.len(),
+        resident_entries: plan.resident_entries,
+        expert_entries: plan.expert_entries,
+        ple_shards: plan.ple_shards,
+        resident_bytes: plan.resident_bytes,
+        external_ple_bytes: plan.external_ple_bytes,
+        predicted_output_bytes,
+        scratch_high_water_bytes: scratch.high_water,
+    })
+}
+
+fn plan_compact_entries(
+    tensors: Vec<SourceTensor>,
+    row_chunk: usize,
+) -> Result<EntryPlan, Qwen4Error> {
+    let mut metadata_sources = BTreeMap::<I64Role, SourceTensor>::new();
+    let mut ple_sources = BTreeMap::<usize, SourceTensor>::new();
+    let mut resident = Vec::new();
+    let mut metadata_entries = Vec::new();
+    let mut expert_entries = 0usize;
+    for tensor in tensors {
+        if let Some(role) = i64_role(&tensor.name) {
+            if tensor.dtype != "I64" {
+                return Err(Qwen4Error::Invalid(format!(
+                    "{} compact fixture metadata must be I64",
+                    tensor.name
+                )));
+            }
+            let expected = match role {
+                I64Role::Multipliers => 3,
+                I64Role::VocabSizes | I64Role::Offsets => PLE_HEAD_COUNT,
+            };
+            if tensor.shape != [expected as u64] || tensor.data_len() != (expected * 8) as u64 {
+                return Err(Qwen4Error::Invalid(format!(
+                    "{} compact fixture I64 shape/extent is invalid",
+                    tensor.name
+                )));
+            }
+            if metadata_sources.insert(role, tensor).is_some() {
+                return Err(Qwen4Error::Invalid(format!(
+                    "duplicate compact fixture I64 role {role:?}"
+                )));
+            }
+            continue;
+        }
+        if let Some(index) = ple_shard_index(&tensor.name) {
+            if tensor.dtype != "BF16" || tensor.shape.len() != 2 || tensor.shape[1] != PLE_ROW_WIDTH
+            {
+                return Err(Qwen4Error::Invalid(format!(
+                    "{} compact fixture PLE must be BF16 [rows, {PLE_ROW_WIDTH}]",
+                    tensor.name
+                )));
+            }
+            let expected = checked_bf16_bytes(&tensor.shape, &tensor.name)?;
+            if tensor.data_len() != expected {
+                return Err(Qwen4Error::Invalid(format!(
+                    "{} compact fixture PLE extent is {}, expected {expected}",
+                    tensor.name,
+                    tensor.data_len()
+                )));
+            }
+            if ple_sources.insert(index, tensor).is_some() {
+                return Err(Qwen4Error::Invalid(format!(
+                    "duplicate compact fixture PLE shard index {index}"
+                )));
+            }
+            continue;
+        }
+        if tensor.dtype != "BF16" {
+            return Err(Qwen4Error::Invalid(format!(
+                "{} compact fixture source must be BF16 or I64",
+                tensor.name
+            )));
+        }
+        let source_len = checked_bf16_bytes(&tensor.shape, &tensor.name)?;
+        if tensor.data_len() != source_len {
+            return Err(Qwen4Error::Invalid(format!(
+                "{} compact fixture source extent is {}, expected {source_len}",
+                tensor.name,
+                tensor.data_len()
+            )));
+        }
+        let shape = shape_u32(&tensor.shape, &tensor.name)?;
+        let is_gate_up = tensor.name.ends_with(".experts.gate_up_proj") && tensor.shape.len() == 3;
+        let is_down = tensor.name.ends_with(".experts.down_proj") && tensor.shape.len() == 3;
+        let (quant_type, group_size, data_len, kind) = if is_gate_up || is_down {
+            let rows = tensor.shape[0]
+                .checked_mul(tensor.shape[1])
+                .ok_or_else(|| Qwen4Error::Invalid(format!("{} rows overflow", tensor.name)))?;
+            let k = tensor.shape[2];
+            let kind = if is_gate_up {
+                EntryKind::GateUp
+            } else {
+                EntryKind::Down
+            };
+            let dtype = if is_gate_up {
+                DType::MQ4G256V2
+            } else {
+                DType::MQ4G128V2
+            };
+            let source_len = checked_bf16_bytes(&tensor.shape, &tensor.name)?;
+            if tensor.data_len() != source_len {
+                return Err(Qwen4Error::Invalid(format!(
+                    "{} compact fixture expert extent is {}, expected {source_len}",
+                    tensor.name,
+                    tensor.data_len()
+                )));
+            }
+            (
+                match dtype {
+                    DType::MQ4G256V2 => MQ4G256V2_QUANT_TYPE,
+                    DType::MQ4G128V2 => MQ4G128V2_QUANT_TYPE,
+                    _ => unreachable!(),
+                },
+                match dtype {
+                    DType::MQ4G256V2 => MQ4G256V2_GROUP_SIZE as u32,
+                    DType::MQ4G128V2 => MQ4G128V2_GROUP_SIZE as u32,
+                    _ => unreachable!(),
+                },
+                quantized_data_len_for_dtype(dtype, rows, k)?,
+                kind,
+            )
+        } else if tensor.shape.len() == 2 && !tensor.name.ends_with(".shared_expert_gate.weight") {
+            let rows = tensor.shape[0];
+            let k = tensor.shape[1];
+            let dtype = if k % MQ4G256V2_GROUP_SIZE == 0 {
+                DType::MQ4G256V2
+            } else {
+                DType::MQ4G128V2
+            };
+            (
+                match dtype {
+                    DType::MQ4G256V2 => MQ4G256V2_QUANT_TYPE,
+                    DType::MQ4G128V2 => MQ4G128V2_QUANT_TYPE,
+                    _ => unreachable!(),
+                },
+                match dtype {
+                    DType::MQ4G256V2 => MQ4G256V2_GROUP_SIZE as u32,
+                    DType::MQ4G128V2 => MQ4G128V2_GROUP_SIZE as u32,
+                    _ => unreachable!(),
+                },
+                quantized_data_len_for_dtype(dtype, rows, k)?,
+                EntryKind::Matrix(dtype),
+            )
+        } else {
+            (
+                16,
+                0,
+                checked_bf16_bytes(&tensor.shape, &tensor.name)?,
+                EntryKind::Bf16,
+            )
+        };
+        if matches!(kind, EntryKind::GateUp | EntryKind::Down) {
+            expert_entries += 1;
+        }
+        resident.push(PlannedEntry {
+            name: tensor.name.clone(),
+            source: tensor,
+            quant_type,
+            shape,
+            group_size,
+            data_len,
+            kind,
+        });
+    }
+    let mut ple_metadata = PleMetadata {
+        multipliers: vec![3, 5, 7],
+        vocab_sizes: vec![127; PLE_HEAD_COUNT],
+        prefix_offsets: (0..PLE_HEAD_COUNT)
+            .map(|index| (index * 127) as i64)
+            .collect(),
+    };
+    if let Some(source) = metadata_sources.get(&I64Role::Multipliers) {
+        ple_metadata.multipliers = read_i64_array(source, 3)?;
+    }
+    if let Some(source) = metadata_sources.get(&I64Role::VocabSizes) {
+        ple_metadata.vocab_sizes = read_i64_array(source, PLE_HEAD_COUNT)?;
+    }
+    if let Some(source) = metadata_sources.get(&I64Role::Offsets) {
+        ple_metadata.prefix_offsets = read_i64_array(source, PLE_HEAD_COUNT)?;
+    }
+    validate_ple_metadata(
+        &ple_metadata.multipliers,
+        &ple_metadata.vocab_sizes,
+        &ple_metadata.prefix_offsets,
+    )?;
+    for role in [I64Role::Multipliers, I64Role::VocabSizes, I64Role::Offsets] {
+        if let Some(source) = metadata_sources.remove(&role) {
+            metadata_entries.push(PlannedEntry {
+                name: source.name.clone(),
+                shape: shape_u32(&source.shape, &source.name)?,
+                quant_type: QWEN4_I64_QUANT_TYPE,
+                group_size: 0,
+                data_len: source.data_len(),
+                kind: EntryKind::I64(role),
+                source,
+            });
+        }
+    }
+    resident.sort_by(|left, right| left.name.cmp(&right.name));
+    if ple_sources.is_empty() {
+        return Err(Qwen4Error::Invalid(
+            "compact fixture has no PLE shards".to_string(),
+        ));
+    }
+    for (expected, actual) in ple_sources.keys().enumerate() {
+        if *actual != expected {
+            return Err(Qwen4Error::Invalid(format!(
+                "compact fixture PLE shard indexes must be contiguous from zero, found {actual}"
+            )));
+        }
+    }
+    let mut ple_entries = Vec::with_capacity(ple_sources.len());
+    for (index, source) in ple_sources {
+        let _ = index;
+        ple_entries.push(PlannedEntry {
+            name: source.name.clone(),
+            shape: shape_u32(&source.shape, &source.name)?,
+            quant_type: 16,
+            group_size: 0,
+            data_len: source.data_len(),
+            kind: EntryKind::Ple,
+            source,
+        });
+    }
+    let resident_bytes = resident.iter().try_fold(0u64, |sum, entry| {
+        sum.checked_add(entry.data_len)
+            .ok_or_else(|| Qwen4Error::Invalid("compact resident byte count overflows".to_string()))
+    })?;
+    let external_ple_bytes = ple_entries.iter().try_fold(0u64, |sum, entry| {
+        sum.checked_add(entry.data_len)
+            .ok_or_else(|| Qwen4Error::Invalid("compact PLE byte count overflows".to_string()))
+    })?;
+    let ple_shards = ple_entries.len();
+    let resident_entries = resident.len();
+    let mut entries = ple_entries;
+    entries.extend(resident);
+    entries.extend(metadata_entries);
+    Ok(EntryPlan {
+        entries,
+        ple_metadata: Some(ple_metadata),
+        row_chunk,
+        resident_entries,
+        expert_entries,
+        resident_bytes,
+        external_ple_bytes,
+        ple_shards,
+    })
+}
+
+fn temporary_output_path(output: &Path) -> Result<PathBuf, Qwen4Error> {
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
     let file_name = output
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("qwen4.hfq");
-    parent.join(format!(".{file_name}.qwen4-tmp-{}", std::process::id()))
+    for nonce in 0..32u32 {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = parent.join(format!(
+            ".{file_name}.qwen4-tmp-{}-{timestamp:x}-{nonce}",
+            std::process::id()
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(_) => {
+                fs::remove_file(&path).map_err(|error| {
+                    Qwen4Error::io(
+                        format!("reserve temporary Qwen4 artifact {}", path.display()),
+                        error,
+                    )
+                })?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(Qwen4Error::io(
+                    format!("reserve temporary Qwen4 artifact {}", path.display()),
+                    error,
+                ));
+            }
+        }
+    }
+    Err(Qwen4Error::Invalid(format!(
+        "could not allocate a unique temporary Qwen4 artifact beside {}",
+        output.display()
+    )))
+}
+
+fn sync_file(path: &Path) -> Result<(), Qwen4Error> {
+    let file = File::open(path)
+        .map_err(|error| Qwen4Error::io(format!("open {} for fsync", path.display()), error))?;
+    file.sync_all()
+        .map_err(|error| Qwen4Error::io(format!("fsync {}", path.display()), error))
+}
+
+fn publish_qwen4(temporary: &Path, output: &Path) -> Result<(), Qwen4Error> {
+    if output.exists() {
+        return Err(Qwen4Error::Invalid(format!(
+            "refusing to replace existing Qwen4 artifact {}",
+            output.display()
+        )));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let old = std::ffi::CString::new(temporary.as_os_str().as_bytes()).map_err(|_| {
+            Qwen4Error::Invalid(format!(
+                "temporary Qwen4 path contains NUL: {}",
+                temporary.display()
+            ))
+        })?;
+        let new = std::ffi::CString::new(output.as_os_str().as_bytes()).map_err(|_| {
+            Qwen4Error::Invalid(format!(
+                "output Qwen4 path contains NUL: {}",
+                output.display()
+            ))
+        })?;
+        // SAFETY: both C strings are NUL-terminated paths and AT_FDCWD
+        // resolves them relative to the current working directory.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                old.as_ptr(),
+                libc::AT_FDCWD,
+                new.as_ptr(),
+                1u32, // RENAME_NOREPLACE
+            )
+        };
+        if result != 0 {
+            return Err(Qwen4Error::io(
+                format!("publish Qwen4 artifact {}", output.display()),
+                io::Error::last_os_error(),
+            ));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        fs::rename(temporary, output).map_err(|error| {
+            Qwen4Error::io(
+                format!("publish Qwen4 artifact {}", output.display()),
+                error,
+            )
+        })?;
+    }
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    #[cfg(unix)]
+    {
+        let directory = File::open(parent).map_err(|error| {
+            Qwen4Error::io(format!("open {} for fsync", parent.display()), error)
+        })?;
+        directory
+            .sync_all()
+            .map_err(|error| Qwen4Error::io(format!("fsync {}", parent.display()), error))?;
+    }
+    Ok(())
+}
+#[derive(Debug, Default)]
+struct ScratchTracker {
+    high_water: u64,
+}
+
+impl ScratchTracker {
+    fn observe(
+        &mut self,
+        raw_bytes: usize,
+        value_bytes: usize,
+        output_bytes: usize,
+    ) -> Result<(), Qwen4Error> {
+        let total = (raw_bytes as u64)
+            .checked_add(value_bytes as u64)
+            .and_then(|value| value.checked_add(output_bytes as u64))
+            .ok_or_else(|| Qwen4Error::Invalid("Qwen4 scratch high-water overflows".to_string()))?;
+        if total > MAX_CHUNK_BYTES {
+            return Err(Qwen4Error::Invalid(format!(
+                "Qwen4 scratch high-water {total} exceeds bounded {MAX_CHUNK_BYTES} bytes"
+            )));
+        }
+        self.high_water = self.high_water.max(total);
+        Ok(())
+    }
+}
+
+fn predicted_output_bytes(
+    metadata_json: &str,
+    entries: &[hipfire_runtime::hfq::HfqStreamEntry],
+) -> Result<u64, Qwen4Error> {
+    let metadata_len = u64::try_from(metadata_json.len())
+        .map_err(|_| Qwen4Error::Invalid("Qwen4 metadata length does not fit u64".to_string()))?;
+    let mut index_len = 4u64;
+    for entry in entries {
+        let name_len = u64::try_from(entry.name.len())
+            .map_err(|_| Qwen4Error::Invalid("Qwen4 entry name length overflows".to_string()))?;
+        let dims = u64::try_from(entry.shape.len())
+            .map_err(|_| Qwen4Error::Invalid("Qwen4 shape rank overflows".to_string()))?;
+        index_len = index_len
+            .checked_add(2)
+            .and_then(|value| value.checked_add(name_len))
+            .and_then(|value| value.checked_add(2))
+            .and_then(|value| value.checked_add(dims.checked_mul(4)?))
+            .and_then(|value| value.checked_add(4))
+            .and_then(|value| value.checked_add(8))
+            .ok_or_else(|| Qwen4Error::Invalid("Qwen4 index length overflows".to_string()))?;
+    }
+    let data_start = 32u64
+        .checked_add(metadata_len)
+        .and_then(|value| value.checked_add(index_len))
+        .ok_or_else(|| Qwen4Error::Invalid("Qwen4 output header length overflows".to_string()))?;
+    let data_offset = data_start
+        .checked_add(4095)
+        .map(|value| value & !4095)
+        .ok_or_else(|| Qwen4Error::Invalid("Qwen4 output alignment overflows".to_string()))?;
+    let payload = entries.iter().try_fold(0u64, |sum, entry| {
+        sum.checked_add(entry.data_len)
+            .ok_or_else(|| Qwen4Error::Invalid("Qwen4 output payload length overflows".to_string()))
+    })?;
+    data_offset
+        .checked_add(payload)
+        .ok_or_else(|| Qwen4Error::Invalid("Qwen4 output length overflows".to_string()))
+}
+
+fn capacity_preflight(path: &Path, predicted: u64) -> Result<(), Qwen4Error> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let available = match env::var(CAPACITY_OVERRIDE_ENV) {
+        Ok(value) => Some(value.parse::<u64>().map_err(|_| {
+            Qwen4Error::Invalid(format!(
+                "{CAPACITY_OVERRIDE_ENV} must be an unsigned byte count, got {value:?}"
+            ))
+        })?),
+        Err(_) => available_capacity(parent)?,
+    };
+    if let Some(available) = available {
+        if available < predicted {
+            return Err(Qwen4Error::Invalid(format!(
+                "insufficient destination capacity for Qwen4 artifact: \
+                 predicted {predicted} bytes, available {available} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn available_capacity(path: &Path) -> Result<Option<u64>, Qwen4Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        let c_path = std::ffi::CString::new(bytes).map_err(|_| {
+            Qwen4Error::Invalid(format!("destination path contains NUL: {}", path.display()))
+        })?;
+        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: c_path is NUL-terminated and stats points to writable
+        // statvfs storage owned by this function.
+        let result = unsafe { libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) };
+        if result != 0 {
+            return Err(Qwen4Error::io(
+                format!("stat free space for {}", path.display()),
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: statvfs initialized stats on success.
+        let stats = unsafe { stats.assume_init() };
+        return stats
+            .f_bavail
+            .checked_mul(stats.f_frsize)
+            .map(Some)
+            .ok_or_else(|| Qwen4Error::Invalid("destination capacity overflows".to_string()));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -315,11 +950,24 @@ fn valid_hf_component(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteObjectIdentity {
+    etag: String,
+    length: u64,
+}
+
+#[derive(Debug, Default)]
+struct RemoteIdentityState {
+    revision: Option<String>,
+    objects: HashMap<String, RemoteObjectIdentity>,
+}
+
 struct RemoteSource {
     spec: RemoteSpec,
     base_url: String,
     agent: ureq::Agent,
     authorization: Option<String>,
+    identity: Mutex<RemoteIdentityState>,
 }
 
 impl std::fmt::Debug for RemoteSource {
@@ -372,6 +1020,7 @@ impl RemoteSource {
             base_url,
             agent,
             authorization,
+            identity: Mutex::new(RemoteIdentityState::default()),
         })
     }
 
@@ -380,6 +1029,63 @@ impl RemoteSource {
             "{}/{}/{}/resolve/{}/{}",
             self.base_url, self.spec.owner, self.spec.repo, self.spec.revision, path
         )
+    }
+
+    fn remember_identity(
+        &self,
+        path: &str,
+        headers: &ureq::http::HeaderMap,
+        length: u64,
+    ) -> Result<(), Qwen4Error> {
+        let etag = headers
+            .get("etag")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Qwen4Error::Invalid(format!("remote {path} response is missing ETag")))?
+            .to_string();
+        // The immutable revision is part of the resolved URL.  HF's CDN
+        // returns `x-repo-commit` for small JSON responses but commonly omits
+        // it for shard ranges; when present, it must still agree with the
+        // pinned URL revision.
+        let response_revision = ["x-repo-commit", "x-revision", "x-repo-revision"]
+            .iter()
+            .find_map(|name| headers.get(*name))
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty());
+        if let Some(response_revision) = response_revision {
+            if response_revision != self.spec.revision {
+                return Err(Qwen4Error::Invalid(format!(
+                    "remote {path} response revision {response_revision:?} disagrees with pinned {}",
+                    self.spec.revision
+                )));
+            }
+        }
+        let revision = self.spec.revision.clone();
+        let mut identity = self.identity.lock().map_err(|_| {
+            Qwen4Error::Invalid("remote source identity lock is poisoned".to_string())
+        })?;
+        if let Some(expected) = &identity.revision {
+            if expected != &revision {
+                return Err(Qwen4Error::Invalid(format!(
+                    "remote source revision changed from {expected:?} to {revision:?}"
+                )));
+            }
+        } else {
+            identity.revision = Some(revision);
+        }
+        let object = RemoteObjectIdentity { etag, length };
+        if let Some(expected) = identity.objects.get(path) {
+            if expected != &object {
+                return Err(Qwen4Error::Invalid(format!(
+                    "remote source identity changed for {path}: \
+                     expected ETag/length {:?}/{}, got {:?}/{}",
+                    expected.etag, expected.length, object.etag, object.length
+                )));
+            }
+        } else {
+            identity.objects.insert(path.to_string(), object);
+        }
+        Ok(())
     }
 
     fn read_json(&self, path: &str, max_bytes: u64) -> Result<Value, Qwen4Error> {
@@ -421,6 +1127,7 @@ impl RemoteSource {
                 max_bytes
             )));
         }
+        self.remember_identity(path, response.headers(), total)?;
         let announced = content_length(response.headers(), path)?;
         if announced != body_len {
             return Err(Qwen4Error::Invalid(format!(
@@ -482,6 +1189,7 @@ impl RemoteSource {
                 offset.saturating_add(length).saturating_sub(1)
             )));
         }
+        self.remember_identity(path, response.headers(), total)?;
         let announced = content_length(response.headers(), path)?;
         if announced != length {
             return Err(Qwen4Error::Invalid(format!(
@@ -586,6 +1294,48 @@ fn validate_remote_path(path: &str, required_suffix: Option<&str>) -> Result<(),
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalFileIdentity {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn local_file_identity(path: &Path) -> Result<LocalFileIdentity, Qwen4Error> {
+    let metadata = fs::metadata(path)
+        .map_err(|error| Qwen4Error::io(format!("stat {}", path.display()), error))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(LocalFileIdentity {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(LocalFileIdentity {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
+fn verify_local_file_identity(path: &Path, expected: &LocalFileIdentity) -> Result<(), Qwen4Error> {
+    let actual = local_file_identity(path)?;
+    if &actual != expected {
+        return Err(Qwen4Error::Invalid(format!(
+            "Qwen4 source identity changed for {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
 fn parse_content_range(value: &str) -> Result<(u64, u64, u64), Qwen4Error> {
     let (unit, range) = value.split_once(' ').ok_or_else(|| {
         Qwen4Error::Invalid(format!(
@@ -689,11 +1439,100 @@ fn read_response_exact(
 enum SourceSet {
     Local {
         paths: Vec<PathBuf>,
+        identities: Vec<LocalFileIdentity>,
     },
     Remote {
         source: Arc<RemoteSource>,
         paths: Vec<String>,
     },
+}
+
+impl SourceSet {
+    fn verify_identity(&self) -> Result<(), Qwen4Error> {
+        match self {
+            Self::Local { paths, identities } => {
+                if paths.len() != identities.len() {
+                    return Err(Qwen4Error::Invalid(
+                        "Qwen4 local source identity seal is incomplete".to_string(),
+                    ));
+                }
+                for (path, expected) in paths.iter().zip(identities) {
+                    verify_local_file_identity(path, expected)?;
+                }
+            }
+            Self::Remote { source, paths } => {
+                let identity = source.identity.lock().map_err(|_| {
+                    Qwen4Error::Invalid("remote source identity lock is poisoned".to_string())
+                })?;
+                for path in paths {
+                    if !identity.objects.contains_key(path) {
+                        return Err(Qwen4Error::Invalid(format!(
+                            "remote source shard {path} was not identity-sealed"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_source_shard_count(source: &SourceSet, mode: Qwen4Mode) -> Result<(), Qwen4Error> {
+    if mode == Qwen4Mode::Production {
+        let count = match source {
+            SourceSet::Local { paths, .. } => paths.len(),
+            SourceSet::Remote { paths, .. } => paths.len(),
+        };
+        if count != PINNED_SHARD_COUNT {
+            return Err(Qwen4Error::Invalid(format!(
+                "Qwen4 production admission requires exactly {PINNED_SHARD_COUNT} safetensors shards, found {count}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_source_inventory(tensors: &[SourceTensor], mode: Qwen4Mode) -> Result<(), Qwen4Error> {
+    if mode != Qwen4Mode::Production {
+        return Ok(());
+    }
+    if tensors.len() != PINNED_SOURCE_TENSOR_COUNT {
+        return Err(Qwen4Error::Invalid(format!(
+            "Qwen4 production admission requires exactly {PINNED_SOURCE_TENSOR_COUNT} source tensors, found {}",
+            tensors.len()
+        )));
+    }
+    let bf16 = tensors
+        .iter()
+        .filter(|tensor| tensor.dtype == "BF16")
+        .count();
+    let i64 = tensors
+        .iter()
+        .filter(|tensor| tensor.dtype == "I64")
+        .count();
+    let vision = tensors
+        .iter()
+        .filter(|tensor| is_vision_tensor(&tensor.name))
+        .count();
+    if bf16 != PINNED_BF16_TENSOR_COUNT || i64 != PINNED_I64_TENSOR_COUNT {
+        return Err(Qwen4Error::Invalid(format!(
+            "Qwen4 production inventory requires {PINNED_BF16_TENSOR_COUNT} BF16 and {PINNED_I64_TENSOR_COUNT} I64 tensors, found {bf16} BF16 and {i64} I64"
+        )));
+    }
+    if vision != PINNED_VISION_TENSOR_COUNT {
+        return Err(Qwen4Error::Invalid(format!(
+            "Qwen4 production inventory requires {PINNED_VISION_TENSOR_COUNT} positively identified vision tensors, found {vision}"
+        )));
+    }
+    if tensors
+        .iter()
+        .any(|tensor| tensor.dtype != "BF16" && tensor.dtype != "I64")
+    {
+        return Err(Qwen4Error::Invalid(
+            "Qwen4 production inventory contains a source dtype other than BF16 or I64".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 enum SourceKind {
@@ -710,6 +1549,7 @@ struct SourceShard {
     path: PathBuf,
     kind: SourceKind,
     file_len: u64,
+    local_identity: Option<LocalFileIdentity>,
 }
 
 impl Clone for SourceShard {
@@ -726,6 +1566,7 @@ impl Clone for SourceShard {
                 },
             },
             file_len: self.file_len,
+            local_identity: self.local_identity.clone(),
         }
     }
 }
@@ -740,6 +1581,13 @@ impl std::fmt::Debug for SourceShard {
 }
 
 impl SourceShard {
+    fn verify_identity(&self) -> Result<(), Qwen4Error> {
+        if let Some(expected) = &self.local_identity {
+            verify_local_file_identity(&self.path, expected)?;
+        }
+        Ok(())
+    }
+
     fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), Qwen4Error> {
         let end = offset.checked_add(dst.len() as u64).ok_or_else(|| {
             Qwen4Error::Invalid(format!("{} source range overflows", self.path.display()))
@@ -751,6 +1599,7 @@ impl SourceShard {
                 self.file_len
             )));
         }
+        self.verify_identity()?;
         match &self.kind {
             SourceKind::Local { file } => read_exact_at(file, offset, dst)
                 .map_err(|error| Qwen4Error::io(format!("read {}", self.path.display()), error)),
@@ -814,8 +1663,10 @@ fn source_paths(input: &Path) -> Result<SourceSet, Qwen4Error> {
                 input.display()
             )));
         }
+        let identity = local_file_identity(input)?;
         return Ok(SourceSet::Local {
             paths: vec![input.to_path_buf()],
+            identities: vec![identity],
         });
     }
     if !metadata.is_dir() {
@@ -846,13 +1697,17 @@ fn source_paths(input: &Path) -> Result<SourceSet, Qwen4Error> {
             input.display()
         )));
     }
-    Ok(SourceSet::Local { paths })
+    let identities = paths
+        .iter()
+        .map(|path| local_file_identity(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SourceSet::Local { paths, identities })
 }
 
 fn load_inventory(source: &SourceSet) -> Result<Vec<SourceTensor>, Qwen4Error> {
     let mut tensors = HashMap::<String, SourceTensor>::new();
     match source {
-        SourceSet::Local { paths } => {
+        SourceSet::Local { paths, .. } => {
             for path in paths {
                 for tensor in parse_safetensors_header(path)? {
                     if tensors.insert(tensor.name.clone(), tensor).is_some() {
@@ -884,10 +1739,8 @@ fn load_inventory(source: &SourceSet) -> Result<Vec<SourceTensor>, Qwen4Error> {
 fn parse_safetensors_header(path: &Path) -> Result<Vec<SourceTensor>, Qwen4Error> {
     let file =
         File::open(path).map_err(|error| Qwen4Error::io(path.display().to_string(), error))?;
-    let file_len = file
-        .metadata()
-        .map_err(|error| Qwen4Error::io(format!("stat {}", path.display()), error))?
-        .len();
+    let local_identity = local_file_identity(path)?;
+    let file_len = local_identity.len;
     let mut length_bytes = [0u8; 8];
     read_exact_at(&file, 0, &mut length_bytes).map_err(|error| {
         Qwen4Error::io(
@@ -901,6 +1754,7 @@ fn parse_safetensors_header(path: &Path) -> Result<Vec<SourceTensor>, Qwen4Error
             file: Arc::new(file),
         },
         file_len,
+        local_identity: Some(local_identity),
     });
     parse_safetensors_header_from_shard(shard, length_bytes)
 }
@@ -919,6 +1773,7 @@ fn parse_remote_safetensors_header(
             path: path.to_string(),
         },
         file_len,
+        local_identity: None,
     });
     parse_safetensors_header_from_shard(shard, length_bytes)
 }
@@ -991,9 +1846,19 @@ fn parse_safetensors_header_from_shard(
         let relative_end = offsets[1]
             .as_u64()
             .ok_or_else(|| Qwen4Error::Invalid(format!("{name} has a non-integer end offset")))?;
-        if relative_start > relative_end {
+        let relative_len = relative_end
+            .checked_sub(relative_start)
+            .ok_or_else(|| Qwen4Error::Invalid(format!("{name} data_offsets are reversed")))?;
+        let expected_len = match dtype.as_str() {
+            "BF16" => checked_bf16_bytes(&shape, name)?,
+            "I64" => checked_product(&shape, name)?
+                .checked_mul(8)
+                .ok_or_else(|| Qwen4Error::Invalid(format!("{name} I64 length overflows")))?,
+            _ => relative_len,
+        };
+        if relative_len != expected_len {
             return Err(Qwen4Error::Invalid(format!(
-                "{name} data_offsets are reversed"
+                "{name} payload is {relative_len} bytes, expected {expected_len} for dtype {dtype}"
             )));
         }
         let data_start = header_end
@@ -1024,7 +1889,7 @@ fn load_optional_config(source: &SourceSet) -> Result<Option<Value>, Qwen4Error>
         SourceSet::Remote { source, .. } => {
             Ok(Some(source.read_json("config.json", MAX_CONFIG_BYTES)?))
         }
-        SourceSet::Local { paths } => {
+        SourceSet::Local { paths, .. } => {
             let first = paths.first().ok_or_else(|| {
                 Qwen4Error::Invalid("Qwen4 local source has no safetensors shards".to_string())
             })?;
@@ -1036,7 +1901,7 @@ fn load_optional_config(source: &SourceSet) -> Result<Option<Value>, Qwen4Error>
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => {
-                    return Err(Qwen4Error::io(format!("stat {}", path.display()), error))
+                    return Err(Qwen4Error::io(format!("stat {}", path.display()), error));
                 }
             };
             if metadata.len() > MAX_CONFIG_BYTES {
@@ -1091,7 +1956,6 @@ fn ple_shard_index(name: &str) -> Option<usize> {
     digits.parse().ok()
 }
 
-
 fn is_vision_tensor(name: &str) -> bool {
     [
         "model.visual.",
@@ -1133,14 +1997,16 @@ struct ManifestIndex {
     aliases: BTreeMap<String, ManifestExpectation>,
     metadata: BTreeMap<String, MetadataExpectation>,
     ple_names: BTreeMap<usize, String>,
+    manifest_order: HashMap<String, usize>,
 }
-
 impl ManifestIndex {
     fn build(manifest: &Qwen4Manifest) -> Result<Self, Qwen4Error> {
         let mut required = BTreeMap::new();
         let mut aliases = BTreeMap::new();
         let mut ple_names = BTreeMap::new();
-        for entry in &manifest.weights {
+        let mut manifest_order = HashMap::new();
+        for (order, entry) in manifest.weights.iter().enumerate() {
+            manifest_order.insert(entry.name.clone(), order);
             let shape = entry
                 .logical_shape
                 .iter()
@@ -1266,6 +2132,7 @@ impl ManifestIndex {
             aliases,
             metadata,
             ple_names,
+            manifest_order,
         })
     }
 }
@@ -1275,7 +2142,6 @@ enum ExpertKind {
     GateUp,
     Down,
 }
-
 
 fn checked_product(values: &[u64], what: &str) -> Result<u64, Qwen4Error> {
     values.iter().try_fold(1u64, |product, &value| {
@@ -1379,7 +2245,7 @@ fn quantized_data_len_for_dtype(dtype: DType, rows: u64, k: u64) -> Result<u64, 
         _ => {
             return Err(Qwen4Error::Invalid(format!(
                 "unsupported Qwen4 matrix quant dtype {dtype:?}"
-            )))
+            )));
         }
     };
     if require_aligned_k && k % group_size != 0 {
@@ -1445,6 +2311,7 @@ struct EntryPlan {
     expert_entries: usize,
     resident_bytes: u64,
     external_ple_bytes: u64,
+    ple_shards: usize,
 }
 
 fn read_i64_array(tensor: &SourceTensor, expected_len: usize) -> Result<Vec<i64>, Qwen4Error> {
@@ -1625,7 +2492,6 @@ fn validate_manifest_inventory_names(
     Ok(())
 }
 
-
 fn validate_manifest_source(
     tensor: &SourceTensor,
     expected: &ManifestExpectation,
@@ -1697,10 +2563,7 @@ fn plan_entries(
             let data_len = checked_product(&tensor.shape, &tensor.name)?
                 .checked_mul(8)
                 .ok_or_else(|| {
-                    Qwen4Error::Invalid(format!(
-                        "{} I64 payload length overflows",
-                        tensor.name
-                    ))
+                    Qwen4Error::Invalid(format!("{} I64 payload length overflows", tensor.name))
                 })?;
             if tensor.data_len() != data_len {
                 return Err(Qwen4Error::Invalid(format!(
@@ -1947,7 +2810,13 @@ fn plan_entries(
     for entry in &mut resident {
         entry.name = entry.source.name.clone();
     }
-    resident.sort_by(|left, right| left.name.cmp(&right.name));
+    resident.sort_by_key(|entry| {
+        inventory
+            .manifest_order
+            .get(&entry.name)
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
 
     let ple_metadata = PleMetadata {
         multipliers,
@@ -1979,9 +2848,9 @@ fn plan_entries(
             .ok_or_else(|| Qwen4Error::Invalid("Qwen4 resident byte count overflows".to_string()))
     })?;
     let resident_entries = resident.len();
-    let mut entries = metadata_entries;
+    let mut entries = ple_entries;
     entries.extend(resident);
-    entries.extend(ple_entries);
+    entries.extend(metadata_entries);
     Ok(EntryPlan {
         entries,
         ple_metadata: Some(ple_metadata),
@@ -1990,6 +2859,7 @@ fn plan_entries(
         expert_entries,
         resident_bytes,
         external_ple_bytes,
+        ple_shards: PLE_SHARD_COUNT,
     })
 }
 
@@ -2051,7 +2921,7 @@ fn build_metadata(
             "row_chunk": plan.row_chunk,
             "resident_entries": plan.resident_entries,
             "expert_entries": plan.expert_entries,
-            "external_ple_entries": PLE_SHARD_COUNT,
+            "external_ple_entries": plan.ple_shards,
         }),
     );
     serde_json::to_string(&Value::Object(root))
@@ -2078,6 +2948,7 @@ fn stream_raw_rows(
     row_width: u64,
     element_bytes: u64,
     row_chunk: usize,
+    scratch: &mut ScratchTracker,
     writer: &mut dyn Write,
 ) -> Result<(), Qwen4Error> {
     let rows = if tensor.shape.len() <= 1 {
@@ -2134,6 +3005,7 @@ fn stream_raw_rows(
             .checked_mul(row_bytes)
             .ok_or_else(|| Qwen4Error::Invalid(format!("{} row offset overflows", tensor.name)))?;
         tensor.read_range(offset, &mut raw)?;
+        scratch.observe(raw.len(), 0, 0)?;
         writer
             .write_all(&raw)
             .map_err(|error| Qwen4Error::io(format!("write {}", tensor.name), error))?;
@@ -2148,16 +3020,34 @@ fn stream_quantized_rows(
     rows: u64,
     k: u64,
     row_chunk: usize,
+    expert_rows: Option<u64>,
     signs1_256: &[f32],
     signs2_256: &[f32],
     signs1_128: &[f32],
     signs2_128: &[f32],
+    scratch: &mut ScratchTracker,
     writer: &mut dyn Write,
 ) -> Result<(), Qwen4Error> {
     let row_bytes = k
         .checked_mul(2)
         .ok_or_else(|| Qwen4Error::Invalid(format!("{} row bytes overflow", tensor.name)))?;
-    let max_chunk_bytes = (row_chunk as u64)
+    let rows_per_chunk = if let Some(expert_rows) = expert_rows {
+        if expert_rows == 0 || rows % expert_rows != 0 {
+            return Err(Qwen4Error::Invalid(format!(
+                "{} expert rows {expert_rows} do not partition {rows} logical rows",
+                tensor.name
+            )));
+        }
+        let requested = row_chunk as u64;
+        if requested < expert_rows {
+            expert_rows
+        } else {
+            requested / expert_rows * expert_rows
+        }
+    } else {
+        row_chunk as u64
+    };
+    let max_chunk_bytes = rows_per_chunk
         .checked_mul(row_bytes)
         .ok_or_else(|| Qwen4Error::Invalid(format!("{} chunk length overflows", tensor.name)))?;
     if max_chunk_bytes > MAX_CHUNK_BYTES {
@@ -2183,7 +3073,7 @@ fn stream_quantized_rows(
     let k_usize = usize::try_from(k)
         .map_err(|_| Qwen4Error::Invalid(format!("{} K does not fit usize", tensor.name)))?;
     while row < rows {
-        let count = (rows - row).min(row_chunk as u64);
+        let count = (rows - row).min(rows_per_chunk);
         let bytes = count.checked_mul(row_bytes).ok_or_else(|| {
             Qwen4Error::Invalid(format!("{} chunk length overflows", tensor.name))
         })?;
@@ -2211,9 +3101,14 @@ fn stream_quantized_rows(
                 return Err(Qwen4Error::Invalid(format!(
                     "{} has unsupported Qwen4 quant dtype {dtype:?}",
                     tensor.name
-                )))
+                )));
             }
         };
+        scratch.observe(
+            raw.capacity(),
+            values.capacity() * std::mem::size_of::<f32>(),
+            quantized.len(),
+        )?;
         writer
             .write_all(&quantized)
             .map_err(|error| Qwen4Error::io(format!("write {}", tensor.name), error))?;
@@ -2229,6 +3124,7 @@ fn stream_entry(
     signs2_256: &[f32],
     signs1_128: &[f32],
     signs2_128: &[f32],
+    scratch: &mut ScratchTracker,
     writer: &mut dyn Write,
 ) -> Result<(), Qwen4Error> {
     match entry.kind {
@@ -2238,16 +3134,18 @@ fn stream_entry(
             } else {
                 checked_product(&entry.source.shape[1..], &entry.source.name)?
             };
-            stream_raw_rows(&entry.source, row_width, 2, row_chunk, writer)
+            stream_raw_rows(&entry.source, row_width, 2, row_chunk, scratch, writer)
         }
-        EntryKind::Ple => stream_raw_rows(&entry.source, PLE_ROW_WIDTH, 2, row_chunk, writer),
+        EntryKind::Ple => {
+            stream_raw_rows(&entry.source, PLE_ROW_WIDTH, 2, row_chunk, scratch, writer)
+        }
         EntryKind::I64(_) => {
             let row_width = if entry.source.shape.len() <= 1 {
                 checked_product(&entry.source.shape, &entry.source.name)?
             } else {
                 checked_product(&entry.source.shape[1..], &entry.source.name)?
             };
-            stream_raw_rows(&entry.source, row_width, 8, row_chunk, writer)
+            stream_raw_rows(&entry.source, row_width, 8, row_chunk, scratch, writer)
         }
         EntryKind::Matrix(dtype) => {
             if entry.source.shape.len() != 2 {
@@ -2262,15 +3160,17 @@ fn stream_entry(
                 entry.source.shape[0],
                 entry.source.shape[1],
                 row_chunk,
+                None,
                 signs1_256,
                 signs2_256,
                 signs1_128,
                 signs2_128,
+                scratch,
                 writer,
             )
         }
         EntryKind::GateUp | EntryKind::Down => {
-            let (dtype, rows, k) = match entry.kind {
+            let (dtype, rows, k, expert_rows) = match entry.kind {
                 EntryKind::GateUp => (
                     DType::MQ4G256V2,
                     entry.source.shape[0]
@@ -2279,6 +3179,7 @@ fn stream_entry(
                             Qwen4Error::Invalid(format!("{} rows overflow", entry.name))
                         })?,
                     entry.source.shape[2],
+                    entry.source.shape[1],
                 ),
                 EntryKind::Down => (
                     DType::MQ4G128V2,
@@ -2288,6 +3189,7 @@ fn stream_entry(
                             Qwen4Error::Invalid(format!("{} rows overflow", entry.name))
                         })?,
                     entry.source.shape[2],
+                    entry.source.shape[1],
                 ),
                 EntryKind::Bf16 | EntryKind::Matrix(_) | EntryKind::Ple | EntryKind::I64(_) => {
                     unreachable!()
@@ -2299,10 +3201,12 @@ fn stream_entry(
                 rows,
                 k,
                 row_chunk,
+                Some(expert_rows),
                 signs1_256,
                 signs2_256,
                 signs1_128,
                 signs2_128,
+                scratch,
                 writer,
             )
         }
@@ -2505,6 +3409,11 @@ impl Qwen4ReopenPlan {
             });
             cumulative_offset = end;
         }
+        if cumulative_offset != file_len {
+            return Err(Qwen4Error::Invalid(format!(
+                "Qwen4 artifact payload ends at {cumulative_offset}, file ends at {file_len}"
+            )));
+        }
         if pos > region.len() {
             return Err(Qwen4Error::Invalid(
                 "Qwen4 index exceeds metadata/data region".to_string(),
@@ -2515,6 +3424,60 @@ impl Qwen4ReopenPlan {
             metadata_json,
             entries,
         })
+    }
+}
+impl Qwen4ReopenPlan {
+    fn validate_against(
+        &self,
+        metadata_json: &str,
+        expected: &[hipfire_runtime::hfq::HfqStreamEntry],
+    ) -> Result<(), Qwen4Error> {
+        if self.arch_id != QWEN4_ARCH_ID {
+            return Err(Qwen4Error::Invalid(format!(
+                "reopened Qwen4 architecture id {} disagrees with planned {}",
+                self.arch_id, QWEN4_ARCH_ID
+            )));
+        }
+        if self.metadata_json != metadata_json {
+            return Err(Qwen4Error::Invalid(
+                "reopened Qwen4 metadata disagrees with planned config/recipe".to_string(),
+            ));
+        }
+        if self.entries.len() != expected.len() {
+            return Err(Qwen4Error::Invalid(format!(
+                "reopened Qwen4 entry count {} disagrees with planned {}",
+                self.entries.len(),
+                expected.len()
+            )));
+        }
+        let mut end = self
+            .entries
+            .first()
+            .map(|entry| entry.data_offset)
+            .unwrap_or(0);
+        for (index, (actual, planned)) in self.entries.iter().zip(expected).enumerate() {
+            if actual.name != planned.name
+                || actual.quant_type != planned.quant_type
+                || actual.shape != planned.shape
+                || actual.group_size != planned.group_size
+                || actual.data_len != planned.data_len
+            {
+                return Err(Qwen4Error::Invalid(format!(
+                    "reopened Qwen4 entry {index} disagrees with planned source record {}",
+                    planned.name
+                )));
+            }
+            if actual.data_offset != end {
+                return Err(Qwen4Error::Invalid(format!(
+                    "reopened Qwen4 entry {} has non-contiguous payload offset {} (expected {end})",
+                    actual.name, actual.data_offset
+                )));
+            }
+            end = end.checked_add(actual.data_len).ok_or_else(|| {
+                Qwen4Error::Invalid("reopened Qwen4 payload overflows".to_string())
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -2790,6 +3753,7 @@ mod tests {
             base_url: base_url.trim_end_matches('/').to_string(),
             agent,
             authorization: None,
+            identity: Mutex::new(RemoteIdentityState::default()),
         }
     }
 
@@ -2824,8 +3788,11 @@ mod tests {
                 200 => "OK",
                 _ => "Response",
             };
-            let mut response =
-                format!("HTTP/1.1 {status} {reason}\r\nContent-Length: {announced}\r\n");
+            let mut response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {announced}\r\n\
+                     ETag: \"fixture-etag\"\r\n\
+                     X-Repo-Commit: 0123456789abcdef0123456789abcdef01234567\r\n"
+            );
             if let Some(content_range) = content_range {
                 response.push_str(&format!("Content-Range: {content_range}\r\n"));
             }
@@ -2858,9 +3825,11 @@ mod tests {
         assert_eq!(spec.owner, "owner");
         assert_eq!(spec.repo, "repo");
         assert_eq!(spec.revision, "0123456789ABCDEF0123456789abcdef01234567");
-        assert!(parse_remote_spec("weights/model.safetensors")
-            .expect("local path is not remote")
-            .is_none());
+        assert!(
+            parse_remote_spec("weights/model.safetensors")
+                .expect("local path is not remote")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2909,9 +3878,11 @@ mod tests {
         let (base, handle) = spawn_http_response(200, None, b"cdef", None, None);
         let source = test_remote_source(&base);
         let mut bytes = [0u8; 4];
-        assert!(source
-            .read_range("model.safetensors", 2, &mut bytes, Some(8))
-            .is_err());
+        assert!(
+            source
+                .read_range("model.safetensors", 2, &mut bytes, Some(8))
+                .is_err()
+        );
         handle.join().unwrap();
     }
 
@@ -2921,9 +3892,11 @@ mod tests {
             spawn_http_response(206, Some("bytes 0-3/8"), b"cdef", None, Some("bytes=2-5"));
         let source = test_remote_source(&base);
         let mut bytes = [0u8; 4];
-        assert!(source
-            .read_range("model.safetensors", 2, &mut bytes, Some(8))
-            .is_err());
+        assert!(
+            source
+                .read_range("model.safetensors", 2, &mut bytes, Some(8))
+                .is_err()
+        );
         handle.join().unwrap();
     }
 
@@ -2933,9 +3906,11 @@ mod tests {
             spawn_http_response(206, Some("bytes 2-5/8"), b"cde", Some(4), Some("bytes=2-5"));
         let source = test_remote_source(&base);
         let mut bytes = [0u8; 4];
-        assert!(source
-            .read_range("model.safetensors", 2, &mut bytes, Some(8))
-            .is_err());
+        assert!(
+            source
+                .read_range("model.safetensors", 2, &mut bytes, Some(8))
+                .is_err()
+        );
         handle.join().unwrap();
     }
     fn source_tensor(bytes: &[u8], shape: Vec<u64>, dtype: &str) -> (NamedTempFile, SourceTensor) {
@@ -2944,11 +3919,12 @@ mod tests {
         file.as_file().sync_all().expect("sync source");
         let path = file.path().to_path_buf();
         let source = Arc::new(SourceShard {
-            path,
+            path: path.clone(),
             kind: SourceKind::Local {
                 file: Arc::new(file.reopen().expect("reopen source")),
             },
             file_len: bytes.len() as u64,
+            local_identity: Some(local_file_identity(&path).expect("source identity")),
         });
         (
             file,
@@ -3008,14 +3984,14 @@ mod tests {
             aliases,
             metadata,
             ple_names: BTreeMap::new(),
+            manifest_order: HashMap::new(),
         }
     }
 
     #[test]
     fn manifest_inventory_rejects_missing_source_records() {
         let inventory = focused_manifest_index();
-        let (_metadata_file, metadata) =
-            named_source("metadata.i64", &[0; 8], vec![1], "I64");
+        let (_metadata_file, metadata) = named_source("metadata.i64", &[0; 8], vec![1], "I64");
         let error = validate_manifest_inventory_names(&[metadata], &inventory).unwrap_err();
         assert!(error.to_string().contains("missing 1 manifest records"));
     }
@@ -3023,36 +3999,60 @@ mod tests {
     #[test]
     fn manifest_inventory_rejects_duplicate_records() {
         let inventory = focused_manifest_index();
-        let (_metadata_file, metadata) =
-            named_source("metadata.i64", &[0; 8], vec![1], "I64");
-        let (_first_file, first) =
-            named_source("required.weight", &[0; 4], vec![2], "BF16");
-        let (_second_file, second) =
-            named_source("required.weight", &[0; 4], vec![2], "BF16");
+        let (_metadata_file, metadata) = named_source("metadata.i64", &[0; 8], vec![1], "I64");
+        let (_first_file, first) = named_source("required.weight", &[0; 4], vec![2], "BF16");
+        let (_second_file, second) = named_source("required.weight", &[0; 4], vec![2], "BF16");
         let error =
             validate_manifest_inventory_names(&[metadata, first, second], &inventory).unwrap_err();
-        assert!(error.to_string().contains("duplicate Qwen4 manifest source record"));
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate Qwen4 manifest source record")
+        );
     }
 
     #[test]
     fn manifest_inventory_excludes_only_positive_vision_records() {
         let inventory = focused_manifest_index();
-        let (_metadata_file, metadata) =
-            named_source("metadata.i64", &[0; 8], vec![1], "I64");
-        let (_required_file, required) =
-            named_source("required.weight", &[0; 4], vec![2], "BF16");
+        let (_metadata_file, metadata) = named_source("metadata.i64", &[0; 8], vec![1], "I64");
+        let (_required_file, required) = named_source("required.weight", &[0; 4], vec![2], "BF16");
         let (_vision_file, vision) =
             named_source("model.visual.patch_embed.weight", &[0; 2], vec![1], "BF16");
         validate_manifest_inventory_names(&[metadata, required, vision], &inventory).unwrap();
+    }
+    #[test]
+    fn pinned_inventory_uses_333_positive_vision_names_and_1325_outputs() {
+        let positive: Vec<String> = (0..PINNED_VISION_TENSOR_COUNT)
+            .map(|index| format!("model.visual.blocks.{index}.attn.weight"))
+            .collect();
+        assert_eq!(
+            positive
+                .iter()
+                .filter(|name| is_vision_tensor(name))
+                .count(),
+            PINNED_VISION_TENSOR_COUNT
+        );
+        for name in [
+            "model.language_model.visual_projection.weight",
+            "model.visualization.weight",
+            "model.language_model.layers.0.attn.weight",
+        ] {
+            assert!(
+                !is_vision_tensor(name),
+                "misclassified non-vision name {name}"
+            );
+        }
+        assert_eq!(
+            PINNED_SOURCE_TENSOR_COUNT - PINNED_VISION_TENSOR_COUNT,
+            PINNED_OUTPUT_ENTRY_COUNT
+        );
     }
 
     #[test]
     fn manifest_inventory_does_not_require_tied_alias_source() {
         let inventory = focused_manifest_index();
-        let (_metadata_file, metadata) =
-            named_source("metadata.i64", &[0; 8], vec![1], "I64");
-        let (_required_file, required) =
-            named_source("required.weight", &[0; 4], vec![2], "BF16");
+        let (_metadata_file, metadata) = named_source("metadata.i64", &[0; 8], vec![1], "I64");
+        let (_required_file, required) = named_source("required.weight", &[0; 4], vec![2], "BF16");
         validate_manifest_inventory_names(&[metadata.clone(), required.clone()], &inventory)
             .unwrap();
         let (_alias_file, alias) =
@@ -3068,11 +4068,9 @@ mod tests {
             is_mtp: false,
             ple_index: None,
         };
-        let (_source_file, source) =
-            named_source("gate_up", &[0; 16], vec![2, 2, 2], "BF16");
+        let (_source_file, source) = named_source("gate_up", &[0; 16], vec![2, 2, 2], "BF16");
         validate_manifest_source(&source, &expected).unwrap();
-        let (_output_file, output) =
-            named_source("gate_up", &[0; 16], vec![2, 2, 2], "MQ4G256V2");
+        let (_output_file, output) = named_source("gate_up", &[0; 16], vec![2, 2, 2], "MQ4G256V2");
         let error = validate_manifest_source(&output, &expected).unwrap_err();
         assert!(error.to_string().contains("expected source BF16"));
     }
@@ -3093,6 +4091,21 @@ mod tests {
         );
         assert!(quantized_data_len(ExpertKind::GateUp, 1, 640).is_err());
         assert!(validate_expert_shape_stub(&[512, 1280, 2559], ExpertKind::GateUp).is_err());
+    }
+    #[test]
+    fn pinned_output_prediction_is_exact_before_payload_reads() {
+        assert_eq!(
+            PINNED_SOURCE_TENSOR_COUNT - PINNED_VISION_TENSOR_COUNT,
+            PINNED_OUTPUT_ENTRY_COUNT
+        );
+        let data_start = 32 + PINNED_METADATA_BYTES + PINNED_INDEX_BYTES;
+        assert_eq!(data_start, 120_450);
+        let data_offset = (data_start + 4_095) & !4_095;
+        assert_eq!(data_offset, 122_880);
+        assert_eq!(
+            data_offset + PINNED_PAYLOAD_BYTES,
+            PINNED_PREDICTED_OUTPUT_BYTES
+        );
     }
 
     fn validate_expert_shape_stub(shape: &[u64], kind: ExpertKind) -> Result<(), Qwen4Error> {
@@ -3124,7 +4137,8 @@ mod tests {
         let bytes = [0x00, 0x3f, 0x80, 0xbf, 0x34, 0x12, 0xff, 0x7f];
         let (_file, tensor) = source_tensor(&bytes, vec![2, 2], "BF16");
         let mut output = Vec::new();
-        stream_raw_rows(&tensor, 2, 2, 1, &mut output).unwrap();
+        let mut scratch = ScratchTracker::default();
+        stream_raw_rows(&tensor, 2, 2, 1, &mut scratch, &mut output).unwrap();
         assert_eq!(output, bytes);
     }
 

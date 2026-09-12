@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::e8;
 use crate::e8_gptq;
@@ -51,6 +51,12 @@ pub(crate) struct QuantizeArgs {
     /// and native MTP experts; legacy recipe flags are ignored.
     #[arg(long, conflicts_with = "flux_pipe")]
     pub qwen4_flash_next: bool,
+    /// Explicit non-production bounded fixture mode for exercising the full
+    /// transactional writer with a compact local component. Production remains
+    /// the default and keeps the pinned checkpoint admission counts.
+    #[arg(long, value_name = "MODE", default_value = "production",
+          value_parser = ["production", "compact-fixture"])]
+    pub qwen4_component_mode: String,
 
     /// Destination HFQ file.
     #[arg(long, value_name = "PATH")]
