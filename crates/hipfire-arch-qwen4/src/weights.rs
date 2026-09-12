@@ -22,7 +22,7 @@ use hipfire_runtime::weight_manifest::{
     StateKind, WeightEntry,
 };
 use hipfire_runtime::weight_store::{TakenWeight, WeightHandle, WeightLoadTransaction};
-use rdna_compute::{DType, Gpu};
+use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -1123,11 +1123,25 @@ pub struct Qwen4MtpWeights {
     pub final_hyper: HyperConnectionWeights,
 }
 
+/// Typed trunk-level roots required by the native forward path.
+///
+/// The references are immutable logical identities.  Their resident buffers
+/// are resolved through [`Qwen4Weights::resident`] so aliases remain owned by
+/// the canonical load transaction and the forward path never performs source
+/// I/O or an ad-hoc upload.
+#[derive(Clone, Debug)]
+pub struct Qwen4RootWeights {
+    pub embedding: TensorRef,
+    pub lm_head: TensorRef,
+    pub final_hyper: HyperConnectionWeights,
+}
+
 /// Published resident ownership.  External PLE descriptors remain in the
 /// attached transaction census; no fake handle is stored here.
 pub struct Qwen4Weights {
     pub manifest: Qwen4Manifest,
     pub taken: Vec<TakenWeight>,
+    pub root: Qwen4RootWeights,
     pub layer_refs: Vec<Qwen4LayerWeights>,
     pub mtp: Qwen4MtpWeights,
 }
@@ -1167,14 +1181,61 @@ impl Qwen4Weights {
             }
         }
         let taken = assembly.commit().finalize();
+        let root = build_root_refs(config)?;
         let layer_refs = build_layer_refs(config)?;
         let mtp = build_mtp_refs(config)?;
         Ok(Self {
             manifest,
             taken,
+            root,
             layer_refs,
             mtp,
         })
+    }
+
+    /// Resolve one immutable typed reference to its resident GPU buffer.
+    ///
+    /// Qwen4 is currently admitted only on the Single route, so device zero is
+    /// the sole logical placement.  Tied weights are followed by their
+    /// canonical source name and never trigger I/O or allocation.
+    pub fn resident(&self, reference: &TensorRef) -> Result<&GpuTensor, WeightError> {
+        self.resident_named(&reference.name, reference.layer, 0, 0)
+    }
+
+    fn resident_named(
+        &self,
+        name: &str,
+        layer: Option<usize>,
+        device: usize,
+        depth: usize,
+    ) -> Result<&GpuTensor, WeightError> {
+        if depth > self.taken.len() {
+            return Err(WeightError::DescriptorMismatch(format!(
+                "{name}: resident alias cycle"
+            )));
+        }
+        let Some(taken) = self
+            .taken
+            .iter()
+            .find(|taken| {
+                taken.key.name == name
+                    && taken.key.layer == layer
+                    && taken.key.device == device
+            })
+        else {
+            return Err(WeightError::MissingResident {
+                name: name.to_string(),
+                layer,
+                device,
+            });
+        };
+        match &taken.handle {
+            WeightHandle::Resident(tensor) => Ok(tensor),
+            WeightHandle::Alias(source) => {
+                let source = source.clone();
+                self.resident_named(&source, layer, device, depth + 1)
+            }
+        }
     }
 
     pub fn external_descriptor<'a>(
@@ -1200,6 +1261,35 @@ impl Qwen4Weights {
         }
         first.map_or(Ok(()), Err)
     }
+}
+
+fn build_root_refs(config: &Qwen4Config) -> Result<Qwen4RootWeights, WeightError> {
+    let hidden = config.hidden_size;
+    let hc_wide = config.hc_count * hidden;
+    let embedding = TensorRef::new(
+        "model.language_model.embed_tokens.weight",
+        TensorRole::TokenEmbedding,
+        None,
+        vec![config.vocab_size, hidden],
+        DType::BF16,
+    )?;
+    let lm_head = TensorRef::new(
+        "lm_head.weight",
+        TensorRole::LanguageHead,
+        None,
+        vec![config.vocab_size, hidden],
+        DType::BF16,
+    )?;
+    Ok(Qwen4RootWeights {
+        embedding,
+        lm_head,
+        final_hyper: build_hyper_refs(
+            "model.language_model.hyper_connection_mixer",
+            None,
+            hc_wide,
+            config.hc_lowrank,
+        )?,
+    })
 }
 
 fn build_hyper_refs(
@@ -1612,6 +1702,11 @@ pub enum WeightError {
         layer: Option<usize>,
         device: usize,
     },
+    MissingResident {
+        name: String,
+        layer: Option<usize>,
+        device: usize,
+    },
     PleShardCount {
         expected: usize,
         actual: usize,
@@ -1655,6 +1750,14 @@ impl fmt::Display for WeightError {
             } => write!(
                 f,
                 "missing external descriptor {name}[layer {layer:?}] on device {device}"
+            ),
+            Self::MissingResident {
+                name,
+                layer,
+                device,
+            } => write!(
+                f,
+                "missing resident tensor {name}[layer {layer:?}] on device {device}"
             ),
             Self::PleShardCount { expected, actual } => {
                 write!(f, "Qwen4 PLE shard count expected {expected}, got {actual}")

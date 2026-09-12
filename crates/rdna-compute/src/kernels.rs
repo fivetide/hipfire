@@ -6344,6 +6344,15 @@ pub const EMBEDDING_Q8_BATCHED_SRC: &str =
 /// is byte-identical to the host `f16_to_f32` fallback it replaces.
 pub const EMBEDDING_F16_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/embedding_f16_batched.hip");
+/// Batched BF16 embedding: widens resident BF16 rows into F32 without a host
+/// token lookup. Token ids are read from a device buffer.
+pub const EMBEDDING_BF16_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/embedding_bf16_batched.hip");
+
+/// Batched Qwen4 MQv2 embedding decoder. Packed qt44/qt53 rows are decoded
+/// into the rotated basis; the owner applies the matching inverse FWHT.
+pub const EMBEDDING_MQ4V2_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/embedding_mq4v2_batched.hip");
 
 /// DSpark bidirectional staging assembly. Builds the per-stage attention
 /// key/value buffer `staged[block, head_dim, stage_w]` on-GPU from the

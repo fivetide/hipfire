@@ -353,6 +353,8 @@ def _generate_ple_projection(seed: int, ple_arrays: Mapping[str, Tensor]) -> tup
         "equations": ["key/value projection from 16x160 BF16 rows", "per-branch grouped RMS", "sign(dot)*sqrt(max(abs(dot),1e-6))", "sigmoid gate", "dilation=ngram_size=3 depthwise kernel=4 SiLU"],
         "ple_embed_dim": PLE_DIM,
         "short_conv_state_rows": 9,
+        "layer_index": 1,
+        "token_boundary": 4,
     }
 
 
@@ -515,6 +517,9 @@ def _generate_qsa(seed: int) -> tuple[dict[str, Tensor], dict[str, object]]:
         "attention_head_dim": QSA_ATTN_DIM,
         "tail_positions": [4, 8, 9, 12],
         "chunk_boundaries": [4, 9, 13],
+        "pool_boundaries": [4, 8, 12],
+        "layer_index": 3,
+        "token_boundary": 4,
     }
 
 
@@ -669,7 +674,7 @@ def _generate_mtp(seed: int, moe_seed: int) -> tuple[dict[str, Tensor], dict[str
 
 def _build_manifest(out: Path, seed: int, fixtures: list[dict[str, object]], source_meta: dict[str, object]) -> dict[str, object]:
     return {
-        "schema": "hipfire.qwen4.reference_oracle.v1",
+        "schema": "hipfire.qwen4.reference_oracle.v2",
         "model": {
             "name": HF_MODEL,
             "architecture": "Qwen4ExpForConditionalGeneration",

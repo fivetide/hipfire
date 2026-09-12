@@ -3,6 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h>
 
 static __device__ __forceinline__ float qwen4_ple_sigmoid(float value) {
     if (value >= 0.0f) {
@@ -142,8 +143,9 @@ extern "C" __global__ void qwen4_ple_norm_f32(
     }
 }
 
-// Each thread owns one channel and walks the token dimension, updating its
-// nine-row causal history after every token.  No thread writes another channel.
+// Each thread owns one channel and evaluates the fixture's dilated window over
+// the concatenated history/input stream.  The state is the trailing history
+// rows, so token chunks compose without changing the oracle's indexing.
 extern "C" __global__ void qwen4_ple_depthwise_conv_silu_add_f32(
     const float* __restrict__ gated,
     const float* __restrict__ normed,
@@ -162,18 +164,149 @@ extern "C" __global__ void qwen4_ple_depthwise_conv_silu_add_f32(
     for (int token = 0; token < tokens; ++token) {
         float total = 0.0f;
         for (int tap = 0; tap < kernel_size; ++tap) {
-            const int source = tap * dilation;
-            const float value = source < history_rows
-                ? state[source * channels + channel]
-                : normed[token * channels + channel];
+            const int source = token + tap * dilation;
+            float value = 0.0f;
+            if (source < history_rows) {
+                value = state[source * channels + channel];
+            } else {
+                const int input_index = source - history_rows;
+                if (input_index < tokens) {
+                    value = normed[input_index * channels + channel];
+                }
+            }
             total += value * conv_weight[channel * kernel_size + tap];
         }
-        output[token * channels + channel] = gated[token * channels + channel] + qwen4_ple_silu(total);
-        if (history_rows > 0) {
-            for (int row = 1; row < history_rows; ++row) {
-                state[(row - 1) * channels + channel] = state[row * channels + channel];
+        output[token * channels + channel] =
+            gated[token * channels + channel] + qwen4_ple_silu(total);
+    }
+    for (int row = 0; row < history_rows; ++row) {
+        const int source = tokens + row;
+        if (source < history_rows) {
+            state[row * channels + channel] = state[source * channels + channel];
+        } else {
+            state[row * channels + channel] =
+                normed[(source - history_rows) * channels + channel];
+        }
+    }
+}
+extern "C" __global__ void qwen4_ple_gate_bf16_f32(
+    const float* __restrict__ key,
+    const float* __restrict__ query,
+    const float* __restrict__ value,
+    const hip_bfloat16* __restrict__ key_norm,
+    const hip_bfloat16* __restrict__ query_norm,
+    float* __restrict__ gated,
+    int tokens,
+    int hc_count,
+    int hidden_size,
+    float epsilon) {
+    if (threadIdx.x != 0) return;
+    const int branch = static_cast<int>(blockIdx.x);
+    const int token = static_cast<int>(blockIdx.y);
+    if (branch >= hc_count || token >= tokens) return;
+    const int channels = hc_count * hidden_size;
+    const int base = token * channels + branch * hidden_size;
+    float key_square = 0.0f;
+    float query_square = 0.0f;
+    for (int index = 0; index < hidden_size; ++index) {
+        const float key_value = key[base + index];
+        const float query_value = query[base + index];
+        key_square += key_value * key_value;
+        query_square += query_value * query_value;
+    }
+    const float key_inverse = rsqrtf(key_square / static_cast<float>(hidden_size) + fmaxf(epsilon, 1.0e-12f));
+    const float query_inverse = rsqrtf(query_square / static_cast<float>(hidden_size) + fmaxf(epsilon, 1.0e-12f));
+    float dot = 0.0f;
+    for (int index = 0; index < hidden_size; ++index) {
+        const int norm_index = branch * hidden_size + index;
+        const float key_value = key[base + index] * key_inverse
+            * (1.0f + static_cast<float>(key_norm[norm_index]));
+        const float query_value = query[base + index] * query_inverse
+            * (1.0f + static_cast<float>(query_norm[norm_index]));
+        dot += key_value * query_value;
+    }
+    dot /= sqrtf(static_cast<float>(hidden_size));
+    const float sign = dot >= 0.0f ? 1.0f : -1.0f;
+    const float transformed = sign * sqrtf(fmaxf(fabsf(dot), 1.0e-6f));
+    const float gate = qwen4_ple_sigmoid(transformed);
+    const float* value_row = value + token * hidden_size;
+    float* gated_row = gated + base;
+    for (int index = 0; index < hidden_size; ++index) {
+        gated_row[index] = gate * value_row[index];
+    }
+}
+
+extern "C" __global__ void qwen4_ple_norm_bf16(
+    const float* __restrict__ input,
+    const hip_bfloat16* __restrict__ weight,
+    float* __restrict__ output,
+    int tokens,
+    int groups,
+    int group_size,
+    float epsilon) {
+    const int group = static_cast<int>(blockIdx.x);
+    const int token = static_cast<int>(blockIdx.y);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (group >= groups || token >= tokens) return;
+    __shared__ float partial[256];
+    const int base = token * groups * group_size + group * group_size;
+    float sum = 0.0f;
+    for (int index = lane; index < group_size; index += static_cast<int>(blockDim.x)) {
+        const float value = input[base + index];
+        sum += value * value;
+    }
+    partial[lane] = sum;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (lane < stride) partial[lane] += partial[lane + stride];
+        __syncthreads();
+    }
+    const float inverse = rsqrtf(partial[0] / static_cast<float>(group_size)
+        + fmaxf(epsilon, 1.0e-12f));
+    for (int index = lane; index < group_size; index += static_cast<int>(blockDim.x)) {
+        output[base + index] = input[base + index] * inverse
+            * (1.0f + static_cast<float>(weight[group * group_size + index]));
+    }
+}
+
+extern "C" __global__ void qwen4_ple_depthwise_conv_silu_add_bf16(
+    const float* __restrict__ gated,
+    const float* __restrict__ normed,
+    const hip_bfloat16* __restrict__ conv_weight,
+    float* __restrict__ state,
+    float* __restrict__ output,
+    int tokens,
+    int channels,
+    int kernel_size,
+    int dilation) {
+    const int channel = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (channel >= channels) return;
+    const int history_rows = (kernel_size - 1) * dilation;
+    for (int token = 0; token < tokens; ++token) {
+        float total = 0.0f;
+        for (int tap = 0; tap < kernel_size; ++tap) {
+            const int source = token + tap * dilation;
+            float value = 0.0f;
+            if (source < history_rows) {
+                value = state[source * channels + channel];
+            } else {
+                const int input_index = source - history_rows;
+                if (input_index < tokens) {
+                    value = normed[input_index * channels + channel];
+                }
             }
-            state[(history_rows - 1) * channels + channel] = normed[token * channels + channel];
+            total += value * static_cast<float>(conv_weight[channel * kernel_size + tap]);
+        }
+        output[token * channels + channel] =
+            gated[token * channels + channel] + qwen4_ple_silu(total);
+    }
+    for (int row = 0; row < history_rows; ++row) {
+        const int source = tokens + row;
+        if (source < history_rows) {
+            state[row * channels + channel] = state[source * channels + channel];
+        } else {
+            state[row * channels + channel] =
+                normed[(source - history_rows) * channels + channel];
         }
     }
 }

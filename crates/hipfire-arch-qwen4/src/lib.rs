@@ -15,6 +15,8 @@ pub mod admission;
 pub mod bundle;
 pub mod config;
 pub mod mtp;
+pub mod forward;
+pub mod gpu_forward;
 pub mod mtp_spec;
 pub mod ops;
 pub mod ple;

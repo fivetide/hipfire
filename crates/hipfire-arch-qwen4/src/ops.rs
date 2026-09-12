@@ -86,7 +86,11 @@ pub fn silu(value: f32) -> f32 {
     value * sigmoid(value)
 }
 
-/// Zero-centered RMS normalization used by grouped HC and PLE branches.
+/// Grouped RMS normalization used by HC and PLE branches.
+///
+/// Qwen4 calls this "zero-centered" because its learned scale is stored as a
+/// zero-centered parameter: the runtime multiplier is `(1 + weight)`.  There
+/// is no mean subtraction in the pinned upstream equation.
 pub fn zero_centered_rms_norm(
     input: &[f32],
     weight: &[f32],
@@ -103,23 +107,15 @@ pub fn zero_centered_rms_norm(
             actual: weight.len().max(output.len()),
         });
     }
-    let mean = input.iter().copied().sum::<f32>() / input.len() as f32;
-    let variance = input
-        .iter()
-        .map(|&value| {
-            let centered = value - mean;
-            centered * centered
-        })
-        .sum::<f32>()
-        / input.len() as f32;
-    let inv_rms = (variance + epsilon.max(1.0e-12)).sqrt().recip();
+    let mean_square = input.iter().map(|value| value * value).sum::<f32>() / input.len() as f32;
+    let inv_rms = (mean_square + epsilon.max(1.0e-12)).sqrt().recip();
     for ((dst, &value), &scale) in output.iter_mut().zip(input).zip(weight) {
-        *dst = (value - mean) * inv_rms * scale;
+        *dst = value * inv_rms * (1.0 + scale);
     }
     Ok(())
 }
 
-/// Ordinary RMSNorm (without zero-centering) for QSA projections.
+/// Ordinary RMSNorm with the Qwen4 zero-centered learned-scale convention.
 pub fn rms_norm(
     input: &[f32],
     weight: &[f32],
@@ -136,10 +132,11 @@ pub fn rms_norm(
     let mean_square = input.iter().map(|v| v * v).sum::<f32>() / input.len().max(1) as f32;
     let inv = (mean_square + epsilon.max(1.0e-12)).sqrt().recip();
     for ((dst, &value), &scale) in output.iter_mut().zip(input).zip(weight) {
-        *dst = value * inv * scale;
+        *dst = value * inv * (1.0 + scale);
     }
     Ok(())
 }
+
 
 /// Prepare one HC residual branch: `(1 + w) * zero_centered_norm(x)`.
 pub fn hc_prepare(
@@ -168,6 +165,136 @@ pub fn hc_prepare(
         *dst = normed * (1.0 + weight);
     }
     Ok(())
+}
+/// Exact learned HC read/mix equation for one or more token rows.
+///
+/// `hyper_input` and `normalized` are flattened `[tokens, branches, hidden]`;
+/// `down` is `[rank, branches*hidden]`; `up` is
+/// `[branches*hidden, rank]`; `mixed` is `[tokens, hidden]`.
+pub fn hc_read(
+    hyper_input: &[f32],
+    down: &[f32],
+    up: &[f32],
+    norm_weight: &[f32],
+    branches: usize,
+    hidden: usize,
+    rank: usize,
+    epsilon: f32,
+    normalized: &mut [f32],
+    mixed: &mut [f32],
+) -> Result<(), OpError> {
+    let wide = branches
+        .checked_mul(hidden)
+        .ok_or(OpError::Shape("HC width overflow"))?;
+    if hyper_input.len() != normalized.len() || hyper_input.len() != wide {
+        return Err(OpError::Shape("HC input must be one flattened stream row"));
+    }
+    if norm_weight.len() != wide
+        || down.len() != rank * wide
+        || up.len() != wide * rank
+        || mixed.len() != hidden
+    {
+        return Err(OpError::Shape("HC learned projection dimensions"));
+    }
+    let mean_square = hyper_input.iter().map(|v| v * v).sum::<f32>() / wide as f32;
+    let inv_rms = (mean_square + epsilon.max(1.0e-12)).sqrt().recip();
+    for ((dst, &value), &weight) in normalized.iter_mut().zip(hyper_input).zip(norm_weight) {
+        *dst = value * inv_rms * (1.0 + weight);
+    }
+    let mut low = vec![0.0f32; rank];
+    for (r, value) in low.iter_mut().enumerate() {
+        let row = &down[r * wide..(r + 1) * wide];
+        *value = silu(
+            row.iter()
+                .zip(normalized.iter())
+                .map(|(&weight, &x)| weight * x)
+                .sum::<f32>()
+                / branches as f32,
+        );
+    }
+    mixed.fill(0.0);
+    for branch in 0..branches {
+        for j in 0..hidden {
+            let column = branch * hidden + j;
+            let gate = (0..rank)
+                .map(|r| up[column * rank + r] * low[r])
+                .sum::<f32>();
+            mixed[j] += sigmoid(gate) * normalized[column];
+        }
+    }
+    for value in mixed {
+        *value /= branches as f32;
+    }
+    Ok(())
+}
+
+/// Exact HC write/injection equation.  The learned block-injection matrix is
+/// `[branches, branches*hidden]`; the shared mixed hidden row is added to each
+/// original stream with `2*sigmoid(dot / branches)`.
+pub fn hc_write(
+    hyper_input: &[f32],
+    normalized: &[f32],
+    mixed: &[f32],
+    block_inject: &[f32],
+    branches: usize,
+    hidden: usize,
+    output: &mut [f32],
+) -> Result<(), OpError> {
+    let wide = branches
+        .checked_mul(hidden)
+        .ok_or(OpError::Shape("HC width overflow"))?;
+    if hyper_input.len() != wide
+        || normalized.len() != wide
+        || output.len() != wide
+        || mixed.len() != hidden
+        || block_inject.len() != branches * wide
+    {
+        return Err(OpError::Shape("HC write dimensions"));
+    }
+    output.copy_from_slice(hyper_input);
+    for branch in 0..branches {
+        let row = &block_inject[branch * wide..(branch + 1) * wide];
+        let gate = 2.0
+            * sigmoid(
+                row.iter()
+                    .zip(normalized)
+                    .map(|(&weight, &x)| weight * x)
+                    .sum::<f32>()
+                    / branches as f32,
+            );
+        for j in 0..hidden {
+            output[branch * hidden + j] += gate * mixed[j];
+        }
+    }
+    Ok(())
+}
+
+/// Final learned HC read mixer.  This retains the normalized multi-stream
+/// row and returns the collapsed hidden row for the language head.
+pub fn hc_final_read(
+    hyper_input: &[f32],
+    down: &[f32],
+    up: &[f32],
+    norm_weight: &[f32],
+    branches: usize,
+    hidden: usize,
+    rank: usize,
+    epsilon: f32,
+    normalized: &mut [f32],
+    mixed: &mut [f32],
+) -> Result<(), OpError> {
+    hc_read(
+        hyper_input,
+        down,
+        up,
+        norm_weight,
+        branches,
+        hidden,
+        rank,
+        epsilon,
+        normalized,
+        mixed,
+    )
 }
 
 /// Inject the HC bottleneck feedback.  The down projection is divided by four,
@@ -318,8 +445,8 @@ pub fn ple_depthwise_conv(
 }
 
 /// Gated DeltaNet recurrence.  Q/K have 16 heads and V has 48 heads; each V
-/// head repeats its corresponding Q/K head three times.  State and reductions
-/// stay F32.  The output gate uses sigmoid, not SiLU.
+/// head repeats its corresponding Q/K head three times.  `gate` is the
+/// already-computed log decay and `beta` is the sigmoid update coefficient.
 pub fn gdn_step(
     state: &mut ReferenceGdnLayerState,
     q: &[f32],
@@ -341,48 +468,50 @@ pub fn gdn_step(
             "GDN gate/beta must have one scalar per value head",
         ));
     }
+    let repeat = state.value_heads / state.key_heads;
     for value_head in 0..state.value_heads {
-        let key_head = value_head / (state.value_heads / state.key_heads);
+        let key_head = value_head / repeat;
         let q_slice = &q[key_head * state.key_dim..(key_head + 1) * state.key_dim];
         let k_slice = &k[key_head * state.key_dim..(key_head + 1) * state.key_dim];
-        let q_norm = l2_norm(q_slice);
-        let k_norm = l2_norm(k_slice);
-        let decay = sigmoid(gate[value_head]);
+        let q_norm = l2_norm_eps(q_slice, 1.0e-6);
+        let k_norm = l2_norm_eps(k_slice, 1.0e-6);
+        let decay = gate[value_head].exp();
         let update = beta[value_head];
         let state_base = value_head * state.value_dim * state.key_dim;
         let value_base = value_head * state.value_dim;
+        for idx in 0..state.value_dim * state.key_dim {
+            state.recurrent[state_base + idx] *= decay;
+        }
         for value_dim in 0..state.value_dim {
-            let row = state_base + value_dim * state.key_dim;
-            for key_dim in 0..state.key_dim {
-                let idx = row + key_dim;
-                state.recurrent[idx] = decay * state.recurrent[idx]
-                    + update * v[value_base + value_dim] * k_norm[key_dim];
-            }
-            output[value_base + value_dim] = q_norm
-                .iter()
-                .enumerate()
-                .map(|(key_dim, &qv)| state.recurrent[row + key_dim] * qv)
+            let kv_mem = (0..state.key_dim)
+                .map(|key_dim| {
+                    state.recurrent[state_base + key_dim * state.value_dim + value_dim]
+                        * k_norm[key_dim]
+                })
                 .sum::<f32>();
-            output[value_base + value_dim] *= sigmoid(output[value_base + value_dim]);
+            let delta = (v[value_base + value_dim] - kv_mem) * update;
+            for key_dim in 0..state.key_dim {
+                let idx = state_base + key_dim * state.value_dim + value_dim;
+                state.recurrent[idx] += k_norm[key_dim] * delta;
+            }
+            output[value_base + value_dim] = (0..state.key_dim)
+                .map(|key_dim| {
+                    state.recurrent[state_base + key_dim * state.value_dim + value_dim]
+                        * q_norm[key_dim]
+                })
+                .sum::<f32>();
         }
     }
-    let mut conv_row = vec![0.0f32; state.conv_channels];
-    let copy = q_width.min(state.conv_channels);
-    conv_row[..copy].copy_from_slice(&q[..copy]);
-    let v_copy = (state.conv_channels - copy).min(v.len());
-    conv_row[copy..copy + v_copy].copy_from_slice(&v[..v_copy]);
-    state.push_conv_row(&conv_row)?;
     Ok(())
 }
 
+fn l2_norm_eps(values: &[f32], epsilon: f32) -> Vec<f32> {
+    let norm = (values.iter().map(|v| v * v).sum::<f32>() + epsilon).sqrt();
+    values.iter().map(|value| value / norm).collect()
+}
+
 fn l2_norm(values: &[f32]) -> Vec<f32> {
-    let norm = values
-        .iter()
-        .map(|v| v * v)
-        .sum::<f32>()
-        .sqrt()
-        .max(1.0e-12);
-    values.iter().map(|v| *v / norm).collect()
+    l2_norm_eps(values, 1.0e-12)
 }
 
 /// Prefix-HalfSplit RoPE.  The rotated half is the first `rotary_dim` values;
@@ -411,8 +540,8 @@ pub fn rope_prefix_halfsplit(
     Ok(())
 }
 
-/// Average a complete indexer block in F32, then L2-normalize and apply RoPE
-/// at the block-start position.
+/// Average a complete indexer block in F32, apply grouped RMS normalization,
+/// and apply HalfSplit RoPE at the block-start position.
 pub fn qsa_pool_block(
     keys: &[f32],
     block_size: usize,
@@ -429,8 +558,11 @@ pub fn qsa_pool_block(
             *dst += value / block_size as f32;
         }
     }
-    let norm = l2_norm(&pooled);
-    pooled.copy_from_slice(&norm);
+    let mean_square = pooled.iter().map(|v| v * v).sum::<f32>() / head_dim as f32;
+    let inv = (mean_square + 1.0e-6).sqrt().recip();
+    for value in &mut pooled {
+        *value *= inv;
+    }
     rope_prefix_halfsplit(&mut pooled, block_start, head_dim.min(64), rope_theta)?;
     Ok(pooled)
 }
@@ -561,12 +693,12 @@ pub fn qsa_attention(
                 .map(|(_, score)| (*score - max_score).exp() / normalizer),
         ) {
             let value_off = index * kv_width + kv_head * head_dim;
-            let gate_scale = sigmoid(gate.iter().copied().sum::<f32>() / head_dim as f32);
-            for (dst, &value) in out
+            for (channel, (dst, &value)) in out
                 .iter_mut()
                 .zip(&full_values[value_off..value_off + head_dim])
+                .enumerate()
             {
-                *dst += weight * gate_scale * value;
+                *dst += weight * sigmoid(gate[channel]) * value;
             }
         }
     }

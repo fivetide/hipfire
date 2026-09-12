@@ -240,6 +240,87 @@ impl Gpu {
             },
         )
     }
+    /// Variant of [`Self::qwen4_ple_gate_f32`] for resident BF16 norm
+    /// weights.  Qwen4 keeps these norms native BF16; widening happens in
+    /// the kernel and never through a host-side conversion.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen4_ple_gate_bf16(
+        &mut self,
+        key: &GpuTensor,
+        query: &GpuTensor,
+        value: &GpuTensor,
+        key_norm: &GpuTensor,
+        query_norm: &GpuTensor,
+        gated: &GpuTensor,
+        tokens: usize,
+        hc_count: usize,
+        hidden_size: usize,
+        epsilon: f32,
+    ) -> HipResult<()> {
+        let channels = checked_product(hc_count, hidden_size, "PLE gated channels")?;
+        require_dtype(key, DType::F32, "PLE key projection")?;
+        require_dtype(query, DType::F32, "PLE query projection")?;
+        require_dtype(value, DType::F32, "PLE value projection")?;
+        require_dtype(key_norm, DType::BF16, "PLE BF16 key norm")?;
+        require_dtype(query_norm, DType::BF16, "PLE BF16 query norm")?;
+        require_dtype(gated, DType::F32, "PLE gated output")?;
+        require_numel(key, checked_product(tokens, channels, "PLE key elements")?, "PLE key projection")?;
+        require_numel(query, checked_product(tokens, channels, "PLE query elements")?, "PLE query projection")?;
+        require_numel(value, checked_product(tokens, hidden_size, "PLE value elements")?, "PLE value projection")?;
+        require_numel(key_norm, channels, "PLE BF16 key norm")?;
+        require_numel(query_norm, channels, "PLE BF16 query norm")?;
+        require_numel(gated, checked_product(tokens, channels, "PLE gated elements")?, "PLE gated output")?;
+        if tokens == 0 || channels == 0 {
+            return Ok(());
+        }
+        let tokens_i = checked_i32(tokens, "PLE gate token count")?;
+        let hc_i = checked_i32(hc_count, "PLE branch count")?;
+        let hidden_i = checked_i32(hidden_size, "PLE hidden width")?;
+        self.bind_thread()?;
+        self.ensure_kernel(QWEN4_PLE_MODULE, QWEN4_PLE_KERNEL_SRC, "qwen4_ple_gate_bf16_f32")?;
+        let key_ptr = key.buf.as_ptr();
+        let query_ptr = query.buf.as_ptr();
+        let value_ptr = value.buf.as_ptr();
+        let key_norm_ptr = key_norm.buf.as_ptr();
+        let query_norm_ptr = query_norm.buf.as_ptr();
+        let gated_ptr = gated.buf.as_ptr();
+        let mut params: Vec<*mut c_void> = vec![
+            &key_ptr as *const _ as *mut c_void,
+            &query_ptr as *const _ as *mut c_void,
+            &value_ptr as *const _ as *mut c_void,
+            &key_norm_ptr as *const _ as *mut c_void,
+            &query_norm_ptr as *const _ as *mut c_void,
+            &gated_ptr as *const _ as *mut c_void,
+            &tokens_i as *const _ as *mut c_void,
+            &hc_i as *const _ as *mut c_void,
+            &hidden_i as *const _ as *mut c_void,
+            &epsilon as *const _ as *mut c_void,
+        ];
+        let grid_x = checked_u32(hc_count, "PLE gate branch grid")?;
+        let grid_y = checked_u32(tokens, "PLE gate token grid")?;
+        self.launch_maybe_blob(
+            "qwen4_ple_gate_bf16_f32",
+            [grid_x, grid_y, 1],
+            [1, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(key_ptr);
+                blob.push_ptr(query_ptr);
+                blob.push_ptr(value_ptr);
+                blob.push_ptr(key_norm_ptr);
+                blob.push_ptr(query_norm_ptr);
+                blob.push_ptr(gated_ptr);
+                blob.push_i32(tokens_i);
+                blob.push_i32(hc_i);
+                blob.push_i32(hidden_i);
+                blob.push_f32(epsilon);
+                blob
+            },
+        )
+    }
+
 
     /// Apply grouped `(1 + weight)` RMS normalization to F32 rows.
     pub fn qwen4_ple_norm_f32(
@@ -301,6 +382,67 @@ impl Gpu {
             },
         )
     }
+    /// Grouped RMS normalization against a resident BF16 norm vector.
+    pub fn qwen4_ple_norm_bf16(
+        &mut self,
+        input: &GpuTensor,
+        weight: &GpuTensor,
+        output: &GpuTensor,
+        tokens: usize,
+        groups: usize,
+        group_size: usize,
+        epsilon: f32,
+    ) -> HipResult<()> {
+        let channels = checked_product(groups, group_size, "PLE normalization channels")?;
+        let elements = checked_product(tokens, channels, "PLE normalization elements")?;
+        require_dtype(input, DType::F32, "PLE normalization input")?;
+        require_dtype(weight, DType::BF16, "PLE BF16 normalization weight")?;
+        require_dtype(output, DType::F32, "PLE normalization output")?;
+        require_numel(input, elements, "PLE normalization input")?;
+        require_numel(weight, channels, "PLE BF16 normalization weight")?;
+        require_numel(output, elements, "PLE normalization output")?;
+        if elements == 0 {
+            return Ok(());
+        }
+        let tokens_i = checked_i32(tokens, "PLE normalization token count")?;
+        let groups_i = checked_i32(groups, "PLE normalization group count")?;
+        let group_size_i = checked_i32(group_size, "PLE normalization group width")?;
+        self.bind_thread()?;
+        self.ensure_kernel(QWEN4_PLE_MODULE, QWEN4_PLE_KERNEL_SRC, "qwen4_ple_norm_bf16")?;
+        let input_ptr = input.buf.as_ptr();
+        let weight_ptr = weight.buf.as_ptr();
+        let output_ptr = output.buf.as_ptr();
+        let mut params: Vec<*mut c_void> = vec![
+            &input_ptr as *const _ as *mut c_void,
+            &weight_ptr as *const _ as *mut c_void,
+            &output_ptr as *const _ as *mut c_void,
+            &tokens_i as *const _ as *mut c_void,
+            &groups_i as *const _ as *mut c_void,
+            &group_size_i as *const _ as *mut c_void,
+            &epsilon as *const _ as *mut c_void,
+        ];
+        let grid_x = checked_u32(groups, "PLE normalization group grid")?;
+        let grid_y = checked_u32(tokens, "PLE normalization token grid")?;
+        self.launch_maybe_blob(
+            "qwen4_ple_norm_bf16",
+            [grid_x, grid_y, 1],
+            [BLOCK, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(input_ptr);
+                blob.push_ptr(weight_ptr);
+                blob.push_ptr(output_ptr);
+                blob.push_i32(tokens_i);
+                blob.push_i32(groups_i);
+                blob.push_i32(group_size_i);
+                blob.push_f32(epsilon);
+                blob
+            },
+        )
+    }
+
 
     /// Depthwise causal convolution with SiLU and gated-value residual add.
     ///
@@ -388,6 +530,89 @@ impl Gpu {
             },
         )
     }
+    /// BF16 convolution-weight variant used by the assembled Qwen4 PLE layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen4_ple_depthwise_conv_silu_add_bf16(
+        &mut self,
+        gated: &GpuTensor,
+        normed: &GpuTensor,
+        conv_weight: &GpuTensor,
+        state: &GpuTensor,
+        output: &GpuTensor,
+        tokens: usize,
+        channels: usize,
+        kernel_size: usize,
+        dilation: usize,
+    ) -> HipResult<()> {
+        let elements = checked_product(tokens, channels, "PLE convolution elements")?;
+        let history_rows = kernel_size
+            .checked_sub(1)
+            .and_then(|value| value.checked_mul(dilation))
+            .ok_or_else(|| HipError::new(0, "PLE convolution history size overflow"))?;
+        let history_elements = checked_product(history_rows, channels, "PLE convolution history")?;
+        let kernel_elements = checked_product(channels, kernel_size, "PLE convolution weights")?;
+        require_dtype(gated, DType::F32, "PLE gated values")?;
+        require_dtype(normed, DType::F32, "PLE normalized values")?;
+        require_dtype(conv_weight, DType::BF16, "PLE BF16 convolution weights")?;
+        require_dtype(state, DType::F32, "PLE convolution state")?;
+        require_dtype(output, DType::F32, "PLE convolution output")?;
+        require_numel(gated, elements, "PLE gated values")?;
+        require_numel(normed, elements, "PLE normalized values")?;
+        require_numel(conv_weight, kernel_elements, "PLE BF16 convolution weights")?;
+        require_numel(state, history_elements, "PLE convolution state")?;
+        require_numel(output, elements, "PLE convolution output")?;
+        if tokens == 0 || channels == 0 {
+            return Ok(());
+        }
+        let tokens_i = checked_i32(tokens, "PLE convolution token count")?;
+        let channels_i = checked_i32(channels, "PLE convolution channel count")?;
+        let kernel_i = checked_i32(kernel_size, "PLE convolution kernel size")?;
+        let dilation_i = checked_i32(dilation, "PLE convolution dilation")?;
+        self.bind_thread()?;
+        self.ensure_kernel(
+            QWEN4_PLE_MODULE,
+            QWEN4_PLE_KERNEL_SRC,
+            "qwen4_ple_depthwise_conv_silu_add_bf16",
+        )?;
+        let gated_ptr = gated.buf.as_ptr();
+        let normed_ptr = normed.buf.as_ptr();
+        let weight_ptr = conv_weight.buf.as_ptr();
+        let state_ptr = state.buf.as_ptr();
+        let output_ptr = output.buf.as_ptr();
+        let mut params: Vec<*mut c_void> = vec![
+            &gated_ptr as *const _ as *mut c_void,
+            &normed_ptr as *const _ as *mut c_void,
+            &weight_ptr as *const _ as *mut c_void,
+            &state_ptr as *const _ as *mut c_void,
+            &output_ptr as *const _ as *mut c_void,
+            &tokens_i as *const _ as *mut c_void,
+            &channels_i as *const _ as *mut c_void,
+            &kernel_i as *const _ as *mut c_void,
+            &dilation_i as *const _ as *mut c_void,
+        ];
+        let grid = checked_grid(channels, BLOCK, "PLE convolution channel grid")?;
+        self.launch_maybe_blob(
+            "qwen4_ple_depthwise_conv_silu_add_bf16",
+            [grid, 1, 1],
+            [BLOCK, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(gated_ptr);
+                blob.push_ptr(normed_ptr);
+                blob.push_ptr(weight_ptr);
+                blob.push_ptr(state_ptr);
+                blob.push_ptr(output_ptr);
+                blob.push_i32(tokens_i);
+                blob.push_i32(channels_i);
+                blob.push_i32(kernel_i);
+                blob.push_i32(dilation_i);
+                blob
+            },
+        )
+    }
+
 }
 
 fn require_dtype(tensor: &GpuTensor, expected: DType, what: &'static str) -> HipResult<()> {
