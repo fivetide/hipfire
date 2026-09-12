@@ -1982,10 +1982,37 @@ pub const MOE_TOPK_RENORM_K8_SRC: &str =
 /// Same per-block algorithm; one workgroup per token row.
 pub const MOE_TOPK_RENORM_K8_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/moe_topk_renorm_k8_batched.hip");
+/// Batched top-10 companion used by the sealed Qwen4 prefill route.  It
+/// consumes already-softmaxed/sigmoid scores and applies renormalization once.
+pub const MOE_TOPK_RENORM_TOP10_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/moe_topk_renorm_top10_batched.hip");
+
 /// Qwen4's fixed 512-expert/top-10 router.  Kept separate from every k=8
 /// source so widening the new grammar cannot change legacy dispatch.
 pub const MOE_ROUTER_SOFTMAX_TOP10_F32_SRC: &str =
     include_str!("../../../kernels/src/moe_router_softmax_top10_f32.hip");
+/// Qwen4 qt=53 (MQ4G128V2) activation transform.  This is deliberately
+/// separate from the legacy 72-byte MQ4G128 route: the source codec uses a
+/// 68-byte row stride and permits a ragged final logical group.
+pub const MQ_ROTATE_X_128_V2_SRC: &str =
+    include_str!("../../../kernels/src/mq_rotate_x_128_v2.hip");
+
+/// Qwen4 qt=53 ordinary projection consumer.  Rows use
+/// `68 * ceil(K / 128)` bytes and fp16 scale/zero headers.
+pub const GEMV_MQ4G128V2_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq4g128v2.hip");
+
+/// Qwen4 qt=53 indexed decode down consumer.  It always writes ten
+/// unweighted expanded route rows; `moe_down_combine_top10_batched` owns the
+/// sole route-weight application.
+pub const GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded.hip");
+
+/// Qwen4 qt=53 grouped-prefill down consumer.  The grouped output remains
+/// unweighted and is folded by the sealed top-10 combine.
+pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10.hip");
+
 
 /// Index-aware MoE gate_up GEMV — reads expert IDs from a device-side
 /// topk_indices buffer and the per-expert weight base from an

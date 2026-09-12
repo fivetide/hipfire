@@ -41,9 +41,6 @@ pub mod gemv;
 
 pub mod moe;
 pub mod moe_buckets;
-/// Dedicated Qwen4 top-10 sealed programs.  This is intentionally separate
-/// from the compatibility k=8 `moe` family.
-pub mod sealed_moe;
 
 pub mod rotation;
 

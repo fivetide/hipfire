@@ -166,7 +166,10 @@ pub struct ExpertExecutionPlan {
     assignment: ExpertAssign,
     router: String,
     execution: String,
+    /// Activation basis of the gate/up input.  Down is intentionally tracked
+    /// independently because Qwen4 uses FWHT-G256 gate/up and FWHT-G128 down.
     activation_basis: String,
+    down_activation_basis: String,
     source_fingerprint: String,
     collective_rows: Vec<crate::weight_manifest::CollectiveScheduleEntry>,
 }
@@ -236,6 +239,9 @@ impl ExpertExecutionPlan {
 
     pub fn activation_basis(&self) -> &str {
         &self.activation_basis
+    }
+    pub fn down_activation_basis(&self) -> &str {
+        &self.down_activation_basis
     }
 
     pub fn source_fingerprint(&self) -> &str {
@@ -414,6 +420,17 @@ fn source_map<'a>(
                 source.name, source.encoded_bytes, source.row_stride
             ));
         }
+        if let Some(expected) = expected_quant_row_stride(
+            source.dtype,
+            source.logical_shape.last().copied().unwrap_or(0),
+        ) {
+            if source.row_stride != expected {
+                return Err(format!(
+                    "expert source '{}' row_stride {} does not match {:?} encoded geometry {}",
+                    source.name, source.row_stride, source.dtype, expected
+                ));
+            }
+        }
         match (&source.alias_owner, source.alias_byte_offset) {
             (None, None) => {}
             (Some(_), Some(_)) => {}
@@ -421,7 +438,7 @@ fn source_map<'a>(
                 return Err(format!(
                     "expert source '{}' has an incomplete alias descriptor",
                     source.name
-                ))
+                ));
             }
         }
         let mut sidecars = HashSet::new();
@@ -436,6 +453,20 @@ fn source_map<'a>(
     }
 
     Ok(map)
+}
+
+fn expected_quant_row_stride(dtype: DType, columns: usize) -> Option<usize> {
+    let (group_bytes, group_width) = match dtype {
+        // qt44: two f16 headers plus 128 payload bytes per 256 weights.
+        DType::MQ4G256V2 => (136usize, 256usize),
+        // qt53: two f16 headers plus 64 payload bytes per 128 weights.
+        DType::MQ4G128V2 => (68usize, 128usize),
+        _ => return None,
+    };
+    columns
+        .checked_add(group_width - 1)
+        .and_then(|rounded| rounded.checked_div(group_width))
+        .and_then(|groups| groups.checked_mul(group_bytes))
 }
 fn manifest_source_names(specs: &[ExpertGroupSpec]) -> Result<BTreeSet<String>, String> {
     let mut names = BTreeSet::new();
@@ -906,6 +937,7 @@ fn validate_and_build_group(
     let mut all_names = HashSet::new();
     let mut fingerprint: Option<String> = None;
     let mut basis: Option<String> = None;
+    let mut down_basis: Option<String> = None;
     let mut dimensions: Option<ExpertProjectionDimensions> = None;
     let mut records = Vec::with_capacity(spec.n_experts);
     let mut source_entries = Vec::new();
@@ -990,7 +1022,11 @@ fn validate_and_build_group(
                 resource.down_bytes
             ));
         }
-        for (source, entry) in [(gate, gate_entry), (up, up_entry), (down, down_entry)] {
+        for (role, source, entry) in [
+            ("gate", gate, gate_entry),
+            ("up", up, up_entry),
+            ("down", down, down_entry),
+        ] {
             if let Some(previous) = &fingerprint {
                 if previous != &source.fingerprint {
                     return Err(format!(
@@ -1001,15 +1037,20 @@ fn validate_and_build_group(
             } else {
                 fingerprint = Some(source.fingerprint.clone());
             }
-            if let Some(previous) = &basis {
+            let projection_basis = if role == "down" {
+                &mut down_basis
+            } else {
+                &mut basis
+            };
+            if let Some(previous) = projection_basis {
                 if previous != &source.basis {
                     return Err(format!(
-                        "{group_context}: activation basis mismatch at '{}'",
+                        "{group_context}: {role} activation basis mismatch at '{}'",
                         source.name
                     ));
                 }
             } else {
-                basis = Some(source.basis.clone());
+                *projection_basis = Some(source.basis.clone());
             }
             all_names.insert(source.name.as_str());
             if !entry.dtype_constraint.accepts(source.dtype) {
@@ -1057,9 +1098,9 @@ fn validate_and_build_group(
                 || down_shape[1] != local_down_cols
             {
                 return Err(format!(
-                        "{group_context}: source '{}' presents full-width buffers where TP shards are required",
-                        gate_name
-                    ));
+                    "{group_context}: source '{}' presents full-width buffers where TP shards are required",
+                    gate_name
+                ));
             }
             (local_gate_rows, local_up_rows, local_down_cols)
         } else {
@@ -1215,6 +1256,8 @@ fn validate_and_build_group(
         router: spec.router.clone(),
         execution: spec.execution.clone(),
         activation_basis: basis.ok_or_else(|| format!("{group_context}: no activation basis"))?,
+        down_activation_basis: down_basis
+            .ok_or_else(|| format!("{group_context}: no down activation basis"))?,
         source_fingerprint: fingerprint
             .ok_or_else(|| format!("{group_context}: no source fingerprint"))?,
         collective_rows,
@@ -1966,42 +2009,48 @@ mod tests {
             .collect::<Vec<_>>();
         ranks[3].physical_device = 99;
         let mut launches = Vec::new();
-        assert!(execute_cpu_mesh(
-            plan,
-            &ranks,
-            &[1.0, 2.0],
-            &[0.0, 0.0],
-            &[(0, 1.0)],
-            &mut launches,
-        )
-        .is_err());
+        assert!(
+            execute_cpu_mesh(
+                plan,
+                &ranks,
+                &[1.0, 2.0],
+                &[0.0, 0.0],
+                &[(0, 1.0)],
+                &mut launches,
+            )
+            .is_err()
+        );
         assert!(launches.is_empty());
     }
 
     #[test]
     fn duplicate_physical_ids_and_alias_cycles_are_refused_without_state() {
         let (manifest, manifest_plan, specs, sources, mesh) = ep_fixture();
-        assert!(plan_expert_execution(
-            &manifest,
-            &manifest_plan,
-            &specs,
-            &sources,
-            &mesh,
-            &[7, 7, 11, 5]
-        )
-        .is_err());
+        assert!(
+            plan_expert_execution(
+                &manifest,
+                &manifest_plan,
+                &specs,
+                &sources,
+                &mesh,
+                &[7, 7, 11, 5]
+            )
+            .is_err()
+        );
         let mut cyclic = sources.clone();
         cyclic[0] = cyclic[0].clone().alias("up", 0);
         cyclic[1] = cyclic[1].clone().alias("gate", 0);
-        assert!(plan_expert_execution(
-            &manifest,
-            &manifest_plan,
-            &specs,
-            &cyclic,
-            &mesh,
-            &[7, 2, 11, 5]
-        )
-        .is_err());
+        assert!(
+            plan_expert_execution(
+                &manifest,
+                &manifest_plan,
+                &specs,
+                &cyclic,
+                &mesh,
+                &[7, 2, 11, 5]
+            )
+            .is_err()
+        );
     }
     fn per_expert_fixture() -> (
         Vec<WeightEntry>,
@@ -2205,6 +2254,24 @@ mod tests {
         )
         .unwrap();
         let plan = &planned[0];
+        assert_eq!(plan.mesh_epoch(), manifest_plan.mesh_epoch);
+        assert_eq!(plan.physical_devices(), &physical);
+        assert_eq!(plan.source_fingerprint(), "fixture-v1");
+        let mut wrong_source = sources.clone();
+        wrong_source[0].fingerprint = "fixture-other-generation".into();
+        let error = plan_expert_execution(
+            &manifest,
+            &manifest_plan,
+            &specs,
+            &wrong_source,
+            &mesh,
+            &physical,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("source fingerprint mismatch"),
+            "got: {error}"
+        );
         let identity = |rank: usize| CpuRankProgram {
             logical_rank: rank,
             physical_device: physical[rank],
@@ -2220,28 +2287,32 @@ mod tests {
         let mut ranks = (0..4).map(identity).collect::<Vec<_>>();
         ranks.swap(0, 1);
         let mut launches = Vec::new();
-        assert!(execute_cpu_mesh(
-            plan,
-            &ranks,
-            &[1.0, 2.0],
-            &[0.0, 0.0],
-            &[(0, 1.0)],
-            &mut launches,
-        )
-        .is_err());
+        assert!(
+            execute_cpu_mesh(
+                plan,
+                &ranks,
+                &[1.0, 2.0],
+                &[0.0, 0.0],
+                &[(0, 1.0)],
+                &mut launches,
+            )
+            .is_err()
+        );
         assert!(launches.is_empty());
 
         let mut ranks = (0..4).map(identity).collect::<Vec<_>>();
         ranks[2].physical_device = 123;
-        assert!(execute_cpu_mesh(
-            plan,
-            &ranks,
-            &[1.0, 2.0],
-            &[0.0, 0.0],
-            &[(0, 1.0)],
-            &mut launches,
-        )
-        .is_err());
+        assert!(
+            execute_cpu_mesh(
+                plan,
+                &ranks,
+                &[1.0, 2.0],
+                &[0.0, 0.0],
+                &[(0, 1.0)],
+                &mut launches,
+            )
+            .is_err()
+        );
         assert!(launches.is_empty());
     }
 
@@ -2275,15 +2346,17 @@ mod tests {
             .collect::<Vec<_>>();
         ranks[0].experts[0].0 = plan.n_experts();
         let mut launches = Vec::new();
-        assert!(execute_cpu_mesh(
-            plan,
-            &ranks,
-            &[1.0, 2.0],
-            &[3.0, -2.0],
-            &[(0, 1.0)],
-            &mut launches,
-        )
-        .is_err());
+        assert!(
+            execute_cpu_mesh(
+                plan,
+                &ranks,
+                &[1.0, 2.0],
+                &[3.0, -2.0],
+                &[(0, 1.0)],
+                &mut launches,
+            )
+            .is_err()
+        );
         assert!(launches.is_empty());
 
         let mut ranks = (0..4)
@@ -2432,15 +2505,17 @@ mod tests {
             source.logical_shape = vec![2, 4, 2];
             source.encoded_bytes = 64;
         }
-        assert!(plan_expert_execution(
-            &manifest,
-            &manifest_plan,
-            &specs,
-            &full_width_sources,
-            &mesh,
-            &[7, 2],
-        )
-        .is_err());
+        assert!(
+            plan_expert_execution(
+                &manifest,
+                &manifest_plan,
+                &specs,
+                &full_width_sources,
+                &mesh,
+                &[7, 2],
+            )
+            .is_err()
+        );
     }
     #[test]
     fn source_capacity_covers_packed_and_per_expert_rows() {
@@ -2499,15 +2574,17 @@ mod tests {
                 source.alignment = 4;
             }
         }
-        assert!(plan_expert_execution(
-            &packed_manifest,
-            &packed_plan,
-            &exact_specs,
-            &exact_sources,
-            &packed_mesh,
-            &[7, 2, 11, 5],
-        )
-        .is_ok());
+        assert!(
+            plan_expert_execution(
+                &packed_manifest,
+                &packed_plan,
+                &exact_specs,
+                &exact_sources,
+                &packed_mesh,
+                &[7, 2, 11, 5],
+            )
+            .is_ok()
+        );
 
         let mut short_specs = exact_specs;
         for resource in &mut short_specs[0].resources.experts {
@@ -2591,15 +2668,17 @@ mod tests {
         owner.encoded_bytes = 32;
         subrange[0] = subrange[0].clone().alias("gate_owner", 0);
         subrange.push(owner);
-        assert!(plan_expert_execution(
-            &manifest,
-            &manifest_plan,
-            &specs,
-            &subrange,
-            &mesh,
-            &physical,
-        )
-        .is_ok());
+        assert!(
+            plan_expert_execution(
+                &manifest,
+                &manifest_plan,
+                &specs,
+                &subrange,
+                &mesh,
+                &physical,
+            )
+            .is_ok()
+        );
 
         let mut bad_stride = valid.clone();
         bad_stride[1].row_stride = 4;

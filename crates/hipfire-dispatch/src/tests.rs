@@ -218,13 +218,15 @@ fn fused_qkv_hfq6_resolves_cross_arch() {
     // hfq6g256, which carry the full cross-arch ladder, so they are now `Always`.
     let fam = FusedQkvFamily::new();
     for ctx in [&ctx_gfx906(), &ctx_rdna3()] {
-        assert!(fam
-            .resolve(KernelKey::FusedQkvzaHfq6G256, ctx, None)
-            .is_ok());
+        assert!(
+            fam.resolve(KernelKey::FusedQkvzaHfq6G256, ctx, None)
+                .is_ok()
+        );
         assert!(fam.resolve(KernelKey::FusedQkvHfq6G256, ctx, None).is_ok());
-        assert!(fam
-            .resolve(KernelKey::FusedGateUpHfq6G256, ctx, None)
-            .is_ok());
+        assert!(
+            fam.resolve(KernelKey::FusedGateUpHfq6G256, ctx, None)
+                .is_ok()
+        );
     }
 }
 
@@ -775,7 +777,7 @@ fn gemv_steps_rotation_matches_plan() {
 // ── GemvFamily::resolve via populated table ───────────────────────────────────
 
 #[test]
-fn mq4g128v2_is_explicitly_rejected_by_dispatch_families() {
+fn mq4g128v2_is_explicitly_rejected_by_generic_dispatch_families() {
     let gemv = GemvFamily::new();
     for variant in [
         GemvVariant::Plain,
@@ -787,9 +789,9 @@ fn mq4g128v2_is_explicitly_rejected_by_dispatch_families() {
         match result {
             Err(DispatchError::UnsupportedVariant { quant, variant, .. }) => {
                 assert_eq!(quant, "MQ4G128V2");
-                assert_eq!(variant, "mq4g128v2_cpu_only");
+                assert_eq!(variant, "mq4g128v2_qwen4_typed_only");
             }
-            other => panic!("qt53 GEMV unexpectedly resolved: {other:?}"),
+            other => panic!("qt53 GEMV unexpectedly resolved through a generic family: {other:?}"),
         }
     }
 
@@ -797,21 +799,23 @@ fn mq4g128v2_is_explicitly_rejected_by_dispatch_families() {
     match gemm.resolve(DType::MQ4G128V2, &ctx_rdna3(), None) {
         Err(DispatchError::UnsupportedVariant { quant, variant, .. }) => {
             assert_eq!(quant, "MQ4G128V2");
-            assert_eq!(variant, "mq4g128v2_cpu_only");
+            assert_eq!(variant, "mq4g128v2_qwen4_typed_only");
         }
-        other => panic!("qt53 GEMM unexpectedly resolved: {other:?}"),
+        other => panic!("qt53 GEMM unexpectedly resolved through a generic family: {other:?}"),
     }
 }
 
 #[test]
 fn gemv_family_resolves_f32_on_all_archs() {
     let fam = GemvFamily::new();
-    assert!(fam
-        .resolve(DType::F32, GemvVariant::Plain, false, &ctx_rdna1(), None)
-        .is_ok());
-    assert!(fam
-        .resolve(DType::F32, GemvVariant::Plain, false, &ctx_rdna3(), None)
-        .is_ok());
+    assert!(
+        fam.resolve(DType::F32, GemvVariant::Plain, false, &ctx_rdna1(), None)
+            .is_ok()
+    );
+    assert!(
+        fam.resolve(DType::F32, GemvVariant::Plain, false, &ctx_rdna3(), None)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -820,51 +824,56 @@ fn gemv_family_resolves_hfq4_on_all_archs() {
     // HFQ4G256 uses generic wave32/wave64 kernels with a fallback for every arch
     // (gfx906 via dp4a/sdot4, gfx1010 via generic). Previously gated on HasDp4a
     // (has_dot2_f32_f16 = RDNA1.1+) which excluded gfx906/gfx1010.
-    assert!(fam
-        .resolve(
+    assert!(
+        fam.resolve(
             DType::HFQ4G256,
             GemvVariant::Plain,
             false,
             &ctx_rdna1(),
             None
         )
-        .is_ok());
-    assert!(fam
-        .resolve(
+        .is_ok()
+    );
+    assert!(
+        fam.resolve(
             DType::HFQ4G256,
             GemvVariant::Plain,
             false,
             &ctx_rdna2(),
             None
         )
-        .is_ok());
-    assert!(fam
-        .resolve(
+        .is_ok()
+    );
+    assert!(
+        fam.resolve(
             DType::HFQ4G256,
             GemvVariant::Plain,
             false,
             &ctx_rdna3(),
             None
         )
-        .is_ok());
-    assert!(fam
-        .resolve(
+        .is_ok()
+    );
+    assert!(
+        fam.resolve(
             DType::MQ4G256,
             GemvVariant::Plain,
             false,
             &ctx_rdna1(),
             None
         )
-        .is_ok());
-    assert!(fam
-        .resolve(
+        .is_ok()
+    );
+    assert!(
+        fam.resolve(
             DType::MQ4G256,
             GemvVariant::Plain,
             false,
             &ctx_rdna2(),
             None
         )
-        .is_ok());
+        .is_ok()
+    );
 }
 
 #[test]
@@ -873,72 +882,79 @@ fn gemv_family_resolves_mq3_prerotated_on_all_wave32_archs_not_cdna() {
     // gate is now HasWave32 (was HasWmma), so it resolves on every RDNA gen
     // (RDNA1/2/3/4) but still NOT on CDNA wave64 (a [32,1,1] kernel needs wave32).
     let fam = GemvFamily::new();
-    assert!(fam
-        .resolve(
+    assert!(
+        fam.resolve(
             DType::MQ3G256,
             GemvVariant::Prerotated,
             false,
             &ctx_rdna1(),
             None
         )
-        .is_ok());
-    assert!(fam
-        .resolve(
+        .is_ok()
+    );
+    assert!(
+        fam.resolve(
             DType::MQ3G256,
             GemvVariant::Prerotated,
             false,
             &ctx_rdna2(),
             None
         )
-        .is_ok());
-    assert!(fam
-        .resolve(
+        .is_ok()
+    );
+    assert!(
+        fam.resolve(
             DType::MQ3G256,
             GemvVariant::Prerotated,
             false,
             &ctx_rdna3(),
             None
         )
-        .is_ok());
-    assert!(fam
-        .resolve(
+        .is_ok()
+    );
+    assert!(
+        fam.resolve(
             DType::MQ3G256,
             GemvVariant::Prerotated,
             false,
             &ctx_rdna4(),
             None
         )
-        .is_ok());
+        .is_ok()
+    );
     // CDNA wave64 (gfx906) still excluded by HasWave32.
-    assert!(fam
-        .resolve(
+    assert!(
+        fam.resolve(
             DType::MQ3G256,
             GemvVariant::Prerotated,
             false,
             &ctx_gfx906(),
             None
         )
-        .is_err());
-    assert!(fam
-        .resolve(
+        .is_err()
+    );
+    assert!(
+        fam.resolve(
             DType::MQ4G256,
             GemvVariant::Prerotated,
             false,
             &ctx_rdna2(),
             None
         )
-        .is_ok());
+        .is_ok()
+    );
     // F32 Prerotated now falls back to GemvF32 (rotation-free dtype → plain key).
     // It resolves on any arch because GemvF32 has no arch gate.
-    assert!(fam
-        .resolve(
+    assert!(
+        fam.resolve(
             DType::F32,
             GemvVariant::Prerotated,
             false,
             &ctx_rdna3(),
             None
         )
-        .is_ok());
+        .is_ok()
+    );
 }
 
 // ── Pipeline::can_satisfy ─────────────────────────────────────────────────────
@@ -1116,6 +1132,30 @@ fn moe_res_q8_router_still_gpu_topk() {
     assert!(r.routed_indexable_mq4);
     assert!(r.use_gpu_topk);
     assert!(r.needs_x_rot_local); // routed_gate_up_mq4 alone fires x_rot
+}
+
+#[test]
+fn qwen35_and_cohere_k8_preserve_gpu_topk_routed_decode() {
+    // Qwen3.5 uses an MQ4 router; Cohere's route uses Q8.  The router dtype
+    // only changes the fused gate-side decision, never the existing k=8
+    // routed-expert top-k path.
+    for (family, router) in [("Qwen3.5", DType::MQ4G256), ("Cohere", DType::Q8_0)] {
+        let mut d = dtypes_all_mq4();
+        d.router = router;
+        let resolved = MoeResolution::resolve(&d, 8);
+        assert!(
+            resolved.routed_indexable_mq4,
+            "{family}: routed MQ4 experts must remain indexable"
+        );
+        assert!(
+            resolved.use_gpu_topk,
+            "{family}: k=8 must retain device-side top-k routing"
+        );
+        assert!(
+            resolved.needs_x_rot_local,
+            "{family}: routed MQ4 experts require FWHT activation rotation"
+        );
+    }
 }
 
 #[test]
@@ -1326,7 +1366,7 @@ fn moe_res_lloyd_gate_up_with_nonlloyd_down_not_indexable() {
 /// pins.
 #[test]
 fn moe_res_gl_routed_indexable() {
-    use DType::{MQ2G256Lloyd, MQ3G256Lloyd, MQ2G256GL, MQ3G256GL};
+    use DType::{MQ2G256GL, MQ2G256Lloyd, MQ3G256GL, MQ3G256Lloyd};
     let codebook = [MQ2G256Lloyd, MQ3G256Lloyd, MQ2G256GL, MQ3G256GL];
     for gu in codebook {
         for dn in codebook {
@@ -1367,7 +1407,7 @@ fn moe_res_gl_gate_up_with_nonlloyd_down_not_indexable() {
 /// an un-rotated activation into a rotated weight is silent garbage.
 #[test]
 fn gl_dtypes_are_fwht_g256() {
-    use crate::types::{dtype_needs_rotation, dtype_rotation_plan, RotationPlan};
+    use crate::types::{RotationPlan, dtype_needs_rotation, dtype_rotation_plan};
     for dt in [DType::MQ2G256GL, DType::MQ3G256GL] {
         assert_eq!(dtype_rotation_plan(dt), RotationPlan::FwhtG256, "{dt:?}");
         assert!(dtype_needs_rotation(dt), "{dt:?}");
@@ -1625,7 +1665,7 @@ fn ninepath_d3_restricts_v2_to_native_gate_and_d4() {
 // ── op-list interpreter: match_prefix (pure logic) ──────────────────────────
 
 use crate::families::gemv::WeightRef;
-use crate::pipeline::steps::{match_prefix, GemvInput};
+use crate::pipeline::steps::{GemvInput, match_prefix};
 use crate::pipeline::{FusedPattern, Step};
 
 fn dummy_wr<'a>(t: &'a rdna_compute::GpuTensor) -> WeightRef<'a> {

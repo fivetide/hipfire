@@ -18,7 +18,8 @@ use hipfire_runtime::model_source::{SourceFormat, SourceRangeDescriptor};
 #[cfg(test)]
 use hipfire_runtime::weight_manifest::WeightResidency;
 use hipfire_runtime::weight_manifest::{
-    DTypeConstraint, PinTarget, PlacementHint, ShardPolicy, StateEntry, StateKind, WeightEntry,
+    DTypeConstraint, ExpertSourceLayout, PinTarget, PlacementHint, ShardPolicy, StateEntry,
+    StateKind, WeightEntry,
 };
 use hipfire_runtime::weight_store::{TakenWeight, WeightHandle, WeightLoadTransaction};
 use rdna_compute::{DType, Gpu};
@@ -900,10 +901,7 @@ fn push_moe_entries<F>(
         layer_idx,
         vec![config.num_experts, hidden, config.moe_intermediate_size],
         ROUTED_DOWN_DTYPE,
-        ShardPolicy::ExpertTensorSharded {
-            n_experts: config.num_experts,
-            inner: Box::new(ShardPolicy::RowShard { axis: 2 }),
-        },
+        ShardPolicy::Replicate,
         quant_matrix,
     ));
     weights.push(layer(
@@ -911,10 +909,7 @@ fn push_moe_entries<F>(
         layer_idx,
         vec![config.num_experts, 2 * config.moe_intermediate_size, hidden],
         ROUTED_GATE_UP_DTYPE,
-        ShardPolicy::ExpertTensorSharded {
-            n_experts: config.num_experts,
-            inner: Box::new(ShardPolicy::ColumnShard { axis: 1 }),
-        },
+        ShardPolicy::Replicate,
         quant_matrix,
     ));
     weights.push(layer(
@@ -1092,6 +1087,10 @@ pub struct PleWeights {
 pub struct MoeWeights {
     pub experts_down: TensorRef,
     pub experts_gate_up: TensorRef,
+    /// The pinned checkpoint carries one stacked gate/up source.  Gate and up
+    /// remain distinct logical projection slices in the sealed runtime plan;
+    /// do not rewrite the artifact merely to spell them as separate sources.
+    pub expert_source_layout: ExpertSourceLayout,
     pub gate: TensorRef,
     pub shared_down: TensorRef,
     pub shared_gate: TensorRef,
@@ -1534,6 +1533,11 @@ fn build_moe_refs(
             vec![config.num_experts, 2 * config.moe_intermediate_size, hidden],
             ROUTED_GATE_UP_DTYPE,
         )?,
+        expert_source_layout: ExpertSourceLayout::PackedFused {
+            gate_up: format!("{prefix}.experts.gate_up_proj"),
+            down: format!("{prefix}.experts.down_proj"),
+            sidecars: Vec::new(),
+        },
         gate: tr(
             "gate.weight",
             TensorRole::Router,
@@ -1813,6 +1817,44 @@ mod tests {
                 ..
             }
         ));
+    }
+    #[test]
+    fn qwen4_moe_keeps_fused_source_replicated_for_single_execution() {
+        let config = pinned_config();
+        let manifest = Qwen4Manifest::build(&config).expect("pinned config manifest");
+        for name in [
+            "model.language_model.layers.0.mlp.experts.gate_up_proj",
+            "model.language_model.layers.0.mlp.experts.down_proj",
+        ] {
+            let entry = manifest
+                .entry(name, Some(0))
+                .unwrap_or_else(|| panic!("missing Qwen4 expert source {name}"));
+            assert_eq!(
+                entry.policy,
+                ShardPolicy::Replicate,
+                "{name} must be replicated for the sealed Single route"
+            );
+        }
+
+        let layers = build_layer_refs(&config).expect("Qwen4 layer references");
+        match &layers[0].moe.expert_source_layout {
+            ExpertSourceLayout::PackedFused {
+                gate_up,
+                down,
+                sidecars,
+            } => {
+                assert_eq!(
+                    gate_up,
+                    "model.language_model.layers.0.mlp.experts.gate_up_proj"
+                );
+                assert_eq!(
+                    down,
+                    "model.language_model.layers.0.mlp.experts.down_proj"
+                );
+                assert!(sidecars.is_empty());
+            }
+            other => panic!("pinned Qwen4 source inventory must stay PackedFused: {other:?}"),
+        }
     }
     #[test]
     fn matrix_roles_select_q44_or_q53_and_keep_nonmatrices_bf16() {

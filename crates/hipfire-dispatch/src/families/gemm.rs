@@ -148,7 +148,7 @@ impl GemmFamily {
             DType::MQ4G128V2 => {
                 return Err(DispatchError::UnsupportedVariant {
                     family: "gemm",
-                    variant: "mq4g128v2_cpu_only",
+                    variant: "mq4g128v2_qwen4_typed_only",
                     arch: "",
                     quant: "MQ4G128V2",
                 });
@@ -212,7 +212,7 @@ impl GemmFamily {
         if params.w.dtype == DType::MQ4G128V2 {
             return Err(DispatchError::UnsupportedVariant {
                 family: "gemm",
-                variant: "mq4g128v2_cpu_only",
+                variant: "mq4g128v2_qwen4_typed_only",
                 arch: "",
                 quant: "MQ4G128V2",
             });

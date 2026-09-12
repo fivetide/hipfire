@@ -13,7 +13,7 @@
 
 use crate::context::DispatchCtx;
 use crate::families::moe::{MoeParams, MoePrefillParams, RoutedExpertWeights};
-use crate::types::{dtype_rotation_plan, DispatchError, RotationPlan};
+use crate::types::{DispatchError, RotationPlan, dtype_rotation_plan};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -442,7 +442,23 @@ impl ExpertMetadata {
         local_slot: usize,
         resources: ExpertResources,
     ) -> Result<Self, DispatchError> {
-        let mut basis = None;
+        let gate_up_names = resources
+            .gate_up()
+            .map(|resource| vec![resource.source_name().to_owned()])
+            .or_else(|| {
+                Some(
+                    [
+                        resources.gate().map(ExpertResource::source_name),
+                        resources.up().map(ExpertResource::source_name),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(str::to_owned)
+                    .collect(),
+                )
+            })
+            .unwrap_or_default();
+        let mut gate_up_basis = None;
         for resource in resources.iter() {
             validate_resource_header(
                 resource.source_name(),
@@ -455,14 +471,19 @@ impl ExpertMetadata {
                 resource.basis(),
             )?;
             validate_sidecars(resource.sidecars())?;
-            if let Some(expected) = basis {
-                if expected != resource.basis() {
-                    return Err(invalid(format!(
-                        "expert {global_id} projection sources use different rotation bases"
-                    )));
+            if gate_up_names
+                .iter()
+                .any(|name| name == resource.source_name())
+            {
+                if let Some(expected) = gate_up_basis {
+                    if expected != resource.basis() {
+                        return Err(invalid(format!(
+                            "expert {global_id} gate/up projection sources use different rotation bases"
+                        )));
+                    }
+                } else {
+                    gate_up_basis = Some(resource.basis());
                 }
-            } else {
-                basis = Some(resource.basis());
             }
         }
         Ok(Self {
@@ -1037,6 +1058,16 @@ impl<'a> SealedMoeCall<'a> {
                 gpu.device_id
             )));
         }
+        let qwen4_route = match &self.params {
+            SealedParams::Decode(params) => params.dtypes.routed_down == DType::MQ4G128V2,
+            SealedParams::Prefill(params) => params.dtypes.routed_down == DType::MQ4G128V2,
+        };
+        if qwen4_route && gpu.replay.is_enabled() {
+            return Err(invalid(
+                "Qwen4 sealed MoE has no retained-replay pointer contract; refusing before launch",
+            ));
+        }
+
         if self.protocol == MoeProtocol::GroupedPrefill {
             let receipt = self
                 .route_receipt
@@ -1108,21 +1139,16 @@ pub fn produce_prefill_route<'a>(
             }
             gpu.softmax_f32(scores)
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            gpu.moe_topk_renorm_k8_batched(
-                scores,
-                params.topk_indices,
-                params.topk_weights,
-                params.n_exp,
-                normalize,
-                params.batch_size,
-            )
-            .map_err(|e| DispatchError::Hip(e.to_string()))?;
-        }
-        MoeRouterInput::PrecomputedSigmoidTopK => {
-            #[cfg(feature = "deltanet")]
-            {
-                gpu.sigmoid_f32(scores)
-                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            if params.k_top == 10 {
+                gpu.moe_topk_renorm_top10_batched(
+                    scores,
+                    params.topk_indices,
+                    params.topk_weights,
+                    params.n_exp,
+                    normalize,
+                    params.batch_size,
+                )
+            } else {
                 gpu.moe_topk_renorm_k8_batched(
                     scores,
                     params.topk_indices,
@@ -1131,6 +1157,33 @@ pub fn produce_prefill_route<'a>(
                     normalize,
                     params.batch_size,
                 )
+            }
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        }
+        MoeRouterInput::PrecomputedSigmoidTopK => {
+            #[cfg(feature = "deltanet")]
+            {
+                gpu.sigmoid_f32(scores)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                if params.k_top == 10 {
+                    gpu.moe_topk_renorm_top10_batched(
+                        scores,
+                        params.topk_indices,
+                        params.topk_weights,
+                        params.n_exp,
+                        normalize,
+                        params.batch_size,
+                    )
+                } else {
+                    gpu.moe_topk_renorm_k8_batched(
+                        scores,
+                        params.topk_indices,
+                        params.topk_weights,
+                        params.n_exp,
+                        normalize,
+                        params.batch_size,
+                    )
+                }
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
             }
             #[cfg(not(feature = "deltanet"))]
@@ -1196,7 +1249,7 @@ pub fn seal_decode_with_router<'a>(
     }
     validate_decode(ctx, &experts, &params)?;
     let basis = expected_basis(&experts, params.dtypes.routed_gate_up)?;
-    let (contribution, shared) = decode_combine(&params)?;
+    let (contribution, shared) = decode_combine(params.routed_out.is_some(), params.skip_shared)?;
     Ok(SealedMoeCall {
         invocation: NEXT_INVOCATION.fetch_add(1, Ordering::Relaxed),
         experts,
@@ -1256,6 +1309,7 @@ pub fn seal_prefill_with_router<'a>(
         router,
         contribution,
         // Prefill's shared output is already in each rank's residual and is
+
         // deliberately outside the routed reduction.
         shared: MoeSharedContribution::PerRankResidual,
         activation: ActivationIdentity::new(ActivationInput::PreRotated, basis),
@@ -1263,6 +1317,33 @@ pub fn seal_prefill_with_router<'a>(
         route_receipt: None,
     })
 }
+fn validate_qwen4_route_width(
+    n_experts: usize,
+    k: usize,
+    hidden: usize,
+    intermediate: usize,
+    gate_up: DType,
+    down: DType,
+    protocol: &str,
+) -> Result<(), DispatchError> {
+    let qt53 = down == DType::MQ4G128V2;
+    let qwen4_pair = gate_up == DType::MQ4G256V2 && qt53;
+    if qt53 && !qwen4_pair {
+        return Err(invalid(format!(
+            "{protocol} qt53 down requires the Qwen4 qt44/qt53 projection pair"
+        )));
+    }
+    if !qwen4_pair {
+        return Ok(());
+    }
+    if n_experts != 512 || k != 10 || hidden != 2560 || intermediate != 640 {
+        return Err(invalid(format!(
+            "{protocol} Qwen4 qt53 route requires n_experts=512, k=10, hidden=2560, intermediate=640 (got experts={n_experts}, k={k}, hidden={hidden}, intermediate={intermediate})"
+        )));
+    }
+    Ok(())
+}
+
 fn require_single_binding(experts: &BoundMoeExperts<'_>) -> Result<(), DispatchError> {
     if experts.rank_count() != 1 || experts.local_rank() != 0 {
         return Err(invalid(format!(
@@ -1288,6 +1369,16 @@ fn validate_decode(
     if params.hidden == 0 || params.mi == 0 || params.smi == 0 {
         return Err(invalid("decode dimensions must be nonzero"));
     }
+    validate_qwen4_route_width(
+        params.n_exp,
+        params.k,
+        params.hidden,
+        params.mi,
+        params.dtypes.routed_gate_up,
+        params.dtypes.routed_down,
+        "decode",
+    )?;
+
     if params.n_exp == 0 || params.k == 0 || params.k > params.n_exp {
         return Err(invalid(format!(
             "decode route width k={} is outside 1..={} ",
@@ -1404,6 +1495,16 @@ fn validate_prefill(
     if params.mi == 0 || params.down_m == 0 || params.down_k == 0 || params.gate_up_k == 0 {
         return Err(invalid("prefill dimensions must be nonzero"));
     }
+    validate_qwen4_route_width(
+        params.n_exp,
+        params.k_top,
+        params.gate_up_k,
+        params.mi,
+        params.dtypes.routed_gate_up,
+        params.dtypes.routed_down,
+        "prefill",
+    )?;
+
     if params.n_exp == 0 || params.k_top == 0 || params.k_top > params.n_exp {
         return Err(invalid(format!(
             "prefill route width k_top={} is outside 1..={} ",
@@ -1555,9 +1656,10 @@ fn validate_prefill(
 }
 
 fn decode_combine(
-    params: &MoeParams<'_>,
+    has_routed_partial: bool,
+    skip_shared: bool,
 ) -> Result<(MoeContribution, MoeSharedContribution), DispatchError> {
-    match (params.routed_out.is_some(), params.skip_shared) {
+    match (has_routed_partial, skip_shared) {
         (false, false) => Ok((MoeContribution::Residual, MoeSharedContribution::None)),
         (true, true) => Ok((
             MoeContribution::ZeroedPartial,
@@ -1592,6 +1694,7 @@ fn validate_expert_shape_and_dtype(
         )));
     }
     let expected_basis = dtype_rotation_plan(representative_gate_up);
+    let expected_down_basis = dtype_rotation_plan(representative_down);
     if mixed {
         if per_gate_up.map_or(true, |values| values.len() != n_experts)
             || per_down.map_or(true, |values| values.len() != n_experts)
@@ -1690,9 +1793,9 @@ fn validate_expert_shape_and_dtype(
                 "expert {index} down dtype differs from the declared source metadata"
             )));
         }
-        if dtype_rotation_plan(down.dtype()) != expected_basis {
+        if dtype_rotation_plan(down.dtype()) != expected_down_basis {
             return Err(invalid(format!(
-                "expert {index} down rotation basis differs from the activation basis"
+                "expert {index} down rotation basis differs from its declared down dtype"
             )));
         }
         validate_logical_shape(down.shape(), down_rows, down_cols, "down", index)?;
@@ -2056,6 +2159,18 @@ fn validate_expert_records(records: &[ExpertMetadata]) -> Result<(), DispatchErr
     Ok(())
 }
 
+fn expected_quant_row_stride(dtype: DType, columns: usize) -> Option<usize> {
+    let (group_bytes, group_width) = match dtype {
+        DType::MQ4G256V2 => (136usize, 256usize),
+        DType::MQ4G128V2 => (68usize, 128usize),
+        _ => return None,
+    };
+    columns
+        .checked_add(group_width - 1)
+        .and_then(|rounded| rounded.checked_div(group_width))
+        .and_then(|groups| groups.checked_mul(group_bytes))
+}
+
 fn validate_resource_header(
     source_name: &str,
     source_fingerprint: &str,
@@ -2066,11 +2181,6 @@ fn validate_resource_header(
     alignment: usize,
     basis: RotationPlan,
 ) -> Result<(), DispatchError> {
-    if dtype == DType::MQ4G128V2 {
-        return Err(invalid(
-            "MQ4G128V2 (qt=53) is CPU/wire-only; expert GPU dispatch is unsupported",
-        ));
-    }
     if source_name.is_empty() {
         return Err(invalid("expert source name is empty"));
     }
@@ -2101,6 +2211,14 @@ fn validate_resource_header(
             dtype,
             dtype_rotation_plan(dtype)
         )));
+    }
+    if let Some(expected) = expected_quant_row_stride(dtype, shape.last().copied().unwrap_or(0)) {
+        if row_stride != expected {
+            return Err(invalid(format!(
+                "expert source '{source_name}' row_stride {row_stride} does not match {:?} geometry {expected}",
+                dtype
+            )));
+        }
     }
     let rows = checked_product(&shape[..shape.len() - 1], "expert source row count")?;
     let minimum = rows
@@ -2367,14 +2485,16 @@ mod tests {
 
     fn resource(name: &str, dtype: DType, shape: &[usize]) -> ExpertResource {
         let rows = shape[..shape.len() - 1].iter().product::<usize>();
-        let bytes = rows * shape[shape.len() - 1];
+        let columns = shape[shape.len() - 1];
+        let row_stride = expected_quant_row_stride(dtype, columns).unwrap_or(columns);
+        let bytes = rows * row_stride;
         ExpertResource::new(
             name,
             "fixture-fingerprint",
             shape.to_vec(),
             dtype,
             bytes,
-            shape[shape.len() - 1],
+            row_stride,
             16,
             dtype_rotation_plan(dtype),
         )
@@ -2412,15 +2532,17 @@ mod tests {
             &[2 * table.n_experts()],
             DType::F32,
         );
-        assert!(validate_live_binding(
-            &bound,
-            Some(&fixture.routed),
-            &swapped_gate_up,
-            &fixture.down_ptrs,
-            None,
-            None,
-        )
-        .is_err());
+        assert!(
+            validate_live_binding(
+                &bound,
+                Some(&fixture.routed),
+                &swapped_gate_up,
+                &fixture.down_ptrs,
+                None,
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2431,15 +2553,17 @@ mod tests {
         bind_fixture(&table, &mut cache, &fixture);
         let bound = BoundMoeExperts::from_cache(&table, &cache).unwrap();
         let replacement = live_fixture(&table, 0x70_0000);
-        assert!(validate_live_binding(
-            &bound,
-            Some(&replacement.routed),
-            &fixture.gate_up_ptrs,
-            &fixture.down_ptrs,
-            None,
-            None,
-        )
-        .is_err());
+        assert!(
+            validate_live_binding(
+                &bound,
+                Some(&replacement.routed),
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2482,7 +2606,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_dtype_with_common_basis_is_admitted_and_basis_mismatch_is_rejected() {
+    fn mixed_dtypes_allow_an_independent_down_basis_but_gate_up_basis_must_match() {
         let records = vec![
             ExpertMetadata::new(
                 0,
@@ -2509,24 +2633,161 @@ mod tests {
         ];
         let table = ExpertTable::new(records).unwrap();
         assert_eq!(table.n_experts(), 2);
-        let bad = ExpertResource::new(
-            "bad",
-            "fp:bad",
-            vec![8, 4],
-            DType::F32,
-            32,
+
+        // Qwen4 deliberately uses FWHT-G256 gate/up and FWHT-G128 down.  The
+        // down basis is independent, while gate/up remains one common basis.
+        let qwen_table = ExpertTable::new(vec![
+            ExpertMetadata::new(
+                0,
+                0,
+                0,
+                ExpertResources::fused(
+                    resource("qwen_gate_up", DType::MQ4G256V2, &[8, 4]),
+                    resource("qwen_down", DType::MQ4G128V2, &[4, 4]),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let mut cache = qwen_table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&qwen_table, 0x90_0000);
+        bind_fixture(&qwen_table, &mut cache, &fixture);
+        let bound = BoundMoeExperts::from_cache(&qwen_table, &cache).unwrap();
+        validate_expert_shape_and_dtype(
+            &bound,
+            1,
+            8,
             4,
-            16,
-            RotationPlan::None,
+            4,
+            4,
+            DType::MQ4G256V2,
+            DType::MQ4G128V2,
+            false,
+            None,
+            None,
         )
         .unwrap();
-        let bad_record = ExpertMetadata::new(
-            0,
-            0,
-            0,
-            ExpertResources::fused(bad, resource("bad_dn", DType::MQ4G256, &[4, 4])).unwrap(),
+
+        let bad_gate = resource("bad_gate", DType::F32, &[4, 4]);
+        let bad_up = resource("bad_up", DType::MQ4G256, &[4, 4]);
+        let bad_down = resource("bad_down", DType::MQ4G256, &[4, 4]);
+        assert!(
+            ExpertMetadata::new(
+                0,
+                0,
+                0,
+                ExpertResources::separate(bad_gate, bad_up, bad_down).unwrap(),
+            )
+            .is_err(),
+            "separate gate/up sources with different bases must be rejected"
         );
-        assert!(bad_record.is_err());
+    }
+
+    #[test]
+    fn qt53_resource_header_requires_exact_stride_extent_and_mixed_tag_capacity() {
+        let qt53 = resource("qt53", DType::MQ4G128V2, &[3, 129]);
+        assert_eq!(qt53.row_stride(), 136);
+        assert_eq!(qt53.encoded_bytes(), 3 * 136);
+
+        assert!(
+            ExpertResource::new(
+                "qt53_bad_stride",
+                "fixture-fingerprint",
+                vec![3, 129],
+                DType::MQ4G128V2,
+                3 * 136,
+                68,
+                16,
+                dtype_rotation_plan(DType::MQ4G128V2),
+            )
+            .is_err()
+        );
+        assert!(
+            ExpertResource::new(
+                "qt53_short_extent",
+                "fixture-fingerprint",
+                vec![3, 129],
+                DType::MQ4G128V2,
+                3 * 136 - 1,
+                136,
+                16,
+                dtype_rotation_plan(DType::MQ4G128V2),
+            )
+            .is_err()
+        );
+
+        let tags = live_tensor(0xa0_0000, 3, &[3], DType::Raw);
+        assert!(validate_dtype_tag_table(Some(&tags), 3, true).is_ok());
+        assert!(validate_dtype_tag_table(None, 3, true).is_err());
+        assert!(validate_dtype_tag_table(Some(&tags), 3, false).is_err());
+        let short_tags = live_tensor(0xa0_1000, 2, &[2], DType::Raw);
+        assert!(validate_dtype_tag_table(Some(&short_tags), 3, true).is_err());
+    }
+
+    #[test]
+    fn binding_identity_rejects_invalid_rank_and_device_before_launch() {
+        let table = table(2, DType::MQ4G256);
+        assert!(table.prepare_binding(0, 0, 0).is_err());
+        assert!(table.prepare_binding(1, 1, 0).is_err());
+        assert!(table.prepare_binding(0, 1, -1).is_err());
+    }
+
+    #[test]
+    fn qwen4_topk_width_and_projection_pair_are_sealed_before_gpu_work() {
+        assert!(
+            validate_qwen4_route_width(
+                512,
+                10,
+                2560,
+                640,
+                DType::MQ4G256V2,
+                DType::MQ4G128V2,
+                "test",
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_qwen4_route_width(
+                512,
+                8,
+                2560,
+                640,
+                DType::MQ4G256V2,
+                DType::MQ4G128V2,
+                "test",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_qwen4_route_width(
+                512,
+                10,
+                2560,
+                640,
+                DType::MQ4G256,
+                DType::MQ4G128V2,
+                "test",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn decode_shared_policy_is_explicit_and_launch_free() {
+        assert_eq!(
+            decode_combine(false, false).unwrap(),
+            (MoeContribution::Residual, MoeSharedContribution::None)
+        );
+        assert_eq!(
+            decode_combine(true, true).unwrap(),
+            (
+                MoeContribution::ZeroedPartial,
+                MoeSharedContribution::RootPartial
+            )
+        );
+        assert!(decode_combine(true, false).is_err());
+        assert!(decode_combine(false, true).is_err());
     }
 
     #[test]
@@ -2593,13 +2854,10 @@ mod tests {
         let gate = resource("paro_gate", DType::ParoQ4G128, &[4, 4]);
         let up = resource("paro_up", DType::ParoQ4G128, &[4, 4]);
         let down = resource("paro_down", DType::ParoQ4G128, &[4, 4]);
-        let table = ExpertTable::new(vec![ExpertMetadata::new(
-            0,
-            0,
-            0,
-            ExpertResources::separate(gate, up, down).unwrap(),
-        )
-        .unwrap()])
+        let table = ExpertTable::new(vec![
+            ExpertMetadata::new(0, 0, 0, ExpertResources::separate(gate, up, down).unwrap())
+                .unwrap(),
+        ])
         .unwrap();
         let mut cache = table.prepare_binding(0, 1, 0).unwrap();
         let fixture = live_fixture(&table, 0x20_0000);
@@ -2663,5 +2921,75 @@ mod tests {
             weights: expected.weights,
         };
         assert!(validate_route_receipt_pair(&expected, &other_invocation).is_err());
+    }
+
+    #[test]
+    fn route_receipt_binds_grammar_dimensions_and_buffers_without_gpu_work() {
+        let indices = GpuTensor::null_for_test();
+        let weights = GpuTensor::null_for_test();
+        let other_indices = GpuTensor::null_for_test();
+        let other_weights = GpuTensor::null_for_test();
+        let expected = MoeRouteReceipt {
+            invocation: 19,
+            protocol: MoeProtocol::GroupedPrefill,
+            router: MoeRouterInput::PrecomputedSoftmaxTopK,
+            n_experts: 4,
+            k_top: 2,
+            scores: 0,
+            normalized: false,
+            indices: &indices,
+            weights: &weights,
+        };
+        let wrong_protocol = MoeRouteReceipt {
+            invocation: expected.invocation,
+            protocol: MoeProtocol::IndexedDecode,
+            router: expected.router,
+            n_experts: expected.n_experts,
+            k_top: expected.k_top,
+            scores: expected.scores,
+            normalized: expected.normalized,
+            indices: expected.indices,
+            weights: expected.weights,
+        };
+        assert!(validate_route_receipt_pair(&expected, &wrong_protocol).is_err());
+
+        let wrong_router = MoeRouteReceipt {
+            invocation: expected.invocation,
+            protocol: expected.protocol,
+            router: MoeRouterInput::PrecomputedSigmoidTopK,
+            n_experts: expected.n_experts,
+            k_top: expected.k_top,
+            scores: expected.scores,
+            normalized: expected.normalized,
+            indices: expected.indices,
+            weights: expected.weights,
+        };
+        assert!(validate_route_receipt_pair(&expected, &wrong_router).is_err());
+
+        let wrong_dimensions = MoeRouteReceipt {
+            invocation: expected.invocation,
+            protocol: expected.protocol,
+            router: expected.router,
+            n_experts: expected.n_experts + 1,
+            k_top: expected.k_top,
+            scores: expected.scores,
+            normalized: expected.normalized,
+            indices: expected.indices,
+            weights: expected.weights,
+        };
+        assert!(validate_route_receipt_pair(&expected, &wrong_dimensions).is_err());
+
+        let swapped_buffers = MoeRouteReceipt {
+            invocation: expected.invocation,
+            protocol: expected.protocol,
+            router: expected.router,
+            n_experts: expected.n_experts,
+            k_top: expected.k_top,
+            scores: expected.scores,
+            normalized: expected.normalized,
+            indices: &other_indices,
+            weights: &other_weights,
+        };
+        assert!(validate_route_receipt_pair(&expected, &swapped_buffers).is_err());
     }
 }

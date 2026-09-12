@@ -767,7 +767,7 @@ fn reject_mq4g128v2(dtype: DType) -> HipResult<()> {
     if dtype == DType::MQ4G128V2 {
         Err(hip_bridge::HipError::new(
             0,
-            "MQ4G128V2 (qt=53) is CPU/wire-only; GPU decode is unsupported",
+            "generic llama GPU decode does not consume MQ4G128V2 (qt=53); qt=53 is admitted only by typed Qwen4 sealed/dense consumers",
         ))
     } else {
         Ok(())

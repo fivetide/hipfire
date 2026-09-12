@@ -1052,4 +1052,93 @@ mod tests {
             assert!(payload.iter().any(|&b| b != 0));
         }
     }
+    fn decode_mq4g128v2_dot_reference(
+        blob: &[u8],
+        row: usize,
+        k: usize,
+        x_rot: &[f32],
+    ) -> f32 {
+        assert_eq!(x_rot.len(), k);
+        let groups_per_row = k.div_ceil(128);
+        let row_stride = groups_per_row * MQ4G128V2_GROUP_BYTES;
+        let row_base = row * row_stride;
+        let mut acc = 0.0f32;
+        for group in 0..groups_per_row {
+            let base = row_base + group * MQ4G128V2_GROUP_BYTES;
+            let scale = f16_to_f32(u16::from_le_bytes([blob[base], blob[base + 1]]));
+            let zero = f16_to_f32(u16::from_le_bytes([blob[base + 2], blob[base + 3]]));
+            let logical = (k - group * 128).min(128);
+            for i in 0..logical {
+                let qbyte = blob[base + 4 + i / 2];
+                let q = if i & 1 == 0 {
+                    qbyte & 0x0f
+                } else {
+                    qbyte >> 4
+                };
+                acc += (scale * f32::from(q) + zero) * x_rot[group * 128 + i];
+            }
+        }
+        acc
+    }
+
+    #[test]
+    fn mq4g128v2_cpu_reference_covers_ragged_row_local_k() {
+        for &k in &[1usize, 127, 128, 129, 160, 320, 640] {
+            let m = 2usize;
+            let groups_per_row = k.div_ceil(128);
+            let row_stride = groups_per_row * MQ4G128V2_GROUP_BYTES;
+            let mut blob = vec![0u8; m * row_stride];
+            for row in 0..m {
+                for group in 0..groups_per_row {
+                    let base = row * row_stride + group * MQ4G128V2_GROUP_BYTES;
+                    blob[base..base + 2].copy_from_slice(&0x3c00u16.to_le_bytes());
+                    blob[base + 2..base + 4].copy_from_slice(&0u16.to_le_bytes());
+                    for i in 0..128 {
+                        let q = ((row * 5 + group * 3 + i) & 0x0f) as u8;
+                        let byte = &mut blob[base + 4 + i / 2];
+                        if i & 1 == 0 {
+                            *byte = q;
+                        } else {
+                            *byte |= q << 4;
+                        }
+                    }
+                }
+            }
+            let x_rot: Vec<f32> = (0..k).map(|i| 0.25 + i as f32 * 0.007).collect();
+            for row in 0..m {
+                let expected = (0..k)
+                    .map(|i| {
+                        let group = i / 128;
+                        let in_group = i & 127;
+                        let base = row * row_stride + group * MQ4G128V2_GROUP_BYTES;
+                        let qbyte = blob[base + 4 + in_group / 2];
+                        let q = if in_group & 1 == 0 {
+                            qbyte & 0x0f
+                        } else {
+                            qbyte >> 4
+                        };
+                        f32::from(q) * x_rot[i]
+                    })
+                    .sum::<f32>();
+                let actual = decode_mq4g128v2_dot_reference(&blob, row, k, &x_rot);
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "qt53 CPU reference mismatch at row={row}, K={k}: {actual} vs {expected}"
+                );
+            }
+
+            let weights: Vec<f32> = (0..m * k)
+                .map(|i| (i as f32 * 0.013).sin() - 0.2)
+                .collect();
+            let signs1 = gen_fwht_signs(43, 128);
+            let signs2 = gen_fwht_signs(1043, 128);
+            let encoded = quantize_mq4g128v2(&weights, m, k, &signs1, &signs2)
+                .expect("qt53 encoder accepts reference dimensions");
+            assert_eq!(
+                encoded.len(),
+                m * groups_per_row * MQ4G128V2_GROUP_BYTES,
+                "qt53 row extent at K={k}"
+            );
+        }
+    }
 }

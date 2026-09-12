@@ -29,7 +29,7 @@ fn reject_mq4g128v2(dtype: DType, family: &'static str) -> Result<(), DispatchEr
     if dtype == DType::MQ4G128V2 {
         return Err(DispatchError::UnsupportedVariant {
             family,
-            variant: "mq4g128v2_cpu_only",
+            variant: "mq4g128v2_qwen4_typed_only",
             arch: "",
             quant: "MQ4G128V2",
         });
@@ -60,6 +60,50 @@ fn reject_mq4g128v2_moe(dtypes: &crate::families::moe::MoeDtypes<'_>) -> Result<
     }
     Ok(())
 }
+/// Exact sealed Qwen4 routed-expert contract.
+///
+/// Qwen4 is the only production route that pairs qt44 G256 gate/up with
+/// qt53 G128 down.  Keep this predicate narrow: generic MoE dispatch must
+/// continue rejecting qt53 rather than accidentally selecting a route whose
+/// activation basis or top-k ABI is different.
+fn is_qwen4_route(
+    dtypes: &crate::families::moe::MoeDtypes<'_>,
+    n_exp: usize,
+    k_top: usize,
+    hidden: usize,
+    intermediate: usize,
+    gate_up_k: usize,
+    down_m: usize,
+    down_k: usize,
+    dtype_tags: Option<&GpuTensor>,
+) -> bool {
+    let uniform = |table: Option<&[DType]>, expected: DType| {
+        table.map_or(true, |values| values.iter().all(|dtype| *dtype == expected))
+    };
+    n_exp == 512
+        && k_top == 10
+        && hidden == 2560
+        && intermediate == 640
+        && gate_up_k == hidden
+        && down_m == hidden
+        && down_k == intermediate
+        && dtypes.routed_gate_up == DType::MQ4G256V2
+        && dtypes.routed_down == DType::MQ4G128V2
+        && !dtypes.routed_has_mixed_experts
+        && !dtypes.has_paro_shared
+        && uniform(dtypes.per_expert_gate_up, DType::MQ4G256V2)
+        && uniform(dtypes.per_expert_down, DType::MQ4G128V2)
+        && dtype_tags.is_none()
+        && ![
+            dtypes.router,
+            dtypes.shared_gate,
+            dtypes.shared_expert_gate,
+            dtypes.shared_expert_up,
+            dtypes.shared_expert_down,
+        ]
+        .contains(&DType::MQ4G128V2)
+}
+
 
 pub struct Pipeline {
     pub ops: &'static [PipelineOp],
@@ -635,7 +679,20 @@ pub(super) fn run_moe_decode(
     let p = call.decode_params().ok_or_else(|| {
         DispatchError::Hip("sealed moe: decode call has no decode operands".into())
     })?;
-    reject_mq4g128v2_moe(&p.dtypes)?;
+    let qwen4 = is_qwen4_route(
+        &p.dtypes,
+        p.n_exp,
+        p.k,
+        p.hidden,
+        p.mi,
+        p.routed_gate_up_k,
+        p.routed_down_m,
+        p.routed_down_k,
+        p.expert_dtype_tags,
+    );
+    if !qwen4 {
+        reject_mq4g128v2_moe(&p.dtypes)?;
+    }
 
     // Runtime guard matching the bias-aware decode guard (not debug_assert —
     // that would be stripped in release). batch_size=1 is the only valid
@@ -660,7 +717,14 @@ pub(super) fn run_moe_decode(
     // deep `select_nth_unstable_by` panic in the fallback into a clean error.
     // NOTE: k != 8 is intentionally NOT rejected — the fallback handles k ∈
     // [1, n_exp] (MQ4 k=4, F32 k=2, …).
-    check_moe_decode_supported(res.use_gpu_topk, p.k, p.n_exp, !p.routed_experts.is_empty())?;
+    if !qwen4 {
+        check_moe_decode_supported(
+            res.use_gpu_topk,
+            p.k,
+            p.n_exp,
+            !p.routed_experts.is_empty(),
+        )?;
+    }
 
     // EP (Ship 6 substrate-EP): when `routed_out` is set, the shared-down and
     // routed-combine accumulate into that zeroed partial (all-reduced by the EP
@@ -890,6 +954,11 @@ pub(super) fn run_moe_decode(
             gemv.run_auto(ctx, gpu, &p.shared_up_w, p.x_norm, &shared_up)
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
         }
+    }
+
+    if qwen4 {
+        let x_rot = x_rot_local.expect("Qwen4 qt44 gate/up requires G256 rotation");
+        return run_qwen4_decode(ctx, gpu, p, &shared_gate, &shared_up, x_rot);
     }
 
     // ── Top-K + routed experts: CPU-top-K generic fallback ───────────────────
@@ -1769,6 +1838,98 @@ pub(super) fn run_moe_decode(
         ))?;
     }
 
+    Ok(())
+}
+
+/// Canonical Qwen4 indexed decode executor.
+///
+/// This is deliberately separate from the k=8 family: qt44 gate/up consumes
+/// the G256 rotation, qt53 down consumes a fresh G128 rotation, and the route
+/// producer/combine both have fixed top-10 ABIs.  No generic dtype arm is
+/// widened to qt53.
+fn run_qwen4_decode(
+    ctx: &DispatchCtx,
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoeParams<'_>,
+    shared_gate: &GpuTensor,
+    shared_up: &GpuTensor,
+    x_rot: &GpuTensor,
+) -> Result<(), DispatchError> {
+    let out_target = p.routed_out.unwrap_or(p.x_residual);
+
+    // The shared expert is replicated and contributes exactly once.  Qwen4's
+    // shared projections are natural-basis dense weights, so do not reuse the
+    // routed qt44/qt53 rotations for this subgraph.
+    if !p.skip_shared {
+        #[cfg(feature = "deltanet")]
+        {
+            hip!(gpu.sigmoid_f32(p.scalar_buf))?;
+            let shared_hid = slice_moe_f32_view(p.ffn_hidden, 0, p.smi);
+            hip!(gpu.silu_mul_f32(shared_gate, shared_up, &shared_hid))?;
+            static GEMV_QWEN4_SHARED_DOWN: LazyLock<GemvFamily> = LazyLock::new(GemvFamily::new);
+            let gemv = &*GEMV_QWEN4_SHARED_DOWN;
+            gemv.run_auto(ctx, gpu, &p.shared_down_w, &shared_hid, p.ffn_out)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            hip!(gpu.scaled_add_inplace_gpu_scalar_f32(
+                out_target,
+                p.ffn_out,
+                p.scalar_buf
+            ))?;
+        }
+        #[cfg(not(feature = "deltanet"))]
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "qwen4-shared-down-requires-deltanet",
+            arch: "",
+            quant: "",
+        });
+    }
+
+    hip!(gpu.moe_router_softmax_top10_f32(
+        p.router_logits,
+        p.topk_indices,
+        p.topk_weights,
+        1,
+        p.norm_topk_prob,
+    ))?;
+
+    let routed_slots = 10usize
+        .checked_mul(p.mi)
+        .ok_or_else(|| DispatchError::Hip("Qwen4 routed slot width overflow".into()))?;
+    let gate_batch = slice_moe_f32_view(p.gate_batch, 0, routed_slots);
+    let up_batch = slice_moe_f32_view(p.up_batch, 0, routed_slots);
+    let rot_batch = slice_moe_f32_view(p.rot_batch, 0, routed_slots);
+    let down_expanded = slice_moe_f32_view(p.down_expanded, 0, 10 * p.hidden);
+
+    hip!(gpu.gemv_mq4g256v2_moe_gate_up_top10_indexed_batched(
+        p.expert_gate_up_ptrs,
+        p.topk_indices,
+        x_rot,
+        &gate_batch,
+        &up_batch,
+        2 * p.mi,
+        p.hidden,
+        1,
+    ))?;
+    hip!(gpu.silu_mul_f32(&gate_batch, &up_batch, &rot_batch))?;
+    hip!(gpu.rotate_x_mq_128_v2(&rot_batch, &rot_batch, p.mi, 10))?;
+    hip!(gpu.gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded(
+        p.expert_down_ptrs,
+        p.topk_indices,
+        &rot_batch,
+        &down_expanded,
+        p.routed_down_m,
+        p.routed_down_k,
+        1,
+        p.n_exp,
+    ))?;
+    hip!(gpu.moe_down_combine_top10_batched(
+        &down_expanded,
+        p.topk_weights,
+        out_target,
+        p.hidden,
+        1,
+    ))?;
     Ok(())
 }
 
@@ -2902,17 +3063,122 @@ pub fn run_moe_prefill_bias_aware(
 /// constant in qwen35.rs and the scatter kernel.
 const MOE_GROUPED_BLOCK_M: usize = 16;
 
+// Dispatch one grouped-GEMM for the given routed expert dtype.
+//
+// Deduplicates the per-dtype×i8×k8 grouped-kernel match for gate_up
+// and down — the only difference is `x` (gate_up reads `x_rot_batch`
+// `[N×dim]`, down reads `rot_batch` `[N*k_top×mi]`), `m`, `k`, and
+// `x_row_div`.
+//
+// The Paro gate_up `givens_rotate_to` preamble is NOT in this helper —
+// it stays in the gate_up block above the call site. Down has no
+// preamble because `rot_batch` is already Givens-rotated by the
+// silu+rotate step.
+/// Canonical Qwen4 grouped-prefill executor.
+///
+/// The gate/up grouped WMMA keeps the established qt44 contraction, while the
+/// down grouped consumer is the dedicated qt53 path.  Route permutation,
+/// unscatter, SwiGLU, and combine all use fixed top-10 symbols so the legacy
+/// k=8 family remains untouched.
+fn run_qwen4_prefill(
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoePrefillParams<'_>,
+) -> Result<(), DispatchError> {
+    let total_slots = p
+        .batch_size
+        .checked_mul(10)
+        .ok_or_else(|| DispatchError::Hip("Qwen4 prefill slot count overflow".into()))?;
+    let grouped_rows = p.m_total_max;
+    if total_slots == 0 || grouped_rows == 0 {
+        return Err(DispatchError::Hip(
+            "Qwen4 prefill requires nonzero route and grouped capacities".into(),
+        ));
+    }
+    let slots_hidden = total_slots
+        .checked_mul(p.mi)
+        .ok_or_else(|| DispatchError::Hip("Qwen4 prefill activation capacity overflow".into()))?;
+    let out_target = p.routed_out.unwrap_or(p.x_batch);
+
+    // Qwen4 gate/up weights consume the natural H->G256 FWHT basis.  The
+    // model-owned x_rot_batch is overwritten here so a stale pre-rotation
+    // cannot silently feed a different layer's activation.
+    hip!(gpu.rotate_x_mq_batched(
+        p.x_norm_batch,
+        p.x_rot_batch,
+        p.gate_up_k,
+        p.batch_size,
+    ))?;
+    hip!(gpu.moe_scatter_fused_top10(
+        p.topk_indices,
+        p.expert_token_counts,
+        p.expert_offsets,
+        p.sorted_slot_index,
+        p.expert_tile_ids,
+        p.inverse_perm,
+        total_slots,
+        p.n_exp,
+        grouped_rows,
+        MOE_GROUPED_BLOCK_M,
+    ))?;
+    hip!(gpu.gemm_mq4g256v2_moe_grouped_top10(
+        p.expert_gate_up_ptrs,
+        p.expert_tile_ids,
+        p.sorted_slot_index,
+        p.x_rot_batch,
+        p.y_gate_up_grouped,
+        2 * p.mi,
+        p.gate_up_k,
+        10,
+        grouped_rows,
+        p.batch_size,
+    ))?;
+    hip!(gpu.moe_gate_up_unscatter_top10(
+        p.y_gate_up_grouped,
+        p.sorted_slot_index,
+        p.gate_batch,
+        p.up_batch,
+        p.mi,
+        grouped_rows,
+        p.batch_size,
+    ))?;
+
+    let gate_batch = slice_moe_f32_view(p.gate_batch, 0, slots_hidden);
+    let up_batch = slice_moe_f32_view(p.up_batch, 0, slots_hidden);
+    let rot_batch = slice_moe_f32_view(p.rot_batch, 0, slots_hidden);
+    hip!(gpu.silu_mul_f32(&gate_batch, &up_batch, &rot_batch))?;
+    hip!(gpu.rotate_x_mq_128_v2(
+        &rot_batch,
+        &rot_batch,
+        p.mi,
+        total_slots,
+    ))?;
+
+    hip!(gpu.gemm_mq4g128v2_moe_grouped_top10(
+        p.expert_down_ptrs,
+        p.expert_tile_ids,
+        p.sorted_slot_index,
+        &rot_batch,
+        p.y_down_grouped,
+        p.down_m,
+        p.down_k,
+        1,
+        grouped_rows,
+        total_slots,
+        p.n_exp,
+    ))?;
+    hip!(gpu.moe_down_combine_grouped_top10(
+        p.y_down_grouped,
+        p.inverse_perm,
+        p.topk_weights,
+        out_target,
+        p.down_m,
+        grouped_rows,
+        p.batch_size,
+    ))?;
+    Ok(())
+}
+
 /// Dispatch one grouped-GEMM for the given routed expert dtype.
-///
-/// Deduplicates the per-dtype×i8×k8 grouped-kernel match for gate_up
-/// and down — the only difference is `x` (gate_up reads `x_rot_batch`
-/// `[N×dim]`, down reads `rot_batch` `[N*k_top×mi]`), `m`, `k`, and
-/// `x_row_div`.
-///
-/// The Paro gate_up `givens_rotate_to` preamble is NOT in this helper —
-/// it stays in the gate_up block above the call site. Down has no
-/// preamble because `rot_batch` is already Givens-rotated by the
-/// silu+rotate step.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_grouped_gemm(
     gpu: &mut Gpu,
@@ -3136,6 +3402,20 @@ pub(super) fn run_moe_prefill(
     let p = call.prefill_params().ok_or_else(|| {
         DispatchError::Hip("sealed moe: prefill call has no prefill operands".into())
     })?;
+    let qwen4 = is_qwen4_route(
+        &p.dtypes,
+        p.n_exp,
+        p.k_top,
+        p.gate_up_k,
+        p.mi,
+        p.gate_up_k,
+        p.down_m,
+        p.down_k,
+        p.expert_dtype_tags,
+    );
+    if qwen4 {
+        return run_qwen4_prefill(gpu, p);
+    }
     reject_mq4g128v2_moe(&p.dtypes)?;
 
     let res = MoePrefillResolution::resolve(&p.dtypes, &ctx.arch, &ctx.flags);

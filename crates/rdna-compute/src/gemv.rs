@@ -386,6 +386,60 @@ impl Gpu {
         }
         result
     }
+    /// Qwen4 qt53 (MQ4G128V2) GEMV against a G128-rotated activation.
+    ///
+    /// This is deliberately separate from the legacy MQ4G128/V1 launcher:
+    /// qt53 rows use a 68-byte f16-header format and ceil(K/128) groups.
+    pub fn gemv_mq4g128v2(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "gemv_mq4g128v2";
+        self.ensure_kernel(FUNC, kernels::GEMV_MQ4G128V2_SRC, FUNC)?;
+
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x_rot.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let bytes = m
+            .saturating_mul(k.div_ceil(128).saturating_mul(68))
+            .saturating_add(m.saturating_mul(k).saturating_mul(4));
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
 
     /// ParoQuant Givens rotation: apply learned pairwise rotations + channel
     /// scaling to activation vector x in-place. Called before GEMV on
@@ -3460,6 +3514,8 @@ impl Gpu {
             &kv as *const _ as *mut c_void,
         ];
         let bytes = crate::profile::mq_rotate_bytes(k) * batch_size;
+
+
         let timer = crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x_batched", bytes);
         let result = self.launch_maybe_blob(
             kernel,
@@ -3488,6 +3544,61 @@ impl Gpu {
         self.invalidate_x_caches_for(xrp);
         result
     }
+    /// FWHT-128 rotation for qt53 activations.
+    ///
+    /// Unlike the legacy V1 launcher this handles a logical tail when K is
+    /// not a multiple of 128 and writes only the logical K elements.
+    pub fn rotate_x_mq_128_v2(
+        &mut self,
+        x: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "mq_rotate_x_128_v2";
+        self.ensure_kernel(FUNC, kernels::MQ_ROTATE_X_128_V2_SRC, FUNC)?;
+        self.ensure_mq_signs_128()?;
+
+        let xp = x.buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let s1 = self.scratch.mq_signs1_128.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2_128.as_ref().unwrap().buf.as_ptr();
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        let bytes = k
+            .saturating_mul(batch_size)
+            .saturating_mul(std::mem::size_of::<f32>());
+        let timer = crate::profile::begin_timer(&self.hip, "fwht", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [k.div_ceil(128) as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(xrp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
 
     /// FWHT-128 standalone rotation for MQ4G128 activations.
     ///
@@ -11057,6 +11168,56 @@ impl Gpu {
         }
         result
     }
+    /// Batched top-10 companion for sealed Qwen4 prefill.  Inputs are already
+    /// softmaxed/sigmoid scores; route normalization is performed once here.
+    pub fn moe_topk_renorm_top10_batched(
+        &mut self,
+        probs: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w: &GpuTensor,
+        n_exp: usize,
+        norm_topk: bool,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "moe_topk_renorm_top10_batched";
+        self.ensure_kernel(FUNC, kernels::MOE_TOPK_RENORM_TOP10_BATCHED_SRC, FUNC)?;
+        let lp = probs.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let n = n_exp as i32;
+        let nr = if norm_topk { 1i32 } else { 0i32 };
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+        ];
+        let bytes = (n_exp * 4 + 10 * (4 + 4)) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [batch_size as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_i32(n);
+                b.push_i32(nr);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
 
     /// N-batched indexed MoE gate_up. Grid = (M, K_TOP, N). `x` is
     /// [N × K], `topk_indices` is [N × K_TOP] i32, `y_gate` and `y_up`

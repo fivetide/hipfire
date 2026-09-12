@@ -84,11 +84,12 @@ pub const GL_MQ3_GROUP_IDX_BYTES: usize = 96;
 /// half-wave uniform, lane-invariant scalar loads. `K % 256 == 0`.
 pub const MQ4V2_GROUP_BYTES: usize = 136;
 
-/// Per-group bytes for MQ4-G128 v2 (qt=53), a row-local CPU/wire format.
+/// Per-group bytes for MQ4-G128 v2 (qt=53), a row-local format admitted by
+/// typed Qwen4 sealed/dense consumers.
 ///
-/// qt=53 has no GPU decoder yet.  Keep the constant here so runtime extent
-/// checks share the wire size without aliasing it to the legacy 72-byte
-/// `MQ4G128` layout.
+/// Generic GPU consumers still reject qt=53. Keep this constant here so
+/// runtime extent checks share the wire size without aliasing it to the legacy
+/// 72-byte `MQ4G128` layout.
 pub const MQ4G128V2_GROUP_BYTES: usize = 68;
 
 /// Per-group bytes for MQ4-G256-C (qt=45): 136 B/group, 4.25 bpw, byte-identical
@@ -336,8 +337,9 @@ pub enum DType {
     /// Per-group 104 B: `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
     /// `[6..8)` fp16 z1, `[8..104)` 96 B 3-bit payload (8/3 B). Same half
     /// MQ4-G128 v2 (qt=53): row-local FWHT-128, 68 B per `ceil(K/128)` group.
-    /// This is a CPU/wire representation only; GPU consumers must reject it
-    /// rather than treating it as legacy `MQ4G128` (72 B/group).
+    /// Typed Qwen4 sealed/dense consumers use dedicated kernels; generic GPU
+    /// consumers must reject it rather than treating it as legacy `MQ4G128`
+    /// (72 B/group).
     MQ4G128V2,
     MQ4G128, // MagnumQuant: FWHT-128-rotated INT4 (72 bytes/group, same layout as HFQ4G128)
     MQ3G256V2,
