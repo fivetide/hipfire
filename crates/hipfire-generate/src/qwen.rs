@@ -58,10 +58,7 @@ use rdna_compute;
 /// exposing their synthetic token. Keeping this sequencing in one inline gate
 /// makes the no-failure-publication contract explicit and testable without HIP.
 #[inline]
-fn publish_after_forward<E>(
-    forward: Result<(), E>,
-    publish: impl FnOnce(),
-) -> Result<(), E> {
+fn publish_after_forward<E>(forward: Result<(), E>, publish: impl FnOnce()) -> Result<(), E> {
     forward?;
     publish();
     Ok(())
@@ -575,15 +572,7 @@ pub fn ep_serve_qwen35_dense_tp(
                 return Err("EP arch mismatch (expected dense Qwen TP)".to_string());
             };
             qwen35::forward_scratch_dense_tp(
-                gpus,
-                shard,
-                weights,
-                configs,
-                next,
-                write_pos,
-                kv_caches,
-                dn_states,
-                scratches,
+                gpus, shard, weights, configs, next, write_pos, kv_caches, dn_states, scratches,
             )
             .map_err(|e| format!("dense TP decode: {e:?}"))
         })();
@@ -5680,7 +5669,6 @@ pub fn generate_mesh_carrier(
     );
 }
 
-
 // --- Auto-appended shared helpers (shared-temp, dedup at merge) ---
 
 /// Walk a [`serde_json::Value`] and produce a canonical-key
@@ -6963,4 +6951,269 @@ mod pp_forward_order_tests {
         assert_eq!(result, Ok(()));
         assert_eq!(events, vec!["token"]);
     }
+}
+
+/// Single-GPU Qwen4 AR producer.
+///
+/// Qwen4 owns a hybrid GDN/QSA state machine rather than a Qwen3.5
+/// `forward_scratch` bundle.  Keep this body behind the existing AR route
+/// scheduler and semantic producer: the only architecture-specific operation
+/// here is the carrier-owned [`Qwen4Bundle::forward_chunk`]/
+/// [`Qwen4Bundle::forward_token`] call.  Prompt state is reset at the start of
+/// every turn until a verified prompt-cache contract exists for Qwen4.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_qwen4_ar(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    max_think_tokens: usize,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    think_mode: ThinkMode,
+    stop: &[String],
+    reasoning_effort: Option<&str>,
+    enable_thinking: bool,
+    _request_seed: u32,
+) {
+    let route = crate::ar::GenerationRoute::Qwen4Ar;
+    let Some((vocab_size, eos_token)) = m
+        .qwen4()
+        .map(|bundle| (bundle.config.vocab_size, bundle.config.eos_token_id))
+    else {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "qwen4 AR dispatch requires a loaded Qwen4 bundle",
+            "internal",
+            false,
+            false,
+        );
+        return;
+    };
+    if max_tokens == 0 {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "max_tokens must be > 0",
+            "validation",
+            false,
+            false,
+        );
+        return;
+    }
+
+    // The Qwen4 carrier currently rejects speculative/PFlash state, so these
+    // inputs are intentionally consumed by the common AR contract rather than
+    // silently selecting another producer.
+    let _ = think_mode;
+
+    let mut started_in_think = matches!(
+        assistant_prefix,
+        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+    );
+    let prompt_tokens = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0");
+        let prompt_tokens = if jinja_enabled {
+            if let Some(template) = m.chat_template.as_ref() {
+                let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                    tokenizer,
+                    template,
+                    system: system_prompt,
+                    user: prompt,
+                    enable_thinking,
+                    bos_token: None,
+                    reasoning_strength: None,
+                    reasoning_effort,
+                };
+                let rendered = if tools.is_some() || messages_history.is_some() {
+                    let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+                    let messages = match messages_history {
+                        Some(messages) => messages,
+                        None => {
+                            let mut value = Vec::new();
+                            if let Some(system) = system_prompt {
+                                value.push(hipfire_runtime::prompt_frame::Message {
+                                    role: hipfire_runtime::prompt_frame::Role::System,
+                                    content: system.to_string(),
+                                    reasoning_content: None,
+                                    name: None,
+                                    rendered_name: None,
+                                    tool_calls: Vec::new(),
+                                    tool_call_id: None,
+                                    tool_plan: String::new(),
+                                });
+                            }
+                            value.push(hipfire_runtime::prompt_frame::Message {
+                                role: hipfire_runtime::prompt_frame::Role::User,
+                                content: prompt.to_string(),
+                                reasoning_content: None,
+                                name: None,
+                                rendered_name: None,
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                                tool_plan: String::new(),
+                            });
+                            synthesized = value;
+                            &synthesized
+                        }
+                    };
+                    frame.render_messages(messages, tools, None)
+                } else {
+                    frame.render()
+                };
+                match rendered {
+                    Ok(rendered) => {
+                        started_in_think = render_tail_opens_think(&rendered);
+                        tokenizer.encode(&rendered)
+                    }
+                    Err(error) => {
+                        emit_active_attempt_error(
+                            stdout,
+                            Some(id),
+                            &format!("qwen4 Jinja render failed: {error}"),
+                            "validation",
+                            false,
+                            false,
+                        );
+                        return;
+                    }
+                }
+            } else {
+                hipfire_runtime::prompt_frame::ChatFrame {
+                    tokenizer,
+                    system: system_prompt,
+                    user: prompt,
+                    assistant_prefix,
+                    raw: false,
+                }
+                .build()
+            }
+        } else {
+            hipfire_runtime::prompt_frame::ChatFrame {
+                tokenizer,
+                system: system_prompt,
+                user: prompt,
+                assistant_prefix,
+                raw: false,
+            }
+            .build()
+        };
+        prompt_tokens
+    };
+    if prompt_tokens.is_empty() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "qwen4 AR prompt rendered to zero tokens",
+            "validation",
+            false,
+            false,
+        );
+        return;
+    }
+    let required = prompt_tokens
+        .len()
+        .checked_add(max_tokens)
+        .and_then(|n| n.checked_add(1));
+    if required.is_none_or(|n| n > m.max_seq) {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "qwen4 request exceeds context window: prompt={} + max_tokens={} + trailer=1 > max_seq={}",
+                prompt_tokens.len(),
+                max_tokens,
+                m.max_seq
+            ),
+            "context_length",
+            false,
+            false,
+        );
+        return;
+    }
+
+    // Qwen4 state has no validated prefix-cache splice yet.  Reset before
+    // replaying the canonical rendered prompt so retry and multi-turn paths
+    // cannot mix old QSA/GDN/PLE state with a new prompt.
+    if m.seq_pos != 0 || !m.conversation_tokens.is_empty() {
+        let reset = m
+            .qwen4_mut()
+            .ok_or_else(|| "qwen4 AR state disappeared before reset".to_string())
+            .and_then(|bundle| bundle.reset(gpu).map_err(|error| error.to_string()));
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+        if let Err(error) = reset {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                &format!("qwen4 pre-generation reset failed: {error}"),
+                "gpu",
+                false,
+                &ep,
+            );
+            return;
+        }
+    }
+
+    crate::ar::generate_ar_with_forward(
+        m,
+        gpu,
+        stdout,
+        id,
+        route,
+        &prompt_tokens,
+        vocab_size,
+        eos_token,
+        temp,
+        top_p,
+        top_k,
+        min_p,
+        max_tokens,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty,
+        frequency_penalty,
+        max_think_tokens,
+        started_in_think,
+        stop,
+        true,
+        |model, device, tokens, logits| {
+            model
+                .qwen4_mut()
+                .ok_or_else(|| "qwen4 AR bundle disappeared before prefill".to_string())
+                .and_then(|bundle| {
+                    bundle
+                        .forward_chunk(device, tokens, logits, None)
+                        .map_err(|error| error.to_string())
+                })
+        },
+        |model, device, token, logits| {
+            model
+                .qwen4_mut()
+                .ok_or_else(|| "qwen4 AR bundle disappeared during decode".to_string())
+                .and_then(|bundle| {
+                    bundle
+                        .forward_token(device, token, logits, None)
+                        .map_err(|error| error.to_string())
+                })
+        },
+    );
 }

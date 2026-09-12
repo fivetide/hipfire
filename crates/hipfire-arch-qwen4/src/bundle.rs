@@ -10,6 +10,7 @@
 //! local may outlive publication as a second owner.
 
 use crate::config::Qwen4Config;
+use crate::gpu_forward::Qwen4GpuForward;
 use crate::ple::PleHashMetadata;
 use crate::ple_rows::{PleRows, PleRowsError};
 use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
@@ -20,7 +21,7 @@ use crate::weights::{
 use hipfire_runtime::model_source::SourceRangeDescriptor;
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
 use hipfire_runtime::weight_store::{WeightLoadTransaction, WeightStoreError};
-use rdna_compute::Gpu;
+use rdna_compute::{Gpu, GpuTensor};
 use std::fmt;
 use std::time::Duration;
 
@@ -79,6 +80,10 @@ pub struct Qwen4Bundle {
     /// Canonical load census and external descriptors.  This is deliberately
     /// not left in the loader or carrier after publication.
     pub(crate) weight_store: AttachedWeightStore,
+    /// Reusable ordinary-HIP execution resources.  This remains attached to
+    /// the published bundle so unload owns the scratch, expert pointer tables,
+    /// and all per-layer dispatch state exactly once.
+    pub(crate) execution: Option<Qwen4GpuForward>,
 }
 
 impl Qwen4Bundle {
@@ -157,6 +162,7 @@ impl Qwen4Bundle {
             ple_rows,
             ple_metadata: metadata,
             weight_store: AttachedWeightStore::new(transaction),
+            execution: None,
         })
     }
 
@@ -209,6 +215,57 @@ impl Qwen4Bundle {
 
     pub fn attached_external_rows_len(&self) -> usize {
         self.weight_store.external_rows_len()
+    }
+
+    /// Attach reusable ordinary-HIP execution resources after the manifest
+    /// transaction and model state have assembled successfully.
+    pub fn attach_forward(&mut self, gpu: &mut Gpu, max_chunk: usize) -> Result<(), BundleError> {
+        if self.execution.is_some() {
+            return Err(BundleError::Forward(
+                "Qwen4 forward resources are already attached".to_string(),
+            ));
+        }
+        let forward = Qwen4GpuForward::new(gpu, self, max_chunk)
+            .map_err(|error| BundleError::Forward(error.to_string()))?;
+        self.execution = Some(forward);
+        Ok(())
+    }
+
+    /// Run one token through the attached execution owner without exposing a
+    /// second bundle owner to callers.
+    pub fn forward_token(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        logits: &GpuTensor,
+        top1: Option<&GpuTensor>,
+    ) -> Result<(), BundleError> {
+        let mut forward = self.execution.take().ok_or_else(|| {
+            BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+        })?;
+        let result = forward
+            .forward_token(self, gpu, token, logits, top1)
+            .map_err(|error| BundleError::Forward(error.to_string()));
+        self.execution = Some(forward);
+        result
+    }
+
+    /// Run a bounded token chunk through the same attached execution owner.
+    pub fn forward_chunk(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        logits: &GpuTensor,
+        top1: Option<&GpuTensor>,
+    ) -> Result<(), BundleError> {
+        let mut forward = self.execution.take().ok_or_else(|| {
+            BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+        })?;
+        let result = forward
+            .forward_chunk(self, gpu, tokens, logits, top1)
+            .map_err(|error| BundleError::Forward(error.to_string()));
+        self.execution = Some(forward);
+        result
     }
 
     fn invalidate_ple_epoch(&self) -> Result<(), BundleError> {
@@ -269,15 +326,58 @@ impl Qwen4Bundle {
             state,
             ple_rows,
             weight_store,
+            execution,
             ..
         } = self;
         let ple_result = ple_rows.unload().map(|_| ()).map_err(BundleError::PleRows);
+        let execution_result = execution
+            .map(|forward| forward.free_gpu(gpu).map_err(BundleError::Hip))
+            .unwrap_or(Ok(()));
         let state_result = state.free_gpu(gpu).map_err(BundleError::State);
         let weight_result = weights.free_gpu(gpu).map_err(BundleError::Hip);
         let store_result = weight_store.drain(gpu).map_err(BundleError::Hip);
-        first_bundle_error([ple_result, state_result, weight_result, store_result])
+        first_bundle_error([
+            ple_result,
+            execution_result,
+            state_result,
+            weight_result,
+            store_result,
+        ])
     }
 }
+
+impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
+    fn dim(&self) -> usize {
+        self.config.hidden_size
+    }
+
+    fn n_layers(&self) -> usize {
+        self.config.num_hidden_layers
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+
+    fn arch_key(&self) -> &'static str {
+        "qwen4"
+    }
+
+    fn kv_cache_mut(&mut self) -> Option<&mut hipfire_runtime::llama::KvCache> {
+        None
+    }
+
+    fn reset_session_state(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.reset(gpu).map_err(|error| error.to_string())
+    }
+
+    fn free_gpu(self: Box<Self>, gpu: &mut Gpu) {
+        if let Err(error) = Qwen4Bundle::free_gpu(*self, gpu) {
+            eprintln!("Qwen4 bundle teardown failed: {error}");
+        }
+    }
+}
+
 const PLE_SHARD_NAME_PREFIX: &str =
     "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_";
 
@@ -477,7 +577,7 @@ fn cleanup_bundle_failure(
     }
 }
 
-fn first_bundle_error(results: [Result<(), BundleError>; 4]) -> Result<(), BundleError> {
+fn first_bundle_error(results: [Result<(), BundleError>; 5]) -> Result<(), BundleError> {
     let mut first = None;
     for result in results {
         if let Err(error) = result {
@@ -495,6 +595,7 @@ pub enum BundleError {
     Weights(WeightError),
     State(StateError),
     PleRows(PleRowsError),
+    Forward(String),
     Hip(hip_bridge::HipError),
     Rollback {
         cause: String,
@@ -521,6 +622,7 @@ impl fmt::Display for BundleError {
             Self::Config(message) => write!(f, "Qwen4 bundle config: {message}"),
             Self::Weights(error) => write!(f, "Qwen4 bundle weights: {error}"),
             Self::State(error) => write!(f, "Qwen4 bundle state: {error}"),
+            Self::Forward(error) => write!(f, "Qwen4 bundle forward: {error}"),
             Self::PleRows(error) => write!(f, "Qwen4 bundle PLE rows: {error}"),
             Self::Hip(error) => write!(f, "Qwen4 bundle HIP teardown: {error}"),
             Self::Rollback { cause, error } => {

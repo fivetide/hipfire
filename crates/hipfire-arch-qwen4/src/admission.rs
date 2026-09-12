@@ -29,8 +29,10 @@ pub enum Qwen4Capability {
     NativeMtp,
 }
 
-/// Qwen4 is text-only at the initial capability boundary.  Image and video
-/// are represented as unsupported rather than silently routed to text.
+/// Qwen4 is text-only at the initial capability boundary. Image and video
+/// requests are represented as unsupported rather than silently routed to
+/// text. Native greedy-MTP remains reserved for the later adapter: this AR
+/// owner deliberately does not publish or accept it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Qwen4Capabilities {
     pub text: bool,
@@ -40,13 +42,19 @@ pub struct Qwen4Capabilities {
 }
 
 impl Qwen4Capabilities {
-    pub const fn text_mtp() -> Self {
+    pub const fn text_ar() -> Self {
         Self {
             text: true,
-            native_mtp: true,
+            native_mtp: false,
             image: false,
             video: false,
         }
+    }
+
+    /// Retain the source-compatible constructor name while keeping native
+    /// MTP disabled until its execution adapter is admitted.
+    pub const fn text_mtp() -> Self {
+        Self::text_ar()
     }
 
     pub const fn supports_modality(self, modality: InputModality) -> bool {
@@ -67,7 +75,7 @@ impl Qwen4Capabilities {
 
 impl Default for Qwen4Capabilities {
     fn default() -> Self {
-        Self::text_mtp()
+        Self::text_ar()
     }
 }
 
@@ -358,6 +366,17 @@ impl Qwen4AdmissionRequest {
     }
 }
 
+/// Successful pure admission result.  This value carries only validated
+/// architecture/capability/topology facts; GPU allocations and source readers
+/// remain owned by the later carrier lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qwen4Admission {
+    pub architecture_id: u32,
+    pub capabilities: Qwen4Capabilities,
+    pub effective_mesh: EffectiveMesh,
+    pub native_mtp: bool,
+}
+
 /// Why a request was refused.  Every variant is detected before allocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdmissionError {
@@ -425,14 +444,6 @@ impl std::error::Error for AdmissionError {}
 
 /// Successful, immutable result passed to a later loader/carrier.  It carries
 /// no GPU or reader handle and therefore cannot imply production admission.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Qwen4Admission {
-    pub architecture_id: u32,
-    pub capabilities: Qwen4Capabilities,
-    pub effective_mesh: EffectiveMesh,
-    pub native_mtp: bool,
-}
-
 impl Qwen4Admission {
     /// Validate all pure boundaries in order: config, capability, mesh,
     /// container, then exact quant recipe.
@@ -441,7 +452,7 @@ impl Qwen4Admission {
         request: &Qwen4AdmissionRequest,
     ) -> Result<Self, AdmissionError> {
         config.validate().map_err(AdmissionError::InvalidConfig)?;
-        let capabilities = Qwen4Capabilities::text_mtp();
+        let capabilities = Qwen4Capabilities::text_ar();
         if !capabilities.supports_modality(request.modality) {
             return Err(AdmissionError::UnsupportedModality(request.modality));
         }
@@ -562,15 +573,27 @@ mod tests {
     }
 
     #[test]
-    fn text_mtp_single_hfqm_is_admitted() {
+    fn native_mtp_remains_unadmitted_until_adapter_lands() {
         let request = Qwen4AdmissionRequest::text_mtp(
             EffectiveMesh::single(),
             Qwen4Artifact::manifest_hfqm(),
         );
-        let admission = Qwen4Admission::admit(&config(), &request).unwrap();
-        assert_eq!(admission.architecture_id, ARCH_ID);
-        assert!(admission.capabilities.text);
-        assert!(admission.capabilities.native_mtp);
+        assert!(matches!(
+            Qwen4Admission::admit(&config(), &request),
+            Err(AdmissionError::UnsupportedCapability(
+                Qwen4Capability::NativeMtp
+            ))
+        ));
+        let ar = Qwen4Admission::admit(
+            &config(),
+            &Qwen4AdmissionRequest::text_ar(
+                EffectiveMesh::single(),
+                Qwen4Artifact::manifest_hfqm(),
+            ),
+        )
+        .expect("AR remains admitted");
+        assert!(ar.capabilities.text);
+        assert!(!ar.capabilities.native_mtp);
     }
 
     #[test]

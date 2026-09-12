@@ -68,6 +68,13 @@ fn capability_rows() -> Vec<(GenerationRoute, GenerationRouteInputs)> {
             },
         ),
         (
+            GenerationRoute::Qwen4Ar,
+            GenerationRouteInputs {
+                arch_id: 16,
+                ..base()
+            },
+        ),
+        (
             GenerationRoute::QwenDflash,
             GenerationRouteInputs {
                 arch_id: 5,
@@ -252,6 +259,7 @@ fn capability_rows() -> Vec<(GenerationRoute, GenerationRouteInputs)> {
 /// Exact proven-safe producer set (contract).
 const SAFE_ROUTES: &[GenerationRoute] = &[
     GenerationRoute::QwenAr,
+    GenerationRoute::Qwen4Ar,
     GenerationRoute::QwenDflash,
     GenerationRoute::Deepseek4Ar,
     GenerationRoute::Deepseek4Ep,
@@ -370,7 +378,7 @@ fn route_matrix_tools_absent_and_present() {
 }
 
 #[test]
-fn exact_safe_set_is_qwen_ar_dflash_ds4_ar_ep_spec_glimmer_ar_spec_and_maple_ar() {
+fn exact_safe_set_is_qwen_ar_qwen4_ar_dflash_ds4_ar_ep_spec_glimmer_ar_spec_and_maple_ar() {
     let mut from_all: Vec<GenerationRoute> = GenerationRoute::ALL
         .iter()
         .copied()
@@ -380,7 +388,7 @@ fn exact_safe_set_is_qwen_ar_dflash_ds4_ar_ep_spec_glimmer_ar_spec_and_maple_ar(
     let mut expected = SAFE_ROUTES.to_vec();
     expected.sort_by_key(|r| r.name());
     assert_eq!(from_all, expected);
-    assert_eq!(from_all.len(), 8);
+    assert_eq!(from_all.len(), 9);
     // Negative: every other ALL member is denied for tools.
     for &r in GenerationRoute::ALL {
         if !SAFE_ROUTES.contains(&r) {

@@ -348,8 +348,11 @@ pub struct HfqFile {
     /// memory consumption. Dropped after header/index parsing via
     /// `drop_mmap()`. When `None`, all tensor reads go through `pread`.
     mmap: Option<Mmap>,
-    pub arch_id: u32,
+    /// HFQM container format version from the immutable header.
+    pub format_version: u32,
+    /// Original metadata JSON from the HFQM container.
     pub metadata_json: String,
+    pub arch_id: u32,
     tensors: Vec<HfqTensorInfo>,
     tensor_map: HashMap<String, usize>,
     /// Reusable read buffer for pread-based tensor reads.
@@ -606,7 +609,7 @@ impl HfqFile {
                 format!("HfqFile: not an HFQ container at offset {base}"),
             ));
         }
-        let _version = u32::from_le_bytes(mmap[base + 4..base + 8].try_into().unwrap());
+        let format_version = u32::from_le_bytes(mmap[base + 4..base + 8].try_into().unwrap());
         let arch_id = u32::from_le_bytes(mmap[base + 8..base + 12].try_into().unwrap());
         let n_tensors = u32::from_le_bytes(mmap[base + 12..base + 16].try_into().unwrap()) as usize;
         // Stored offsets are relative to the container start; rebase to absolute
@@ -818,6 +821,7 @@ impl HfqFile {
             path: path.to_path_buf(),
             source_file_identity,
             mmap: Some(mmap),
+            format_version,
             arch_id,
             metadata_json,
             tensors,
@@ -1602,8 +1606,6 @@ fn quant_type_to_dtype(quant_type: u8) -> &'static str {
         30 => "MQ4G256Lloyd",
         38 => "MQ2G256GL",
         39 => "MQ3G256GL",
-        40 => "TQ2G128",
-        41 => "BQ1G128",
         44 => "MQ4G256V2",
         45 => "MQ4CG256",
         47 => "MQ6G256V2",
@@ -1612,6 +1614,7 @@ fn quant_type_to_dtype(quant_type: u8) -> &'static str {
         50 => "MQ2G256V2",
         51 => "MQ2G256LloydU",
         52 => "I64",
+        53 => "MQ4G128V2",
         _ => "?",
     }
 }

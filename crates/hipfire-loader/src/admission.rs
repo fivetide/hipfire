@@ -13,14 +13,21 @@
 
 use crate::Carrier;
 use hipfire_arch_qwen4::config::{Qwen4Config, ARCH_ID as QWEN4_ARCH_ID};
-use hipfire_arch_qwen4::ple::PleHashMetadata;
-use hipfire_arch_qwen4::weights::Qwen4Manifest;
 use hipfire_arch_qwen4::{InputModality, Qwen4Capabilities};
-use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
-use hipfire_runtime::loader_api::ModelSource;
-use hipfire_runtime::weight_manifest::ShardPolicy;
-use std::collections::BTreeMap;
+use hipfire_runtime::loader_api::{ModelSource, SpecLoadCfg};
+fn qwen4_vision_tensor_name(name: &str) -> bool {
+    [
+        "model.visual.",
+        "model.vision_tower.",
+        "model.vision_projection.",
+        "model.multi_modal_projector.",
+        "vision_tower.",
+        "visual.",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+}
 
 /// The one effective topology admitted for a load. `tp>1` (expert-parallel) and
 /// `pp>1` (pipeline-parallel) are mutually exclusive; both default to 1.
@@ -31,9 +38,21 @@ pub enum EffectiveTopology {
     Expert(usize),
 }
 
-/// The result of the Qwen4 source-only boundary. It is deliberately not a
-/// [`SourceAdmission`]: arch 16 has no executable carrier yet, so a successful
-/// pure check must never be mistaken for a loadable route.
+/// Optional load-time controls that must be rejected at Qwen4 admission
+/// before any previous model teardown or GPU allocation.
+#[derive(Clone, Copy, Default)]
+pub struct SourceAdmissionOptions {
+    pub spec: SpecLoadCfg,
+    pub gemma4_drafter: bool,
+    pub cask: bool,
+    pub state_quant: bool,
+    pub non_single_compute: bool,
+    pub pflash: bool,
+}
+
+/// The source-only portion of Qwen4 admission. The validated config and
+/// inventory are reused by the executable Single carrier without reopening
+/// or reclassifying the HFQM path.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Qwen4SourceAdmission {
     pub config: Qwen4Config,
@@ -51,7 +70,7 @@ pub fn qwen4_request_admission(
     modality: InputModality,
     native_mtp: bool,
 ) -> Result<(), String> {
-    let capabilities = Qwen4Capabilities::text_mtp();
+    let capabilities = Qwen4Capabilities::text_ar();
     if !capabilities.supports_modality(modality) {
         return Err(format!("qwen4: unsupported modality {modality:?}"));
     }
@@ -66,122 +85,11 @@ pub fn qwen4_request_admission(
     }
     Ok(())
 }
-
-/// The reserved Qwen4 id is intentionally not executable until a carrier and
-/// generation owner are registered. Keep this refusal explicit instead of
-/// returning a dummy carrier or publishing a partial generation route.
-pub const fn qwen4_non_executable_refusal() -> &'static str {
-    "qwen4: pure admission succeeded, but arch_id=16 has no executable carrier registered"
-}
-
-fn qwen4_vision_tensor_name(name: &str) -> bool {
-    [
-        "model.visual.",
-        "model.vision_tower.",
-        "model.vision_projection.",
-        "model.multi_modal_projector.",
-        "vision_tower.",
-        "visual.",
-    ]
-    .iter()
-    .any(|prefix| name.starts_with(prefix))
-}
-
-fn qwen4_manifest_inventory(hfq: &HfqFile, manifest: &Qwen4Manifest) -> Result<usize, String> {
-    let mut expected = BTreeMap::<String, Vec<u32>>::new();
-    for entry in &manifest.weights {
-        if matches!(&entry.policy, ShardPolicy::Tied { .. }) {
-            continue;
-        }
-        let shape = entry
-            .logical_shape
-            .iter()
-            .copied()
-            .map(|dimension| {
-                u32::try_from(dimension).map_err(|_| {
-                    format!(
-                        "qwen4: manifest dimension for {} does not fit HFQ shape",
-                        entry.name
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if expected.insert(entry.name.clone(), shape).is_some() {
-            return Err(format!(
-                "qwen4: manifest contains duplicate source tensor {}",
-                entry.name
-            ));
-        }
-    }
-    for entry in &manifest.metadata {
-        let shape = entry
-            .shape
-            .iter()
-            .copied()
-            .map(|dimension| {
-                u32::try_from(dimension).map_err(|_| {
-                    format!(
-                        "qwen4: manifest dimension for {} does not fit HFQ shape",
-                        entry.name
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if expected.insert(entry.name.clone(), shape).is_some() {
-            return Err(format!(
-                "qwen4: manifest metadata duplicates source tensor {}",
-                entry.name
-            ));
-        }
-    }
-    let manifest_count = manifest.source_tensor_count();
-    if expected.len() != manifest_count {
-        return Err(format!(
-            "qwen4: manifest source inventory has {} descriptors but contract declares {manifest_count}",
-            expected.len()
-        ));
-    }
-    if hfq.tensors().len() != manifest_count {
-        return Err(format!(
-            "qwen4: HFQ source inventory has {} tensors but manifest declares {manifest_count}",
-            hfq.tensors().len()
-        ));
-    }
-
-    for tensor in hfq.tensors() {
-        if qwen4_vision_tensor_name(&tensor.name) {
-            return Err(format!(
-                "qwen4: vision tensor {} is not admitted by the text-only source boundary",
-                tensor.name
-            ));
-        }
-        let Some(shape) = expected.remove(&tensor.name) else {
-            return Err(format!(
-                "qwen4: source tensor {} is not declared by the manifest",
-                tensor.name
-            ));
-        };
-        if tensor.shape != shape {
-            return Err(format!(
-                "qwen4: source tensor {} has shape {:?}, expected manifest shape {:?}",
-                tensor.name, tensor.shape, shape
-            ));
-        }
-    }
-    if let Some((name, _)) = expected.into_iter().next() {
-        return Err(format!(
-            "qwen4: source inventory is missing manifest tensor {name}"
-        ));
-    }
-    Ok(manifest_count)
-}
-
-/// Validate a reserved arch-16 HFQ source without allocating weights.
+/// Validate a reserved arch-16 HFQM source without allocating weights.
 ///
-/// The manifest supplies the complete layer/dimension/PLE/source-inventory
-/// contract. Quant codec bytes remain owned by the Qwen4 codec boundary, so
-/// this function intentionally does not duplicate a quant-type table that can
-/// drift while the qt53 route is being landed.
+/// The architecture crate owns the complete source/index contract.  Loader
+/// admission only adds request/topology policy and retains the receipt's
+/// value-only config/count for the carrier handoff.
 pub fn admit_qwen4_source(
     source: &ModelSource,
     effective_mesh: hipfire_arch_qwen4::EffectiveMesh,
@@ -194,36 +102,14 @@ pub fn admit_qwen4_source(
             "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
         );
     };
-    if hfq.arch_id != QWEN4_ARCH_ID {
-        return Err(format!(
-            "qwen4: source arch_id={} does not match reserved arch_id={QWEN4_ARCH_ID}",
-            hfq.arch_id
-        ));
-    }
-    if hfq
-        .tensors()
-        .iter()
-        .any(|tensor| qwen4_vision_tensor_name(&tensor.name))
-    {
-        return Err(
-            "qwen4: image/video tensors are not supported by the text-only source boundary".into(),
-        );
-    }
-    let config = Qwen4Config::from_metadata_json(&hfq.metadata_json)?;
-    let manifest = Qwen4Manifest::build(&config)
-        .map_err(|error| format!("qwen4: manifest admission failed: {error}"))?;
-    let manifest_source_tensors = qwen4_manifest_inventory(hfq, &manifest)?;
-    let ple = PleHashMetadata::from_json(&hfq.metadata_json)
-        .map_err(|error| format!("qwen4: PLE metadata admission failed: {error}"))?;
-    if ple != PleHashMetadata::qwen4() {
-        return Err("qwen4: PLE metadata does not match the pinned manifest contract".into());
-    }
+    let receipt =
+        hipfire_arch_qwen4::admit_hfqm_artifact(hfq).map_err(|error| error.to_string())?;
     Ok(Qwen4SourceAdmission {
-        config,
+        config: receipt.config,
         effective_mesh,
         modality,
         native_mtp,
-        manifest_source_tensors,
+        manifest_source_tensors: receipt.source_tensor_count,
     })
 }
 
@@ -519,6 +405,8 @@ fn flux_arch_refusal(arch_id: u32, gpu_arch: &str) -> Option<String> {
 ///
 /// Refusals mirror the current-master daemon/loader refusals so no
 /// currently-served route changes; they simply fire before destructive work.
+/// Compatibility wrapper for callers that do not expose the optional
+/// load-time controls.  Qwen4 still receives the conservative defaults.
 pub fn admit_source(
     path: &str,
     tp: usize,
@@ -529,6 +417,32 @@ pub fn admit_source(
     vision: Option<&str>,
     head: Option<&str>,
     max_seq: usize,
+) -> Result<SourceAdmission, String> {
+    admit_source_with_options(
+        path,
+        tp,
+        pp,
+        kv_backend_override,
+        draft_path,
+        gpu_arch,
+        vision,
+        head,
+        max_seq,
+        SourceAdmissionOptions::default(),
+    )
+}
+
+pub fn admit_source_with_options(
+    path: &str,
+    tp: usize,
+    pp: usize,
+    kv_backend_override: Option<&str>,
+    draft_path: Option<&str>,
+    gpu_arch: &str,
+    vision: Option<&str>,
+    head: Option<&str>,
+    max_seq: usize,
+    options: SourceAdmissionOptions,
 ) -> Result<SourceAdmission, String> {
     let mut source = ModelSource::from_path(path)?;
     let arch_id = source
@@ -546,74 +460,108 @@ pub fn admit_source(
     if let Some(refusal) = flux_arch_refusal(arch_id, gpu_arch) {
         return Err(refusal);
     }
-    // Arch 16 is reserved and has no executable carrier. Run its complete
-    // source-only boundary here, then fail explicitly instead of entering the
-    // generic registry or mutating the currently loaded model.
-    if arch_id == QWEN4_ARCH_ID {
-        let mesh = hipfire_arch_qwen4::EffectiveMesh::new(pp, tp, 1);
-        admit_qwen4_source(&source, mesh, InputModality::Text, true)?;
-        return Err(qwen4_non_executable_refusal().into());
-    }
-
-    let (topology, carrier) = if tp > 1 {
-        // Expert-parallel admission (HFQ-only). Mirrors
-        // `load_model_ep_with_kv_mode`'s arch_id dispatch + per-arch VMM
-        // refusal: DeepSeek V4 (9) serves vmm by design; Qwen3.5 (5|6) and
-        // MiniMax (10) refuse it (single-device backend, no EP VMM path).
-        if is_dir {
+    // Arch 16 is an executable local-path carrier, but only after its complete
+    // source-only boundary succeeds.  Keep this before vision/head handling so
+    // every refusal remains pre-allocation.
+    let (topology, carrier) = if arch_id == QWEN4_ARCH_ID {
+        if max_seq != 2048 {
+            return Err(format!(
+                "qwen4: max_seq must be exactly 2048 (got {max_seq})"
+            ));
+        }
+        if draft_path.is_some()
+            || options.gemma4_drafter
+            || options.cask
+            || options.state_quant
+            || options.non_single_compute
+            || options.pflash
+            || options.spec.mtp.is_some_and(|enabled| enabled)
+            || options.spec.dflash.is_some_and(|enabled| enabled)
+            || options.spec.dspark.is_some_and(|enabled| enabled)
+            || options.spec.ngram_draft.is_some_and(|enabled| enabled)
+        {
             return Err(
-                "EP not supported for safetensors directory sources (load as a single HFQ file)"
+                "qwen4: requested DFlash, MTP, DSpark, n-gram, EAGLE, CASK, state-quant, PFlash, or non-Single option is unsupported"
                     .into(),
             );
         }
-        if !matches!(arch_id, 5 | 6 | 9 | 10) {
+        if kv_backend != KvBackend::Contiguous {
             return Err(format!(
-                "EP not supported for arch_id={arch_id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
+                "qwen4: KV backend '{}' is unsupported; only contiguous is admitted",
+                kv_backend.as_str()
             ));
         }
-        if let Some(refusal) = ep_vmm_refusal(arch_id, kv_backend) {
-            return Err(refusal);
-        }
-        // Qwen3.5 MoE has no EP serve path. Parse the retained source's
-        // actual config before any caller can tear down its active model or
-        // enter `Gpus::init_ep`; this must reuse the loader's established
-        // refusal predicate and exact error text.
-        if matches!(arch_id, 5 | 6) {
-            let ModelSource::Hfq(hfq) = &source else {
-                return Err("EP qwen35 requires an HFQ source".to_string());
-            };
-            let config = hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
-                .map_err(|e| format!("qwen35 config: {e}"))?;
-            if let Some(refusal) = crate::qwen35_ep_moe_refusal(arch_id, config.num_experts) {
+        admit_qwen4_source(
+            &source,
+            hipfire_arch_qwen4::EffectiveMesh::new(pp, tp, 1),
+            InputModality::Text,
+            false,
+        )?;
+        let carrier = resolve_carrier(&source)?;
+        carrier.admit_topology(arch_id, is_dir, pp, kv_backend)?;
+        (EffectiveTopology::Single, Some(carrier))
+    } else {
+        let (topology, carrier) = if tp > 1 {
+            // Expert-parallel admission (HFQ-only). Mirrors
+            // `load_model_ep_with_kv_mode`'s arch_id dispatch + per-arch VMM
+            // refusal: DeepSeek V4 (9) serves vmm by design; Qwen3.5 (5|6) and
+            // MiniMax (10) refuse it (single-device backend, no EP VMM path).
+            if is_dir {
+                return Err(
+                "EP not supported for safetensors directory sources (load as a single HFQ file)"
+                    .into(),
+            );
+            }
+            if !matches!(arch_id, 5 | 6 | 9 | 10) {
+                return Err(format!(
+                "EP not supported for arch_id={arch_id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
+            ));
+            }
+            if let Some(refusal) = ep_vmm_refusal(arch_id, kv_backend) {
                 return Err(refusal);
             }
-        }
-        (EffectiveTopology::Expert(tp), None)
-    } else {
-        // Single / pipeline-parallel via the carrier registry.
-        let carrier = resolve_carrier(&source)?;
-        if kv_backend == KvBackend::Vmm
-            && !matches!(carrier.name(), "qwen35" | "deepseek4" | "muse_glimmer")
-        {
-            return Err(format!(
+            // Qwen3.5 MoE has no EP serve path. Parse the retained source's
+            // actual config before any caller can tear down its active model or
+            // enter `Gpus::init_ep`; this must reuse the loader's established
+            // refusal predicate and exact error text.
+            if matches!(arch_id, 5 | 6) {
+                let ModelSource::Hfq(hfq) = &source else {
+                    return Err("EP qwen35 requires an HFQ source".to_string());
+                };
+                let config = hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
+                    .map_err(|e| format!("qwen35 config: {e}"))?;
+                if let Some(refusal) = crate::qwen35_ep_moe_refusal(arch_id, config.num_experts) {
+                    return Err(refusal);
+                }
+            }
+            (EffectiveTopology::Expert(tp), None)
+        } else {
+            // Single / pipeline-parallel via the carrier registry.
+            let carrier = resolve_carrier(&source)?;
+            if kv_backend == KvBackend::Vmm
+                && !matches!(carrier.name(), "qwen35" | "deepseek4" | "muse_glimmer")
+            {
+                return Err(format!(
                 "KV backend 'vmm' currently supports qwen3.5, deepseek4, and Muse Glimmer only (selected carrier: {})",
                 carrier.name()
             ));
-        }
-        if kv_backend == KvBackend::Vmm && pp > 1 {
-            return Err(
+            }
+            if kv_backend == KvBackend::Vmm && pp > 1 {
+                return Err(
                 "KV backend 'vmm' is single-device and does not support pipeline parallelism (pp>1); \
                  use a different kv_cache backend or load with pp=1"
                     .to_string(),
             );
-        }
-        carrier.admit_topology(arch_id, is_dir, pp, kv_backend)?;
-        let topology = if pp > 1 {
-            EffectiveTopology::Pipeline(pp)
-        } else {
-            EffectiveTopology::Single
+            }
+            carrier.admit_topology(arch_id, is_dir, pp, kv_backend)?;
+            let topology = if pp > 1 {
+                EffectiveTopology::Pipeline(pp)
+            } else {
+                EffectiveTopology::Single
+            };
+            (topology, Some(carrier))
         };
-        (topology, Some(carrier))
+        (topology, carrier)
     };
     let mut has_vision = probe_vision(&source, arch_id)?;
     // Shared tower sidecar (registry `vision` slot / `params.vision` /
@@ -704,11 +652,6 @@ mod tests {
             true
         )
         .is_err());
-    }
-
-    #[test]
-    fn qwen4_reserved_route_has_explicit_non_executable_gate() {
-        assert!(qwen4_non_executable_refusal().contains("no executable carrier"));
     }
 
     /// The EP VMM refusal is per-arch, mirroring `load_model_ep_with_kv_mode`:

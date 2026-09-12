@@ -10,11 +10,15 @@ use crate::{
     finish_qwen35_load, resolve_chat_template, resolve_chat_template_overrides, LoadedModel,
 };
 use hipfire_arch_minimax::{config_from_safetensors, load_weights_from_safetensors, MiniMaxState};
+use hipfire_runtime::device_mesh::DeviceMesh;
+use hipfire_runtime::hfq::HfqModelSource;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 use hipfire_runtime::model_source::ModelSource as _;
+use hipfire_runtime::model_source::SourcePayload;
 use hipfire_runtime::spec::{InPlaceGuard, SpecEmit, SpecEmitCtx, SpecTargetGuard};
+use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use std::any::Any;
 
 // The ChatML/Hermes per-token emitter (`Qwen35Emit`) is shared by every
@@ -189,6 +193,157 @@ impl Carrier for Qwen2Carrier {
         Ok(LoadedModel {
             state: Some(Box::new(bundle)),
             speculator,
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                meta.chat_template,
+            )
+        })
+    }
+}
+
+// ─── Qwen4Carrier ────────────────────────────────────────────────────
+
+/// Executable local-path Qwen4 carrier.  Distribution/product admission stays
+/// outside this registry; this route only makes an already admitted HFQM
+/// artifact loadable on its one supported gfx1151 device.
+pub struct Qwen4Carrier;
+
+impl Carrier for Qwen4Carrier {
+    fn name(&self) -> &'static str {
+        "qwen4"
+    }
+
+    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
+        arch_id == hipfire_arch_qwen4::ARCH_ID && !is_dir
+    }
+
+    fn admit_topology(
+        &self,
+        _arch_id: u32,
+        is_dir: bool,
+        pp: usize,
+        _kv_backend: KvBackend,
+    ) -> Result<(), String> {
+        if is_dir {
+            return Err(
+                "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
+            );
+        }
+        if pp != 1 {
+            return Err("qwen4: only Single topology is admitted".into());
+        }
+        Ok(())
+    }
+
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: Some(2),
+            has_deltanet: false,
+            supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::QwenJinja,
+        }
+    }
+
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(0.3, 0.8, 1.0)
+    }
+
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        self.admit_topology(
+            hipfire_arch_qwen4::ARCH_ID,
+            src.is_dir(),
+            ctx.pp,
+            ctx.kv_backend,
+        )?;
+        if ctx.kv_backend != KvBackend::Contiguous {
+            return Err(format!(
+                "qwen4: KV backend '{}' is unsupported; only contiguous is admitted",
+                ctx.kv_backend.as_str()
+            ));
+        }
+        if ctx.max_seq != 2048 {
+            return Err(format!(
+                "qwen4: max_seq must be exactly 2048 (got {})",
+                ctx.max_seq
+            ));
+        }
+        if ctx.draft_path.is_some()
+            || ctx.gemma4_drafter_path.is_some()
+            || ctx.spec.mtp.is_some_and(|enabled| enabled)
+            || ctx.cask.sidecar.is_some()
+            || ctx.state_quant_override.is_some()
+            || !matches!(
+                ctx.deepseek4_compute_placement,
+                hipfire_config::Deepseek4ComputePlacement::Single
+            )
+        {
+            return Err(
+                "qwen4: DFlash, MTP, EAGLE, CASK, state-quant, and non-Single placement are unsupported"
+                    .into(),
+            );
+        }
+        let meta = resolve_source_meta(&src, ctx.path)?;
+        let ModelSource::Hfq(hfq) = src else {
+            return Err(
+                "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
+            );
+        };
+        let receipt =
+            hipfire_arch_qwen4::admit_hfqm_artifact(&hfq).map_err(|error| error.to_string())?;
+        let config = receipt.config;
+        let manifest = receipt.manifest;
+        let metadata = receipt.ple;
+        let placements = receipt.placements;
+        let mesh = DeviceMesh::single().map_err(|error| format!("qwen4: mesh: {error}"))?;
+        let expected = WeightOrigin::for_single(&mesh, ctx.gpu);
+        let source = HfqModelSource::from_hfq(hfq);
+        let transaction = fulfill_manifest_from_payloads(
+            &manifest.weights,
+            &mesh,
+            config.num_hidden_layers,
+            ctx.gpu,
+            expected,
+            |entry| {
+                if entry.residency.is_external() {
+                    return source
+                        .tensor_range(&entry.name)
+                        .map_err(|error| error.to_string())?
+                        .map(SourcePayload::Range)
+                        .ok_or_else(|| format!("missing external tensor '{}'", entry.name));
+                }
+                let (info, bytes) = source
+                    .tensor_data(&entry.name)
+                    .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
+                Ok(SourcePayload::Borrowed { info, bytes })
+            },
+        )
+        .map_err(|error| format!("qwen4: manifest fulfillment failed: {error}"))?;
+        let mut bundle = hipfire_arch_qwen4::bundle::Qwen4Bundle::assemble_with_metadata(
+            config,
+            transaction,
+            &placements,
+            ctx.gpu,
+            ctx.max_seq,
+            metadata,
+        )
+        .map_err(|error| format!("qwen4: bundle assembly failed: {error}"))?;
+        if let Err(error) = bundle.attach_forward(ctx.gpu, ctx.max_seq) {
+            let detail = error.to_string();
+            let _ = bundle.free_gpu(ctx.gpu);
+            return Err(format!("qwen4: forward setup failed: {detail}"));
+        }
+
+        Ok(LoadedModel {
+            state: Some(Box::new(bundle)),
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,

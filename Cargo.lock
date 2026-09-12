@@ -1336,6 +1336,7 @@ dependencies = [
  "hipfire-runtime",
  "rdna-compute",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

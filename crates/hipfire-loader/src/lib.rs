@@ -361,6 +361,7 @@ pub fn generation_early_route(arch_id: u32) -> Option<GenerationEarlyRoute> {
 
 const REGISTRY: &[&dyn Carrier] = &[
     &Qwen2Carrier,
+    &Qwen4Carrier,
     &Qwen35Carrier,
     &LlamaCarrier,
     &DotsOcrCarrier,
@@ -1069,6 +1070,19 @@ impl LoadedModel {
         self.state
             .as_deref_mut()
             .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+    }
+
+    /// Qwen4 bundle if this model is arch_id=16, else None.
+    pub fn qwen4(&self) -> Option<&hipfire_arch_qwen4::bundle::Qwen4Bundle> {
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<hipfire_arch_qwen4::bundle::Qwen4Bundle>())
+    }
+
+    pub fn qwen4_mut(&mut self) -> Option<&mut hipfire_arch_qwen4::bundle::Qwen4Bundle> {
+        self.state.as_deref_mut().and_then(|s| {
+            (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+        })
     }
 
     pub fn llama(&self) -> Option<&hipfire_arch_llama::LlamaBundle> {
@@ -2299,19 +2313,48 @@ pub fn load_model_with_kv_backend(
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
-    // Open the source before any VMM/teardown work so the reserved Qwen4
-    // boundary can classify it without a destructive side effect.
+    // Open the source before any VMM/teardown work so Qwen4's complete
+    // source-only boundary can classify it without a destructive side effect.
     let src = ModelSource::from_path(path)?;
     if src.arch_id() == Some(hipfire_arch_qwen4::ARCH_ID) {
         let raw_kv_mode = kv_mode_override.unwrap_or("");
         kv_mode::resolve_qwen4(raw_kv_mode, 256)?;
+        if pp != 1 || max_seq != 2048 {
+            return Err(format!(
+                "qwen4: only Single topology and max_seq=2048 are admitted (pp={pp}, max_seq={max_seq})"
+            ));
+        }
+        if kv_backend_override
+            .filter(|backend| !backend.is_empty() && *backend != "contiguous")
+            .is_some()
+        {
+            return Err("qwen4: only contiguous KV backend is admitted".into());
+        }
+        if draft_path.is_some()
+            || deepseek4_experts_per_token.is_some()
+            || !matches!(
+                deepseek4_compute_placement,
+                hipfire_config::Deepseek4ComputePlacement::Single
+            )
+            || kv_adaptive_override.is_some()
+            || state_quant_override.is_some()
+            || cask.sidecar.is_some()
+            || spec.mtp.is_some_and(|enabled| enabled)
+            || spec.dflash.is_some_and(|enabled| enabled)
+            || spec.dspark.is_some_and(|enabled| enabled)
+            || spec.ngram_draft.is_some_and(|enabled| enabled)
+        {
+            return Err(
+                "qwen4: requested speculative, adaptive-KV, CASK, state-quant, or non-Single option is unsupported"
+                    .into(),
+            );
+        }
         crate::admission::admit_qwen4_source(
             &src,
-            hipfire_arch_qwen4::EffectiveMesh::new(pp, 1, 1),
+            hipfire_arch_qwen4::EffectiveMesh::single(),
             hipfire_arch_qwen4::InputModality::Text,
-            true,
+            false,
         )?;
-        return Err(crate::admission::qwen4_non_executable_refusal().into());
     }
     // Retry any arenas left by a prior failed teardown; refuse the load if
     // ownership is still live so a new model cannot stack on pending VMM state.
@@ -2495,8 +2538,7 @@ pub fn load_model_with_gemma4_drafter(
     // Validate draft_len early (refuse-don't-degrade, same rule as daemon).
     let _ = gemma4_eagle_spec_len(Some(gemma4_draft_len as u64))
         .map_err(|e| format!("gemma4 drafter: {e}"))?;
-    // Classify once and admit before any side effect (source-aware admission).
-    let admission = crate::admission::admit_source(
+    let admission = crate::admission::admit_source_with_options(
         path,
         1, // this entry serves tp<=1
         pp,
@@ -2506,6 +2548,17 @@ pub fn load_model_with_gemma4_drafter(
         None,
         head_path,
         max_seq,
+        crate::admission::SourceAdmissionOptions {
+            spec,
+            gemma4_drafter: gemma4_drafter_path.is_some(),
+            cask: cask.sidecar.is_some(),
+            state_quant: state_quant_override.is_some(),
+            non_single_compute: !matches!(
+                deepseek4_compute_placement,
+                hipfire_config::Deepseek4ComputePlacement::Single
+            ),
+            pflash: false,
+        },
     )?;
     load_admitted_with_gemma4_drafter(
         admission,

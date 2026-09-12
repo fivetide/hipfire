@@ -1734,7 +1734,18 @@ fn main() {
                 // BEFORE any destructive side effect so a refusal leaves the
                 // prior model usable. The retained SourceAdmission is consumed
                 // by the load route below — no re-open, no re-classify.
-                let admission = match hipfire_loader::admission::admit_source(
+                let qwen4_admission_options = hipfire_loader::admission::SourceAdmissionOptions {
+                    spec: spec_cfg,
+                    gemma4_drafter: gemma4_drafter.is_some(),
+                    cask: cask.sidecar.is_some(),
+                    state_quant: state_quant_override.is_some(),
+                    non_single_compute: !matches!(
+                        deepseek4_compute_placement,
+                        hipfire_config::Deepseek4ComputePlacement::Single
+                    ),
+                    pflash: pflash_drafter.is_some() || pflash_mode_str != "off",
+                };
+                let admission = match hipfire_loader::admission::admit_source_with_options(
                     path,
                     tp,
                     pp,
@@ -1744,6 +1755,7 @@ fn main() {
                     vision_path.as_deref(),
                     head_path.as_deref(),
                     max_seq,
+                    qwen4_admission_options,
                 ) {
                     Ok(a) => a,
                     Err(e) => {
@@ -1755,6 +1767,9 @@ fn main() {
                         continue;
                     }
                 };
+                let admitted_arch_id = admission.arch_id;
+                let defer_prior_unload =
+                    load_tp > 1 || admitted_arch_id == hipfire_arch_qwen4::ARCH_ID;
 
                 // Unload previous if any. PFlash drafter goes first so
                 // its tensors join the pool before unload_model drains
@@ -1775,7 +1790,7 @@ fn main() {
                 // the original order. (EP archs are ds4/minimax and refuse
                 // PFlash drafters, so on a SUCCESSFUL tp>1 load this just frees
                 // the outgoing model's drafter at the deferred site.)
-                if load_tp <= 1 {
+                if !defer_prior_unload {
                     if let Some(mut pf) = pflash_state.take() {
                         if let Some(mut dg) = pflash_drafter_gpu.take() {
                             dg.bind_thread_or_warn();
@@ -1862,7 +1877,7 @@ fn main() {
                         // the newly built EP model, clear associated fresh
                         // state, and emit a hard error covering prior failure
                         // and any rollback failure.
-                        if load_tp > 1 {
+                        if defer_prior_unload {
                             if let Some(mut pf) = pflash_state.take() {
                                 if let Some(mut dg) = pflash_drafter_gpu.take() {
                                     dg.bind_thread_or_warn();
@@ -1907,6 +1922,7 @@ fn main() {
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
                             6 => "qwen3_5_moe",
+                            16 => "qwen4",
                             7 => "qwen2",
                             8 => "dots-ocr",
                             9 => "deepseek4",
@@ -3904,6 +3920,7 @@ fn main() {
                     .map(|m| match m.arch_id {
                         5 => "qwen3_5",
                         6 => "qwen3_5_moe",
+                        16 => "qwen4",
                         7 => "qwen2",
                         9 => "deepseek4",
                         10 => "minimax_m2",
