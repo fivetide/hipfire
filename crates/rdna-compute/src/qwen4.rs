@@ -607,6 +607,55 @@ pub fn qwen4_qsa_select(gpu: &mut Gpu, p: &Qwen4QsaSelect<'_>) -> HipResult<()> 
         args.as_mut_slice(),
     )
 }
+/// Device-side stable reuse of a prior MTP QSA selection row.
+///
+/// `selected` is a byte-addressed [`DType::Raw`] allocation containing i32
+/// indices. `selected_len_out` is a persistent four-byte Raw scalar written by
+/// the kernel; callers can read only that scalar when the logical span changes,
+/// never the selected row itself.
+pub struct Qwen4QsaReuseSelection<'a> {
+    pub selected: &'a GpuTensor,
+    pub selected_len: usize,
+    pub position: usize,
+    pub capacity: usize,
+    pub selected_len_out: &'a GpuTensor,
+}
+
+pub fn qwen4_qsa_reuse_selection(gpu: &mut Gpu, p: &Qwen4QsaReuseSelection<'_>) -> HipResult<()> {
+    ensure_gfx1151(gpu)?;
+    let selected_bytes = p
+        .capacity
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or_else(|| HipError::new(0, &Qwen4ComputeError::WrongShape.to_string()))?;
+    if p.selected.dtype != DType::Raw
+        || p.selected_len > p.capacity
+        || p.capacity == 0
+        || p.selected.numel() < selected_bytes
+        || p.selected_len_out.dtype != DType::Raw
+        || p.selected_len_out.numel() < std::mem::size_of::<i32>()
+        || p.selected_len > i32::MAX as usize
+        || p.position > i32::MAX as usize
+        || p.capacity > i32::MAX as usize
+    {
+        return Err(HipError::new(0, &Qwen4ComputeError::WrongShape.to_string()));
+    }
+    gpu.ensure_kernel_public("qwen4_ops", QWEN4_OPS_SRC, "qwen4_qsa_reuse_selection")?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.selected.buf.as_ptr());
+    args.push_ptr(p.selected_len_out.buf.as_ptr());
+    args.push_i32(p.selected_len as i32);
+    args.push_i32(p.position as i32);
+    args.push_i32(p.capacity as i32);
+    args.pad_to(16);
+    gpu.launch_kernel_blob(
+        "qwen4_qsa_reuse_selection",
+        [1, 1, 1],
+        [1, 1, 1],
+        0,
+        args.as_mut_slice(),
+    )
+}
+
 pub struct Qwen4QsaPoolRope<'a> {
     pub raw_keys: &'a GpuTensor,
     pub pooled: &'a GpuTensor,
@@ -1023,5 +1072,88 @@ mod tests {
         let error = qwen4_hc_mix(&mut gpu, &params).expect_err("branch count must be four");
         assert!(error.to_string().contains("tensor shape mismatch"));
         assert_eq!(gpu.last_launched_kernel(), None);
+    }
+    #[test]
+    fn qsa_reuse_selection_rejects_byte_capacity_mismatch() {
+        let Some(mut gpu) = try_gfx1151_gpu() else {
+            eprintln!("skip: no gfx1151 GPU");
+            return;
+        };
+        let selected = null_tensor(&[3], DType::Raw);
+        let selected_len_out = null_tensor(&[4], DType::Raw);
+        let params = Qwen4QsaReuseSelection {
+            selected: &selected,
+            selected_len: 1,
+            position: 0,
+            capacity: 1,
+            selected_len_out: &selected_len_out,
+        };
+
+        let error = qwen4_qsa_reuse_selection(&mut gpu, &params)
+            .expect_err("byte capacity must be checked");
+        assert!(error.to_string().contains("tensor shape mismatch"));
+        assert_eq!(gpu.last_launched_kernel(), None);
+    }
+
+    #[test]
+    fn qsa_reuse_selection_preserves_order_and_boundaries() {
+        let Some(mut gpu) = try_gfx1151_gpu() else {
+            eprintln!("skip: no gfx1151 GPU");
+            return;
+        };
+        let capacity = 4usize;
+        let mut selected = gpu
+            .zeros(&[capacity * std::mem::size_of::<i32>()], DType::Raw)
+            .expect("selected allocation");
+        let selected_len_out = gpu
+            .zeros(&[std::mem::size_of::<i32>()], DType::Raw)
+            .expect("length allocation");
+        let cases: [([i32; 4], usize, usize, [i32; 4], i32); 4] = [
+            ([-1, -1, -1, -1], 0usize, 7usize, [7, -1, -1, -1], 1),
+            ([0, 3, 1, 99], 4, 2, [0, 1, 2, -1], 3),
+            ([0, 2, 1, -1], 3, 2, [0, 2, 1, -1], 3),
+            ([0, 1, 2, 3], 4, 4, [0, 1, 2, 3], 4),
+        ];
+        for (input, selected_len, position, expected, expected_len) in cases {
+            let input_bytes = input
+                .iter()
+                .flat_map(|value| value.to_ne_bytes())
+                .collect::<Vec<_>>();
+            gpu.hip
+                .memcpy_htod(&selected.buf, &input_bytes)
+                .expect("upload selected row");
+            gpu.hip
+                .memset(&selected_len_out.buf, 0, selected_len_out.byte_size())
+                .expect("clear selected length");
+            qwen4_qsa_reuse_selection(
+                &mut gpu,
+                &Qwen4QsaReuseSelection {
+                    selected: &selected,
+                    selected_len,
+                    position,
+                    capacity,
+                    selected_len_out: &selected_len_out,
+                },
+            )
+            .expect("reuse selection");
+
+            let mut output_bytes = vec![0u8; capacity * std::mem::size_of::<i32>()];
+            gpu.hip
+                .memcpy_dtoh(&mut output_bytes, &selected.buf)
+                .expect("download selected row");
+            let output = output_bytes
+                .chunks_exact(std::mem::size_of::<i32>())
+                .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 bytes")))
+                .collect::<Vec<_>>();
+            assert_eq!(output, expected);
+            let mut length_bytes = [0u8; std::mem::size_of::<i32>()];
+            gpu.hip
+                .memcpy_dtoh(&mut length_bytes, &selected_len_out.buf)
+                .expect("download selected length");
+            assert_eq!(i32::from_ne_bytes(length_bytes), expected_len);
+        }
+        gpu.free_tensor(selected).expect("free selected");
+        gpu.free_tensor(selected_len_out)
+            .expect("free selected length");
     }
 }

@@ -491,6 +491,34 @@ extern "C" __global__ void qwen4_qsa_select_f32(
         selected[offset++] = token;
     }
 }
+// Reuse the previous MTP QSA sparse row after step zero. The selected buffer
+// stores i32 indices in a byte-addressed Raw allocation. One workgroup owns
+// the row so compaction is stable and requires no host round-trip or scratch
+// allocation.
+extern "C" __global__ void qwen4_qsa_reuse_selection(
+    int* selected,
+    int* selected_len_out,
+    int selected_len,
+    int position,
+    int capacity) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    int write = 0;
+    bool has_current = false;
+    for (int read = 0; read < selected_len && read < capacity; ++read) {
+        int token = selected[read];
+        if (token < 0 || token > position) continue;
+        if (token == position) has_current = true;
+        selected[write++] = token;
+    }
+    if (!has_current && write < capacity) {
+        selected[write++] = position;
+    }
+    for (int index = write; index < capacity; ++index) {
+        selected[index] = -1;
+    }
+    *selected_len_out = write;
+}
+
 extern "C" __global__ void qwen4_ple_depthwise_f32(
     const float* input,
     const float* history,
