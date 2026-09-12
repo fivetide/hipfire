@@ -23,7 +23,7 @@ use hipfire_arch_qwen4::config::Qwen4Config;
 use hipfire_arch_qwen4::weights::Qwen4Manifest;
 use hipfire_runtime::weight_manifest::ShardPolicy;
 use rdna_compute::DType;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 use crate::quant_fwht::{gen_fwht_signs, quantize_mq4g128v2, quantize_mq4g256v2};
 use hipfire_quantize::float16::bf16_to_f32;
@@ -73,13 +73,22 @@ const PINNED_PAYLOAD_BYTES: u64 = 170_625_677_336;
 #[cfg(test)]
 const PINNED_PREDICTED_OUTPUT_BYTES: u64 = 170_625_800_216;
 const PINNED_SHARD_COUNT: usize = 131;
-/// Default bounded source row chunk.  A gate/up chunk is about 2.5 MiB BF16
-/// and 5 MiB F32; the quantizer's output is smaller still.
-pub(crate) const DEFAULT_ROW_CHUNK: usize = 256;
-const MAX_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
+/// Default bounded source row chunk.  A pinned gate/up chunk is 20 MiB BF16
+/// and 40 MiB F32 before its encoded output; 4,096 rows stay below the
+/// 96 MiB aggregate scratch ceiling.
+pub(crate) const DEFAULT_ROW_CHUNK: usize = 4_096;
+const MAX_CHUNK_BYTES: u64 = 96 * 1024 * 1024;
 /// Do not let an accidental CLI value turn a row stream into a tensor buffer.
-const MAX_ROW_CHUNK: usize = 1_024;
+const MAX_ROW_CHUNK: usize = 4_096;
 const CAPACITY_OVERRIDE_ENV: &str = "HIPFIRE_QWEN4_CAPACITY_BYTES";
+fn validate_row_chunk(row_chunk: usize) -> Result<(), Qwen4Error> {
+    if row_chunk == 0 || row_chunk > MAX_ROW_CHUNK {
+        return Err(Qwen4Error::Invalid(format!(
+            "Qwen4 row chunk must be in 1..={MAX_ROW_CHUNK}, got {row_chunk}"
+        )));
+    }
+    Ok(())
+}
 
 fn qwen4_quantized_dtype(dtype: DType) -> bool {
     matches!(dtype, DType::MQ4G256V2 | DType::MQ4G128V2)
@@ -205,12 +214,7 @@ pub(crate) fn run_cli_with_mode(
 /// the final rename, so a malformed source or short callback never publishes
 /// a partially written candidate over an existing artifact.
 pub(crate) fn write_qwen4_artifact(options: &Qwen4Options<'_>) -> Result<Qwen4Summary, Qwen4Error> {
-    if options.row_chunk == 0 || options.row_chunk > MAX_ROW_CHUNK {
-        return Err(Qwen4Error::Invalid(format!(
-            "Qwen4 row chunk must be in 1..={MAX_ROW_CHUNK}, got {}",
-            options.row_chunk
-        )));
-    }
+    validate_row_chunk(options.row_chunk)?;
     if options.output.exists() {
         return Err(Qwen4Error::Invalid(format!(
             "refusing to replace existing Qwen4 artifact {}",
@@ -3733,12 +3737,12 @@ fn read_exact_at(file: &File, offset: u64, dst: &mut [u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
     use std::io::{Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
-    use std::thread::{self, JoinHandle};
-    use std::env;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
+    use std::thread::{self, JoinHandle};
     use tempfile::NamedTempFile;
 
     fn test_remote_source(base_url: &str) -> RemoteSource {
@@ -3828,11 +3832,9 @@ mod tests {
         assert_eq!(spec.owner, "owner");
         assert_eq!(spec.repo, "repo");
         assert_eq!(spec.revision, "0123456789ABCDEF0123456789abcdef01234567");
-        assert!(
-            parse_remote_spec("weights/model.safetensors")
-                .expect("local path is not remote")
-                .is_none()
-        );
+        assert!(parse_remote_spec("weights/model.safetensors")
+            .expect("local path is not remote")
+            .is_none());
     }
 
     #[test]
@@ -3881,11 +3883,9 @@ mod tests {
         let (base, handle) = spawn_http_response(200, None, b"cdef", None, None);
         let source = test_remote_source(&base);
         let mut bytes = [0u8; 4];
-        assert!(
-            source
-                .read_range("model.safetensors", 2, &mut bytes, Some(8))
-                .is_err()
-        );
+        assert!(source
+            .read_range("model.safetensors", 2, &mut bytes, Some(8))
+            .is_err());
         handle.join().unwrap();
     }
 
@@ -3895,11 +3895,9 @@ mod tests {
             spawn_http_response(206, Some("bytes 0-3/8"), b"cdef", None, Some("bytes=2-5"));
         let source = test_remote_source(&base);
         let mut bytes = [0u8; 4];
-        assert!(
-            source
-                .read_range("model.safetensors", 2, &mut bytes, Some(8))
-                .is_err()
-        );
+        assert!(source
+            .read_range("model.safetensors", 2, &mut bytes, Some(8))
+            .is_err());
         handle.join().unwrap();
     }
 
@@ -3909,11 +3907,9 @@ mod tests {
             spawn_http_response(206, Some("bytes 2-5/8"), b"cde", Some(4), Some("bytes=2-5"));
         let source = test_remote_source(&base);
         let mut bytes = [0u8; 4];
-        assert!(
-            source
-                .read_range("model.safetensors", 2, &mut bytes, Some(8))
-                .is_err()
-        );
+        assert!(source
+            .read_range("model.safetensors", 2, &mut bytes, Some(8))
+            .is_err());
         handle.join().unwrap();
     }
     fn source_tensor(bytes: &[u8], shape: Vec<u64>, dtype: &str) -> (NamedTempFile, SourceTensor) {
@@ -4007,11 +4003,9 @@ mod tests {
         let (_second_file, second) = named_source("required.weight", &[0; 4], vec![2], "BF16");
         let error =
             validate_manifest_inventory_names(&[metadata, first, second], &inventory).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("duplicate Qwen4 manifest source record")
-        );
+        assert!(error
+            .to_string()
+            .contains("duplicate Qwen4 manifest source record"));
     }
 
     #[test]
@@ -4094,6 +4088,47 @@ mod tests {
         );
         assert!(quantized_data_len(ExpertKind::GateUp, 1, 640).is_err());
         assert!(validate_expert_shape_stub(&[512, 1280, 2559], ExpertKind::GateUp).is_err());
+    }
+    #[test]
+    fn production_chunk_budget_covers_pinned_gate_up_and_rejects_oversized_values() {
+        let rows = MAX_ROW_CHUNK as u64;
+        let row_bytes = HIDDEN_WIDTH.checked_mul(2).unwrap();
+        let raw_bytes = rows.checked_mul(row_bytes).unwrap();
+        let value_bytes = rows
+            .checked_mul(HIDDEN_WIDTH)
+            .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>() as u64))
+            .unwrap();
+        let encoded_bytes =
+            quantized_data_len_for_dtype(DType::MQ4G256V2, rows, HIDDEN_WIDTH).unwrap();
+        let worst = raw_bytes
+            .checked_add(value_bytes)
+            .and_then(|bytes| bytes.checked_add(encoded_bytes))
+            .unwrap();
+
+        assert_eq!(MAX_CHUNK_BYTES, 96 * 1024 * 1024);
+        assert_eq!(raw_bytes, 20_971_520);
+        assert_eq!(value_bytes, 41_943_040);
+        assert_eq!(encoded_bytes, 5_570_560);
+        assert_eq!(worst, 68_485_120);
+        assert!(worst < MAX_CHUNK_BYTES);
+
+        let mut tracker = ScratchTracker::default();
+        tracker
+            .observe(
+                usize::try_from(raw_bytes).unwrap(),
+                usize::try_from(value_bytes).unwrap(),
+                usize::try_from(encoded_bytes).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(tracker.high_water, worst);
+
+        let mut over_cap = ScratchTracker::default();
+        assert!(over_cap
+            .observe(usize::try_from(MAX_CHUNK_BYTES).unwrap(), 1, 0)
+            .is_err());
+        assert!(validate_row_chunk(MAX_ROW_CHUNK).is_ok());
+        assert!(validate_row_chunk(MAX_ROW_CHUNK + 1).is_err());
+        assert!(validate_row_chunk(0).is_err());
     }
     #[test]
     fn pinned_output_prediction_is_exact_before_payload_reads() {
@@ -4388,9 +4423,8 @@ mod tests {
             .and_then(|elements| elements.checked_mul(2))
             .ok_or_else(|| Qwen4Error::Invalid("sparse PLE bytes overflow".to_string()))?;
         let source_ple_bytes = ple_entries.iter().try_fold(0u64, |sum, entry| {
-            sum.checked_add(entry.source.data_len()).ok_or_else(|| {
-                Qwen4Error::Invalid("sparse source PLE bytes overflow".to_string())
-            })
+            sum.checked_add(entry.source.data_len())
+                .ok_or_else(|| Qwen4Error::Invalid("sparse source PLE bytes overflow".to_string()))
         })?;
         if source_ple_bytes != external_ple_bytes {
             return Err(Qwen4Error::Invalid(format!(
@@ -4445,15 +4479,24 @@ mod tests {
         let tensors = load_inventory(&source).expect("header inventory");
         assert_eq!(tensors.len(), PINNED_SOURCE_TENSOR_COUNT);
         assert_eq!(
-            tensors.iter().filter(|tensor| tensor.dtype == "BF16").count(),
+            tensors
+                .iter()
+                .filter(|tensor| tensor.dtype == "BF16")
+                .count(),
             PINNED_BF16_TENSOR_COUNT
         );
         assert_eq!(
-            tensors.iter().filter(|tensor| tensor.dtype == "I64").count(),
+            tensors
+                .iter()
+                .filter(|tensor| tensor.dtype == "I64")
+                .count(),
             PINNED_I64_TENSOR_COUNT
         );
         assert_eq!(
-            tensors.iter().filter(|tensor| is_vision_tensor(&tensor.name)).count(),
+            tensors
+                .iter()
+                .filter(|tensor| is_vision_tensor(&tensor.name))
+                .count(),
             PINNED_VISION_TENSOR_COUNT
         );
         validate_source_inventory(&tensors, Qwen4Mode::Production).expect("pinned source census");
