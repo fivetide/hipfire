@@ -53,7 +53,6 @@ def _cfg() -> dict[str, object]:
         "heads_per_ngram": 1,
         "ple_embed_dim": 8,
         "ngram_vocab_size_base": 7,
-        "seed": 1234,
         "eos_token_id": 2,
         "make_ngram_vocab_size_divisible_by": 8,
         "ple_conv_kernel_size": 2,
