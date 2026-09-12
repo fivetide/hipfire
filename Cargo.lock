@@ -1528,6 +1528,7 @@ dependencies = [
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
+ "hipfire-arch-qwen4",
  "hipfire-config",
  "hipfire-runtime",
  "rdna-compute",

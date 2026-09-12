@@ -15,10 +15,16 @@
 //! claimed by `Carrier::claims_arch_id`. Changing any assignment is a
 //! wire-format / routing break, so keep them byte-identical.
 
-/// Canonical `model_type` (HF) / `general.architecture` (GGUF) → `arch_id`.
+/// Canonical executable `model_type` (HF) / `general.architecture` (GGUF) →
+/// `arch_id`.
 ///
-/// Covers the union of every string previously recognised by the three
-/// consumers. Strings absent from this table are *unknown* and must fail
+/// Reserved source-only families live in [`RESERVED_MODEL_TYPE_TO_ARCH_ID`]
+/// instead of this executable registry. Keeping the tables separate lets
+/// source classification retain a reservation without making reset-core and
+/// carrier inventories pretend that a generation route exists.
+///
+/// Covers the union of every string previously recognised by executable
+/// consumers. Strings absent from both tables are *unknown* and must fail
 /// closed (not silently become llama 0). The qwen2 entry is intentionally
 /// `7` (Qwen2Carrier, loads Q/K/V biases); earlier `hipfire-quantize` builds
 /// mapped it to `1` (LLaMA) which dropped those biases — that was a bug and
@@ -81,9 +87,6 @@ pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
     ("muse_glimmer_text", 14),
     // arch 15 — maple (Maple-Preview 20B-A1B, natively-ternary 256-expert MoE)
     ("maple", 15),
-    // arch 16 — Qwen3.8-Flash-Next / Qwen4 experimental text trunk
-    ("qwen4_exp", 16),
-    ("qwen4_exp_text", 16),
     // arch 22 — gemma4 EAGLE drafter (single-block spec-decode head for arch 13)
     ("gemma4_unified_assistant", 22),
     // arch 23 — muse_glimmer DFlash drafter
@@ -100,26 +103,32 @@ pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
     // `FluxTransformer2DModel` to 40 via "flux".
     ("flux2", 45),
 ];
+/// Reserved source classifications with no executable carrier or reset owner.
+/// These strings remain accepted by [`lookup_model_type`] so packers and
+/// safetensors probing can preserve the wire id without publishing a route.
+pub const RESERVED_MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] =
+    &[("qwen4_exp", 16), ("qwen4_exp_text", 16)];
 
-/// Look up an `arch_id` for a `model_type` / GGUF `general.architecture` string.
+/// Look up an `arch_id` for a `model_type` / GGUF `general.architecture`
+/// string, including reserved source-only classifications.
 ///
-/// Returns `None` for unknown inputs — callers must fail closed (error
-/// naming the unrecognised string and listing `supported_model_types()`).
-/// The lookup is an exact string compare; no prefix or substring fallback,
-/// so a typo does not silently route to an unrelated arch.
+/// Returns `None` for unknown inputs — callers must fail closed (error naming
+/// the unrecognised string and listing `supported_model_types()`).
 pub fn lookup_model_type(model_type: &str) -> Option<u32> {
-    for (k, v) in MODEL_TYPE_TO_ARCH_ID {
-        if *k == model_type {
-            return Some(*v);
-        }
-    }
-    None
+    MODEL_TYPE_TO_ARCH_ID
+        .iter()
+        .chain(RESERVED_MODEL_TYPE_TO_ARCH_ID)
+        .find_map(|(key, id)| (*key == model_type).then_some(*id))
 }
 
-/// Sorted list of every recognised `model_type` / architecture string, for
-/// error messages. Computed from [`MODEL_TYPE_TO_ARCH_ID`] so it cannot drift.
+/// Sorted list of every recognised executable or reserved source string, for
+/// error messages. Computed from both tables so they cannot drift.
 pub fn supported_model_types() -> Vec<&'static str> {
-    let mut out: Vec<&'static str> = MODEL_TYPE_TO_ARCH_ID.iter().map(|(k, _)| *k).collect();
+    let mut out: Vec<&'static str> = MODEL_TYPE_TO_ARCH_ID
+        .iter()
+        .chain(RESERVED_MODEL_TYPE_TO_ARCH_ID)
+        .map(|(key, _)| *key)
+        .collect();
     out.sort_unstable();
     out.dedup();
     out
@@ -132,12 +141,23 @@ pub fn supported_model_types_display() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::lookup_model_type;
+    use super::{lookup_model_type, MODEL_TYPE_TO_ARCH_ID, RESERVED_MODEL_TYPE_TO_ARCH_ID};
 
     #[test]
     fn qwen4_outer_and_text_model_types_share_reserved_architecture_id() {
         assert_eq!(lookup_model_type("qwen4_exp"), Some(16));
         assert_eq!(lookup_model_type("qwen4_exp_text"), Some(16));
+    }
+
+    #[test]
+    fn qwen4_is_reserved_and_not_in_executable_table() {
+        assert!(MODEL_TYPE_TO_ARCH_ID
+            .iter()
+            .all(|(model_type, _)| !model_type.starts_with("qwen4")));
+        assert_eq!(
+            RESERVED_MODEL_TYPE_TO_ARCH_ID,
+            &[("qwen4_exp", 16), ("qwen4_exp_text", 16)]
+        );
     }
 
     #[test]

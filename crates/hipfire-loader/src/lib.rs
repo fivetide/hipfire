@@ -2299,10 +2299,23 @@ pub fn load_model_with_kv_backend(
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
+    // Open the source before any VMM/teardown work so the reserved Qwen4
+    // boundary can classify it without a destructive side effect.
+    let src = ModelSource::from_path(path)?;
+    if src.arch_id() == Some(hipfire_arch_qwen4::ARCH_ID) {
+        let raw_kv_mode = kv_mode_override.unwrap_or("");
+        kv_mode::resolve_qwen4(raw_kv_mode, 256)?;
+        crate::admission::admit_qwen4_source(
+            &src,
+            hipfire_arch_qwen4::EffectiveMesh::new(pp, 1, 1),
+            hipfire_arch_qwen4::InputModality::Text,
+            true,
+        )?;
+        return Err(crate::admission::qwen4_non_executable_refusal().into());
+    }
     // Retry any arenas left by a prior failed teardown; refuse the load if
     // ownership is still live so a new model cannot stack on pending VMM state.
     ensure_vmm_ready_for_load(gpu)?;
-    let src = ModelSource::from_path(path)?;
     let kv_backend_raw = kv_backend_override.unwrap_or("contiguous");
     let kv_backend: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
 

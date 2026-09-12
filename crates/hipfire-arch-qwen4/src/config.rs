@@ -4,10 +4,11 @@
 
 //! Pure Qwen4 (Qwen3.8-Flash-Next) configuration parsing and admission.
 //!
-//! The checkpoint has two JSON envelopes in common use: an HF metadata
-//! envelope (`{"config": ...}`) and a raw Transformers `config.json`.  The
-//! parser accepts either, descends into `text_config`, and then validates the
-//! complete text/MTP shape before a caller can allocate anything.
+//! The offline source/quantizer parser accepts two JSON envelopes: an HF
+//! metadata envelope (`{"config": ...}`) and a raw Transformers `config.json`.
+//! Runtime serving admission uses the strict nested conditional-generation
+//! parser, which additionally requires the outer model type and canonical
+//! architecture entry before allocation.
 
 use serde_json::Value;
 use std::fmt;
@@ -213,16 +214,77 @@ pub struct Qwen4Config {
 }
 
 impl Qwen4Config {
-    /// Parse an HF metadata JSON string or a raw `config.json` string.
+    /// Parse an offline source/quantizer JSON input.
+    ///
+    /// This deliberately accepts either the HF metadata envelope or a raw
+    /// Transformers `config.json`; runtime serving admission must use the
+    /// strict [`Self::from_metadata_json`] contract instead.
     pub fn from_json(json: &str) -> Result<Self, String> {
         let value: Value = serde_json::from_str(json)
             .map_err(|e| format!("qwen4: configuration is not valid JSON: {e}"))?;
         Self::from_value(&value)
     }
 
-    /// Alias matching the existing architecture crates' public entry point.
+    /// Parse the strict nested conditional-generation envelope used by a
+    /// runtime serving artifact.
     pub fn from_metadata_json(json: &str) -> Result<Self, String> {
-        Self::from_json(json)
+        Self::from_nested_metadata_json(json)
+    }
+
+    /// Parse only the nested conditional-generation envelope used by a
+    /// Qwen4 serving artifact.
+    ///
+    /// `from_value` is the explicit source/quantizer parser and remains
+    /// compatible with raw text `config.json` inputs. Runtime admission is
+    /// stricter: a source must identify the outer conditional-generation
+    /// model, its nested text model, and the one canonical architecture entry.
+    /// This keeps an arbitrary text-shaped config from being classified as the
+    /// reserved arch 16 route.
+    pub fn from_nested_json(json: &str) -> Result<Self, String> {
+        let value: Value = serde_json::from_str(json)
+            .map_err(|e| format!("qwen4: configuration is not valid JSON: {e}"))?;
+        Self::from_nested_value(&value)
+    }
+
+    /// Strict runtime classifier for the nested text+MTP Qwen4 envelope.
+    pub fn from_nested_value(value: &Value) -> Result<Self, String> {
+        let config = value.get("config").unwrap_or(value);
+        let object = config
+            .as_object()
+            .ok_or_else(|| "qwen4: nested `config` must be a JSON object".to_string())?;
+        if object.get("model_type").and_then(Value::as_str) != Some(MODEL_TYPE) {
+            return Err(format!(
+                "qwen4: nested runtime admission requires outer model_type={MODEL_TYPE:?}"
+            ));
+        }
+        let text = object
+            .get("text_config")
+            .ok_or_else(|| "qwen4: nested runtime admission requires `text_config`".to_string())?
+            .as_object()
+            .ok_or_else(|| "qwen4: `text_config` must be a JSON object".to_string())?;
+        if text.get("model_type").and_then(Value::as_str) != Some(TEXT_MODEL_TYPE) {
+            return Err(format!(
+                "qwen4: nested runtime admission requires text_config.model_type={TEXT_MODEL_TYPE:?}"
+            ));
+        }
+        let architectures = object
+            .get("architectures")
+            .ok_or_else(|| "qwen4: nested runtime admission requires `architectures`".to_string())?
+            .as_array()
+            .ok_or_else(|| "qwen4: `architectures` must be an array".to_string())?;
+        if architectures.len() != 1
+            || architectures.first().and_then(Value::as_str) != Some(ARCHITECTURE_NAME)
+        {
+            return Err(format!(
+                "qwen4: nested runtime admission requires architectures=[{ARCHITECTURE_NAME:?}]"
+            ));
+        }
+        Self::from_value(value)
+    }
+
+    /// Parse the strict nested runtime envelope from HFQ metadata.
+    pub fn from_nested_metadata_json(json: &str) -> Result<Self, String> {
+        Self::from_nested_json(json)
     }
 
     /// Parse from an already decoded metadata/config value.
@@ -753,6 +815,33 @@ mod tests {
             .insert("model_type".into(), Value::String(TEXT_MODEL_TYPE.into()));
         let cfg = Qwen4Config::from_value(&text).expect("raw text config should parse");
         assert_eq!(cfg.text_model_type, TEXT_MODEL_TYPE);
+    }
+    #[test]
+    fn strict_runtime_classifier_requires_nested_conditional_envelope() {
+        let metadata = json!({"config": fixture()});
+        let metadata_json = metadata.to_string();
+        let cfg = Qwen4Config::from_metadata_json(&metadata_json).expect("nested config");
+        assert_eq!(cfg.model_type, MODEL_TYPE);
+        assert_eq!(cfg.text_model_type, TEXT_MODEL_TYPE);
+
+        let mut raw = fixture();
+        let text = raw.as_object_mut().unwrap().remove("text_config").unwrap();
+        assert!(Qwen4Config::from_metadata_json(&text.to_string()).is_err());
+
+        let mut missing_architecture = fixture();
+        missing_architecture
+            .as_object_mut()
+            .unwrap()
+            .remove("architectures");
+        assert!(Qwen4Config::from_metadata_json(&missing_architecture.to_string()).is_err());
+    }
+
+    #[test]
+    fn strict_runtime_classifier_accepts_conditional_config_with_vision_marker() {
+        let mut metadata = fixture();
+        metadata["vision_config"] = json!({"model_type": "vision"});
+        let cfg = Qwen4Config::from_nested_value(&metadata).expect("text config");
+        assert_eq!(cfg.architecture_id, ARCH_ID);
     }
 
     #[test]

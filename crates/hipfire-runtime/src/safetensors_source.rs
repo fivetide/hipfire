@@ -705,7 +705,10 @@ pub fn derive_arch_id(config: &serde_json::Value) -> u32 {
         }
         // Generic table-driven substring match for all other architectures.
         let mut best: Option<(&'static str, u32)> = None;
-        for (k, v) in crate::arch_mapping::MODEL_TYPE_TO_ARCH_ID {
+        for (k, v) in crate::arch_mapping::MODEL_TYPE_TO_ARCH_ID
+            .iter()
+            .chain(crate::arch_mapping::RESERVED_MODEL_TYPE_TO_ARCH_ID)
+        {
             if arch_lower.contains(*k) {
                 match best {
                     Some((bk, _)) if k.len() <= bk.len() => {}

@@ -562,7 +562,6 @@ mod tests {
         }
 
         let drafters: BTreeSet<u32> = [22, 23].into_iter().collect();
-
         let mut expected_keys = BTreeSet::new();
         let mut id_to_key = BTreeMap::new();
         for (_, id) in MODEL_TYPE_TO_ARCH_ID.iter() {
@@ -605,6 +604,10 @@ mod tests {
         // Unknowns must stay ineligible (fail-closed).
         assert!(!is_retry_reset_eligible("unknown-arch"));
         assert!(reset_coverage_for("unknown-arch").is_none());
+        // Reserved Qwen4 remains fail-closed until a real ArchModel reset
+        // owner exists; no dummy inventory row is allowed.
+        assert!(!is_retry_reset_eligible("qwen4"));
+        assert!(reset_coverage_for("qwen4").is_none());
     }
 
     #[test]
