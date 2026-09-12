@@ -412,7 +412,6 @@ pub fn reset_mesh_request_state(
     }
 }
 
-
 fn emit_active_error_route_aware(
     stdout: &mut impl std::io::Write,
     id: Option<&str>,
@@ -1618,6 +1617,10 @@ pub fn arm_generation_faults_from_request(msg: &serde_json::Value) {
     let flag = |k: &str| msg.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
     arm_generation_fault_after_prefill(flag("test_fault_after_prefill"));
     arm_generation_fault_after_first_decode(flag("test_fault_after_first_decode"));
+    #[cfg(feature = "serve-fault-inject")]
+    hipfire_dispatch::pipeline::sealed_moe::arm_fault_after_expert_mutation(flag(
+        "test_fault_after_expert_mutation",
+    ));
 }
 
 /// Disarm every generation fault hook on this thread.
@@ -1625,6 +1628,8 @@ pub fn arm_generation_faults_from_request(msg: &serde_json::Value) {
 pub fn disarm_generation_faults() {
     arm_generation_fault_after_prefill(false);
     arm_generation_fault_after_first_decode(false);
+    #[cfg(feature = "serve-fault-inject")]
+    hipfire_dispatch::pipeline::sealed_moe::arm_fault_after_expert_mutation(false);
 }
 
 /// Test-only per-request fault arming for the daemon (`serve-fault-inject`):

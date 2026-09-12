@@ -675,56 +675,34 @@ fn dispatch_kv_write(
             // established two-launch path.
             let pos = io.positions();
             #[cfg(feature = "deltanet")]
-            {
-                if gpu.arch_caps.is_gfx1100() && !gpu.flags.fa_batch_fuse_off {
-                    hip!(gpu.kv_cache_write_q8_0_pair_batched(
-                        io.k_cache,
-                        io.v_cache,
-                        io.k,
-                        io.v,
-                        pos,
-                        io.n_kv_heads,
-                        io.head_dim,
-                        io.batch_size,
-                    ))
-                } else {
-                    hip!(gpu.kv_cache_write_q8_0_batched(
-                        io.k_cache,
-                        io.k,
-                        pos,
-                        io.n_kv_heads,
-                        io.head_dim,
-                        io.batch_size,
-                    ))?;
-                    hip!(gpu.kv_cache_write_q8_0_batched(
-                        io.v_cache,
-                        io.v,
-                        pos,
-                        io.n_kv_heads,
-                        io.head_dim,
-                        io.batch_size,
-                    ))
-                }
-            }
-            #[cfg(not(feature = "deltanet"))]
-            {
-                hip!(gpu.kv_cache_write_q8_0_batched(
+            if gpu.arch_caps.is_gfx1100() && !gpu.flags.fa_batch_fuse_off {
+                return hip!(gpu.kv_cache_write_q8_0_pair_batched(
                     io.k_cache,
-                    io.k,
-                    pos,
-                    io.n_kv_heads,
-                    io.head_dim,
-                    io.batch_size,
-                ))?;
-                hip!(gpu.kv_cache_write_q8_0_batched(
                     io.v_cache,
+                    io.k,
                     io.v,
                     pos,
                     io.n_kv_heads,
                     io.head_dim,
                     io.batch_size,
-                ))
+                ));
             }
+            hip!(gpu.kv_cache_write_q8_0_batched(
+                io.k_cache,
+                io.k,
+                pos,
+                io.n_kv_heads,
+                io.head_dim,
+                io.batch_size,
+            ))?;
+            hip!(gpu.kv_cache_write_q8_0_batched(
+                io.v_cache,
+                io.v,
+                pos,
+                io.n_kv_heads,
+                io.head_dim,
+                io.batch_size,
+            ))
         }
         KernelKey::KvWriteBf16Batched => {
             // Called twice (K, then V), like the Q8 batched write. Legacy
