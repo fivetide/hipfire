@@ -31,10 +31,16 @@ pub const PLE_ROW_BYTES: usize = PLE_ROW_WIDTH * 2;
 /// Userspace cache budget.  This is deliberately fixed rather than a public
 /// runtime knob: the model's SSD path must remain bounded on every request.
 pub const PLE_PAGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
-/// Page size used by the userspace cache.  It is row aligned.
-pub const PLE_PAGE_BYTES: usize = 2 * 1024 * 1024;
-/// Maximum number of bytes in one coalesced read or one staging buffer.
-pub const PLE_STAGING_BYTES: usize = 8 * 1024 * 1024;
+/// Target page size used by the userspace cache.
+const PLE_PAGE_TARGET_BYTES: usize = 2 * 1024 * 1024;
+/// Page size rounded down to a whole number of physical rows.
+///
+/// Keeping the public geometry row aligned avoids partial-row pages and makes
+/// every positional read a multiple of the source row width.
+pub const PLE_PAGE_BYTES: usize = (PLE_PAGE_TARGET_BYTES / PLE_ROW_BYTES) * PLE_ROW_BYTES;
+/// Maximum of bytes in one coalesced read or one staging buffer, rounded down
+/// to a whole number of rows.
+pub const PLE_STAGING_BYTES: usize = (8 * 1024 * 1024 / PLE_ROW_BYTES) * PLE_ROW_BYTES;
 /// At most two staging buffers exist: one completed output and one read buffer.
 pub const PLE_MAX_STAGING_BUFFERS: usize = 2;
 /// Bounded queue of request ids.  A completed request also occupies one ticket
@@ -143,14 +149,14 @@ pub enum PleRowsError {
         requested: u64,
         current: u64,
     },
+    EpochNotMonotonic {
+        requested: u64,
+        current: u64,
+    },
     Canceled,
     UnknownTicket(u64),
     AlreadyConsumed(u64),
     WorkerStopped,
-    CacheMiss {
-        shard: usize,
-        page: usize,
-    },
     InvalidLease {
         reason: String,
     },
@@ -193,13 +199,16 @@ impl fmt::Display for PleRowsError {
                     "PLE request epoch {requested} does not match current epoch {current}"
                 )
             }
+            Self::EpochNotMonotonic { requested, current } => {
+                write!(
+                    f,
+                    "PLE epoch {requested} is not newer than current epoch {current}"
+                )
+            }
             Self::Canceled => f.write_str("PLE prefetch was canceled"),
             Self::UnknownTicket(id) => write!(f, "unknown PLE prefetch ticket {id}"),
             Self::AlreadyConsumed(id) => write!(f, "PLE prefetch ticket {id} was already consumed"),
             Self::WorkerStopped => f.write_str("PLE reader worker has stopped"),
-            Self::CacheMiss { shard, page } => {
-                write!(f, "PLE cache lost shard {shard} page {page}")
-            }
             Self::InvalidLease { reason } => write!(f, "invalid PLE lease: {reason}"),
             Self::LeaseStale {
                 lease_epoch,
@@ -266,15 +275,23 @@ impl PleRowLease {
         &self.ids
     }
 
-    /// Borrow the contiguous `[tokens, 16, 160]` BF16 staging bytes.
-    /// `validate` should be called at the layer-1 consumption boundary when
-    /// the caller needs stale-epoch failure instead of an unconditional view.
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
+    /// Borrow the contiguous `[tokens, 16, 160]` BF16 staging bytes only
+    /// while this lease's epoch is current.  A fallible view is intentional:
+    /// returning an unconditional slice would let a reset publish stale rows.
+    pub fn as_bytes(&self) -> Result<&[u8], PleRowsError> {
+        self.try_bytes()
     }
 
     pub fn validate(&self) -> Result<(), PleRowsError> {
         self.inner.validate_lease_epoch(self.epoch)
+    }
+
+    /// Re-check the reader epoch after the caller's device upload has
+    /// completed.  The upload itself is intentionally owned by the caller;
+    /// this method closes the second half of the publication boundary so a
+    /// reset cannot silently publish stale rows.
+    pub fn validate_after_upload(&self) -> Result<(), PleRowsError> {
+        self.validate()
     }
 
     pub fn try_bytes(&self) -> Result<&[u8], PleRowsError> {
@@ -302,9 +319,12 @@ impl PleRowLease {
             })?;
         Ok(&self.bytes[begin..begin + PLE_ROW_BYTES])
     }
+
     /// Copy all rows in one contiguous operation into caller-owned upload
     /// storage.  This is the CPU staging boundary; callers must not copy one
-    /// row at a time into separate device allocations.
+    /// row at a time into separate device allocations.  The epoch is checked
+    /// both before and after the copy so a reset racing this operation is
+    /// reported instead of publishing stale bytes.
     pub fn stage_into(&self, destination: &mut [u8]) -> Result<(), PleRowsError> {
         self.validate()?;
         if destination.len() != self.bytes.len() {
@@ -317,7 +337,7 @@ impl PleRowLease {
             });
         }
         destination.copy_from_slice(&self.bytes);
-        Ok(())
+        self.validate_after_upload()
     }
 }
 
@@ -364,10 +384,13 @@ impl PlePrefetch {
     pub fn row_ids(&self) -> Result<Vec<[u64; PLE_ROWS_PER_TOKEN]>, PleRowsError> {
         let inner = self.inner.upgrade().ok_or(PleRowsError::WorkerStopped)?;
         let state = inner.state.lock().expect("PLE state mutex poisoned");
-        let ticket = state
-            .tickets
-            .get(&self.id)
-            .ok_or(PleRowsError::UnknownTicket(self.id))?;
+        let ticket = state.tickets.get(&self.id).ok_or_else(|| {
+            if self.canceled.load(Ordering::Acquire) {
+                PleRowsError::Canceled
+            } else {
+                PleRowsError::UnknownTicket(self.id)
+            }
+        })?;
         Ok(ticket.ids.clone())
     }
 
@@ -443,12 +466,14 @@ impl PleRows {
             })?;
         let inner = Arc::new(PleRowsInner {
             source,
+            stopped: AtomicBool::new(false),
             shard_count: descriptors.len(),
             _descriptors: descriptors,
             metadata,
             rows_per_shard,
             rows_per_page: PLE_ROWS_PER_PAGE,
             current_epoch: AtomicU64::new(0),
+            epoch_started: AtomicBool::new(false),
             state: Mutex::new(PleRowsState::new()),
             cv: Condvar::new(),
         });
@@ -490,15 +515,64 @@ impl PleRows {
         self.inner.current_epoch.load(Ordering::Acquire)
     }
 
-    /// Start a model/request epoch and invalidate every prior ticket.  Existing
-    /// leases remain memory-safe but fail [`PleRowLease::validate`] as stale.
-    pub fn begin_epoch(&self, epoch: u64) {
-        self.inner.current_epoch.store(epoch, Ordering::Release);
-        let state = self.inner.state.lock().expect("PLE state mutex poisoned");
-        for ticket in state.tickets.values() {
-            ticket.canceled.store(true, Ordering::Release);
+    /// Start a model/request epoch and invalidate every prior ticket.
+    ///
+    /// Epochs are single-use and strictly increasing after the first epoch.
+    /// The first caller may choose epoch zero.  Invalidated queued tickets are
+    /// removed immediately; an in-flight source read is allowed to finish
+    /// under cancellation but can never publish a lease.
+    pub fn begin_epoch(&self, epoch: u64) -> Result<(), PleRowsError> {
+        let mut state = self.inner.state.lock().expect("PLE state mutex poisoned");
+        if self.inner.stopped.load(Ordering::Acquire) {
+            return Err(PleRowsError::WorkerStopped);
         }
+        let current = self.current_epoch();
+        let started = self.inner.epoch_started.load(Ordering::Acquire);
+        if started && epoch <= current {
+            return Err(PleRowsError::EpochNotMonotonic {
+                requested: epoch,
+                current,
+            });
+        }
+        self.inner.current_epoch.store(epoch, Ordering::Release);
+        self.inner.epoch_started.store(true, Ordering::Release);
+        invalidate_tickets_locked(&self.inner, &mut state);
         self.inner.cv.notify_all();
+        Ok(())
+    }
+
+    /// Invalidate the current request epoch, drain all queued/readers/leases,
+    /// then resume the same model-owned cache for the next epoch.  Immutable
+    /// cached pages survive; request tickets and output buffers do not.
+    pub fn reset_epoch(&self, timeout: Duration) -> Result<u64, PleRowsError> {
+        if self.inner.stopped.load(Ordering::Acquire) {
+            return Err(PleRowsError::WorkerStopped);
+        }
+        let next = {
+            let mut state = self.inner.state.lock().expect("PLE state mutex poisoned");
+            let current = self.current_epoch();
+            let next = current
+                .checked_add(1)
+                .ok_or(PleRowsError::EpochNotMonotonic {
+                    requested: u64::MAX,
+                    current: u64::MAX,
+                })?;
+            let started = self.inner.epoch_started.load(Ordering::Acquire);
+            if started && next <= current {
+                return Err(PleRowsError::EpochNotMonotonic {
+                    requested: next,
+                    current,
+                });
+            }
+            self.inner.current_epoch.store(next, Ordering::Release);
+            self.inner.epoch_started.store(true, Ordering::Release);
+            invalidate_tickets_locked(&self.inner, &mut state);
+            self.inner.cv.notify_all();
+            next
+        };
+        self.quiesce(timeout)?;
+        self.resume()?;
+        Ok(next)
     }
 
     /// Compute all sixteen ids and enqueue a bounded, token-known prefetch.
@@ -547,12 +621,6 @@ impl PleRows {
         if state.tickets.len() >= PLE_READER_QUEUE_CAPACITY {
             return Err(PleRowsError::QueueFull);
         }
-        let mut buffer = self
-            .inner
-            .take_staging_locked(&mut state)
-            .ok_or(PleRowsError::StagingUnavailable)?;
-        buffer.resize(required_bytes, 0);
-        let output = Some(buffer);
         let id = state.next_ticket;
         state.next_ticket = state.next_ticket.wrapping_add(1);
         let canceled = Arc::new(AtomicBool::new(false));
@@ -564,7 +632,8 @@ impl PleRows {
                 ids,
                 locations,
                 pages,
-                output,
+                required_bytes,
+                output: None,
                 status: TicketStatus::Pending,
             },
         );
@@ -599,7 +668,13 @@ impl PleRows {
         loop {
             let done = match state.tickets.get(&ticket.id) {
                 Some(ticket_state) => !matches!(ticket_state.status, TicketStatus::Pending),
-                None => return Err(PleRowsError::UnknownTicket(ticket.id)),
+                None => {
+                    return Err(if ticket.canceled.load(Ordering::Acquire) {
+                        PleRowsError::Canceled
+                    } else {
+                        PleRowsError::UnknownTicket(ticket.id)
+                    })
+                }
             };
             if done {
                 break;
@@ -676,9 +751,7 @@ impl PleRows {
         {
             let mut state = self.inner.state.lock().expect("PLE state mutex poisoned");
             state.accepting = false;
-            for ticket in state.tickets.values() {
-                ticket.canceled.store(true, Ordering::Release);
-            }
+            invalidate_tickets_locked(&self.inner, &mut state);
             self.inner.cv.notify_all();
         }
         let deadline = Instant::now() + timeout;
@@ -711,9 +784,28 @@ impl PleRows {
         }
     }
 
+    fn quiesce_blocking(&self) -> Result<PleQuiesceReport, PleRowsError> {
+        {
+            let mut state = self.inner.state.lock().expect("PLE state mutex poisoned");
+            state.accepting = false;
+            invalidate_tickets_locked(&self.inner, &mut state);
+            self.inner.cv.notify_all();
+        }
+        let mut state = self.inner.state.lock().expect("PLE state mutex poisoned");
+        loop {
+            if state.queue.is_empty() && state.active_readers == 0 && state.active_leases == 0 {
+                purge_tickets_locked(&self.inner, &mut state);
+                let report = self.inner.report_locked(&state);
+                self.inner.cv.notify_all();
+                return Ok(report);
+            }
+            state = self.inner.cv.wait(state).expect("PLE state mutex poisoned");
+        }
+    }
+
     pub fn resume(&self) -> Result<(), PleRowsError> {
         let mut state = self.inner.state.lock().expect("PLE state mutex poisoned");
-        if state.stop {
+        if state.stop || self.inner.stopped.load(Ordering::Acquire) {
             return Err(PleRowsError::WorkerStopped);
         }
         state.accepting = true;
@@ -721,10 +813,14 @@ impl PleRows {
         Ok(())
     }
 
-    /// Quiesce and join the model-owned reader.  Success proves no reader,
-    /// queue item, lease, or staging buffer remains outstanding.
-    pub fn unload(mut self, timeout: Duration) -> Result<PleQuiesceReport, PleRowsError> {
-        let report = self.quiesce(timeout)?;
+    /// Quiesce and join the model-owned reader with explicit blocking
+    /// semantics.  Regular-file positional reads cannot be safely canceled,
+    /// so this API never returns a timeout while a worker can still outlive
+    /// its source owner.
+    pub fn unload(mut self) -> Result<PleQuiesceReport, PleRowsError> {
+        let report = self.quiesce_blocking()?;
+        self.inner.stopped.store(true, Ordering::Release);
+        self.inner.current_epoch.fetch_add(1, Ordering::AcqRel);
         {
             let mut state = self.inner.state.lock().expect("PLE state mutex poisoned");
             state.stop = true;
@@ -787,11 +883,11 @@ impl PleRows {
 
 impl Drop for PleRows {
     fn drop(&mut self) {
+        self.inner.stopped.store(true, Ordering::Release);
+        self.inner.current_epoch.fetch_add(1, Ordering::AcqRel);
         if let Ok(mut state) = self.inner.state.lock() {
             state.accepting = false;
-            for ticket in state.tickets.values() {
-                ticket.canceled.store(true, Ordering::Release);
-            }
+            invalidate_tickets_locked(&self.inner, &mut state);
             state.stop = true;
             self.inner.cv.notify_all();
         }
@@ -808,7 +904,9 @@ struct PleRowsInner {
     metadata: PleHashMetadata,
     rows_per_shard: usize,
     rows_per_page: usize,
+    epoch_started: AtomicBool,
     current_epoch: AtomicU64,
+    stopped: AtomicBool,
     state: Mutex<PleRowsState>,
     cv: Condvar,
 }
@@ -860,7 +958,7 @@ impl PleRowsInner {
 
     fn validate_lease_epoch(&self, lease_epoch: u64) -> Result<(), PleRowsError> {
         let current = self.current_epoch.load(Ordering::Acquire);
-        if current != lease_epoch {
+        if self.stopped.load(Ordering::Acquire) || current != lease_epoch {
             Err(PleRowsError::LeaseStale {
                 lease_epoch,
                 current_epoch: current,
@@ -924,30 +1022,36 @@ impl PleRowsInner {
 
     fn cancel_ticket(&self, id: u64) -> Result<(), PleRowsError> {
         let mut state = self.state.lock().expect("PLE state mutex poisoned");
-        let completed = {
-            let ticket = state
-                .tickets
-                .get(&id)
-                .ok_or(PleRowsError::UnknownTicket(id))?;
-            ticket.canceled.store(true, Ordering::Release);
-            matches!(ticket.status, TicketStatus::Completed(_))
+        let Some(ticket) = state.tickets.get(&id) else {
+            return Ok(());
         };
-        if completed {
-            let ticket = state.tickets.remove(&id).expect("ticket disappeared");
-            if let Some(buffer) = ticket.output {
-                self.return_staging_locked(&mut state, buffer);
+        ticket.canceled.store(true, Ordering::Release);
+
+        let queued = state.queue.iter().position(|queued_id| *queued_id == id);
+        let completed = matches!(
+            state.tickets.get(&id).map(|ticket| &ticket.status),
+            Some(TicketStatus::Completed(_))
+        );
+        if let Some(position) = queued {
+            state.queue.remove(position);
+        }
+        if queued.is_some() || completed {
+            if let Some(ticket) = state.tickets.remove(&id) {
+                if let Some(buffer) = ticket.output {
+                    self.return_staging_locked(&mut state, buffer);
+                }
             }
         }
         self.cv.notify_all();
         Ok(())
     }
-
-    fn process_ticket(&self, id: u64) -> ProcessedTicket {
+    fn process_ticket(&self, id: u64, read_buffer: Vec<u8>) -> ProcessedTicket {
         let (epoch, canceled, pages, locations, output) = {
             let mut state = self.state.lock().expect("PLE state mutex poisoned");
             let Some(ticket) = state.tickets.get_mut(&id) else {
                 return ProcessedTicket {
                     output: None,
+                    read_buffer,
                     result: Err(PleRowsError::Canceled),
                 };
             };
@@ -960,9 +1064,11 @@ impl PleRowsInner {
             )
         };
         let mut output = output.unwrap_or_default();
+        let mut read_buffer = read_buffer;
         if canceled.load(Ordering::Acquire) {
             return ProcessedTicket {
                 output: Some(output),
+                read_buffer,
                 result: Err(PleRowsError::Canceled),
             };
         }
@@ -970,78 +1076,110 @@ impl PleRowsInner {
         if epoch != current {
             return ProcessedTicket {
                 output: Some(output),
+                read_buffer,
                 result: Err(PleRowsError::EpochMismatch {
                     requested: epoch,
                     current,
                 }),
             };
         }
-        if let Err(error) = self.read_pages(&pages, &canceled) {
-            return ProcessedTicket {
-                output: Some(output),
-                result: Err(error),
-            };
-        }
-        if canceled.load(Ordering::Acquire) {
-            return ProcessedTicket {
-                output: Some(output),
-                result: Err(PleRowsError::Canceled),
-            };
-        }
-        let result = self.assemble_rows(&locations, &mut output, &canceled);
+        let result = self.fill_output(&locations, &pages, &mut output, &mut read_buffer, &canceled);
         ProcessedTicket {
             output: Some(output),
+            read_buffer,
             result,
         }
     }
 
-    fn read_pages(&self, pages: &[PageKey], canceled: &AtomicBool) -> Result<(), PleRowsError> {
+    /// Fill the final bounded lease directly while each page group is
+    /// available.  Requested page sets may be much larger than the cache;
+    /// no second pass assumes all pages remain resident.
+    fn fill_output(
+        &self,
+        locations: &[PleRowLocation],
+        pages: &[PageKey],
+        output: &mut [u8],
+        read_staging: &mut Vec<u8>,
+        canceled: &AtomicBool,
+    ) -> Result<(), PleRowsError> {
+        let expected = locations.len().checked_mul(PLE_ROW_BYTES).ok_or_else(|| {
+            PleRowsError::InvalidLease {
+                reason: "staging size overflow".to_string(),
+            }
+        })?;
+        if output.len() != expected {
+            return Err(PleRowsError::InvalidLease {
+                reason: "staging size does not match row plan".to_string(),
+            });
+        }
+        let mut requested: HashMap<PageKey, Vec<RowCopy>> = HashMap::new();
+        for (index, location) in locations.iter().copied().enumerate() {
+            requested
+                .entry(location.page_key())
+                .or_default()
+                .push(RowCopy {
+                    output_offset: index * PLE_ROW_BYTES,
+                    page_offset: location.page_byte_offset,
+                });
+        }
+
         let mut missing = Vec::new();
-        {
+        for &page in pages {
+            if canceled.load(Ordering::Acquire) {
+                return Err(PleRowsError::Canceled);
+            }
             let mut state = self.state.lock().expect("PLE state mutex poisoned");
-            for &page in pages {
-                if state.cache.pages.contains_key(&page) {
-                    state.cache.touch(page);
-                    state.cache.hits += 1;
-                } else {
-                    state.cache.misses += 1;
-                    missing.push(page);
-                }
+            if let Some(cached) = state.cache.pages.get(&page) {
+                copy_requested_rows(
+                    page,
+                    &cached.bytes,
+                    requested.get(&page).map(Vec::as_slice).unwrap_or(&[]),
+                    output,
+                )?;
+                state.cache.touch(page);
+                state.cache.hits += 1;
+            } else {
+                state.cache.misses += 1;
+                missing.push(page);
             }
         }
-        let groups = self.coalesce_pages(&missing);
+
+        let groups = self.coalesce_pages(&missing)?;
         for group in groups {
             if canceled.load(Ordering::Acquire) {
                 return Err(PleRowsError::Canceled);
             }
-            self.read_group(&group, canceled)?;
+            self.read_group(&group, &requested, output, read_staging, canceled)?;
         }
         Ok(())
     }
 
-    fn coalesce_pages(&self, pages: &[PageKey]) -> Vec<Vec<PageKey>> {
+    fn coalesce_pages(&self, pages: &[PageKey]) -> Result<Vec<Vec<PageKey>>, PleRowsError> {
         let mut groups: Vec<Vec<PageKey>> = Vec::new();
+        let mut current_bytes = 0usize;
         for &page in pages {
-            let page_bytes = self.page_len(page).unwrap_or(0);
+            let page_bytes = self.page_len(page)?;
             let append = groups.last().is_some_and(|group| {
                 let previous = group[group.len() - 1];
                 previous.shard == page.shard
                     && previous.page.checked_add(1) == Some(page.page)
-                    && group
-                        .iter()
-                        .fold(0usize, |total, key| {
-                            total.saturating_add(self.page_len(*key).unwrap_or(usize::MAX))
-                        })
-                        .saturating_add(page_bytes)
-                        <= PLE_STAGING_BYTES
+                    && current_bytes
+                        .checked_add(page_bytes)
+                        .is_some_and(|total| total <= PLE_STAGING_BYTES)
             });
             if append {
                 groups.last_mut().expect("group exists").push(page);
+                current_bytes = current_bytes.checked_add(page_bytes).ok_or_else(|| {
+                    PleRowsError::InvalidLease {
+                        reason: "coalesced length overflow".to_string(),
+                    }
+                })?;
             } else {
                 groups.push(vec![page]);
+                current_bytes = page_bytes;
             }
         }
-        groups
+        Ok(groups)
     }
 
     fn page_len(&self, page: PageKey) -> Result<usize, PleRowsError> {
@@ -1067,8 +1205,14 @@ impl PleRowsInner {
                 reason: "page byte length overflow".to_string(),
             })
     }
-
-    fn read_group(&self, group: &[PageKey], canceled: &AtomicBool) -> Result<(), PleRowsError> {
+    fn read_group(
+        &self,
+        group: &[PageKey],
+        requested: &HashMap<PageKey, Vec<RowCopy>>,
+        output: &mut [u8],
+        read_staging: &mut Vec<u8>,
+        canceled: &AtomicBool,
+    ) -> Result<(), PleRowsError> {
         let first = *group.first().ok_or_else(|| PleRowsError::InvalidLease {
             reason: "empty coalesced page group".to_string(),
         })?;
@@ -1085,93 +1229,79 @@ impl PleRowsInner {
             .collect::<Result<_, _>>()?;
         let total = lengths
             .iter()
-            .try_fold(0usize, |sum, len| sum.checked_add(*len));
-        let total = total.ok_or_else(|| PleRowsError::InvalidLease {
-            reason: "coalesced length overflow".to_string(),
-        })?;
+            .try_fold(0usize, |sum, len| sum.checked_add(*len))
+            .ok_or_else(|| PleRowsError::InvalidLease {
+                reason: "coalesced length overflow".to_string(),
+            })?;
         if total > PLE_STAGING_BYTES {
             return Err(PleRowsError::InvalidLease {
                 reason: "coalesced read exceeds staging budget".to_string(),
             });
         }
 
-        let mut read_staging = {
-            let mut state = self.state.lock().expect("PLE state mutex poisoned");
-            self.take_staging_locked(&mut state)
-        };
-        if let Some(mut staging) = read_staging.take() {
-            staging.resize(total, 0);
-            let result = self.source.read_at(first.shard, first_offset, &mut staging);
-            if let Err(error) = result {
-                let mut state = self.state.lock().expect("PLE state mutex poisoned");
-                self.return_staging_locked(&mut state, staging);
-                return Err(error.into());
-            }
-            if canceled.load(Ordering::Acquire) {
-                let mut state = self.state.lock().expect("PLE state mutex poisoned");
-                self.return_staging_locked(&mut state, staging);
-                return Err(PleRowsError::Canceled);
-            }
-            let mut state = self.state.lock().expect("PLE state mutex poisoned");
-            let mut cursor = 0usize;
-            for (&page, &length) in group.iter().zip(&lengths) {
-                state
-                    .cache
-                    .insert(page, staging[cursor..cursor + length].to_vec());
-                cursor += length;
-            }
-            state.cache.reads += 1;
-            state.cache.coalesced_reads += 1;
-            state.cache.read_bytes += total as u64;
-            self.return_staging_locked(&mut state, staging);
-            return Ok(());
+        read_staging.resize(total, 0);
+        self.source
+            .read_at(first.shard, first_offset, read_staging)
+            .map_err(PleRowsError::Source)?;
+        if canceled.load(Ordering::Acquire) {
+            return Err(PleRowsError::Canceled);
         }
 
-        Err(PleRowsError::StagingUnavailable)
-    }
-
-    fn assemble_rows(
-        &self,
-        locations: &[PleRowLocation],
-        output: &mut [u8],
-        canceled: &AtomicBool,
-    ) -> Result<(), PleRowsError> {
-        if output.len() != locations.len() * PLE_ROW_BYTES {
-            return Err(PleRowsError::InvalidLease {
-                reason: "staging size does not match row plan".to_string(),
-            });
-        }
         let mut state = self.state.lock().expect("PLE state mutex poisoned");
-        for (index, location) in locations.iter().copied().enumerate() {
-            if canceled.load(Ordering::Acquire) {
-                return Err(PleRowsError::Canceled);
+        let mut cursor = 0usize;
+        for (&page, &length) in group.iter().zip(&lengths) {
+            let page_bytes = &read_staging[cursor..cursor + length];
+            if let Some(rows) = requested.get(&page) {
+                copy_requested_rows(page, page_bytes, rows, output)?;
             }
-            let out_begin = index * PLE_ROW_BYTES;
-            let page =
-                state
-                    .cache
-                    .pages
-                    .get(&location.page_key())
-                    .ok_or(PleRowsError::CacheMiss {
-                        shard: location.shard,
-                        page: location.page,
-                    })?;
-            let begin = location.page_byte_offset;
-            let end = begin + PLE_ROW_BYTES;
-            if end > page.bytes.len() {
-                return Err(PleRowsError::InvalidLease {
-                    reason: "cached page is shorter than requested row".to_string(),
-                });
-            }
-            output[out_begin..out_begin + PLE_ROW_BYTES].copy_from_slice(&page.bytes[begin..end]);
-            state.cache.touch(location.page_key());
+            state.cache.insert(page, page_bytes.to_vec());
+            cursor += length;
         }
+        state.cache.reads += 1;
+        state.cache.coalesced_reads += 1;
+        state.cache.read_bytes += total as u64;
         Ok(())
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RowCopy {
+    output_offset: usize,
+    page_offset: usize,
+}
+
+fn copy_requested_rows(
+    page: PageKey,
+    page_bytes: &[u8],
+    rows: &[RowCopy],
+    output: &mut [u8],
+) -> Result<(), PleRowsError> {
+    for row in rows {
+        let page_end = row.page_offset.checked_add(PLE_ROW_BYTES).ok_or_else(|| {
+            PleRowsError::InvalidLease {
+                reason: format!("page {page:?} row offset overflow"),
+            }
+        })?;
+        let output_end = row
+            .output_offset
+            .checked_add(PLE_ROW_BYTES)
+            .ok_or_else(|| PleRowsError::InvalidLease {
+                reason: "output row offset overflow".to_string(),
+            })?;
+        if page_end > page_bytes.len() || output_end > output.len() {
+            return Err(PleRowsError::InvalidLease {
+                reason: format!("requested row is outside page {page:?} or output"),
+            });
+        }
+        output[row.output_offset..output_end]
+            .copy_from_slice(&page_bytes[row.page_offset..page_end]);
+    }
+    Ok(())
+}
+
 struct ProcessedTicket {
     output: Option<Vec<u8>>,
+    read_buffer: Vec<u8>,
     result: Result<(), PleRowsError>,
 }
 
@@ -1181,6 +1311,7 @@ struct TicketState {
     ids: Vec<[u64; PLE_ROWS_PER_TOKEN]>,
     locations: Vec<PleRowLocation>,
     pages: Vec<PageKey>,
+    required_bytes: usize,
     output: Option<Vec<u8>>,
     status: TicketStatus,
 }
@@ -1219,8 +1350,36 @@ impl PleRowsState {
             active_leases: 0,
             staging_pool,
             staging_in_use: 0,
+
             staging_high_water: 0,
             cache: PageCache::new(PLE_PAGE_CACHE_BYTES),
+        }
+    }
+}
+fn invalidate_tickets_locked(inner: &PleRowsInner, state: &mut PleRowsState) {
+    for ticket in state.tickets.values() {
+        ticket.canceled.store(true, Ordering::Release);
+    }
+    let queued: Vec<u64> = state.queue.drain(..).collect();
+    for id in queued {
+        if let Some(ticket) = state.tickets.remove(&id) {
+            if let Some(buffer) = ticket.output {
+                inner.return_staging_locked(state, buffer);
+            }
+        }
+    }
+    let completed: Vec<u64> = state
+        .tickets
+        .iter()
+        .filter_map(|(&id, ticket)| {
+            matches!(ticket.status, TicketStatus::Completed(_)).then_some(id)
+        })
+        .collect();
+    for id in completed {
+        if let Some(ticket) = state.tickets.remove(&id) {
+            if let Some(buffer) = ticket.output {
+                inner.return_staging_locked(state, buffer);
+            }
         }
     }
 }
@@ -1241,25 +1400,48 @@ fn worker_loop(weak: Weak<PleRowsInner>) {
         let Some(inner) = weak.upgrade() else {
             break;
         };
-        let id = {
+        let work = {
             let mut state = inner.state.lock().expect("PLE state mutex poisoned");
             loop {
-                if let Some(id) = state.queue.pop_front() {
-                    state.active_readers += 1;
-                    break Some(id);
-                }
                 if state.stop {
                     break None;
                 }
-                state = inner.cv.wait(state).expect("PLE state mutex poisoned");
+                let Some(id) = state.queue.front().copied() else {
+                    state = inner.cv.wait(state).expect("PLE state mutex poisoned");
+                    continue;
+                };
+                let Some(mut output) = inner.take_staging_locked(&mut state) else {
+                    state = inner.cv.wait(state).expect("PLE state mutex poisoned");
+                    continue;
+                };
+                let Some(read_buffer) = inner.take_staging_locked(&mut state) else {
+                    inner.return_staging_locked(&mut state, output);
+                    state = inner.cv.wait(state).expect("PLE state mutex poisoned");
+                    continue;
+                };
+                state.queue.pop_front();
+                let Some(ticket) = state.tickets.get_mut(&id) else {
+                    inner.return_staging_locked(&mut state, output);
+                    inner.return_staging_locked(&mut state, read_buffer);
+                    continue;
+                };
+                output.resize(ticket.required_bytes, 0);
+                ticket.output = Some(output);
+                state.active_readers += 1;
+                break Some((id, read_buffer));
             }
         };
-        let Some(id) = id else {
+        let Some((id, read_buffer)) = work else {
             break;
         };
-        let ProcessedTicket { mut output, result } = inner.process_ticket(id);
+        let ProcessedTicket {
+            mut output,
+            read_buffer,
+            result,
+        } = inner.process_ticket(id, read_buffer);
         let mut state = inner.state.lock().expect("PLE state mutex poisoned");
         state.active_readers = state.active_readers.saturating_sub(1);
+        inner.return_staging_locked(&mut state, read_buffer);
         let Some((ticket_canceled, ticket_epoch)) = state
             .tickets
             .get(&id)
@@ -1273,11 +1455,18 @@ fn worker_loop(weak: Weak<PleRowsInner>) {
         };
         let canceled =
             ticket_canceled || ticket_epoch != inner.current_epoch.load(Ordering::Acquire);
-        let result = if canceled {
-            Err(PleRowsError::Canceled)
-        } else {
-            result
-        };
+        if canceled {
+            if let Some(ticket) = state.tickets.remove(&id) {
+                if let Some(buffer) = ticket.output {
+                    inner.return_staging_locked(&mut state, buffer);
+                }
+            }
+            if let Some(buffer) = output.take() {
+                inner.return_staging_locked(&mut state, buffer);
+            }
+            inner.cv.notify_all();
+            continue;
+        }
         let mut return_buffer = None;
         {
             let ticket = state.tickets.get_mut(&id).expect("ticket disappeared");
@@ -1607,7 +1796,21 @@ mod tests {
             rows_per_shard: usize,
             source: Arc<MemoryRowSource>,
         ) -> Result<Self, PleRowsError> {
-            if rows_per_shard == 0 {
+            Self::from_test_source_with_page_rows(
+                metadata,
+                rows_per_shard,
+                PLE_ROWS_PER_PAGE,
+                source,
+            )
+        }
+
+        fn from_test_source_with_page_rows(
+            metadata: PleHashMetadata,
+            rows_per_shard: usize,
+            rows_per_page: usize,
+            source: Arc<MemoryRowSource>,
+        ) -> Result<Self, PleRowsError> {
+            if rows_per_shard == 0 || rows_per_page == 0 {
                 return Err(PleRowsError::Descriptor {
                     index: 0,
                     reason: "invalid fixture shard geometry".to_string(),
@@ -1636,8 +1839,10 @@ mod tests {
                 _descriptors: Vec::new().into(),
                 metadata,
                 rows_per_shard,
-                rows_per_page: PLE_ROWS_PER_PAGE,
+                rows_per_page,
                 current_epoch: AtomicU64::new(0),
+                stopped: AtomicBool::new(false),
+                epoch_started: AtomicBool::new(false),
                 state: Mutex::new(PleRowsState::new()),
                 cv: Condvar::new(),
             });
@@ -1703,8 +1908,8 @@ mod tests {
         .unwrap();
         assert_eq!(full.locate_row(63).unwrap().shard, 0);
         assert_eq!(full.locate_row(64).unwrap().shard, 1);
-        assert!(full.unload(Duration::from_secs(1)).unwrap().is_clean());
-        assert!(rows.unload(Duration::from_secs(1)).unwrap().is_clean());
+        assert!(full.unload().unwrap().is_clean());
+        assert!(rows.unload().unwrap().is_clean());
     }
 
     #[test]
@@ -1727,16 +1932,16 @@ mod tests {
                 assert_eq!(value, lease.row_ids()[token][head]);
             }
         }
-        let mut copied = vec![0; lease.as_bytes().len()];
+        let mut copied = vec![0; lease.as_bytes().unwrap().len()];
         lease.stage_into(&mut copied).unwrap();
-        assert_eq!(copied, lease.as_bytes());
+        assert_eq!(copied, lease.as_bytes().unwrap());
         drop(lease);
         assert_eq!(source.reads.load(Ordering::Acquire), 1);
         let second = rows.prefetch(0, PleHistory::new(99), &[0, 1]).unwrap();
         let lease = rows.wait_completed_lease(&second).unwrap();
         drop(lease);
         assert_eq!(source.reads.load(Ordering::Acquire), 1);
-        assert!(rows.unload(Duration::from_secs(1)).unwrap().is_clean());
+        assert!(rows.unload().unwrap().is_clean());
     }
 
     #[test]
@@ -1753,7 +1958,7 @@ mod tests {
             error,
             PleRowsError::Source(SourceError::Io { .. })
         ));
-        assert!(rows.unload(Duration::from_secs(1)).unwrap().is_clean());
+        assert!(rows.unload().unwrap().is_clean());
 
         let source = Arc::new(MemoryRowSource {
             shards: rows_source(2, 64),
@@ -1762,13 +1967,13 @@ mod tests {
         });
         let rows = PleRows::from_test_source(metadata(128), 64, source).unwrap();
         let ticket = rows.prefetch(0, PleHistory::new(99), &[0]).unwrap();
-        rows.begin_epoch(1);
+        rows.begin_epoch(1).unwrap();
         let error = rows.wait_completed_lease(&ticket).unwrap_err();
         assert!(matches!(
             error,
             PleRowsError::Canceled | PleRowsError::EpochMismatch { .. }
         ));
-        assert!(rows.unload(Duration::from_secs(1)).unwrap().is_clean());
+        assert!(rows.unload().unwrap().is_clean());
     }
 
     #[test]
@@ -1790,5 +1995,169 @@ mod tests {
                 PageKey { shard: 1, page: 2 },
             ]
         );
+    }
+    #[test]
+    fn direct_fill_handles_partial_pages_duplicates_and_cache_pressure() {
+        assert_eq!(PLE_PAGE_BYTES % PLE_ROW_BYTES, 0);
+        assert_eq!(PLE_STAGING_BYTES % PLE_ROW_BYTES, 0);
+
+        let source = Arc::new(MemoryRowSource {
+            shards: rows_source(2, 64),
+            reads: AtomicUsize::new(0),
+            fail: None,
+        });
+        let rows = PleRows::from_test_source_with_page_rows(
+            metadata_with_head_size(8, 128),
+            64,
+            5,
+            source.clone(),
+        )
+        .unwrap();
+        {
+            let mut state = rows
+                .inner
+                .state
+                .lock()
+                .expect("PLE test state mutex poisoned");
+            state.cache.capacity_bytes = PLE_ROW_BYTES * 10;
+        }
+
+        let ticket = rows.prefetch(0, PleHistory::new(999), &[0, 0]).unwrap();
+        let expected_ids = ticket.row_ids().unwrap();
+        let lease = rows.wait_completed_lease(&ticket).unwrap();
+        assert_eq!(lease.row_ids(), expected_ids.as_slice());
+        for token in 0..2 {
+            for head in 0..PLE_ROWS_PER_TOKEN {
+                let row = lease.row_bytes(token, head).unwrap();
+                let value = u16::from_le_bytes([row[0], row[1]]) as u64;
+                assert_eq!(value, lease.row_ids()[token][head]);
+            }
+        }
+        let first_stats = rows.cache_stats();
+        assert!(first_stats.reads > 1);
+        assert_eq!(
+            source.reads.load(Ordering::Acquire) as u64,
+            first_stats.reads
+        );
+        assert!(first_stats.resident_bytes <= PLE_ROW_BYTES * 10);
+        drop(lease);
+
+        let ticket = rows.prefetch(0, PleHistory::new(999), &[1]).unwrap();
+        let expected_ids = ticket.row_ids().unwrap();
+        let lease = rows.wait_completed_lease(&ticket).unwrap();
+        for (head, &row_id) in lease.row_ids()[0].iter().enumerate() {
+            let row = lease.row_bytes(0, head).unwrap();
+            let value = u16::from_le_bytes([row[0], row[1]]) as u64;
+            assert_eq!(value, row_id);
+        }
+        assert_eq!(lease.row_ids(), expected_ids.as_slice());
+        drop(lease);
+
+        let stats = rows.cache_stats();
+        assert!(stats.reads > first_stats.reads);
+        assert_eq!(source.reads.load(Ordering::Acquire) as u64, stats.reads);
+        assert!(stats.cache_hits > 0);
+        assert!(stats.cache_misses > 0);
+        assert!(stats.evictions > 0);
+        assert!(stats.resident_bytes <= PLE_ROW_BYTES * 10);
+        assert!(rows.unload().unwrap().is_clean());
+    }
+
+    #[test]
+    fn epoch_reset_stales_lease_and_enforces_monotonic_epochs() {
+        let source = Arc::new(MemoryRowSource {
+            shards: rows_source(2, 64),
+            reads: AtomicUsize::new(0),
+            fail: None,
+        });
+        let rows = PleRows::from_test_source(metadata(128), 64, source).unwrap();
+        rows.begin_epoch(0).unwrap();
+        let ticket = rows.prefetch(0, PleHistory::new(99), &[0]).unwrap();
+        let lease = rows.wait_completed_lease(&ticket).unwrap();
+
+        std::thread::scope(|scope| {
+            let resetter = scope.spawn(|| rows.reset_epoch(Duration::from_secs(1)));
+            while rows.current_epoch() != 1 {
+                std::thread::yield_now();
+            }
+            assert!(matches!(
+                lease.validate(),
+                Err(PleRowsError::LeaseStale { .. })
+            ));
+            assert!(matches!(
+                lease.as_bytes(),
+                Err(PleRowsError::LeaseStale { .. })
+            ));
+            let mut destination =
+                vec![0u8; lease.token_count() * PLE_ROWS_PER_TOKEN * PLE_ROW_BYTES];
+            assert!(matches!(
+                lease.stage_into(&mut destination),
+                Err(PleRowsError::LeaseStale { .. })
+            ));
+            assert!(matches!(
+                lease.validate_after_upload(),
+                Err(PleRowsError::LeaseStale { .. })
+            ));
+            drop(lease);
+            assert_eq!(resetter.join().unwrap().unwrap(), 1);
+        });
+
+        assert!(matches!(
+            rows.begin_epoch(1),
+            Err(PleRowsError::EpochNotMonotonic {
+                requested: 1,
+                current: 1
+            })
+        ));
+        rows.begin_epoch(2).unwrap();
+        assert!(rows.unload().unwrap().is_clean());
+    }
+
+    #[test]
+    fn cancel_releases_queued_ticket_slot_while_lease_holds_staging() {
+        let source = Arc::new(MemoryRowSource {
+            shards: rows_source(2, 64),
+            reads: AtomicUsize::new(0),
+            fail: None,
+        });
+        let rows = PleRows::from_test_source(metadata(128), 64, source).unwrap();
+        let first = rows.prefetch(0, PleHistory::new(99), &[0]).unwrap();
+        let lease = rows.wait_completed_lease(&first).unwrap();
+
+        let mut queued = Vec::with_capacity(PLE_READER_QUEUE_CAPACITY);
+        for _ in 0..PLE_READER_QUEUE_CAPACITY {
+            queued.push(rows.prefetch(0, PleHistory::new(99), &[0]).unwrap());
+        }
+        assert!(matches!(
+            rows.prefetch(0, PleHistory::new(99), &[0]),
+            Err(PleRowsError::QueueFull)
+        ));
+        rows.cancel(&queued[0]).unwrap();
+        let replacement = rows.prefetch(0, PleHistory::new(99), &[0]).unwrap();
+
+        drop(queued);
+        drop(replacement);
+        drop(lease);
+        assert!(rows.unload().unwrap().is_clean());
+    }
+
+    #[test]
+    fn unload_waits_for_a_live_lease_before_releasing_the_reader() {
+        let source = Arc::new(MemoryRowSource {
+            shards: rows_source(2, 64),
+            reads: AtomicUsize::new(0),
+            fail: None,
+        });
+        let rows = PleRows::from_test_source(metadata(128), 64, source).unwrap();
+        let ticket = rows.prefetch(0, PleHistory::new(99), &[0]).unwrap();
+        let lease = rows.wait_completed_lease(&ticket).unwrap();
+
+        let unload = std::thread::spawn(move || rows.unload());
+        for _ in 0..128 {
+            assert!(!unload.is_finished());
+            std::thread::yield_now();
+        }
+        drop(lease);
+        assert!(unload.join().unwrap().unwrap().is_clean());
     }
 }

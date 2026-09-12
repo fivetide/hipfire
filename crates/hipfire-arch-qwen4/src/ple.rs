@@ -250,8 +250,10 @@ impl PleHashMetadata {
         let expected_padded = valid_rows
             .checked_add(padding_multiple - 1)
             .ok_or(PleMetadataError::RowCountOverflow)?
-            / padding_multiple
-            * padding_multiple;
+            / padding_multiple;
+        let expected_padded = expected_padded
+            .checked_mul(padding_multiple)
+            .ok_or(PleMetadataError::RowCountOverflow)?;
         if padded_rows != expected_padded {
             return Err(PleMetadataError::PaddedRowsMisaligned {
                 padded: padded_rows,
@@ -267,17 +269,16 @@ impl PleHashMetadata {
         })
     }
 
-    /// Return the exact pinned Qwen4 metadata.
+    /// Return the exact pinned Qwen4 metadata after checking it through the
+    /// same constructor used for artifact-provided metadata.
     pub fn qwen4() -> Self {
-        // These values are constants copied from the checkpoint metadata and
-        // the constructor invariants are checked by the unit tests.
-        Self {
-            multipliers: PLE_MULTIPLIERS,
-            head_vocab_sizes: PLE_HEAD_VOCAB_SIZES,
-            head_offsets: PLE_HEAD_OFFSETS,
-            valid_rows: PLE_VALID_ROWS,
-            padded_rows: PLE_PADDED_ROWS,
-        }
+        Self::from_stored(
+            PLE_MULTIPLIERS,
+            PLE_HEAD_VOCAB_SIZES,
+            PLE_HEAD_OFFSETS,
+            PLE_PADDED_ROWS,
+        )
+        .expect("pinned Qwen4 PLE metadata must satisfy its invariants")
     }
 
     /// Parse the canonical version-1 `qwen4_ple` object without converting

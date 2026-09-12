@@ -24,7 +24,7 @@ use rdna_compute::Gpu;
 use std::fmt;
 use std::time::Duration;
 
-const PLE_UNLOAD_TIMEOUT: Duration = Duration::from_secs(5);
+const PLE_RESET_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Architecture-private owner for the fulfilled manifest census.
 ///
@@ -75,6 +75,7 @@ pub struct Qwen4Bundle {
     /// Bounded model-owned PLE reader/cache.  It must quiesce before source
     /// descriptors and the attached transaction are dropped.
     pub(crate) ple_rows: PleRows,
+    pub(crate) ple_metadata: PleHashMetadata,
     /// Canonical load census and external descriptors.  This is deliberately
     /// not left in the loader or carrier after publication.
     pub(crate) weight_store: AttachedWeightStore,
@@ -114,7 +115,7 @@ impl Qwen4Bundle {
                 ));
             }
         };
-        let descriptors = match ple_descriptors(&transaction, &weights.manifest) {
+        let descriptors = match ple_descriptors(&transaction, &weights.manifest, &metadata) {
             Ok(descriptors) => descriptors,
             Err(error) => {
                 let weight_result = weights.free_gpu(gpu);
@@ -122,7 +123,7 @@ impl Qwen4Bundle {
                 return Err(cleanup_bundle_failure(error, weight_result, cleanup));
             }
         };
-        let ple_rows = match PleRows::new(descriptors, metadata) {
+        let ple_rows = match PleRows::new(descriptors, metadata.clone()) {
             Ok(rows) => rows,
             Err(error) => {
                 let weight_result = weights.free_gpu(gpu);
@@ -139,7 +140,7 @@ impl Qwen4Bundle {
             Err(error) => {
                 // `unload` consumes the reader and joins its worker even on a
                 // quiesce error, so source descriptors cannot outlive failure.
-                let _ = ple_rows.unload(PLE_UNLOAD_TIMEOUT);
+                let _ = ple_rows.unload();
                 let weight_result = weights.free_gpu(gpu);
                 let cleanup = transaction.rollback(gpu);
                 return Err(cleanup_bundle_failure(
@@ -154,6 +155,7 @@ impl Qwen4Bundle {
             weights,
             state,
             ple_rows,
+            ple_metadata: metadata,
             weight_store: AttachedWeightStore::new(transaction),
         })
     }
@@ -170,28 +172,18 @@ impl Qwen4Bundle {
             .external_descriptor(&placement.name, placement.layer, placement.device)
     }
 
-    /// Return all numerically ordered PLE shard descriptors for a reader that
-    /// has not yet been attached.  The bundle's own reader is normally the
-    /// consumer; this accessor is useful for diagnostics without exposing the
-    /// transaction itself.
-    pub fn ple_descriptors(&self) -> Vec<SourceRangeDescriptor> {
-        let mut entries = self.manifest().external_entries().collect::<Vec<_>>();
-        entries.sort_by_key(|entry| {
-            ple_shard_index(&entry.name).unwrap_or(PLE_SHARD_COUNT)
-        });
-        entries
-            .into_iter()
-            .filter_map(|entry| {
-                self.external_descriptor(&Qwen4Placement {
-                    name: entry.name.clone(),
-                    layer: entry.layer,
-                    device: 0,
-                })
-                .cloned()
-            })
-            .collect()
+    /// Return all numerically ordered PLE shard descriptors from the
+    /// attached canonical transaction census.
+    ///
+    /// This strict accessor is useful to admission and diagnostics callers;
+    /// the bundle's own reader already owns the same sealed descriptors.
+    pub fn ple_descriptors(&self) -> Result<Vec<SourceRangeDescriptor>, BundleError> {
+        ple_descriptors(
+            &self.weight_store.transaction,
+            self.manifest(),
+            &self.ple_metadata,
+        )
     }
-
 
     pub fn ple_rows(&self) -> &PleRows {
         &self.ple_rows
@@ -201,8 +193,10 @@ impl Qwen4Bundle {
         &mut self.ple_rows
     }
 
-    pub fn begin_ple_epoch(&self, epoch: u64) {
-        self.ple_rows.begin_epoch(epoch);
+    pub fn begin_ple_epoch(&self, epoch: u64) -> Result<(), BundleError> {
+        self.ple_rows
+            .begin_epoch(epoch)
+            .map_err(BundleError::PleRows)
     }
 
     pub fn attached_origin(&self) -> Option<hipfire_runtime::weight_store::WeightOrigin> {
@@ -217,11 +211,32 @@ impl Qwen4Bundle {
         self.weight_store.external_rows_len()
     }
 
+    fn invalidate_ple_epoch(&self) -> Result<(), BundleError> {
+        self.ple_rows
+            .reset_epoch(PLE_RESET_TIMEOUT)
+            .map(|_| ())
+            .map_err(BundleError::PleRows)
+    }
+
+    /// Quiesce request-local PLE work without advancing the current epoch.
+    /// Snapshot and commit preserve that epoch; reset and restore call
+    /// `invalidate_ple_epoch` instead so work from the discarded state cannot
+    /// publish after the state transition.
+    fn quiesce_ple(&self) -> Result<(), BundleError> {
+        self.ple_rows
+            .quiesce(PLE_RESET_TIMEOUT)
+            .map(|_| ())
+            .map_err(BundleError::PleRows)?;
+        self.ple_rows.resume().map_err(BundleError::PleRows)
+    }
+
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        self.invalidate_ple_epoch()?;
         self.state.reset(gpu).map_err(BundleError::State)
     }
 
     pub fn snapshot(&self, gpu: &mut Gpu) -> Result<Qwen4StateSnapshot, BundleError> {
+        self.quiesce_ple()?;
         self.state.snapshot(gpu).map_err(BundleError::State)
     }
 
@@ -230,6 +245,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         snapshot: Qwen4StateSnapshot,
     ) -> Result<(), BundleError> {
+        self.invalidate_ple_epoch()?;
         self.state
             .restore(gpu, snapshot)
             .map_err(BundleError::State)
@@ -240,6 +256,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         snapshot: Qwen4StateSnapshot,
     ) -> Result<(), BundleError> {
+        self.quiesce_ple()?;
         self.state.commit(snapshot, gpu).map_err(BundleError::State)
     }
 
@@ -254,10 +271,7 @@ impl Qwen4Bundle {
             weight_store,
             ..
         } = self;
-        let ple_result = ple_rows
-            .unload(PLE_UNLOAD_TIMEOUT)
-            .map(|_| ())
-            .map_err(BundleError::PleRows);
+        let ple_result = ple_rows.unload().map(|_| ()).map_err(BundleError::PleRows);
         let state_result = state.free_gpu(gpu).map_err(BundleError::State);
         let weight_result = weights.free_gpu(gpu).map_err(BundleError::Hip);
         let store_result = weight_store.drain(gpu).map_err(BundleError::Hip);
@@ -279,9 +293,9 @@ fn ple_shard_index(name: &str) -> Result<usize, WeightError> {
             "invalid PLE shard name '{name}'"
         )));
     }
-    let index = suffix.parse::<usize>().map_err(|_| {
-        WeightError::DescriptorMismatch(format!("invalid PLE shard name '{name}'"))
-    })?;
+    let index = suffix
+        .parse::<usize>()
+        .map_err(|_| WeightError::DescriptorMismatch(format!("invalid PLE shard name '{name}'")))?;
     if index >= PLE_SHARD_COUNT || index.to_string() != suffix {
         return Err(WeightError::DescriptorMismatch(format!(
             "PLE shard index {index} is outside canonical range in '{name}'"
@@ -303,7 +317,8 @@ fn ordered_ple_entries<'a>(
     let mut ordered = vec![None; PLE_SHARD_COUNT];
     for entry in entries {
         let index = ple_shard_index(&entry.name)?;
-        if entry.layer != Some(1) || entry.logical_shape.as_slice() != [PLE_SHARD_ROWS, PLE_ROW_WIDTH]
+        if entry.layer != Some(1)
+            || entry.logical_shape.as_slice() != [PLE_SHARD_ROWS, PLE_ROW_WIDTH]
         {
             return Err(WeightError::DescriptorMismatch(entry.name.clone()));
         }
@@ -324,12 +339,49 @@ fn ordered_ple_entries<'a>(
         .collect()
 }
 
+fn validate_ple_metadata(metadata: &PleHashMetadata) -> Result<(), BundleError> {
+    let physical_rows = (PLE_SHARD_ROWS as u64)
+        .checked_mul(PLE_SHARD_COUNT as u64)
+        .ok_or_else(|| {
+            BundleError::Weights(WeightError::DescriptorMismatch(
+                "PLE physical row count overflow".to_string(),
+            ))
+        })?;
+    if metadata.padded_rows() != physical_rows {
+        return Err(BundleError::Weights(WeightError::DescriptorMismatch(
+            format!(
+                "PLE metadata padded rows {} do not match physical rows {physical_rows}",
+                metadata.padded_rows()
+            ),
+        )));
+    }
+    let valid_rows = (0..PLE_SHARD_COUNT).try_fold(0u64, |sum, shard| {
+        sum.checked_add(ple_valid_rows_for_shard(shard) as u64)
+            .ok_or_else(|| {
+                BundleError::Weights(WeightError::DescriptorMismatch(
+                    "PLE valid row count overflow".to_string(),
+                ))
+            })
+    })?;
+    if metadata.valid_rows() != valid_rows {
+        return Err(BundleError::Weights(WeightError::DescriptorMismatch(
+            format!(
+                "PLE metadata valid rows {} do not match canonical rows {valid_rows}",
+                metadata.valid_rows()
+            ),
+        )));
+    }
+    Ok(())
+}
 fn ple_descriptors(
     transaction: &WeightLoadTransaction,
     manifest: &Qwen4Manifest,
+    metadata: &PleHashMetadata,
 ) -> Result<Vec<SourceRangeDescriptor>, BundleError> {
+    validate_ple_metadata(metadata)?;
     let entries = ordered_ple_entries(manifest).map_err(BundleError::Weights)?;
     let mut descriptors: Vec<SourceRangeDescriptor> = Vec::with_capacity(entries.len());
+    let mut valid_rows_total = 0u64;
     for (index, entry) in entries.into_iter().enumerate() {
         let descriptor = transaction
             .external_descriptor(&entry.name, entry.layer, 0)
@@ -357,6 +409,13 @@ fn ple_descriptors(
                 entry.name.clone(),
             )));
         }
+        valid_rows_total = valid_rows_total
+            .checked_add(valid_rows as u64)
+            .ok_or_else(|| {
+                BundleError::Weights(WeightError::DescriptorMismatch(
+                    "PLE valid row count overflow".to_string(),
+                ))
+            })?;
         if let Some(first) = descriptors.first() {
             if first.source_identity() != descriptor.source_identity() {
                 return Err(BundleError::Weights(WeightError::DescriptorMismatch(
@@ -375,9 +434,16 @@ fn ple_descriptors(
         .map_err(BundleError::Weights)?;
         descriptors.push(descriptor);
     }
+    if valid_rows_total != metadata.valid_rows() {
+        return Err(BundleError::Weights(WeightError::DescriptorMismatch(
+            format!(
+                "PLE metadata valid rows {} do not match manifest rows {valid_rows_total}",
+                metadata.valid_rows()
+            ),
+        )));
+    }
     Ok(descriptors)
 }
-
 
 fn cleanup_transaction(primary: BundleError, rollback: hip_bridge::HipResult<()>) -> BundleError {
     match rollback {
@@ -466,3 +532,34 @@ impl fmt::Display for BundleError {
 }
 
 impl std::error::Error for BundleError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ple::PLE_HEAD_COUNT;
+
+    #[test]
+    fn rejects_metadata_with_same_padding_but_different_valid_rows() {
+        let canonical = PleHashMetadata::qwen4();
+        let mut sizes = *canonical.head_vocab_sizes();
+        sizes[PLE_HEAD_COUNT - 1] -= 1;
+        let mut offsets = [0u64; PLE_HEAD_COUNT];
+        for head in 1..PLE_HEAD_COUNT {
+            offsets[head] = offsets[head - 1] + sizes[head - 1];
+        }
+        let metadata = PleHashMetadata::from_stored(
+            *canonical.multipliers(),
+            sizes,
+            offsets,
+            canonical.padded_rows(),
+        )
+        .expect("one valid row removed still rounds to the same physical padding");
+
+        let error = validate_ple_metadata(&metadata).unwrap_err();
+        assert!(matches!(
+            error,
+            BundleError::Weights(WeightError::DescriptorMismatch(message))
+                if message.contains("valid rows")
+        ));
+    }
+}
