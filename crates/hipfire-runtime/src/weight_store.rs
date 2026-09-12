@@ -1735,8 +1735,8 @@ mod tests {
     use crate::weight_manifest::{DTypeConstraint, PinTarget, ShardPolicy};
 
     use crate::model_source::{
-        SourceError, SourceFormat, SourceIdentity, SourcePayload, SourceRangeDescriptor,
-        SourceReader, SourceReaderImpl, TensorInfo,
+        ModelSource, SourceError, SourceFormat, SourceIdentity, SourcePayload,
+        SourceRangeDescriptor, SourceReader, SourceReaderImpl, TensorInfo,
     };
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -2281,6 +2281,94 @@ mod tests {
         transaction
             .rollback(&mut gpu)
             .expect("external-only rollback has no resident buffers");
+        assert_eq!(test_support::resident_releases(), 0);
+        test_support::reset();
+    }
+    #[test]
+    fn compact_qwen4_ple_ranges_bind_external_rows_without_allocating() {
+        let Ok(mut gpu) = Gpu::init() else {
+            return;
+        };
+        let fixture_dir = tempfile::tempdir().expect("fixture directory");
+        let fixture_path = fixture_dir.path().join("qwen4-ple.hfq");
+        crate::hfq::hfq_test_fixture::write_compact_qwen4_ple_hfq(&fixture_path)
+            .expect("write compact Qwen4 fixture");
+        let hfq = crate::hfq::HfqFile::open(&fixture_path).expect("open compact Qwen4 fixture");
+        let entries = crate::hfq::hfq_test_fixture::COMPACT_PLE_NAMES
+            .into_iter()
+            .map(|name| {
+                WeightEntry::layer(
+                    name,
+                    1,
+                    vec![
+                        crate::hfq::hfq_test_fixture::COMPACT_PLE_ROW_COUNT,
+                        crate::hfq::hfq_test_fixture::COMPACT_PLE_ROW_WIDTH,
+                    ],
+                    DType::BF16,
+                    ShardPolicy::Replicate,
+                )
+                .external_rows(
+                    crate::hfq::hfq_test_fixture::COMPACT_PLE_ROW_BYTES,
+                    crate::hfq::hfq_test_fixture::COMPACT_PLE_ROW_COUNT,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mesh = DeviceMesh::single().expect("single-device mesh construction");
+        let expected = WeightOrigin::for_single(&mesh, &gpu);
+        test_support::reset();
+        let transaction =
+            fulfill_manifest_from_payloads(&entries, &mesh, 2, &mut gpu, expected, |entry| {
+                let source: &dyn ModelSource = &hfq;
+                source
+                    .tensor_payload(&entry.name)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| format!("missing fixture tensor '{}'", entry.name))
+            })
+            .expect("HFQM ranges should bind as external rows");
+
+        assert_eq!(transaction.len(), 0);
+        assert_eq!(transaction.external_rows_len(), 2);
+        assert_eq!(transaction.inventory_len(), 2);
+        assert_eq!(test_support::resident_allocations(), 0);
+        let shard_10 = transaction
+            .external_descriptor(
+                crate::hfq::hfq_test_fixture::COMPACT_PLE_NAMES[0],
+                Some(1),
+                0,
+            )
+            .expect("shard_10 external descriptor");
+        let shard_2 = transaction
+            .external_descriptor(
+                crate::hfq::hfq_test_fixture::COMPACT_PLE_NAMES[1],
+                Some(1),
+                0,
+            )
+            .expect("shard_2 external descriptor");
+        assert_eq!(shard_10.source_identity(), shard_2.source_identity());
+        assert_eq!(shard_10.source_identity().format, SourceFormat::Hfq);
+        assert_eq!(shard_10.source_identity().manifest.len(), 5);
+
+        let mut last_row = vec![0u8; crate::hfq::hfq_test_fixture::COMPACT_PLE_ROW_BYTES];
+        shard_2
+            .read_exact_at(
+                shard_2.offset + crate::hfq::hfq_test_fixture::COMPACT_PLE_ROW_BYTES as u64,
+                &mut last_row,
+            )
+            .expect("last row of shard_2");
+        assert!(last_row
+            .chunks_exact(2)
+            .all(|chunk| chunk == 0x21u16.to_le_bytes()));
+        let mut first_row = vec![0u8; crate::hfq::hfq_test_fixture::COMPACT_PLE_ROW_BYTES];
+        shard_10
+            .read_exact_at(shard_10.offset, &mut first_row)
+            .expect("first row of shard_10");
+        assert!(first_row
+            .chunks_exact(2)
+            .all(|chunk| chunk == 0x10u16.to_le_bytes()));
+
+        transaction
+            .rollback(&mut gpu)
+            .expect("external-only transaction rollback");
         assert_eq!(test_support::resident_releases(), 0);
         test_support::reset();
     }

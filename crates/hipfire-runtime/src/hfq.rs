@@ -2902,8 +2902,346 @@ pub(crate) mod hfq_test_fixture {
         }
         f.flush().unwrap();
     }
+    pub(crate) const COMPACT_PLE_ROW_COUNT: usize = 2;
+    pub(crate) const COMPACT_PLE_ROW_WIDTH: usize = 160;
+    pub(crate) const COMPACT_PLE_ROW_BYTES: usize = COMPACT_PLE_ROW_WIDTH * 2;
+    pub(crate) const COMPACT_PLE_NAMES: [&str; 2] = [
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_10.weight",
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_2.weight",
+    ];
+    pub(crate) const COMPACT_I64_NAMES: [&str; 3] = [
+        "model.language_model.layers.1.ple.ple_embedding.layer_multipliers",
+        "model.language_model.layers.1.ple.ple_embedding.ngram_heads_vocab_sizes",
+        "model.language_model.layers.1.ple.ple_embedding.ngram_heads_offsets",
+    ];
+
+    fn qwen4_ple_metadata_json() -> String {
+        serde_json::json!({
+            "format": "hfqm",
+            "format_version": 1,
+            "arch_id": 16,
+            "model_type": "qwen4_exp",
+            "config": {"model_type": "qwen4_exp"},
+            "qwen4_ple": {
+                "version": 1,
+                "multipliers": [
+                    23_703_573_157_769i64,
+                    20_090_736_453_365i64,
+                    8_052_911_324_071i64
+                ],
+                "head_vocab_sizes": [
+                    20_000_003u64, 20_000_023, 20_000_033, 20_000_047,
+                    20_000_059, 20_000_063, 20_000_069, 20_000_077,
+                    20_000_081, 20_000_093, 20_000_107, 20_000_147,
+                    20_000_153, 20_000_159, 20_000_161, 20_000_171
+                ],
+                "head_offsets": [
+                    0u64, 20_000_003, 40_000_026, 60_000_059,
+                    80_000_106, 100_000_165, 120_000_228, 140_000_297,
+                    160_000_374, 180_000_455, 200_000_548, 220_000_655,
+                    240_000_802, 260_000_955, 280_001_114, 300_001_275
+                ],
+                "padded_rows": 320_001_536u64
+            }
+        })
+        .to_string()
+    }
+
+    fn bf16_rows(first: u16, last: u16) -> Vec<u8> {
+        [first, last]
+            .into_iter()
+            .flat_map(|bits| {
+                std::iter::repeat(bits.to_le_bytes())
+                    .take(COMPACT_PLE_ROW_WIDTH)
+                    .flatten()
+            })
+            .collect()
+    }
+
+    fn i64_bytes(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    pub(crate) fn write_compact_qwen4_ple_hfq(path: &Path) -> std::io::Result<()> {
+        let tensors = vec![
+            super::HfqMemTensor {
+                name: COMPACT_PLE_NAMES[0].to_string(),
+                quant_type: 16,
+                shape: vec![COMPACT_PLE_ROW_COUNT as u32, COMPACT_PLE_ROW_WIDTH as u32],
+                group_size: 0,
+                data: bf16_rows(0x10, 0x11),
+            },
+            super::HfqMemTensor {
+                name: COMPACT_PLE_NAMES[1].to_string(),
+                quant_type: 16,
+                shape: vec![COMPACT_PLE_ROW_COUNT as u32, COMPACT_PLE_ROW_WIDTH as u32],
+                group_size: 0,
+                data: bf16_rows(0x20, 0x21),
+            },
+            super::HfqMemTensor {
+                name: COMPACT_I64_NAMES[0].to_string(),
+                quant_type: 52,
+                shape: vec![3],
+                group_size: 0,
+                data: i64_bytes(&[23_703_573_157_769, 20_090_736_453_365, 8_052_911_324_071]),
+            },
+            super::HfqMemTensor {
+                name: COMPACT_I64_NAMES[1].to_string(),
+                quant_type: 52,
+                shape: vec![16],
+                group_size: 0,
+                data: i64_bytes(&[
+                    20_000_003, 20_000_023, 20_000_033, 20_000_047, 20_000_059, 20_000_063,
+                    20_000_069, 20_000_077, 20_000_081, 20_000_093, 20_000_107, 20_000_147,
+                    20_000_153, 20_000_159, 20_000_161, 20_000_171,
+                ]),
+            },
+            super::HfqMemTensor {
+                name: COMPACT_I64_NAMES[2].to_string(),
+                quant_type: 52,
+                shape: vec![16],
+                group_size: 0,
+                data: i64_bytes(&[
+                    0,
+                    20_000_003,
+                    40_000_026,
+                    60_000_059,
+                    80_000_106,
+                    100_000_165,
+                    120_000_228,
+                    140_000_297,
+                    160_000_374,
+                    180_000_455,
+                    200_000_548,
+                    220_000_655,
+                    240_000_802,
+                    260_000_955,
+                    280_001_114,
+                    300_001_275,
+                ]),
+            },
+        ];
+        super::write_hfqm_package_mem(path, 16, &qwen4_ple_metadata_json(), &tensors)
+    }
 }
 
+#[cfg(test)]
+mod compact_qwen4_ple_tests {
+    use super::hfq_test_fixture::{
+        write_compact_qwen4_ple_hfq, COMPACT_I64_NAMES, COMPACT_PLE_NAMES, COMPACT_PLE_ROW_BYTES,
+        COMPACT_PLE_ROW_COUNT, COMPACT_PLE_ROW_WIDTH,
+    };
+    use super::*;
+    use crate::model_source::{ModelSource, SourceError, SourceFormat, SourcePayload};
+
+    fn range(hfq: &HfqFile, name: &str) -> SourceRangeDescriptor {
+        let source: &dyn ModelSource = hfq;
+        match source
+            .tensor_payload(name)
+            .expect("HFQ range lookup")
+            .expect("fixture tensor")
+        {
+            SourcePayload::Range(descriptor) => descriptor,
+            SourcePayload::Borrowed { .. } | SourcePayload::Owned { .. } => {
+                panic!("HFQ source must preserve a lazy range payload")
+            }
+        }
+    }
+
+    fn row(descriptor: &SourceRangeDescriptor, local_row: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; COMPACT_PLE_ROW_BYTES];
+        let offset = descriptor.offset + (local_row * COMPACT_PLE_ROW_BYTES) as u64;
+        descriptor
+            .read_exact_at(offset, &mut bytes)
+            .expect("bounded PLE row read");
+        bytes
+    }
+
+    fn assert_bf16_row(bytes: &[u8], bits: u16) {
+        assert_eq!(bytes.len(), COMPACT_PLE_ROW_BYTES);
+        assert!(bytes
+            .chunks_exact(2)
+            .all(|chunk| chunk == bits.to_le_bytes()));
+        assert_eq!(bytes.len() / 2, COMPACT_PLE_ROW_WIDTH);
+    }
+
+    fn i64_values(descriptor: &SourceRangeDescriptor) -> Vec<i64> {
+        let mut bytes = vec![0u8; descriptor.length as usize];
+        descriptor
+            .read_exact(&mut bytes)
+            .expect("I64 metadata read");
+        bytes
+            .chunks_exact(8)
+            .map(|chunk| i64::from_le_bytes(chunk.try_into().expect("I64 chunk")))
+            .collect()
+    }
+
+    #[test]
+    fn compact_qwen4_ple_round_trip_binds_lazy_ranges_and_metadata() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let path = dir.path().join("qwen4-ple.hfq");
+        write_compact_qwen4_ple_hfq(&path).expect("write compact Qwen4 fixture");
+
+        let hfq = HfqFile::open(&path).expect("reopen compact Qwen4 fixture");
+        let metadata: serde_json::Value =
+            serde_json::from_str(&hfq.metadata_json).expect("canonical metadata JSON");
+        let ple = metadata
+            .get("qwen4_ple")
+            .expect("canonical qwen4_ple object");
+        assert_eq!(
+            ple.get("version").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            ple.get("padded_rows").and_then(serde_json::Value::as_u64),
+            Some(320_001_536)
+        );
+        assert_eq!(
+            ple.get("multipliers")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(3)
+        );
+        assert_eq!(
+            ple.get("head_vocab_sizes")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(16)
+        );
+        assert_eq!(
+            ple.get("head_offsets")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(16)
+        );
+
+        let source: &dyn ModelSource = &hfq;
+        assert_eq!(
+            source.tensor_names().len(),
+            COMPACT_PLE_NAMES.len() + COMPACT_I64_NAMES.len()
+        );
+        assert_eq!(hfq.pread_buf.borrow().capacity(), 0);
+        let first_index_range = range(&hfq, COMPACT_PLE_NAMES[0]);
+        assert_eq!(first_index_range.dtype(), "BF16");
+        assert_eq!(
+            first_index_range.logical_shape(),
+            &[COMPACT_PLE_ROW_COUNT, COMPACT_PLE_ROW_WIDTH]
+        );
+        assert!(matches!(
+            source
+                .tensor_payload(COMPACT_PLE_NAMES[0])
+                .expect("lazy range payload lookup"),
+            Some(SourcePayload::Range(_))
+        ));
+        assert_eq!(hfq.pread_buf.borrow().capacity(), 0);
+
+        let shard_10 = first_index_range;
+        let shard_2 = range(&hfq, COMPACT_PLE_NAMES[1]);
+        assert_eq!(shard_10.source_identity(), shard_2.source_identity());
+        assert_eq!(shard_10.source_identity().format, SourceFormat::Hfq);
+        assert_eq!(shard_10.source_identity().manifest.len(), 5);
+        assert_eq!(
+            shard_10
+                .source_identity()
+                .manifest
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            COMPACT_PLE_NAMES
+                .iter()
+                .copied()
+                .chain(COMPACT_I64_NAMES.iter().copied())
+                .collect::<Vec<_>>()
+        );
+
+        let mut numeric_order = COMPACT_PLE_NAMES;
+        numeric_order.sort_by_key(|name| {
+            name.rsplit_once("shard_")
+                .and_then(|(_, suffix)| suffix.strip_suffix(".weight"))
+                .and_then(|suffix| suffix.parse::<usize>().ok())
+                .expect("numeric PLE suffix")
+        });
+        assert_eq!(numeric_order, [COMPACT_PLE_NAMES[1], COMPACT_PLE_NAMES[0]]);
+        assert_bf16_row(&row(&shard_2, 0), 0x20);
+        assert_bf16_row(&row(&shard_2, 1), 0x21);
+        assert_bf16_row(&row(&shard_10, 0), 0x10);
+        assert_bf16_row(&row(&shard_10, 1), 0x11);
+        assert_bf16_row(&row(&shard_2, COMPACT_PLE_ROW_COUNT - 1), 0x21);
+        assert_bf16_row(&row(&shard_10, 0), 0x10);
+
+        assert_eq!(
+            i64_values(&range(&hfq, COMPACT_I64_NAMES[0])),
+            vec![23_703_573_157_769, 20_090_736_453_365, 8_052_911_324_071]
+        );
+        assert_eq!(
+            i64_values(&range(&hfq, COMPACT_I64_NAMES[1])),
+            vec![
+                20_000_003, 20_000_023, 20_000_033, 20_000_047, 20_000_059, 20_000_063, 20_000_069,
+                20_000_077, 20_000_081, 20_000_093, 20_000_107, 20_000_147, 20_000_153, 20_000_159,
+                20_000_161, 20_000_171,
+            ]
+        );
+        assert_eq!(
+            i64_values(&range(&hfq, COMPACT_I64_NAMES[2])),
+            vec![
+                0,
+                20_000_003,
+                40_000_026,
+                60_000_059,
+                80_000_106,
+                100_000_165,
+                120_000_228,
+                140_000_297,
+                160_000_374,
+                180_000_455,
+                200_000_548,
+                220_000_655,
+                240_000_802,
+                260_000_955,
+                280_001_114,
+                300_001_275,
+            ]
+        );
+    }
+
+    #[test]
+    fn compact_qwen4_ple_range_rejects_identity_change_and_truncation() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let path = dir.path().join("qwen4-ple.hfq");
+        write_compact_qwen4_ple_hfq(&path).expect("write compact Qwen4 fixture");
+        let hfq = HfqFile::open(&path).expect("open compact fixture");
+        let descriptor = range(&hfq, COMPACT_PLE_NAMES[0]);
+
+        let replacement = dir.path().join("replacement.hfq");
+        write_compact_qwen4_ple_hfq(&replacement).expect("write replacement fixture");
+        std::fs::rename(&replacement, &path).expect("replace fixture path");
+        let mut bytes = vec![0u8; COMPACT_PLE_ROW_BYTES];
+        assert!(matches!(
+            descriptor.read_exact_at(descriptor.offset, &mut bytes),
+            Err(SourceError::IdentityChanged { .. })
+        ));
+
+        let truncated = dir.path().join("truncated.hfq");
+        write_compact_qwen4_ple_hfq(&truncated).expect("write truncation fixture");
+        let len = std::fs::metadata(&truncated)
+            .expect("truncation fixture metadata")
+            .len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&truncated)
+            .expect("open truncation fixture")
+            .set_len(len - 1)
+            .expect("truncate payload");
+        let error = match HfqFile::open(&truncated) {
+            Ok(_) => panic!("truncated payload must refuse"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+}
 // ─── Overlay resolution tests (SP3) ─────────────────────────────────────────
 
 #[cfg(test)]
