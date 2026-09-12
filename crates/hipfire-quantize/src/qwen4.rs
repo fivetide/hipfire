@@ -3736,6 +3736,9 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
     use std::thread::{self, JoinHandle};
+    use std::env;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
     use tempfile::NamedTempFile;
 
     fn test_remote_source(base_url: &str) -> RemoteSource {
@@ -4198,5 +4201,340 @@ mod tests {
         assert_eq!(plan.arch_id, 16);
         assert_eq!(plan.entries.len(), 1);
         assert_eq!(plan.entries[0].data_len, payload.len() as u64);
+    }
+    /// Construct the production output plan from headers only.  Unlike
+    /// `plan_entries`, this deliberately does not read the three I64 payloads;
+    /// it is the bounded admission proof for a sparse full-checkpoint fixture.
+    fn sparse_header_plan(
+        tensors: &[SourceTensor],
+        inventory: &ManifestIndex,
+    ) -> Result<EntryPlan, Qwen4Error> {
+        validate_manifest_inventory_names(tensors, inventory)?;
+        let mut ple_entries = Vec::with_capacity(PLE_SHARD_COUNT);
+        let mut resident = Vec::new();
+        let mut metadata_entries = Vec::new();
+        let mut expert_entries = 0usize;
+        let mut gate_up_count = 0usize;
+        let mut down_count = 0usize;
+        let mut mtp_gate_up = false;
+        let mut mtp_down = false;
+
+        for tensor in tensors {
+            if let Some(expected) = inventory.metadata.get(&tensor.name) {
+                if tensor.dtype != "I64" || tensor.shape != expected.shape {
+                    return Err(Qwen4Error::Invalid(format!(
+                        "{} header metadata is {:?}/{:?}, expected I64/{:?}",
+                        tensor.name, tensor.dtype, tensor.shape, expected.shape
+                    )));
+                }
+                let data_len = checked_product(&tensor.shape, &tensor.name)?
+                    .checked_mul(8)
+                    .ok_or_else(|| {
+                        Qwen4Error::Invalid(format!("{} I64 payload length overflows", tensor.name))
+                    })?;
+                if tensor.data_len() != data_len {
+                    return Err(Qwen4Error::Invalid(format!(
+                        "{} header payload is {}, expected {}",
+                        tensor.name,
+                        tensor.data_len(),
+                        data_len
+                    )));
+                }
+                metadata_entries.push(PlannedEntry {
+                    source: tensor.clone(),
+                    name: tensor.name.clone(),
+                    quant_type: QWEN4_I64_QUANT_TYPE,
+                    shape: shape_u32(&tensor.shape, &tensor.name)?,
+                    group_size: 0,
+                    data_len,
+                    kind: EntryKind::I64(expected.role),
+                });
+                continue;
+            }
+
+            if let Some(expected) = inventory.required.get(&tensor.name) {
+                validate_manifest_source(tensor, expected)?;
+                match expected.role {
+                    ManifestRole::Ple => {
+                        let index = expected
+                            .ple_index
+                            .expect("manifest PLE role has a numeric shard index");
+                        let data_len = (PLE_ROWS_PER_SHARD)
+                            .checked_mul(PLE_ROW_WIDTH)
+                            .and_then(|elements| elements.checked_mul(2))
+                            .ok_or_else(|| {
+                                Qwen4Error::Invalid(
+                                    "sparse header PLE payload length overflows".to_string(),
+                                )
+                            })?;
+                        if tensor.data_len() != data_len {
+                            return Err(Qwen4Error::Invalid(format!(
+                                "{} header PLE payload is {}, expected {}",
+                                tensor.name,
+                                tensor.data_len(),
+                                data_len
+                            )));
+                        }
+                        ple_entries.push(PlannedEntry {
+                            source: tensor.clone(),
+                            name: tensor.name.clone(),
+                            quant_type: 16,
+                            shape: shape_u32(&tensor.shape, &tensor.name)?,
+                            group_size: 0,
+                            data_len,
+                            kind: EntryKind::Ple,
+                        });
+                    }
+                    ManifestRole::GateUp | ManifestRole::Down => {
+                        let kind = match expected.role {
+                            ManifestRole::GateUp => ExpertKind::GateUp,
+                            ManifestRole::Down => ExpertKind::Down,
+                            _ => unreachable!("matched expert role"),
+                        };
+                        let (rows, k) = validate_expert_shape(tensor, kind, &expected.shape)?;
+                        let dtype = match kind {
+                            ExpertKind::GateUp => DType::MQ4G256V2,
+                            ExpertKind::Down => DType::MQ4G128V2,
+                        };
+                        let data_len = quantized_data_len_for_dtype(dtype, rows, k)?;
+                        resident.push(PlannedEntry {
+                            source: tensor.clone(),
+                            name: tensor.name.clone(),
+                            quant_type: match dtype {
+                                DType::MQ4G256V2 => MQ4G256V2_QUANT_TYPE,
+                                DType::MQ4G128V2 => MQ4G128V2_QUANT_TYPE,
+                                _ => unreachable!("Qwen4 expert dtype"),
+                            },
+                            shape: shape_u32(&tensor.shape, &tensor.name)?,
+                            group_size: match dtype {
+                                DType::MQ4G256V2 => MQ4G256V2_GROUP_SIZE as u32,
+                                DType::MQ4G128V2 => MQ4G128V2_GROUP_SIZE as u32,
+                                _ => unreachable!("Qwen4 expert dtype"),
+                            },
+                            data_len,
+                            kind: match kind {
+                                ExpertKind::GateUp => EntryKind::GateUp,
+                                ExpertKind::Down => EntryKind::Down,
+                            },
+                        });
+                        expert_entries += 1;
+                        match kind {
+                            ExpertKind::GateUp => {
+                                gate_up_count += 1;
+                                mtp_gate_up |= expected.is_mtp;
+                            }
+                            ExpertKind::Down => {
+                                down_count += 1;
+                                mtp_down |= expected.is_mtp;
+                            }
+                        }
+                    }
+                    ManifestRole::Matrix(dtype) => {
+                        let (rows, k) = validate_matrix_shape(tensor, &expected.shape)?;
+                        let data_len = quantized_data_len_for_dtype(dtype, rows, k)?;
+                        resident.push(PlannedEntry {
+                            source: tensor.clone(),
+                            name: tensor.name.clone(),
+                            quant_type: match dtype {
+                                DType::MQ4G256V2 => MQ4G256V2_QUANT_TYPE,
+                                DType::MQ4G128V2 => MQ4G128V2_QUANT_TYPE,
+                                _ => unreachable!("Qwen4 matrix dtype"),
+                            },
+                            shape: shape_u32(&tensor.shape, &tensor.name)?,
+                            group_size: match dtype {
+                                DType::MQ4G256V2 => MQ4G256V2_GROUP_SIZE as u32,
+                                DType::MQ4G128V2 => MQ4G128V2_GROUP_SIZE as u32,
+                                _ => unreachable!("Qwen4 matrix dtype"),
+                            },
+                            data_len,
+                            kind: EntryKind::Matrix(dtype),
+                        });
+                    }
+                    ManifestRole::Bf16 => {
+                        let data_len = checked_bf16_bytes(&tensor.shape, &tensor.name)?;
+                        resident.push(PlannedEntry {
+                            source: tensor.clone(),
+                            name: tensor.name.clone(),
+                            quant_type: 16,
+                            shape: shape_u32(&tensor.shape, &tensor.name)?,
+                            group_size: 0,
+                            data_len,
+                            kind: EntryKind::Bf16,
+                        });
+                    }
+                }
+                continue;
+            }
+
+            if inventory.aliases.contains_key(&tensor.name) || is_vision_tensor(&tensor.name) {
+                continue;
+            }
+            return Err(Qwen4Error::Invalid(format!(
+                "sparse header tensor {} is not declared by the manifest",
+                tensor.name
+            )));
+        }
+
+        if ple_entries.len() != PLE_SHARD_COUNT {
+            return Err(Qwen4Error::Invalid(format!(
+                "sparse header plan found {} PLE shards, expected {PLE_SHARD_COUNT}",
+                ple_entries.len()
+            )));
+        }
+        ple_entries.sort_by_key(|entry| ple_shard_index(&entry.name).expect("PLE entry name"));
+        let external_ple_bytes = (PLE_SHARD_COUNT as u64)
+            .checked_mul(PLE_ROWS_PER_SHARD)
+            .and_then(|rows| rows.checked_mul(PLE_ROW_WIDTH as u64))
+            .and_then(|elements| elements.checked_mul(2))
+            .ok_or_else(|| Qwen4Error::Invalid("sparse PLE bytes overflow".to_string()))?;
+        let source_ple_bytes = ple_entries.iter().try_fold(0u64, |sum, entry| {
+            sum.checked_add(entry.source.data_len()).ok_or_else(|| {
+                Qwen4Error::Invalid("sparse source PLE bytes overflow".to_string())
+            })
+        })?;
+        if source_ple_bytes != external_ple_bytes {
+            return Err(Qwen4Error::Invalid(format!(
+                "sparse source PLE bytes {source_ple_bytes}, expected {external_ple_bytes}"
+            )));
+        }
+        if gate_up_count == 0 || down_count == 0 || !mtp_gate_up || !mtp_down {
+            return Err(Qwen4Error::Invalid(
+                "sparse header plan is missing trunk or MTP gate/up/down experts".to_string(),
+            ));
+        }
+        resident.sort_by_key(|entry| inventory.manifest_order.get(&entry.name).copied());
+        metadata_entries.sort_by_key(|entry| inventory.manifest_order.get(&entry.name).copied());
+        let resident_bytes = resident.iter().try_fold(0u64, |sum, entry| {
+            sum.checked_add(entry.data_len)
+                .ok_or_else(|| Qwen4Error::Invalid("sparse resident bytes overflow".to_string()))
+        })?;
+        let resident_entries = resident.len();
+        let mut entries = ple_entries;
+        entries.extend(resident);
+        entries.extend(metadata_entries);
+        Ok(EntryPlan {
+            entries,
+            ple_metadata: Some(PleMetadata {
+                multipliers: hipfire_arch_qwen4::ple::PLE_MULTIPLIERS.to_vec(),
+                vocab_sizes: hipfire_arch_qwen4::ple::PLE_HEAD_VOCAB_SIZES
+                    .iter()
+                    .map(|&value| value as i64)
+                    .collect(),
+                prefix_offsets: hipfire_arch_qwen4::ple::PLE_HEAD_OFFSETS
+                    .iter()
+                    .map(|&value| value as i64)
+                    .collect(),
+            }),
+            row_chunk: DEFAULT_ROW_CHUNK,
+            resident_entries,
+            expert_entries,
+            resident_bytes,
+            external_ple_bytes,
+            ple_shards: PLE_SHARD_COUNT,
+        })
+    }
+
+    #[test]
+    #[ignore = "network-backed sparse pinned-checkpoint campaign; set QWEN4_SPARSE_INVENTORY_DIR"]
+    fn production_pinned_sparse_headers_validate_without_payload_reads() {
+        let root = env::var_os("QWEN4_SPARSE_INVENTORY_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("QWEN4_SPARSE_INVENTORY_DIR must point to fetched sparse headers");
+        let source = source_paths(&root).expect("sparse source paths");
+        validate_source_shard_count(&source, Qwen4Mode::Production).expect("131 shard admission");
+        let tensors = load_inventory(&source).expect("header inventory");
+        assert_eq!(tensors.len(), PINNED_SOURCE_TENSOR_COUNT);
+        assert_eq!(
+            tensors.iter().filter(|tensor| tensor.dtype == "BF16").count(),
+            PINNED_BF16_TENSOR_COUNT
+        );
+        assert_eq!(
+            tensors.iter().filter(|tensor| tensor.dtype == "I64").count(),
+            PINNED_I64_TENSOR_COUNT
+        );
+        assert_eq!(
+            tensors.iter().filter(|tensor| is_vision_tensor(&tensor.name)).count(),
+            PINNED_VISION_TENSOR_COUNT
+        );
+        validate_source_inventory(&tensors, Qwen4Mode::Production).expect("pinned source census");
+
+        #[cfg(unix)]
+        let blocks_before: Vec<_> = match &source {
+            SourceSet::Local { paths, .. } => paths
+                .iter()
+                .map(|path| std::fs::metadata(path).expect("sparse shard stat").blocks())
+                .collect(),
+            SourceSet::Remote { .. } => Vec::new(),
+        };
+        let config_value = load_optional_config(&source)
+            .expect("sparse config")
+            .expect("sparse config.json");
+        let config = Qwen4Config::from_value(&config_value).expect("pinned Qwen4 config");
+        let manifest = Qwen4Manifest::build(&config).expect("pinned Qwen4 manifest");
+        let inventory = ManifestIndex::build(&manifest).expect("manifest index");
+        let plan = sparse_header_plan(&tensors, &inventory).expect("header-only output plan");
+        assert_eq!(plan.entries.len(), PINNED_OUTPUT_ENTRY_COUNT);
+        assert_eq!(plan.ple_shards, PLE_SHARD_COUNT);
+        assert_eq!(plan.external_ple_bytes, 102_400_491_520);
+        assert_eq!(
+            plan.entries
+                .iter()
+                .filter(|entry| matches!(entry.kind, EntryKind::I64(_)))
+                .count(),
+            PINNED_I64_TENSOR_COUNT
+        );
+        let ple = plan.ple_metadata.as_ref().expect("pinned PLE metadata");
+        let metadata_json = build_metadata(Some(&config_value), &plan, ple).expect("metadata JSON");
+        println!("sparse metadata bytes={}", metadata_json.len());
+        let stream_entries: Vec<_> = plan
+            .entries
+            .iter()
+            .map(|entry| hipfire_runtime::hfq::HfqStreamEntry {
+                name: entry.name.clone(),
+                quant_type: entry.quant_type,
+                shape: entry.shape.clone(),
+                group_size: entry.group_size,
+                data_len: entry.data_len,
+            })
+            .collect();
+        let predicted = predicted_output_bytes(&metadata_json, &stream_entries)
+            .expect("header-only predicted output bytes");
+        assert_eq!(predicted, PINNED_PREDICTED_OUTPUT_BYTES);
+        assert_eq!(
+            plan.entries
+                .iter()
+                .filter(|entry| entry.kind == EntryKind::Ple)
+                .count(),
+            PLE_SHARD_COUNT
+        );
+        assert_eq!(
+            plan.entries
+                .iter()
+                .filter(|entry| matches!(entry.kind, EntryKind::I64(_)))
+                .count(),
+            PINNED_I64_TENSOR_COUNT
+        );
+        source.verify_identity().expect("sparse source identities");
+        #[cfg(unix)]
+        if let SourceSet::Local { paths, .. } = &source {
+            let blocks_after: Vec<_> = paths
+                .iter()
+                .map(|path| std::fs::metadata(path).expect("sparse shard stat").blocks())
+                .collect();
+            assert_eq!(
+                blocks_after, blocks_before,
+                "header-only admission must not fault/write source payload blocks"
+            );
+        }
+        println!(
+            "PASS sparse production headers: shards=131 source_tensors={} excluded_vision={} output_entries={} ple_shards={} i64={} metadata_bytes={} predicted_output_bytes={} payload_reads=0",
+            tensors.len(),
+            PINNED_VISION_TENSOR_COUNT,
+            plan.entries.len(),
+            plan.ple_shards,
+            PINNED_I64_TENSOR_COUNT,
+            metadata_json.len(),
+            predicted
+        );
     }
 }

@@ -13,7 +13,8 @@
 //! Usage:
 //!   cargo run --release --example qwen4_qt53_channel -p hipfire-runtime
 
-use rdna_compute::{DType, Gpu, GpuTensor};
+use half::f16;
+use rdna_compute::{gen_fwht_signs, DType, Gpu, GpuTensor};
 
 const QT53_GROUP_BYTES: usize = 68;
 const QT44_GROUP_BYTES: usize = 136;
@@ -81,6 +82,258 @@ fn f16_to_f32(bits: u16) -> f32 {
         (1.0 + fraction as f32 / 1024.0) * 2.0f32.powi(exponent as i32 - 15)
     };
     if sign == 0 { value } else { -value }
+}
+const HFQ4_G128_GROUP_BYTES: usize = 72;
+
+fn bf16_bits_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
+fn f32_to_bf16_bits(value: f32) -> u16 {
+    assert!(value.is_finite(), "source BF16 harness value must be finite");
+    let bits = value.to_bits();
+    let rounding = 0x7fffu32 + ((bits >> 16) & 1);
+    (bits.wrapping_add(rounding) >> 16) as u16
+}
+
+fn source_bf16_words(len: usize, seed: usize) -> Vec<u16> {
+    (0..len)
+        .map(|index| {
+            let coarse = (seed.wrapping_add(index.wrapping_mul(17)) % 257) as f32 - 128.0;
+            let fine =
+                (seed.wrapping_mul(3).wrapping_add(index.wrapping_mul(11)) % 29) as f32 - 14.0;
+            f32_to_bf16_bits(coarse * 0.03125 + fine * 0.001953125)
+        })
+        .collect()
+}
+
+
+fn activation_values(k: usize, seed: usize) -> Vec<f32> {
+    (0..k)
+        .map(|index| {
+            let coarse = (seed.wrapping_add(index.wrapping_mul(13)) % 193) as f32 - 96.0;
+            let fine =
+                (seed.wrapping_mul(5).wrapping_add(index.wrapping_mul(7)) % 31) as f32 - 15.0;
+            coarse * 0.0078125 + fine * 0.0009765625
+        })
+        .collect()
+}
+
+fn report_quant_loss(label: &str, source: &[f32], decoded: &[f32]) -> Result<(), String> {
+    if source.len() != decoded.len() || source.is_empty() {
+        return Err(format!(
+            "{label}: invalid metric lengths {} and {}",
+            source.len(),
+            decoded.len()
+        ));
+    }
+    let mut sum_squared = 0.0f64;
+    let mut sum_absolute = 0.0f64;
+    let mut max_absolute = 0.0f32;
+    for (&source_value, &decoded_value) in source.iter().zip(decoded) {
+        if !source_value.is_finite() || !decoded_value.is_finite() {
+            return Err(format!("{label}: non-finite source-BF16 quant metric"));
+        }
+        let difference = source_value - decoded_value;
+        let absolute = difference.abs();
+        sum_squared += f64::from(difference) * f64::from(difference);
+        sum_absolute += f64::from(absolute);
+        max_absolute = max_absolute.max(absolute);
+    }
+    let count = source.len() as f64;
+    let mse = sum_squared / count;
+    let mae = sum_absolute / count;
+    if !mse.is_finite() || !mae.is_finite() || !max_absolute.is_finite() {
+        return Err(format!("{label}: non-finite aggregate"));
+    }
+    println!(
+        "{label}: finite source-BF16 quant loss (mse={mse:.8e}, mae={mae:.8e}, max_abs={max_absolute:.8e})"
+    );
+    Ok(())
+}
+
+fn hfq4g128_embedding_bytes(
+    source: &[u16],
+    rows: usize,
+    dim: usize,
+) -> Result<Vec<u8>, String> {
+    if dim == 0 || dim % 128 != 0 || source.len() != rows.saturating_mul(dim) {
+        return Err(format!(
+            "HFQ4-G128 embedding geometry mismatch: rows={rows} dim={dim} source={}",
+            source.len()
+        ));
+    }
+    let groups = dim / 128;
+    let row_stride = groups * HFQ4_G128_GROUP_BYTES;
+    let mut payload = vec![0u8; rows * row_stride];
+    for row in 0..rows {
+        for group in 0..groups {
+            let logical_start = row * dim + group * 128;
+            let values: Vec<f32> = source[logical_start..logical_start + 128]
+                .iter()
+                .map(|&bits| bf16_bits_to_f32(bits))
+                .collect();
+            let zero = values.iter().copied().fold(f32::INFINITY, f32::min);
+            let high = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let range = high - zero;
+            let scale = if range > 0.0 { range / 15.0 } else { 0.0 };
+            let base = row * row_stride + group * HFQ4_G128_GROUP_BYTES;
+            payload[base..base + 4].copy_from_slice(&scale.to_le_bytes());
+            payload[base + 4..base + 8].copy_from_slice(&zero.to_le_bytes());
+            for index in 0..128 {
+                let quantized = if scale > 0.0 {
+                    (((values[index] - zero) / scale + 0.5)
+                        .floor()
+                        .clamp(0.0, 15.0)) as u8
+                } else {
+                    0
+                };
+                let byte = base + 8 + index / 2;
+                if index & 1 == 0 {
+                    payload[byte] = quantized;
+                } else {
+                    payload[byte] |= quantized << 4;
+                }
+            }
+        }
+    }
+    Ok(payload)
+}
+
+fn hfq4g128_decode_row(row: &[u8], dim: usize) -> Result<Vec<f32>, String> {
+    if dim == 0 || dim % 128 != 0 || row.len() != (dim / 128) * HFQ4_G128_GROUP_BYTES {
+        return Err(format!(
+            "HFQ4-G128 row geometry mismatch: dim={dim} row_bytes={}",
+            row.len()
+        ));
+    }
+    let mut decoded = vec![0.0f32; dim];
+    for index in 0..dim {
+        let group = index / 128;
+        let within = index % 128;
+        let base = group * HFQ4_G128_GROUP_BYTES;
+        let scale = f32::from_le_bytes(row[base..base + 4].try_into().unwrap());
+        let zero = f32::from_le_bytes(row[base + 4..base + 8].try_into().unwrap());
+        let packed = row[base + 8 + within / 2];
+        let quantized = if within & 1 == 0 {
+            packed & 0x0f
+        } else {
+            packed >> 4
+        };
+        decoded[index] = scale * quantized as f32 + zero;
+    }
+    Ok(decoded)
+}
+
+fn cpu_fwht_128(values: &mut [f32]) {
+    assert_eq!(values.len(), 128);
+    let signs1 = gen_fwht_signs(43, 128);
+    let signs2 = gen_fwht_signs(1043, 128);
+    for (value, sign) in values.iter_mut().zip(&signs1) {
+        *value *= sign;
+    }
+    let mut stride = 1;
+    while stride < 128 {
+        let mut offset = 0;
+        while offset < 128 {
+            for index in 0..stride {
+                let left = values[offset + index];
+                let right = values[offset + index + stride];
+                values[offset + index] = left + right;
+                values[offset + index + stride] = left - right;
+            }
+            offset += stride * 2;
+        }
+        stride <<= 1;
+    }
+    let normalization = 1.0f32 / 128.0f32.sqrt();
+    for (value, sign) in values.iter_mut().zip(&signs2) {
+        *value *= normalization * sign;
+    }
+}
+
+fn cpu_rotate_128(input: &[f32], batch: usize, k: usize) -> Vec<f32> {
+    assert_eq!(input.len(), batch * k);
+    let mut output = vec![0.0f32; input.len()];
+    let groups = k.div_ceil(128);
+    for row in 0..batch {
+        for group in 0..groups {
+            let start = group * 128;
+            let actual = (k - start).min(128);
+            let mut values = [0.0f32; 128];
+            values[..actual].copy_from_slice(&input[row * k + start..row * k + start + actual]);
+            cpu_fwht_128(&mut values);
+            output[row * k + start..row * k + start + actual]
+                .copy_from_slice(&values[..actual]);
+        }
+    }
+    output
+}
+
+fn qt53_pack_bf16(
+    source: &[u16],
+    rows: usize,
+    k: usize,
+) -> Result<(Vec<u8>, Vec<f32>, Vec<f32>), String> {
+    if rows == 0 || k == 0 || source.len() != rows.saturating_mul(k) {
+        return Err(format!(
+            "qt53 source geometry mismatch: rows={rows} k={k} source={}",
+            source.len()
+        ));
+    }
+    let groups = k.div_ceil(128);
+    let mut payload = vec![0u8; rows * groups * QT53_GROUP_BYTES];
+    let mut rotated_source = vec![0.0f32; rows * k];
+    let mut rotated_decoded = vec![0.0f32; rows * k];
+    for row in 0..rows {
+        for group_index in 0..groups {
+            let group_start = group_index * 128;
+            let actual = (k - group_start).min(128);
+            let mut values = [0.0f32; 128];
+            for index in 0..actual {
+                values[index] = bf16_bits_to_f32(source[row * k + group_start + index]);
+            }
+            cpu_fwht_128(&mut values);
+            rotated_source[row * k + group_start..row * k + group_start + actual]
+                .copy_from_slice(&values[..actual]);
+            let low = values.iter().copied().fold(f32::INFINITY, f32::min);
+            let high = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let range = high - low;
+            let step = if range > 0.0 { range / 15.0 } else { 0.0 };
+            let mut scale_bits = f16::from_f32(step).to_bits();
+            let zero_bits = f16::from_f32(low).to_bits();
+            let mut scale = f16::from_bits(scale_bits).to_f32();
+            let zero = f16::from_bits(zero_bits).to_f32();
+            let degenerate = high == low || step == 0.0 || scale == 0.0;
+            if degenerate {
+                scale_bits = 0;
+                scale = 0.0;
+            }
+            let base = (row * groups + group_index) * QT53_GROUP_BYTES;
+            payload[base..base + 2].copy_from_slice(&scale_bits.to_le_bytes());
+            payload[base + 2..base + 4].copy_from_slice(&zero_bits.to_le_bytes());
+            for index in 0..128 {
+                let quantized = if degenerate {
+                    0
+                } else {
+                    (((values[index] - zero) / scale + 0.5)
+                        .floor()
+                        .clamp(0.0, 15.0)) as u8
+                };
+                let byte = base + 4 + index / 2;
+                if index & 1 == 0 {
+                    payload[byte] = quantized;
+                } else {
+                    payload[byte] |= quantized << 4;
+                }
+                if index < actual {
+                    rotated_decoded[row * k + group_start + index] =
+                        scale * quantized as f32 + zero;
+                }
+            }
+        }
+    }
+    Ok((payload, rotated_source, rotated_decoded))
 }
 
 fn qt53_dot(row: &[u8], k: usize, x: &[f32]) -> f32 {
@@ -194,6 +447,138 @@ fn free_all(gpu: &mut Gpu, tensors: impl IntoIterator<Item = GpuTensor>) -> Resu
     for tensor in tensors {
         gpu.free_tensor(tensor).map_err(|error| error.to_string())?;
     }
+    Ok(())
+}
+
+fn embedding_row(gpu: &mut Gpu) -> Result<(), String> {
+    let rows = 3usize;
+    let dim = 256usize;
+    let token_id = 2usize;
+    let source_words = source_bf16_words(rows * dim, 211);
+    let source_values: Vec<f32> = source_words
+        .iter()
+        .map(|&bits| bf16_bits_to_f32(bits))
+        .collect();
+    let payload = hfq4g128_embedding_bytes(&source_words, rows, dim)?;
+    let row_stride = (dim / 128) * HFQ4_G128_GROUP_BYTES;
+    let expected = hfq4g128_decode_row(
+        &payload[token_id * row_stride..(token_id + 1) * row_stride],
+        dim,
+    )?;
+    report_quant_loss(
+        "HFQ4-G128 embedding row source-BF16 quant loss gfx1151",
+        &source_values[token_id * dim..(token_id + 1) * dim],
+        &expected,
+    )?;
+    let table = gpu
+        .upload_raw(&payload, &[payload.len()])
+        .map_err(|error| error.to_string())?;
+    let output = gpu
+        .zeros(&[dim], DType::F32)
+        .map_err(|error| error.to_string())?;
+    gpu.embedding_lookup_hfq4g128(&table, &output, token_id as u32, dim)
+        .map_err(|error| error.to_string())?;
+    let actual = gpu
+        .download_f32(&output)
+        .map_err(|error| error.to_string())?;
+    let result = check_close(
+        "HFQ4-G128 embedding row exact payload gfx1151",
+        &actual,
+        &expected,
+        1e-6,
+    );
+    free_all(gpu, [table, output])?;
+    result
+}
+
+fn qt53_dense_case(
+    gpu: &mut Gpu,
+    label: &str,
+    rows: usize,
+    k: usize,
+    weight_seed: usize,
+    activation_seed: usize,
+) -> Result<(), String> {
+    let source_words = source_bf16_words(rows * k, weight_seed);
+    let (weight_bytes, source_rotated, decoded_rotated) = qt53_pack_bf16(&source_words, rows, k)?;
+    report_quant_loss(
+        &format!("{label} source-BF16 quant loss"),
+        &source_rotated,
+        &decoded_rotated,
+    )?;
+    let x_host = activation_values(k, activation_seed);
+    let x_rotated_cpu = cpu_rotate_128(&x_host, 1, k);
+    let weight = gpu
+        .upload_raw(&weight_bytes, &[weight_bytes.len()])
+        .map_err(|error| error.to_string())?;
+    let x = gpu
+        .upload_f32(&x_host, &[k])
+        .map_err(|error| error.to_string())?;
+    let x_rot = gpu
+        .zeros(&[k], DType::F32)
+        .map_err(|error| error.to_string())?;
+    let output = gpu
+        .zeros(&[rows], DType::F32)
+        .map_err(|error| error.to_string())?;
+    gpu.rotate_x_mq_128_v2(&x, &x_rot, k, 1)
+        .map_err(|error| error.to_string())?;
+    let rotated_actual = gpu
+        .download_f32(&x_rot)
+        .map_err(|error| error.to_string())?;
+    let rotation_result = check_close(
+        &format!("{label} activation FWHT gfx1151"),
+        &rotated_actual,
+        &x_rotated_cpu,
+        3e-6,
+    );
+    if let Err(error) = rotation_result {
+        free_all(gpu, [weight, x, x_rot, output])?;
+        return Err(error);
+    }
+    gpu.gemv_mq4g128v2(&weight, &x_rot, &output, rows, k)
+        .map_err(|error| error.to_string())?;
+    let actual = gpu
+        .download_f32(&output)
+        .map_err(|error| error.to_string())?;
+    let groups = k.div_ceil(128);
+    let row_stride = groups * QT53_GROUP_BYTES;
+    let expected: Vec<f32> = (0..rows)
+        .map(|row| {
+            qt53_dot(
+                &weight_bytes[row * row_stride..(row + 1) * row_stride],
+                k,
+                &x_rotated_cpu,
+            )
+        })
+        .collect();
+    let result = check_close(label, &actual, &expected, 3e-5);
+    free_all(gpu, [weight, x, x_rot, output])?;
+    result
+}
+
+fn shared_dense_qt53(gpu: &mut Gpu) -> Result<(), String> {
+    qt53_dense_case(
+        gpu,
+        "qt53 shared/dense K=640 exact payload gfx1151",
+        3,
+        640,
+        307,
+        401,
+    )
+}
+
+fn qt53_boundary_matrix(gpu: &mut Gpu) -> Result<(), String> {
+    for &k in &[1usize, 127, 128, 129, 160, 320] {
+        qt53_dense_case(
+            gpu,
+            &format!("qt53 dense boundary K={k} exact payload gfx1151"),
+            2,
+            k,
+            503 + k,
+            601 + k,
+        )?;
+    }
+    println!("qt53 dense K boundaries [1,127,128,129,160,320,640]: PASS (K=640 shared path)");
     Ok(())
 }
 
@@ -531,6 +916,9 @@ fn run() -> Result<(), String> {
             gpu.arch
         ));
     }
+    embedding_row(&mut gpu)?;
+    shared_dense_qt53(&mut gpu)?;
+    qt53_boundary_matrix(&mut gpu)?;
     ordinary_gemv(&mut gpu)?;
     indexed_top10(&mut gpu)?;
     grouped_prefill(&mut gpu)?;
