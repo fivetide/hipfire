@@ -2,17 +2,23 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Run the generated Qwen4 operator oracle on the production gfx1151 path.
+//! Run the generated Qwen4 operator oracle on the production gfx1151 path, or
+//! execute the production HFQM carrier on the fixed teacher-forced corpus.
 //!
-//! Usage:
+//! Fixture usage:
 //!   cargo run --release -p hipfire-arch-qwen4 --example qwen4_parity -- \
 //!       --fixtures /path/to/reference-fixtures --out /tmp/qwen4-parity.json
 //!
-//! This runner intentionally exposes only the fixture contract.  Model loading,
-//! state-dump, and quality modes belong to the later carrier-level harness and
-//! are not accepted here.
+//! Candidate quality usage:
+//!   cargo run --release -p hipfire-arch-qwen4 --example qwen4_parity -- \
+//!       --model /path/to/model.hfq --tokens benchmarks/prompts/qwen4-teacher-forced.tokens.json \
+//!       --out /tmp/qwen4-candidate.json
 
-use hipfire_arch_qwen4::{PleHashMetadata, PleHistory};
+use hipfire_arch_qwen4::{admit_hfqm_artifact, PleHashMetadata, PleHistory, Qwen4HfqmArtifact};
+use hipfire_runtime::device_mesh::DeviceMesh;
+use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
+use hipfire_runtime::model_source::{ModelSource, SourcePayload};
+use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use rdna_compute::qwen4::{
     qwen4_gdn_params_f32, qwen4_gdn_step, qwen4_hc_read, qwen4_hc_write, qwen4_qsa_attention,
     qwen4_qsa_cache_append, qwen4_qsa_norm_rope, qwen4_qsa_pool_rope, qwen4_qsa_select,
@@ -21,6 +27,7 @@ use rdna_compute::qwen4::{
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -3315,6 +3322,328 @@ fn run_mtp(
         "logits_max_abs":logits_err.0
     }))
 }
+const QUALITY_SCHEMA: &str = "hipfire.qwen4.quality.v1";
+const CANONICAL_TOKEN_COUNT: usize = 17;
+const CANONICAL_TOKEN_SHA256: &str =
+    "e53de8c7b501eaaea637648feb6f569dd17cd564c2f669b2924ccdf1b7e52e2f";
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    format!("{:x}", digest.finalize())
+}
+
+fn sha256_path(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let mut file =
+        fs::File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 1 << 20];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn read_quality_tokens(path: &Path) -> Result<(Vec<u32>, Value), String> {
+    let metadata_path = if path.extension().and_then(|value| value.to_str()) == Some("json") {
+        path.to_path_buf()
+    } else {
+        path.with_extension("json")
+    };
+    let metadata_text = fs::read_to_string(&metadata_path)
+        .map_err(|error| format!("read corpus metadata {}: {error}", metadata_path.display()))?;
+    let metadata: Value = serde_json::from_str(&metadata_text)
+        .map_err(|error| format!("parse corpus metadata {}: {error}", metadata_path.display()))?;
+    if metadata.get("schema").and_then(Value::as_str)
+        != Some("hipfire.qwen4.teacher_forced_corpus.v1")
+        || metadata.get("format").and_then(Value::as_str) != Some("u32le")
+        || metadata.get("count").and_then(Value::as_u64) != Some(CANONICAL_TOKEN_COUNT as u64)
+        || metadata.get("sha256").and_then(Value::as_str) != Some(CANONICAL_TOKEN_SHA256)
+    {
+        return fail("teacher corpus metadata is not the canonical 17-token u32le manifest");
+    }
+    let relative = metadata
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or("teacher corpus metadata has no path")?;
+    let relative_path = Path::new(relative);
+    if relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+    {
+        return fail("teacher corpus metadata path must stay beside its manifest");
+    }
+    let payload = metadata_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(relative_path);
+    let bytes = fs::read(&payload)
+        .map_err(|error| format!("read canonical corpus {}: {error}", payload.display()))?;
+    if bytes.len() != CANONICAL_TOKEN_COUNT * 4 || sha256_hex(&bytes) != CANONICAL_TOKEN_SHA256 {
+        return fail("canonical teacher corpus byte count or SHA256 does not match metadata");
+    }
+    let mut tokens = Vec::with_capacity(CANONICAL_TOKEN_COUNT);
+    for chunk in bytes.chunks_exact(4) {
+        tokens.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok((
+        tokens,
+        json!({
+            "metadata_path": metadata_path,
+            "payload_path": payload,
+            "count": CANONICAL_TOKEN_COUNT,
+            "sha256": CANONICAL_TOKEN_SHA256,
+        }),
+    ))
+}
+
+fn artifact_identity_digest(receipt: &Qwen4HfqmArtifact) -> Result<String, String> {
+    let identity = receipt.source_identity.as_ref();
+    let files = identity
+        .files
+        .iter()
+        .map(|file| {
+            json!({
+                "path": file.canonical_path,
+                "dev": file.dev,
+                "ino": file.ino,
+                "len": file.len,
+                "mtime_secs": file.mtime_secs,
+                "mtime_nanos": file.mtime_nanos,
+            })
+        })
+        .collect::<Vec<_>>();
+    let manifest = identity
+        .manifest
+        .iter()
+        .map(|range| {
+            json!({
+                "name": range.name,
+                "file_index": range.file_index,
+                "offset": range.offset,
+                "length": range.length,
+                "dtype": range.dtype,
+                "logical_shape": range.logical_shape,
+            })
+        })
+        .collect::<Vec<_>>();
+    let value = json!({
+        "canonical_path": identity.canonical_path,
+        "format": format!("{:?}", identity.format),
+        "files": files,
+        "metadata_json": identity.metadata_json,
+        "manifest": manifest,
+    });
+    let bytes = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn quality_state_digest(
+    bundle: &hipfire_arch_qwen4::bundle::Qwen4Bundle,
+) -> Result<String, String> {
+    let state = &bundle.state;
+    let qsa = state
+        .qsa
+        .first()
+        .map(|qsa| {
+            json!({
+                "full_len": qsa.full_len,
+                "raw_len": qsa.raw_len,
+                "pooled_len": qsa.pooled_len,
+                "partial_len": qsa.partial_len,
+                "selected_len": qsa.selected_len,
+            })
+        })
+        .unwrap_or(Value::Null);
+    let value = json!({
+        "position": state.position,
+        "qsa": qsa,
+        "ple_history": format!("{:?}", state.ple_history),
+    });
+    let bytes = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn run_quality_candidate(
+    model_path: &Path,
+    corpus_path: &Path,
+    output_path: &Path,
+) -> Result<(), String> {
+    let (tokens, corpus) = read_quality_tokens(corpus_path)?;
+    let hfq = HfqFile::open(model_path)
+        .map_err(|error| format!("open HFQM {}: {error}", model_path.display()))?;
+    let receipt = admit_hfqm_artifact(&hfq)
+        .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
+    let artifact_sha256 = sha256_path(model_path)?;
+    let identity_sha256 = artifact_identity_digest(&receipt)?;
+    let config = receipt.config.clone();
+    let manifest = receipt.manifest.clone();
+    let metadata = receipt.ple.clone();
+    let placements = receipt.placements.clone();
+    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    if !gpu.arch_caps.is_gfx1151() {
+        return fail(format!(
+            "Qwen4 quality runner requires gfx1151, got {}",
+            gpu.arch
+        ));
+    }
+    let mesh = DeviceMesh::single().map_err(|error| format!("qwen4 mesh: {error}"))?;
+    let expected = WeightOrigin::for_single(&mesh, &gpu);
+    let source = HfqModelSource::from_hfq(hfq);
+    let transaction = fulfill_manifest_from_payloads(
+        &manifest.weights,
+        &mesh,
+        config.num_hidden_layers,
+        &mut gpu,
+        expected,
+        |entry| {
+            if entry.residency.is_external() {
+                return source
+                    .tensor_range(&entry.name)
+                    .map_err(|error| error.to_string())?
+                    .map(SourcePayload::Range)
+                    .ok_or_else(|| format!("missing external tensor '{}'", entry.name));
+            }
+            let (info, bytes) = source
+                .tensor_data(&entry.name)
+                .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
+            Ok(SourcePayload::Borrowed { info, bytes })
+        },
+    )
+    .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
+    let placements = placements;
+    let mut bundle = hipfire_arch_qwen4::bundle::Qwen4Bundle::assemble_with_metadata(
+        config.clone(),
+        transaction,
+        &placements,
+        &mut gpu,
+        2048,
+        metadata,
+    )
+    .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
+    let mut nlls = Vec::with_capacity(tokens.len().saturating_sub(1));
+    bundle
+        .attach_forward(&mut gpu, 2048)
+        .map_err(|error| format!("qwen4 forward setup failed: {error}"))?;
+    let vocab = config.vocab_size;
+    let logits = gpu
+        .zeros(&[vocab], DType::F32)
+        .map_err(|error| error.to_string())?;
+    let mut rows = Vec::with_capacity(tokens.len());
+    let mut state_digests = Vec::with_capacity(tokens.len());
+    for (position, &token) in tokens.iter().enumerate() {
+        bundle
+            .forward_token(&mut gpu, token, &logits, None)
+            .map_err(|error| format!("forward token {position} ({token}) failed: {error}"))?;
+        let values = gpu
+            .download_f32(&logits)
+            .map_err(|error| error.to_string())?;
+        if values.len() != vocab || values.iter().any(|value| !value.is_finite()) {
+            return fail(format!(
+                "nonfinite or malformed logits at token position {position}"
+            ));
+        }
+        let max_value = values.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let exp_sum = values
+            .iter()
+            .map(|value| ((*value as f64) - max_value).exp())
+            .sum::<f64>();
+        let logsumexp = max_value + exp_sum.ln();
+        let mut indices = (0..vocab).collect::<Vec<_>>();
+        indices.sort_unstable_by(|left, right| {
+            values[*right]
+                .partial_cmp(&values[*left])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.cmp(right))
+        });
+        let top = indices.into_iter().take(32).collect::<Vec<_>>();
+        let top_logits = top.iter().map(|&id| values[id] as f64).collect::<Vec<_>>();
+        let top1 = top[0];
+        let target_id = tokens.get(position + 1).copied();
+        let target_logit = target_id.map(|id| values[id as usize] as f64);
+        if let Some(target) = target_logit {
+            nlls.push(logsumexp - target);
+        }
+        rows.push(json!({
+            "position": position,
+            "input_id": token,
+            "target_id": target_id,
+            "target_logit": target_logit,
+            "logsumexp": logsumexp,
+            "top_ids": top,
+            "top_logits": top_logits,
+            "top1": top1,
+        }));
+        state_digests.push(quality_state_digest(&bundle)?);
+    }
+    gpu.free_tensor(logits).map_err(|error| error.to_string())?;
+    let final_state_sha256 =
+        sha256_hex(&serde_json::to_vec(&state_digests).map_err(|error| error.to_string())?);
+    bundle
+        .free_gpu(&mut gpu)
+        .map_err(|error| format!("qwen4 bundle teardown failed: {error}"))?;
+    let binary_sha256 = env::current_exe()
+        .ok()
+        .and_then(|path| sha256_path(&path).ok());
+    let ppl = if nlls.is_empty() {
+        Value::Null
+    } else {
+        json!((nlls.iter().sum::<f64>() / nlls.len() as f64).exp())
+    };
+    let quality_rows = json!([{
+        "variant": "qwen4-candidate",
+        "arch": "gfx1151",
+        "scoring_mode": "teacher_forced",
+        "n_chunks": 1,
+        "mean_kld": Value::Null,
+        "mean_kld_ci_lo": Value::Null,
+        "mean_kld_ci_hi": Value::Null,
+        "p99_kld": Value::Null,
+        "ppl": ppl,
+        "notes": format!("n_tokens={}; n_scored={}", tokens.len(), nlls.len()),
+    }]);
+    let report = json!({
+        "schema": QUALITY_SCHEMA,
+        "variant": "qwen4-candidate",
+        "tokens": tokens,
+        "corpus": corpus,
+        "corpus_sha256": CANONICAL_TOKEN_SHA256,
+        "rows": rows,
+        "quality_rows": quality_rows,
+        "source": {
+            "artifact_sha256": artifact_sha256,
+            "source_identity_sha256": identity_sha256,
+            "source_tensor_count": receipt.source_tensor_count,
+            "binary_sha256": binary_sha256,
+            "no_full_model_residency": false,
+            "forward_route": "production_qwen4_gpu_forward",
+        },
+        "state_summary_sha256": final_state_sha256,
+        "mtp": {"status": "unavailable", "reason": "native MTP adapter is not admitted"},
+    });
+    if let Some(parent) = output_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    }
+    fs::write(
+        output_path,
+        serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("write {}: {error}", output_path.display()))?;
+    Ok(())
+}
+
 fn fixture_cases(fixtures: &Value) -> Result<Vec<(String, String, Value)>, String> {
     let values = fixtures
         .as_array()
@@ -3338,27 +3667,47 @@ fn fixture_cases(fixtures: &Value) -> Result<Vec<(String, String, Value)>, Strin
     Ok(cases)
 }
 
-fn parse_args() -> Result<(PathBuf, PathBuf), String> {
+enum ParityMode {
+    Fixtures {
+        directory: PathBuf,
+        output: PathBuf,
+    },
+    Candidate {
+        model: PathBuf,
+        tokens: PathBuf,
+        output: PathBuf,
+    },
+}
+
+fn parse_args() -> Result<ParityMode, String> {
     let mut fixtures = None;
+    let mut model = None;
+    let mut tokens = None;
     let mut out = None;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--fixtures" => {
-                fixtures = Some(PathBuf::from(args.next().ok_or("--fixtures needs DIR")?))
-            }
+            "--fixtures" => fixtures = Some(PathBuf::from(args.next().ok_or("--fixtures needs DIR")?)),
+            "--model" => model = Some(PathBuf::from(args.next().ok_or("--model needs FILE")?)),
+            "--tokens" => tokens = Some(PathBuf::from(args.next().ok_or("--tokens needs metadata JSON")?)),
             "--out" => out = Some(PathBuf::from(args.next().ok_or("--out needs FILE")?)),
             other => {
                 return fail(format!(
-                    "unsupported argument {other:?}; only --fixtures DIR --out FILE are accepted"
+                    "unsupported argument {other:?}; use --fixtures DIR --out FILE or --model FILE --tokens CORPUS --out FILE"
                 ))
             }
         }
     }
-    Ok((
-        fixtures.ok_or("missing --fixtures DIR")?,
-        out.ok_or("missing --out FILE")?,
-    ))
+    let output = out.ok_or("missing --out FILE")?;
+    match (fixtures, model, tokens) {
+        (Some(directory), None, None) => Ok(ParityMode::Fixtures { directory, output }),
+        (None, Some(model), Some(tokens)) => Ok(ParityMode::Candidate {
+            model,
+            tokens,
+            output,
+        }),
+        _ => fail("choose exactly one mode: --fixtures DIR or --model FILE --tokens CORPUS"),
+    }
 }
 
 fn main() {
@@ -3368,8 +3717,7 @@ fn main() {
     }
 }
 
-fn run() -> Result<(), String> {
-    let (fixtures_dir, output_path) = parse_args()?;
+fn run_fixtures(fixtures_dir: PathBuf, output_path: PathBuf) -> Result<(), String> {
     let manifest_path = fixtures_dir.join("manifest.json");
     let manifest_text = fs::read_to_string(&manifest_path)
         .map_err(|error| format!("read {}: {error}", manifest_path.display()))?;
@@ -3423,4 +3771,19 @@ fn run() -> Result<(), String> {
     .map_err(|error| format!("write {}: {error}", output_path.display()))?;
     println!("qwen4 parity PASS: {}", output_path.display());
     Ok(())
+}
+
+fn run() -> Result<(), String> {
+    match parse_args()? {
+        ParityMode::Fixtures { directory, output } => run_fixtures(directory, output),
+        ParityMode::Candidate {
+            model,
+            tokens,
+            output,
+        } => {
+            run_quality_candidate(&model, &tokens, &output)?;
+            println!("qwen4 quality candidate written: {}", output.display());
+            Ok(())
+        }
+    }
 }

@@ -12,6 +12,7 @@ ranges are cached.
 from __future__ import annotations
 
 import ast
+from contextlib import nullcontext
 import copy
 import hashlib
 import importlib
@@ -467,14 +468,82 @@ _RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+|\*)$")
 
 
 class _RangeClient:
+    """Bounded HTTP range reader with per-object provenance seals.
+
+    Every range is keyed by the exact URL/start/end tuple.  The first response
+    for a URL records the available ETag, revision, and total length; later
+    ranges (including cached ranges) must agree with every seal that was
+    present on the first response.  This prevents a proxy or mutable mirror
+    from combining slices from different checkpoint revisions.
+    """
+
     def __init__(self, cache_dir: Path):
         self.cache_dir = cache_dir / "checkpoint_ranges"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.seals: dict[str, dict[str, object]] = {}
+        self.read_bytes = 0
+
+    def _seal(self, url: str, metadata: Mapping[str, object]) -> None:
+        revision = metadata.get("repo_commit")
+        if revision not in (None, HF_CONFIG_COMMIT):
+            raise FixtureError(f"checkpoint range revision mismatch for {url}: {revision!r}")
+        current = {
+            "etag": metadata.get("etag"),
+            "repo_commit": revision,
+            "total": metadata.get("total"),
+        }
+        previous = self.seals.get(url)
+        if previous is None:
+            self.seals[url] = current
+            return
+        for key, old in previous.items():
+            new = current.get(key)
+            if old is not None and new != old:
+                raise FixtureError(
+                    f"checkpoint range {key} seal mismatch for {url}: expected {old!r}, got {new!r}"
+                )
+            if old is None and new is not None:
+                previous[key] = new
+    @staticmethod
+    def _expected_end(start: int, end: int, total: object) -> int:
+        if total is None:
+            return end
+        if not isinstance(total, int) or total <= 0:
+            raise FixtureError(f"invalid Content-Range total {total!r}")
+        if start >= total:
+            raise FixtureError(f"range start {start} is outside object of length {total}")
+        return min(end, total - 1)
+
+    def _validate_metadata(
+        self,
+        metadata: Mapping[str, object],
+        *,
+        url: str,
+        start: int,
+        end: int,
+        body_length: int,
+    ) -> None:
+        if metadata.get("url") != url or metadata.get("start") != start or metadata.get("end") != end:
+            raise FixtureError(f"range provenance mismatch for {url} bytes {start}-{end}")
+        total = metadata.get("total")
+        response_end = metadata.get("response_end", self._expected_end(start, end, total))
+        expected_end = self._expected_end(start, end, total)
+        if response_end != expected_end:
+            raise FixtureError(
+                f"Content-Range end {response_end!r} does not match requested {start}-{end} for total {total!r}"
+            )
+        expected_length = expected_end - start + 1
+        if body_length != expected_length:
+            raise FixtureError(f"range response length {body_length} does not match {expected_length}")
+        if metadata.get("length") != body_length:
+            raise FixtureError(f"range metadata length {metadata.get('length')!r} does not match {body_length}")
+
 
     def read(self, url: str, start: int, end: int, *, maximum: int) -> tuple[bytes, dict[str, object]]:
         if start < 0 or end < start:
             raise FixtureError(f"invalid HTTP range {start}-{end}")
-        if end - start + 1 > maximum:
+        requested_length = end - start + 1
+        if requested_length > maximum:
             raise FixtureError(f"requested HTTP range {start}-{end} exceeds bound {maximum}")
         key = _sha256_bytes(f"{url}\0{start}\0{end}".encode("utf-8"))
         body_path = self.cache_dir / f"{key}.bin"
@@ -486,12 +555,20 @@ class _RangeClient:
                 metadata = json.loads(meta_path.read_text(encoding="utf-8"))
             except (OSError, ValueError) as exc:
                 raise FixtureError(f"invalid cached range metadata {key}: {exc}") from exc
-            if metadata.get("url") != url or metadata.get("start") != start or metadata.get("end") != end:
-                raise FixtureError(f"cached range provenance mismatch {key}")
             body = _read_bounded(body_path, maximum)
-            if metadata.get("sha256") != _sha256_bytes(body) or metadata.get("length") != len(body):
+            self._validate_metadata(
+                metadata,
+                url=url,
+                start=start,
+                end=end,
+                body_length=len(body),
+            )
+            if metadata.get("sha256") != _sha256_bytes(body):
                 raise FixtureError(f"cached range digest mismatch {key}")
+            self._seal(url, metadata)
+            self.read_bytes += len(body)
             return body, metadata
+
         request = urllib.request.Request(
             url,
             headers={"Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"},
@@ -502,19 +579,17 @@ class _RangeClient:
             if status != 206:
                 raise FixtureError(f"range request returned HTTP {status}, expected 206")
             content_range = response.headers.get("Content-Range", "")
-            match = _RANGE_RE.match(content_range)
+            match = _RANGE_RE.fullmatch(content_range)
             if match is None:
                 raise FixtureError(f"range response has invalid Content-Range {content_range!r}")
             got_start, got_end, total_text = match.groups()
             got_start_i, got_end_i = int(got_start), int(got_end)
-            # HTTP servers clip an open-ended request to the object end.  The
-            # returned range must still start exactly where requested and may
-            # never extend beyond the requested bound.
-            if got_start_i != start or got_end_i > end:
-                raise FixtureError(f"range response {content_range!r} does not match requested {start}-{end}")
             total = None if total_text == "*" else int(total_text)
-            if total is not None and got_end_i >= total:
-                raise FixtureError(f"range response {content_range!r} exceeds object size")
+            expected_end = self._expected_end(start, end, total)
+            if got_start_i != start or got_end_i != expected_end:
+                raise FixtureError(
+                    f"range response {content_range!r} does not match requested {start}-{end}"
+                )
             expected_length = got_end_i - start + 1
             body = response.read(maximum + 1)
             if len(body) > maximum or len(body) != expected_length:
@@ -523,16 +598,26 @@ class _RangeClient:
                 "url": url,
                 "start": start,
                 "end": end,
+                "response_end": got_end_i,
                 "total": total,
                 "length": len(body),
                 "sha256": _sha256_bytes(body),
                 "etag": response.headers.get("ETag"),
                 "repo_commit": response.headers.get("X-Repo-Commit"),
             }
+            self._validate_metadata(
+                metadata,
+                url=url,
+                start=start,
+                end=end,
+                body_length=len(body),
+            )
+            self._seal(url, metadata)
         except (OSError, urllib.error.URLError, ValueError) as exc:
             raise FixtureError(f"unable to range-read {url} bytes {start}-{end}: {exc}") from exc
         body_path.write_bytes(body)
         meta_path.write_text(json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+        self.read_bytes += len(body)
         return body, metadata
 
 
@@ -558,6 +643,278 @@ def _dtype_info(dtype: str) -> tuple[int, str]:
         "U8": (1, "uint8"),
         "BOOL": (1, "bool"),
     }.get(dtype, (0, ""))
+def _tensor_descriptor(
+    client: _RangeClient,
+    model_index: Mapping[str, str],
+    tensor_name: str,
+) -> dict[str, object]:
+    """Return one validated safetensors descriptor without reading tensor data."""
+    shard = model_index.get(tensor_name)
+    if shard is None:
+        raise FixtureError(f"pinned model index is missing required tensor {tensor_name}")
+    url = f"https://huggingface.co/{HF_MODEL}/resolve/{HF_CONFIG_COMMIT}/{shard}"
+    header, header_meta = _safetensor_header(client, url)
+    descriptor = header.get(tensor_name)
+    if not isinstance(descriptor, dict):
+        raise FixtureError(f"safetensors header is missing required tensor {tensor_name}")
+    dtype = descriptor.get("dtype")
+    shape = descriptor.get("shape")
+    offsets = descriptor.get("data_offsets")
+    if (
+        not isinstance(dtype, str)
+        or not isinstance(shape, list)
+        or not isinstance(offsets, list)
+        or len(offsets) != 2
+    ):
+        raise FixtureError(f"invalid safetensors descriptor for {tensor_name}")
+    try:
+        shape_tuple = tuple(int(item) for item in shape)
+        begin, finish = int(offsets[0]), int(offsets[1])
+    except (TypeError, ValueError) as exc:
+        raise FixtureError(f"invalid safetensors descriptor for {tensor_name}") from exc
+    if not shape_tuple or any(item <= 0 for item in shape_tuple) or begin < 0 or finish < begin:
+        raise FixtureError(f"invalid safetensors shape/offsets for {tensor_name}")
+    itemsize, storage_dtype = _dtype_info(dtype)
+    if not itemsize:
+        raise FixtureError(f"unsupported dtype {dtype!r} for {tensor_name}")
+    expected_bytes = math.prod(shape_tuple) * itemsize
+    if finish - begin != expected_bytes:
+        raise FixtureError(
+            f"tensor {tensor_name} data extent {finish - begin} does not equal {expected_bytes}"
+        )
+    header_length = int(header_meta["header_length"])
+    data_start = 8 + header_length + begin
+    data_end = 8 + header_length + finish
+    total = header_meta.get("total")
+    if isinstance(total, int) and data_end > total:
+        raise FixtureError(f"tensor {tensor_name} extends beyond shard length {total}")
+    return {
+        "tensor": tensor_name,
+        "shard": shard,
+        "url": url,
+        "dtype": dtype,
+        "storage_dtype": storage_dtype,
+        "shape": list(shape_tuple),
+        "data_offsets": [begin, finish],
+        "header_length": header_length,
+        "data_start": data_start,
+        "data_end": data_end,
+        "header_sha256": header_meta["header_sha256"],
+        "header_etag": header_meta.get("header_etag"),
+        "header_repo_commit": header_meta.get("header_repo_commit"),
+    }
+
+
+def _read_tensor_elements(
+    client: _RangeClient,
+    descriptor: Mapping[str, object],
+    element_start: int,
+    element_count: int,
+    *,
+    output_shape: Sequence[int] | None = None,
+) -> dict[str, object]:
+    """Read an arbitrary contiguous element range in bounded HTTP slices."""
+    shape = tuple(int(item) for item in descriptor["shape"])  # type: ignore[arg-type]
+    itemsize, dtype = _dtype_info(str(descriptor["dtype"]))
+    total_items = math.prod(shape)
+    if element_start < 0 or element_count < 0 or element_start + element_count > total_items:
+        raise FixtureError(
+            f"tensor slice {descriptor['tensor']} elements {element_start}+{element_count} exceeds {shape}"
+        )
+    if output_shape is None:
+        output_shape = (element_count,)
+    if math.prod(tuple(int(item) for item in output_shape)) != element_count:
+        raise FixtureError(f"tensor slice output shape {output_shape} does not contain {element_count} elements")
+    max_items = max(1, MAX_TENSOR_SLICE_BYTES // itemsize)
+    raw_parts: list[bytes] = []
+    ranges: list[dict[str, object]] = []
+    remaining = element_count
+    cursor = element_start
+    while remaining:
+        count = min(remaining, max_items)
+        absolute_start = int(descriptor["data_start"]) + cursor * itemsize
+        absolute_end = absolute_start + count * itemsize - 1
+        raw, metadata = client.read(
+            str(descriptor["url"]),
+            absolute_start,
+            absolute_end,
+            maximum=count * itemsize,
+        )
+        if len(raw) != count * itemsize:
+            raise FixtureError(
+                f"tensor slice {descriptor['tensor']} returned {len(raw)} bytes, expected {count * itemsize}"
+            )
+        raw_parts.append(raw)
+        ranges.append(
+            {
+                "start": absolute_start,
+                "end": absolute_end,
+                "length": len(raw),
+                "sha256": metadata["sha256"],
+                "etag": metadata.get("etag"),
+                "repo_commit": metadata.get("repo_commit"),
+            }
+        )
+        cursor += count
+        remaining -= count
+    raw = b"".join(raw_parts)
+    values = _decode_storage(raw, str(descriptor["dtype"]), tuple(int(item) for item in output_shape))
+    return {
+        "tensor": descriptor["tensor"],
+        "shard": descriptor["shard"],
+        "url": descriptor["url"],
+        "dtype": descriptor["dtype"],
+        "shape": list(shape),
+        "slice_shape": [int(item) for item in output_shape],
+        "element_start": element_start,
+        "element_count": element_count,
+        "byte_start": int(descriptor["data_start"]) + element_start * itemsize,
+        "byte_length": len(raw),
+        "sha256": _sha256_bytes(raw),
+        "header_sha256": descriptor["header_sha256"],
+        "ranges": ranges,
+        "values": values,
+    }
+
+
+def _read_tensor_rows(
+    client: _RangeClient,
+    model_index: Mapping[str, str],
+    tensor_name: str,
+    row_start: int,
+    row_count: int,
+) -> dict[str, object]:
+    descriptor = _tensor_descriptor(client, model_index, tensor_name)
+    shape = tuple(int(item) for item in descriptor["shape"])  # type: ignore[arg-type]
+    if row_start < 0 or row_count < 0 or row_start + row_count > shape[0]:
+        raise FixtureError(f"tensor row slice {tensor_name} {row_start}+{row_count} exceeds {shape}")
+    row_items = math.prod(shape[1:]) if len(shape) > 1 else 1
+    return _read_tensor_elements(
+        client,
+        descriptor,
+        row_start * row_items,
+        row_count * row_items,
+        output_shape=(row_count,) + shape[1:],
+    )
+
+
+def _read_tensor_expert_rows(
+    client: _RangeClient,
+    model_index: Mapping[str, str],
+    tensor_name: str,
+    expert: int,
+    row_start: int,
+    row_count: int,
+) -> dict[str, object]:
+    """Read one expert's row interval from a fused [experts, rows, cols] tensor."""
+    descriptor = _tensor_descriptor(client, model_index, tensor_name)
+    shape = tuple(int(item) for item in descriptor["shape"])  # type: ignore[arg-type]
+    if len(shape) != 3:
+        raise FixtureError(f"expert tensor {tensor_name} is not rank three: {shape}")
+    experts, rows, cols = shape
+    if expert < 0 or expert >= experts or row_start < 0 or row_count < 0 or row_start + row_count > rows:
+        raise FixtureError(f"expert row slice {tensor_name}[{expert}] {row_start}+{row_count} exceeds {shape}")
+    start = (expert * rows + row_start) * cols
+    result = _read_tensor_elements(
+        client,
+        descriptor,
+        start,
+        row_count * cols,
+        output_shape=(row_count, cols),
+    )
+    result["expert"] = expert
+    result["row_start"] = row_start
+    return result
+
+
+class PinnedCheckpoint:
+    """Metadata/index view whose tensor reads remain bounded and independently sealed."""
+
+    def __init__(
+        self,
+        client: _RangeClient,
+        *,
+        index: Mapping[str, object],
+        config: Mapping[str, object],
+        index_meta: Mapping[str, object],
+        config_meta: Mapping[str, object],
+        index_sha256: str,
+        config_sha256: str,
+    ):
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in weight_map.items()):
+            raise FixtureError("pinned model index has no valid weight_map")
+        self.client = client
+        self.index = index
+        self.config = config
+        self.weight_map: dict[str, str] = dict(weight_map)
+        self.index_meta = dict(index_meta)
+        self.config_meta = dict(config_meta)
+        self.index_sha256 = index_sha256
+        self.config_sha256 = config_sha256
+
+    @property
+    def read_bytes(self) -> int:
+        return self.client.read_bytes
+
+    @property
+    def seals(self) -> dict[str, dict[str, object]]:
+        return {url: dict(seal) for url, seal in self.client.seals.items()}
+
+    def tensor_rows(self, name: str, row_start: int, row_count: int) -> dict[str, object]:
+        return _read_tensor_rows(self.client, self.weight_map, name, row_start, row_count)
+
+    def tensor_expert_rows(
+        self,
+        name: str,
+        expert: int,
+        row_start: int,
+        row_count: int,
+    ) -> dict[str, object]:
+        return _read_tensor_expert_rows(self.client, self.weight_map, name, expert, row_start, row_count)
+
+    def provenance(self) -> dict[str, object]:
+        return {
+            "model": HF_MODEL,
+            "revision": HF_CONFIG_COMMIT,
+            "index_sha256": self.index_sha256,
+            "config_sha256": self.config_sha256,
+            "index_etag": self.index_meta.get("etag"),
+            "config_etag": self.config_meta.get("etag"),
+            "range_seals": self.seals,
+            "read_bytes": self.read_bytes,
+        }
+
+
+def open_pinned_checkpoint(cache_dir: str | Path | None = None) -> PinnedCheckpoint:
+    """Open the pinned index/config; tensor payloads are fetched only on demand."""
+    root = _validated_cache_dir(cache_dir)
+    client = _RangeClient(root)
+    index_url = f"https://huggingface.co/{HF_MODEL}/resolve/{HF_CONFIG_COMMIT}/model.safetensors.index.json"
+    config_url = f"https://huggingface.co/{HF_MODEL}/resolve/{HF_CONFIG_COMMIT}/config.json"
+    index_raw, index_meta = _read_small_object(client, index_url, MODEL_INDEX_SHA256, label="safetensors index")
+    config_raw, config_meta = _read_small_object(client, config_url, MODEL_CONFIG_SHA256, label="model config")
+    try:
+        index = json.loads(index_raw.decode("utf-8"))
+        config = json.loads(config_raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise FixtureError(f"invalid pinned model metadata: {exc}") from exc
+    if not isinstance(index, dict) or not isinstance(config, dict):
+        raise FixtureError("pinned model metadata must be JSON objects")
+    text_config = config.get("text_config", config)
+    if not isinstance(text_config, dict) or text_config.get("model_type") not in ("qwen4_exp_text", "qwen4_exp"):
+        raise FixtureError(f"pinned model config has unexpected model_type {text_config!r}")
+    return PinnedCheckpoint(
+        client,
+        index=index,
+        config=config,
+        index_meta=index_meta,
+        config_meta=config_meta,
+        index_sha256=_sha256_bytes(index_raw),
+        config_sha256=_sha256_bytes(config_raw),
+    )
+
+
 
 
 def _decode_storage(raw: bytes, dtype: str, shape: Sequence[int]) -> Tensor:
@@ -593,6 +950,7 @@ def _safetensor_header(client: _RangeClient, url: str) -> tuple[dict[str, object
         "header_length": header_length,
         "header_sha256": _sha256_bytes(header_raw),
         "header_etag": header_meta.get("etag") or prefix_meta.get("etag"),
+        "header_repo_commit": header_meta.get("repo_commit") or prefix_meta.get("repo_commit"),
         "total": header_meta.get("total"),
     }
 
@@ -709,10 +1067,15 @@ def load_checkpoint_slices(cache_dir: Path) -> dict[str, object]:
 
 
 def _strip_decorators(node: ast.AST) -> ast.AST:
+    """Copy source while retaining decorators with Python binding semantics."""
     cloned = copy.deepcopy(node)
     for item in ast.walk(cloned):
         if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            item.decorator_list = []
+            item.decorator_list = [
+                decorator
+                for decorator in item.decorator_list
+                if isinstance(decorator, ast.Name) and decorator.id in {"staticmethod", "classmethod"}
+            ]
     return cloned
 
 
@@ -791,6 +1154,766 @@ def _compile_method(source: str, class_name: str, method_name: str, globals_extr
 
 
 
+
+_PINNED_OPERATOR_SIGNATURES: tuple[dict[str, object], ...] = (
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextGatedResidual", "method": "forward", "args": ("self", "hyper_input"), "vararg": None, "kwarg": None, "defaults": 0},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextGatedDeltaNet", "method": "forward", "args": ("self", "hidden_states", "cache_params", "attention_mask"), "vararg": None, "kwarg": "kwargs", "defaults": 2},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextAttention", "method": "forward", "args": ("self", "hidden_states", "position_embeddings", "attention_mask", "past_key_values"), "vararg": None, "kwarg": "kwargs", "defaults": 1},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextQSAIndexer", "method": "forward", "args": ("self", "hidden_states", "position_embeddings", "attention_mask", "past_key_values"), "vararg": None, "kwarg": None, "defaults": 0},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextNGramEmbedding", "method": "forward", "args": ("self", "input_ids", "past_key_values"), "vararg": None, "kwarg": None, "defaults": 0},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextNGramEmbedding", "method": "_shift_right_ignore_eos", "args": ("self", "token_ids", "shift"), "vararg": None, "kwarg": None, "defaults": 0},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextPLELayer", "method": "forward", "args": ("self", "hidden_states", "input_ids", "past_key_values", "conv_mask"), "vararg": None, "kwarg": None, "defaults": 1},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextPLELayer", "method": "_short_conv", "args": ("self", "hidden_states", "past_key_values"), "vararg": None, "kwarg": None, "defaults": 0},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextRotaryEmbedding", "method": "forward", "args": ("self", "x", "position_ids"), "vararg": None, "kwarg": None, "defaults": 0},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextRMSNorm", "method": "forward", "args": ("self", "x"), "vararg": None, "kwarg": None, "defaults": 0},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextRMSNormGated", "method": "forward", "args": ("self", "hidden_states", "gate"), "vararg": None, "kwarg": None, "defaults": 1},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextMLP", "method": "forward", "args": ("self", "x"), "vararg": None, "kwarg": None, "defaults": 0},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextExperts", "method": "forward", "args": ("self", "hidden_states", "top_k_index", "top_k_weights"), "vararg": None, "kwarg": None, "defaults": 0},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextTopKRouter", "method": "forward", "args": ("self", "hidden_states"), "vararg": None, "kwarg": None, "defaults": 0},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextSparseMoeBlock", "method": "forward", "args": ("self", "hidden_states"), "vararg": None, "kwarg": None, "defaults": 0},
+    {"source": "transformers_modeling", "class": None, "method": "torch_chunk_gated_delta_rule", "args": ("query", "key", "value", "g", "beta", "chunk_size", "initial_state", "output_final_state", "use_qk_l2norm_in_kernel"), "vararg": None, "kwarg": "kwargs", "defaults": 4},
+    {"source": "transformers_modeling", "class": None, "method": "torch_recurrent_gated_delta_rule", "args": ("query", "key", "value", "g", "beta", "initial_state", "output_final_state", "use_qk_l2norm_in_kernel"), "vararg": None, "kwarg": "kwargs", "defaults": 1},
+    {"source": "transformers_modeling", "class": None, "method": "causal_conv1d_fn", "args": ("hidden_states", "weight", "bias", "activation"), "vararg": None, "kwarg": "kwargs", "defaults": 2},
+    {"source": "transformers_modeling", "class": None, "method": "causal_conv1d_update", "args": ("hidden_states", "conv_state", "weight", "bias", "activation"), "vararg": None, "kwarg": None, "defaults": 2},
+    {"source": "transformers_modeling", "class": None, "method": "l2norm", "args": ("x", "dim", "eps"), "vararg": None, "kwarg": None, "defaults": 2},
+    {"source": "transformers_modeling", "class": None, "method": "rotate_half", "args": ("x",), "vararg": None, "kwarg": None, "defaults": 0},
+    {"source": "transformers_modeling", "class": None, "method": "apply_rotary_pos_emb", "args": ("q", "k", "cos", "sin", "unsqueeze_dim"), "vararg": None, "kwarg": None, "defaults": 4},
+    {"source": "transformers_modeling", "class": None, "method": "repeat_kv", "args": ("hidden_states", "n_rep"), "vararg": None, "kwarg": None, "defaults": 0},
+    {"source": "transformers_modeling", "class": None, "method": "eager_attention_forward", "args": ("module", "query", "key", "value", "attention_mask", "scaling", "dropout"), "vararg": None, "kwarg": "kwargs", "defaults": 1},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextDecoderLayer", "method": "forward", "args": ("self", "hidden_states", "position_embeddings", "attention_mask", "conv_mask", "past_key_values", "ple_input_ids"), "vararg": None, "kwarg": "kwargs", "defaults": 4},
+)
+_PINNED_OPERATOR_DIGEST_SPECS: tuple[dict[str, object], ...] = _PINNED_OPERATOR_SIGNATURES + (
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextGatedResidual", "method": "__init__"},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextGatedDeltaNet", "method": "__init__"},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextAttention", "method": "__init__"},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextQSAIndexer", "method": "__init__"},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextNGramEmbedding", "method": "__init__"},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextPLELayer", "method": "__init__"},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextRotaryEmbedding", "method": "__init__"},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextRotaryEmbedding", "method": "compute_default_rope_parameters"},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextRotaryEmbedding", "method": "apply_interleaved_mrope"},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextRMSNorm", "method": "__init__"},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextRMSNorm", "method": "_norm"},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextRMSNormGated", "method": "__init__"},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextMLP", "method": "__init__"},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextExperts", "method": "__init__"},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextTopKRouter", "method": "__init__"},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextSparseMoeBlock", "method": "__init__"},
+    {"source": "transformers_modeling", "class": "Qwen4ExpTextDecoderLayer", "method": "__init__"},
+    {"source": "transformers_modeling", "class": None, "method": "apply_mask_to_padding_states"},
+    {"source": "transformers_modeling", "class": None, "method": "_splitmix64"},
+    {"source": "transformers_modeling", "class": None, "method": "_build_layer_multipliers"},
+    {"source": "transformers_modeling", "class": None, "method": "_is_prime"},
+    {"source": "transformers_modeling", "class": None, "method": "_find_nth_prime_after"},
+)
+
+_EXPECTED_OPERATOR_AST_SHA256 = types.MappingProxyType(
+    {
+        "Qwen4ExpTextGatedResidual.__init__": "6e1d6bc99682dafbca7a9f7710ff5fa233da45f005354d58ea1112b0b48c930e",
+        "Qwen4ExpTextGatedResidual.forward": "a1f9ac81b05a64ba879e96c5c62a715c9892f8739f2f2501d16e5f537c589ce8",
+        "Qwen4ExpTextGatedDeltaNet.__init__": "dd39e1e905b187afa0868e1c8c62a74dce880a475ecd87eb22a9a616eb5f1c0a",
+        "Qwen4ExpTextGatedDeltaNet.forward": "03763c9ca1a426c49b16feed5e40ef7ebccefc4c2ef32e1d50983691df7ba863",
+        "Qwen4ExpTextAttention.__init__": "01674c533ba3cf5872cf0c09a6bdd645b5c0ab9c642f4542680fd276ad65af63",
+        "Qwen4ExpTextAttention.forward": "c40a96fe210f40e34deafded604e43138bdb1679c6e60ebcae3f981fde01de57",
+        "Qwen4ExpTextQSAIndexer.__init__": "1cabf0172d7b7c85e0c42101e96d219df8d0f5d81fab346c37cf138087837c00",
+        "Qwen4ExpTextQSAIndexer.forward": "4be4dfa38613822a37295a5bdd497f28e13feb4081ead86c84cc2aa3bfcfa205",
+        "Qwen4ExpTextNGramEmbedding.__init__": "1c415b76ba5e9e29bead10d428110618c559a850fe6ac379158a97407401661f",
+        "Qwen4ExpTextNGramEmbedding.forward": "bb443aa599841f4e0bdbf4a34839fd168ec0502777280dcefe7e634aed82a2bf",
+        "Qwen4ExpTextNGramEmbedding._shift_right_ignore_eos": "766c41743a20992a64a1df57f3c089e43d027c2a39eac4aae4315049940a406c",
+        "Qwen4ExpTextPLELayer.__init__": "15891209ca677af19e5459b9706a972324a5cadcae68e7861eea52c8b3367987",
+        "Qwen4ExpTextPLELayer.forward": "73802991ec8c2599349914551156692b28b652df230c6f21a98689874d79d7a6",
+        "Qwen4ExpTextPLELayer._short_conv": "4776b7a9f9ddb531e406fac22b5c5c1e7372d18c5800b1de94e540d6c8dc375e",
+        "Qwen4ExpTextRotaryEmbedding.__init__": "0b28c133b226f80bb2c0f5b10aa8abff1d63ae34bad11b78f6d9da912e1d1de6",
+        "Qwen4ExpTextRotaryEmbedding.compute_default_rope_parameters": "b64ff8ba6d988ea1b4cb373ff684dcfbcda9685c0520d873aa850863bb579ea3",
+        "Qwen4ExpTextRotaryEmbedding.forward": "22cc8862c2da69ece4487bacb5e83794cc50c9a1705ecdc6e893293523e17918",
+        "Qwen4ExpTextRotaryEmbedding.apply_interleaved_mrope": "031fdd4fb9c139ce2c2447eb74d6fd5a30442fe7ce4e825f654b27d4ac06e5d4",
+        "Qwen4ExpTextRMSNorm.__init__": "a662601e53462088b4eb02c7ebc78fd7979ce1095a6dfe370d9c75294d929d3b",
+        "Qwen4ExpTextRMSNorm._norm": "64951ff87b66b040e8650948b58c355486064e90908a85734218c9a646dae9e3",
+        "Qwen4ExpTextRMSNorm.forward": "fb25a12e0dd200f06661af8c14b22a98e87c907e88d2a3aa5bd0c85f76e7b68f",
+        "Qwen4ExpTextRMSNormGated.__init__": "eb8b1a583ffda82b1c05d3254547cac3aae48f357d5fd099b66f96fd681a35e7",
+        "Qwen4ExpTextRMSNormGated.forward": "14f1b1412449675bb3048b948f0c9c4641ec0d28e4af1f0176d4f47a805166f9",
+        "Qwen4ExpTextMLP.__init__": "5de5e849fb9fe0ae347a9b6a73a531c6d50c589b3f38ad48d2aead2c0d081ae5",
+        "Qwen4ExpTextMLP.forward": "468b4e3f6b1120c589bcf9199034816dce5b637bf01fe5c76646f3729e967d03",
+        "Qwen4ExpTextExperts.__init__": "e4909208595b9b0c065440ef30204cdd2b71002bc34fa2257edca66a0dfa50b6",
+        "Qwen4ExpTextExperts.forward": "00c4108f96c02c67b7e9e0baea3d166aee3e0a93ea0f4190c8bf79386605fcaf",
+        "Qwen4ExpTextTopKRouter.__init__": "bdb78bf81cc1e4db718578f8a6bb58553f15a7f211cd4da82a6d64727146abee",
+        "Qwen4ExpTextTopKRouter.forward": "0a0097d78ed871505f54f30ef285939bc25057d0e122f61c5a8ea5f702c65afb",
+        "Qwen4ExpTextSparseMoeBlock.__init__": "188cf4926d77bb2f5521d7636a5d544f5ba6105866b5a9739270d0a1d082f0a3",
+        "_splitmix64": "97a08c66543de379717684966428caf568b5c56caf3e5e91bdc98399983309a1",
+        "_build_layer_multipliers": "a5756debb4036c0e0e1579c739539961ab41955b0e877f85aac4a0550b0412cb",
+        "_is_prime": "af6dc0fde5d2273b4055b41cec94b78fcb3f255f26ecb04a14d8dcd293e1ae8e",
+        "_find_nth_prime_after": "ed12d037614ef116af3317301bf82d91e6cc59e7df3f3d844acdcc56ef7ea291",
+        "Qwen4ExpTextSparseMoeBlock.forward": "8c70c4e5297d16f359a0f244155de792e7412402792f8eeff6226880ade5b07c",
+        "Qwen4ExpTextDecoderLayer.__init__": "69d8b7a34e50d134ebb41c378c78c0a0323ab6d859e036640cd365a68606aeb6",
+        "Qwen4ExpTextDecoderLayer.forward": "1c754f2c1b49ace9793dcbcd5530babc4f5dd423e3b38cb233c4578f5b6db38a",
+        "apply_mask_to_padding_states": "bc47dcff0659508145d9def52a6f0fbed08d207cf7d5562b60eaf4437dfbac46",
+        "causal_conv1d_fn": "378eaddeafac2ced194439fc49b75ed85e10c8f3895c262f8627ad107d358c1a",
+        "causal_conv1d_update": "0284ada30446410daafd359b936cb815bb873301202c732d9fbddb0ece8c2ba2",
+        "l2norm": "4049615a48d1eb41c5c29337e7a34457cb4e4cea85d0cc602bffad20cfd05fb1",
+        "torch_chunk_gated_delta_rule": "28c0a0bfbecafe9a5781f7e2817dab1e47da6c796a64a23f2fe649daf5ce0218",
+        "torch_recurrent_gated_delta_rule": "9aba4a5e00969de0229f4d6fd6ba6cf2788ee58c08c201f4ca9cafc25c0168ca",
+        "rotate_half": "7a26b6ec674072b8eb8553902cec9b2e33c8bf95c2d51f72372503031aeaf3c3",
+        "apply_rotary_pos_emb": "a7fed3320acf3edcd986df4c2404944e9667b56e114614fc042ffaedaf793509",
+        "repeat_kv": "1e0fd7298a25393f0b9cdff62b94842e42ae90c3f45d3c597e0f35e005ca3766",
+        "eager_attention_forward": "2983de7669a3a910b4a812afbfa1353cfc1727aca41fecd3d5e9ab1e4d4bab9e",
+    }
+)
+
+_PINNED_BASE_CONTRACTS = {
+    "Qwen4ExpTextGatedResidual": "nn.Module",
+    "Qwen4ExpTextGatedDeltaNet": "nn.Module",
+    "Qwen4ExpTextAttention": "nn.Module",
+    "Qwen4ExpTextQSAIndexer": "nn.Module",
+    "Qwen4ExpTextNGramEmbedding": "nn.Module",
+    "Qwen4ExpTextPLELayer": "nn.Module",
+    "Qwen4ExpTextRotaryEmbedding": "nn.Module",
+    "Qwen4ExpTextRMSNorm": "nn.Module",
+    "Qwen4ExpTextRMSNormGated": "nn.Module",
+    "Qwen4ExpTextMLP": "nn.Module",
+    "Qwen4ExpTextExperts": "nn.Module",
+    "Qwen4ExpTextTopKRouter": "nn.Module",
+    "Qwen4ExpTextSparseMoeBlock": "nn.Module",
+    "Qwen4ExpTextDecoderLayer": "GradientCheckpointingLayer",
+}
+
+
+def _callable_node(tree: ast.Module, spec: Mapping[str, object]) -> ast.AST | None:
+    class_name = spec.get("class")
+    method_name = str(spec["method"])
+    if class_name is None:
+        return next(
+            (node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == method_name),
+            None,
+        )
+    class_node = next((node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name), None)
+    if class_node is None:
+        return None
+    return next(
+        (node for node in class_node.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == method_name),
+        None,
+    )
+
+
+_EXPECTED_DEFAULT_EXPRESSIONS: dict[str, tuple[str, ...]] = {
+    "Qwen4ExpTextGatedDeltaNet.forward": ("Constant(value=None)", "Constant(value=None)"),
+    "Qwen4ExpTextAttention.forward": ("Constant(value=None)",),
+    "Qwen4ExpTextPLELayer.forward": ("Constant(value=None)",),
+    "Qwen4ExpTextRMSNormGated.forward": ("Constant(value=None)",),
+    "torch_chunk_gated_delta_rule": (
+        "Constant(value=64)",
+        "Constant(value=None)",
+        "Constant(value=False)",
+        "Constant(value=False)",
+    ),
+    "torch_recurrent_gated_delta_rule": ("Constant(value=False)",),
+    "causal_conv1d_fn": ("Constant(value=None)", "Constant(value=None)"),
+    "causal_conv1d_update": ("Constant(value=None)", "Constant(value=None)"),
+    "l2norm": ("UnaryOp(op=USub(), operand=Constant(value=1))", "Constant(value=1e-06)"),
+    "apply_rotary_pos_emb": (
+        "Constant(value=None)",
+        "Constant(value=None)",
+        "Constant(value=None)",
+        "Constant(value=1)",
+    ),
+    "eager_attention_forward": ("Constant(value=0.0)",),
+    "Qwen4ExpTextDecoderLayer.forward": (
+        "Constant(value=None)",
+        "Constant(value=None)",
+        "Constant(value=None)",
+        "Constant(value=None)",
+    ),
+}
+
+
+def _callable_label(spec: Mapping[str, object]) -> str:
+    return f"{spec.get('class') + '.' if spec.get('class') else ''}{spec['method']}"
+
+
+def _node_signature(
+    node: ast.AST,
+) -> tuple[tuple[str, ...], tuple[str, ...], str | None, tuple[str, ...], str | None, tuple[str, ...]]:
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        raise FixtureError("pinned operator definition is not a function")
+    arguments = node.args
+    posonly = tuple(item.arg for item in arguments.posonlyargs)
+    positional = tuple(item.arg for item in arguments.args)
+    vararg = arguments.vararg.arg if arguments.vararg is not None else None
+    kwonly = tuple(item.arg for item in arguments.kwonlyargs)
+    kwarg = arguments.kwarg.arg if arguments.kwarg is not None else None
+    defaults = tuple(ast.dump(item, annotate_fields=True, include_attributes=False) for item in arguments.defaults)
+    return posonly, positional, vararg, kwonly, kwarg, defaults
+
+
+def _validate_pinned_operator_signatures(
+    source_text: Mapping[str, str],
+    specs: Sequence[Mapping[str, object]] = _PINNED_OPERATOR_SIGNATURES,
+) -> None:
+    trees: dict[str, ast.Module] = {}
+    for spec in specs:
+        source_name = str(spec["source"])
+        if source_name not in trees:
+            try:
+                trees[source_name] = ast.parse(source_text[source_name])
+            except (KeyError, SyntaxError) as exc:
+                raise FixtureError(f"pinned source cannot satisfy operator signatures for {source_name}: {exc}") from exc
+        tree = trees[source_name]
+        class_name = spec.get("class")
+        if class_name is not None and class_name in _PINNED_BASE_CONTRACTS:
+            class_node = next((item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == class_name), None)
+            if class_node is None:
+                raise FixtureError(f"pinned source is missing required class {class_name}")
+            actual_bases = tuple(ast.unparse(base) for base in class_node.bases)
+            expected_base = _PINNED_BASE_CONTRACTS[str(class_name)]
+            if actual_bases != (expected_base,):
+                raise FixtureError(
+                    f"pinned base contract changed for {class_name}: expected {(expected_base,)!r}, got {actual_bases!r}"
+                )
+        node = _callable_node(tree, spec)
+        if node is None:
+            raise FixtureError(f"pinned source is missing required operator {_callable_label(spec)}")
+        actual = _node_signature(node)
+        expected = (
+            tuple(spec.get("posonly", ())),
+            tuple(spec["args"]),
+            spec.get("vararg"),
+            tuple(spec.get("kwonly", ())),
+            spec.get("kwarg"),
+            tuple(_EXPECTED_DEFAULT_EXPRESSIONS.get(_callable_label(spec), ())),
+        )
+        if actual != expected:
+            raise FixtureError(
+                f"pinned operator signature changed for {_callable_label(spec)}: expected {expected!r}, got {actual!r}"
+            )
+
+
+def _pinned_operator_ast_digests(
+    source_text: Mapping[str, str],
+    specs: Sequence[Mapping[str, object]] = _PINNED_OPERATOR_DIGEST_SPECS,
+) -> dict[str, str]:
+    trees: dict[str, ast.Module] = {}
+    digests: dict[str, str] = {}
+    for spec in specs:
+        source_name = str(spec["source"])
+        if source_name not in trees:
+            try:
+                trees[source_name] = ast.parse(source_text[source_name])
+            except (KeyError, SyntaxError) as exc:
+                raise FixtureError(f"pinned source cannot satisfy callable digest allowlist for {source_name}: {exc}") from exc
+        node = _callable_node(trees[source_name], spec)
+        label = _callable_label(spec)
+        if node is None:
+            raise FixtureError(f"pinned source is missing required callable {label}")
+        body = ast.dump(node, annotate_fields=True, include_attributes=False).encode("utf-8")
+        digest = hashlib.sha256(body).hexdigest()
+        expected = _EXPECTED_OPERATOR_AST_SHA256.get(label)
+        if expected is None:
+            raise FixtureError(f"callable {label} has no immutable AST digest allowlist entry")
+        if digest != expected:
+            raise FixtureError(f"pinned callable AST changed for {label}: expected {expected}, got {digest}")
+        digests[label] = digest
+    return digests
+
+
+def _trusted_operator_provenance(source_text: Mapping[str, str]) -> list[dict[str, object]]:
+    trusted: list[dict[str, object]] = []
+    for spec in UPSTREAM_SOURCE_SPECS:
+        name = spec["name"]
+        raw = source_text.get(name)
+        if raw is None:
+            raise FixtureError(f"pinned source text is missing {name}")
+        digest = _sha256_bytes(raw.encode("utf-8"))
+        if digest != spec["sha256"]:
+            raise FixtureError(f"pinned source hash mismatch for {name}: expected {spec['sha256']}, got {digest}")
+        trusted.append(
+            {
+                "name": name,
+                "project": spec["project"],
+                "commit": spec["commit"],
+                "path": spec["path"],
+                "url": _source_url(spec),
+                "sha256": digest,
+                "origin": "verified_pinned_spec",
+            }
+        )
+    return trusted
+
+
+
+class _GdnLayer:
+    def __init__(self):
+        self.conv_states = [None]
+        self.recurrent_states = [None]
+        self.record_past = False
+
+
+class _GdnCache:
+    def __init__(self, layer_count: int):
+        self.layers = [_GdnLayer() for _ in range(layer_count)]
+
+    def has_previous_state(self, layer_idx: int, state_idx: int = 0) -> bool:
+        layer = self.layers[layer_idx]
+        return layer.conv_states[state_idx] is not None if state_idx else layer.recurrent_states[0] is not None
+
+    def update_conv_state(self, hidden_states: Any, layer_idx: int, *, conv_kernel_size: int, state_idx: int = 0) -> Any:
+        self.layers[layer_idx].conv_states[state_idx] = hidden_states[..., -conv_kernel_size:].detach().clone()
+        return hidden_states
+
+    def update_recurrent_state(self, state: Any, layer_idx: int) -> None:
+        self.layers[layer_idx].recurrent_states[0] = state.detach().clone() if state is not None else None
+class _StreamingExpertParameter:
+    def __init__(self, reader: Any):
+        self._reader = reader
+
+    def __getitem__(self, index: Any) -> Any:
+        if hasattr(index, "item"):
+            index = index.item()
+        return self._reader(int(index))
+
+
+class _StreamingNGram(types.SimpleNamespace):
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self.forward(*args, **kwargs)
+
+
+class _StreamingExperts:
+    def __init__(self, source_forward: Any, num_experts: int, hidden_dim: int, intermediate_dim: int, gate_reader: Any, down_reader: Any, act_fn: Any):
+        self.num_experts = num_experts
+        self.hidden_dim = hidden_dim
+        self.intermediate_dim = intermediate_dim
+        self.gate_up_proj = _StreamingExpertParameter(gate_reader)
+        self.down_proj = _StreamingExpertParameter(down_reader)
+        self.act_fn = act_fn
+        self.forward = types.MethodType(source_forward, self)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self.forward(*args, **kwargs)
+
+
+class _StreamingEmbedding:
+    def __init__(self, torch: Any, embedding_dim: int, reader: Any):
+        self._torch = torch
+        self._embedding_dim = embedding_dim
+        self._reader = reader
+        self.weight = types.SimpleNamespace(device=torch.device("cpu"))
+
+    def __call__(self, ids: Any) -> Any:
+        shape = tuple(int(item) for item in ids.shape)
+        values = self._reader([int(item) for item in ids.reshape(-1).tolist()])
+        return values.reshape(*shape, self._embedding_dim)
+
+
+class PinnedQwen4Operators:
+    """Adapters whose arithmetic is executed by the pinned upstream source."""
+
+    def __init__(self, torch: Any, source_text: Mapping[str, str], source_provenance: Sequence[Mapping[str, object]]):
+        del source_provenance
+        trusted = _trusted_operator_provenance(source_text)
+        _validate_pinned_operator_signatures(source_text)
+        self._ast_digests = _pinned_operator_ast_digests(source_text)
+        self.torch = torch
+        self._source_provenance = {str(item["name"]): item for item in trusted}
+        nn = torch.nn
+        functional = nn.functional
+
+        class _AttentionFunctions:
+            @staticmethod
+            def get_interface(_name: str, default: Any) -> Any:
+                return default
+
+        hf_globals = {
+            "torch": torch,
+            "nn": nn,
+            "math": math,
+            "F": functional,
+            "ACT2FN": {
+                "silu": functional.silu,
+                "gelu": functional.gelu,
+                "relu": functional.relu,
+                "sigmoid": torch.sigmoid,
+            },
+            "ROPE_INIT_FUNCTIONS": {},
+            "ALL_ATTENTION_FUNCTIONS": _AttentionFunctions,
+            "maybe_autocast": lambda **_kwargs: nullcontext(),
+        }
+        names = (
+            "_MASK64",
+            "_SPLITMIX_GAMMA",
+            "_SPLITMIX_M1",
+            "_SPLITMIX_M2",
+            "_PRIME_1",
+            "_splitmix64",
+            "_build_layer_multipliers",
+            "_is_prime",
+            "_find_nth_prime_after",
+            "Qwen4ExpTextRotaryEmbedding",
+            "Qwen4ExpTextRMSNorm",
+            "Qwen4ExpTextRMSNormGated",
+            "apply_mask_to_padding_states",
+            "causal_conv1d_fn",
+            "causal_conv1d_update",
+            "l2norm",
+            "torch_chunk_gated_delta_rule",
+            "torch_recurrent_gated_delta_rule",
+            "Qwen4ExpTextGatedDeltaNet",
+            "rotate_half",
+            "apply_rotary_pos_emb",
+            "repeat_kv",
+            "eager_attention_forward",
+            "Qwen4ExpTextQSAIndexer",
+            "Qwen4ExpTextAttention",
+            "Qwen4ExpTextMLP",
+            "Qwen4ExpTextExperts",
+            "Qwen4ExpTextTopKRouter",
+            "Qwen4ExpTextSparseMoeBlock",
+            "Qwen4ExpTextGatedResidual",
+            "Qwen4ExpTextNGramEmbedding",
+            "Qwen4ExpTextPLELayer",
+        )
+        self._hf = _compile_source(source_text["transformers_modeling"], names, hf_globals)
+        self._decoder_forward = _compile_method(
+            source_text["transformers_modeling"],
+            "Qwen4ExpTextDecoderLayer",
+            "forward",
+            {"torch": torch},
+        )
+        self._op_specs = {
+            "hyperconnection": (
+                ("transformers_modeling", "Qwen4ExpTextGatedResidual.__init__"),
+                ("transformers_modeling", "Qwen4ExpTextGatedResidual.forward"),
+                ("transformers_modeling", "Qwen4ExpTextRMSNorm.__init__"),
+                ("transformers_modeling", "Qwen4ExpTextRMSNorm._norm"),
+                ("transformers_modeling", "Qwen4ExpTextRMSNorm.forward"),
+                ("transformers_modeling", "Qwen4ExpTextDecoderLayer.forward"),
+            ),
+            "gdn": (
+                ("transformers_modeling", "Qwen4ExpTextGatedDeltaNet.__init__"),
+                ("transformers_modeling", "Qwen4ExpTextGatedDeltaNet.forward"),
+                ("transformers_modeling", "Qwen4ExpTextRMSNormGated.__init__"),
+                ("transformers_modeling", "Qwen4ExpTextRMSNormGated.forward"),
+                ("transformers_modeling", "torch_chunk_gated_delta_rule"),
+                ("transformers_modeling", "torch_recurrent_gated_delta_rule"),
+                ("transformers_modeling", "causal_conv1d_fn"),
+                ("transformers_modeling", "causal_conv1d_update"),
+                ("transformers_modeling", "l2norm"),
+            ),
+            "qsa": (
+                ("transformers_modeling", "Qwen4ExpTextAttention.__init__"),
+                ("transformers_modeling", "Qwen4ExpTextAttention.forward"),
+                ("transformers_modeling", "Qwen4ExpTextQSAIndexer.__init__"),
+                ("transformers_modeling", "Qwen4ExpTextQSAIndexer.forward"),
+                ("transformers_modeling", "Qwen4ExpTextRotaryEmbedding.__init__"),
+                ("transformers_modeling", "Qwen4ExpTextRotaryEmbedding.compute_default_rope_parameters"),
+                ("transformers_modeling", "Qwen4ExpTextRotaryEmbedding.forward"),
+                ("transformers_modeling", "Qwen4ExpTextRotaryEmbedding.apply_interleaved_mrope"),
+                ("transformers_modeling", "Qwen4ExpTextRMSNorm.__init__"),
+                ("transformers_modeling", "Qwen4ExpTextRMSNorm._norm"),
+                ("transformers_modeling", "Qwen4ExpTextRMSNorm.forward"),
+                ("transformers_modeling", "apply_rotary_pos_emb"),
+                ("transformers_modeling", "rotate_half"),
+                ("transformers_modeling", "repeat_kv"),
+                ("transformers_modeling", "eager_attention_forward"),
+            ),
+            "moe": (
+                ("transformers_modeling", "Qwen4ExpTextSparseMoeBlock.forward"),
+                ("transformers_modeling", "Qwen4ExpTextTopKRouter.__init__"),
+                ("transformers_modeling", "Qwen4ExpTextTopKRouter.forward"),
+                ("transformers_modeling", "Qwen4ExpTextExperts.forward"),
+                ("transformers_modeling", "Qwen4ExpTextMLP.__init__"),
+                ("transformers_modeling", "Qwen4ExpTextMLP.forward"),
+            ),
+            "ple": (
+                ("transformers_modeling", "_splitmix64"),
+                ("transformers_modeling", "_build_layer_multipliers"),
+                ("transformers_modeling", "_is_prime"),
+                ("transformers_modeling", "_find_nth_prime_after"),
+                ("transformers_modeling", "Qwen4ExpTextPLELayer.forward"),
+                ("transformers_modeling", "Qwen4ExpTextPLELayer._short_conv"),
+                ("transformers_modeling", "Qwen4ExpTextNGramEmbedding.forward"),
+                ("transformers_modeling", "Qwen4ExpTextNGramEmbedding._shift_right_ignore_eos"),
+                ("transformers_modeling", "Qwen4ExpTextRMSNorm.__init__"),
+                ("transformers_modeling", "Qwen4ExpTextRMSNorm._norm"),
+                ("transformers_modeling", "Qwen4ExpTextRMSNorm.forward"),
+            ),
+        }
+    def provenance(self) -> dict[str, list[dict[str, object]]]:
+        result: dict[str, list[dict[str, object]]] = {}
+        for operation, entries in self._op_specs.items():
+            operation_rows: list[dict[str, object]] = []
+            for source_name, callable_name in entries:
+                identity = self._source_provenance.get(source_name)
+                if identity is None:
+                    raise FixtureError(f"missing source provenance for {source_name}")
+                digest = self._ast_digests.get(callable_name)
+                if digest is None:
+                    raise FixtureError(f"callable {callable_name} has no verified AST digest")
+                row = dict(identity)
+                row["callable"] = callable_name
+                row["ast_sha256"] = digest
+                operation_rows.append(row)
+            result[operation] = operation_rows
+        return result
+
+    def _config(self, raw: Mapping[str, object]) -> Any:
+        config = types.SimpleNamespace(**dict(raw))
+        if not hasattr(config, "_attn_implementation"):
+            config._attn_implementation = "eager"
+        if not hasattr(config, "attention_dropout"):
+            config.attention_dropout = 0.0
+        if not hasattr(config, "attention_bias"):
+            config.attention_bias = False
+        if not hasattr(config, "head_dim"):
+            config.head_dim = config.hidden_size // config.num_attention_heads
+        return config
+
+    def _copy(self, destination: Any, source: Any) -> None:
+        with self.torch.no_grad():
+            destination.copy_(source.to(device=destination.device, dtype=destination.dtype))
+
+    def _module(self, module: Any, hidden: Any) -> Any:
+        return module.to(device=hidden.device, dtype=hidden.dtype).eval()
+
+    def hyperconnection(self, hidden: Any, weights: Mapping[str, Any], cfg: Mapping[str, object], *, combine: bool) -> Any:
+        module = self._module(
+            self._hf["Qwen4ExpTextGatedResidual"](self._config(cfg), use_combine=combine),
+            hidden,
+        )
+        self._copy(module.hc_norm.weight, weights["hc_norm"])
+        self._copy(module.input_mix_weight_down.weight, weights["down"])
+        self._copy(module.input_mix_weight_up.weight, weights["up"])
+        if combine:
+            self._copy(module.block_inject_weight.weight, weights["block"])
+        return module(hidden)
+
+    def inject(self, hyper_input: Any, block_output: Any, injection_weights: Any) -> Any:
+        squeeze_batch = hyper_input.ndim == 2
+        if squeeze_batch:
+            hyper_input = hyper_input.unsqueeze(0)
+            block_output = block_output.unsqueeze(0)
+            injection_weights = injection_weights.unsqueeze(0)
+        zero_injection = self.torch.zeros_like(injection_weights)
+
+        def attention_connection(_hidden: Any) -> tuple[Any, Any, Any]:
+            return block_output, hyper_input, injection_weights
+
+        def linear_attention(value: Any, **_kwargs: Any) -> Any:
+            return value
+
+        def mlp_connection(value: Any) -> tuple[Any, Any, Any]:
+            return value, value, zero_injection
+
+        layer = types.SimpleNamespace(
+            ple=None,
+            layer_type="linear_attention",
+            attn_hyper_connection=attention_connection,
+            linear_attn=linear_attention,
+            mlp_hyper_connection=mlp_connection,
+            mlp=lambda _value: self.torch.zeros_like(block_output),
+        )
+        result = self._decoder_forward(
+            layer,
+            hyper_input,
+            None,
+            attention_mask=None,
+            conv_mask=None,
+            past_key_values=None,
+            ple_input_ids=None,
+        )
+        return result.squeeze(0) if squeeze_batch else result
+
+    def gdn(self, hidden: Any, weights: Mapping[str, Any], cfg: Mapping[str, object], layer: int) -> tuple[Any, Mapping[str, Any]]:
+        module = self._module(self._hf["Qwen4ExpTextGatedDeltaNet"](self._config(cfg), layer), hidden)
+        self._copy(module.in_proj_qkv.weight, weights["qkv"])
+        self._copy(module.in_proj_z.weight, weights["z"])
+        self._copy(module.in_proj_b.weight, weights["b"])
+        self._copy(module.in_proj_a.weight, weights["a"])
+        self._copy(module.conv1d.weight, weights["conv"])
+        self._copy(module.A_log, weights["a_log"])
+        self._copy(module.dt_bias, weights["dt_bias"])
+        self._copy(module.norm.weight, weights["norm"])
+        self._copy(module.out_proj.weight, weights["out"])
+        cache = _GdnCache(layer + 1)
+        output = module(hidden.unsqueeze(0), cache_params=cache, attention_mask=None).squeeze(0)
+        state = cache.layers[layer]
+        return output, {"recurrent": state.recurrent_states[0], "conv": state.conv_states[0]}
+
+    def qsa(self, hidden: Any, weights: Mapping[str, Any], cfg: Mapping[str, object], layer: int) -> tuple[Any, Any]:
+        module = self._module(self._hf["Qwen4ExpTextAttention"](self._config(cfg), layer), hidden)
+        self._copy(module.q_proj.weight, weights["q"])
+        self._copy(module.q_norm.weight, weights["q_norm"])
+        self._copy(module.k_proj.weight, weights["k"])
+        self._copy(module.k_norm.weight, weights["k_norm"])
+        self._copy(module.v_proj.weight, weights["v"])
+        self._copy(module.o_proj.weight, weights["out"])
+        self._copy(module.indexer.index_qk_proj.weight, weights["index_qk"])
+        self._copy(module.indexer.q_layernorm.weight, weights["index_q_norm"])
+        self._copy(module.indexer.k_layernorm.weight, weights["index_k_norm"])
+        rotary = self._module(self._hf["Qwen4ExpTextRotaryEmbedding"](self._config(cfg)), hidden)
+        positions = self.torch.arange(hidden.shape[0], device=hidden.device, dtype=self.torch.long).unsqueeze(0)
+        cos, sin = rotary(hidden.unsqueeze(0), positions)
+        size = hidden.shape[0]
+        causal = self.torch.triu(
+            self.torch.ones((1, 1, size, size), device=hidden.device, dtype=self.torch.bool),
+            diagonal=1,
+        )
+        mask = self.torch.where(
+            causal,
+            self.torch.full((), self.torch.finfo(hidden.dtype).min, device=hidden.device, dtype=hidden.dtype),
+            self.torch.zeros((), device=hidden.device, dtype=hidden.dtype),
+        )
+        output, attention = module(hidden.unsqueeze(0), (cos, sin), mask, past_key_values=None)
+        return output.squeeze(0), attention
+
+    def moe(
+        self,
+        hidden: Any,
+        cfg: Mapping[str, object],
+        load_full: Any,
+        load_expert: Any,
+        layer: int,
+    ) -> Any:
+        config = self._config(cfg)
+        router = self._module(self._hf["Qwen4ExpTextTopKRouter"](config), hidden)
+        self._copy(router.weight, load_full(f"model.language_model.layers.{layer}.mlp.gate.weight"))
+        shared = self._module(
+            self._hf["Qwen4ExpTextMLP"](config, intermediate_size=int(cfg["shared_expert_intermediate_size"])),
+            hidden,
+        )
+        prefix = f"model.language_model.layers.{layer}.mlp"
+        self._copy(shared.gate_proj.weight, load_full(f"{prefix}.shared_expert.gate_proj.weight"))
+        self._copy(shared.up_proj.weight, load_full(f"{prefix}.shared_expert.up_proj.weight"))
+        self._copy(shared.down_proj.weight, load_full(f"{prefix}.shared_expert.down_proj.weight"))
+        shared_gate = self.torch.nn.Linear(int(cfg["hidden_size"]), 1, bias=False).to(
+            device=hidden.device, dtype=hidden.dtype
+        )
+        self._copy(shared_gate.weight, load_full(f"{prefix}.shared_expert_gate.weight"))
+        expert_forward = self._hf["Qwen4ExpTextExperts"].forward
+        experts = _StreamingExperts(
+            expert_forward,
+            int(cfg["num_experts"]),
+            int(cfg["hidden_size"]),
+            int(cfg["moe_intermediate_size"]),
+            lambda expert: load_expert(
+                f"{prefix}.experts.gate_up_proj",
+                expert,
+                0,
+                2 * int(cfg["moe_intermediate_size"]),
+            ),
+            lambda expert: load_expert(
+                f"{prefix}.experts.down_proj",
+                expert,
+                0,
+                int(cfg["hidden_size"]),
+            ),
+            self.torch.nn.functional.silu,
+        )
+        sparse = types.SimpleNamespace(
+            shared_expert=shared,
+            gate=router,
+            experts=experts,
+            shared_expert_gate=shared_gate,
+        )
+        return self._hf["Qwen4ExpTextSparseMoeBlock"].forward(sparse, hidden.unsqueeze(0)).squeeze(0)
+
+    def ple(
+        self,
+        hidden: Any,
+        token_ids: Sequence[int],
+        cfg: Mapping[str, object],
+        metadata: Mapping[str, Any],
+        load_full: Any,
+        read_rows: Any,
+    ) -> Any:
+        config = self._config(cfg)
+        ngram_class = self._hf["Qwen4ExpTextNGramEmbedding"]
+        ple_class = self._hf["Qwen4ExpTextPLELayer"]
+        embedding_dim = int(cfg["ple_embed_dim"])
+        heads = (int(cfg["ngram_size"]) - 1) * int(cfg["heads_per_ngram"])
+        if embedding_dim % heads:
+            raise FixtureError("pinned PLE embedding dimension is not divisible by its source head count")
+        ngram = _StreamingNGram(
+            layer_idx=1,
+            ngram_size=int(cfg["ngram_size"]),
+            context_len=int(cfg["ngram_size"]) - 1,
+            heads_per_ngram=int(cfg["heads_per_ngram"]),
+            ngram_heads=heads,
+            ple_layer_index=0,
+            unigram_vocab_size=int(cfg["vocab_size"]),
+            ngram_vocab_size_base=int(cfg["ngram_vocab_size_base"]),
+            ple_embed_dim=embedding_dim,
+            seed=int(cfg["seed"]),
+            eos_token_id=(
+                int(cfg["eos_token_id"][0])
+                if isinstance(cfg["eos_token_id"], list)
+                else int(cfg["eos_token_id"])
+            ),
+            layer_multipliers=metadata["layer_multipliers"],
+            ngram_heads_vocab_sizes=metadata["ngram_heads_vocab_sizes"],
+            ngram_heads_offsets=metadata["ngram_heads_offsets"],
+        )
+        ngram.ngram_embedding = _StreamingEmbedding(
+            self.torch,
+            embedding_dim // heads,
+            read_rows,
+        )
+        ngram._shift_right_ignore_eos = types.MethodType(
+            ngram_class._shift_right_ignore_eos,
+            ngram,
+        )
+        ngram.forward = types.MethodType(ngram_class.forward, ngram)
+
+        hidden_size = int(cfg["hidden_size"])
+        hc_count = int(cfg["hc_count"])
+        hc_hidden_size = hidden_size * hc_count
+        ple = types.SimpleNamespace(
+            layer_idx=1,
+            hidden_size=hidden_size,
+            hc_count=hc_count,
+            short_conv_state_len=(int(cfg["ple_conv_kernel_size"]) - 1) * int(cfg["ngram_size"]),
+            ple_embedding=ngram,
+        )
+        norm_class = self._hf["Qwen4ExpTextRMSNorm"]
+        ple.key_proj = self.torch.nn.Linear(embedding_dim, hc_hidden_size, bias=False)
+        ple.value_proj = self.torch.nn.Linear(embedding_dim, hidden_size, bias=False)
+        ple.norm_key = norm_class(hc_hidden_size, group_size=hidden_size, eps=float(cfg["rms_norm_eps"]))
+        ple.norm_query = norm_class(hc_hidden_size, group_size=hidden_size, eps=float(cfg["rms_norm_eps"]))
+        ple.norm_conv = norm_class(hc_hidden_size, group_size=hidden_size, eps=float(cfg["rms_norm_eps"]))
+        ple.conv1d = self.torch.nn.Conv1d(
+            hc_hidden_size,
+            hc_hidden_size,
+            kernel_size=int(cfg["ple_conv_kernel_size"]),
+            groups=hc_hidden_size,
+            dilation=int(cfg["ngram_size"]),
+            bias=False,
+        )
+        ple.key_proj = self._module(ple.key_proj, hidden)
+        ple.value_proj = self._module(ple.value_proj, hidden)
+        ple.norm_key = self._module(ple.norm_key, hidden)
+        ple.norm_query = self._module(ple.norm_query, hidden)
+        ple.norm_conv = self._module(ple.norm_conv, hidden)
+        ple.conv1d = self._module(ple.conv1d, hidden)
+        self._copy(ple.key_proj.weight, load_full("model.language_model.layers.1.ple.key_proj.weight"))
+        self._copy(ple.value_proj.weight, load_full("model.language_model.layers.1.ple.value_proj.weight"))
+        self._copy(ple.norm_key.weight, load_full("model.language_model.layers.1.ple.norm_key.weight"))
+        self._copy(ple.norm_query.weight, load_full("model.language_model.layers.1.ple.norm_query.weight"))
+        self._copy(ple.norm_conv.weight, load_full("model.language_model.layers.1.ple.norm_conv.weight"))
+        self._copy(ple.conv1d.weight, load_full("model.language_model.layers.1.ple.conv1d.weight"))
+        ple._short_conv = types.MethodType(ple_class._short_conv, ple)
+        output = ple_class.forward(
+            ple,
+            hidden.unsqueeze(0),
+            self.torch.tensor([list(token_ids)], dtype=self.torch.long, device=hidden.device),
+            None,
+        )
+        return output.squeeze(0)
+
+
+def load_pinned_operators(
+    source_text: Mapping[str, str],
+    source_provenance: Sequence[Mapping[str, object]],
+    torch: Any,
+) -> PinnedQwen4Operators:
+    _trusted_operator_provenance(source_text)
+    return PinnedQwen4Operators(torch, source_text, source_provenance)
 
 def _from_torch(value: Any, torch: Any) -> Tensor:
     value = value.detach().cpu().contiguous()

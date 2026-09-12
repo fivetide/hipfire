@@ -12,11 +12,12 @@
 #![recursion_limit = "256"]
 
 pub mod admission;
+pub mod artifact;
 pub mod bundle;
 pub mod config;
-pub mod mtp;
 pub mod forward;
 pub mod gpu_forward;
+pub mod mtp;
 pub mod mtp_spec;
 pub mod ops;
 pub mod ple;
@@ -31,6 +32,7 @@ pub use admission::{
     Qwen4Artifact, Qwen4ArtifactFormat, Qwen4Capabilities, Qwen4Capability, Qwen4QuantGeometry,
     RequestKind,
 };
+pub use artifact::{admit_hfqm_artifact, Qwen4ArtifactError, Qwen4HfqmArtifact};
 pub use config::{
     LayerType, Qwen4Config, Qwen4MtpConfig, RecurrentStateDType, SourceDType, ARCHITECTURE_NAME,
     ARCH_ID, MODEL_TYPE, TEXT_MODEL_TYPE,
