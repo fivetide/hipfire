@@ -422,6 +422,22 @@ def l2_normalize_heads(value: Tensor, eps: float = 1e-6) -> Tensor:
         out.extend(f32(float(x) * inv) for x in row)
     return tensor(value.shape, out, "float32")
 
+def l2_normalize_heads_bf16(value: Tensor, eps: float = 1e-6) -> Tensor:
+    """Mirror the pinned source l2norm while preserving its BF16 boundary."""
+
+    if value.ndim != 3:
+        raise FixtureError("BF16 head normalization expects [tokens, heads, dim]")
+    out: list[float] = []
+    dim = value.shape[2]
+    eps_bf16 = bf16_value(bf16_word(eps))
+    for start in range(0, len(value.data), dim):
+        row = [bf16_value(bf16_word(float(x))) for x in value.data[start : start + dim]]
+        sum_f32 = f32(sum(bf16_value(bf16_word(x * x)) for x in row))
+        sum_bf16 = bf16_value(bf16_word(sum_f32))
+        inv_bf16 = bf16_value(bf16_word(1.0 / math.sqrt(sum_bf16 + eps_bf16)))
+        out.extend(bf16_value(bf16_word(x * inv_bf16)) for x in row)
+    return tensor(value.shape, out, "float32")
+
 
 def _qsa_select_one(
     raw_keys: Tensor,
@@ -578,7 +594,6 @@ def gdn_depthwise_conv(mixed_qkv: Tensor, kernel: Tensor, history: Tensor | None
     new_history = combined[-state * channels :] if state else []
     return {"output": tensor((tokens, channels), output, "float32"), "history": tensor((state, channels), new_history, "float32")}
 
-
 def gdn_recurrent(
     query: Tensor,
     key: Tensor,
@@ -596,8 +611,10 @@ def gdn_recurrent(
     if value.shape[0] != tokens or value.shape[1] != heads or g.shape != (tokens, heads) or beta.shape != (tokens, heads):
         raise FixtureError("GDN gate/value shapes are invalid")
     vdim = value.shape[2]
-    q = l2_normalize_heads(query, qk_l2norm_eps)
-    k = l2_normalize_heads(key, qk_l2norm_eps)
+    q = l2_normalize_heads_bf16(query, qk_l2norm_eps)
+    k = l2_normalize_heads_bf16(key, qk_l2norm_eps)
+    query_scale = 1.0 / math.sqrt(kdim)
+    q_scaled = tensor(q.shape, (f32(float(x) * query_scale) for x in q.data), "float32")
     state_data = [0.0] * (heads * kdim * vdim) if initial_state is None else [float(x) for x in initial_state.data]
     if len(state_data) != heads * kdim * vdim:
         raise FixtureError("GDN recurrent state shape is invalid")
@@ -621,7 +638,9 @@ def gdn_recurrent(
                     state_data[base + i * vdim + j] = f32(state_data[base + i * vdim + j] + kval * delta[j])
             obase = (t * heads + head) * vdim
             for j in range(vdim):
-                output[obase + j] = f32(sum(state_data[base + i * vdim + j] * float(q.data[qbase + i]) for i in range(kdim)))
+                output[obase + j] = f32(
+                    sum(state_data[base + i * vdim + j] * float(q_scaled.data[qbase + i]) for i in range(kdim))
+                )
     return {
         "query_l2": q,
         "key_l2": k,

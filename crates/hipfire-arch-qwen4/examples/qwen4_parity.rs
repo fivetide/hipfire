@@ -20,10 +20,10 @@ use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
 use hipfire_runtime::model_source::{ModelSource, SourcePayload};
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use rdna_compute::qwen4::{
-    qwen4_gdn_params_f32, qwen4_gdn_step, qwen4_hc_read, qwen4_hc_write, qwen4_qsa_attention,
-    qwen4_qsa_cache_append, qwen4_qsa_norm_rope, qwen4_qsa_pool_rope, qwen4_qsa_select,
-    Qwen4GdnStep, Qwen4HcRead, Qwen4HcWrite, Qwen4QsaAttention, Qwen4QsaCacheAppend,
-    Qwen4QsaNormRope, Qwen4QsaPoolRope, Qwen4QsaSelect,
+    qwen4_gdn_bf16_roundtrip, qwen4_gdn_params_f32, qwen4_gdn_step, qwen4_hc_read, qwen4_hc_write,
+    qwen4_qsa_attention, qwen4_qsa_cache_append, qwen4_qsa_norm_rope, qwen4_qsa_pool_rope,
+    qwen4_qsa_select, Qwen4GdnBf16Roundtrip, Qwen4GdnStep, Qwen4HcRead, Qwen4HcWrite,
+    Qwen4QsaAttention, Qwen4QsaCacheAppend, Qwen4QsaNormRope, Qwen4QsaPoolRope, Qwen4QsaSelect,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
@@ -439,6 +439,32 @@ fn compare_f32(
         }
     }
     Ok((max_abs, max_rel))
+}
+fn measure_f32(
+    actual: &[f32],
+    expected: &[f32],
+    atol: f32,
+    rtol: f32,
+    label: &str,
+) -> Result<(f32, f32, bool), String> {
+    if actual.len() != expected.len() {
+        return fail(format!(
+            "{label}: {} values, expected {}",
+            actual.len(),
+            expected.len()
+        ));
+    }
+    let mut max_abs = 0.0f32;
+    let mut max_rel = 0.0f32;
+    let mut within_tolerance = true;
+    for (&got, &want) in actual.iter().zip(expected) {
+        let abs = (got - want).abs();
+        let rel = abs / want.abs().max(1.0e-12);
+        max_abs = max_abs.max(abs);
+        max_rel = max_rel.max(rel);
+        within_tolerance &= abs <= atol + rtol * want.abs();
+    }
+    Ok((max_abs, max_rel, within_tolerance))
 }
 
 fn compare_i64(actual: &[i64], expected: &[i64], label: &str) -> Result<(), String> {
@@ -1347,12 +1373,20 @@ fn run_gdn(
         &[(0, 3), (3, tokens)],
     )?;
     let (atol, rtol) = tolerance(manifest, "f32_state_recurrence")?;
+    let (source_atol, source_rtol) = tolerance(manifest, "bf16_input_f32_accumulation")?;
     let conv_err = compare_f32(
         &conv_actual,
         &required(arrays, "conv_output")?.values,
         atol,
         rtol,
         "GDN convolution",
+    )?;
+    let source_conv_err = measure_f32(
+        &conv_actual,
+        &required(arrays, "source_conv_output")?.values,
+        source_atol,
+        source_rtol,
+        "GDN convolution vs source",
     )?;
     let conv_state_err = compare_f32(
         &conv_history,
@@ -1448,19 +1482,19 @@ fn run_gdn(
     let k_l2 = gpu
         .download_f32(&k_l2_gpu)
         .map_err(|error| error.to_string())?;
-    let q_l2_err = compare_f32(
+    let q_l2_err = measure_f32(
         &q_l2,
-        &required(arrays, "query_l2")?.values,
-        atol,
-        rtol,
-        "GDN Q L2",
+        &required(arrays, "source_query_l2")?.values,
+        source_atol,
+        source_rtol,
+        "GDN Q L2 vs source BF16 stage",
     )?;
-    let k_l2_err = compare_f32(
+    let k_l2_err = measure_f32(
         &k_l2,
-        &required(arrays, "key_l2")?.values,
-        atol,
-        rtol,
-        "GDN K L2",
+        &required(arrays, "source_key_l2")?.values,
+        source_atol,
+        source_rtol,
+        "GDN K L2 vs source BF16 stage",
     )?;
     free(gpu, q_l2_gpu)?;
     free(gpu, k_l2_gpu)?;
@@ -1487,17 +1521,31 @@ fn run_gdn(
         run_gdn_sequence(gpu, arrays, &gate, &beta, &[(0, 3), (3, tokens)])?;
     let core_err = compare_f32(
         &whole,
-        &required(arrays, "core_attention_output")?.values,
+        &required(arrays, "candidate_core_attention_output")?.values,
         atol,
         rtol,
-        "GDN recurrent output",
+        "GDN recurrent output candidate",
+    )?;
+    let source_core_err = measure_f32(
+        &whole,
+        &required(arrays, "source_core_attention_output")?.values,
+        source_atol,
+        source_rtol,
+        "GDN recurrent output vs source",
     )?;
     let state_err = compare_f32(
         &whole_state,
-        &required(arrays, "final_recurrent_state")?.values,
+        &required(arrays, "candidate_final_recurrent_state")?.values,
         atol,
         rtol,
-        "GDN recurrent state",
+        "GDN recurrent state candidate",
+    )?;
+    let source_state_err = measure_f32(
+        &whole_state,
+        &required(arrays, "source_final_recurrent_state")?.values,
+        source_atol,
+        source_rtol,
+        "GDN recurrent state vs source",
     )?;
     compare_f32(&chunked, &whole, atol, rtol, "GDN recurrent chunking")?;
     compare_f32(
@@ -1507,22 +1555,102 @@ fn run_gdn(
         rtol,
         "GDN recurrent chunk state",
     )?;
+    // HF casts the recurrent output through BF16 before RMSNormGated.  Keep
+    // this as an explicit device-side boundary in the physical oracle: one
+    // BF16 scratch and one F32 destination are reused for every token.
+    let recurrent_bf16 = gpu
+        .zeros(&[value_heads * value_dim], DType::BF16)
+        .map_err(|error| error.to_string())?;
+    let recurrent_rounded = gpu
+        .zeros(&[value_heads * value_dim], DType::F32)
+        .map_err(|error| error.to_string())?;
+    let mut rounded_whole = Vec::with_capacity(whole.len());
+    for token in 0..tokens {
+        let recurrent = gpu
+            .upload_f32(
+                &whole[token * value_heads * value_dim..(token + 1) * value_heads * value_dim],
+                &[value_heads * value_dim],
+            )
+            .map_err(|error| error.to_string())?;
+        qwen4_gdn_bf16_roundtrip(
+            gpu,
+            &Qwen4GdnBf16Roundtrip {
+                input: &recurrent,
+                scratch: &recurrent_bf16,
+                output: &recurrent_rounded,
+                elements: value_heads * value_dim,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        rounded_whole.extend(
+            gpu.download_f32(&recurrent_rounded)
+                .map_err(|error| error.to_string())?,
+        );
+        free(gpu, recurrent)?;
+    }
+    let rounded_candidate_err = measure_f32(
+        &rounded_whole,
+        &required(arrays, "candidate_bf16_core_attention_output_f32")?.values,
+        source_atol,
+        source_rtol,
+        "GDN BF16-rounded recurrent output candidate",
+    )?;
+    let rounded_source_err = measure_f32(
+        &rounded_whole,
+        &required(arrays, "source_core_attention_output")?.values,
+        source_atol,
+        source_rtol,
+        "GDN BF16-rounded recurrent output source",
+    )?;
 
     let norm_weight = vec![0.0f32; value_dim];
-    let core_norm = gpu_ple_norm_rows(
+    let core_norm_raw = gpu_ple_norm_rows(
         gpu,
-        &whole,
+        &rounded_whole,
         tokens * value_heads,
         1,
         value_dim,
         &norm_weight,
     )?;
+    let mut core_norm = Vec::with_capacity(core_norm_raw.len());
+    for token in 0..tokens {
+        let norm_input = gpu
+            .upload_f32(
+                &core_norm_raw
+                    [token * value_heads * value_dim..(token + 1) * value_heads * value_dim],
+                &[value_heads * value_dim],
+            )
+            .map_err(|error| error.to_string())?;
+        qwen4_gdn_bf16_roundtrip(
+            gpu,
+            &Qwen4GdnBf16Roundtrip {
+                input: &norm_input,
+                scratch: &recurrent_bf16,
+                output: &recurrent_rounded,
+                elements: value_heads * value_dim,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        core_norm.extend(
+            gpu.download_f32(&recurrent_rounded)
+                .map_err(|error| error.to_string())?,
+        );
+        free(gpu, norm_input)?;
+    }
+
     let norm_err = compare_f32(
         &core_norm,
-        &required(arrays, "core_norm")?.values,
+        &required(arrays, "candidate_core_norm")?.values,
         atol,
         rtol,
-        "GDN output norm",
+        "GDN output norm candidate",
+    )?;
+    let source_norm_err = measure_f32(
+        &core_norm,
+        &required(arrays, "source_core_norm")?.values,
+        source_atol,
+        source_rtol,
+        "GDN output norm vs source",
     )?;
     let z = required(arrays, "z_output_gate")?;
     let norm_bf16 = upload_bf16(gpu, &norm_weight, &[value_dim])?;
@@ -1530,7 +1658,8 @@ fn run_gdn(
     for token in 0..tokens {
         let recurrent = gpu
             .upload_f32(
-                &whole[token * value_heads * value_dim..(token + 1) * value_heads * value_dim],
+                &rounded_whole
+                    [token * value_heads * value_dim..(token + 1) * value_heads * value_dim],
                 &[value_heads * value_dim],
             )
             .map_err(|error| error.to_string())?;
@@ -1562,10 +1691,17 @@ fn run_gdn(
     }
     let gated_err = compare_f32(
         &gated_output,
-        &required(arrays, "output_gate_sigmoid")?.values,
+        &required(arrays, "candidate_output_gate_sigmoid")?.values,
         atol,
         rtol,
-        "GDN gated output",
+        "GDN gated output candidate",
+    )?;
+    let source_gated_err = measure_f32(
+        &gated_output,
+        &required(arrays, "source_output_gate_sigmoid")?.values,
+        source_atol,
+        source_rtol,
+        "GDN gated output vs source",
     )?;
     let projected = gpu_ple_linear_rows(
         gpu,
@@ -1577,27 +1713,81 @@ fn run_gdn(
     )?;
     let output_err = compare_f32(
         &projected,
-        &required(arrays, "output")?.values,
+        &required(arrays, "candidate_output")?.values,
         atol,
         rtol,
-        "GDN output projection",
+        "GDN output projection candidate",
     )?;
+    let source_output_err = measure_f32(
+        &projected,
+        &required(arrays, "source_output")?.values,
+        source_atol,
+        source_rtol,
+        "GDN output projection vs source",
+    )?;
+    free(gpu, recurrent_bf16)?;
+    free(gpu, recurrent_rounded)?;
     free(gpu, norm_bf16)?;
+    if !(source_conv_err.2
+        && source_core_err.2
+        && source_state_err.2
+        && rounded_source_err.2
+        && rounded_candidate_err.2
+        && source_norm_err.2
+        && source_gated_err.2
+        && source_output_err.2)
+    {
+        return fail(format!(
+            "GDN source BF16 parity exceeded frozen tolerance: conv={} core={} state={} rounded_source={} rounded_candidate={} norm={} gated={} output={} (max_abs conv={:.8e} core={:.8e} state={:.8e} rounded_source={:.8e} rounded_candidate={:.8e} norm={:.8e} gated={:.8e} output={:.8e})",
+            source_conv_err.2,
+            source_core_err.2,
+            source_state_err.2,
+            rounded_source_err.2,
+            rounded_candidate_err.2,
+            source_norm_err.2,
+            source_gated_err.2,
+            source_output_err.2,
+            source_conv_err.0,
+            source_core_err.0,
+            source_state_err.0,
+            rounded_source_err.0,
+            rounded_candidate_err.0,
+            source_norm_err.0,
+            source_gated_err.0,
+            source_output_err.0,
+        ));
+    }
     Ok(json!({
         "case":"gdn_recurrence_conv_head_expansion",
         "status":"pass",
         "chunk_boundary":3,
         "checks":["production GDN conv/SiLU","production Q/K expansion","production Q/K L2","production decay/beta","production recurrent state","production gated norm/output"],
         "conv_max_abs":conv_err.0,
+        "source_conv_max_abs":source_conv_err.0,
+        "source_conv_within_tolerance":source_conv_err.2,
         "conv_state_max_abs":conv_state_err.0,
         "expansion_max_abs":expansion_err.0.max(k_exp_err.0),
         "q_l2_max_abs":q_l2_err.0.max(k_l2_err.0),
         "params_max_abs":gate_err.0.max(beta_err.0),
         "core_max_abs":core_err.0,
+        "source_core_max_abs":source_core_err.0,
+        "source_core_within_tolerance":source_core_err.2,
         "state_max_abs":state_err.0,
+        "rounded_source_max_abs":rounded_source_err.0,
+        "rounded_source_within_tolerance":rounded_source_err.2,
+        "rounded_candidate_max_abs":rounded_candidate_err.0,
+        "rounded_candidate_within_tolerance":rounded_candidate_err.2,
+        "source_state_max_abs":source_state_err.0,
+        "source_state_within_tolerance":source_state_err.2,
         "norm_max_abs":norm_err.0,
+        "source_norm_max_abs":source_norm_err.0,
+        "source_norm_within_tolerance":source_norm_err.2,
         "gated_max_abs":gated_err.0,
-        "output_max_abs":output_err.0
+        "source_gated_max_abs":source_gated_err.0,
+        "source_gated_within_tolerance":source_gated_err.2,
+        "output_max_abs":output_err.0,
+        "source_output_max_abs":source_output_err.0,
+        "source_output_within_tolerance":source_output_err.2
     }))
 }
 
@@ -2832,6 +3022,72 @@ fn run_mtp(
     let wide = branches * hidden_size;
     let intermediate = 8usize;
     let (atol, rtol) = tolerance(manifest, "bf16_input_f32_accumulation")?;
+    let source_native_residual_err = compare_f32(
+        &required(arrays, "native_residual_input")?.values,
+        &required(arrays, "source_native_residual_input")?.values,
+        0.0,
+        0.0,
+        "MTP source/native residual capture",
+    )?;
+    let source_native_sample_err = compare_f32(
+        &required(arrays, "native_sample_hidden")?.values,
+        &required(arrays, "source_native_sample_hidden")?.values,
+        0.0,
+        0.0,
+        "MTP source/native sample capture",
+    )?;
+    let source_native_multi_err = compare_f32(
+        &required(arrays, "native_multi_hidden")?.values,
+        &required(arrays, "source_native_multi_hidden")?.values,
+        0.0,
+        0.0,
+        "MTP source/native multi capture",
+    )?;
+    let source_native_hc_err = compare_f32(
+        &required(arrays, "native_hc_mixed")?.values,
+        &required(arrays, "source_native_hc_mixed")?.values,
+        0.0,
+        0.0,
+        "MTP source/native HC capture",
+    )?;
+    let source_native_injection_err = compare_f32(
+        &required(arrays, "native_hc_injection_weight")?.values,
+        &required(arrays, "source_native_hc_injection_weight")?.values,
+        0.0,
+        0.0,
+        "MTP source/native HC injection capture",
+    )?;
+    let source_native_mask_err = compare_f32(
+        &required(arrays, "native_qsa_selected_token_mask")?.values,
+        &required(arrays, "source_native_qsa_selected_token_mask")?.values,
+        0.0,
+        0.0,
+        "MTP source/native QSA mask capture",
+    )?;
+    let source_native_moe_err = compare_f32(
+        &required(arrays, "native_moe_output")?.values,
+        &required(arrays, "source_native_moe_output")?.values,
+        0.0,
+        0.0,
+        "MTP source/native MoE capture",
+    )?;
+    compare_i64(
+        required(arrays, "native_mtp_step0_indices")?.ints()?,
+        required(arrays, "source_native_mtp_step0_indices")?.ints()?,
+        "MTP source/native step0 indices",
+    )?;
+    compare_i64(
+        required(arrays, "native_mtp_later_reused_indices")?.ints()?,
+        required(arrays, "source_native_mtp_later_reused_indices")?.ints()?,
+        "MTP source/native reused indices",
+    )?;
+    let source_equation_residual_err = measure_f32(
+        &required(arrays, "native_residual_input")?.values,
+        &required(arrays, "source_equation_residual_input")?.values,
+        atol,
+        rtol,
+        "MTP native source-equation residual",
+    )?;
     let ids_gpu = upload_raw_i32(gpu, token_ids)?;
     let table_words: Vec<u16> = required(arrays, "token_embedding_bf16")?
         .ints()?
@@ -3299,6 +3555,10 @@ fn run_mtp(
         "case":"native_mtp_embedding_qsa_moe_hc",
         "status":"pass",
         "checks":["production BF16 embedding lookup","production embedding/backbone RMS and FC projections","production MTP QSA pool/select/reuse/cache/attention/output","production attention HC read/write","production MTP 512-way/top10 MoE","production MLP HC read/write","production final HC and LM head"],
+        "source_native_alias_max_abs":source_native_residual_err.0.max(source_native_sample_err.0).max(source_native_multi_err.0).max(source_native_hc_err.0).max(source_native_injection_err.0).max(source_native_mask_err.0).max(source_native_moe_err.0),
+        "source_native_aliases_exact":true,
+        "source_equation_residual_max_abs":source_equation_residual_err.0,
+        "source_equation_residual_within_tolerance":source_equation_residual_err.2,
         "embedding_max_abs":embedding_err.0,
         "embedding_norm_max_abs":embedding_norm_err.0,
         "projected_embedding_max_abs":projected_embedding_err.0,

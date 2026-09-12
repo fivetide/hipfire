@@ -17,6 +17,7 @@ import copy
 import hashlib
 import importlib
 import json
+import random
 import math
 import os
 import platform
@@ -41,20 +42,24 @@ try:
         NG_SCALE,
         NG_VALID_ROWS,
         bf16_to_f32,
+        bf16_tensor,
         gdn_expand_qk,
         gdn_depthwise_conv,
         gdn_recurrent,
         hc_final_mix,
         hc_inject,
         hc_prepare,
+        matmul,
         moe_top10,
         mtp_embedding_projection,
         ple_hash_history,
         qsa_attention,
         qsa_indexer,
+        rng_normal,
+        rng_uniform,
         rope_half_split,
-        scale,
         tensor,
+        transpose2,
     )
     from .schema import FixtureError, Tensor, array_metadata, read_npz, sha256_file, write_json, write_npz
 except ImportError:  # direct execution from this directory
@@ -66,20 +71,24 @@ except ImportError:  # direct execution from this directory
         NG_SCALE,
         NG_VALID_ROWS,
         bf16_to_f32,
+        bf16_tensor,
         gdn_expand_qk,
         gdn_depthwise_conv,
         gdn_recurrent,
         hc_final_mix,
         hc_inject,
         hc_prepare,
+        matmul,
         moe_top10,
         mtp_embedding_projection,
         ple_hash_history,
         qsa_attention,
         qsa_indexer,
+        rng_normal,
+        rng_uniform,
         rope_half_split,
-        scale,
         tensor,
+        transpose2,
     )
     from schema import FixtureError, Tensor, array_metadata, read_npz, sha256_file, write_json, write_npz  # type: ignore
 
@@ -1970,6 +1979,154 @@ def _source_arrays(records: Mapping[str, Mapping[str, object]], family: str) -> 
     return arrays
 
 
+def _generate_candidate_mtp(seed: int, moe_seed: int) -> dict[str, Tensor]:
+    """Build the independent compact F32 MTP candidate used by parity.
+
+    This intentionally mirrors the dependency-free generator's fixed streams
+    without importing that module: the generator imports this upstream backend
+    when invoked as a script, so a top-level cross-import would recurse.
+    """
+
+    rng = random.Random(seed)
+    vocab = 32
+    hidden = 8
+    branches = 4
+    tokens = [1, 5, 7, 9]
+    embedding_words = bf16_tensor(
+        rng_uniform(rng, (vocab, hidden), 0.5).data,
+        (vocab, hidden),
+    )
+    backbone = rng_normal(rng, (len(tokens), branches * hidden), 0.6)
+    fc_embedding = rng_normal(rng, (hidden, hidden), 0.08)
+    fc_hidden = rng_normal(rng, (hidden, hidden), 0.08)
+    projected = mtp_embedding_projection(
+        tokens,
+        embedding_words,
+        backbone,
+        fc_embedding,
+        fc_hidden,
+        branches,
+        hidden,
+        1e-6,
+    )
+
+    raw_q = rng_normal(rng, (len(tokens), 4, 4), 0.6)
+    raw_keys = rng_normal(rng, (len(tokens), 2, 4), 0.6)
+    index_queries = tensor(
+        raw_q.shape,
+        (abs(float(value)) + 0.19 + 0.005 * (index % 4) for index, value in enumerate(raw_q.data)),
+        "float32",
+    )
+    raw_keys = tensor(
+        raw_keys.shape,
+        (abs(float(value)) + 0.13 + 0.009 * (index % 4) for index, value in enumerate(raw_keys.data)),
+        "float32",
+    )
+    mtp_index = qsa_indexer(index_queries, raw_keys, list(range(len(tokens))), 4, 8, 4)
+    later_reused = tensor(mtp_index["selected_indices"].shape, mtp_index["selected_indices"].data, "int32")
+
+    queries = rng_normal(rng, (len(tokens), 4, 4), 0.6)
+    keys = rng_normal(rng, (len(tokens), 2, 4), 0.6)
+    values = rng_normal(rng, (len(tokens), 2, 4), 0.6)
+    attention_gate = rng_normal(rng, (len(tokens), 4 * 4), 0.3)
+    attention_projection = rng_normal(rng, (hidden, 4 * 4), 0.04)
+    attention = qsa_attention(
+        queries,
+        keys,
+        values,
+        later_reused,
+        attention_gate,
+        attention_projection,
+        list(range(len(tokens))),
+        4,
+    )
+
+    norm_weight = rng_uniform(rng, (branches, hidden), 0.05)
+    down = rng_normal(rng, (3, branches * hidden), 0.08)
+    up = rng_normal(rng, (branches * hidden, 3), 0.08)
+    inject_weight = rng_normal(rng, (branches, branches * hidden), 0.08)
+    attn_prepared = hc_prepare(projected["residual_input"], down, up, norm_weight, branches, hidden, 1e-6)
+    attn_for_inject = dict(attn_prepared)
+    attn_for_inject["mixed"] = attention["output"]
+    attn_injected = hc_inject(attn_for_inject, projected["residual_input"], inject_weight, branches)
+
+    mlp_prepared = hc_prepare(attn_injected["injected"], down, up, norm_weight, branches, hidden, 1e-6)
+    moe_rng = random.Random(moe_seed)
+    moe_hidden = mlp_prepared["mixed"]
+    router = rng_normal(moe_rng, (512, hidden), 0.07)
+    gate_up = rng_normal(moe_rng, (512 * 2 * 8, hidden), 0.045).reshape(512, 2 * 8, hidden)
+    down_moe = rng_normal(moe_rng, (512 * hidden, 8), 0.045).reshape(512, hidden, 8)
+    shared_gate = rng_uniform(moe_rng, (hidden,), 0.08)
+    shared_gate_up = rng_normal(moe_rng, (2 * 8, hidden), 0.045)
+    shared_down = rng_normal(moe_rng, (hidden, 8), 0.045)
+    moe = moe_top10(
+        moe_hidden,
+        router,
+        gate_up,
+        down_moe,
+        shared_gate,
+        shared_gate_up,
+        shared_down,
+        10,
+    )
+    mlp_for_inject = dict(mlp_prepared)
+    mlp_for_inject["mixed"] = moe["output"]
+    mlp_injected = hc_inject(mlp_for_inject, attn_injected["injected"], inject_weight, branches)
+
+    final_down = rng_normal(rng, (3, branches * hidden), 0.08)
+    final_up = rng_normal(rng, (branches * hidden, 3), 0.08)
+    final = hc_final_mix(mlp_injected["injected"], norm_weight, branches, hidden, 1e-6, final_down, final_up)
+    lm_head = rng_normal(rng, (vocab, hidden), 0.06)
+    logits = matmul(final["mixed"], transpose2(lm_head))
+    return {
+        "token_ids": tensor((len(tokens),), tokens, "int64"),
+        "token_embedding_bf16": embedding_words,
+        "backbone_hidden": backbone,
+        "fc_embedding": fc_embedding,
+        "fc_hidden": fc_hidden,
+        "embedding": projected["embedding"],
+        "embedding_norm": projected["embedding_norm"],
+        "projected_embedding": projected["projected_embedding"],
+        "hidden_norm": projected["hidden_norm"],
+        "projected_hidden": projected["projected_hidden"],
+        "residual_input": projected["residual_input"],
+        "index_queries": index_queries,
+        "raw_index_keys": raw_keys,
+        "step0_selected_indices": mtp_index["selected_indices"],
+        "step0_selected_token_mask": mtp_index["selected_token_mask"],
+        "later_reused_indices": later_reused,
+        "attention_queries": queries,
+        "attention_keys": keys,
+        "attention_values": values,
+        "attention_gate": attention_gate,
+        "attention_projection": attention_projection,
+        "attention_output": attention["output"],
+        "hc_norm_weight": norm_weight,
+        "hc_down": down,
+        "hc_up": up,
+        "hc_inject_weight": inject_weight,
+        "final_hc_down": final_down,
+        "final_hc_up": final_up,
+        "attn_hc_normed": attn_prepared["normed"],
+        "attn_hc_mixed": attn_prepared["mixed"],
+        "attn_hc_injected": attn_injected["injected"],
+        "mtp_moe_hidden": moe_hidden,
+        "mtp_moe_router_logits": moe["router_logits"],
+        "mtp_moe_selected_experts": moe["selected_experts"],
+        "mtp_moe_routing_weights": moe["routing_weights"],
+        "final_hc_lowrank_silu": final["lowrank_silu"],
+        "final_hc_mix_gate": final["mix_gate"],
+        "mtp_moe_output": moe["output"],
+        "mlp_hc_normed": mlp_prepared["normed"],
+        "mlp_hc_mixed": mlp_prepared["mixed"],
+        "mlp_hc_injected": mlp_injected["injected"],
+        "final_hc_normed": final["normed"],
+        "sample_hidden": final["mixed"],
+        "lm_head": lm_head,
+        "logits": logits,
+    }
+
+
 def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[str, object], seed: int) -> tuple[list[tuple[str, dict[str, Tensor], dict[str, object]]], dict[str, object]]:
     try:
         packages = _import_pinned_packages()
@@ -2045,7 +2202,15 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
     finally:
         nn.Embedding = original_embedding
     ple_tokens = [31, 47, 53, 59, 61, EOS_TOKEN_ID, 71, 73, 79, 83, EOS_TOKEN_ID, 89, 97]
-    ple( torch.tensor([ple_tokens], dtype=torch.long), None)
+    previous_context = torch.tensor([EOS_TOKEN_ID, EOS_TOKEN_ID], dtype=torch.long)
+    token_input = torch.tensor(ple_tokens, dtype=torch.long)
+    token_history_source = torch.cat((previous_context, token_input)).unsqueeze(0)
+    shifted_source = torch.stack(
+        [ple._shift_right_ignore_eos(token_history_source, shift) for shift in range(ple_config.ngram_size)]
+    ).squeeze(1)
+    source_token_history = _from_torch(token_history_source.squeeze(0), torch)
+    source_shifted_tokens = _from_torch(shifted_source, torch)
+    ple(torch.tensor([ple_tokens], dtype=torch.long), None)
     capture = ple.ngram_embedding
     if capture.ids is None:
         raise FixtureError("pinned PLE source did not expose n-gram IDs")
@@ -2069,6 +2234,11 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
     ple_arrays = {
         "tokens": tensor((len(ple_tokens),), ple_tokens, "int64"),
         "previous_context": tensor((2,), [EOS_TOKEN_ID, EOS_TOKEN_ID], "int64"),
+        "token_history": source_token_history,
+        "shifted_tokens": source_shifted_tokens,
+        "multipliers": source_multipliers,
+        "head_vocab_sizes": source_sizes,
+        "head_offsets": source_offsets,
         "ple_row_ids": source_ids,
         "ple_rows_bf16": ple_rows,
         "ple_embedding_f32": bf16_to_f32(ple_rows),
@@ -2094,7 +2264,42 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
     small_ple_layer = hf["Qwen4ExpTextPLELayer"](small_ple_config, 1, 0)
     small_ple_ids = torch.tensor([[1, 2, EOS_TOKEN_ID, 3]], dtype=torch.long)
     small_ple_hidden = torch.randn(1, 4, 32, dtype=torch.float32)
-    small_ple_output = small_ple_layer(small_ple_hidden, small_ple_ids, None)
+    with torch.no_grad():
+        small_ple_embedding = small_ple_layer.ple_embedding(small_ple_ids, None)
+        small_ple_key_raw = small_ple_layer.key_proj(small_ple_embedding)
+        small_ple_key_normed = small_ple_layer.norm_key(small_ple_key_raw).unflatten(-1, (4, 8))
+        small_ple_value = small_ple_layer.value_proj(small_ple_embedding)
+        small_ple_query_normed = small_ple_layer.norm_query(small_ple_hidden).unflatten(-1, (4, 8))
+        small_ple_gate = (
+            (small_ple_key_normed * small_ple_query_normed).sum(dim=-1, keepdim=True) / math.sqrt(8.0)
+        )
+        small_ple_gate = small_ple_gate.abs().clamp_min(1.0e-6).sqrt() * small_ple_gate.sign()
+        small_ple_gated = torch.sigmoid(small_ple_gate) * small_ple_value.unsqueeze(-2)
+        small_ple_gated = small_ple_gated.flatten(-2)
+        small_ple_gated_normed = small_ple_layer.norm_conv(small_ple_gated)
+        small_ple_conv = small_ple_layer._short_conv(small_ple_gated_normed, None)
+        small_ple_output = small_ple_gated + small_ple_conv
+        small_ple_state = torch.zeros((9, 32), dtype=small_ple_gated_normed.dtype)
+        small_ple_state[-4:] = small_ple_gated_normed.squeeze(0)
+    ple_projection_arrays = {
+        "ple_embedding_f32": _from_torch(small_ple_embedding.squeeze(0), torch),
+        "hidden_states": _from_torch(small_ple_hidden.squeeze(0), torch),
+        "key_proj": _from_torch(small_ple_layer.key_proj.weight, torch),
+        "value_proj": _from_torch(small_ple_layer.value_proj.weight, torch),
+        "norm_key_weight": _from_torch(small_ple_layer.norm_key.weight.reshape(4, 8), torch),
+        "norm_query_weight": _from_torch(small_ple_layer.norm_query.weight.reshape(4, 8), torch),
+        "norm_conv_weight": _from_torch(small_ple_layer.norm_conv.weight.reshape(4, 8), torch),
+        "conv1d_weight": _from_torch(small_ple_layer.conv1d.weight.squeeze(1), torch),
+        "key_normed": _from_torch(small_ple_key_normed.flatten(-2).squeeze(0), torch),
+        "query_normed": _from_torch(small_ple_query_normed.flatten(-2).squeeze(0), torch),
+        "gate": _from_torch(small_ple_gate.squeeze(0).squeeze(-1), torch),
+        "value": _from_torch(small_ple_value.squeeze(0), torch),
+        "gated_value": _from_torch(small_ple_gated.squeeze(0), torch),
+        "gated_value_normed": _from_torch(small_ple_gated_normed.squeeze(0), torch),
+        "conv_history": _from_torch(small_ple_state, torch),
+        "conv_output": _from_torch(small_ple_conv.squeeze(0), torch),
+        "output": _from_torch(small_ple_output.squeeze(0), torch),
+    }
     ple_arrays.update(
         {
             "source_projection_hidden": _from_torch(small_ple_hidden.squeeze(0), torch),
@@ -2107,8 +2312,14 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
     query_16 = torch.randn(1, tokens, key_heads, kdim, dtype=torch.bfloat16)
     key_16 = torch.randn(1, tokens, key_heads, kdim, dtype=torch.bfloat16)
     value = torch.randn(1, tokens, value_heads, vdim, dtype=torch.bfloat16)
-    g = torch.randn(1, tokens, value_heads, dtype=torch.float32) * 0.08
-    beta = torch.sigmoid(torch.randn(1, tokens, value_heads, dtype=torch.float32))
+    a_logits = torch.randn(1, tokens, value_heads, dtype=torch.float32) * 0.4
+    b_logits = torch.randn(1, tokens, value_heads, dtype=torch.float32) * 0.4
+    dt_bias = torch.rand(value_heads, dtype=torch.float32) * 0.15
+    a_log = torch.rand(value_heads, dtype=torch.float32) * 0.4
+    g = -torch.exp(a_log).reshape(1, 1, value_heads) * functional.softplus(
+        a_logits + dt_bias.reshape(1, 1, value_heads)
+    )
+    beta = torch.sigmoid(b_logits)
     repeat = value_heads // key_heads
     query = query_16.repeat_interleave(repeat, dim=2)
     key = key_16.repeat_interleave(repeat, dim=2)
@@ -2118,6 +2329,9 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
     source_chunk, chunk_state = hf["torch_chunk_gated_delta_rule"](
         query, key, value, g, beta, chunk_size=64, output_final_state=True, use_qk_l2norm_in_kernel=True
     )
+    source_query_l2_torch = hf["l2norm"](query, dim=-1, eps=1.0e-6)
+    source_key_l2_torch = hf["l2norm"](key, dim=-1, eps=1.0e-6)
+    source_query_scaled_torch = source_query_l2_torch.to(torch.float32) * (1.0 / math.sqrt(kdim))
 
     query_16_tensor = _from_torch(query_16.squeeze(0).float(), torch)
     key_16_tensor = _from_torch(key_16.squeeze(0).float(), torch)
@@ -2130,7 +2344,6 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
         _from_torch(g.squeeze(0), torch),
         _from_torch(beta.squeeze(0), torch),
     )
-    recurrent_candidate["output"] = scale(recurrent_candidate["output"], 1.0 / math.sqrt(kdim))
     source_recurrent_tensor = _from_torch(source_recurrent.squeeze(0).float(), torch)
     source_chunk_tensor = _from_torch(source_chunk.squeeze(0).float(), torch)
     _assert_close(source_recurrent_tensor, recurrent_candidate["output"], "GDN recurrent output", tolerance="bf16_input_f32_accumulation")
@@ -2145,19 +2358,103 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
         None,
         activation=True,
     )
+    source_core_output_torch = source_recurrent.squeeze(0).float()
+    candidate_core_output_torch = torch.tensor(
+        recurrent_candidate["output"].data,
+        dtype=torch.float32,
+    ).reshape(tokens, value_heads, vdim)
+    # HF casts the recurrent/chunk result back to hidden BF16 before the
+    # RMSNormGated boundary.  Keep the raw F32 candidate for core parity, but
+    # derive all downstream candidate expectations from an explicit BF16
+    # storage roundtrip so the production device boundary is independently
+    # measurable.
+    candidate_bf16_storage = candidate_core_output_torch.to(torch.bfloat16)
+    candidate_bf16_core_tensor = _from_torch(candidate_bf16_storage, torch)
+    candidate_bf16_core_f32_tensor = _from_torch(candidate_bf16_storage.float(), torch)
+    candidate_bf16_core_output_torch = candidate_bf16_storage.float()
+    source_core_norm_raw_torch = source_core_output_torch * torch.rsqrt(
+        source_core_output_torch.square().mean(dim=-1, keepdim=True) + 1.0e-6
+    )
+    source_core_norm_storage = source_core_norm_raw_torch.to(torch.bfloat16)
+    source_core_norm_torch = source_core_norm_storage.float()
+    candidate_core_norm_raw_torch = candidate_bf16_core_output_torch * torch.rsqrt(
+        candidate_bf16_core_output_torch.square().mean(dim=-1, keepdim=True) + 1.0e-6
+    )
+    candidate_core_norm_storage = candidate_core_norm_raw_torch.to(torch.bfloat16)
+    candidate_core_norm_torch = candidate_core_norm_storage.float()
+    z_torch = torch.randn(tokens, value_heads * vdim, dtype=torch.float32) * 0.4
+    source_output_gate_torch = source_core_norm_torch.reshape(tokens, value_heads * vdim) * torch.sigmoid(z_torch)
+    candidate_output_gate_torch = candidate_core_norm_torch.reshape(tokens, value_heads * vdim) * torch.sigmoid(z_torch)
+    out_proj_torch = torch.randn(8, value_heads * vdim, dtype=torch.float32) * 0.04
+    source_output_torch = source_output_gate_torch @ out_proj_torch.transpose(0, 1)
+    candidate_output_torch = candidate_output_gate_torch @ out_proj_torch.transpose(0, 1)
     source_conv_tensor = _from_torch(source_conv.squeeze(0).transpose(0, 1).float(), torch)
     _assert_close(source_conv_tensor, conv_candidate["output"], "GDN causal convolution", tolerance="bf16_input_f32_accumulation")
     gdn_arrays = {
-        "query_16x4": _from_torch(query_16.squeeze(0), torch),
-        "key_16x4": _from_torch(key_16.squeeze(0), torch),
-        "query_expanded_48x4": _from_torch(query.squeeze(0), torch),
-        "key_expanded_48x4": _from_torch(key.squeeze(0), torch),
-        "value_48x4": _from_torch(value.squeeze(0), torch),
+        "query_16x4": _from_torch(query_16.squeeze(0).float(), torch),
+        "key_16x4": _from_torch(key_16.squeeze(0).float(), torch),
+        "query_expanded_48x4": _from_torch(query.squeeze(0).float(), torch),
+        "key_expanded_48x4": _from_torch(key.squeeze(0).float(), torch),
+        "source_query_l2": _from_torch(source_query_l2_torch.squeeze(0).float(), torch),
+        "source_query_l2_bf16_storage": _from_torch(source_query_l2_torch.squeeze(0), torch),
+        "source_key_l2": _from_torch(source_key_l2_torch.squeeze(0).float(), torch),
+        "source_key_l2_bf16_storage": _from_torch(source_key_l2_torch.squeeze(0), torch),
+        "source_query_scaled": _from_torch(source_query_scaled_torch.squeeze(0), torch),
+        "source_value_f32": _from_torch(value.squeeze(0).float(), torch),
+        "source_g_decay": _from_torch(g.squeeze(0), torch),
+        "source_beta_f32": _from_torch(beta.squeeze(0), torch),
+        "value_48x4": _from_torch(value.squeeze(0).float(), torch),
+        "mixed_qkv": _from_torch(conv_input.squeeze(0).transpose(0, 1).float(), torch),
+        "conv_weight": _from_torch(conv_weight.float(), torch),
+        "initial_conv_history": _from_torch(torch.zeros((3, conv_channels), dtype=torch.float32), torch),
+        "conv_output": conv_candidate["output"],
+        "conv_final_history": conv_candidate["history"],
+        "query_after_conv": _from_torch(query.squeeze(0).float(), torch),
+        "key_after_conv": _from_torch(key.squeeze(0).float(), torch),
+        "value_after_conv": _from_torch(value.squeeze(0).float(), torch),
+        "a_logits": _from_torch(a_logits.squeeze(0), torch),
+        "b_logits": _from_torch(b_logits.squeeze(0), torch),
+        "a_log": _from_torch(a_log, torch),
+        "dt_bias": _from_torch(dt_bias, torch),
+        "g_decay": _from_torch(g.squeeze(0), torch),
+        "beta_sigmoid": _from_torch(beta.squeeze(0), torch),
+        "query_l2": recurrent_candidate["query_l2"],
+        "key_l2": recurrent_candidate["key_l2"],
+        "core_attention_output": source_recurrent_tensor,
+        "final_recurrent_state": _from_torch(
+            source_state.squeeze(0) if source_state is not None else torch.zeros((value_heads, kdim, vdim)),
+            torch,
+        ),
+        "z_output_gate": _from_torch(z_torch, torch),
+        "core_norm": _from_torch(source_core_norm_torch.reshape(tokens, value_heads * vdim), torch),
+        "output_gate_sigmoid": _from_torch(source_output_gate_torch, torch),
+        "out_proj": _from_torch(out_proj_torch, torch),
+        "output": _from_torch(source_output_torch, torch),
+        "source_core_attention_output": source_recurrent_tensor,
+        "source_final_recurrent_state": _from_torch(
+            source_state.squeeze(0) if source_state is not None else torch.zeros((value_heads, kdim, vdim)),
+            torch,
+        ),
+        "source_core_norm": _from_torch(source_core_norm_torch.reshape(tokens, value_heads * vdim), torch),
+        "source_core_norm_bf16_storage": _from_torch(source_core_norm_storage, torch),
+        "source_output_gate_sigmoid": _from_torch(source_output_gate_torch, torch),
+        "source_output": _from_torch(source_output_torch, torch),
+        "candidate_core_attention_output": recurrent_candidate["output"],
+        "candidate_final_recurrent_state": recurrent_candidate["final_state"],
+        "candidate_core_norm": _from_torch(candidate_core_norm_torch.reshape(tokens, value_heads * vdim), torch),
+        "candidate_core_norm_bf16_storage": _from_torch(candidate_core_norm_storage, torch),
+        "candidate_output_gate_sigmoid": _from_torch(candidate_output_gate_torch, torch),
+        "candidate_output": _from_torch(candidate_output_torch, torch),
         "g": _from_torch(g.squeeze(0), torch),
         "beta": _from_torch(beta.squeeze(0), torch),
         "source_recurrent_output": source_recurrent_tensor,
         "source_chunk_output": source_chunk_tensor,
-        "source_recurrent_state": _from_torch(source_state.squeeze(0) if source_state is not None else torch.zeros((value_heads, kdim, vdim)), torch),
+        "source_recurrent_state": _from_torch(
+            source_state.squeeze(0) if source_state is not None else torch.zeros((value_heads, kdim, vdim)),
+            torch,
+        ),
+        "candidate_bf16_core_attention_output": candidate_bf16_core_tensor,
+        "candidate_bf16_core_attention_output_f32": candidate_bf16_core_f32_tensor,
         "candidate_recurrent_output": recurrent_candidate["output"],
         **_source_arrays(records, "gdn"),
         "mixed_qkv_bf16": _from_torch(conv_input.squeeze(0).transpose(0, 1), torch),
@@ -2212,6 +2509,22 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
     _assert_close(_from_torch(source_final_mix, torch), candidate_final_mix["mixed"], "HC final mix", tolerance="f32_accumulation")
     hc_arrays = {
         "hyper_input": hyper_t,
+        "hc_norm_weight_zero_centered": _from_torch(norm_weight_t, torch),
+        "input_mix_weight_down": _from_torch(down_t, torch),
+        "input_mix_weight_up": _from_torch(up_t, torch),
+        "block_inject_weight": _from_torch(inject_t, torch),
+        "normed": hc_candidate["normed"],
+        "lowrank_silu": hc_candidate["lowrank_silu"],
+        "mix_gate": hc_candidate["mix_gate"],
+        "mixed": hc_candidate["mixed"],
+        "injection_weight": hc_candidate_injected["injection_weight"],
+        "injected": hc_candidate_injected["injected"],
+        "final_input_mix_weight_down": _from_torch(down_t, torch),
+        "final_input_mix_weight_up": _from_torch(up_t, torch),
+        "final_normed": candidate_final_mix["normed"],
+        "final_lowrank_silu": candidate_final_mix["lowrank_silu"],
+        "final_mix_gate": candidate_final_mix["mix_gate"],
+        "final_mixed": candidate_final_mix["mixed"],
         "source_mixed": _from_torch(source_mix, torch),
         "source_injection_weight": _from_torch(source_injection, torch),
         "candidate_mixed": hc_candidate["mixed"],
@@ -2282,11 +2595,12 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
         "QSA block scores",
         tolerance="f32_accumulation",
     )
-    rope_value = torch.randn(13, 2, 8, dtype=torch.float32)
-    rope_angles = torch.empty(13, 8, dtype=torch.float32)
-    for position in range(13):
+    rope_positions = [0, 1, 4, 7, 11]
+    rope_value = torch.randn(5, 2, 8, dtype=torch.float32)
+    rope_angles = torch.empty(5, 8, dtype=torch.float32)
+    for row, position in enumerate(rope_positions):
         for dimension in range(8):
-            rope_angles[position, dimension] = position / (1000000.0 ** (2.0 * (dimension % 4) / 8.0))
+            rope_angles[row, dimension] = position / (1000000.0 ** (2.0 * (dimension % 4) / 8.0))
     source_rope = hf["apply_rotary_pos_emb"](
         rope_value,
         cos=rope_angles.cos(),
@@ -2295,7 +2609,7 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
     )
     candidate_rope = rope_half_split(
         _from_torch(rope_value, torch),
-        list(range(13)),
+        rope_positions,
         8,
     )
     _assert_close(_from_torch(source_rope, torch), candidate_rope, "QSA HalfSplit RoPE", tolerance="f32_accumulation")
@@ -2357,12 +2671,31 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
     _assert_close(source_token_mask, candidate_qsa["selected_token_mask"], "QSA selected token mask", tolerance="exact_integer_or_bytes")
     qsa_arrays = {
         "hidden": _from_torch(hidden.squeeze(0), torch),
+        "positions": tensor((13,), range(13), "int64"),
+        "index_queries": _from_torch(q_indexer_rot.squeeze(0), torch),
+        "raw_index_keys": _from_torch(k_raw.squeeze(0), torch),
+        "selected_indices": candidate_qsa["selected_indices"],
+        "selected_indices_chunked": candidate_qsa["selected_indices"],
+        "selected_indices_incremental": candidate_qsa["selected_indices"],
+        "selected_mask": candidate_qsa["selected_mask"],
+        "selected_token_mask": candidate_qsa["selected_token_mask"],
+        "block_scores": candidate_qsa["block_scores"],
+        "attention_queries": _from_torch(attention_q.squeeze(0).transpose(0, 1), torch),
+        "attention_keys": _from_torch(attention_k.squeeze(0).transpose(0, 1), torch),
+        "attention_values": _from_torch(attention_v.squeeze(0).transpose(0, 1), torch),
+        "attention_gate": _from_torch(attention_gate, torch),
+        "attention_output_projection": _from_torch(attention_projection, torch),
+        "query_rope": _from_torch(attention_q_rot.squeeze(0).transpose(0, 1), torch),
+        "key_rope": _from_torch(attention_k_rot.squeeze(0).transpose(0, 1), torch),
+        "attention_weights": candidate_attention["attention_weights"],
+        "attention_head_output": candidate_attention["head_output"],
+        "attention_output": candidate_attention["output"],
         "rope_input": _from_torch(rope_value, torch),
+        "rope_output": candidate_rope,
         "source_rope": _from_torch(source_rope, torch),
         "candidate_rope": candidate_rope,
         "source_attention_weights": _from_torch(source_attention_weights, torch),
         "source_attention_head": _from_torch(source_attention_head, torch),
-        "attention_gate": _from_torch(attention_gate, torch),
         "source_attention_output": _from_torch(source_attention_output.squeeze(0), torch),
         "candidate_attention_output": candidate_attention["output"],
         "source_selected_token_mask": source_token_mask,
@@ -2426,6 +2759,19 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
     _assert_close(_from_torch(source_moe_output, torch), moe_candidate["output"], "MoE output", tolerance="f32_accumulation")
     moe_arrays = {
         "hidden": _from_torch(hidden_moe, torch),
+        "router_weight": _from_torch(router_weight_t, torch),
+        "gate_up_weight": _from_torch(gate_up_t, torch),
+        "down_weight": _from_torch(down_moe_t, torch),
+        "shared_gate_weight": _from_torch(source_shared_gate_t.squeeze(0), torch),
+        "shared_gate_up_weight": _from_torch(shared_gate_up_t, torch),
+        "shared_down_weight": _from_torch(shared_down_t, torch),
+        "router_logits": moe_candidate["router_logits"],
+        "selected_experts": moe_candidate["selected_experts"],
+        "routing_weights": moe_candidate["routing_weights"],
+        "routed_output": moe_candidate["routed_output"],
+        "shared_gate": moe_candidate["shared_gate"],
+        "shared_output": moe_candidate["shared_output"],
+        "output": moe_candidate["output"],
         "source_router_logits": _from_torch(source_router_logits, torch),
         "source_selected_experts": source_indices_tensor,
         "source_routing_weights": _from_torch(source_scores, torch),
@@ -2549,7 +2895,11 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
     )
     native_residual = _from_torch(mtp.layers[0].input.float(), torch)
     _assert_close(native_residual, local_mtp["residual_input"], "native MTP residual input", tolerance="bf16_input_f32_accumulation")
-    mtp_arrays = {
+    # Keep the pinned vLLM capture as a named source oracle.  The physical
+    # runner consumes a separately generated F32 candidate below; preserving
+    # both sets prevents the compact implementation fixture from replacing the
+    # source expectation.
+    source_mtp_arrays = {
         "token_ids": tensor((4,), [1, 5, 7, 9], "int64"),
         "token_embedding_bf16": _from_torch(embedding_words_t, torch),
         "backbone_hidden": _from_torch(backbone_t, torch),
@@ -2562,9 +2912,18 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
         "native_mtp_step0_indices": mtp_step_indices,
         "native_mtp_later_reused_indices": mtp_step_indices,
         "native_moe_output": _from_torch(mtp_layer.moe_output, torch),
-        "candidate_residual_input": local_mtp["residual_input"],
-        "candidate_embedding_norm": local_mtp["embedding_norm"],
-        "candidate_hidden_norm": local_mtp["hidden_norm"],
+        "equation_residual_input": local_mtp["residual_input"],
+        "equation_embedding_norm": local_mtp["embedding_norm"],
+        "equation_hidden_norm": local_mtp["hidden_norm"],
+    }
+    candidate_mtp_arrays = _generate_candidate_mtp(seed + 107, seed + 89)
+    mtp_arrays = {
+        # Generic names are the independently generated F32 candidate consumed
+        # by the production physical runner.
+        **candidate_mtp_arrays,
+        **{f"candidate_{name}": value for name, value in candidate_mtp_arrays.items()},
+        **{name: value for name, value in source_mtp_arrays.items() if name.startswith("native_")},
+        **{f"source_{name}": value for name, value in source_mtp_arrays.items()},
         **_source_arrays(records, "mtp"),
     }
 
@@ -2590,6 +2949,7 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
         (
             "ple_projection_dilated_conv",
             {
+                **ple_projection_arrays,
                 "source_ple_rows_bf16": ple_rows,
                 "source_ple_embedding_f32": bf16_to_f32(ple_rows),
                 "source_projection_hidden": ple_arrays["source_projection_hidden"],
@@ -2607,8 +2967,13 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
             gdn_arrays,
             {
                 "case": "gdn_recurrence_conv_head_expansion",
-                "equations": ["pinned Transformers recurrent gated-delta rule", "pinned Transformers chunk rule", "16 Q/K heads repeat_interleave to 48 V heads", "causal depthwise conv + SiLU"],
+                "equations": ["pinned Transformers recurrent gated-delta rule", "pinned Transformers chunk rule", "16 Q/K heads repeat_interleave to 48 V heads", "causal depthwise conv + SiLU", "upstream 1/sqrt(key_dim) query scale"],
                 "source_execution": "transformers_modeling.Qwen4ExpTextGatedDeltaNet forward primitives + repeat_interleave",
+                "oracle_sets": {
+                    "source": ["source_core_attention_output", "source_final_recurrent_state", "source_core_norm", "source_output_gate_sigmoid", "source_output"],
+                    "candidate": ["candidate_core_attention_output", "candidate_bf16_core_attention_output", "candidate_bf16_core_attention_output_f32", "candidate_final_recurrent_state", "candidate_core_norm", "candidate_output_gate_sigmoid", "candidate_output"],
+                },
+                "candidate_activation_boundary": "BF16 source Q/K raw values use BF16 product/reduction/rsqrt/output in l2norm, then promote to F32; query scale is a separate F32 multiply; BF16 source V promotes to F32; recurrent state remains F32; explicit F32->BF16->F32 cast before RMSNormGated; BF16 storage words, promoted F32 candidate, raw source BF16, and strict raw F32 candidate remain separately reported",
             },
         ),
         (
@@ -2636,6 +3001,12 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
                 "case": "native_mtp_embedding_qsa_moe_hc",
                 "equations": ["pinned vLLM residual_linear_shared MTP forward", "BF16 embedding and hidden projections", "native HC read/injection, QSA selection, and MoE output reuse"],
                 "source_execution": "vllm_mtp.Qwen4ExpMultiTokenPredictor.forward + pinned HC/QSA/MoE adapter",
+                "oracle_sets": {
+                    "source": sorted(f"source_{name}" for name in source_mtp_arrays),
+                    "native": sorted(name for name in source_mtp_arrays if name.startswith("native_")),
+                    "candidate": sorted(f"candidate_{name}" for name in candidate_mtp_arrays),
+                },
+                "candidate_activation_boundary": "independent deterministic F32 compact MTP equations; pinned vLLM source capture is retained under source_* and native_* arrays",
             },
         ),
     ]

@@ -102,6 +102,7 @@ pub fn qwen4_gdn_step(gpu: &mut Gpu, p: &Qwen4GdnStep<'_>) -> HipResult<()> {
     args.push_i32(p.value_heads as i32);
     args.push_i32(p.key_dim as i32);
     args.push_i32(p.value_dim as i32);
+    args.push_f32((p.key_dim as f32).sqrt().recip());
     args.pad_to(16);
     gpu.launch_kernel_blob(
         "qwen4_gdn_step_f32",
@@ -111,6 +112,46 @@ pub fn qwen4_gdn_step(gpu: &mut Gpu, p: &Qwen4GdnStep<'_>) -> HipResult<()> {
         args.as_mut_slice(),
     )
 }
+
+/// Device-side F32 -> BF16 storage -> F32 conversion at a source activation
+/// boundary.  `scratch` is caller-owned and is allocated with the forward
+/// arena; no host transfer or per-token allocation occurs.
+pub struct Qwen4GdnBf16Roundtrip<'a> {
+    pub input: &'a GpuTensor,
+    pub scratch: &'a GpuTensor,
+    pub output: &'a GpuTensor,
+    pub elements: usize,
+}
+
+pub fn qwen4_gdn_bf16_roundtrip(gpu: &mut Gpu, p: &Qwen4GdnBf16Roundtrip<'_>) -> HipResult<()> {
+    ensure_gfx1151(gpu)?;
+    ensure_f32(p.input)?;
+    ensure_f32(p.output)?;
+    if p.scratch.dtype != DType::BF16
+        || p.elements == 0
+        || p.input.numel() < p.elements
+        || p.scratch.numel() < p.elements
+        || p.output.numel() < p.elements
+        || p.elements > i32::MAX as usize
+    {
+        return Err(HipError::new(0, &Qwen4ComputeError::WrongShape.to_string()));
+    }
+    gpu.ensure_kernel_public("qwen4_ops", QWEN4_OPS_SRC, "qwen4_gdn_bf16_roundtrip_f32")?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.input.buf.as_ptr());
+    args.push_ptr(p.scratch.buf.as_ptr());
+    args.push_ptr(p.output.buf.as_ptr());
+    args.push_i32(p.elements as i32);
+    args.pad_to(16);
+    gpu.launch_kernel_blob(
+        "qwen4_gdn_bf16_roundtrip_f32",
+        [blocks(p.elements), 1, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+    )
+}
+
 pub struct Qwen4HcRead<'a> {
     pub input: &'a GpuTensor,
     pub norm_weight: &'a GpuTensor,

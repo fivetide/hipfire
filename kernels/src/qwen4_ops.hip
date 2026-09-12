@@ -2,8 +2,11 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// Qwen4 ordinary-HIP correctness kernels.  All accumulations are F32.  The
-// host side owns bounded arenas and passes explicit active lengths; no kernel
+// Q/K input values are source BF16 activations.  The recurrent state and
+// projections remain F32, but source l2norm intentionally performs its
+// multiply, reduction, rsqrt, and output multiply in BF16 before promotion.
+// Keep these helpers explicit so the boundary is not widened by F32 operators.
+// The host side owns bounded arenas and passes explicit active lengths; no kernel
 // performs host I/O or allocates memory.
 
 #include <hip/hip_runtime.h>
@@ -13,6 +16,16 @@ using __hip_bfloat16 = hip_bfloat16;
 
 static __device__ __forceinline__ float __bfloat162float(__hip_bfloat16 value) {
     return static_cast<float>(value);
+}
+
+static __device__ __forceinline__ __hip_bfloat16 qwen4_bf16_round(float value) {
+    return static_cast<__hip_bfloat16>(value);
+}
+
+static __device__ __forceinline__ __hip_bfloat16 qwen4_bf16_add(
+    __hip_bfloat16 lhs,
+    __hip_bfloat16 rhs) {
+    return qwen4_bf16_round(__bfloat162float(lhs) + __bfloat162float(rhs));
 }
 
 extern "C" __global__ void qwen4_hc_prepare_f32(
@@ -42,9 +55,10 @@ extern "C" __global__ void qwen4_hc_mix_f32(
     output[i] = sum / (float)branch_count;
 }
 
-// q/k contain 16 heads of width 128, v contains 48 heads of width 128.  Each
-// value head repeats one q/k head three times.  state is
-// [48, key_dim, value_dim], and gate is the precomputed log decay.
+// q/k/v are source BF16 activations promoted to the explicit F32 recurrent
+// state.  Each value head repeats one q/k head.  The source l2norm call runs
+// before that promotion, so its intermediate products, reduction, rsqrt, and
+// output are BF16.  Query scale is a separate F32 multiply after promotion.
 extern "C" __global__ void qwen4_gdn_step_f32(
     const float* q,
     const float* k,
@@ -56,22 +70,31 @@ extern "C" __global__ void qwen4_gdn_step_f32(
     int key_heads,
     int value_heads,
     int key_dim,
-    int value_dim) {
+    int value_dim,
+    float query_scale) {
     int value_head = (int)blockIdx.x;
     int value_index = (int)(blockIdx.y * blockDim.x + threadIdx.x);
     if (value_head >= value_heads || value_index >= value_dim) return;
     int repeat = value_heads / key_heads;
     int key_head = value_head / repeat;
-    float q_norm = 0.0f;
-    float k_norm = 0.0f;
+    const int key_base = key_head * key_dim;
+    float q_sum_f32 = 0.0f;
+    float k_sum_f32 = 0.0f;
+    const __hip_bfloat16 eps = qwen4_bf16_round(1.0e-6f);
     for (int kd = 0; kd < key_dim; ++kd) {
-        float qv = q[key_head * key_dim + kd];
-        float kv = k[key_head * key_dim + kd];
-        q_norm += qv * qv;
-        k_norm += kv * kv;
+        const __hip_bfloat16 q_value = qwen4_bf16_round(q[key_base + kd]);
+        const __hip_bfloat16 k_value = qwen4_bf16_round(k[key_base + kd]);
+        const float q_float = __bfloat162float(q_value);
+        const float k_float = __bfloat162float(k_value);
+        q_sum_f32 += __bfloat162float(qwen4_bf16_round(q_float * q_float));
+        k_sum_f32 += __bfloat162float(qwen4_bf16_round(k_float * k_float));
     }
-    q_norm = rsqrtf(q_norm + 1.0e-6f);
-    k_norm = rsqrtf(k_norm + 1.0e-6f);
+    const __hip_bfloat16 q_sum = qwen4_bf16_round(q_sum_f32);
+    const __hip_bfloat16 k_sum = qwen4_bf16_round(k_sum_f32);
+    const __hip_bfloat16 q_inv = qwen4_bf16_round(
+        rsqrtf(__bfloat162float(q_sum) + __bfloat162float(eps)));
+    const __hip_bfloat16 k_inv = qwen4_bf16_round(
+        rsqrtf(__bfloat162float(k_sum) + __bfloat162float(eps)));
     float decay = expf(gate[value_head]);
     float beta_value = beta[value_head];
     int state_base = value_head * key_dim * value_dim;
@@ -80,20 +103,48 @@ extern "C" __global__ void qwen4_gdn_step_f32(
     }
     float kv_mem = 0.0f;
     for (int kd = 0; kd < key_dim; ++kd) {
-        float kv = k[key_head * key_dim + kd] * k_norm;
+        const __hip_bfloat16 k_value = qwen4_bf16_round(k[key_base + kd]);
+        const __hip_bfloat16 k_normalized = qwen4_bf16_round(
+            __bfloat162float(k_value) * __bfloat162float(k_inv));
+        float kv = __bfloat162float(k_normalized);
         kv_mem += state[state_base + kd * value_dim + value_index] * kv;
     }
-    float delta = (v[value_head * value_dim + value_index] - kv_mem) * beta_value;
+    const __hip_bfloat16 v_value = qwen4_bf16_round(
+        v[value_head * value_dim + value_index]);
+    float delta = (__bfloat162float(v_value) - kv_mem) * beta_value;
     for (int kd = 0; kd < key_dim; ++kd) {
-        float kv = k[key_head * key_dim + kd] * k_norm;
+        const __hip_bfloat16 k_value = qwen4_bf16_round(k[key_base + kd]);
+        const __hip_bfloat16 k_normalized = qwen4_bf16_round(
+            __bfloat162float(k_value) * __bfloat162float(k_inv));
+        float kv = __bfloat162float(k_normalized);
         state[state_base + kd * value_dim + value_index] += kv * delta;
     }
     float out = 0.0f;
     for (int kd = 0; kd < key_dim; ++kd) {
-        float qv = q[key_head * key_dim + kd] * q_norm;
+        const __hip_bfloat16 q_value = qwen4_bf16_round(q[key_base + kd]);
+        const __hip_bfloat16 q_normalized = qwen4_bf16_round(
+            __bfloat162float(q_value) * __bfloat162float(q_inv));
+        float qv = __bfloat162float(q_normalized);
+        qv *= query_scale;
         out += state[state_base + kd * value_dim + value_index] * qv;
     }
     output[value_head * value_dim + value_index] = out;
+}
+
+// Source HF executes the recurrent/chunk result through a hidden BF16 cast
+// before RMSNormGated.  Keep the compact production buffer F32 for the
+// existing gate kernel while forcing the exact bounded BF16 storage boundary
+// through a caller-owned device scratch tensor.
+extern "C" __global__ void qwen4_gdn_bf16_roundtrip_f32(
+    const float* input,
+    __hip_bfloat16* scratch,
+    float* output,
+    int elements) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= elements) return;
+    __hip_bfloat16 rounded = static_cast<__hip_bfloat16>(input[i]);
+    scratch[i] = rounded;
+    output[i] = __bfloat162float(scratch[i]);
 }
 
 // Learned HC read/mix. `norm_weight` is resident BF16; down/up projections
@@ -270,8 +321,12 @@ extern "C" __global__ void qwen4_gdn_gate_bf16_f32(
     float inv = rsqrtf(sum / (float)value_dim + 1.0e-6f);
     float normalized = recurrent[start + channel] * inv
         * (1.0f + __bfloat162float(norm[channel]));
+    // HF RMSNormGated casts the normalized hidden back to the input BF16
+    // dtype before applying the output sigmoid gate.
+    __hip_bfloat16 normalized_bf16 = static_cast<__hip_bfloat16>(normalized);
+    float normalized_hidden = __bfloat162float(normalized_bf16);
     float gate = z[start + channel];
-    output[start + channel] = normalized / (1.0f + expf(-gate));
+    output[start + channel] = normalized_hidden / (1.0f + expf(-gate));
     (void)width;
 }
 extern "C" __global__ void qwen4_qsa_norm_rope_f32(
