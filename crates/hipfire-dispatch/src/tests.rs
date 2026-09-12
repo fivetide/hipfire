@@ -775,6 +775,35 @@ fn gemv_steps_rotation_matches_plan() {
 // ── GemvFamily::resolve via populated table ───────────────────────────────────
 
 #[test]
+fn mq4g128v2_is_explicitly_rejected_by_dispatch_families() {
+    let gemv = GemvFamily::new();
+    for variant in [
+        GemvVariant::Plain,
+        GemvVariant::Prerotated,
+        GemvVariant::WithResidual,
+        GemvVariant::WithSwiGLUResidual,
+    ] {
+        let result = gemv.resolve(DType::MQ4G128V2, variant, false, &ctx_rdna3(), None);
+        match result {
+            Err(DispatchError::UnsupportedVariant { quant, variant, .. }) => {
+                assert_eq!(quant, "MQ4G128V2");
+                assert_eq!(variant, "mq4g128v2_cpu_only");
+            }
+            other => panic!("qt53 GEMV unexpectedly resolved: {other:?}"),
+        }
+    }
+
+    let gemm = crate::families::gemm::GemmFamily::new();
+    match gemm.resolve(DType::MQ4G128V2, &ctx_rdna3(), None) {
+        Err(DispatchError::UnsupportedVariant { quant, variant, .. }) => {
+            assert_eq!(quant, "MQ4G128V2");
+            assert_eq!(variant, "mq4g128v2_cpu_only");
+        }
+        other => panic!("qt53 GEMM unexpectedly resolved: {other:?}"),
+    }
+}
+
+#[test]
 fn gemv_family_resolves_f32_on_all_archs() {
     let fam = GemvFamily::new();
     assert!(fam

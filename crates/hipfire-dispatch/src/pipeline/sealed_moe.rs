@@ -2066,6 +2066,11 @@ fn validate_resource_header(
     alignment: usize,
     basis: RotationPlan,
 ) -> Result<(), DispatchError> {
+    if dtype == DType::MQ4G128V2 {
+        return Err(invalid(
+            "MQ4G128V2 (qt=53) is CPU/wire-only; expert GPU dispatch is unsupported",
+        ));
+    }
     if source_name.is_empty() {
         return Err(invalid("expert source name is empty"));
     }

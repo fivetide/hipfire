@@ -128,15 +128,18 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         // falling through to RotationPlan::None leaves x unrotated against weights
         // that were encoded post-rotation, which is silent garbage, not an error.
         MQ4G128 => RotationPlan::FwhtG128,
+        // MQ4G128V2 is a CPU/wire representation only.  There is no GPU
+        // decoder or rotation route for this dtype.
+        MQ4G128V2 => RotationPlan::None,
         MQ8G256 => RotationPlan::Mq8Internal,
         ParoQ4G128 => RotationPlan::Givens,
         // MQ2G256LloydU is the UNROTATED Lloyd sibling: its weights are encoded
         // in the natural basis, so x must NOT be rotated. Stated explicitly
         // rather than left to the `_` fallthrough below — by the same argument
-        // as the comment above, a dtype that lands on `None` by accident rather
-        // than by intent is precisely the silent-garbage failure mode, and
-        // whoever adds the next Lloyd variant should be forced to decide which
-        // side of this line it belongs on.
+        // as the comment above, a dtype that lands on `None` by accident
+        // rather than by intent is precisely the silent-garbage failure mode,
+        // and whoever adds the next Lloyd variant should be forced to decide
+        // which side of this line it belongs on.
         MQ2G256LloydU => RotationPlan::None,
         _ => RotationPlan::None,
     }
@@ -153,9 +156,10 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
         // prerotated GEMV route.
         MQ4G256 | MQ4G256V2 | MQ5G256V2 | MQ6G256V2 | MQ3G256V2 | MQ2G256V2 | MQ4CG256
         | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd | MQ3G256Lloyd
-        | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MQ4G128 => {
-            GemvVariant::Prerotated
-        }
+        | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA
+        | MFP3G32E8 | MFP2G32E8 | MQ4G128 => GemvVariant::Prerotated,
+        // Explicitly keep the CPU/wire-only codec out of GPU dispatch.
+        MQ4G128V2 => GemvVariant::Plain,
         _ => GemvVariant::Plain,
     }
 }
@@ -728,6 +732,13 @@ impl KernelKey {
             (Q4F16G64, Plain) => Ok(Self::GemvQ4F16G64),
             (Q4F16G32, Plain) => Ok(Self::GemvQ4F16G32),
             (Q8HFQ, Plain) => Ok(Self::GemvQ8HFQ),
+            // qt=53 is a CPU/wire codec until a dedicated GPU decoder exists.
+            (MQ4G128V2, _) => Err(DispatchError::UnsupportedVariant {
+                family: "gemv",
+                variant: "mq4g128v2_cpu_only",
+                arch: "",
+                quant: "MQ4G128V2",
+            }),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
                 variant: "unknown",
@@ -773,6 +784,12 @@ impl KernelKey {
             // Q4K/Q6K/HFQ3G256/HFQ6G256/HFQ2G256/HFP4G32). Rotation-needing dtypes not
             // enumerated above (e.g. MQ4G128 = FwhtG128) MUST NOT fall through — the
             // plain path would re-rotate already-rotated input — so they stay an Err.
+            MQ4G128V2 => Err(DispatchError::UnsupportedVariant {
+                family: "gemv",
+                variant: "mq4g128v2_cpu_only",
+                arch: "",
+                quant: "MQ4G128V2",
+            }),
             _ => {
                 if dtype_rotation_plan(dtype) == RotationPlan::None {
                     Self::for_gemv(dtype, GemvVariant::Plain, false)
@@ -806,6 +823,12 @@ impl KernelKey {
             MQ6G256 => Ok(Self::GemvMq6G256Residual),
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydResidual),
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydResidual),
+            MQ4G128V2 => Err(DispatchError::UnsupportedVariant {
+                family: "gemv",
+                variant: "mq4g128v2_cpu_only",
+                arch: "",
+                quant: "MQ4G128V2",
+            }),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
                 variant: "residual",
@@ -833,6 +856,12 @@ impl KernelKey {
             MQ6G256 => Ok(Self::GemvMq6G256SwiGLUResidual),
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydSwiGLUResidual),
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydSwiGLUResidual),
+            MQ4G128V2 => Err(DispatchError::UnsupportedVariant {
+                family: "gemv",
+                variant: "mq4g128v2_cpu_only",
+                arch: "",
+                quant: "MQ4G128V2",
+            }),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
                 variant: "swiglu_residual",
@@ -891,6 +920,9 @@ impl KernelKey {
             // inherits the identical arch gating.
             MQ2G256Lloyd | MQ2G256LloydU | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWave32,
             MQ2G256GL | MQ3G256GL | MQ4G256V2 | MQ2G256V2 | MQ3G256V2 | MQ5G256V2 | MQ6G256V2 | MQ4CG256 => ArchPredicate::HasWave32,
+            // qt=53 has no GPU implementation; keep it explicit so a future
+            // kernel cannot accidentally inherit a legacy MQ4G128 route.
+            MQ4G128V2 => ArchPredicate::Always,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }

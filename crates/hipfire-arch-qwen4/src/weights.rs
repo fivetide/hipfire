@@ -25,14 +25,51 @@ use rdna_compute::{DType, Gpu};
 use std::collections::BTreeSet;
 use std::fmt;
 
-/// Mixed Halo artifact recipe: all routed gate/up records use MQ4G256V2.
+/// MQ4-G256V2 is the aligned logical-K matrix representation.
 pub const ROUTED_GATE_UP_DTYPE: DType = DType::MQ4G256V2;
-/// Mixed Halo artifact recipe: all routed down records use the qt=3 Q8/F16
-/// runtime representation, carried by the existing Q8_0 wire tag.
-pub const ROUTED_DOWN_DTYPE: DType = DType::Q8_0;
+/// MQ4-G128V2 is the row-local fallback for non-256-aligned logical K.
+pub const ROUTED_DOWN_DTYPE: DType = DType::MQ4G128V2;
 pub const PLE_SHARD_ROWS: usize = 2_500_012;
 pub const PLE_ROW_WIDTH: usize = 160;
 pub const PLE_SHARD_COUNT: usize = 128;
+
+fn qwen4_quantized_dtype(dtype: DType) -> bool {
+    matches!(dtype, DType::MQ4G256V2 | DType::MQ4G128V2)
+}
+
+fn qwen4_quantizable_matrix(name: &str, shape: &[usize]) -> bool {
+    match shape.len() {
+        2 => {
+            !name.ends_with(".shared_expert_gate.weight")
+                && !name.contains(".ngram_embedding.shard_")
+        }
+        3 => name.ends_with(".experts.down_proj") || name.ends_with(".experts.gate_up_proj"),
+        _ => false,
+    }
+}
+
+fn qwen4_matrix_dtype(shape: &[usize]) -> DType {
+    let k = shape.last().copied().unwrap_or_default();
+    if k % 256 == 0 {
+        DType::MQ4G256V2
+    } else {
+        DType::MQ4G128V2
+    }
+}
+
+fn qwen4_target_dtype(name: &str, shape: &[usize], requested: DType) -> DType {
+    if qwen4_quantizable_matrix(name, shape)
+        && (requested == DType::BF16 || qwen4_quantized_dtype(requested))
+    {
+        qwen4_matrix_dtype(shape)
+    } else {
+        requested
+    }
+}
+
+fn qwen4_quant_source() -> DTypeConstraint {
+    DTypeConstraint::source_from_sources(vec![DType::BF16, DType::MQ4G256V2, DType::MQ4G128V2])
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub enum TensorRole {
@@ -102,6 +139,7 @@ impl TensorRef {
         if name.is_empty() || shape.is_empty() || shape.iter().any(|&dim| dim == 0) {
             return Err(WeightError::InvalidShape { name, shape });
         }
+        let dtype = qwen4_target_dtype(&name, &shape, dtype);
         Ok(Self {
             name,
             role,
@@ -224,25 +262,34 @@ impl Qwen4Manifest {
     pub fn build(config: &Qwen4Config) -> Result<Self, WeightError> {
         config.validate().map_err(WeightError::Config)?;
         let bf16 = DTypeConstraint::source_exact(DType::BF16);
-        // The source checkpoint is BF16, while a converted HFQM artifact
-        // presents routed records in their physical quantized dtype.  Admit
-        // exactly those two representations; never label a quant record BF16.
-        let quant_gate_up =
-            DTypeConstraint::source_from_sources(vec![DType::BF16, ROUTED_GATE_UP_DTYPE]);
-        let quant_down = DTypeConstraint::source_from_sources(vec![DType::BF16, ROUTED_DOWN_DTYPE]);
+        // Converted HFQM records may already carry either MQ4G256V2 (qt=44)
+        // or MQ4G128V2 (qt=53).  The source checkpoint itself remains BF16.
+        let quant_matrix = qwen4_quant_source();
         let model = |name: &str,
                      shape: Vec<usize>,
-                     dtype: DType,
+                     requested_dtype: DType,
                      policy: ShardPolicy,
                      source: &DTypeConstraint| {
+            let dtype = qwen4_target_dtype(name, &shape, requested_dtype);
+            let source = if qwen4_quantized_dtype(dtype) {
+                &quant_matrix
+            } else {
+                source
+            };
             WeightEntry::model_with_dtype_constraint(name, shape, dtype, source.clone(), policy)
         };
         let layer = |name: &str,
                      layer_idx: usize,
                      shape: Vec<usize>,
-                     dtype: DType,
+                     requested_dtype: DType,
                      policy: ShardPolicy,
                      source: &DTypeConstraint| {
+            let dtype = qwen4_target_dtype(name, &shape, requested_dtype);
+            let source = if qwen4_quantized_dtype(dtype) {
+                &quant_matrix
+            } else {
+                source
+            };
             WeightEntry::layer_with_dtype_constraint(
                 name,
                 layer_idx,
@@ -476,8 +523,7 @@ impl Qwen4Manifest {
                 hidden,
                 config,
                 &bf16,
-                &quant_gate_up,
-                &quant_down,
+                &quant_matrix,
             );
             if layer_idx == 1 {
                 push_ple_entries(
@@ -567,8 +613,7 @@ impl Qwen4Manifest {
             hidden,
             config,
             &bf16,
-            &quant_gate_up,
-            &quant_down,
+            &quant_matrix,
         );
 
         // These declarations preserve the exact I64 payload identities for
@@ -652,11 +697,17 @@ impl Qwen4Manifest {
 fn mtp_model(
     name: &str,
     shape: Vec<usize>,
-    dtype: DType,
+    requested_dtype: DType,
     policy: ShardPolicy,
     source: &DTypeConstraint,
 ) -> WeightEntry {
-    WeightEntry::model_with_dtype_constraint(name, shape, dtype, source.clone(), policy)
+    let dtype = qwen4_target_dtype(name, &shape, requested_dtype);
+    let source = if qwen4_quantized_dtype(dtype) {
+        qwen4_quant_source()
+    } else {
+        source.clone()
+    };
+    WeightEntry::model_with_dtype_constraint(name, shape, dtype, source, policy)
 }
 
 fn mtp_layer(
@@ -839,8 +890,7 @@ fn push_moe_entries<F>(
     hidden: usize,
     config: &Qwen4Config,
     bf16: &DTypeConstraint,
-    quant_gate_up: &DTypeConstraint,
-    quant_down: &DTypeConstraint,
+    quant_matrix: &DTypeConstraint,
 ) where
     F: Fn(&str, usize, Vec<usize>, DType, ShardPolicy, &DTypeConstraint) -> WeightEntry,
 {
@@ -854,7 +904,7 @@ fn push_moe_entries<F>(
             n_experts: config.num_experts,
             inner: Box::new(ShardPolicy::RowShard { axis: 2 }),
         },
-        quant_down,
+        quant_matrix,
     ));
     weights.push(layer(
         &format!("{moe}.experts.gate_up_proj"),
@@ -865,7 +915,7 @@ fn push_moe_entries<F>(
             n_experts: config.num_experts,
             inner: Box::new(ShardPolicy::ColumnShard { axis: 1 }),
         },
-        quant_gate_up,
+        quant_matrix,
     ));
     weights.push(layer(
         &format!("{moe}.gate.weight"),
@@ -1763,5 +1813,93 @@ mod tests {
                 ..
             }
         ));
+    }
+    #[test]
+    fn matrix_roles_select_q44_or_q53_and_keep_nonmatrices_bf16() {
+        let tensor = |name: &str, shape: &[usize]| {
+            TensorRef::new(
+                name,
+                TensorRole::SharedExpertUp,
+                None,
+                shape.to_vec(),
+                DType::BF16,
+            )
+            .expect("tensor reference")
+        };
+        assert_eq!(
+            tensor(
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                &[12288, 2560]
+            )
+            .dtype,
+            DType::MQ4G256V2
+        );
+        assert_eq!(
+            tensor(
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                &[7, 641]
+            )
+            .dtype,
+            DType::MQ4G128V2
+        );
+        assert_eq!(
+            tensor(
+                "model.language_model.layers.1.ple.ple_embedding.key_proj.weight",
+                &[2560, 641],
+            )
+            .dtype,
+            DType::MQ4G128V2
+        );
+        assert_eq!(
+            tensor(
+                "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
+                &[PLE_SHARD_ROWS, PLE_ROW_WIDTH],
+            )
+            .dtype,
+            DType::BF16
+        );
+        assert_eq!(
+            tensor(
+                "model.language_model.layers.0.mlp.shared_expert_gate.weight",
+                &[1, 641],
+            )
+            .dtype,
+            DType::BF16
+        );
+        assert_eq!(
+            tensor(
+                "model.language_model.layers.0.linear_attn.conv1d.weight",
+                &[10240, 1, 4],
+            )
+            .dtype,
+            DType::BF16
+        );
+        assert_eq!(
+            tensor("model.language_model.layers.0.linear_attn.A_log", &[48],).dtype,
+            DType::BF16
+        );
+    }
+
+    #[test]
+    fn quantized_matrix_entries_accept_bf16_and_both_wire_dtypes() {
+        let manifest = Qwen4Manifest::build(&pinned_config()).expect("pinned config manifest");
+        let entry = manifest
+            .entry(
+                "model.language_model.layers.3.self_attn.q_proj.weight",
+                Some(3),
+            )
+            .expect("q projection");
+        assert_eq!(entry.dtype, DType::MQ4G256V2);
+        assert!(entry.dtype_constraint.accepts(DType::BF16));
+        assert!(entry.dtype_constraint.accepts(DType::MQ4G256V2));
+        assert!(entry.dtype_constraint.accepts(DType::MQ4G128V2));
+        let ple = manifest
+            .entry(
+                "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
+                Some(1),
+            )
+            .expect("PLE shard");
+        assert_eq!(ple.dtype, DType::BF16);
+        assert!(!ple.dtype_constraint.accepts(DType::MQ4G128V2));
     }
 }

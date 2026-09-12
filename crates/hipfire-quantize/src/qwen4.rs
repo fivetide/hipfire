@@ -25,8 +25,7 @@ use hipfire_runtime::weight_manifest::ShardPolicy;
 use rdna_compute::DType;
 use serde_json::{json, Map, Value};
 
-use crate::quant_fwht::{gen_fwht_signs, quantize_mq4g256v2};
-use crate::quant_q4::quantize_q8f16;
+use crate::quant_fwht::{gen_fwht_signs, quantize_mq4g128v2, quantize_mq4g256v2};
 use hipfire_quantize::float16::bf16_to_f32;
 
 /// Native Qwen4 architecture ID reserved by the runtime registry.
@@ -43,10 +42,12 @@ const ROUTER_TOP_K: u32 = 10;
 const HIDDEN_WIDTH: u64 = 2_560;
 const GATE_UP_INTERMEDIATE: u64 = 1_280;
 const DOWN_INTERMEDIATE: u64 = 640;
-const MQ4_GROUP_SIZE: u64 = 256;
-const Q8_GROUP_SIZE: u64 = 32;
-const Q8_GROUP_BYTES: u64 = 34;
-const MQ4_GROUP_BYTES: u64 = 136;
+const MQ4G256V2_GROUP_SIZE: u64 = 256;
+const MQ4G256V2_GROUP_BYTES: u64 = 136;
+const MQ4G128V2_GROUP_SIZE: u64 = 128;
+const MQ4G128V2_GROUP_BYTES: u64 = 68;
+const MQ4G256V2_QUANT_TYPE: u8 = 44;
+const MQ4G128V2_QUANT_TYPE: u8 = 53;
 /// Raw signed-I64 records are a distinct HFQ type.  TidI32 is not a valid
 /// representation for Qwen4's hash metadata.
 const QWEN4_I64_QUANT_TYPE: u8 = 52;
@@ -59,6 +60,10 @@ pub(crate) const DEFAULT_ROW_CHUNK: usize = 256;
 const MAX_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
 /// Do not let an accidental CLI value turn a row stream into a tensor buffer.
 const MAX_ROW_CHUNK: usize = 1_024;
+
+fn qwen4_quantized_dtype(dtype: DType) -> bool {
+    matches!(dtype, DType::MQ4G256V2 | DType::MQ4G128V2)
+}
 
 #[derive(Debug)]
 pub(crate) struct Qwen4Options<'a> {
@@ -190,11 +195,11 @@ pub(crate) fn write_qwen4_artifact(options: &Qwen4Options<'_>) -> Result<Qwen4Su
             data_len: entry.data_len,
         })
         .collect();
-
+    let signs1_256 = gen_fwht_signs(42, 256);
+    let signs2_256 = gen_fwht_signs(1042, 256);
+    let signs1_128 = gen_fwht_signs(43, 128);
+    let signs2_128 = gen_fwht_signs(1043, 128);
     let temporary = temporary_output_path(options.output);
-    let _ = fs::remove_file(&temporary);
-    let signs1 = gen_fwht_signs(42, 256);
-    let signs2 = gen_fwht_signs(1042, 256);
     let write_result = hipfire_runtime::hfq::write_hfqm_package_streaming(
         &temporary,
         QWEN4_ARCH_ID,
@@ -204,8 +209,10 @@ pub(crate) fn write_qwen4_artifact(options: &Qwen4Options<'_>) -> Result<Qwen4Su
             stream_entry(
                 &plan.entries[index],
                 options.row_chunk,
-                &signs1,
-                &signs2,
+                &signs1_256,
+                &signs2_256,
+                &signs1_128,
+                &signs2_128,
                 writer,
             )
             .map_err(Qwen4Error::into_io)
@@ -1100,6 +1107,7 @@ fn is_vision_tensor(name: &str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ManifestRole {
     Bf16,
+    Matrix(DType),
     GateUp,
     Down,
     Ple,
@@ -1147,10 +1155,12 @@ impl ManifestIndex {
                 .collect::<Result<Vec<_>, _>>()?;
             let role = if entry.residency.is_external() {
                 ManifestRole::Ple
-            } else if entry.dtype == DType::MQ4G256V2 {
+            } else if entry.name.ends_with(".experts.gate_up_proj") && shape.len() == 3 {
                 ManifestRole::GateUp
-            } else if entry.dtype == DType::Q8_0 {
+            } else if entry.name.ends_with(".experts.down_proj") && shape.len() == 3 {
                 ManifestRole::Down
+            } else if qwen4_quantized_dtype(entry.dtype) {
+                ManifestRole::Matrix(entry.dtype)
             } else {
                 ManifestRole::Bf16
             };
@@ -1332,26 +1342,77 @@ fn validate_expert_shape(
     Ok((rows, k))
 }
 
-fn quantized_data_len(kind: ExpertKind, rows: u64, k: u64) -> Result<u64, Qwen4Error> {
-    let (group_size, group_bytes) = match kind {
-        ExpertKind::GateUp => (MQ4_GROUP_SIZE, MQ4_GROUP_BYTES),
-        ExpertKind::Down => (Q8_GROUP_SIZE, Q8_GROUP_BYTES),
-    };
-    if k % group_size != 0 {
+fn validate_matrix_shape(
+    tensor: &SourceTensor,
+    expected: &[u64],
+) -> Result<(u64, u64), Qwen4Error> {
+    if tensor.shape != expected {
         return Err(Qwen4Error::Invalid(format!(
-            "expert K={k} is not aligned to quantizer group {group_size}"
+            "{} has {:?}, expected manifest matrix shape {:?}",
+            tensor.name, tensor.shape, expected
         )));
     }
-    rows.checked_mul(k / group_size)
+    if tensor.shape.len() != 2 {
+        return Err(Qwen4Error::Invalid(format!(
+            "{} manifest matrix role requires a rank-2 tensor",
+            tensor.name
+        )));
+    }
+    let rows = tensor.shape[0];
+    let k = tensor.shape[1];
+    let expected_bytes = checked_bf16_bytes(&tensor.shape, &tensor.name)?;
+    if tensor.data_len() != expected_bytes {
+        return Err(Qwen4Error::Invalid(format!(
+            "{} has {} payload bytes, expected {}",
+            tensor.name,
+            tensor.data_len(),
+            expected_bytes
+        )));
+    }
+    Ok((rows, k))
+}
+
+fn quantized_data_len_for_dtype(dtype: DType, rows: u64, k: u64) -> Result<u64, Qwen4Error> {
+    let (group_size, group_bytes, require_aligned_k) = match dtype {
+        DType::MQ4G256V2 => (MQ4G256V2_GROUP_SIZE, MQ4G256V2_GROUP_BYTES, true),
+        DType::MQ4G128V2 => (MQ4G128V2_GROUP_SIZE, MQ4G128V2_GROUP_BYTES, false),
+        _ => {
+            return Err(Qwen4Error::Invalid(format!(
+                "unsupported Qwen4 matrix quant dtype {dtype:?}"
+            )))
+        }
+    };
+    if require_aligned_k && k % group_size != 0 {
+        return Err(Qwen4Error::Invalid(format!(
+            "matrix K={k} is not aligned to quantizer group {group_size}"
+        )));
+    }
+    let groups = if require_aligned_k {
+        k / group_size
+    } else {
+        k.checked_add(group_size - 1)
+            .and_then(|rounded| rounded.checked_div(group_size))
+            .ok_or_else(|| {
+                Qwen4Error::Invalid("quantized matrix group count overflows".to_string())
+            })?
+    };
+    rows.checked_mul(groups)
         .and_then(|groups| groups.checked_mul(group_bytes))
-        .ok_or_else(|| {
-            Qwen4Error::Invalid("quantized expert byte length overflows u64".to_string())
-        })
+        .ok_or_else(|| Qwen4Error::Invalid("quantized matrix byte length overflows".to_string()))
+}
+
+fn quantized_data_len(kind: ExpertKind, rows: u64, k: u64) -> Result<u64, Qwen4Error> {
+    let dtype = match kind {
+        ExpertKind::GateUp => DType::MQ4G256V2,
+        ExpertKind::Down => DType::MQ4G128V2,
+    };
+    quantized_data_len_for_dtype(dtype, rows, k)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EntryKind {
     Bf16,
+    Matrix(DType),
     GateUp,
     Down,
     Ple,
@@ -1676,7 +1737,7 @@ fn plan_entries(
                     let kind = match expected.role {
                         ManifestRole::GateUp => ExpertKind::GateUp,
                         ManifestRole::Down => ExpertKind::Down,
-                        ManifestRole::Bf16 | ManifestRole::Ple => {
+                        ManifestRole::Bf16 | ManifestRole::Matrix(_) | ManifestRole::Ple => {
                             unreachable!("matched expert manifest role")
                         }
                     };
@@ -1698,19 +1759,41 @@ fn plan_entries(
                         source: tensor,
                         name: String::new(),
                         quant_type: match kind {
-                            ExpertKind::GateUp => 44,
-                            ExpertKind::Down => 3,
+                            ExpertKind::GateUp => MQ4G256V2_QUANT_TYPE,
+                            ExpertKind::Down => MQ4G128V2_QUANT_TYPE,
                         },
                         shape,
                         group_size: match kind {
-                            ExpertKind::GateUp => MQ4_GROUP_SIZE as u32,
-                            ExpertKind::Down => Q8_GROUP_SIZE as u32,
+                            ExpertKind::GateUp => MQ4G256V2_GROUP_SIZE as u32,
+                            ExpertKind::Down => MQ4G128V2_GROUP_SIZE as u32,
                         },
                         data_len: expected_len,
                         kind: match kind {
                             ExpertKind::GateUp => EntryKind::GateUp,
                             ExpertKind::Down => EntryKind::Down,
                         },
+                    });
+                }
+                ManifestRole::Matrix(dtype) => {
+                    let (rows, k) = validate_matrix_shape(&tensor, &expected.shape)?;
+                    let expected_len = quantized_data_len_for_dtype(dtype, rows, k)?;
+                    let shape = shape_u32(&expected.shape, &tensor.name)?;
+                    resident.push(PlannedEntry {
+                        source: tensor,
+                        name: String::new(),
+                        quant_type: match dtype {
+                            DType::MQ4G256V2 => MQ4G256V2_QUANT_TYPE,
+                            DType::MQ4G128V2 => MQ4G128V2_QUANT_TYPE,
+                            _ => unreachable!("manifest matrix role must be a Qwen4 MQ4 dtype"),
+                        },
+                        shape,
+                        group_size: match dtype {
+                            DType::MQ4G256V2 => MQ4G256V2_GROUP_SIZE as u32,
+                            DType::MQ4G128V2 => MQ4G128V2_GROUP_SIZE as u32,
+                            _ => unreachable!("manifest matrix role must be a Qwen4 MQ4 dtype"),
+                        },
+                        data_len: expected_len,
+                        kind: EntryKind::Matrix(dtype),
                     });
                 }
                 ManifestRole::Bf16 => {
@@ -1941,8 +2024,12 @@ fn build_metadata(
             "version": 1,
             "stacked_experts": true,
             "routing": {"num_experts": ROUTED_EXPERTS, "top_k": ROUTER_TOP_K},
-            "gate_up": {"quant_type": 44, "format": "MQ4G256V2", "group_size": MQ4_GROUP_SIZE, "k": HIDDEN_WIDTH},
-            "down": {"quant_type": 3, "format": "Q8F16", "group_size": Q8_GROUP_SIZE, "k": DOWN_INTERMEDIATE},
+            "matrix": {
+                "aligned_k": {"quant_type": MQ4G256V2_QUANT_TYPE, "format": "MQ4G256V2", "group_size": MQ4G256V2_GROUP_SIZE},
+                "unaligned_k": {"quant_type": MQ4G128V2_QUANT_TYPE, "format": "MQ4G128V2", "group_size": MQ4G128V2_GROUP_SIZE}
+            },
+            "gate_up": {"quant_type": MQ4G256V2_QUANT_TYPE, "format": "MQ4G256V2", "group_size": MQ4G256V2_GROUP_SIZE, "k": HIDDEN_WIDTH},
+            "down": {"quant_type": MQ4G128V2_QUANT_TYPE, "format": "MQ4G128V2", "group_size": MQ4G128V2_GROUP_SIZE, "k": DOWN_INTERMEDIATE},
             "nonexpert": {"quant_type": 16, "format": "BF16", "byte_preserving": true},
             "mtp_experts": "same_as_trunk"
         }),
@@ -2057,12 +2144,14 @@ fn stream_raw_rows(
 
 fn stream_quantized_rows(
     tensor: &SourceTensor,
-    kind: ExpertKind,
+    dtype: DType,
     rows: u64,
     k: u64,
     row_chunk: usize,
-    signs1: &[f32],
-    signs2: &[f32],
+    signs1_256: &[f32],
+    signs2_256: &[f32],
+    signs1_128: &[f32],
+    signs2_128: &[f32],
     writer: &mut dyn Write,
 ) -> Result<(), Qwen4Error> {
     let row_bytes = k
@@ -2110,9 +2199,20 @@ fn stream_quantized_rows(
         let count_usize = usize::try_from(count).map_err(|_| {
             Qwen4Error::Invalid(format!("{} row count does not fit usize", tensor.name))
         })?;
-        let quantized = match kind {
-            ExpertKind::GateUp => quantize_mq4g256v2(&values, count_usize, k_usize, signs1, signs2),
-            ExpertKind::Down => quantize_q8f16(&values),
+        let quantized = match dtype {
+            DType::MQ4G256V2 => {
+                quantize_mq4g256v2(&values, count_usize, k_usize, signs1_256, signs2_256)
+            }
+            DType::MQ4G128V2 => {
+                quantize_mq4g128v2(&values, count_usize, k_usize, signs1_128, signs2_128)
+                    .map_err(Qwen4Error::Invalid)?
+            }
+            _ => {
+                return Err(Qwen4Error::Invalid(format!(
+                    "{} has unsupported Qwen4 quant dtype {dtype:?}",
+                    tensor.name
+                )))
+            }
         };
         writer
             .write_all(&quantized)
@@ -2125,8 +2225,10 @@ fn stream_quantized_rows(
 fn stream_entry(
     entry: &PlannedEntry,
     row_chunk: usize,
-    signs1: &[f32],
-    signs2: &[f32],
+    signs1_256: &[f32],
+    signs2_256: &[f32],
+    signs1_128: &[f32],
+    signs2_128: &[f32],
     writer: &mut dyn Write,
 ) -> Result<(), Qwen4Error> {
     match entry.kind {
@@ -2147,23 +2249,60 @@ fn stream_entry(
             };
             stream_raw_rows(&entry.source, row_width, 8, row_chunk, writer)
         }
-        EntryKind::GateUp | EntryKind::Down => {
-            let kind = match entry.kind {
-                EntryKind::GateUp => ExpertKind::GateUp,
-                EntryKind::Down => ExpertKind::Down,
-                EntryKind::Bf16 | EntryKind::Ple | EntryKind::I64(_) => unreachable!(),
-            };
-            let rows = entry.source.shape[0]
-                .checked_mul(entry.source.shape[1])
-                .ok_or_else(|| Qwen4Error::Invalid(format!("{} rows overflow", entry.name)))?;
+        EntryKind::Matrix(dtype) => {
+            if entry.source.shape.len() != 2 {
+                return Err(Qwen4Error::Invalid(format!(
+                    "{} matrix stream requires rank-2 source shape, got {:?}",
+                    entry.name, entry.source.shape
+                )));
+            }
             stream_quantized_rows(
                 &entry.source,
-                kind,
-                rows,
-                entry.source.shape[2],
+                dtype,
+                entry.source.shape[0],
+                entry.source.shape[1],
                 row_chunk,
-                signs1,
-                signs2,
+                signs1_256,
+                signs2_256,
+                signs1_128,
+                signs2_128,
+                writer,
+            )
+        }
+        EntryKind::GateUp | EntryKind::Down => {
+            let (dtype, rows, k) = match entry.kind {
+                EntryKind::GateUp => (
+                    DType::MQ4G256V2,
+                    entry.source.shape[0]
+                        .checked_mul(entry.source.shape[1])
+                        .ok_or_else(|| {
+                            Qwen4Error::Invalid(format!("{} rows overflow", entry.name))
+                        })?,
+                    entry.source.shape[2],
+                ),
+                EntryKind::Down => (
+                    DType::MQ4G128V2,
+                    entry.source.shape[0]
+                        .checked_mul(entry.source.shape[1])
+                        .ok_or_else(|| {
+                            Qwen4Error::Invalid(format!("{} rows overflow", entry.name))
+                        })?,
+                    entry.source.shape[2],
+                ),
+                EntryKind::Bf16 | EntryKind::Matrix(_) | EntryKind::Ple | EntryKind::I64(_) => {
+                    unreachable!()
+                }
+            };
+            stream_quantized_rows(
+                &entry.source,
+                dtype,
+                rows,
+                k,
+                row_chunk,
+                signs1_256,
+                signs2_256,
+                signs1_128,
+                signs2_128,
                 writer,
             )
         }
@@ -2172,7 +2311,6 @@ fn stream_entry(
 
 /// Bounded, mmap-free reopen plan used both by the producer and by fixture
 /// tests.  It is intentionally a plan rather than a payload reader: loading
-/// the 100+ GiB PLE records is the runtime's external-row responsibility.
 #[derive(Debug)]
 pub(crate) struct Qwen4ReopenPlan {
     pub(crate) arch_id: u32,
@@ -2328,7 +2466,10 @@ impl Qwen4ReopenPlan {
                 })?;
             pos += name_len;
             let quant_type = read_u8(&region, &mut pos, "quant type")?;
-            if !matches!(quant_type, 3 | 16 | 44 | QWEN4_I64_QUANT_TYPE) {
+            if !matches!(
+                quant_type,
+                16 | MQ4G256V2_QUANT_TYPE | MQ4G128V2_QUANT_TYPE | QWEN4_I64_QUANT_TYPE
+            ) {
                 return Err(Qwen4Error::Invalid(format!(
                     "Qwen4 artifact tensor {name} uses unknown quant type {quant_type}"
                 )));
@@ -2375,6 +2516,32 @@ impl Qwen4ReopenPlan {
             entries,
         })
     }
+}
+
+fn validate_quantized_output_len(
+    name: &str,
+    shape: &[u32],
+    data_len: u64,
+    dtype: DType,
+) -> Result<(), Qwen4Error> {
+    if shape.len() < 2 || shape.iter().any(|&dimension| dimension == 0) {
+        return Err(Qwen4Error::Invalid(format!(
+            "{name} {dtype:?} output requires a nonzero rank-2-or-higher matrix shape, got {shape:?}"
+        )));
+    }
+    let shape_u64 = shape
+        .iter()
+        .map(|&dimension| dimension as u64)
+        .collect::<Vec<_>>();
+    let rows = checked_product(&shape_u64[..shape_u64.len() - 1], name)?;
+    let k = *shape_u64.last().expect("rank checked above");
+    let expected = quantized_data_len_for_dtype(dtype, rows, k)?;
+    if expected != data_len {
+        return Err(Qwen4Error::Invalid(format!(
+            "{name} {dtype:?} payload is {data_len} bytes, expected {expected} for rows={rows} K={k}"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_output_entry_len(
@@ -2425,33 +2592,16 @@ fn validate_output_entry_len(
                 )));
             }
         }
-        44 => {
-            if shape != [512, 1280, 2560] {
-                return Err(Qwen4Error::Invalid(format!(
-                    "{name} MQ4 output shape {:?} is not [512,1280,2560]",
-                    shape
-                )));
-            }
-            let expected = quantized_data_len(ExpertKind::GateUp, 512 * 1280, 2560)?;
-            if expected != data_len {
-                return Err(Qwen4Error::Invalid(format!(
-                    "{name} MQ4 payload is {data_len} bytes, expected {expected}"
-                )));
-            }
+        MQ4G256V2_QUANT_TYPE => {
+            validate_quantized_output_len(name, shape, data_len, DType::MQ4G256V2)?;
+        }
+        MQ4G128V2_QUANT_TYPE => {
+            validate_quantized_output_len(name, shape, data_len, DType::MQ4G128V2)?;
         }
         3 => {
-            if shape != [512, 2560, 640] {
-                return Err(Qwen4Error::Invalid(format!(
-                    "{name} Q8 output shape {:?} is not [512,2560,640]",
-                    shape
-                )));
-            }
-            let expected = quantized_data_len(ExpertKind::Down, 512 * 2560, 640)?;
-            if expected != data_len {
-                return Err(Qwen4Error::Invalid(format!(
-                    "{name} Q8 payload is {data_len} bytes, expected {expected}"
-                )));
-            }
+            return Err(Qwen4Error::Invalid(format!(
+                "{name} uses obsolete qt=3 Q8F16; Qwen4 matrices require qt=44 or qt=53"
+            )));
         }
         other => {
             return Err(Qwen4Error::Invalid(format!(
@@ -2928,14 +3078,18 @@ mod tests {
     }
 
     #[test]
-    fn qwen4_recipe_geometry_has_no_padding_fallback() {
+    fn qwen4_recipe_geometry_uses_row_aware_formats() {
         assert_eq!(
             quantized_data_len(ExpertKind::GateUp, 512 * 1280, 2560).unwrap(),
             891_289_600
         );
         assert_eq!(
             quantized_data_len(ExpertKind::Down, 512 * 2560, 640).unwrap(),
-            891_289_600
+            445_644_800
+        );
+        assert_eq!(
+            quantized_data_len_for_dtype(DType::MQ4G128V2, 2, 129).unwrap(),
+            2 * 2 * MQ4G128V2_GROUP_BYTES
         );
         assert!(quantized_data_len(ExpertKind::GateUp, 1, 640).is_err());
         assert!(validate_expert_shape_stub(&[512, 1280, 2559], ExpertKind::GateUp).is_err());

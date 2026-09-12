@@ -87,6 +87,7 @@ impl QuantType {
             49 => Some(Self::MQ3G256V2),
             50 => Some(Self::MQ2G256V2),
             51 => Some(Self::MQ2G256LloydU),
+            53 => Some(Self::MQ4G128V2),
             _ => None,
         }
     }
@@ -139,7 +140,6 @@ pub(crate) enum QuantType {
     PARO4G128 = 28,  // ParoQuant native AWQ W4 + pairwise activation rotation metadata
     PARO4G128T = 29, // ParoQuant engine-tiled qweight [M/8, K] for coalesced GEMV reads
     // MFP4G32R    = 29, // v3  — HFP4G32 + online block-diag-128 rotation (AMD recipe)
-    // HFP8E5M2G32 = 30, // v2  — HFP8 E5M2 family
     MQ4G256Lloyd = 30, // MagnumQuant 4-bit + per-block Lloyd-Max 16-entry fp16 codebook (160 B/group)
     // Renumbered from 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
     // Models quantized pre-renumber MUST be re-quantized.
@@ -184,7 +184,6 @@ pub(crate) enum QuantType {
     // See findings/prismml-q2_0-layout.md.
     BQ1G128 = 41, // BQ1G128: PrismML Q1_0-compatible scale-only binary, g128, 18 B/blk
     // (1.14 bpw). [FP16 d][16B sign bits], bit set for +d.
-    // Byte-identical to GGUF ggml_type Q1_0=41.
     /// MQ4-G256 v2 (qt=44): FWHT-rotated 4-bit, per-128 asymmetric. 136 B/group,
     /// byte-identical to qt=13 (MQ4G256) except the 8 header bytes. Payload is
     /// unchanged: 128 B of 4-bit nibbles at offset 8, lane `t` reading the u32 at
@@ -233,8 +232,15 @@ pub(crate) enum QuantType {
     /// reproduces them exactly; FWHT would destroy that structure and force an
     /// approximation. Three slots are used, slot 3 duplicates slot 2 and is
     /// never indexed. 2.25 bpw. `K % 256 == 0`.
-    /// See `docs/design/2026-08-22-maple-preview-20b-a1b.md`.
     MQ2G256LloydU = 51,
+    /// MQ4-G128 v2 (qt=53): FWHT-rotated 4-bit, per-128 asymmetric affine.
+    /// Each logical row is independently tiled as `ceil(K/128)` groups; every
+    /// group is 68 B: `[0..2)` fp16 scale, `[2..4)` fp16 zero, `[4..68)`
+    /// 64 B low-nibble-even packed payload. The final partial group is zero
+    /// padded before FWHT. This is a CPU/wire format only until a dedicated
+    /// GPU decoder is implemented; it must never be interpreted as qt=44 or
+    /// the legacy MQ4G128.
+    MQ4G128V2 = 53,
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.

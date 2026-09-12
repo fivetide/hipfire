@@ -145,6 +145,14 @@ impl GemmFamily {
             DType::TQ2G128 => KernelKey::GemmTQ2G128Prefill,
             DType::BQ1G128 => KernelKey::GemmBQ1G128Prefill,
             DType::MQ4G256V2 => KernelKey::GemmMq4G256V2,
+            DType::MQ4G128V2 => {
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "gemm",
+                    variant: "mq4g128v2_cpu_only",
+                    arch: "",
+                    quant: "MQ4G128V2",
+                });
+            }
             DType::MQ6G256V2 => KernelKey::GemmMq6G256V2,
             DType::MQ5G256V2 => KernelKey::GemmMq5G256V2,
             DType::MQ3G256V2 => KernelKey::GemmMq3G256V2,
@@ -201,6 +209,14 @@ impl GemmFamily {
         gpu: &mut Gpu,
         params: &GemmParams,
     ) -> Result<(), DispatchError> {
+        if params.w.dtype == DType::MQ4G128V2 {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "gemm",
+                variant: "mq4g128v2_cpu_only",
+                arch: "",
+                quant: "MQ4G128V2",
+            });
+        }
         // Validate the explicit key is registered and arch-admissible. The
         // dispatcher-entry keys used at migrated prefill sites are registered
         // `ArchPredicate::Always`, so this never rejects on a supported build.

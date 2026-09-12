@@ -18,6 +18,14 @@ use crate::tables::gemv_table;
 use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
 use crate::types::*;
+fn reject_mq4g128v2() -> Result<(), DispatchError> {
+    Err(DispatchError::UnsupportedVariant {
+        family: "gemv",
+        variant: "mq4g128v2_cpu_only",
+        arch: "",
+        quant: "MQ4G128V2",
+    })
+}
 
 // ── Lightweight weight descriptor ──────────────────────
 
@@ -241,6 +249,9 @@ impl GemvFamily {
         input: RotInput,
         y: &GpuTensor,
     ) -> Result<(), DispatchError> {
+        if w.dtype == DType::MQ4G128V2 {
+            reject_mq4g128v2()?;
+        }
         let x_buf = match input {
             RotInput::Raw(x) => {
                 let plan = crate::types::dtype_rotation_plan(w.dtype);
@@ -303,6 +314,9 @@ impl GemvFamily {
         gpu: &mut Gpu,
         params: &GemvParams,
     ) -> Result<(), DispatchError> {
+        if params.w.dtype == DType::MQ4G128V2 {
+            reject_mq4g128v2()?;
+        }
         let shape = ShapeInfo {
             batch_size: 1,
             head_dim: 0,
@@ -352,6 +366,9 @@ impl GemvFamily {
         x: &GpuTensor,
         inputs: &RotateInputs,
     ) -> Result<RotatedActivation, DispatchError> {
+        if w.dtype == DType::MQ4G128V2 {
+            reject_mq4g128v2()?;
+        }
         let plan = crate::types::dtype_rotation_plan(w.dtype);
         if plan == RotationPlan::None {
             return Err(DispatchError::UnsupportedVariant {
@@ -557,6 +574,7 @@ fn dispatch_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchE
         MQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x, y, m, k)),
         MQ3G256Lloyd => hip!(gpu.gemv_mq3g256_lloyd_residual(w.buf, x, y, m, k)),
         MQ4G256Lloyd => hip!(gpu.gemv_mq4g256_lloyd_residual(w.buf, x, y, m, k)),
+        MQ4G128V2 => reject_mq4g128v2(),
         _ => Err(DispatchError::UnsupportedVariant {
             family: "gemv",
             variant: "residual",
@@ -598,6 +616,7 @@ fn dispatch_swiglu_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), Di
         MQ5G256 => hip!(gpu.gemv_hfq5g256_residual(w.buf, x_in, residual, m, k)),
         MQ3G256Lloyd => hip!(gpu.gemv_mq3g256_lloyd_residual(w.buf, x_in, residual, m, k)),
         MQ4G256Lloyd => hip!(gpu.gemv_mq4g256_lloyd_residual(w.buf, x_in, residual, m, k)),
+        MQ4G128V2 => reject_mq4g128v2(),
         _ => Err(DispatchError::UnsupportedVariant {
             family: "gemv",
             variant: "swiglu_residual",

@@ -83,3 +83,4 @@
 49  MQ3G256V2     passthrough
 50  MQ2G256V2     passthrough
 51  MQ2G256LloydU  passthrough  Maple native-ternary (unrotated MQ2-Lloyd)
+53  MQ4G128V2    passthrough

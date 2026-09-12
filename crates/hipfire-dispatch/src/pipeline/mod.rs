@@ -25,6 +25,42 @@ pub use steps::{execute_steps, FusedPattern, GemvInput, Step};
 // only at this step; not on any live path until wired behind HIPFIRE_FORWARD_LOWERED).
 pub mod superop;
 
+fn reject_mq4g128v2(dtype: DType, family: &'static str) -> Result<(), DispatchError> {
+    if dtype == DType::MQ4G128V2 {
+        return Err(DispatchError::UnsupportedVariant {
+            family,
+            variant: "mq4g128v2_cpu_only",
+            arch: "",
+            quant: "MQ4G128V2",
+        });
+    }
+    Ok(())
+}
+
+fn reject_mq4g128v2_moe(dtypes: &crate::families::moe::MoeDtypes<'_>) -> Result<(), DispatchError> {
+    let tagged = dtypes
+        .per_expert_gate_up
+        .is_some_and(|values| values.contains(&DType::MQ4G128V2))
+        || dtypes
+            .per_expert_down
+            .is_some_and(|values| values.contains(&DType::MQ4G128V2));
+    if tagged
+        || [
+            dtypes.router,
+            dtypes.shared_gate,
+            dtypes.shared_expert_gate,
+            dtypes.shared_expert_up,
+            dtypes.shared_expert_down,
+            dtypes.routed_gate_up,
+            dtypes.routed_down,
+        ]
+        .contains(&DType::MQ4G128V2)
+    {
+        return reject_mq4g128v2(DType::MQ4G128V2, "moe");
+    }
+    Ok(())
+}
+
 pub struct Pipeline {
     pub ops: &'static [PipelineOp],
 }
@@ -62,6 +98,7 @@ pub fn execute_pipeline(
     dtype: rdna_compute::DType,
     registry: &KernelRegistry,
 ) -> Result<(), DispatchError> {
+    reject_mq4g128v2(dtype, "pipeline")?;
     if let Some(key) = find_fused(registry, ctx, dtype, steps) {
         return dispatch_fused(ctx, gpu, key, params);
     }
@@ -436,6 +473,7 @@ pub(crate) fn shared_dense_down_kind(dtype: DType) -> Option<&'static str> {
         DType::MQ4G256 => Some("hfq4_sigmoid_scaled"),
         DType::MQ4G256V2 => Some("mq4v2_prerotated"),
         DType::MQ6G256V2 => Some("mq6v2_prerotated"),
+        DType::MQ4G128V2 => None,
         _ => Some("run_auto"),
     }
 }
@@ -456,6 +494,7 @@ pub fn run_uniform_moe_gate_up(
     k: usize,
     k_top: usize,
 ) -> Result<(), DispatchError> {
+    reject_mq4g128v2(dtype, "moe")?;
     let hip = |result: hip_bridge::HipResult<()>| {
         result.map_err(|error| DispatchError::Hip(error.to_string()))
     };
@@ -533,6 +572,7 @@ pub fn run_uniform_moe_down_expanded(
     k_top: usize,
     batch_size: usize,
 ) -> Result<(), DispatchError> {
+    reject_mq4g128v2(dtype, "moe")?;
     let hip = |result: hip_bridge::HipResult<()>| {
         result.map_err(|error| DispatchError::Hip(error.to_string()))
     };
@@ -595,6 +635,7 @@ pub(super) fn run_moe_decode(
     let p = call.decode_params().ok_or_else(|| {
         DispatchError::Hip("sealed moe: decode call has no decode operands".into())
     })?;
+    reject_mq4g128v2_moe(&p.dtypes)?;
 
     // Runtime guard matching the bias-aware decode guard (not debug_assert —
     // that would be stripped in release). batch_size=1 is the only valid
@@ -1806,6 +1847,7 @@ fn run_moe_decode_cpu_fallback(
     shared_gate: &GpuTensor,
     shared_up: &GpuTensor,
 ) -> Result<(), DispatchError> {
+    reject_mq4g128v2_moe(&p.dtypes)?;
     // EP (Ship 6 substrate-EP) is not wired through the generic CPU-top-K
     // fallback yet — it still accumulates into x_residual directly. The
     // fast-path (use_gpu_topk) covers all current EP-target MoE models
@@ -2890,6 +2932,7 @@ fn dispatch_grouped_gemm(
     paro_i8: bool,
     paro_i8_k8: bool,
 ) -> Result<(), DispatchError> {
+    reject_mq4g128v2(dtype, "moe")?;
     // Mixed per-expert: the merged grouped kernel carries the per-expert stride
     // via the dtype_tags table; takes priority over the uniform dtype dispatch.
     if let Some(tags) = expert_dtype_tags {
@@ -3093,6 +3136,7 @@ pub(super) fn run_moe_prefill(
     let p = call.prefill_params().ok_or_else(|| {
         DispatchError::Hip("sealed moe: prefill call has no prefill operands".into())
     })?;
+    reject_mq4g128v2_moe(&p.dtypes)?;
 
     let res = MoePrefillResolution::resolve(&p.dtypes, &ctx.arch, &ctx.flags);
     let force_mq4_grouped_fp16 = res.force_mq4_grouped_fp16 || p.force_mq4_grouped_fp16;

@@ -129,27 +129,29 @@ impl Qwen4ArtifactFormat {
     }
 }
 
-/// Quantized tensor format relevant to the Qwen4 mixed artifact recipe.
+/// Quantized tensor format relevant to the Qwen4 manifest recipe.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum QuantFormat {
-    /// MQ4G256V2, HFQM quant_type 44.
+    /// MQ4G256V2, HFQM quant_type 44, 136 B per 256 weights.
     Mq4G256V2,
-    /// Q8F16/Q8_0, HFQM quant_type 3.
-    Q8F16,
+    /// MQ4G128V2, HFQM quant_type 53, 68 B per 128 weights.
+    Mq4G128V2,
     /// Native bfloat16 record, HFQM quant_type 16.
     BF16,
+    /// Raw signed-I64 metadata record, HFQM quant_type 52.
+    I64,
     Other(String),
 }
 
-/// Shape/format identity for a routed expert projection.
+/// Shape/format identity for one logical matrix family.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct QuantTensorGeometry {
     pub format: QuantFormat,
-    /// HFQM quant_type byte (44 for MQ4G256V2, 3 for Q8F16).
+    /// HFQM quant_type byte (44 for MQ4G256V2, 53 for MQ4G128V2).
     pub quant_type: u8,
     /// Logical input width K of one projection row.
     pub k: usize,
-    /// Quantization block width.  Q8F16 uses the Q8_0 32-element block.
+    /// Quantization block width.
     pub block_size: usize,
 }
 
@@ -163,76 +165,144 @@ impl QuantTensorGeometry {
         }
     }
 
-    pub const fn q8f16(k: usize) -> Self {
+    pub const fn mq4g128v2(k: usize) -> Self {
         Self {
-            format: QuantFormat::Q8F16,
-            quant_type: 3,
+            format: QuantFormat::Mq4G128V2,
+            quant_type: 53,
             k,
-            block_size: 32,
+            block_size: 128,
         }
+    }
+
+    /// Bytes emitted for `rows` logical rows, including every row-local group.
+    ///
+    /// `None` means the geometry is not a valid exact extent (zero dimensions,
+    /// overflow, or an aligned MQ4G256V2 tensor whose K is not divisible by
+    /// 256).  The row product is intentionally supplied by the caller so
+    /// stacked expert and ordinary matrix shapes share this check.
+    pub fn payload_bytes(&self, rows: usize) -> Option<usize> {
+        if rows == 0 || self.k == 0 || self.block_size == 0 {
+            return None;
+        }
+        let group_bytes = match self.format {
+            QuantFormat::Mq4G256V2 if self.quant_type == 44 && self.block_size == 256 => 136,
+            QuantFormat::Mq4G128V2 if self.quant_type == 53 && self.block_size == 128 => 68,
+            _ => return None,
+        };
+        if matches!(self.format, QuantFormat::Mq4G256V2) && self.k % 256 != 0 {
+            return None;
+        }
+        let groups = self
+            .k
+            .checked_add(self.block_size - 1)?
+            .checked_div(self.block_size)?;
+        rows.checked_mul(groups)?.checked_mul(group_bytes)
     }
 }
 
-/// Exact per-projection and nonexpert storage recipe.  This is deliberately
-/// more specific than a format name: a valid format with the wrong K must be
-/// refused before dispatch.
+/// Exact Qwen4 manifest storage recipe.  Every logical matrix uses the
+/// aligned MQ4G256V2 form when K is divisible by 256 and the row-local
+/// MQ4G128V2 form otherwise.  Non-matrix payload classes retain their native
+/// wire representation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Qwen4QuantGeometry {
+    pub matrix_aligned: QuantTensorGeometry,
+    pub matrix_unaligned: QuantTensorGeometry,
     pub routed_gate_up: QuantTensorGeometry,
     pub routed_down: QuantTensorGeometry,
-    pub nonexpert_dtype: QuantFormat,
     pub ple_row_dtype: QuantFormat,
+    pub scalar_dtype: QuantFormat,
+    pub vector_dtype: QuantFormat,
+    pub conv_dtype: QuantFormat,
+    pub metadata_dtype: QuantFormat,
 }
 
 /// Compatibility spelling for callers that call expert projections simply
 /// gate/up and down.
 pub type QuantGeometry = Qwen4QuantGeometry;
 
+const ROUTED_GATE_UP_ROWS: usize = 512 * 1_280;
+const ROUTED_GATE_UP_BYTES: usize = 891_289_600;
+const ROUTED_DOWN_ROWS: usize = 512 * 2_560;
+const ROUTED_DOWN_BYTES: usize = 445_644_800;
+
 impl Qwen4QuantGeometry {
-    /// Selected Halo candidate recipe: routed gate/up MQ4G256V2, routed down
-    /// Q8F16, and byte-preserving BF16 nonexpert/PLE records.
-    pub const fn halo_mixed() -> Self {
+    /// Manifest-derived recipe for the pinned Qwen4 text checkpoint.
+    pub const fn manifest() -> Self {
         Self {
-            routed_gate_up: QuantTensorGeometry::mq4g256v2(2560),
-            routed_down: QuantTensorGeometry::q8f16(640),
-            nonexpert_dtype: QuantFormat::BF16,
+            matrix_aligned: QuantTensorGeometry::mq4g256v2(2_560),
+            matrix_unaligned: QuantTensorGeometry::mq4g128v2(640),
+            routed_gate_up: QuantTensorGeometry::mq4g256v2(2_560),
+            routed_down: QuantTensorGeometry::mq4g128v2(640),
             ple_row_dtype: QuantFormat::BF16,
+            scalar_dtype: QuantFormat::BF16,
+            vector_dtype: QuantFormat::BF16,
+            conv_dtype: QuantFormat::BF16,
+            metadata_dtype: QuantFormat::I64,
         }
     }
 
     pub const fn expected() -> Self {
-        Self::halo_mixed()
+        Self::manifest()
     }
 
-    /// Validate the exact geometry selected for the initial Qwen4 artifact.
+    /// Validate the exact matrix policy, native payload classes, and routed
+    /// extents selected by the Qwen4 manifest.
     pub fn validate(&self) -> Result<(), QuantAdmissionError> {
         let expected = Self::expected();
-        if self.routed_gate_up != expected.routed_gate_up {
+        for (component, got, expected_geometry) in [
+            (
+                "aligned matrix",
+                &self.matrix_aligned,
+                &expected.matrix_aligned,
+            ),
+            (
+                "unaligned matrix",
+                &self.matrix_unaligned,
+                &expected.matrix_unaligned,
+            ),
+            (
+                "routed gate/up",
+                &self.routed_gate_up,
+                &expected.routed_gate_up,
+            ),
+            ("routed down", &self.routed_down, &expected.routed_down),
+        ] {
+            if got != expected_geometry {
+                return Err(QuantAdmissionError::WrongGeometry {
+                    component,
+                    expected: expected_geometry.clone(),
+                    got: got.clone(),
+                });
+            }
+        }
+        for (component, got, expected_dtype) in [
+            ("PLE rows", &self.ple_row_dtype, &expected.ple_row_dtype),
+            ("scalars", &self.scalar_dtype, &expected.scalar_dtype),
+            ("vectors", &self.vector_dtype, &expected.vector_dtype),
+            ("convolution", &self.conv_dtype, &expected.conv_dtype),
+            ("metadata", &self.metadata_dtype, &expected.metadata_dtype),
+        ] {
+            if got != expected_dtype {
+                return Err(QuantAdmissionError::WrongDtype {
+                    component,
+                    expected: expected_dtype.clone(),
+                    got: got.clone(),
+                });
+            }
+        }
+        if self.routed_gate_up.payload_bytes(ROUTED_GATE_UP_ROWS) != Some(ROUTED_GATE_UP_BYTES) {
             return Err(QuantAdmissionError::WrongGeometry {
-                component: "routed gate/up",
+                component: "routed gate/up extent",
                 expected: expected.routed_gate_up,
                 got: self.routed_gate_up.clone(),
             });
         }
-        if self.routed_down != expected.routed_down {
+        if self.routed_down.payload_bytes(ROUTED_DOWN_ROWS) != Some(ROUTED_DOWN_BYTES) {
             return Err(QuantAdmissionError::WrongGeometry {
-                component: "routed down",
+                component: "routed down extent",
                 expected: expected.routed_down,
                 got: self.routed_down.clone(),
-            });
-        }
-        if self.nonexpert_dtype != expected.nonexpert_dtype {
-            return Err(QuantAdmissionError::WrongDtype {
-                component: "nonexpert",
-                expected: expected.nonexpert_dtype,
-                got: self.nonexpert_dtype.clone(),
-            });
-        }
-        if self.ple_row_dtype != expected.ple_row_dtype {
-            return Err(QuantAdmissionError::WrongDtype {
-                component: "PLE rows",
-                expected: expected.ple_row_dtype,
-                got: self.ple_row_dtype.clone(),
             });
         }
         Ok(())
@@ -254,8 +324,8 @@ impl Qwen4Artifact {
         }
     }
 
-    pub const fn halo_hfqm() -> Self {
-        Self::new(Qwen4ArtifactFormat::Hfqm, Qwen4QuantGeometry::halo_mixed())
+    pub const fn manifest_hfqm() -> Self {
+        Self::new(Qwen4ArtifactFormat::Hfqm, Qwen4QuantGeometry::manifest())
     }
 }
 
@@ -493,8 +563,10 @@ mod tests {
 
     #[test]
     fn text_mtp_single_hfqm_is_admitted() {
-        let request =
-            Qwen4AdmissionRequest::text_mtp(EffectiveMesh::single(), Qwen4Artifact::halo_hfqm());
+        let request = Qwen4AdmissionRequest::text_mtp(
+            EffectiveMesh::single(),
+            Qwen4Artifact::manifest_hfqm(),
+        );
         let admission = Qwen4Admission::admit(&config(), &request).unwrap();
         assert_eq!(admission.architecture_id, ARCH_ID);
         assert!(admission.capabilities.text);
@@ -504,7 +576,7 @@ mod tests {
     #[test]
     fn images_videos_meshes_and_formats_fail_closed() {
         let mut request =
-            Qwen4AdmissionRequest::text_ar(EffectiveMesh::single(), Qwen4Artifact::halo_hfqm());
+            Qwen4AdmissionRequest::text_ar(EffectiveMesh::single(), Qwen4Artifact::manifest_hfqm());
         request.modality = InputModality::Image;
         assert!(matches!(
             Qwen4Admission::admit(&config(), &request),
@@ -533,7 +605,7 @@ mod tests {
 
     #[test]
     fn wrong_quant_geometry_is_refused() {
-        let mut artifact = Qwen4Artifact::halo_hfqm();
+        let mut artifact = Qwen4Artifact::manifest_hfqm();
         artifact.quant_geometry.routed_down.k = 2560;
         let request = Qwen4AdmissionRequest::text_ar(EffectiveMesh::single(), artifact);
         assert!(matches!(
@@ -543,5 +615,37 @@ mod tests {
                 ..
             })
         ));
+    }
+    #[test]
+    fn manifest_recipe_has_exact_extents_and_native_payload_classes() {
+        let geometry = Qwen4QuantGeometry::manifest();
+        assert_eq!(
+            geometry
+                .matrix_aligned
+                .payload_bytes(2)
+                .expect("aligned matrix extent"),
+            2 * 10 * 136
+        );
+        assert_eq!(
+            geometry
+                .matrix_unaligned
+                .payload_bytes(2)
+                .expect("row-local matrix extent"),
+            2 * 5 * 68
+        );
+        assert_eq!(
+            geometry.routed_gate_up.payload_bytes(ROUTED_GATE_UP_ROWS),
+            Some(ROUTED_GATE_UP_BYTES)
+        );
+        assert_eq!(
+            geometry.routed_down.payload_bytes(ROUTED_DOWN_ROWS),
+            Some(ROUTED_DOWN_BYTES)
+        );
+        assert_eq!(geometry.ple_row_dtype, QuantFormat::BF16);
+        assert_eq!(geometry.scalar_dtype, QuantFormat::BF16);
+        assert_eq!(geometry.vector_dtype, QuantFormat::BF16);
+        assert_eq!(geometry.conv_dtype, QuantFormat::BF16);
+        assert_eq!(geometry.metadata_dtype, QuantFormat::I64);
+        geometry.validate().expect("manifest recipe");
     }
 }

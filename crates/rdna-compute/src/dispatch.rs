@@ -84,6 +84,13 @@ pub const GL_MQ3_GROUP_IDX_BYTES: usize = 96;
 /// half-wave uniform, lane-invariant scalar loads. `K % 256 == 0`.
 pub const MQ4V2_GROUP_BYTES: usize = 136;
 
+/// Per-group bytes for MQ4-G128 v2 (qt=53), a row-local CPU/wire format.
+///
+/// qt=53 has no GPU decoder yet.  Keep the constant here so runtime extent
+/// checks share the wire size without aliasing it to the legacy 72-byte
+/// `MQ4G128` layout.
+pub const MQ4G128V2_GROUP_BYTES: usize = 68;
+
 /// Per-group bytes for MQ4-G256-C (qt=45): 136 B/group, 4.25 bpw, byte-identical
 /// payload to MQ4G256 (qt=13) at the same offset. Pad layout (NOT the earlier
 /// 132 B planar layout):
@@ -328,14 +335,17 @@ pub enum DType {
     /// MQ3-G256 v2 (qt=49): FWHT-rotated, 104 B/group, neutral Magnum V2.
     /// Per-group 104 B: `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
     /// `[6..8)` fp16 z1, `[8..104)` 96 B 3-bit payload (8/3 B). Same half
-    /// semantics as MQ6G256V2. `K % 256 == 0`, 3.25 bpw.
+    /// MQ4-G128 v2 (qt=53): row-local FWHT-128, 68 B per `ceil(K/128)` group.
+    /// This is a CPU/wire representation only; GPU consumers must reject it
+    /// rather than treating it as legacy `MQ4G128` (72 B/group).
+    MQ4G128V2,
+    MQ4G128, // MagnumQuant: FWHT-128-rotated INT4 (72 bytes/group, same layout as HFQ4G128)
     MQ3G256V2,
     /// MQ2-G256 v2 (qt=50): FWHT-rotated, 72 B/group, neutral Magnum V2.
     /// Per-group 72 B: `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
     /// `[6..8)` fp16 z1, `[8..72)` 64 B 2-bit payload (4/B). Same half
     /// semantics as MQ6G256V2. `K % 256 == 0`, 2.25 bpw.
     MQ2G256V2,
-    MQ4G128, // MagnumQuant: FWHT-128-rotated INT4 (72 bytes/group, same layout as HFQ4G128)
     MQ8G256, // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target (258 bytes/group)
     MQ6G256, // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
     MQ5G256, // MagnumQuant: FWHT-rotated 5-bit (168 bytes/group, 5.25 bpw)
@@ -419,6 +429,7 @@ impl DType {
             | DType::HFQ6G256
             | DType::MQ4G256
             | DType::MQ4G256V2
+            | DType::MQ4G128V2
             | DType::MQ4CG256
             | DType::MQ6G256V2
             | DType::MQ5G256V2

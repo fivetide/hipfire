@@ -657,6 +657,7 @@ fn hfq_weight(
                 awq_scale: None,
             })
         }
+        53 => panic!("dflash: MQ4G128V2 (qt=53) is CPU/wire-only; no GPU decoder for {name}"),
         q => panic!("dflash: unsupported matrix quant_type {q} for {name}"),
     }?;
     // AWQ sidecar attachment — same allow-list as hfq.rs::load_weight_tensor
@@ -2156,6 +2157,10 @@ fn gemm_dispatch(
     let result = match w.gpu_dtype {
         DType::F32 => gpu.gemm_f32_batched(x, &w.buf, y, batch, w.k, w.m),
         DType::F16 => gpu.gemm_f16_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
+        DType::MQ4G128V2 => Err(hip_bridge::HipError::new(
+            0,
+            "dflash GEMM cannot consume MQ4G128V2: codec is CPU/wire-only",
+        )),
         DType::HFQ4G256 => gpu.gemm_hfq4g256_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::MQ4G256 => {
             // S7 draft collapse: rotate straight to the persistent F16 twin

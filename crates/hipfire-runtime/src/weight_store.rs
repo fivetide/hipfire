@@ -795,6 +795,7 @@ fn source_dtype(dtype: &str) -> Result<DType, String> {
         "HFQ6G256" => DType::HFQ6G256,
         "MQ4G256" => DType::MQ4G256,
         "MQ4G256V2" => DType::MQ4G256V2,
+        "MQ4G128V2" => DType::MQ4G128V2,
         "MQ4CG256" => DType::MQ4CG256,
         "MQ6G256V2" => DType::MQ6G256V2,
         "MQ5G256V2" => DType::MQ5G256V2,
@@ -832,8 +833,8 @@ fn source_dtype(dtype: &str) -> Result<DType, String> {
 fn quant_block_bytes(dtype: DType) -> usize {
     match dtype {
         DType::Q4K => 144,
-        DType::Q6K => 210,
         DType::HFQ4G256 | DType::MQ4G256 | DType::MQ4G256V2 => 136,
+        DType::MQ4G128V2 => 68,
         DType::MQ4CG256 => 136,
         DType::HFQ6G256 | DType::MQ6G256 | DType::MQ6G256V2 => 200,
         DType::Q8_0 => 34,
@@ -881,6 +882,61 @@ fn expected_float_bytes(shape: &[usize], dtype: DType) -> Option<usize> {
         .iter()
         .try_fold(1usize, |product, &dim| product.checked_mul(dim))
         .and_then(|elements| elements.checked_mul(dtype.size()))
+}
+
+/// Return the exact payload extent for formats whose packed bytes are
+/// row-shaped rather than `bytes-per-element`.  `shape` may include stacked
+/// expert dimensions; every dimension before K contributes to the row count.
+/// In particular, MQ4G128V2 is `rows * ceil(K/128) * 68`, not a flat
+/// `ceil(rows*K/128)` calculation.
+fn expected_payload_bytes(shape: &[usize], dtype: DType) -> Result<Option<usize>, String> {
+    if matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
+        return Ok(expected_float_bytes(shape, dtype));
+    }
+    let (group_size, group_bytes, require_aligned_k) = match dtype {
+        DType::MQ4G256V2 => (256usize, 136usize, true),
+        DType::MQ4G128V2 => (128usize, 68usize, false),
+        _ => return Ok(None),
+    };
+    if shape.len() < 2 {
+        return Err(format!(
+            "{dtype:?} payload shape {:?} must include row and K dimensions",
+            shape
+        ));
+    }
+    let k = *shape.last().expect("shape length checked");
+    if k == 0 {
+        return Err(format!("{dtype:?} payload K dimension cannot be zero"));
+    }
+    if require_aligned_k && k % group_size != 0 {
+        return Err(format!(
+            "{dtype:?} payload requires K%{group_size}==0, got K={k}"
+        ));
+    }
+    let rows = shape[..shape.len() - 1]
+        .iter()
+        .try_fold(1usize, |product, &dim| product.checked_mul(dim))
+        .ok_or_else(|| format!("{dtype:?} payload row count overflows usize"))?;
+    let groups_per_row = k
+        .checked_add(group_size - 1)
+        .ok_or_else(|| format!("{dtype:?} payload group count overflows usize"))?
+        / group_size;
+    rows.checked_mul(groups_per_row)
+        .and_then(|groups| groups.checked_mul(group_bytes))
+        .ok_or_else(|| format!("{dtype:?} payload byte length overflows usize"))
+        .map(Some)
+}
+
+fn validate_payload_extent(shape: &[usize], dtype: DType, actual: usize) -> Result<(), String> {
+    if let Some(expected) = expected_payload_bytes(shape, dtype)? {
+        if actual != expected {
+            return Err(format!(
+                "source payload has {actual} bytes, expected {expected} for {dtype:?} {:?}",
+                shape
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn upload_range_pooled(
@@ -1453,22 +1509,12 @@ where
                         ),
                     ));
                 }
-                if let Some(expected_bytes) = expected_float_bytes(&info.shape, dtype) {
-                    if expected_bytes != bytes.len() {
-                        return Err(rollback_fulfill_error(
-                            store,
-                            gpu,
-                            fulfill_entry_error(
-                                entry,
-                                format!(
-                                    "source payload has {} bytes, expected {expected_bytes} \
-                                     for {dtype:?} {:?}",
-                                    bytes.len(),
-                                    info.shape
-                                ),
-                            ),
-                        ));
-                    }
+                if let Err(reason) = validate_payload_extent(&info.shape, dtype, bytes.len()) {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(entry, reason),
+                    ));
                 }
                 let tensor = match upload_pooled_bytes(gpu, bytes, &entry.logical_shape) {
                     Ok(mut tensor) => {
@@ -1540,22 +1586,12 @@ where
                         ),
                     ));
                 }
-                if let Some(expected_bytes) = expected_float_bytes(&info.shape, dtype) {
-                    if expected_bytes != bytes.len() {
-                        return Err(rollback_fulfill_error(
-                            store,
-                            gpu,
-                            fulfill_entry_error(
-                                entry,
-                                format!(
-                                    "source payload has {} bytes, expected {expected_bytes} \
-                                     for {dtype:?} {:?}",
-                                    bytes.len(),
-                                    info.shape
-                                ),
-                            ),
-                        ));
-                    }
+                if let Err(reason) = validate_payload_extent(&info.shape, dtype, bytes.len()) {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(entry, reason),
+                    ));
                 }
                 let tensor = match upload_pooled_bytes(gpu, &bytes, &entry.logical_shape) {
                     Ok(mut tensor) => {
@@ -1628,6 +1664,25 @@ where
                         ),
                     ));
                 }
+                let range_len = match usize::try_from(descriptor.length) {
+                    Ok(length) => length,
+                    Err(_) => {
+                        return Err(rollback_fulfill_error(
+                            store,
+                            gpu,
+                            fulfill_entry_error(entry, "source range length does not fit usize"),
+                        ));
+                    }
+                };
+                if let Err(reason) =
+                    validate_payload_extent(descriptor.logical_shape(), dtype, range_len)
+                {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(entry, reason),
+                    ));
+                }
                 if entry.residency.is_external() {
                     if let Err(reason) = validate_external_range(entry, dtype, &descriptor) {
                         return Err(rollback_fulfill_error(
@@ -1645,34 +1700,6 @@ where
                         ));
                     }
                     continue;
-                }
-                let range_len = match usize::try_from(descriptor.length) {
-                    Ok(length) => length,
-                    Err(_) => {
-                        return Err(rollback_fulfill_error(
-                            store,
-                            gpu,
-                            fulfill_entry_error(entry, "source range length does not fit usize"),
-                        ));
-                    }
-                };
-                if let Some(expected_bytes) =
-                    expected_float_bytes(descriptor.logical_shape(), dtype)
-                {
-                    if expected_bytes != range_len {
-                        return Err(rollback_fulfill_error(
-                            store,
-                            gpu,
-                            fulfill_entry_error(
-                                entry,
-                                format!(
-                                    "source range has {range_len} bytes, expected {expected_bytes} \
-                                     for {dtype:?} {:?}",
-                                    descriptor.logical_shape()
-                                ),
-                            ),
-                        ));
-                    }
                 }
                 let tensor =
                     match upload_range_pooled(gpu, &descriptor, dtype, &entry.logical_shape) {
@@ -2236,7 +2263,7 @@ mod tests {
     }
     #[test]
     fn range_chunks_are_bounded_and_quant_block_aligned() {
-        for dtype in [DType::BF16, DType::F32, DType::MQ4G256V2] {
+        for dtype in [DType::BF16, DType::F32, DType::MQ4G256V2, DType::MQ4G128V2] {
             let alignment = quant_block_bytes(dtype);
             let total = RANGE_UPLOAD_CHUNK_BYTES.div_ceil(alignment) * alignment + alignment * 3;
             let mut offset = 0usize;
@@ -2409,9 +2436,25 @@ mod tests {
     }
 
     #[test]
+    fn mq4g128v2_extent_is_row_aware_and_exact() {
+        assert_eq!(
+            expected_payload_bytes(&[2, 129], DType::MQ4G128V2).unwrap(),
+            Some(2 * 2 * 68)
+        );
+        assert_eq!(
+            expected_payload_bytes(&[3, 5, 640], DType::MQ4G128V2).unwrap(),
+            Some(15 * 5 * 68)
+        );
+        assert!(validate_payload_extent(&[3, 5, 640], DType::MQ4G128V2, 15 * 5 * 68,).is_ok());
+        assert!(validate_payload_extent(&[2, 129], DType::MQ4G128V2, 2 * 68).is_err());
+        assert!(expected_payload_bytes(&[2, 512], DType::MQ4G256V2).is_ok());
+        assert!(expected_payload_bytes(&[2, 129], DType::MQ4G256V2).is_err());
+    }
+
+    #[test]
     fn source_dtype_mapping_is_explicit_and_rejects_unknown_formats() {
         assert_eq!(source_dtype("BF16").unwrap(), DType::BF16);
-        assert_eq!(source_dtype("mq4g256v2").unwrap(), DType::MQ4G256V2);
+        assert_eq!(source_dtype("mq4g128v2").unwrap(), DType::MQ4G128V2);
         assert!(source_dtype("I64").is_err());
     }
 }
