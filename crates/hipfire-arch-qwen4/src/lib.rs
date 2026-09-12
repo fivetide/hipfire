@@ -18,11 +18,13 @@ pub mod config;
 pub mod forward;
 pub mod gpu_forward;
 pub mod mtp;
+pub mod mtp_gpu;
 pub mod mtp_spec;
 pub mod ops;
 pub mod ple;
 pub mod ple_ops;
 pub mod ple_rows;
+pub(crate) mod projection;
 pub mod state;
 pub mod weights;
 

@@ -137,7 +137,6 @@ pub fn rms_norm(
     Ok(())
 }
 
-
 /// Prepare one HC residual branch: `(1 + w) * zero_centered_norm(x)`.
 pub fn hc_prepare(
     input: &[f32],
@@ -469,6 +468,7 @@ pub fn gdn_step(
         ));
     }
     let repeat = state.value_heads / state.key_heads;
+    let query_scale = (state.key_dim as f32).sqrt().recip();
     for value_head in 0..state.value_heads {
         let key_head = value_head / repeat;
         let q_slice = &q[key_head * state.key_dim..(key_head + 1) * state.key_dim];
@@ -498,6 +498,7 @@ pub fn gdn_step(
                 .map(|key_dim| {
                     state.recurrent[state_base + key_dim * state.value_dim + value_dim]
                         * q_norm[key_dim]
+                        * query_scale
                 })
                 .sum::<f32>();
         }

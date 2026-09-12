@@ -75,6 +75,16 @@ fn capability_rows() -> Vec<(GenerationRoute, GenerationRouteInputs)> {
             },
         ),
         (
+            GenerationRoute::Qwen4Spec,
+            GenerationRouteInputs {
+                arch_id: 16,
+                has_speculator: true,
+                speculator_is_mtp: true,
+                temp: 0.0,
+                ..base()
+            },
+        ),
+        (
             GenerationRoute::QwenDflash,
             GenerationRouteInputs {
                 arch_id: 5,
@@ -375,6 +385,82 @@ fn route_matrix_tools_absent_and_present() {
             );
         }
     }
+}
+
+#[test]
+fn qwen4_native_mtp_route_requires_explicit_greedy_request() {
+    let mtp = GenerationRouteInputs {
+        arch_id: 16,
+        has_speculator: true,
+        speculator_is_mtp: true,
+        temp: 0.0,
+        ..base()
+    };
+    assert_eq!(select_generation_route(&mtp), GenerationRoute::Qwen4Spec);
+
+    for refused in [
+        GenerationRouteInputs { temp: 0.7, ..mtp },
+        GenerationRouteInputs {
+            user_explicit_sampling: true,
+            ..mtp
+        },
+        GenerationRouteInputs {
+            min_p: Some(0.1),
+            ..mtp
+        },
+        GenerationRouteInputs {
+            nonneutral_penalties: true,
+            ..mtp
+        },
+        GenerationRouteInputs {
+            force_ar_chat: true,
+            ..mtp
+        },
+        GenerationRouteInputs {
+            temp_spec_env_off: true,
+            ..mtp
+        },
+        GenerationRouteInputs {
+            kv_adaptive: true,
+            ..mtp
+        },
+        GenerationRouteInputs {
+            speculator_is_mtp: false,
+            ..mtp
+        },
+        GenerationRouteInputs {
+            has_speculator: false,
+            ..mtp
+        },
+    ] {
+        assert_eq!(
+            select_generation_route(&refused),
+            GenerationRoute::Qwen4Ar,
+            "Qwen4 native MTP must refuse non-greedy or non-explicit inputs: {refused:?}"
+        );
+    }
+}
+#[test]
+fn qwen4_mtp_cache_planner_forces_cold_after_ar_transition() {
+    assert!(hipfire_generate::qwen::spec_cache_disabled_for(
+        "mtp", false
+    ));
+    assert!(!hipfire_generate::qwen::spec_cache_disabled_for(
+        "dflash", false
+    ));
+
+    let plan = hipfire_generate::qwen::plan_from_rendered(
+        &[10, 11],
+        vec![10, 11, 12],
+        false,
+        &[],
+        false,
+        "mtp",
+    );
+    assert!(!plan.cache_hit);
+    assert_eq!(plan.start_pos, 0);
+    assert_eq!(plan.cached_tokens, 0);
+    assert_eq!(plan.new_tokens, vec![10, 11, 12]);
 }
 
 #[test]

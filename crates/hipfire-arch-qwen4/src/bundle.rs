@@ -11,6 +11,7 @@
 
 use crate::config::Qwen4Config;
 use crate::gpu_forward::Qwen4GpuForward;
+use crate::mtp_gpu::{MtpGpuStateSnapshot, Qwen4MtpGpu};
 use crate::ple::PleHashMetadata;
 use crate::ple_rows::{PleRows, PleRowsError};
 use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
@@ -84,6 +85,16 @@ pub struct Qwen4Bundle {
     /// the published bundle so unload owns the scratch, expert pointer tables,
     /// and all per-layer dispatch state exactly once.
     pub(crate) execution: Option<Qwen4GpuForward>,
+    /// Reusable native MTP execution resources, attached only when the
+    /// admitted artifact carries the validated one-layer MTP head.
+    pub(crate) mtp: Option<Qwen4MtpGpu>,
+    /// Fixed target-side output buffers for the arch-generic speculative seam.
+    /// These are allocated with the ordinary forward owner and reused by every
+    /// verify/advance call.
+    pub(crate) spec_logits: Option<GpuTensor>,
+    pub(crate) spec_top1: Option<GpuTensor>,
+    pub(crate) spec_hidden: Option<GpuTensor>,
+    pub(crate) spec_host_top1: Vec<u8>,
 }
 
 impl Qwen4Bundle {
@@ -140,7 +151,7 @@ impl Qwen4Bundle {
                 ));
             }
         };
-        let state = match Qwen4State::new(gpu, &config, max_seq_len) {
+        let mut state = match Qwen4State::new(gpu, &config, max_seq_len) {
             Ok(state) => state,
             Err(error) => {
                 // `unload` consumes the reader and joins its worker even on a
@@ -155,6 +166,7 @@ impl Qwen4Bundle {
                 ));
             }
         };
+        state.bind_transaction_generation(transaction.inventory_len() as u64);
         Ok(Self {
             config,
             weights,
@@ -163,6 +175,11 @@ impl Qwen4Bundle {
             ple_metadata: metadata,
             weight_store: AttachedWeightStore::new(transaction),
             execution: None,
+            mtp: None,
+            spec_logits: None,
+            spec_top1: None,
+            spec_hidden: None,
+            spec_host_top1: Vec::new(),
         })
     }
 
@@ -227,8 +244,311 @@ impl Qwen4Bundle {
         }
         let forward = Qwen4GpuForward::new(gpu, self, max_chunk)
             .map_err(|error| BundleError::Forward(error.to_string()))?;
+        let logits_len = max_chunk
+            .checked_mul(self.config.vocab_size)
+            .ok_or_else(|| BundleError::Forward("spec logit scratch overflow".to_string()))?;
+        let spec_logits = match gpu.zeros(&[logits_len], rdna_compute::DType::F32) {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                let _ = forward.free_gpu(gpu);
+                return Err(BundleError::Hip(error));
+            }
+        };
+        let top1_len = match max_chunk.checked_mul(std::mem::size_of::<i32>()) {
+            Some(len) => len,
+            None => {
+                let _ = gpu.free_tensor(spec_logits);
+                let _ = forward.free_gpu(gpu);
+                return Err(BundleError::Forward(
+                    "spec argmax scratch overflow".to_string(),
+                ));
+            }
+        };
+        let spec_top1 = match gpu.zeros(&[top1_len], rdna_compute::DType::Raw) {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                let _ = gpu.free_tensor(spec_logits);
+                let _ = forward.free_gpu(gpu);
+                return Err(BundleError::Hip(error));
+            }
+        };
         self.execution = Some(forward);
+        self.spec_logits = Some(spec_logits);
+        self.spec_top1 = Some(spec_top1);
+        self.spec_host_top1 = vec![0; top1_len];
         Ok(())
+    }
+    /// Attach the reusable native MTP head and its bounded GPU state.
+    pub fn attach_mtp(&mut self, gpu: &mut Gpu, max_seq: usize) -> Result<(), BundleError> {
+        if self.mtp.is_some() {
+            return Err(BundleError::Forward(
+                "Qwen4 MTP resources are already attached".to_string(),
+            ));
+        }
+        let mtp = Qwen4MtpGpu::new(gpu, &self.weights, &self.config, max_seq)
+            .map_err(|error| BundleError::Forward(error.to_string()))?;
+        self.mtp = Some(mtp);
+        Ok(())
+    }
+
+    pub(crate) fn ensure_spec_hidden(
+        &mut self,
+        gpu: &mut Gpu,
+        rows: usize,
+    ) -> Result<(), BundleError> {
+        if rows == 0 {
+            return Err(BundleError::Forward(
+                "Qwen4 spec hidden capacity is zero".to_string(),
+            ));
+        }
+        let width = self
+            .config
+            .hc_count
+            .checked_mul(self.config.hidden_size)
+            .ok_or_else(|| BundleError::Forward("spec hidden width overflow".to_string()))?;
+        let elements = rows
+            .checked_mul(width)
+            .ok_or_else(|| BundleError::Forward("spec hidden capacity overflow".to_string()))?;
+        if let Some(hidden) = self.spec_hidden.as_ref() {
+            if hidden.dtype != rdna_compute::DType::F32 || hidden.numel() < elements {
+                return Err(BundleError::Forward(
+                    "Qwen4 spec hidden capacity is too small".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+        self.spec_hidden = Some(
+            gpu.zeros(&[elements], rdna_compute::DType::F32)
+                .map_err(BundleError::Hip)?,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn spec_forward_rows(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        capture_hidden: bool,
+    ) -> Result<Vec<u32>, BundleError> {
+        if tokens.is_empty() {
+            return Err(BundleError::Forward(
+                "Qwen4 spec forward cannot process an empty block".to_string(),
+            ));
+        }
+        let max_chunk = self
+            .execution
+            .as_ref()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+            })?
+            .scratch
+            .max_chunk;
+        if tokens.len() > max_chunk {
+            return Err(BundleError::Forward(format!(
+                "Qwen4 spec block length {} exceeds capacity {max_chunk}",
+                tokens.len()
+            )));
+        }
+        let vocab = self.config.vocab_size;
+        let logits_len = tokens
+            .len()
+            .checked_mul(vocab)
+            .ok_or_else(|| BundleError::Forward("Qwen4 spec logits overflow".to_string()))?;
+        let logits = self
+            .spec_logits
+            .as_ref()
+            .ok_or_else(|| BundleError::Forward("Qwen4 spec logits are not attached".to_string()))?
+            .sub_offset(0, logits_len);
+        let top1_len = tokens
+            .len()
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| BundleError::Forward("Qwen4 spec argmax overflow".to_string()))?;
+        let top1 = self
+            .spec_top1
+            .as_ref()
+            .ok_or_else(|| BundleError::Forward("Qwen4 spec argmax is not attached".to_string()))?
+            .sub_offset(0, top1_len);
+        let hidden = if capture_hidden {
+            let width = self
+                .config
+                .hc_count
+                .checked_mul(self.config.hidden_size)
+                .ok_or_else(|| BundleError::Forward("spec hidden width overflow".to_string()))?;
+            let hidden_len = tokens
+                .len()
+                .checked_mul(width)
+                .ok_or_else(|| BundleError::Forward("spec hidden row overflow".to_string()))?;
+            Some(
+                self.spec_hidden
+                    .as_ref()
+                    .ok_or_else(|| {
+                        BundleError::Forward("Qwen4 spec hidden is not allocated".to_string())
+                    })?
+                    .sub_offset(0, hidden_len),
+            )
+        } else {
+            None
+        };
+        let mut forward = self.execution.take().ok_or_else(|| {
+            BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+        })?;
+        let result = match hidden.as_ref() {
+            Some(hidden) => forward
+                .forward_chunk_with_wide_hidden(self, gpu, tokens, &logits, Some(&top1), hidden)
+                .map_err(|error| BundleError::Forward(error.to_string())),
+            None => forward
+                .forward_chunk(self, gpu, tokens, &logits, Some(&top1))
+                .map_err(|error| BundleError::Forward(error.to_string())),
+        };
+        self.execution = Some(forward);
+        result?;
+        let bytes_len = tokens.len() * std::mem::size_of::<i32>();
+        if self.spec_host_top1.len() < bytes_len {
+            return Err(BundleError::Forward(
+                "Qwen4 spec host argmax capacity is too small".to_string(),
+            ));
+        }
+        gpu.hip
+            .memcpy_dtoh(&mut self.spec_host_top1[..bytes_len], &top1.buf)
+            .map_err(BundleError::Hip)?;
+        let mut picks = Vec::with_capacity(tokens.len());
+        for bytes in self.spec_host_top1[..bytes_len].chunks_exact(4) {
+            picks.push(u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+        }
+        Ok(picks)
+    }
+
+    pub(crate) fn copy_spec_hidden_row_to(
+        &self,
+        gpu: &mut Gpu,
+        row: usize,
+        destination: &GpuTensor,
+    ) -> Result<(), BundleError> {
+        let width = self
+            .config
+            .hc_count
+            .checked_mul(self.config.hidden_size)
+            .ok_or_else(|| BundleError::Forward("spec hidden width overflow".to_string()))?;
+        if destination.dtype != rdna_compute::DType::F32 || destination.numel() != width {
+            return Err(BundleError::Forward(
+                "Qwen4 spec hidden destination shape mismatch".to_string(),
+            ));
+        }
+        let source = self.spec_hidden.as_ref().ok_or_else(|| {
+            BundleError::Forward("Qwen4 spec hidden is not allocated".to_string())
+        })?;
+        let offset = row
+            .checked_mul(width)
+            .ok_or_else(|| BundleError::Forward("spec hidden row offset overflow".to_string()))?;
+        if offset
+            .checked_add(width)
+            .is_none_or(|end| end > source.numel())
+        {
+            return Err(BundleError::Forward(
+                "Qwen4 spec hidden row is outside capture".to_string(),
+            ));
+        }
+        let source = source.sub_offset(offset, width);
+        gpu.copy_d2d(&source, destination, destination.byte_size())
+            .map_err(BundleError::Hip)
+    }
+
+    pub(crate) fn spec_capture_token(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+    ) -> Result<u32, BundleError> {
+        self.spec_forward_rows(gpu, std::slice::from_ref(&token), true)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 spec capture returned no argmax".to_string())
+            })
+    }
+
+    pub(crate) fn mtp_forward_token(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        backbone_hidden: Option<&GpuTensor>,
+        position: usize,
+    ) -> Result<u32, BundleError> {
+        let mtp = self.mtp.as_mut().ok_or_else(|| {
+            BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+        })?;
+        let result = match backbone_hidden {
+            Some(hidden) => {
+                mtp.forward_token(gpu, &self.weights, &self.config, token, hidden, position)
+            }
+            None => mtp.forward_token_from_state(gpu, &self.weights, &self.config, token, position),
+        };
+        result.map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    pub(crate) fn mtp_snapshot(
+        &mut self,
+        gpu: &mut Gpu,
+    ) -> Result<MtpGpuStateSnapshot, BundleError> {
+        self.mtp
+            .as_mut()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+            })?
+            .snapshot(gpu)
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    pub(crate) fn mtp_restore(
+        &mut self,
+        gpu: &mut Gpu,
+        snapshot: MtpGpuStateSnapshot,
+    ) -> Result<(), BundleError> {
+        self.mtp
+            .as_mut()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+            })?
+            .restore(gpu, snapshot)
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+    pub(crate) fn mtp_restore_retain(
+        &mut self,
+        gpu: &mut Gpu,
+        snapshot: MtpGpuStateSnapshot,
+    ) -> Result<(), BundleError> {
+        self.mtp
+            .as_mut()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+            })?
+            .restore_retain(gpu, snapshot)
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    pub(crate) fn mtp_validate_commit(
+        &self,
+        snapshot: MtpGpuStateSnapshot,
+    ) -> Result<(), BundleError> {
+        self.mtp
+            .as_ref()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+            })?
+            .validate_commit(snapshot)
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    pub(crate) fn mtp_commit_validated(&mut self, snapshot: MtpGpuStateSnapshot) {
+        if let Some(mtp) = self.mtp.as_mut() {
+            mtp.commit_validated(snapshot);
+        }
+    }
+
+    pub(crate) fn mtp_position(&self) -> Result<usize, BundleError> {
+        self.mtp
+            .as_ref()
+            .ok_or_else(|| BundleError::Forward("Qwen4 MTP resources are not attached".to_string()))
+            .map(Qwen4MtpGpu::position)
     }
 
     /// Run one token through the attached execution owner without exposing a
@@ -289,10 +609,15 @@ impl Qwen4Bundle {
 
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
         self.invalidate_ple_epoch()?;
-        self.state.reset(gpu).map_err(BundleError::State)
+        self.state.reset(gpu).map_err(BundleError::State)?;
+        if let Some(mtp) = self.mtp.as_mut() {
+            mtp.reset(gpu)
+                .map_err(|error| BundleError::Forward(error.to_string()))?;
+        }
+        Ok(())
     }
 
-    pub fn snapshot(&self, gpu: &mut Gpu) -> Result<Qwen4StateSnapshot, BundleError> {
+    pub fn snapshot(&mut self, gpu: &mut Gpu) -> Result<Qwen4StateSnapshot, BundleError> {
         self.quiesce_ple()?;
         self.state.snapshot(gpu).map_err(BundleError::State)
     }
@@ -306,6 +631,26 @@ impl Qwen4Bundle {
         self.state
             .restore(gpu, snapshot)
             .map_err(BundleError::State)
+    }
+    pub(crate) fn restore_retain(
+        &mut self,
+        gpu: &mut Gpu,
+        snapshot: Qwen4StateSnapshot,
+    ) -> Result<(), BundleError> {
+        self.quiesce_ple()?;
+        self.state
+            .restore_retain(gpu, snapshot)
+            .map_err(BundleError::State)
+    }
+
+    pub(crate) fn validate_commit(&self, snapshot: Qwen4StateSnapshot) -> Result<(), BundleError> {
+        self.state
+            .validate_commit(snapshot)
+            .map_err(BundleError::State)
+    }
+
+    pub(crate) fn commit_validated(&mut self, snapshot: Qwen4StateSnapshot) {
+        self.state.commit_validated(snapshot);
     }
 
     pub fn commit(
@@ -327,18 +672,37 @@ impl Qwen4Bundle {
             ple_rows,
             weight_store,
             execution,
+            mtp,
+            spec_logits,
+            spec_top1,
+            spec_hidden,
             ..
         } = self;
         let ple_result = ple_rows.unload().map(|_| ()).map_err(BundleError::PleRows);
         let execution_result = execution
             .map(|forward| forward.free_gpu(gpu).map_err(BundleError::Hip))
             .unwrap_or(Ok(()));
+        let mtp_result = mtp
+            .map(|mtp| {
+                mtp.free_gpu(gpu)
+                    .map_err(|error| BundleError::Forward(error.to_string()))
+            })
+            .unwrap_or(Ok(()));
+        let mut spec_error = None;
+        for tensor in [spec_logits, spec_top1, spec_hidden].into_iter().flatten() {
+            if let Err(error) = gpu.free_tensor(tensor) {
+                spec_error.get_or_insert(error);
+            }
+        }
+        let spec_result = spec_error.map_or(Ok(()), |error| Err(BundleError::Hip(error)));
         let state_result = state.free_gpu(gpu).map_err(BundleError::State);
         let weight_result = weights.free_gpu(gpu).map_err(BundleError::Hip);
         let store_result = weight_store.drain(gpu).map_err(BundleError::Hip);
         first_bundle_error([
             ple_result,
             execution_result,
+            mtp_result,
+            spec_result,
             state_result,
             weight_result,
             store_result,
@@ -577,7 +941,7 @@ fn cleanup_bundle_failure(
     }
 }
 
-fn first_bundle_error(results: [Result<(), BundleError>; 5]) -> Result<(), BundleError> {
+fn first_bundle_error(results: [Result<(), BundleError>; 7]) -> Result<(), BundleError> {
     let mut first = None;
     for result in results {
         if let Err(error) = result {

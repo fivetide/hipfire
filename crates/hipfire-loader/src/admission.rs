@@ -50,6 +50,12 @@ pub struct SourceAdmissionOptions {
     pub pflash: bool,
 }
 
+/// Native Qwen4 MTP is an explicit load intent. A missing field and an
+/// explicit disable both keep the carrier on its ordinary AR-only shape.
+pub(crate) const fn qwen4_native_mtp_requested(spec: SpecLoadCfg) -> bool {
+    matches!(spec.mtp, Some(true))
+}
+
 /// The source-only portion of Qwen4 admission. The validated config and
 /// inventory are reused by the executable Single carrier without reopening
 /// or reclassifying the HFQM path.
@@ -70,7 +76,11 @@ pub fn qwen4_request_admission(
     modality: InputModality,
     native_mtp: bool,
 ) -> Result<(), String> {
-    let capabilities = Qwen4Capabilities::text_ar();
+    let capabilities = if native_mtp {
+        Qwen4Capabilities::text_mtp()
+    } else {
+        Qwen4Capabilities::text_ar()
+    };
     if !capabilities.supports_modality(modality) {
         return Err(format!("qwen4: unsupported modality {modality:?}"));
     }
@@ -469,19 +479,34 @@ pub fn admit_source_with_options(
                 "qwen4: max_seq must be exactly 2048 (got {max_seq})"
             ));
         }
+        // The executable HFQM manifest always carries the validated one-layer
+        // MTP head. Native execution is opt-in: only `Some(true)` expresses
+        // the request to attach it; `None` and `Some(false)` remain AR-only.
+        let native_mtp = qwen4_native_mtp_requested(options.spec);
         if draft_path.is_some()
             || options.gemma4_drafter
             || options.cask
             || options.state_quant
             || options.non_single_compute
             || options.pflash
-            || options.spec.mtp.is_some_and(|enabled| enabled)
             || options.spec.dflash.is_some_and(|enabled| enabled)
             || options.spec.dspark.is_some_and(|enabled| enabled)
             || options.spec.ngram_draft.is_some_and(|enabled| enabled)
+            || options.spec.ddtree_budget.is_some()
+            || options.spec.ddtree_topk.is_some()
         {
             return Err(
-                "qwen4: requested DFlash, MTP, DSpark, n-gram, EAGLE, CASK, state-quant, PFlash, or non-Single option is unsupported"
+                "qwen4: requested DFlash, DSpark, n-gram, DDTree, EAGLE, CASK, state-quant, PFlash, or non-Single option is unsupported"
+                    .into(),
+            );
+        }
+        if native_mtp
+            && hipfire_runtime::config::retained_redline_default(
+                gpu_arch, "qwen4", path, pp, tp, true,
+            )
+        {
+            return Err(
+                "qwen4: native MTP cannot be admitted with retained Redline; load the non-MQ4R HFQM artifact or disable MTP"
                     .into(),
             );
         }
@@ -495,7 +520,7 @@ pub fn admit_source_with_options(
             &source,
             hipfire_arch_qwen4::EffectiveMesh::new(pp, tp, 1),
             InputModality::Text,
-            false,
+            native_mtp,
         )?;
         let carrier = resolve_carrier(&source)?;
         carrier.admit_topology(arch_id, is_dir, pp, kv_backend)?;
@@ -642,8 +667,22 @@ mod tests {
     }
 
     #[test]
+    fn qwen4_native_mtp_request_is_explicit() {
+        let mut spec = SpecLoadCfg::default();
+        assert!(!qwen4_native_mtp_requested(spec));
+
+        spec.mtp = Some(false);
+        assert!(!qwen4_native_mtp_requested(spec));
+
+        spec.mtp = Some(true);
+        assert!(qwen4_native_mtp_requested(spec));
+    }
+
+    #[test]
     fn qwen4_request_refuses_image_video_and_non_single_before_source_access() {
         let single = hipfire_arch_qwen4::EffectiveMesh::single();
+        assert!(qwen4_request_admission(single, InputModality::Text, true).is_ok());
+        assert!(qwen4_request_admission(single, InputModality::Text, false).is_ok());
         assert!(qwen4_request_admission(single, InputModality::Image, true).is_err());
         assert!(qwen4_request_admission(single, InputModality::Video, true).is_err());
         assert!(qwen4_request_admission(

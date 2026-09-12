@@ -29,10 +29,10 @@ pub enum Qwen4Capability {
     NativeMtp,
 }
 
-/// Qwen4 is text-only at the initial capability boundary. Image and video
-/// requests are represented as unsupported rather than silently routed to
-/// text. Native greedy-MTP remains reserved for the later adapter: this AR
-/// owner deliberately does not publish or accept it.
+/// Qwen4 is text-only at the modality boundary. Image and video requests are
+/// represented as unsupported rather than silently routed to text. Native
+/// greedy-MTP is a capability of the executable artifact when its validated
+/// MTP manifest is requested by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Qwen4Capabilities {
     pub text: bool,
@@ -51,10 +51,16 @@ impl Qwen4Capabilities {
         }
     }
 
-    /// Retain the source-compatible constructor name while keeping native
-    /// MTP disabled until its execution adapter is admitted.
+    /// Native MTP is enabled only for an explicitly requested executable
+    /// artifact. The artifact parser remains responsible for validating that
+    /// the one-layer MTP manifest/config is present.
     pub const fn text_mtp() -> Self {
-        Self::text_ar()
+        Self {
+            text: true,
+            native_mtp: true,
+            image: false,
+            video: false,
+        }
     }
 
     pub const fn supports_modality(self, modality: InputModality) -> bool {
@@ -452,7 +458,11 @@ impl Qwen4Admission {
         request: &Qwen4AdmissionRequest,
     ) -> Result<Self, AdmissionError> {
         config.validate().map_err(AdmissionError::InvalidConfig)?;
-        let capabilities = Qwen4Capabilities::text_ar();
+        let capabilities = if request.native_mtp {
+            Qwen4Capabilities::text_mtp()
+        } else {
+            Qwen4Capabilities::text_ar()
+        };
         if !capabilities.supports_modality(request.modality) {
             return Err(AdmissionError::UnsupportedModality(request.modality));
         }
@@ -573,17 +583,16 @@ mod tests {
     }
 
     #[test]
-    fn native_mtp_remains_unadmitted_until_adapter_lands() {
+    fn native_mtp_is_admitted_when_requested() {
         let request = Qwen4AdmissionRequest::text_mtp(
             EffectiveMesh::single(),
             Qwen4Artifact::manifest_hfqm(),
         );
-        assert!(matches!(
-            Qwen4Admission::admit(&config(), &request),
-            Err(AdmissionError::UnsupportedCapability(
-                Qwen4Capability::NativeMtp
-            ))
-        ));
+        let mtp = Qwen4Admission::admit(&config(), &request).expect("native MTP is admitted");
+        assert!(mtp.capabilities.text);
+        assert!(mtp.capabilities.native_mtp);
+        assert!(mtp.native_mtp);
+
         let ar = Qwen4Admission::admit(
             &config(),
             &Qwen4AdmissionRequest::text_ar(
@@ -594,6 +603,7 @@ mod tests {
         .expect("AR remains admitted");
         assert!(ar.capabilities.text);
         assert!(!ar.capabilities.native_mtp);
+        assert!(!ar.native_mtp);
     }
 
     #[test]

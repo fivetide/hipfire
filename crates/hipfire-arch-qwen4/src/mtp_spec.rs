@@ -12,8 +12,14 @@
 //! includes the seed, so `accept_len = num_accepted_tokens - 1` counts only
 //! accepted drafts.
 
+use crate::bundle::Qwen4Bundle;
 use crate::mtp::{MtpError, Qwen4MtpState};
-use hipfire_runtime::spec::{accept_greedy_prefix, MtpWindow, SpecStep};
+use crate::state::Qwen4StateSnapshot;
+use hipfire_runtime::spec::{
+    accept_greedy_prefix, MtpDrafter, MtpSpeculator, MtpWindow, SpecAdvance, SpecGrammar,
+    SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
+};
+use rdna_compute::{Gpu, GpuTensor};
 
 /// Result of one native greedy MTP target comparison.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +41,30 @@ pub struct NativeMtpAcceptance {
     pub next_seed: u32,
     /// Whether EOS terminated this window.
     pub hit_eos: bool,
+}
+impl NativeMtpAcceptance {
+    /// Whether EOS was an accepted draft rather than the verifier's bonus.
+    /// Accepted EOS remains a pending seed, so neither target nor MTP state
+    /// consumes that final token until the terminal flush.
+    pub fn accepted_eos(&self) -> bool {
+        self.hit_eos && self.committed.len() == self.accepted_drafts
+    }
+
+    /// Number of accepted drafts the target should commit before the pending
+    /// EOS seed. A bonus EOS is already predicted after this prefix and uses
+    /// the ordinary accepted-draft count.
+    pub fn target_commit_accept_len(&self) -> usize {
+        if self.accepted_eos() {
+            self.rollback_accept_len.saturating_sub(1)
+        } else {
+            self.rollback_accept_len
+        }
+    }
+
+    /// Captured target-hidden row that produced the next pending seed.
+    pub fn pending_hidden_row(&self) -> usize {
+        self.target_commit_accept_len()
+    }
 }
 
 /// Native MTP uses greedy target picks only.  A sampled request must fail
@@ -202,6 +232,687 @@ pub fn window_to_spec_step(window: MtpWindow) -> Result<SpecStep, String> {
         window.accepted,
     ))
 }
+/// Reusable Qwen4 target-side verify scratch.  GPU output buffers and the
+/// captured wide hidden rows belong to the bundle; this object owns only the
+/// checked-out rollback ticket and its fixed block capacity.
+pub struct Qwen4SpecScratch {
+    block_size: usize,
+    target_snapshot: Option<Qwen4StateSnapshot>,
+}
+
+impl SpecScratch for Qwen4SpecScratch {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn free(self: Box<Self>, _gpu: &mut Gpu) {
+        // A live ticket is consumed by verify/commit before the speculator is
+        // released.  Bundle teardown also owns the arena, so there is no
+        // independent GPU allocation to free here.
+        debug_assert!(
+            self.target_snapshot.is_none(),
+            "Qwen4 verify scratch dropped with an active target snapshot"
+        );
+    }
+}
+
+impl SpecTarget for Qwen4Bundle {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn reset_recurrent(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.reset(gpu)
+            .map_err(|error| format!("Qwen4 reset_recurrent: {error}"))
+    }
+
+    fn retry_reset_eligible(&self) -> bool {
+        true
+    }
+
+    fn new_spec_scratch(
+        &mut self,
+        gpu: &mut Gpu,
+        block_size: usize,
+    ) -> Result<Box<dyn SpecScratch>, String> {
+        let block_size = block_size.max(1);
+        let max_chunk = self
+            .execution
+            .as_ref()
+            .ok_or_else(|| "Qwen4 spec scratch requires attached forward resources".to_string())?
+            .scratch
+            .max_chunk;
+        if block_size > max_chunk {
+            return Err(format!(
+                "Qwen4 spec block size {block_size} exceeds forward capacity {max_chunk}"
+            ));
+        }
+        self.ensure_spec_hidden(gpu, block_size)
+            .map_err(|error| error.to_string())?;
+        Ok(Box::new(Qwen4SpecScratch {
+            block_size,
+            target_snapshot: None,
+        }))
+    }
+
+    fn spec_advance(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        start_pos: usize,
+        reset: bool,
+        abort: &dyn Fn() -> bool,
+        _hidden_out: Option<&mut Vec<f32>>,
+    ) -> Result<SpecAdvance, String> {
+        if reset {
+            self.reset_recurrent(gpu)?;
+        }
+        if tokens.is_empty() {
+            return Err("Qwen4 spec_advance cannot process an empty token slice".to_string());
+        }
+        if self.state.position != start_pos {
+            return Err(format!(
+                "Qwen4 spec_advance position mismatch: expected {}, got {start_pos}",
+                self.state.position
+            ));
+        }
+        let end_pos = start_pos
+            .checked_add(tokens.len())
+            .ok_or_else(|| "Qwen4 spec position overflow".to_string())?;
+        if end_pos > self.state.max_seq_len {
+            return Err(format!(
+                "Qwen4 spec advance end {end_pos} exceeds context capacity {}",
+                self.state.max_seq_len
+            ));
+        }
+        let max_chunk = self
+            .execution
+            .as_ref()
+            .ok_or_else(|| "Qwen4 forward resources are not attached".to_string())?
+            .scratch
+            .max_chunk;
+        let mut offset = 0usize;
+        let mut last_argmax = None;
+        while offset < tokens.len() {
+            if abort() {
+                self.reset_recurrent(gpu)?;
+                return Ok(SpecAdvance::Aborted);
+            }
+            let end = (offset + max_chunk).min(tokens.len());
+            let picks = self
+                .spec_forward_rows(gpu, &tokens[offset..end], false)
+                .map_err(|error| error.to_string())?;
+            last_argmax = picks.last().copied();
+            offset = end;
+        }
+        if self.state.position != end_pos {
+            return Err(format!(
+                "Qwen4 spec advance ended at {}, expected {end_pos}",
+                self.state.position
+            ));
+        }
+        Ok(SpecAdvance::Ready {
+            last_argmax: last_argmax.expect("non-empty spec advance produced no argmax"),
+            last_logits: None,
+        })
+    }
+
+    fn verify_block(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        _hidden_out: Option<&mut Vec<f32>>,
+    ) -> Result<Vec<u32>, String> {
+        let block_size = {
+            let s = scratch
+                .as_any_mut()
+                .downcast_mut::<Qwen4SpecScratch>()
+                .ok_or("Qwen4 verify_block: scratch is not Qwen4SpecScratch")?;
+            if s.target_snapshot.is_some() {
+                return Err("Qwen4 verify_block: target snapshot is already active".to_string());
+            }
+            s.block_size
+        };
+        if block.is_empty() || block.len() > block_size {
+            return Err(format!(
+                "Qwen4 verify block length {} is outside scratch capacity {block_size}",
+                block.len()
+            ));
+        }
+        if self.state.position != position {
+            return Err(format!(
+                "Qwen4 verify_block position mismatch: expected {}, got {position}",
+                self.state.position
+            ));
+        }
+        let end_pos = position
+            .checked_add(block.len())
+            .ok_or_else(|| "Qwen4 verify position overflow".to_string())?;
+        if end_pos > self.state.max_seq_len {
+            return Err(format!(
+                "Qwen4 verify end {end_pos} exceeds context capacity {}",
+                self.state.max_seq_len
+            ));
+        }
+        let snapshot = self.snapshot(gpu).map_err(|error| error.to_string())?;
+        scratch
+            .as_any_mut()
+            .downcast_mut::<Qwen4SpecScratch>()
+            .ok_or("Qwen4 verify_block: scratch is not Qwen4SpecScratch")?
+            .target_snapshot = Some(snapshot);
+        let result = self
+            .spec_forward_rows(gpu, block, true)
+            .map_err(|error| error.to_string());
+        if let Err(error) = &result {
+            let snapshot = scratch
+                .as_any_mut()
+                .downcast_mut::<Qwen4SpecScratch>()
+                .and_then(|s| s.target_snapshot.take());
+            if let Some(snapshot) = snapshot {
+                self.restore(gpu, snapshot)
+                    .map_err(|restore| format!("{error}; target restore failed: {restore}"))?;
+            }
+            return Err(error.clone());
+        }
+        if self.state.position != end_pos {
+            let mismatch = format!(
+                "Qwen4 verify ended at {}, expected {end_pos}",
+                self.state.position
+            );
+            let snapshot = scratch
+                .as_any_mut()
+                .downcast_mut::<Qwen4SpecScratch>()
+                .and_then(|s| s.target_snapshot.take());
+            if let Some(snapshot) = snapshot {
+                self.restore(gpu, snapshot)
+                    .map_err(|restore| format!("{mismatch}; target restore failed: {restore}"))?;
+            }
+            return Err(mismatch);
+        }
+        result
+    }
+
+    fn commit_prefix(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        accept_len: usize,
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+    ) -> Result<(), String> {
+        if block.is_empty() {
+            return Err("Qwen4 commit_prefix cannot commit an empty block".to_string());
+        }
+        let draft_len = block.len() - 1;
+        if accept_len > draft_len {
+            return Err(format!(
+                "Qwen4 commit_prefix accepts {accept_len} drafts out of {draft_len}"
+            ));
+        }
+        let verified_end = position
+            .checked_add(block.len())
+            .ok_or_else(|| "Qwen4 commit position overflow".to_string())?;
+        if self.state.position != verified_end {
+            return Err(format!(
+                "Qwen4 commit_prefix target position mismatch: expected {verified_end}, got {}",
+                self.state.position
+            ));
+        }
+        let committed_end = position
+            .checked_add(accept_len + 1)
+            .ok_or_else(|| "Qwen4 commit position overflow".to_string())?;
+        let snapshot = scratch
+            .as_any_mut()
+            .downcast_mut::<Qwen4SpecScratch>()
+            .ok_or("Qwen4 commit_prefix: scratch is not Qwen4SpecScratch")?
+            .target_snapshot
+            .take()
+            .ok_or("Qwen4 commit_prefix: target snapshot is not active")?;
+        if accept_len == draft_len {
+            return self
+                .commit(gpu, snapshot)
+                .map_err(|error| error.to_string());
+        }
+        self.restore(gpu, snapshot)
+            .map_err(|error| error.to_string())?;
+        self.spec_forward_rows(gpu, &block[..accept_len + 1], true)
+            .map(|_| ())
+            .map_err(|error| error.to_string())?;
+        if self.state.position != committed_end {
+            return Err(format!(
+                "Qwen4 commit_prefix replay ended at {}, expected {committed_end}",
+                self.state.position
+            ));
+        }
+        Ok(())
+    }
+
+    fn eos_token(&self) -> u32 {
+        self.config.eos_token_id
+    }
+
+    fn ctx_capacity(&self) -> usize {
+        self.state.max_seq_len
+    }
+}
+
+/// Native GPU MTP drafter.  The MTP operator/state stay model-owned by the
+/// target bundle; this adapter owns only the reusable verifier scratch and one
+/// pending target-hidden row needed to seed each MTP window.
+pub struct Qwen4MtpDrafter {
+    max_k: usize,
+    ctx_capacity: usize,
+    request: SpecRequestConfig,
+    scratch: Option<Box<dyn SpecScratch>>,
+    pending_hidden: Option<GpuTensor>,
+}
+
+impl Qwen4MtpDrafter {
+    pub fn new(max_k: usize, ctx_capacity: usize) -> Self {
+        Self {
+            max_k: max_k.clamp(1, 10),
+            ctx_capacity,
+            request: SpecRequestConfig::default(),
+            scratch: None,
+            pending_hidden: None,
+        }
+    }
+
+    fn bundle<'a>(target: &'a mut dyn SpecTarget) -> Result<&'a mut Qwen4Bundle, String> {
+        target
+            .as_any_mut()
+            .downcast_mut::<Qwen4Bundle>()
+            .ok_or_else(|| "Qwen4MtpDrafter: target is not a Qwen4Bundle".to_string())
+    }
+
+    fn ensure_resources(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+    ) -> Result<(), String> {
+        let width = {
+            let bundle = Self::bundle(target)?;
+            bundle.mtp_position().map_err(|error| error.to_string())?;
+            bundle
+                .config
+                .hc_count
+                .checked_mul(bundle.config.hidden_size)
+                .ok_or_else(|| "Qwen4 MTP hidden width overflow".to_string())?
+        };
+        if self.scratch.is_none() {
+            let scratch = target.new_spec_scratch(gpu, self.max_k + 1)?;
+            self.scratch = Some(scratch);
+        }
+        if self.pending_hidden.is_none() {
+            self.pending_hidden = Some(
+                gpu.zeros(&[width], rdna_compute::DType::F32)
+                    .map_err(|error| format!("Qwen4 MTP pending hidden allocation: {error}"))?,
+            );
+        }
+        Ok(())
+    }
+
+    fn pending_hidden(&self) -> Result<&GpuTensor, String> {
+        self.pending_hidden
+            .as_ref()
+            .ok_or_else(|| "Qwen4 MTP pending hidden is not allocated".to_string())
+    }
+}
+
+impl MtpDrafter for Qwen4MtpDrafter {
+    fn mtp_prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        prompt_tokens: &[u32],
+        _fill_tokens: &[u32],
+        _start_pos: usize,
+        _cache_hit: bool,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<u32, String> {
+        require_native_greedy(self.request.temp)?;
+        // Native Qwen4 MTP has no exact target+MTP suffix rehydration yet.
+        // Always discard any AR or stale MTP prefix and rebuild the complete
+        // rendered prompt from position zero.
+        if prompt_tokens.is_empty() {
+            return Err("Qwen4 native MTP prefill requires at least one prompt token".to_string());
+        }
+        target.reset_recurrent(gpu)?;
+        let fill_tokens = prompt_tokens;
+        let start_pos = 0usize;
+        self.ensure_resources(gpu, target)?;
+        {
+            let bundle = Self::bundle(target)?;
+            let target_position = bundle.state.position;
+            let mtp_position = bundle.mtp_position().map_err(|error| error.to_string())?;
+            if target_position != start_pos || mtp_position != start_pos {
+                return Err(format!(
+                    "Qwen4 MTP prefill position mismatch: target={}, mtp={}, start={start_pos}",
+                    target_position, mtp_position
+                ));
+            }
+        }
+        let pending = self.pending_hidden()?;
+        let mut first_token = None;
+        for (index, &token) in fill_tokens.iter().enumerate() {
+            if abort() {
+                target.reset_recurrent(gpu)?;
+                return Err("Qwen4 native MTP prefill aborted".to_string());
+            }
+            let position = start_pos
+                .checked_add(index)
+                .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
+            let bundle = Self::bundle(target)?;
+            let argmax = bundle
+                .spec_capture_token(gpu, token)
+                .map_err(|error| error.to_string())?;
+            bundle
+                .copy_spec_hidden_row_to(gpu, 0, pending)
+                .map_err(|error| error.to_string())?;
+            bundle
+                .mtp_forward_token(gpu, token, Some(pending), position)
+                .map_err(|error| error.to_string())?;
+            first_token = Some(argmax);
+        }
+        Ok(first_token.expect("non-empty MTP prefill produced no seed"))
+    }
+
+    fn mtp_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        _emitted: &[u32],
+        k: usize,
+        eos: u32,
+        _grammar: Option<&mut dyn SpecGrammar>,
+    ) -> Result<MtpWindow, String> {
+        require_native_greedy(self.request.temp)?;
+        if k > self.max_k {
+            return Err(format!(
+                "Qwen4 native MTP draft budget {k} exceeds configured K {}",
+                self.max_k
+            ));
+        }
+        self.ensure_resources(gpu, target)?;
+        {
+            let bundle = Self::bundle(target)?;
+            let target_position = bundle.state.position;
+            let mtp_position = bundle.mtp_position().map_err(|error| error.to_string())?;
+            if target_position != position || mtp_position != position {
+                return Err(format!(
+                    "Qwen4 MTP step position mismatch: target={}, mtp={}, position={position}",
+                    target_position, mtp_position
+                ));
+            }
+        }
+        let mut snapshot = {
+            let bundle = Self::bundle(target)?;
+            Some(
+                bundle
+                    .mtp_snapshot(gpu)
+                    .map_err(|error| error.to_string())?,
+            )
+        };
+        let result = (|| -> Result<MtpWindow, String> {
+            let mut drafts = Vec::with_capacity(k);
+            let mut input = seed;
+            for index in 0..k {
+                let hidden = if index == 0 {
+                    Some(self.pending_hidden()?)
+                } else {
+                    None
+                };
+                let token_position = position
+                    .checked_add(index)
+                    .ok_or_else(|| "Qwen4 MTP step position overflow".to_string())?;
+                input = Self::bundle(target)?
+                    .mtp_forward_token(gpu, input, hidden, token_position)
+                    .map_err(|error| error.to_string())?;
+                drafts.push(input);
+            }
+            let mut block = Vec::with_capacity(k + 1);
+            block.push(seed);
+            block.extend_from_slice(&drafts);
+            let picks = Self::bundle(target)?;
+            let pending_hidden = self
+                .pending_hidden
+                .as_ref()
+                .ok_or_else(|| "Qwen4 native MTP pending hidden is not allocated".to_string())?;
+            let scratch = self
+                .scratch
+                .as_mut()
+                .ok_or_else(|| "Qwen4 native MTP verify scratch is not allocated".to_string())?;
+            let target_picks = picks
+                .verify_block(gpu, &block, position, scratch.as_mut(), None)
+                .map_err(|error| error.to_string())?;
+            let acceptance = accept_native_greedy(&drafts, &target_picks, Some(eos))?;
+            let target_accept_len = acceptance.target_commit_accept_len();
+            let full_accept = target_accept_len == k;
+            let target_scratch = scratch
+                .as_any_mut()
+                .downcast_mut::<Qwen4SpecScratch>()
+                .ok_or("Qwen4 native MTP target scratch type changed")?;
+            let target_snapshot = target_scratch
+                .target_snapshot
+                .ok_or("Qwen4 native MTP target snapshot disappeared")?;
+
+            // Keep both pre-window tickets active until every replay and hidden
+            // copy succeeds. A retained restore lets the outer rollback repair
+            // both owners if either side's GPU work fails.
+            if !full_accept {
+                picks
+                    .restore_retain(gpu, target_snapshot)
+                    .map_err(|error| error.to_string())?;
+                picks
+                    .spec_forward_rows(gpu, &block[..target_accept_len + 1], true)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())?;
+            }
+            let mtp_ticket = snapshot
+                .as_ref()
+                .copied()
+                .expect("MTP snapshot remains active until transaction commit");
+            if full_accept && k > 0 {
+                let last_draft = *drafts
+                    .last()
+                    .ok_or_else(|| "Qwen4 native MTP full accept has no final draft".to_string())?;
+                let last_position = position
+                    .checked_add(k)
+                    .ok_or_else(|| "Qwen4 MTP step position overflow".to_string())?;
+                picks
+                    .mtp_forward_token(gpu, last_draft, None, last_position)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                picks
+                    .mtp_restore_retain(gpu, mtp_ticket)
+                    .map_err(|error| error.to_string())?;
+                for (index, &token) in block[..target_accept_len + 1].iter().enumerate() {
+                    let hidden = if index == 0 {
+                        Some(pending_hidden)
+                    } else {
+                        None
+                    };
+                    let token_position = position
+                        .checked_add(index)
+                        .ok_or_else(|| "Qwen4 MTP step position overflow".to_string())?;
+                    picks
+                        .mtp_forward_token(gpu, token, hidden, token_position)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            let committed_end = position
+                .checked_add(target_accept_len + 1)
+                .ok_or_else(|| "Qwen4 MTP commit position overflow".to_string())?;
+            if picks.state.position != committed_end
+                || picks.mtp_position().map_err(|error| error.to_string())? != committed_end
+            {
+                return Err(format!(
+                    "Qwen4 native MTP transaction ended at target={} mtp={}, expected {committed_end}",
+                    picks.state.position,
+                    picks.mtp_position().map_err(|error| error.to_string())?
+                ));
+            }
+            picks
+                .copy_spec_hidden_row_to(gpu, acceptance.pending_hidden_row(), pending_hidden)
+                .map_err(|error| error.to_string())?;
+
+            let window = acceptance_to_window(acceptance)?;
+            // All fallible GPU operations are complete. Validate both tickets
+            // before invalidating either arena, then perform the no-copy commit
+            // boundary and clear the target scratch ticket.
+            picks
+                .validate_commit(target_snapshot)
+                .map_err(|error| error.to_string())?;
+            picks
+                .mtp_validate_commit(mtp_ticket)
+                .map_err(|error| error.to_string())?;
+            picks.commit_validated(target_snapshot);
+            picks.mtp_commit_validated(mtp_ticket);
+            target_scratch.target_snapshot = None;
+            snapshot = None;
+            Ok(window)
+        })();
+        if let Err(error) = &result {
+            let mut rollback_errors = Vec::new();
+            let target_ticket = match self.scratch.as_mut() {
+                Some(scratch) => match scratch.as_any_mut().downcast_mut::<Qwen4SpecScratch>() {
+                    Some(scratch) => scratch.target_snapshot.take(),
+                    None => {
+                        rollback_errors.push("target rollback scratch type changed".to_string());
+                        None
+                    }
+                },
+                None => None,
+            };
+            if let Some(ticket) = target_ticket {
+                if let Err(rollback) = Self::bundle(target).and_then(|bundle| {
+                    bundle
+                        .restore(gpu, ticket)
+                        .map_err(|restore| restore.to_string())
+                }) {
+                    rollback_errors.push(format!("target rollback failed: {rollback}"));
+                }
+            }
+            if let Some(ticket) = snapshot.take() {
+                if let Err(rollback) = Self::bundle(target).and_then(|bundle| {
+                    bundle
+                        .mtp_restore(gpu, ticket)
+                        .map_err(|restore| restore.to_string())
+                }) {
+                    rollback_errors.push(format!("MTP rollback failed: {rollback}"));
+                }
+            }
+            if !rollback_errors.is_empty() {
+                return Err(format!(
+                    "{error}; rollback failed: {}",
+                    rollback_errors.join("; ")
+                ));
+            }
+        }
+        result
+    }
+
+    fn mtp_forced_advance(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        tokens: &[u32],
+        start_pos: usize,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<bool, String> {
+        if tokens.is_empty() {
+            return Ok(true);
+        }
+        if abort() {
+            return Ok(true);
+        }
+        self.ensure_resources(gpu, target)?;
+        let pending = self.pending_hidden()?;
+        for (index, &token) in tokens.iter().enumerate() {
+            if abort() {
+                return Ok(true);
+            }
+            let position = start_pos
+                .checked_add(index)
+                .ok_or_else(|| "Qwen4 native MTP forced position overflow".to_string())?;
+            let bundle = Self::bundle(target)?;
+            bundle
+                .spec_capture_token(gpu, token)
+                .map_err(|error| error.to_string())?;
+            bundle
+                .copy_spec_hidden_row_to(gpu, 0, pending)
+                .map_err(|error| error.to_string())?;
+            bundle
+                .mtp_forward_token(gpu, token, Some(pending), position)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(true)
+    }
+
+    fn mtp_reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        if let Some(scratch) = self.scratch.as_mut() {
+            if let Some(scratch) = scratch.as_any_mut().downcast_mut::<Qwen4SpecScratch>() {
+                scratch.target_snapshot = None;
+            }
+        }
+        if let Some(hidden) = self.pending_hidden.as_ref() {
+            gpu.hip
+                .memset(&hidden.buf, 0, hidden.buf.size())
+                .map_err(|error| format!("Qwen4 native MTP pending reset: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn mtp_free(self: Box<Self>, gpu: &mut Gpu) {
+        let Self {
+            scratch,
+            pending_hidden,
+            ..
+        } = *self;
+        if let Some(scratch) = scratch {
+            scratch.free(gpu);
+        }
+        if let Some(hidden) = pending_hidden {
+            let _ = gpu.free_tensor(hidden);
+        }
+    }
+
+    fn k(&self) -> usize {
+        self.max_k
+    }
+
+    fn proposal_capacity(&self) -> usize {
+        self.max_k
+    }
+
+    fn ctx_capacity(&self) -> usize {
+        self.ctx_capacity
+    }
+
+    fn requires_greedy(&self) -> bool {
+        true
+    }
+
+    fn configure_request(&mut self, cfg: SpecRequestConfig) {
+        self.request = cfg;
+    }
+
+    fn supports_temp_verify(&self) -> bool {
+        false
+    }
+}
+
+/// Build the generic runtime adapter around the native Qwen4 GPU MTP core.
+pub fn build_qwen4_mtp_speculator(max_k: usize, ctx_capacity: usize) -> Box<dyn Speculator> {
+    Box::new(MtpSpeculator::new(Qwen4MtpDrafter::new(
+        max_k,
+        ctx_capacity,
+    )))
+}
 
 /// Convert an equation-level MTP error into the erased runtime error type.
 pub fn mtp_error(error: MtpError) -> String {
@@ -259,9 +970,84 @@ mod tests {
         assert!(eos.hit_eos);
 
         assert!(native_rollback_accept_len(0).is_err());
-        assert!(require_native_greedy(0.0).is_ok());
-        assert!(require_native_greedy(0.7).is_err());
+        assert!(require_native_greedy(-0.0).is_ok());
+        assert!(require_native_greedy(1.0e-6).is_ok());
+        assert!(require_native_greedy(1.0e-5).is_err());
+        assert!(require_native_greedy(f32::INFINITY).is_err());
+        assert!(require_native_greedy(f32::NEG_INFINITY).is_err());
         assert!(require_native_greedy(f32::NAN).is_err());
+    }
+
+    #[test]
+    fn accepted_eos_stays_pending_for_terminal_flush() {
+        let accepted = accept_native_greedy(&[10, 99], &[10, 99, 12], Some(99)).unwrap();
+        assert!(accepted.accepted_eos());
+        assert_eq!(accepted.target_commit_accept_len(), 1);
+        assert_eq!(accepted.pending_hidden_row(), 1);
+        assert_eq!(
+            committed_target_positions(7, accepted.target_commit_accept_len()).unwrap(),
+            vec![7]
+        );
+        assert_eq!(
+            native_commit_position(7, accepted.target_commit_accept_len()).unwrap(),
+            8
+        );
+
+        let bonus = accept_native_greedy(&[10, 11], &[10, 99, 12], Some(99)).unwrap();
+        assert!(!bonus.accepted_eos());
+        assert_eq!(bonus.target_commit_accept_len(), 1);
+        assert_eq!(bonus.pending_hidden_row(), 1);
+    }
+
+    #[test]
+    fn zero_draft_replays_seed_before_terminal_flush() {
+        let zero = accept_native_greedy(&[], &[42], Some(99)).unwrap();
+        assert_eq!(zero.target_commit_accept_len(), 0);
+        assert_eq!(zero.pending_hidden_row(), 0);
+        assert_eq!(
+            committed_target_positions(7, zero.target_commit_accept_len() + 1).unwrap(),
+            vec![7]
+        );
+        assert_eq!(
+            native_commit_position(7, zero.target_commit_accept_len() + 1).unwrap(),
+            8
+        );
+    }
+
+    #[test]
+    fn native_zero_one_all_acceptance_advances_mtp_state_in_lockstep() {
+        let cases = [
+            (vec![], vec![42], 0usize),
+            (vec![10], vec![10, 42], 1usize),
+            (vec![10, 11], vec![10, 11, 42], 2usize),
+        ];
+        for (drafts, target_picks, expected_accept_len) in cases {
+            let acceptance = accept_native_greedy(&drafts, &target_picks, None).unwrap();
+            assert_eq!(acceptance.target_commit_accept_len(), expected_accept_len);
+            let consumed = acceptance.target_commit_accept_len() + 1;
+            let expected_position = native_commit_position(7, consumed).unwrap();
+            let mut state = Qwen4MtpState::new(MtpQsaGeometry {
+                q_heads: 2,
+                kv_heads: 1,
+                head_dim: 2,
+                index_heads: 1,
+                index_dim: 2,
+                compress_ratio: 2,
+                budget: 4,
+                max_seq_len: 16,
+                rotary_dim: 2,
+                rope_theta: 10_000,
+            })
+            .unwrap();
+            state.position = 7;
+            state.qsa.position = 7;
+            let snapshot = state.begin_transaction();
+            state.forced_advance(consumed).unwrap();
+            state.commit(snapshot).unwrap();
+            assert_eq!(state.position, expected_position);
+            assert_eq!(state.qsa.position, expected_position);
+            assert_eq!(state.step_index, consumed);
+        }
     }
 
     #[test]

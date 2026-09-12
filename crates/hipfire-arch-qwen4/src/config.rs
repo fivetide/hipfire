@@ -591,6 +591,77 @@ impl Qwen4Config {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn compact_test_config() -> Qwen4Config {
+    let layers: Vec<_> = (0..48)
+        .map(|idx| {
+            if idx % 4 == 3 {
+                "full_attention"
+            } else {
+                "linear_attention"
+            }
+        })
+        .collect();
+    let value = serde_json::json!({
+        "architectures": [ARCHITECTURE_NAME],
+        "model_type": MODEL_TYPE,
+        "text_config": {
+            "model_type": TEXT_MODEL_TYPE,
+            "dtype": "bfloat16",
+            "hidden_size": 2560,
+            "vocab_size": 248320,
+            "num_hidden_layers": 48,
+            "max_position_embeddings": 262144,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "partial_rotary_factor": 0.25,
+            "rope_parameters": {"rope_theta": 10000000.0},
+            "attention_bias": false,
+            "layer_types": layers,
+            "full_attention_interval": 4,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "mamba_ssm_dtype": "float32",
+            "indexer_n_heads": 4,
+            "indexer_kv_heads": 1,
+            "indexer_head_dim": 128,
+            "indexer_budget": 2048,
+            "indexer_compress_ratio": 4,
+            "num_experts": 512,
+            "num_experts_per_tok": 10,
+            "moe_intermediate_size": 640,
+            "shared_expert_intermediate_size": 640,
+            "norm_topk_prob": true,
+            "hc_count": 4,
+            "hc_lowrank": 320,
+            "ple_layer_ids": [2],
+            "ple_conv_kernel_size": 4,
+            "ple_embed_dim": 2560,
+            "split_ngram_parts": 128,
+            "heads_per_ngram": 8,
+            "ngram_size": 3,
+            "ngram_vocab_size_base": 20000000,
+            "make_ngram_vocab_size_divisible_by": 128,
+            "eos_token_id": 248044,
+            "tie_word_embeddings": false,
+            "mtp_num_hidden_layers": 1,
+            "mtp_use_dedicated_embeddings": false,
+            "output_gate_type": "sigmoid",
+            "mtp": {
+                "hybrid": true,
+                "layer_types": ["full_attention"],
+                "num_hidden_layers": 1,
+                "rope_theta": 10000000.0
+            }
+        }
+    });
+    Qwen4Config::from_value(&value).expect("compact Qwen4 GPU fixture config")
+}
+
 fn approximately_equal(left: f64, right: f64) -> bool {
     let scale = right.abs().max(1.0);
     (left - right).abs() <= scale * 1e-9

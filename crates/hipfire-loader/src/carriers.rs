@@ -217,6 +217,26 @@ impl Carrier for Qwen4Carrier {
         "qwen4"
     }
 
+    fn spec_target_guard<'m>(
+        &self,
+        state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        match state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+        }) {
+            Some(bundle) => Ok(Box::new(InPlaceGuard { bundle })),
+            _ => Err("qwen4: spec target state mismatch".into()),
+        }
+    }
+
+    fn make_spec_emitter<'a>(
+        &self,
+        ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        Ok(Qwen35Emit::from_ctx(ctx))
+    }
+
     fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
         arch_id == hipfire_arch_qwen4::ARCH_ID && !is_dir
     }
@@ -244,8 +264,8 @@ impl Carrier for Qwen4Carrier {
             supports_continuous_batch: false,
             supports_ep_batch: false,
             dflash: None,
-            supports_mtp: false,
-            spec_excludes_adaptive: false,
+            supports_mtp: true,
+            spec_excludes_adaptive: true,
             semantic_contract_version: Some(2),
             has_deltanet: false,
             supports_images: false,
@@ -276,9 +296,18 @@ impl Carrier for Qwen4Carrier {
                 ctx.max_seq
             ));
         }
+        // Native execution is opt-in. The validated artifact carries the MTP
+        // tensors for capability discovery, but only `Some(true)` may attach
+        // the GPU head and publish a speculative drafter.
+        let native_mtp = crate::admission::qwen4_native_mtp_requested(ctx.spec);
         if ctx.draft_path.is_some()
             || ctx.gemma4_drafter_path.is_some()
-            || ctx.spec.mtp.is_some_and(|enabled| enabled)
+            || ctx.kv_adaptive_override.is_some()
+            || ctx.spec.dflash.is_some_and(|enabled| enabled)
+            || ctx.spec.dspark.is_some_and(|enabled| enabled)
+            || ctx.spec.ngram_draft.is_some_and(|enabled| enabled)
+            || ctx.spec.ddtree_budget.is_some()
+            || ctx.spec.ddtree_topk.is_some()
             || ctx.cask.sidecar.is_some()
             || ctx.state_quant_override.is_some()
             || !matches!(
@@ -287,7 +316,22 @@ impl Carrier for Qwen4Carrier {
             )
         {
             return Err(
-                "qwen4: DFlash, MTP, EAGLE, CASK, state-quant, and non-Single placement are unsupported"
+                "qwen4: DFlash, DSpark, n-gram, DDTree, adaptive-KV, EAGLE, CASK, state-quant, and non-Single placement are unsupported"
+                    .into(),
+            );
+        }
+        if native_mtp
+            && hipfire_runtime::config::retained_redline_default(
+                &ctx.gpu.arch,
+                "qwen4",
+                ctx.path,
+                ctx.pp,
+                1,
+                true,
+            )
+        {
+            return Err(
+                "qwen4: native MTP cannot be admitted with retained Redline; load the non-MQ4R HFQM artifact or disable MTP"
                     .into(),
             );
         }
@@ -341,9 +385,28 @@ impl Carrier for Qwen4Carrier {
             let _ = bundle.free_gpu(ctx.gpu);
             return Err(format!("qwen4: forward setup failed: {detail}"));
         }
-
-        Ok(LoadedModel {
+        let max_k = ctx
+            .spec
+            .mtp_k
+            .unwrap_or(hipfire_runtime::config::get().mtp_k)
+            .clamp(1, 10);
+        let speculator = if native_mtp {
+            if let Err(error) = bundle.attach_mtp(ctx.gpu, ctx.max_seq) {
+                let detail = error.to_string();
+                let _ = bundle.free_gpu(ctx.gpu);
+                return Err(format!("qwen4: MTP setup failed: {detail}"));
+            }
+            eprintln!("  qwen4 native MTP speculator enabled (K={max_k})");
+            Some(hipfire_arch_qwen4::mtp_spec::build_qwen4_mtp_speculator(
+                max_k,
+                ctx.max_seq,
+            ))
+        } else {
+            None
+        };
+        let mut model = LoadedModel {
             state: Some(Box::new(bundle)),
+            speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,
@@ -352,7 +415,17 @@ impl Carrier for Qwen4Carrier {
                 ctx.path.to_string(),
                 meta.chat_template,
             )
-        })
+        };
+        model.mtp_weights_present = native_mtp;
+        if native_mtp {
+            model.mtp_k = max_k;
+            model.mtp_mode = if ctx.spec.mtp == Some(true) {
+                "on".to_string()
+            } else {
+                "auto".to_string()
+            };
+        }
+        Ok(model)
     }
 }
 

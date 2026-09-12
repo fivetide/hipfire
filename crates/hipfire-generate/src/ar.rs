@@ -747,6 +747,7 @@ pub fn truncate_checkpoints(
 pub enum GenerationRoute {
     QwenAr,
     Qwen4Ar,
+    Qwen4Spec,
     QwenDflash,
     Qwen2Ar,
     Qwen2Spec,
@@ -776,6 +777,7 @@ impl GenerationRoute {
     pub const ALL: &'static [Self] = &[
         Self::QwenAr,
         Self::Qwen4Ar,
+        Self::Qwen4Spec,
         Self::QwenDflash,
         Self::Qwen2Ar,
         Self::Qwen2Spec,
@@ -833,6 +835,7 @@ impl GenerationRoute {
         match self {
             Self::QwenAr => "qwen_ar",
             Self::Qwen4Ar => "qwen4_ar",
+            Self::Qwen4Spec => "qwen4_spec",
             Self::QwenDflash => "qwen_dflash",
             Self::Qwen2Ar => "qwen2_ar",
             Self::Qwen2Spec => "qwen2_spec",
@@ -1161,6 +1164,7 @@ macro_rules! define_route_terminal {
 
 define_route_start!(qwen_ar_route_start, 5);
 define_route_start!(qwen4_ar_route_start, 16);
+define_route_start!(qwen4_spec_route_start, 16);
 
 define_route_start!(qwen_dflash_route_start, 5);
 define_route_start!(qwen2_ar_route_start, 7);
@@ -1199,6 +1203,7 @@ define_route_start!(unknown_route_start, 255);
 
 define_route_terminal!(qwen_ar_route_terminal, GenerationRoute::QwenAr);
 define_route_terminal!(qwen4_ar_route_terminal, GenerationRoute::Qwen4Ar);
+define_route_terminal!(qwen4_spec_route_terminal, GenerationRoute::Qwen4Spec);
 
 define_route_terminal!(qwen_dflash_route_terminal, GenerationRoute::QwenDflash);
 define_route_terminal!(qwen2_ar_route_terminal, GenerationRoute::Qwen2Ar);
@@ -1241,6 +1246,11 @@ pub fn generation_route_adapter(route: GenerationRoute) -> Option<GenerationRout
             route,
             start: qwen4_ar_route_start,
             terminal: qwen4_ar_route_terminal,
+        },
+        GenerationRoute::Qwen4Spec => GenerationRouteAdapter {
+            route,
+            start: qwen4_spec_route_start,
+            terminal: qwen4_spec_route_terminal,
         },
 
         GenerationRoute::QwenDflash => GenerationRouteAdapter {
@@ -1522,7 +1532,25 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
 
     // 2. Arch short-circuits (Qwen2, DeepSeek4, LFM, Cohere, MiniMax, dots).
     match i.arch_id {
-        16 => return GenerationRoute::Qwen4Ar,
+        16 => {
+            // Qwen4 native MTP is a strictly greedy, explicitly requested
+            // route. Any sampler control, adaptive state, or force-AR switch
+            // keeps the request on the ordinary Qwen4 producer.
+            let spec_ok = i.has_speculator
+                && i.speculator_is_mtp
+                && i.temp <= 1e-6
+                && !i.user_explicit_sampling
+                && !i.min_p.is_some_and(|p| p > 0.0)
+                && !i.nonneutral_penalties
+                && !i.force_ar_chat
+                && !i.temp_spec_env_off
+                && !i.kv_adaptive;
+            return if spec_ok {
+                GenerationRoute::Qwen4Spec
+            } else {
+                GenerationRoute::Qwen4Ar
+            };
+        }
 
         7 => {
             let spec_ok = i.has_speculator && (i.temp <= 1e-6 || i.ngram_can_sample);
@@ -2275,6 +2303,64 @@ pub fn generate(
     // miss fallthrough (crate::qwen::generate_dflash → false) stays inside the Spec arm and
     // continues to that arch's AR producer — never an independent re-predicate.
     match selected_route {
+        GenerationRoute::Qwen4Spec => {
+            if crate::qwen::generate_dflash(
+                m,
+                gpu,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                max_tokens,
+                max_think_tokens,
+                assistant_prefix,
+                None, // native Qwen4 MTP owns no PFlash drafter
+                None, // pflash_alpha
+                tools,
+                messages_history,
+                stop,
+                temp,
+                top_p,
+                top_k.map(|k| k as usize).unwrap_or(0),
+                min_p.unwrap_or(0.0),
+                cactus_delta,
+                request_seed as u64,
+                reasoning_effort,
+                enable_thinking,
+            ) {
+                return;
+            }
+            // A speculative context-capacity miss is the sole unhandled
+            // generic-spec result. Fall through to the normal Qwen4 AR
+            // producer without re-predicating route eligibility.
+            crate::qwen::generate_qwen4_ar(
+                m,
+                gpu,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                temp,
+                top_p,
+                top_k,
+                min_p,
+                max_tokens,
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
+                max_think_tokens,
+                assistant_prefix,
+                tools,
+                messages_history,
+                think_mode,
+                stop,
+                reasoning_effort,
+                enable_thinking,
+                request_seed,
+            );
+            return;
+        }
         GenerationRoute::Qwen4Ar => {
             crate::qwen::generate_qwen4_ar(
                 m,

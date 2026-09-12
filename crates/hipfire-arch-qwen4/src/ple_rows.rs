@@ -1958,6 +1958,15 @@ mod tests {
             error,
             PleRowsError::Source(SourceError::Io { .. })
         ));
+        // This is the forward-attempt abort boundary: the consumed ticket
+        // may already report a source error, but reset_epoch must still drain
+        // the exact epoch before a caller returns to its request loop.
+        assert_eq!(rows.reset_epoch(Duration::from_secs(5)).unwrap(), 1);
+        let stats = rows.cache_stats();
+        assert_eq!(stats.queue_depth, 0);
+        assert_eq!(stats.outstanding_readers, 0);
+        assert_eq!(stats.outstanding_leases, 0);
+        assert_eq!(stats.staging_in_use, 0);
         assert!(rows.unload().unwrap().is_clean());
 
         let source = Arc::new(MemoryRowSource {
@@ -1973,6 +1982,17 @@ mod tests {
             error,
             PleRowsError::Canceled | PleRowsError::EpochMismatch { .. }
         ));
+        // A canceled read follows the same abort path and must leave the
+        // reader reusable at a later epoch rather than leaking its ticket.
+        assert_eq!(rows.reset_epoch(Duration::from_secs(5)).unwrap(), 2);
+        let retry = rows.prefetch(2, PleHistory::new(99), &[0]).unwrap();
+        let lease = rows.wait_completed_lease(&retry).unwrap();
+        drop(lease);
+        let stats = rows.cache_stats();
+        assert_eq!(stats.queue_depth, 0);
+        assert_eq!(stats.outstanding_readers, 0);
+        assert_eq!(stats.outstanding_leases, 0);
+        assert_eq!(stats.staging_in_use, 0);
         assert!(rows.unload().unwrap().is_clean());
     }
 

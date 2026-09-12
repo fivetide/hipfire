@@ -2330,6 +2330,7 @@ pub fn load_model_with_kv_backend(
         {
             return Err("qwen4: only contiguous KV backend is admitted".into());
         }
+        let native_mtp = crate::admission::qwen4_native_mtp_requested(spec);
         if draft_path.is_some()
             || deepseek4_experts_per_token.is_some()
             || !matches!(
@@ -2339,13 +2340,24 @@ pub fn load_model_with_kv_backend(
             || kv_adaptive_override.is_some()
             || state_quant_override.is_some()
             || cask.sidecar.is_some()
-            || spec.mtp.is_some_and(|enabled| enabled)
             || spec.dflash.is_some_and(|enabled| enabled)
             || spec.dspark.is_some_and(|enabled| enabled)
             || spec.ngram_draft.is_some_and(|enabled| enabled)
+            || spec.ddtree_budget.is_some()
+            || spec.ddtree_topk.is_some()
         {
             return Err(
-                "qwen4: requested speculative, adaptive-KV, CASK, state-quant, or non-Single option is unsupported"
+                "qwen4: requested DFlash, DSpark, n-gram, DDTree, adaptive-KV, CASK, state-quant, or non-Single option is unsupported"
+                    .into(),
+            );
+        }
+        if native_mtp
+            && hipfire_runtime::config::retained_redline_default(
+                &gpu.arch, "qwen4", path, 1, 1, true,
+            )
+        {
+            return Err(
+                "qwen4: native MTP cannot be admitted with retained Redline; load the non-MQ4R HFQM artifact or disable MTP"
                     .into(),
             );
         }
@@ -2353,7 +2365,7 @@ pub fn load_model_with_kv_backend(
             &src,
             hipfire_arch_qwen4::EffectiveMesh::single(),
             hipfire_arch_qwen4::InputModality::Text,
-            false,
+            native_mtp,
         )?;
     }
     // Retry any arenas left by a prior failed teardown; refuse the load if
