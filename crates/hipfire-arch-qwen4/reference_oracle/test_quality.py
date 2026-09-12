@@ -18,6 +18,11 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(identity["payload_sha256"], quality.CANONICAL_TOKEN_SHA256)
         self.assertEqual(tokens[-1], 113)
 
+    def test_config_adapter_supplies_source_router_default(self) -> None:
+        adapter = object.__new__(quality.upstream.PinnedQwen4Operators)
+        config = adapter._config({"hidden_size": 8, "num_attention_heads": 2})
+        self.assertTrue(config.norm_topk_prob)
+
     def test_compare_emits_astrea_row(self) -> None:
         tokens, _ = quality._load_corpus("benchmarks/prompts/qwen4-teacher-forced.tokens.json")
         rows = [

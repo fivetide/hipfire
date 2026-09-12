@@ -1670,6 +1670,8 @@ class PinnedQwen4Operators:
             config.attention_dropout = 0.0
         if not hasattr(config, "attention_bias"):
             config.attention_bias = False
+        if not hasattr(config, "norm_topk_prob"):
+            config.norm_topk_prob = True
         if not hasattr(config, "head_dim"):
             config.head_dim = config.hidden_size // config.num_attention_heads
         return config
