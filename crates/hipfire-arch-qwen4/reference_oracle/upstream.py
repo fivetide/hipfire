@@ -1853,7 +1853,7 @@ class PinnedQwen4Operators:
             unigram_vocab_size=int(cfg["vocab_size"]),
             ngram_vocab_size_base=int(cfg["ngram_vocab_size_base"]),
             ple_embed_dim=embedding_dim,
-            seed=int(cfg["seed"]),
+            seed=int(config.seed),
             eos_token_id=(
                 int(cfg["eos_token_id"][0])
                 if isinstance(cfg["eos_token_id"], list)
