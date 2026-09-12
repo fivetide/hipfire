@@ -89,6 +89,9 @@ pub enum PleMetadataError {
         padded: u64,
         multiple: u64,
     },
+    VersionMissing,
+    UnsupportedVersion(u64),
+    UnknownField(String),
     FieldMissing(&'static str),
     FieldWrongType(&'static str),
     NumberOutOfRange(&'static str),
@@ -123,6 +126,11 @@ impl std::fmt::Display for PleMetadataError {
             Self::PaddedRowsMisaligned { padded, multiple } => {
                 write!(f, "PLE padded rows {padded} are not aligned to {multiple}")
             }
+            Self::VersionMissing => f.write_str("PLE metadata is missing `version`"),
+            Self::UnsupportedVersion(version) => {
+                write!(f, "PLE metadata has unsupported version {version}")
+            }
+            Self::UnknownField(field) => write!(f, "PLE metadata has unknown field `{field}`"),
             Self::FieldMissing(field) => write!(f, "PLE metadata missing `{field}`"),
             Self::FieldWrongType(field) => write!(f, "PLE metadata `{field}` has the wrong type"),
             Self::NumberOutOfRange(field) => {
@@ -272,49 +280,66 @@ impl PleHashMetadata {
         }
     }
 
-    /// Parse the versioned `qwen4_ple` JSON object without converting its
-    /// integer arrays to floating point.
+    /// Parse the canonical version-1 `qwen4_ple` object without converting
+    /// typed integer arrays through floating point.
+    ///
+    /// The envelope is intentionally strict: version and the four canonical
+    /// fields are the complete object schema.  Source tensor names and shapes
+    /// remain typed I64/index records; they are not duplicated here.
     pub fn from_json_value(value: &Value) -> Result<Self, PleMetadataError> {
+        const FIELDS: [&str; 5] = [
+            "version",
+            "multipliers",
+            "head_vocab_sizes",
+            "head_offsets",
+            "padded_rows",
+        ];
         let object = value
             .get("qwen4_ple")
-            .unwrap_or(value)
+            .ok_or(PleMetadataError::FieldMissing("qwen4_ple"))?
             .as_object()
             .ok_or(PleMetadataError::FieldWrongType("qwen4_ple"))?;
+        for field in object.keys() {
+            if !FIELDS.contains(&field.as_str()) {
+                return Err(PleMetadataError::UnknownField(field.clone()));
+            }
+        }
+        let version = object
+            .get("version")
+            .ok_or(PleMetadataError::VersionMissing)?;
+        let version = parse_u64_number(version, "version")?;
+        if version != 1 {
+            return Err(PleMetadataError::UnsupportedVersion(version));
+        }
         let multipliers = parse_i64_array(
             object
                 .get("multipliers")
-                .or_else(|| object.get("layer_multipliers"))
                 .ok_or(PleMetadataError::FieldMissing("multipliers"))?,
             "multipliers",
         )?;
         let sizes = parse_u64_array(
             object
                 .get("head_vocab_sizes")
-                .or_else(|| object.get("ngram_heads_vocab_sizes"))
                 .ok_or(PleMetadataError::FieldMissing("head_vocab_sizes"))?,
             "head_vocab_sizes",
         )?;
         let offsets = parse_u64_array(
             object
                 .get("head_offsets")
-                .or_else(|| object.get("ngram_heads_offsets"))
                 .ok_or(PleMetadataError::FieldMissing("head_offsets"))?,
             "head_offsets",
         )?;
-        let padded_rows = object
-            .get("padded_rows")
-            .or_else(|| object.get("physical_rows"))
-            .ok_or(PleMetadataError::FieldMissing("padded_rows"))?
-            .as_u64()
-            .ok_or(PleMetadataError::FieldWrongType("padded_rows"))?;
-        let multipliers: Vec<i64> = multipliers;
-        let sizes: Vec<u64> = sizes;
-        let offsets: Vec<u64> = offsets;
+        let padded_rows = parse_u64_number(
+            object
+                .get("padded_rows")
+                .ok_or(PleMetadataError::FieldMissing("padded_rows"))?,
+            "padded_rows",
+        )?;
         Self::from_slices(&multipliers, &sizes, &offsets, padded_rows)
     }
 
-    /// Parse a JSON string containing either the object itself or a
-    /// `{"qwen4_ple": {...}}` envelope.
+    /// Parse a JSON metadata envelope containing the canonical `qwen4_ple`
+    /// object.
     pub fn from_json(json: &str) -> Result<Self, String> {
         let value: Value = serde_json::from_str(json)
             .map_err(|error| format!("qwen4 PLE metadata is not valid JSON: {error}"))?;
@@ -415,10 +440,13 @@ impl PleHashMetadata {
     }
 }
 
-impl Default for PleHashMetadata {
-    fn default() -> Self {
-        Self::qwen4()
+fn parse_u64_number(value: &Value, field: &'static str) -> Result<u64, PleMetadataError> {
+    if !value.is_number() {
+        return Err(PleMetadataError::FieldWrongType(field));
     }
+    value
+        .as_u64()
+        .ok_or(PleMetadataError::NumberOutOfRange(field))
 }
 
 fn parse_i64_array(value: &Value, field: &'static str) -> Result<Vec<i64>, PleMetadataError> {
@@ -510,6 +538,21 @@ pub type PleRowId = u64;
 mod tests {
     use super::*;
     use serde_json::json;
+    fn canonical_value() -> Value {
+        let mut offsets = Vec::new();
+        for head in 0..PLE_HEAD_COUNT {
+            offsets.push(head as u64 * 128);
+        }
+        json!({
+            "qwen4_ple": {
+                "version": 1,
+                "multipliers": [-3, 5, 7],
+                "head_vocab_sizes": [128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128],
+                "head_offsets": offsets,
+                "padded_rows": 2048
+            }
+        })
+    }
 
     #[test]
     fn pinned_metadata_has_exact_prefix_and_padding() {
@@ -601,26 +644,99 @@ mod tests {
     }
 
     #[test]
-    fn json_parser_keeps_signed_multipliers_and_rejects_float_arrays() {
-        let mut offsets = Vec::new();
-        for head in 0..PLE_HEAD_COUNT {
-            offsets.push(head as u64 * 128);
-        }
-        let value = json!({
-            "qwen4_ple": {
-                "multipliers": [-3, 5, 7],
-                "head_vocab_sizes": [128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128],
-                "head_offsets": offsets,
-                "padded_rows": 2048
-            }
-        });
+    fn json_parser_roundtrips_canonical_versioned_metadata() {
+        let value = canonical_value();
         let metadata = PleHashMetadata::from_json_value(&value).unwrap();
-        assert_eq!(metadata.multipliers()[0], -3);
-        let mut bad = value;
-        bad["qwen4_ple"]["multipliers"][0] = json!(1.5);
+        assert_eq!(metadata.multipliers(), &[-3, 5, 7]);
+        assert_eq!(metadata.head_vocab_sizes(), &[128; PLE_HEAD_COUNT]);
+        assert_eq!(metadata.head_offsets()[1], 128);
+        assert_eq!(metadata.valid_rows(), 2048);
+        assert_eq!(metadata.padded_rows(), 2048);
+    }
+
+    #[test]
+    fn json_parser_rejects_missing_unknown_and_wrong_versions() {
+        let mut missing = canonical_value();
+        missing["qwen4_ple"]
+            .as_object_mut()
+            .unwrap()
+            .remove("version");
         assert!(matches!(
-            PleHashMetadata::from_json_value(&bad),
+            PleHashMetadata::from_json_value(&missing),
+            Err(PleMetadataError::VersionMissing)
+        ));
+
+        let mut unknown_version = canonical_value();
+        unknown_version["qwen4_ple"]["version"] = json!(2);
+        assert!(matches!(
+            PleHashMetadata::from_json_value(&unknown_version),
+            Err(PleMetadataError::UnsupportedVersion(2))
+        ));
+
+        let mut float_version = canonical_value();
+        float_version["qwen4_ple"]["version"] = json!(1.5);
+        assert!(matches!(
+            PleHashMetadata::from_json_value(&float_version),
+            Err(PleMetadataError::NumberOutOfRange("version"))
+        ));
+
+        for field in [
+            "schema",
+            "layer_multipliers",
+            "ngram_heads_vocab_sizes",
+            "ngram_heads_offsets",
+            "physical_rows",
+        ] {
+            let mut value = canonical_value();
+            value["qwen4_ple"][field] = json!(0);
+            assert!(matches!(
+                PleHashMetadata::from_json_value(&value),
+                Err(PleMetadataError::UnknownField(got)) if got == field
+            ));
+        }
+    }
+
+    #[test]
+    fn json_parser_rejects_float_out_of_range_prefix_and_padding_values() {
+        let mut float_array = canonical_value();
+        float_array["qwen4_ple"]["multipliers"][0] = json!(1.5);
+        assert!(matches!(
+            PleHashMetadata::from_json_value(&float_array),
             Err(PleMetadataError::NumberOutOfRange("multipliers"))
+        ));
+
+        let mut out_of_range = canonical_value();
+        out_of_range["qwen4_ple"]["head_vocab_sizes"][0] = json!(u64::MAX);
+        assert!(matches!(
+            PleHashMetadata::from_json_value(&out_of_range),
+            Err(PleMetadataError::HeadSizeTooLarge { head: 0, .. })
+        ));
+
+        let mut bad_prefix = canonical_value();
+        bad_prefix["qwen4_ple"]["head_offsets"][1] = json!(1);
+        assert!(matches!(
+            PleHashMetadata::from_json_value(&bad_prefix),
+            Err(PleMetadataError::OffsetNotPrefixSum { head: 1, .. })
+        ));
+
+        let mut too_small = canonical_value();
+        too_small["qwen4_ple"]["padded_rows"] = json!(2047);
+        assert!(matches!(
+            PleHashMetadata::from_json_value(&too_small),
+            Err(PleMetadataError::PaddedRowsTooSmall {
+                valid: 2048,
+                padded: 2047
+            })
+        ));
+
+        let mut wrong_rounding = canonical_value();
+        wrong_rounding["qwen4_ple"]["padded_rows"] = json!(2176);
+        assert!(matches!(
+            PleHashMetadata::from_json_value(&wrong_rounding),
+            Err(PleMetadataError::PaddedRowsMisaligned {
+                padded: 2176,
+                multiple: 128
+            })
         ));
     }
 }

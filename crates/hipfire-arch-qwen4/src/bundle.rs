@@ -81,22 +81,17 @@ pub struct Qwen4Bundle {
 }
 
 impl Qwen4Bundle {
-    /// Assemble a complete Single bundle using the pinned PLE metadata.
+    /// Assemble a complete Single bundle using metadata parsed from the
+    /// artifact's canonical `qwen4_ple` object.
     pub fn assemble(
         config: Qwen4Config,
         transaction: WeightLoadTransaction,
         placements: &[Qwen4Placement],
         gpu: &mut Gpu,
         max_seq_len: usize,
+        metadata: PleHashMetadata,
     ) -> Result<Self, BundleError> {
-        Self::assemble_with_metadata(
-            config,
-            transaction,
-            placements,
-            gpu,
-            max_seq_len,
-            PleHashMetadata::default(),
-        )
+        Self::assemble_with_metadata(config, transaction, placements, gpu, max_seq_len, metadata)
     }
 
     /// Assemble with validated metadata read from the artifact's exact I64

@@ -1240,10 +1240,6 @@ struct PleMetadata {
     multipliers: Vec<i64>,
     vocab_sizes: Vec<i64>,
     prefix_offsets: Vec<i64>,
-    source_names: Vec<String>,
-    source_shapes: Vec<Vec<u64>>,
-    metadata_names: Vec<String>,
-    metadata_shapes: Vec<Vec<u64>>,
 }
 
 #[derive(Debug)]
@@ -1600,29 +1596,10 @@ fn plan_entries(tensors: Vec<SourceTensor>, row_chunk: usize) -> Result<EntryPla
     }
     resident.sort_by(|left, right| left.name.cmp(&right.name));
 
-    let source_names: Vec<String> = (0..PLE_SHARD_COUNT)
-        .map(|index| ple_sources[&index].name.clone())
-        .collect();
-    let source_shapes: Vec<Vec<u64>> = (0..PLE_SHARD_COUNT)
-        .map(|index| ple_sources[&index].shape.clone())
-        .collect();
-    let metadata_names: Vec<String> = [I64Role::Multipliers, I64Role::VocabSizes, I64Role::Offsets]
-        .iter()
-        .map(|role| metadata_sources[role].name.clone())
-        .collect();
-    let metadata_shapes: Vec<Vec<u64>> =
-        [I64Role::Multipliers, I64Role::VocabSizes, I64Role::Offsets]
-            .iter()
-            .map(|role| metadata_sources[role].shape.clone())
-            .collect();
     let ple_metadata = PleMetadata {
         multipliers,
         vocab_sizes,
         prefix_offsets,
-        source_names,
-        source_shapes,
-        metadata_names,
-        metadata_shapes,
     };
     let mut ple_entries = Vec::with_capacity(PLE_SHARD_COUNT);
     for index in 0..PLE_SHARD_COUNT {
@@ -1673,29 +1650,6 @@ fn build_metadata(
     let physical_rows = (PLE_SHARD_COUNT as u64)
         .checked_mul(PLE_ROWS_PER_SHARD)
         .ok_or_else(|| Qwen4Error::Invalid("Qwen4 physical PLE rows overflow".to_string()))?;
-    let trailing_padding = physical_rows - valid_rows;
-    let shard_records: Vec<Value> = ple
-        .source_names
-        .iter()
-        .zip(ple.source_shapes.iter())
-        .enumerate()
-        .map(|(index, (name, shape))| {
-            let shard_start = (index as u64) * PLE_ROWS_PER_SHARD;
-            let valid_in_shard = valid_rows
-                .saturating_sub(shard_start)
-                .min(PLE_ROWS_PER_SHARD);
-            json!({
-                "index": index,
-                "source_name": name,
-                "record_name": name,
-                "source_dtype": "BF16",
-                "source_shape": shape,
-                "residency": "external_rows",
-                "valid_rows": valid_in_shard,
-                "physical_rows": PLE_ROWS_PER_SHARD,
-            })
-        })
-        .collect();
 
     let mut root = Map::new();
     root.insert("format".to_string(), Value::String("hfqm".to_string()));
@@ -1727,30 +1681,10 @@ fn build_metadata(
         "qwen4_ple".to_string(),
         json!({
             "version": QWEN4_PLE_VERSION,
-            "schema": "qwen4_ple",
-            "metadata_dtype": "I64",
-            "metadata_encoding": "little_endian_signed_i64",
-            "heads": PLE_HEAD_COUNT,
-            "ngram_size": PLE_NGRAM_SIZE,
             "multipliers": ple.multipliers.clone(),
-            "prime_vocab_sizes": ple.vocab_sizes.clone(),
-            "vocab_sizes": ple.vocab_sizes.clone(),
-            "prefix_offsets": ple.prefix_offsets.clone(),
-            "offsets": ple.prefix_offsets.clone(),
-            "valid_rows": valid_rows,
-            "padded_physical_rows": physical_rows,
-            "trailing_padding_rows": trailing_padding,
-            "physical_rows_per_shard": PLE_ROWS_PER_SHARD,
-            "row_width": PLE_ROW_WIDTH,
-            "dtype": "BF16",
-            "quant_type": 16,
-            "metadata_quant_type": QWEN4_I64_QUANT_TYPE,
-            "metadata_names": ple.metadata_names.clone(),
-            "metadata_shapes": ple.metadata_shapes.clone(),
-            "residency": "external_rows",
-            "source_names": ple.source_names.clone(),
-            "source_shapes": ple.source_shapes.clone(),
-            "shards": shard_records,
+            "head_vocab_sizes": ple.vocab_sizes.clone(),
+            "head_offsets": ple.prefix_offsets.clone(),
+            "padded_rows": physical_rows,
         }),
     );
     root.insert(
@@ -2273,26 +2207,74 @@ fn validate_reopened_metadata(metadata: &Value) -> Result<(), Qwen4Error> {
         .ok_or_else(|| {
             Qwen4Error::Invalid("reopened Qwen4 metadata is missing qwen4_ple".to_string())
         })?;
-    if ple.get("version").and_then(Value::as_u64) != Some(QWEN4_PLE_VERSION as u64)
-        || ple.get("metadata_dtype").and_then(Value::as_str) != Some("I64")
-        || ple.get("residency").and_then(Value::as_str) != Some("external_rows")
-    {
-        return Err(Qwen4Error::Invalid(
-            "reopened qwen4_ple metadata has an unsupported version, dtype, or residency"
-                .to_string(),
-        ));
+    const FIELDS: [&str; 5] = [
+        "version",
+        "multipliers",
+        "head_vocab_sizes",
+        "head_offsets",
+        "padded_rows",
+    ];
+    for field in ple.keys() {
+        if !FIELDS.contains(&field.as_str()) {
+            return Err(Qwen4Error::Invalid(format!(
+                "reopened qwen4_ple metadata has unknown field `{field}`"
+            )));
+        }
     }
-    let source_names = ple
-        .get("source_names")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            Qwen4Error::Invalid("reopened qwen4_ple metadata is missing source_names".to_string())
-        })?;
-    if source_names.len() != PLE_SHARD_COUNT {
+    let version = ple.get("version").and_then(Value::as_u64).ok_or_else(|| {
+        Qwen4Error::Invalid("reopened qwen4_ple version is not an integer".into())
+    })?;
+    if version != QWEN4_PLE_VERSION as u64 {
         return Err(Qwen4Error::Invalid(format!(
-            "reopened qwen4_ple metadata has {} source names, expected {PLE_SHARD_COUNT}",
-            source_names.len()
+            "reopened qwen4_ple metadata has unsupported version {version}"
         )));
+    }
+    let read_i64_array = |field: &'static str, expected: usize| -> Result<Vec<i64>, Qwen4Error> {
+        let value = ple.get(field).ok_or_else(|| {
+            Qwen4Error::Invalid(format!("reopened qwen4_ple metadata is missing `{field}`"))
+        })?;
+        let values = value.as_array().ok_or_else(|| {
+            Qwen4Error::Invalid(format!("reopened qwen4_ple `{field}` is not an array"))
+        })?;
+        if values.len() != expected {
+            return Err(Qwen4Error::Invalid(format!(
+                "reopened qwen4_ple `{field}` has {} values, expected {expected}",
+                values.len()
+            )));
+        }
+        values
+            .iter()
+            .map(|value| {
+                value.as_i64().ok_or_else(|| {
+                    Qwen4Error::Invalid(format!(
+                        "reopened qwen4_ple `{field}` contains a non-i64 value"
+                    ))
+                })
+            })
+            .collect()
+    };
+    let multipliers = read_i64_array("multipliers", 3)?;
+    let vocab_sizes = read_i64_array("head_vocab_sizes", PLE_HEAD_COUNT)?;
+    let prefix_offsets = read_i64_array("head_offsets", PLE_HEAD_COUNT)?;
+    let padded_rows = ple
+        .get("padded_rows")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            Qwen4Error::Invalid("reopened qwen4_ple `padded_rows` is not an integer".into())
+        })?;
+    let valid_rows = validate_ple_metadata(&multipliers, &vocab_sizes, &prefix_offsets)?;
+    let expected_padded_rows = (PLE_SHARD_COUNT as u64)
+        .checked_mul(PLE_ROWS_PER_SHARD)
+        .ok_or_else(|| Qwen4Error::Invalid("Qwen4 PLE physical rows overflow".to_string()))?;
+    if padded_rows != expected_padded_rows {
+        return Err(Qwen4Error::Invalid(format!(
+            "reopened qwen4_ple padded_rows is {padded_rows}, expected {expected_padded_rows}"
+        )));
+    }
+    if padded_rows < valid_rows || padded_rows % 128 != 0 {
+        return Err(Qwen4Error::Invalid(
+            "reopened qwen4_ple padding is inconsistent with valid rows".to_string(),
+        ));
     }
     Ok(())
 }
@@ -2629,13 +2611,18 @@ mod tests {
     #[test]
     fn reopen_plan_reads_small_fixture_without_mapping_payload() {
         let temp = NamedTempFile::new().unwrap();
+        let mut offsets = Vec::new();
+        for head in 0..PLE_HEAD_COUNT {
+            offsets.push((head * 127) as i64);
+        }
         let metadata = json!({
             "arch_id": 16,
             "qwen4_ple": {
                 "version": 1,
-                "metadata_dtype": "I64",
-                "residency": "external_rows",
-                "source_names": (0..128).map(|i| format!("shard_{i}")).collect::<Vec<_>>()
+                "multipliers": [3, 5, 7],
+                "head_vocab_sizes": [127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127],
+                "head_offsets": offsets,
+                "padded_rows": PLE_SHARD_COUNT as u64 * PLE_ROWS_PER_SHARD
             }
         })
         .to_string();
