@@ -10,7 +10,6 @@
 //! route before calling them.
 
 use hip_bridge::{HipError, HipResult, KernargBlob};
-use std::ffi::c_void;
 
 use crate::{DType, Gpu, GpuTensor};
 
@@ -268,4 +267,105 @@ pub fn qwen4_hc_mix(gpu: &mut Gpu, p: &Qwen4HcMix<'_>) -> HipResult<()> {
         0,
         args.as_mut_slice(),
     )
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn try_gfx1151_gpu() -> Option<Gpu> {
+        let gpu = Gpu::init().ok()?;
+        if !gpu.arch_caps.is_gfx1151() {
+            eprintln!("skip: Qwen4 ordinary-HIP validation requires gfx1151");
+            return None;
+        }
+        Some(gpu)
+    }
+
+    fn null_tensor(shape: &[usize], dtype: DType) -> GpuTensor {
+        let mut tensor = GpuTensor::null_for_test();
+        tensor.shape = shape.to_vec();
+        tensor.dtype = dtype;
+        tensor
+    }
+
+    #[test]
+    fn gdn_rejects_shape_before_kernel_launch() {
+        let Some(mut gpu) = try_gfx1151_gpu() else {
+            eprintln!("skip: no gfx1151 GPU");
+            return;
+        };
+        let q = null_tensor(&[1], DType::F32);
+        let k = null_tensor(&[2], DType::F32);
+        let v = null_tensor(&[12], DType::F32);
+        let gate = null_tensor(&[3], DType::F32);
+        let beta = null_tensor(&[3], DType::F32);
+        let state = null_tensor(&[24], DType::F32);
+        let output = null_tensor(&[12], DType::F32);
+        let params = Qwen4GdnStep {
+            q: &q,
+            k: &k,
+            v: &v,
+            gate: &gate,
+            beta: &beta,
+            state: &state,
+            output: &output,
+            key_heads: 1,
+            value_heads: 3,
+            key_dim: 2,
+            value_dim: 4,
+        };
+
+        let error = qwen4_gdn_step(&mut gpu, &params).expect_err("invalid shape must fail");
+        assert!(error.to_string().contains("tensor shape mismatch"));
+        assert_eq!(gpu.last_launched_kernel(), None);
+    }
+
+    #[test]
+    fn ple_depthwise_rejects_wrong_dtype_before_kernel_launch() {
+        let Some(mut gpu) = try_gfx1151_gpu() else {
+            eprintln!("skip: no gfx1151 GPU");
+            return;
+        };
+        let input = null_tensor(&[1], DType::F16);
+        let history = null_tensor(&[9], DType::F32);
+        let kernel = null_tensor(&[4], DType::F32);
+        let output = null_tensor(&[1], DType::F32);
+        let next_history = null_tensor(&[9], DType::F32);
+        let params = Qwen4PleDepthwise {
+            input: &input,
+            history: &history,
+            kernel: &kernel,
+            output: &output,
+            next_history: &next_history,
+            channels: 1,
+            history_rows: 9,
+            kernel_size: 4,
+            dilation: 3,
+            cursor: 0,
+        };
+
+        let error = qwen4_ple_depthwise(&mut gpu, &params).expect_err("wrong dtype must fail");
+        assert!(error.to_string().contains("expects F32 tensors"));
+        assert_eq!(gpu.last_launched_kernel(), None);
+    }
+
+    #[test]
+    fn hc_mix_rejects_noncanonical_branch_count() {
+        let Some(mut gpu) = try_gfx1151_gpu() else {
+            eprintln!("skip: no gfx1151 GPU");
+            return;
+        };
+        let branches = null_tensor(&[3], DType::F32);
+        let output = null_tensor(&[1], DType::F32);
+        let params = Qwen4HcMix {
+            branches: &branches,
+            output: &output,
+            branch_count: 3,
+            hidden: 1,
+        };
+
+        let error = qwen4_hc_mix(&mut gpu, &params).expect_err("branch count must be four");
+        assert!(error.to_string().contains("tensor shape mismatch"));
+        assert_eq!(gpu.last_launched_kernel(), None);
+    }
 }
