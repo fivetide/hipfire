@@ -22,11 +22,13 @@ import math
 import os
 import platform
 import re
-import shutil
+import errno
+import socket
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import urllib.error
 import urllib.request
@@ -180,6 +182,9 @@ MODEL_CONFIG_SHA256 = "889658f2508e8c61d409b02e70e0d78d8d4452ec65aaafbe129805d21
 MAX_SOURCE_BYTES = 8 << 20
 MAX_HEADER_BYTES = 8 << 20
 MAX_TENSOR_SLICE_BYTES = 128 << 10
+RANGE_MAX_RETRIES = 4
+RANGE_RETRY_BACKOFF_SECONDS = 0.25
+RANGE_RETRY_BACKOFF_MAX_SECONDS = 1.0
 
 # Names are intentionally explicit instead of selecting the first lexical
 # match.  This prevents a model-index reorder from changing the fixture.
@@ -474,6 +479,58 @@ def load_pinned_sources(cache_dir: str | Path | None = None) -> tuple[dict[str, 
 
 
 _RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+|\*)$")
+_RETRYABLE_RANGE_ERRNOS = frozenset(
+    {
+        errno.ECONNABORTED,
+        errno.ECONNREFUSED,
+        errno.ECONNRESET,
+        errno.ETIMEDOUT,
+        errno.EPIPE,
+    }
+)
+
+
+def _retryable_range_status(status: object) -> bool:
+    try:
+        code = int(status)
+    except (TypeError, ValueError):
+        return False
+    return code == 429 or 500 <= code < 600
+
+
+def _retryable_range_transport_error(error: BaseException) -> bool:
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if isinstance(current, (ConnectionError, BrokenPipeError, TimeoutError, socket.timeout)):
+            return True
+        if isinstance(current, OSError) and current.errno in _RETRYABLE_RANGE_ERRNOS:
+            return True
+        reason = getattr(current, "reason", None)
+        if isinstance(reason, BaseException):
+            pending.append(reason)
+        cause = current.__cause__
+        if isinstance(cause, BaseException):
+            pending.append(cause)
+        context = current.__context__
+        if isinstance(context, BaseException):
+            pending.append(context)
+    return False
+
+
+def _sleep_before_range_retry(retry_index: int) -> None:
+    delay = min(
+        RANGE_RETRY_BACKOFF_SECONDS * (2**retry_index),
+        RANGE_RETRY_BACKOFF_MAX_SECONDS,
+    )
+    time.sleep(delay)
+
+
 
 
 class _RangeClient:
@@ -578,52 +635,69 @@ class _RangeClient:
             self.read_bytes += len(body)
             return body, metadata
 
-        request = urllib.request.Request(
-            url,
-            headers={"Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"},
-        )
-        try:
-            response = urllib.request.urlopen(request, timeout=90)
-            status = getattr(response, "status", response.getcode())
-            if status != 206:
-                raise FixtureError(f"range request returned HTTP {status}, expected 206")
-            content_range = response.headers.get("Content-Range", "")
-            match = _RANGE_RE.fullmatch(content_range)
-            if match is None:
-                raise FixtureError(f"range response has invalid Content-Range {content_range!r}")
-            got_start, got_end, total_text = match.groups()
-            got_start_i, got_end_i = int(got_start), int(got_end)
-            total = None if total_text == "*" else int(total_text)
-            expected_end = self._expected_end(start, end, total)
-            if got_start_i != start or got_end_i != expected_end:
-                raise FixtureError(
-                    f"range response {content_range!r} does not match requested {start}-{end}"
-                )
-            expected_length = got_end_i - start + 1
-            body = response.read(maximum + 1)
-            if len(body) > maximum or len(body) != expected_length:
-                raise FixtureError(f"range response length {len(body)} does not match {expected_length}")
-            metadata = {
-                "url": url,
-                "start": start,
-                "end": end,
-                "response_end": got_end_i,
-                "total": total,
-                "length": len(body),
-                "sha256": _sha256_bytes(body),
-                "etag": response.headers.get("ETag"),
-                "repo_commit": response.headers.get("X-Repo-Commit"),
-            }
-            self._validate_metadata(
-                metadata,
-                url=url,
-                start=start,
-                end=end,
-                body_length=len(body),
+        retry_index = 0
+        while True:
+            request = urllib.request.Request(
+                url,
+                headers={"Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"},
             )
-            self._seal(url, metadata)
-        except (OSError, urllib.error.URLError, ValueError) as exc:
-            raise FixtureError(f"unable to range-read {url} bytes {start}-{end}: {exc}") from exc
+            try:
+                response = urllib.request.urlopen(request, timeout=90)
+                status = getattr(response, "status", response.getcode())
+                if status != 206:
+                    if _retryable_range_status(status) and retry_index < RANGE_MAX_RETRIES:
+                        _sleep_before_range_retry(retry_index)
+                        retry_index += 1
+                        continue
+                    raise FixtureError(f"range request returned HTTP {status}, expected 206")
+                content_range = response.headers.get("Content-Range", "")
+                match = _RANGE_RE.fullmatch(content_range)
+                if match is None:
+                    raise FixtureError(f"range response has invalid Content-Range {content_range!r}")
+                got_start, got_end, total_text = match.groups()
+                got_start_i, got_end_i = int(got_start), int(got_end)
+                total = None if total_text == "*" else int(total_text)
+                expected_end = self._expected_end(start, end, total)
+                if got_start_i != start or got_end_i != expected_end:
+                    raise FixtureError(
+                        f"range response {content_range!r} does not match requested {start}-{end}"
+                    )
+                expected_length = got_end_i - start + 1
+                body = response.read(maximum + 1)
+                if len(body) > maximum or len(body) != expected_length:
+                    raise FixtureError(f"range response length {len(body)} does not match {expected_length}")
+                metadata = {
+                    "url": url,
+                    "start": start,
+                    "end": end,
+                    "response_end": got_end_i,
+                    "total": total,
+                    "length": len(body),
+                    "sha256": _sha256_bytes(body),
+                    "etag": response.headers.get("ETag"),
+                    "repo_commit": response.headers.get("X-Repo-Commit"),
+                }
+                self._validate_metadata(
+                    metadata,
+                    url=url,
+                    start=start,
+                    end=end,
+                    body_length=len(body),
+                )
+                self._seal(url, metadata)
+                break
+            except urllib.error.HTTPError as exc:
+                if _retryable_range_status(exc.code) and retry_index < RANGE_MAX_RETRIES:
+                    _sleep_before_range_retry(retry_index)
+                    retry_index += 1
+                    continue
+                raise FixtureError(f"range request returned HTTP {exc.code}, expected 206") from exc
+            except (OSError, urllib.error.URLError, ValueError) as exc:
+                if _retryable_range_transport_error(exc) and retry_index < RANGE_MAX_RETRIES:
+                    _sleep_before_range_retry(retry_index)
+                    retry_index += 1
+                    continue
+                raise FixtureError(f"unable to range-read {url} bytes {start}-{end}: {exc}") from exc
         body_path.write_bytes(body)
         meta_path.write_text(json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
         self.read_bytes += len(body)

@@ -37,6 +37,59 @@ class RangeClientTests(unittest.TestCase):
     def _client(self) -> tuple[tempfile.TemporaryDirectory[str], upstream._RangeClient]:
         temp = tempfile.TemporaryDirectory()
         return temp, upstream._RangeClient(Path(temp.name))
+    def test_connection_reset_retries_with_same_range_and_succeeds(self) -> None:
+        temp, client = self._client()
+        try:
+            reset = upstream.urllib.error.URLError(ConnectionResetError(104, "Connection reset by peer"))
+            with mock.patch.object(
+                upstream.urllib.request,
+                "urlopen",
+                side_effect=[reset, _response(b"abcd", 0, 3)],
+            ) as urlopen, mock.patch.object(upstream.time, "sleep") as sleep:
+                body, _ = client.read("https://example.test/shard", 0, 3, maximum=8)
+            self.assertEqual(body, b"abcd")
+            self.assertEqual(urlopen.call_count, 2)
+            self.assertEqual(
+                [call.args[0].get_header("Range") for call in urlopen.call_args_list],
+                ["bytes=0-3", "bytes=0-3"],
+            )
+            self.assertEqual(sleep.call_count, 1)
+            sleep.assert_called_once_with(upstream.RANGE_RETRY_BACKOFF_SECONDS)
+        finally:
+            temp.cleanup()
+
+    def test_connection_reset_retries_are_bounded(self) -> None:
+        temp, client = self._client()
+        try:
+            reset = upstream.urllib.error.URLError(ConnectionResetError(104, "Connection reset by peer"))
+            errors = [reset] * (upstream.RANGE_MAX_RETRIES + 1)
+            with mock.patch.object(
+                upstream.urllib.request,
+                "urlopen",
+                side_effect=errors,
+            ) as urlopen, mock.patch.object(upstream.time, "sleep") as sleep:
+                with self.assertRaises(upstream.FixtureError):
+                    client.read("https://example.test/shard", 0, 3, maximum=8)
+            self.assertEqual(urlopen.call_count, upstream.RANGE_MAX_RETRIES + 1)
+            self.assertEqual(sleep.call_count, upstream.RANGE_MAX_RETRIES)
+        finally:
+            temp.cleanup()
+
+    def test_identity_mismatch_is_not_retried(self) -> None:
+        temp, client = self._client()
+        try:
+            with mock.patch.object(
+                upstream.urllib.request,
+                "urlopen",
+                side_effect=[_response(b"abcd", 1, 4), _response(b"abcd", 0, 3)],
+            ) as urlopen, mock.patch.object(upstream.time, "sleep") as sleep:
+                with self.assertRaises(upstream.FixtureError):
+                    client.read("https://example.test/shard", 0, 3, maximum=8)
+            self.assertEqual(urlopen.call_count, 1)
+            sleep.assert_not_called()
+        finally:
+            temp.cleanup()
+
 
     def test_short_response_is_rejected(self) -> None:
         temp, client = self._client()
