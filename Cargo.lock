@@ -1556,6 +1556,7 @@ dependencies = [
  "faer",
  "half",
  "hipfire-arch-gemma4",
+ "hipfire-arch-qwen4",
  "hipfire-config",
  "hipfire-reap",
  "hipfire-runtime",

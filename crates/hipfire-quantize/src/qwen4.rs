@@ -19,6 +19,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use hipfire_arch_qwen4::config::Qwen4Config;
+use hipfire_arch_qwen4::weights::Qwen4Manifest;
+use hipfire_runtime::weight_manifest::ShardPolicy;
+use rdna_compute::DType;
 use serde_json::{json, Map, Value};
 
 use crate::quant_fwht::{gen_fwht_signs, quantize_mq4g256v2};
@@ -155,15 +159,20 @@ pub(crate) fn write_qwen4_artifact(options: &Qwen4Options<'_>) -> Result<Qwen4Su
     }
     let source = source_paths(options.input)?;
     let tensors = load_inventory(&source)?;
-    let config = load_optional_config(&source)?;
-    validate_config(config.as_ref())?;
+    let config_value = load_optional_config(&source)?.ok_or_else(|| {
+        Qwen4Error::Invalid("Qwen4 input is missing required config.json".to_string())
+    })?;
+    let config = Qwen4Config::from_value(&config_value)
+        .map_err(|error| Qwen4Error::Invalid(format!("Qwen4 config is invalid: {error}")))?;
+    let manifest = Qwen4Manifest::build(&config).map_err(|error| {
+        Qwen4Error::Invalid(format!("Qwen4 manifest could not be built: {error}"))
+    })?;
 
-    let plan = plan_entries(tensors, options.row_chunk)?;
+    let plan = plan_entries(tensors, options.row_chunk, &manifest)?;
     let ple_metadata = plan.ple_metadata.as_ref().ok_or_else(|| {
         Qwen4Error::Invalid("Qwen4 plan did not produce PLE metadata".to_string())
     })?;
-    let metadata_json = build_metadata(config.as_ref(), &plan, ple_metadata)?;
-
+    let metadata_json = build_metadata(Some(&config_value), &plan, ple_metadata)?;
     if plan.entries.len() > u32::MAX as usize {
         return Err(Qwen4Error::Invalid(format!(
             "Qwen4 artifact has too many entries: {}",
@@ -1041,28 +1050,6 @@ fn load_optional_config(source: &SourceSet) -> Result<Option<Value>, Qwen4Error>
     }
 }
 
-fn validate_config(config: Option<&Value>) -> Result<(), Qwen4Error> {
-    let Some(config) = config else { return Ok(()) };
-    let model_type = config
-        .get("model_type")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            config
-                .get("text_config")
-                .and_then(Value::as_object)
-                .and_then(|text| text.get("model_type"))
-                .and_then(Value::as_str)
-        });
-    if let Some(model_type) = model_type {
-        if model_type != "qwen4_exp" && model_type != "qwen4_exp_text" {
-            return Err(Qwen4Error::Invalid(format!(
-                "Qwen4 producer received model_type {model_type:?}, expected qwen4_exp"
-            )));
-        }
-    }
-    Ok(())
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum I64Role {
     Multipliers,
@@ -1097,9 +1084,6 @@ fn ple_shard_index(name: &str) -> Option<usize> {
     digits.parse().ok()
 }
 
-fn is_ple_shard_name(name: &str) -> bool {
-    name.contains(".ngram_embedding.shard_")
-}
 
 fn is_vision_tensor(name: &str) -> bool {
     [
@@ -1113,6 +1097,168 @@ fn is_vision_tensor(name: &str) -> bool {
     .iter()
     .any(|prefix| name.starts_with(prefix))
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManifestRole {
+    Bf16,
+    GateUp,
+    Down,
+    Ple,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ManifestExpectation {
+    shape: Vec<u64>,
+    role: ManifestRole,
+    is_mtp: bool,
+    ple_index: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MetadataExpectation {
+    role: I64Role,
+    shape: Vec<u64>,
+}
+
+#[derive(Debug)]
+struct ManifestIndex {
+    required: BTreeMap<String, ManifestExpectation>,
+    aliases: BTreeMap<String, ManifestExpectation>,
+    metadata: BTreeMap<String, MetadataExpectation>,
+    ple_names: BTreeMap<usize, String>,
+}
+
+impl ManifestIndex {
+    fn build(manifest: &Qwen4Manifest) -> Result<Self, Qwen4Error> {
+        let mut required = BTreeMap::new();
+        let mut aliases = BTreeMap::new();
+        let mut ple_names = BTreeMap::new();
+        for entry in &manifest.weights {
+            let shape = entry
+                .logical_shape
+                .iter()
+                .map(|&dimension| {
+                    u64::try_from(dimension).map_err(|_| {
+                        Qwen4Error::Invalid(format!(
+                            "Qwen4 manifest shape for {} does not fit u64",
+                            entry.name
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let role = if entry.residency.is_external() {
+                ManifestRole::Ple
+            } else if entry.dtype == DType::MQ4G256V2 {
+                ManifestRole::GateUp
+            } else if entry.dtype == DType::Q8_0 {
+                ManifestRole::Down
+            } else {
+                ManifestRole::Bf16
+            };
+            let ple_index = if role == ManifestRole::Ple {
+                let index = ple_shard_index(&entry.name).ok_or_else(|| {
+                    Qwen4Error::Invalid(format!(
+                        "Qwen4 manifest external record is not a numeric PLE shard: {}",
+                        entry.name
+                    ))
+                })?;
+                if index >= PLE_SHARD_COUNT {
+                    return Err(Qwen4Error::Invalid(format!(
+                        "Qwen4 manifest PLE shard index {index} is outside 0..{}",
+                        PLE_SHARD_COUNT - 1
+                    )));
+                }
+                if ple_names.insert(index, entry.name.clone()).is_some() {
+                    return Err(Qwen4Error::Invalid(format!(
+                        "Qwen4 manifest has duplicate PLE shard index {index}"
+                    )));
+                }
+                Some(index)
+            } else {
+                None
+            };
+            let expectation = ManifestExpectation {
+                shape,
+                role,
+                is_mtp: entry.name.starts_with("mtp."),
+                ple_index,
+            };
+            let is_alias = matches!(entry.policy, ShardPolicy::Tied { .. });
+            if required.contains_key(&entry.name) || aliases.contains_key(&entry.name) {
+                return Err(Qwen4Error::Invalid(format!(
+                    "Qwen4 manifest has duplicate weight name {}",
+                    entry.name
+                )));
+            }
+            if is_alias {
+                aliases.insert(entry.name.clone(), expectation);
+            } else {
+                required.insert(entry.name.clone(), expectation);
+            }
+        }
+        if ple_names.len() != PLE_SHARD_COUNT {
+            return Err(Qwen4Error::Invalid(format!(
+                "Qwen4 manifest requires {PLE_SHARD_COUNT} numeric PLE shards, found {}",
+                ple_names.len()
+            )));
+        }
+
+        let mut metadata = BTreeMap::new();
+        for record in &manifest.metadata {
+            let role = i64_role(&record.name).ok_or_else(|| {
+                Qwen4Error::Invalid(format!(
+                    "Qwen4 manifest has unknown I64 metadata record {}",
+                    record.name
+                ))
+            })?;
+            let shape = record
+                .shape
+                .iter()
+                .map(|&dimension| {
+                    u64::try_from(dimension).map_err(|_| {
+                        Qwen4Error::Invalid(format!(
+                            "Qwen4 metadata shape for {} does not fit u64",
+                            record.name
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if record.source_dtype != "I64" {
+                return Err(Qwen4Error::Invalid(format!(
+                    "Qwen4 metadata {} has source dtype {}, expected I64",
+                    record.name, record.source_dtype
+                )));
+            }
+            if required.contains_key(&record.name)
+                || aliases.contains_key(&record.name)
+                || metadata
+                    .insert(record.name.clone(), MetadataExpectation { role, shape })
+                    .is_some()
+            {
+                return Err(Qwen4Error::Invalid(format!(
+                    "Qwen4 manifest has duplicate metadata name {}",
+                    record.name
+                )));
+            }
+        }
+        let roles: BTreeSet<_> = metadata.values().map(|record| record.role).collect();
+        if roles.len() != 3
+            || !roles.contains(&I64Role::Multipliers)
+            || !roles.contains(&I64Role::VocabSizes)
+            || !roles.contains(&I64Role::Offsets)
+        {
+            return Err(Qwen4Error::Invalid(
+                "Qwen4 manifest must declare exactly three distinct PLE I64 metadata roles"
+                    .to_string(),
+            ));
+        }
+        Ok(Self {
+            required,
+            aliases,
+            metadata,
+            ple_names,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExpertKind {
@@ -1120,19 +1266,6 @@ enum ExpertKind {
     Down,
 }
 
-fn expert_kind(name: &str) -> Option<ExpertKind> {
-    if name.ends_with(".mlp.experts.gate_up_proj")
-        || name.ends_with(".mlp.experts.gate_up_proj.weight")
-    {
-        Some(ExpertKind::GateUp)
-    } else if name.ends_with(".mlp.experts.down_proj")
-        || name.ends_with(".mlp.experts.down_proj.weight")
-    {
-        Some(ExpertKind::Down)
-    } else {
-        None
-    }
-}
 
 fn checked_product(values: &[u64], what: &str) -> Result<u64, Qwen4Error> {
     values.iter().try_fold(1u64, |product, &value| {
@@ -1169,25 +1302,25 @@ fn shape_u32(shape: &[u64], name: &str) -> Result<Vec<u32>, Qwen4Error> {
 fn validate_expert_shape(
     tensor: &SourceTensor,
     kind: ExpertKind,
+    expected: &[u64],
 ) -> Result<(u64, u64), Qwen4Error> {
-    let expected = match kind {
-        ExpertKind::GateUp => [ROUTED_EXPERTS, GATE_UP_INTERMEDIATE, HIDDEN_WIDTH],
-        ExpertKind::Down => [ROUTED_EXPERTS, HIDDEN_WIDTH, DOWN_INTERMEDIATE],
-    };
-    if tensor.shape.as_slice() != expected {
+    if tensor.shape != expected {
         return Err(Qwen4Error::Invalid(format!(
             "{} has {:?}, expected {:?}; Qwen4 never pads expert K",
             tensor.name, tensor.shape, expected
+        )));
+    }
+    if tensor.shape.len() != 3 {
+        return Err(Qwen4Error::Invalid(format!(
+            "{} manifest expert role {kind:?} requires a rank-3 tensor",
+            tensor.name
         )));
     }
     let rows = tensor.shape[0]
         .checked_mul(tensor.shape[1])
         .ok_or_else(|| Qwen4Error::Invalid(format!("{} row count overflows", tensor.name)))?;
     let k = tensor.shape[2];
-    let expected_bytes = rows
-        .checked_mul(k)
-        .and_then(|elements| elements.checked_mul(2))
-        .ok_or_else(|| Qwen4Error::Invalid(format!("{} byte length overflows", tensor.name)))?;
+    let expected_bytes = checked_bf16_bytes(&tensor.shape, &tensor.name)?;
     if tensor.data_len() != expected_bytes {
         return Err(Qwen4Error::Invalid(format!(
             "{} has {} payload bytes, expected {}",
@@ -1366,14 +1499,114 @@ fn validate_ple_metadata(
             "Qwen4 PLE valid rows {valid_rows} exceed physical rows {physical_rows}"
         )));
     }
+
     Ok(valid_rows)
 }
+fn validate_manifest_inventory_names(
+    tensors: &[SourceTensor],
+    inventory: &ManifestIndex,
+) -> Result<(), Qwen4Error> {
+    let mut seen_metadata = BTreeSet::new();
+    let mut seen_required = BTreeSet::new();
+    let mut seen_aliases = BTreeSet::new();
+    for tensor in tensors {
+        if inventory.metadata.contains_key(&tensor.name) {
+            if !seen_metadata.insert(tensor.name.clone()) {
+                return Err(Qwen4Error::Invalid(format!(
+                    "duplicate Qwen4 I64 metadata record {}",
+                    tensor.name
+                )));
+            }
+        } else if inventory.required.contains_key(&tensor.name) {
+            if !seen_required.insert(tensor.name.clone()) {
+                return Err(Qwen4Error::Invalid(format!(
+                    "duplicate Qwen4 manifest source record {}",
+                    tensor.name
+                )));
+            }
+        } else if inventory.aliases.contains_key(&tensor.name) {
+            if !seen_aliases.insert(tensor.name.clone()) {
+                return Err(Qwen4Error::Invalid(format!(
+                    "duplicate Qwen4 manifest alias record {}",
+                    tensor.name
+                )));
+            }
+        } else if !is_vision_tensor(&tensor.name) {
+            return Err(Qwen4Error::Invalid(format!(
+                "Qwen4 source tensor {} is not declared by the manifest",
+                tensor.name
+            )));
+        }
+    }
+    let missing_metadata: Vec<_> = inventory
+        .metadata
+        .keys()
+        .filter(|name| !seen_metadata.contains(*name))
+        .map(String::as_str)
+        .collect();
+    if !missing_metadata.is_empty() {
+        return Err(Qwen4Error::Invalid(format!(
+            "Qwen4 source is missing manifest metadata records {missing_metadata:?}"
+        )));
+    }
+    let missing_required: Vec<_> = inventory
+        .required
+        .keys()
+        .filter(|name| !seen_required.contains(*name))
+        .map(String::as_str)
+        .collect();
+    if !missing_required.is_empty() {
+        return Err(Qwen4Error::Invalid(format!(
+            "Qwen4 source is missing {} manifest records: {missing_required:?}",
+            missing_required.len()
+        )));
+    }
+    Ok(())
+}
 
-fn plan_entries(tensors: Vec<SourceTensor>, row_chunk: usize) -> Result<EntryPlan, Qwen4Error> {
+
+fn validate_manifest_source(
+    tensor: &SourceTensor,
+    expected: &ManifestExpectation,
+) -> Result<(), Qwen4Error> {
+    if tensor.dtype != "BF16" {
+        return Err(Qwen4Error::Invalid(format!(
+            "{} has dtype {}, expected source BF16",
+            tensor.name, tensor.dtype
+        )));
+    }
+    if tensor.shape != expected.shape {
+        return Err(Qwen4Error::Invalid(format!(
+            "{} has {:?}, expected manifest shape {:?}",
+            tensor.name, tensor.shape, expected.shape
+        )));
+    }
+    let expected_bytes = checked_bf16_bytes(&tensor.shape, &tensor.name)?;
+    if tensor.data_len() != expected_bytes {
+        return Err(Qwen4Error::Invalid(format!(
+            "{} has {} payload bytes, expected {}",
+            tensor.name,
+            tensor.data_len(),
+            expected_bytes
+        )));
+    }
+    Ok(())
+}
+
+fn plan_entries(
+    tensors: Vec<SourceTensor>,
+    row_chunk: usize,
+    manifest: &Qwen4Manifest,
+) -> Result<EntryPlan, Qwen4Error> {
+    let inventory = ManifestIndex::build(manifest)?;
+    validate_manifest_inventory_names(&tensors, &inventory)?;
     let mut metadata_sources: BTreeMap<I64Role, SourceTensor> = BTreeMap::new();
     let mut ple_sources: BTreeMap<usize, SourceTensor> = BTreeMap::new();
     let mut metadata_entries = Vec::new();
     let mut resident = Vec::new();
+    let mut seen_metadata = BTreeSet::new();
+    let mut seen_required = BTreeSet::new();
+    let mut seen_aliases = BTreeSet::new();
     let mut expert_entries = 0usize;
     let mut gate_up_count = 0usize;
     let mut down_count = 0usize;
@@ -1381,123 +1614,168 @@ fn plan_entries(tensors: Vec<SourceTensor>, row_chunk: usize) -> Result<EntryPla
     let mut mtp_down = false;
 
     for tensor in tensors {
-        if let Some(role) = i64_role(&tensor.name) {
+        if let Some(expected) = inventory.metadata.get(&tensor.name) {
+            if !seen_metadata.insert(tensor.name.clone()) {
+                return Err(Qwen4Error::Invalid(format!(
+                    "duplicate Qwen4 I64 metadata record {}",
+                    tensor.name
+                )));
+            }
             if tensor.dtype != "I64" {
                 return Err(Qwen4Error::Invalid(format!(
-                    "{} has dtype {}, expected I64 metadata",
+                    "{} has dtype {}, expected manifest I64 metadata",
                     tensor.name, tensor.dtype
                 )));
             }
-            if metadata_sources.insert(role, tensor.clone()).is_some() {
+            if tensor.shape != expected.shape {
                 return Err(Qwen4Error::Invalid(format!(
-                    "duplicate Qwen4 I64 metadata role {role:?}"
+                    "{} has {:?}, expected manifest metadata shape {:?}",
+                    tensor.name, tensor.shape, expected.shape
                 )));
             }
-            continue;
-        }
-        if tensor.dtype == "I64" {
-            return Err(Qwen4Error::Invalid(format!(
-                "unknown Qwen4 I64 tensor {}; refusing TidI32 or implicit casts",
-                tensor.name
-            )));
-        }
-        if is_ple_shard_name(&tensor.name) {
-            let index = ple_shard_index(&tensor.name).ok_or_else(|| {
-                Qwen4Error::Invalid(format!("malformed Qwen4 PLE shard name {}", tensor.name))
-            })?;
-            if index >= PLE_SHARD_COUNT {
-                return Err(Qwen4Error::Invalid(format!(
-                    "Qwen4 PLE shard index {index} is outside 0..{}",
-                    PLE_SHARD_COUNT - 1
-                )));
-            }
-            if tensor.dtype != "BF16" || tensor.shape != [PLE_ROWS_PER_SHARD, PLE_ROW_WIDTH] {
-                return Err(Qwen4Error::Invalid(format!(
-                    "{} must be BF16 [{PLE_ROWS_PER_SHARD},{PLE_ROW_WIDTH}], got {} {:?}",
-                    tensor.name, tensor.dtype, tensor.shape
-                )));
-            }
-            let expected_bytes = checked_bf16_bytes(&tensor.shape, &tensor.name)?;
-            if tensor.data_len() != expected_bytes {
+            let data_len = checked_product(&tensor.shape, &tensor.name)?
+                .checked_mul(8)
+                .ok_or_else(|| {
+                    Qwen4Error::Invalid(format!(
+                        "{} I64 payload length overflows",
+                        tensor.name
+                    ))
+                })?;
+            if tensor.data_len() != data_len {
                 return Err(Qwen4Error::Invalid(format!(
                     "{} has {} payload bytes, expected {}",
                     tensor.name,
                     tensor.data_len(),
-                    expected_bytes
+                    data_len
                 )));
             }
-            if ple_sources.insert(index, tensor).is_some() {
+            metadata_sources.insert(expected.role, tensor);
+            continue;
+        }
+
+        if let Some(expected) = inventory.required.get(&tensor.name) {
+            if !seen_required.insert(tensor.name.clone()) {
                 return Err(Qwen4Error::Invalid(format!(
-                    "duplicate Qwen4 PLE shard index {index}"
+                    "duplicate Qwen4 manifest source record {}",
+                    tensor.name
                 )));
             }
-            continue;
-        }
-        if is_vision_tensor(&tensor.name) {
-            // The Qwen4 text artifact intentionally omits vision tensors.  Do
-            // not let a vision BF16 tensor become an accidental text weight.
-            continue;
-        }
-        if tensor.dtype != "BF16" {
-            return Err(Qwen4Error::Invalid(format!(
-                "{} has dtype {}, expected BF16 or one of the typed Qwen4 I64 metadata arrays",
-                tensor.name, tensor.dtype
-            )));
-        }
-        let shape = shape_u32(&tensor.shape, &tensor.name)?;
-        if let Some(expert_kind) = expert_kind(&tensor.name) {
-            let (rows, k) = validate_expert_shape(&tensor, expert_kind)?;
-            let expected_len = quantized_data_len(expert_kind, rows, k)?;
-            let is_mtp = tensor.name.starts_with("mtp.") || tensor.name.contains(".mtp.");
-            match expert_kind {
-                ExpertKind::GateUp => {
-                    gate_up_count += 1;
-                    mtp_gate_up |= is_mtp;
+            validate_manifest_source(&tensor, expected)?;
+            match expected.role {
+                ManifestRole::Ple => {
+                    let index = expected
+                        .ple_index
+                        .expect("manifest PLE role has a numeric shard index");
+                    if ple_sources.insert(index, tensor).is_some() {
+                        return Err(Qwen4Error::Invalid(format!(
+                            "duplicate Qwen4 PLE shard index {index}"
+                        )));
+                    }
                 }
-                ExpertKind::Down => {
-                    down_count += 1;
-                    mtp_down |= is_mtp;
+                ManifestRole::GateUp | ManifestRole::Down => {
+                    let kind = match expected.role {
+                        ManifestRole::GateUp => ExpertKind::GateUp,
+                        ManifestRole::Down => ExpertKind::Down,
+                        ManifestRole::Bf16 | ManifestRole::Ple => {
+                            unreachable!("matched expert manifest role")
+                        }
+                    };
+                    let (rows, k) = validate_expert_shape(&tensor, kind, &expected.shape)?;
+                    let expected_len = quantized_data_len(kind, rows, k)?;
+                    match kind {
+                        ExpertKind::GateUp => {
+                            gate_up_count += 1;
+                            mtp_gate_up |= expected.is_mtp;
+                        }
+                        ExpertKind::Down => {
+                            down_count += 1;
+                            mtp_down |= expected.is_mtp;
+                        }
+                    }
+                    let shape = shape_u32(&expected.shape, &tensor.name)?;
+                    expert_entries += 1;
+                    resident.push(PlannedEntry {
+                        source: tensor,
+                        name: String::new(),
+                        quant_type: match kind {
+                            ExpertKind::GateUp => 44,
+                            ExpertKind::Down => 3,
+                        },
+                        shape,
+                        group_size: match kind {
+                            ExpertKind::GateUp => MQ4_GROUP_SIZE as u32,
+                            ExpertKind::Down => Q8_GROUP_SIZE as u32,
+                        },
+                        data_len: expected_len,
+                        kind: match kind {
+                            ExpertKind::GateUp => EntryKind::GateUp,
+                            ExpertKind::Down => EntryKind::Down,
+                        },
+                    });
+                }
+                ManifestRole::Bf16 => {
+                    let expected_len = checked_bf16_bytes(&tensor.shape, &tensor.name)?;
+                    let shape = shape_u32(&expected.shape, &tensor.name)?;
+                    resident.push(PlannedEntry {
+                        source: tensor,
+                        name: String::new(),
+                        quant_type: 16,
+                        shape,
+                        group_size: 0,
+                        data_len: expected_len,
+                        kind: EntryKind::Bf16,
+                    });
                 }
             }
-            expert_entries += 1;
-            resident.push(PlannedEntry {
-                source: tensor,
-                name: String::new(),
-                quant_type: match expert_kind {
-                    ExpertKind::GateUp => 44,
-                    ExpertKind::Down => 3,
-                },
-                shape,
-                group_size: match expert_kind {
-                    ExpertKind::GateUp => MQ4_GROUP_SIZE as u32,
-                    ExpertKind::Down => Q8_GROUP_SIZE as u32,
-                },
-                data_len: expected_len,
-                kind: match expert_kind {
-                    ExpertKind::GateUp => EntryKind::GateUp,
-                    ExpertKind::Down => EntryKind::Down,
-                },
-            });
             continue;
         }
-        let expected_len = checked_bf16_bytes(&tensor.shape, &tensor.name)?;
-        if tensor.data_len() != expected_len {
-            return Err(Qwen4Error::Invalid(format!(
-                "{} has {} payload bytes, expected {}",
-                tensor.name,
-                tensor.data_len(),
-                expected_len
-            )));
+
+        if let Some(expected) = inventory.aliases.get(&tensor.name) {
+            if !seen_aliases.insert(tensor.name.clone()) {
+                return Err(Qwen4Error::Invalid(format!(
+                    "duplicate Qwen4 manifest alias record {}",
+                    tensor.name
+                )));
+            }
+            validate_manifest_source(&tensor, expected)?;
+            // Tied records are logical aliases, not duplicate source records.
+            continue;
         }
-        resident.push(PlannedEntry {
-            source: tensor,
-            name: String::new(),
-            quant_type: 16,
-            shape,
-            group_size: 0,
-            data_len: expected_len,
-            kind: EntryKind::Bf16,
-        });
+
+        if is_vision_tensor(&tensor.name) {
+            // The Qwen4 text artifact intentionally omits only positively
+            // identified vision records.
+            continue;
+        }
+
+        return Err(Qwen4Error::Invalid(format!(
+            "Qwen4 source tensor {} is not declared by the manifest",
+            tensor.name
+        )));
+    }
+
+    let missing_metadata: Vec<_> = inventory
+        .metadata
+        .iter()
+        .filter(|(name, _)| !seen_metadata.contains(*name))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !missing_metadata.is_empty() {
+        return Err(Qwen4Error::Invalid(format!(
+            "Qwen4 source is missing manifest metadata records {missing_metadata:?}"
+        )));
+    }
+    let missing_required: Vec<_> = inventory
+        .required
+        .keys()
+        .filter(|name| !seen_required.contains(*name))
+        .map(String::as_str)
+        .collect();
+    if !missing_required.is_empty() {
+        return Err(Qwen4Error::Invalid(format!(
+            "Qwen4 source is missing {} manifest records: {missing_required:?}",
+            missing_required.len()
+        )));
     }
 
     let multipliers = metadata_sources
@@ -1522,7 +1800,7 @@ fn plan_entries(tensors: Vec<SourceTensor>, row_chunk: usize) -> Result<EntryPla
     for role in [I64Role::Multipliers, I64Role::VocabSizes, I64Role::Offsets] {
         let source = metadata_sources
             .get(&role)
-            .expect("metadata role presence was validated")
+            .expect("manifest metadata role presence was validated")
             .clone();
         let shape = shape_u32(&source.shape, &source.name)?;
         let data_len = (checked_product(&source.shape, &source.name)?)
@@ -1530,14 +1808,6 @@ fn plan_entries(tensors: Vec<SourceTensor>, row_chunk: usize) -> Result<EntryPla
             .ok_or_else(|| {
                 Qwen4Error::Invalid(format!("{} I64 payload length overflows", source.name))
             })?;
-        if source.data_len() != data_len {
-            return Err(Qwen4Error::Invalid(format!(
-                "{} has {} payload bytes, expected {}",
-                source.name,
-                source.data_len(),
-                data_len
-            )));
-        }
         metadata_entries.push(PlannedEntry {
             name: source.name.clone(),
             source,
@@ -1554,7 +1824,7 @@ fn plan_entries(tensors: Vec<SourceTensor>, row_chunk: usize) -> Result<EntryPla
             .filter(|index| !ple_sources.contains_key(index))
             .collect();
         return Err(Qwen4Error::Invalid(format!(
-            "Qwen4 requires all {PLE_SHARD_COUNT} PLE shards; found {}, missing {:?}",
+            "Qwen4 requires all {PLE_SHARD_COUNT} manifest PLE shards; found {}, missing {:?}",
             ple_sources.len(),
             missing
         )));
@@ -2541,6 +2811,120 @@ mod tests {
                 shard: source,
             },
         )
+    }
+
+    fn named_source(
+        name: &str,
+        bytes: &[u8],
+        shape: Vec<u64>,
+        dtype: &str,
+    ) -> (NamedTempFile, SourceTensor) {
+        let (file, mut tensor) = source_tensor(bytes, shape, dtype);
+        tensor.name = name.to_string();
+        (file, tensor)
+    }
+
+    fn focused_manifest_index() -> ManifestIndex {
+        let mut required = BTreeMap::new();
+        required.insert(
+            "required.weight".to_string(),
+            ManifestExpectation {
+                shape: vec![2],
+                role: ManifestRole::Bf16,
+                is_mtp: false,
+                ple_index: None,
+            },
+        );
+        let mut aliases = BTreeMap::new();
+        aliases.insert(
+            "mtp.embed_tokens.weight".to_string(),
+            ManifestExpectation {
+                shape: vec![2],
+                role: ManifestRole::Bf16,
+                is_mtp: true,
+                ple_index: None,
+            },
+        );
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "metadata.i64".to_string(),
+            MetadataExpectation {
+                role: I64Role::Multipliers,
+                shape: vec![1],
+            },
+        );
+        ManifestIndex {
+            required,
+            aliases,
+            metadata,
+            ple_names: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn manifest_inventory_rejects_missing_source_records() {
+        let inventory = focused_manifest_index();
+        let (_metadata_file, metadata) =
+            named_source("metadata.i64", &[0; 8], vec![1], "I64");
+        let error = validate_manifest_inventory_names(&[metadata], &inventory).unwrap_err();
+        assert!(error.to_string().contains("missing 1 manifest records"));
+    }
+
+    #[test]
+    fn manifest_inventory_rejects_duplicate_records() {
+        let inventory = focused_manifest_index();
+        let (_metadata_file, metadata) =
+            named_source("metadata.i64", &[0; 8], vec![1], "I64");
+        let (_first_file, first) =
+            named_source("required.weight", &[0; 4], vec![2], "BF16");
+        let (_second_file, second) =
+            named_source("required.weight", &[0; 4], vec![2], "BF16");
+        let error =
+            validate_manifest_inventory_names(&[metadata, first, second], &inventory).unwrap_err();
+        assert!(error.to_string().contains("duplicate Qwen4 manifest source record"));
+    }
+
+    #[test]
+    fn manifest_inventory_excludes_only_positive_vision_records() {
+        let inventory = focused_manifest_index();
+        let (_metadata_file, metadata) =
+            named_source("metadata.i64", &[0; 8], vec![1], "I64");
+        let (_required_file, required) =
+            named_source("required.weight", &[0; 4], vec![2], "BF16");
+        let (_vision_file, vision) =
+            named_source("model.visual.patch_embed.weight", &[0; 2], vec![1], "BF16");
+        validate_manifest_inventory_names(&[metadata, required, vision], &inventory).unwrap();
+    }
+
+    #[test]
+    fn manifest_inventory_does_not_require_tied_alias_source() {
+        let inventory = focused_manifest_index();
+        let (_metadata_file, metadata) =
+            named_source("metadata.i64", &[0; 8], vec![1], "I64");
+        let (_required_file, required) =
+            named_source("required.weight", &[0; 4], vec![2], "BF16");
+        validate_manifest_inventory_names(&[metadata.clone(), required.clone()], &inventory)
+            .unwrap();
+        let (_alias_file, alias) =
+            named_source("mtp.embed_tokens.weight", &[0; 4], vec![2], "BF16");
+        validate_manifest_inventory_names(&[metadata, required, alias], &inventory).unwrap();
+    }
+
+    #[test]
+    fn manifest_source_dtype_is_bf16_even_when_output_role_is_quantized() {
+        let expected = ManifestExpectation {
+            shape: vec![2, 2, 2],
+            role: ManifestRole::GateUp,
+            is_mtp: false,
+            ple_index: None,
+        };
+        let (_source_file, source) =
+            named_source("gate_up", &[0; 16], vec![2, 2, 2], "BF16");
+        validate_manifest_source(&source, &expected).unwrap();
+        let (_output_file, output) =
+            named_source("gate_up", &[0; 16], vec![2, 2, 2], "MQ4G256V2");
+        let error = validate_manifest_source(&output, &expected).unwrap_err();
+        assert!(error.to_string().contains("expected source BF16"));
     }
 
     #[test]
