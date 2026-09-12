@@ -2,5 +2,6 @@
 """Pinned Qwen4Exp layerwise reference fixture generator."""
 
 from .generate_fixtures import generate, main
+from .upstream import generate_upstream
 
-__all__ = ["generate", "main"]
+__all__ = ["generate", "generate_upstream", "main"]

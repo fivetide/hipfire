@@ -2,16 +2,24 @@
 # SPDX-License-Identifier: Apache-2.0
 """Generate deterministic, compact Qwen4Exp layerwise reference fixtures.
 
-Usage::
+Synthetic usage::
 
     python3 crates/hipfire-arch-qwen4/reference_oracle/generate_fixtures.py \
         --out /tmp/qwen4-reference-fixtures --seed 3800
 
-The generator implements only small synthetic tensors (plus selected BF16 PLE
-rows), never a full checkpoint.  ``--source-bf16-slices`` accepts an NPZ with
+Upstream parity usage::
+
+    python3 crates/hipfire-arch-qwen4/reference_oracle/generate_fixtures.py \
+        --upstream-reference --out .codeinsight+research/qwen4/oracle --seed 3800
+
+The default path implements only small synthetic tensors (plus optional
+selected BF16 PLE rows).  ``--source-bf16-slices`` accepts an NPZ with
 ``ple_row_ids`` (int64, ``[tokens,16]``) and ``ple_rows_bf16`` (uint16 BF16
-words, ``[tokens,16,160]``).  Both shape and byte-level row IDs are checked;
-wrong dtype, shape, duplicate IDs, or a token/row mismatch is a hard error.
+words, ``[tokens,16,160]``); shape, dtype, duplicate IDs, and token/row
+mismatches are hard errors.  ``--upstream-reference`` instead executes exact
+SHA-verified Transformers/vLLM source snapshots through an explicit adapter,
+requires only PyTorch, and range-reads bounded trained checkpoint slices;
+neither path loads a full checkpoint.
 """
 
 from __future__ import annotations
@@ -96,6 +104,13 @@ except ImportError:  # direct execution from this directory
         transpose2,
     )
     from schema import FixtureError, Tensor, array_metadata, read_npz, sha256_file, tensor_bytes, write_json, write_npz  # type: ignore
+try:
+    from .upstream import generate_upstream, self_test
+except ImportError:  # direct execution from this directory
+    from upstream import generate_upstream, self_test  # type: ignore
+
+
+UPSTREAM_REFERENCE_SCHEMA = "hipfire.qwen4.reference_oracle.v2"
 
 
 HF_TRANSFORMERS_COMMIT = "93c8b7b485963a10800c91f55304db6be211c2bd"
@@ -716,16 +731,34 @@ def generate(out: str | Path, seed: int = 3800, source_path: str | None = None) 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out", required=True, help="output directory for NPZ fixtures and manifest.json")
+    parser.add_argument("--out", help="output directory for NPZ fixtures and manifest.json")
     parser.add_argument("--seed", type=int, default=3800, help="deterministic root seed (default: 3800)")
     parser.add_argument("--source-bf16-slices", "--source-slices", dest="source_path", help="optional selected-row NPZ; requires int row IDs and uint16 BF16 rows")
+    parser.add_argument("--upstream-reference", action="store_true", help="execute exact SHA-verified Transformers/vLLM source snapshots with torch and range-read checkpoint slices")
+    parser.add_argument("--cache-dir", help="bounded upstream cache (under ~/.hipfire/datasets or .codeinsight+research)")
+    parser.add_argument("--self-test", action="store_true", help="validate synthetic preservation and rejection guards")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.self_test and args.upstream_reference:
+        print("qwen4 reference fixture generation failed: --self-test and --upstream-reference are exclusive", file=sys.stderr)
+        return 2
+    if not args.self_test and not args.out:
+        print("qwen4 reference fixture generation failed: --out is required unless --self-test is used", file=sys.stderr)
+        return 2
     try:
-        manifest = generate(args.out, args.seed, args.source_path)
+        if args.self_test:
+            self_test(args.cache_dir)
+            print("qwen4 reference fixture self-test passed")
+            return 0
+        if args.upstream_reference:
+            manifest = generate_upstream(args.out, args.seed, args.cache_dir)
+        else:
+            if args.cache_dir:
+                raise FixtureError("--cache-dir is only valid with --upstream-reference or --self-test")
+            manifest = generate(args.out, args.seed, args.source_path)
     except (FixtureError, OSError, ValueError) as exc:
         print(f"qwen4 reference fixture generation failed: {exc}", file=sys.stderr)
         return 2
