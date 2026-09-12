@@ -26,6 +26,7 @@ pub mod ple_ops;
 pub mod ple_rows;
 pub(crate) mod projection;
 pub mod state;
+pub mod state_parity;
 pub mod weights;
 
 pub use admission::{

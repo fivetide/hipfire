@@ -666,6 +666,39 @@ pub struct MtpGpuState {
     snapshot_arena: MtpGpuStateSnapshotArena,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MtpStateParityMetadata {
+    pub(crate) full_len: usize,
+    pub(crate) raw_len: usize,
+    pub(crate) pooled_len: usize,
+    pub(crate) selected_len: usize,
+    pub(crate) position: usize,
+    pub(crate) step_index: usize,
+}
+
+pub(crate) struct MtpStateParityBuffers<'a> {
+    pub(crate) full_keys: &'a GpuTensor,
+    pub(crate) full_values: &'a GpuTensor,
+    pub(crate) raw_index_keys: &'a GpuTensor,
+    pub(crate) pooled_keys: &'a GpuTensor,
+    pub(crate) selected_indices: &'a GpuTensor,
+    pub(crate) selected_len_out: &'a GpuTensor,
+    pub(crate) wide_hidden: &'a GpuTensor,
+}
+
+impl MtpStateParityMetadata {
+    fn from_state(state: &MtpGpuState) -> Self {
+        Self {
+            full_len: state.full_len,
+            raw_len: state.raw_len,
+            pooled_len: state.pooled_len,
+            selected_len: state.selected_len,
+            position: state.position,
+            step_index: state.step_index,
+        }
+    }
+}
+
 impl MtpGpuState {
     fn mark(&self) -> MtpStateMark {
         MtpStateMark {
@@ -677,7 +710,11 @@ impl MtpGpuState {
             step_index: self.step_index,
         }
     }
-    fn new(gpu: &mut Gpu, config: &Qwen4Config, max_seq: usize) -> Result<Self, MtpGpuError> {
+    pub(crate) fn new(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        max_seq: usize,
+    ) -> Result<Self, MtpGpuError> {
         let full_width = config.num_key_value_heads * config.head_dim;
         let raw_width = config.indexer_kv_heads * config.indexer_head_dim;
         let pooled_capacity = max_seq.div_ceil(config.indexer_compress_ratio);
@@ -794,7 +831,7 @@ impl MtpGpuState {
         })
     }
 
-    fn reset(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
+    pub(crate) fn reset(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
         self.snapshot_arena.invalidate();
         for tensor in [
             &self.full_keys,
@@ -817,7 +854,7 @@ impl MtpGpuState {
         self.generation = self.generation.wrapping_add(1);
         Ok(())
     }
-    fn snapshot(&mut self, gpu: &mut Gpu) -> Result<MtpGpuStateSnapshot, MtpGpuError> {
+    pub(crate) fn snapshot(&mut self, gpu: &mut Gpu) -> Result<MtpGpuStateSnapshot, MtpGpuError> {
         let dimensions = MtpGpuStateSnapshotArena::dimensions(self);
         let mark = self.mark();
         {
@@ -909,11 +946,15 @@ impl MtpGpuState {
         result
     }
 
-    fn restore(&mut self, gpu: &mut Gpu, snapshot: MtpGpuStateSnapshot) -> Result<(), MtpGpuError> {
+    pub(crate) fn restore(
+        &mut self,
+        gpu: &mut Gpu,
+        snapshot: MtpGpuStateSnapshot,
+    ) -> Result<(), MtpGpuError> {
         self.restore_impl(gpu, snapshot, true)
     }
 
-    fn restore_retain(
+    pub(crate) fn restore_retain(
         &mut self,
         gpu: &mut Gpu,
         snapshot: MtpGpuStateSnapshot,
@@ -921,11 +962,11 @@ impl MtpGpuState {
         self.restore_impl(gpu, snapshot, false)
     }
 
-    fn validate_commit(&self, snapshot: MtpGpuStateSnapshot) -> Result<(), MtpGpuError> {
+    pub(crate) fn validate_commit(&self, snapshot: MtpGpuStateSnapshot) -> Result<(), MtpGpuError> {
         self.snapshot_arena.validate_ticket(self, &snapshot)
     }
 
-    fn commit_validated(&mut self, _snapshot: MtpGpuStateSnapshot) {
+    pub(crate) fn commit_validated(&mut self, _snapshot: MtpGpuStateSnapshot) {
         debug_assert!(
             self.snapshot_arena.active,
             "MTP commit_validated requires an active snapshot"
@@ -939,11 +980,36 @@ impl MtpGpuState {
         Ok(())
     }
 
-    fn position(&self) -> usize {
+    pub(crate) fn position(&self) -> usize {
         self.position
     }
 
-    fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
+    pub(crate) fn parity_metadata(&self) -> MtpStateParityMetadata {
+        MtpStateParityMetadata::from_state(self)
+    }
+
+    pub(crate) fn parity_buffers(&self) -> MtpStateParityBuffers<'_> {
+        MtpStateParityBuffers {
+            full_keys: &self.full_keys,
+            full_values: &self.full_values,
+            raw_index_keys: &self.raw_index_keys,
+            pooled_keys: &self.pooled_keys,
+            selected_indices: &self.selected_indices,
+            selected_len_out: &self.selected_len_out,
+            wide_hidden: &self.wide_hidden,
+        }
+    }
+
+    pub(crate) fn parity_set_metadata(&mut self, metadata: MtpStateParityMetadata) {
+        self.full_len = metadata.full_len;
+        self.raw_len = metadata.raw_len;
+        self.pooled_len = metadata.pooled_len;
+        self.selected_len = metadata.selected_len;
+        self.position = metadata.position;
+        self.step_index = metadata.step_index;
+    }
+
+    pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
         let Self {
             full_keys,
             full_values,
@@ -1069,6 +1135,10 @@ impl Qwen4MtpGpu {
         self.state.position()
     }
 
+    pub(crate) fn parity_state(&self) -> &MtpGpuState {
+        &self.state
+    }
+
     pub(crate) fn forward_token(
         &mut self,
         gpu: &mut Gpu,
@@ -1090,6 +1160,23 @@ impl Qwen4MtpGpu {
         position: usize,
     ) -> Result<u32, MtpGpuError> {
         self.forward_token_inner(gpu, weights, config, token, None, position)
+    }
+
+    pub(crate) fn forward_token_with_logits(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        config: &Qwen4Config,
+        token: u32,
+        position: usize,
+        logits: &GpuTensor,
+    ) -> Result<u32, MtpGpuError> {
+        if logits.dtype != DType::F32 || logits.numel() != self.scratch.logits.numel() {
+            return Err(invalid("MTP logits destination shape mismatch"));
+        }
+        let next = self.forward_token_from_state(gpu, weights, config, token, position)?;
+        gpu.copy_d2d(&self.scratch.logits, logits, logits.byte_size())?;
+        Ok(next)
     }
 
     fn forward_token_inner(

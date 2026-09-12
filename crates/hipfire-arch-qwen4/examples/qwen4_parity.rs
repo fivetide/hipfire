@@ -2,8 +2,9 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Run the generated Qwen4 operator oracle on the production gfx1151 path, or
-//! execute the production HFQM carrier on the fixed teacher-forced corpus.
+//! Run the generated Qwen4 operator oracle on the production gfx1151 path,
+//! execute the production HFQM carrier on the fixed teacher-forced corpus, or
+//! exercise real-model state/MTP rollback plus compact arena fault scenarios.
 //!
 //! Fixture usage:
 //!   cargo run --release -p hipfire-arch-qwen4 --example qwen4_parity -- \
@@ -13,6 +14,12 @@
 //!   cargo run --release -p hipfire-arch-qwen4 --example qwen4_parity -- \
 //!       --model /path/to/model.hfq --tokens benchmarks/prompts/qwen4-teacher-forced.tokens.json \
 //!       --out /tmp/qwen4-candidate.json
+//!
+//! State parity usage:
+//!   cargo run --release -p hipfire-arch-qwen4 --example qwen4_parity -- \
+//!       --mode state --model /path/to/model.hfq \
+//!       --tokens benchmarks/prompts/qwen4-teacher-forced.tokens.json \
+//!       --out /tmp/qwen4-state-parity.json
 
 use hipfire_arch_qwen4::{admit_hfqm_artifact, PleHashMetadata, PleHistory, Qwen4HfqmArtifact};
 use hipfire_runtime::device_mesh::DeviceMesh;
@@ -3937,9 +3944,15 @@ enum ParityMode {
         tokens: PathBuf,
         output: PathBuf,
     },
+    State {
+        model: PathBuf,
+        tokens: PathBuf,
+        output: PathBuf,
+    },
 }
 
 fn parse_args() -> Result<ParityMode, String> {
+    let mut mode = None;
     let mut fixtures = None;
     let mut model = None;
     let mut tokens = None;
@@ -3947,26 +3960,39 @@ fn parse_args() -> Result<ParityMode, String> {
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--fixtures" => fixtures = Some(PathBuf::from(args.next().ok_or("--fixtures needs DIR")?)),
+            "--mode" => mode = Some(args.next().ok_or("--mode needs NAME")?),
+            "--fixtures" => {
+                fixtures = Some(PathBuf::from(args.next().ok_or("--fixtures needs DIR")?))
+            }
             "--model" => model = Some(PathBuf::from(args.next().ok_or("--model needs FILE")?)),
-            "--tokens" => tokens = Some(PathBuf::from(args.next().ok_or("--tokens needs metadata JSON")?)),
+            "--tokens" => {
+                tokens = Some(PathBuf::from(args.next().ok_or("--tokens needs metadata JSON")?))
+            }
             "--out" => out = Some(PathBuf::from(args.next().ok_or("--out needs FILE")?)),
             other => {
                 return fail(format!(
-                    "unsupported argument {other:?}; use --fixtures DIR --out FILE or --model FILE --tokens CORPUS --out FILE"
+                    "unsupported argument {other:?}; use --fixtures DIR --out FILE, --model FILE --tokens CORPUS --out FILE, or --mode state --model FILE --tokens CORPUS --out FILE"
                 ))
             }
         }
     }
     let output = out.ok_or("missing --out FILE")?;
-    match (fixtures, model, tokens) {
-        (Some(directory), None, None) => Ok(ParityMode::Fixtures { directory, output }),
-        (None, Some(model), Some(tokens)) => Ok(ParityMode::Candidate {
+    match (mode.as_deref(), fixtures, model, tokens) {
+        (None, Some(directory), None, None) => Ok(ParityMode::Fixtures { directory, output }),
+        (None, None, Some(model), Some(tokens)) => Ok(ParityMode::Candidate {
             model,
             tokens,
             output,
         }),
-        _ => fail("choose exactly one mode: --fixtures DIR or --model FILE --tokens CORPUS"),
+        (Some("state"), None, Some(model), Some(tokens)) => Ok(ParityMode::State {
+            model,
+            tokens,
+            output,
+        }),
+        (Some(other), _, _, _) => fail(format!("unsupported --mode {other:?}; only --mode state is available")),
+        _ => fail(
+            "choose exactly one mode: --fixtures DIR, --model FILE --tokens CORPUS, or --mode state --model FILE --tokens CORPUS",
+        ),
     }
 }
 
@@ -4043,6 +4069,16 @@ fn run() -> Result<(), String> {
         } => {
             run_quality_candidate(&model, &tokens, &output)?;
             println!("qwen4 quality candidate written: {}", output.display());
+            Ok(())
+        }
+        ParityMode::State {
+            model,
+            tokens,
+            output,
+        } => {
+            let report = hipfire_arch_qwen4::state_parity::run_state_parity(&model, &tokens)?;
+            report.write(&output)?;
+            println!("qwen4 state parity PASS: {}", output.display());
             Ok(())
         }
     }

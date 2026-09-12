@@ -591,7 +591,6 @@ impl Qwen4Config {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn compact_test_config() -> Qwen4Config {
     let layers: Vec<_> = (0..48)
         .map(|idx| {

@@ -485,6 +485,22 @@ impl Qwen4Bundle {
         result.map_err(|error| BundleError::Forward(error.to_string()))
     }
 
+    /// Run one native MTP token from its committed state and copy the
+    /// production logits into the caller-owned F32 destination.
+    pub fn mtp_forward_token_logits(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        position: usize,
+        logits: &GpuTensor,
+    ) -> Result<u32, BundleError> {
+        let mtp = self.mtp.as_mut().ok_or_else(|| {
+            BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+        })?;
+        mtp.forward_token_with_logits(gpu, &self.weights, &self.config, token, position, logits)
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
     pub(crate) fn mtp_snapshot(
         &mut self,
         gpu: &mut Gpu,

@@ -79,6 +79,35 @@ pub fn require_native_greedy(temp: f32) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuse native MTP prefill requests that would reuse a cached suffix.
+///
+/// Native MTP prefill is currently a cold, position-zero operation.  Silent
+/// truncation of a cache-hit suffix would leave target and MTP state at
+/// different positions, so callers must reject it before touching either
+/// owner.
+pub fn validate_native_mtp_prefill_request(
+    prompt_tokens: &[u32],
+    fill_tokens: &[u32],
+    start_pos: usize,
+    cache_hit: bool,
+) -> Result<(), String> {
+    if prompt_tokens.is_empty() {
+        return Err("Qwen4 native MTP prefill requires at least one prompt token".to_string());
+    }
+    if cache_hit {
+        return Err("Qwen4 native MTP prefill refuses cache-hit suffix reuse".to_string());
+    }
+    if start_pos != 0 {
+        return Err(format!(
+            "Qwen4 native MTP prefill requires position zero, got {start_pos}"
+        ));
+    }
+    if fill_tokens != prompt_tokens {
+        return Err("Qwen4 native MTP prefill requires a complete prompt fill".to_string());
+    }
+    Ok(())
+}
+
 /// Convert the native count (which includes the seed) into the runtime's
 /// accepted-draft count.  Zero is invalid because the seed itself is always
 /// present in a verified block.
@@ -567,21 +596,17 @@ impl MtpDrafter for Qwen4MtpDrafter {
         gpu: &mut Gpu,
         target: &mut dyn SpecTarget,
         prompt_tokens: &[u32],
-        _fill_tokens: &[u32],
-        _start_pos: usize,
-        _cache_hit: bool,
+        fill_tokens: &[u32],
+        start_pos: usize,
+        cache_hit: bool,
         abort: &dyn Fn() -> bool,
     ) -> Result<u32, String> {
         require_native_greedy(self.request.temp)?;
+        validate_native_mtp_prefill_request(prompt_tokens, fill_tokens, start_pos, cache_hit)?;
         // Native Qwen4 MTP has no exact target+MTP suffix rehydration yet.
         // Always discard any AR or stale MTP prefix and rebuild the complete
         // rendered prompt from position zero.
-        if prompt_tokens.is_empty() {
-            return Err("Qwen4 native MTP prefill requires at least one prompt token".to_string());
-        }
         target.reset_recurrent(gpu)?;
-        let fill_tokens = prompt_tokens;
-        let start_pos = 0usize;
         self.ensure_resources(gpu, target)?;
         {
             let bundle = Self::bundle(target)?;
