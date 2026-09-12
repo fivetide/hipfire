@@ -14,11 +14,11 @@ use crate::ple::PleHashMetadata;
 use crate::ple_rows::{PleRows, PleRowsError};
 use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
 use crate::weights::{
-    ExternalRowsRef, Qwen4Manifest, Qwen4Placement, Qwen4Weights, WeightError, PLE_SHARD_COUNT,
-    PLE_SHARD_ROWS,
+    ple_valid_rows_for_shard, ExternalRowsRef, Qwen4Manifest, Qwen4Placement, Qwen4Weights,
+    WeightError, PLE_ROW_WIDTH, PLE_SHARD_COUNT, PLE_SHARD_ROWS,
 };
 use hipfire_runtime::model_source::SourceRangeDescriptor;
-use hipfire_runtime::weight_manifest::WeightResidency;
+use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
 use hipfire_runtime::weight_store::{WeightLoadTransaction, WeightStoreError};
 use rdna_compute::Gpu;
 use std::fmt;
@@ -175,8 +175,12 @@ impl Qwen4Bundle {
     /// consumer; this accessor is useful for diagnostics without exposing the
     /// transaction itself.
     pub fn ple_descriptors(&self) -> Vec<SourceRangeDescriptor> {
-        self.manifest()
-            .external_entries()
+        let mut entries = self.manifest().external_entries().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| {
+            ple_shard_index(&entry.name).unwrap_or(PLE_SHARD_COUNT)
+        });
+        entries
+            .into_iter()
             .filter_map(|entry| {
                 self.external_descriptor(&Qwen4Placement {
                     name: entry.name.clone(),
@@ -187,6 +191,7 @@ impl Qwen4Bundle {
             })
             .collect()
     }
+
 
     pub fn ple_rows(&self) -> &PleRows {
         &self.ple_rows
@@ -259,28 +264,73 @@ impl Qwen4Bundle {
         first_bundle_error([ple_result, state_result, weight_result, store_result])
     }
 }
+const PLE_SHARD_NAME_PREFIX: &str =
+    "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_";
+
+fn ple_shard_index(name: &str) -> Result<usize, WeightError> {
+    let suffix = name
+        .strip_prefix(PLE_SHARD_NAME_PREFIX)
+        .and_then(|name| name.strip_suffix(".weight"))
+        .ok_or_else(|| {
+            WeightError::DescriptorMismatch(format!("invalid PLE shard name '{name}'"))
+        })?;
+    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(WeightError::DescriptorMismatch(format!(
+            "invalid PLE shard name '{name}'"
+        )));
+    }
+    let index = suffix.parse::<usize>().map_err(|_| {
+        WeightError::DescriptorMismatch(format!("invalid PLE shard name '{name}'"))
+    })?;
+    if index >= PLE_SHARD_COUNT || index.to_string() != suffix {
+        return Err(WeightError::DescriptorMismatch(format!(
+            "PLE shard index {index} is outside canonical range in '{name}'"
+        )));
+    }
+    Ok(index)
+}
+
+fn ordered_ple_entries<'a>(
+    manifest: &'a Qwen4Manifest,
+) -> Result<Vec<&'a WeightEntry>, WeightError> {
+    let entries = manifest.external_entries().collect::<Vec<_>>();
+    if entries.len() != PLE_SHARD_COUNT {
+        return Err(WeightError::PleShardCount {
+            expected: PLE_SHARD_COUNT,
+            actual: entries.len(),
+        });
+    }
+    let mut ordered = vec![None; PLE_SHARD_COUNT];
+    for entry in entries {
+        let index = ple_shard_index(&entry.name)?;
+        if entry.layer != Some(1) || entry.logical_shape.as_slice() != [PLE_SHARD_ROWS, PLE_ROW_WIDTH]
+        {
+            return Err(WeightError::DescriptorMismatch(entry.name.clone()));
+        }
+        if ordered[index].replace(entry).is_some() {
+            return Err(WeightError::DescriptorMismatch(format!(
+                "duplicate PLE shard index {index}"
+            )));
+        }
+    }
+    ordered
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            entry.ok_or_else(|| {
+                WeightError::DescriptorMismatch(format!("missing PLE shard index {index}"))
+            })
+        })
+        .collect()
+}
 
 fn ple_descriptors(
     transaction: &WeightLoadTransaction,
     manifest: &Qwen4Manifest,
 ) -> Result<Vec<SourceRangeDescriptor>, BundleError> {
-    let mut entries = manifest.external_entries().collect::<Vec<_>>();
-    entries.sort_by_key(|entry| {
-        entry
-            .name
-            .rsplit_once("shard_")
-            .and_then(|(_, suffix)| suffix.strip_suffix(".weight"))
-            .and_then(|suffix| suffix.parse::<usize>().ok())
-            .unwrap_or(usize::MAX)
-    });
-    if entries.len() != PLE_SHARD_COUNT {
-        return Err(BundleError::Weights(WeightError::PleShardCount {
-            expected: PLE_SHARD_COUNT,
-            actual: entries.len(),
-        }));
-    }
-    let mut descriptors = Vec::with_capacity(entries.len());
-    for entry in entries {
+    let entries = ordered_ple_entries(manifest).map_err(BundleError::Weights)?;
+    let mut descriptors: Vec<SourceRangeDescriptor> = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.into_iter().enumerate() {
         let descriptor = transaction
             .external_descriptor(&entry.name, entry.layer, 0)
             .ok_or_else(|| {
@@ -302,9 +352,21 @@ fn ple_descriptors(
                 )))
             }
         };
+        if row_bytes != PLE_ROW_WIDTH * 2 || valid_rows != ple_valid_rows_for_shard(index) {
+            return Err(BundleError::Weights(WeightError::DescriptorMismatch(
+                entry.name.clone(),
+            )));
+        }
+        if let Some(first) = descriptors.first() {
+            if first.source_identity() != descriptor.source_identity() {
+                return Err(BundleError::Weights(WeightError::DescriptorMismatch(
+                    format!("PLE shard {index} source identity differs"),
+                )));
+            }
+        }
         ExternalRowsRef {
             name: entry.name.clone(),
-            layer: entry.layer.unwrap_or(1),
+            layer: 1,
             row_bytes,
             physical_rows: PLE_SHARD_ROWS,
             valid_rows,
@@ -315,6 +377,7 @@ fn ple_descriptors(
     }
     Ok(descriptors)
 }
+
 
 fn cleanup_transaction(primary: BundleError, rollback: hip_bridge::HipResult<()>) -> BundleError {
     match rollback {

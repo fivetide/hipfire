@@ -14,7 +14,7 @@
 use crate::config::{LayerType, Qwen4Config};
 #[cfg(test)]
 use crate::config::{Qwen4MtpConfig, RecurrentStateDType, SourceDType};
-use hipfire_runtime::model_source::SourceRangeDescriptor;
+use hipfire_runtime::model_source::{SourceFormat, SourceRangeDescriptor};
 #[cfg(test)]
 use hipfire_runtime::weight_manifest::WeightResidency;
 use hipfire_runtime::weight_manifest::{
@@ -151,10 +151,46 @@ impl ExternalRowsRef {
                 physical_rows: self.physical_rows,
             });
         }
+        if descriptor.source_identity().format != SourceFormat::Hfq {
+            return Err(WeightError::DescriptorMismatch(self.name.clone()));
+        }
+        let Some(indexed) = descriptor
+            .source_identity()
+            .manifest
+            .iter()
+            .find(|range| range.name == self.name)
+        else {
+            return Err(WeightError::DescriptorMismatch(self.name.clone()));
+        };
+        if indexed.offset != descriptor.offset
+            || indexed.length != descriptor.length
+            || !indexed.dtype.eq_ignore_ascii_case(descriptor.dtype())
+            || indexed.logical_shape != descriptor.logical_shape
+        {
+            return Err(WeightError::DescriptorMismatch(self.name.clone()));
+        }
+        let Some(file) = descriptor
+            .source_identity()
+            .files
+            .get(indexed.file_index)
+        else {
+            return Err(WeightError::DescriptorMismatch(self.name.clone()));
+        };
+        let end = descriptor
+            .offset
+            .checked_add(descriptor.length)
+            .ok_or_else(|| WeightError::ShapeOverflow(self.name.clone()))?;
+        if end > file.len {
+            return Err(WeightError::RangeLength {
+                name: self.name.clone(),
+                expected: file.len.saturating_sub(descriptor.offset),
+                actual: descriptor.length,
+            });
+        }
         Ok(())
     }
-}
 
+}
 /// I64 metadata is retained as an exact source declaration rather than being
 /// coerced into a floating-point `WeightEntry`.  The HFQM writer serializes
 /// these arrays under its versioned `qwen4_ple` object; they never become GPU

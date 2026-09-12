@@ -17,7 +17,7 @@
 //! assembling typed weights, and therefore removes the cell from the store's
 //! cleanup set.
 use crate::device_mesh::{DeviceMesh, MeshEpoch};
-use crate::model_source::{SourcePayload, SourceRangeDescriptor};
+use crate::model_source::{SourceFormat, SourcePayload, SourceRangeDescriptor};
 use crate::weight_manifest::{placement_devices, ShardPolicy, WeightEntry, WeightResidency};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
@@ -1163,6 +1163,76 @@ fn validate_payload_shape(entry: &WeightEntry, shape: &[usize]) -> Result<(), St
     Ok(())
 }
 
+/// Validate the source-owned seal for a range payload before it is either
+/// uploaded or retained as an external row descriptor.
+///
+/// HFQ ranges carry the complete indexed source manifest.  External Qwen4
+/// rows must be obtained by name from that manifest; accepting a descriptor
+/// whose byte extent merely happens to have the right shape would allow a
+/// caller to substitute another tensor (or invent offsets in metadata JSON).
+/// Non-HFQ ranges retain the generic source-compatible behavior because older
+/// source implementations do not expose an indexed manifest.
+fn validate_source_range_identity(
+    entry: &WeightEntry,
+    descriptor: &SourceRangeDescriptor,
+    require_named_entry: bool,
+) -> Result<(), String> {
+    let identity = descriptor.source_identity();
+    if identity.format != SourceFormat::Hfq {
+        return Ok(());
+    }
+    let range = identity
+        .manifest
+        .iter()
+        .find(|range| range.name == entry.name);
+    let Some(range) = range else {
+        if require_named_entry {
+            return Err(format!(
+                "HFQ source identity has no indexed range for external entry '{}'",
+                entry.name
+            ));
+        }
+        return Ok(());
+    };
+    if range.offset != descriptor.offset
+        || range.length != descriptor.length
+        || !range.dtype.eq_ignore_ascii_case(descriptor.dtype())
+        || range.logical_shape != descriptor.logical_shape()
+    {
+        return Err(format!(
+            "HFQ source identity range for '{}' does not match descriptor \
+             (identity offset={} length={} dtype={} shape={:?}; descriptor \
+             offset={} length={} dtype={} shape={:?})",
+            entry.name,
+            range.offset,
+            range.length,
+            range.dtype,
+            range.logical_shape,
+            descriptor.offset,
+            descriptor.length,
+            descriptor.dtype(),
+            descriptor.logical_shape()
+        ));
+    }
+    let file = identity.files.get(range.file_index).ok_or_else(|| {
+        format!(
+            "HFQ source identity range for '{}' refers to missing file index {}",
+            entry.name, range.file_index
+        )
+    })?;
+    let end = descriptor
+        .offset
+        .checked_add(descriptor.length)
+        .ok_or_else(|| format!("HFQ source range for '{}' overflows", entry.name))?;
+    if end > file.len {
+        return Err(format!(
+            "HFQ source range for '{}' ends at {end}, beyond file length {}",
+            entry.name, file.len
+        ));
+    }
+    Ok(())
+}
+
 fn validate_external_range(
     entry: &WeightEntry,
     dtype: DType,
@@ -1527,6 +1597,17 @@ where
                         ));
                     }
                 };
+                if let Err(reason) = validate_source_range_identity(
+                    entry,
+                    &descriptor,
+                    entry.residency.is_external(),
+                ) {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(entry, reason),
+                    ));
+                }
                 if let Err(reason) = validate_payload_shape(entry, descriptor.logical_shape()) {
                     return Err(rollback_fulfill_error(
                         store,
