@@ -82,8 +82,9 @@ pub enum Step<'a> {
         bias: &'a GpuTensor,
         dim: usize,
     },
-    /// Complete validated MoE program. The call owns the bound expert view and
-    /// raw operands privately; callers can only obtain it through `seal_*`.
+    /// Complete validated MoE program. The sealed call is lowered at execution
+    /// time into ordered computation stages; callers can only
+    /// obtain it through `seal_*`.
     Moe(sealed_moe::SealedMoeCall<'a>),
 }
 
@@ -98,8 +99,8 @@ fn op_kind(step: &Step) -> PipelineOp {
         Step::QkNorm { .. } => PipelineOp::QkNorm,
         Step::BiasAdd { .. } => PipelineOp::BiasAdd,
         // MoE is already a complete grammar, so it must never be considered
-        // a projection fusion prefix.  `MoeCombine` is the existing pipeline
-        // marker and lowers to the dedicated `SuperOpKind::Moe`.
+        // a projection fusion prefix. Its marker is lowered by the executor
+        // into the typed sealed-MoE stage program.
         Step::Moe(_) => PipelineOp::MoeCombine,
     }
 }

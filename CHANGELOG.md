@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Sealed MoE calls lower to granular computation programs; Qwen root-routed EP decode and batched prefill share a checked collective schedule. Existing kernels, ownership, reduction order, and diagnostic policies are retained. This does not admit new parallel axes or product replay routes; see [the design and validation boundary](docs/design/sealed-granular-moe.md).
+
 ## v0.3.1 — DFlash cache repair, admission hardening, image gen
 
 - Source-aware admission and refusal-before-teardown (#682, #687).

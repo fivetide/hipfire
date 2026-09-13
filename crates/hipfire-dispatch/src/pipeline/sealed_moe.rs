@@ -1810,9 +1810,9 @@ pub fn produce_prefill_route<'a>(
     })
 }
 
-/// Execute a validated sealed call.  The arithmetic helpers remain in
-/// `pipeline::mod`; this chokepoint prevents a caller from bypassing the
-/// bound-call checks.
+/// Execute a validated sealed call. The compute boundary lowers it into the
+/// typed ordered program in `pipeline::moe_program`; this chokepoint preserves
+/// the bound-call checks and prevents callers from bypassing them.
 pub(crate) fn execute_sealed(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
