@@ -73,9 +73,9 @@ const PINNED_PAYLOAD_BYTES: u64 = 170_625_677_336;
 #[cfg(test)]
 const PINNED_PREDICTED_OUTPUT_BYTES: u64 = 170_625_800_216;
 const PINNED_SHARD_COUNT: usize = 131;
-/// Default bounded source row chunk.  A pinned gate/up chunk is 20 MiB BF16
-/// and 40 MiB F32 before its encoded output; 4,096 rows stay below the
-/// 96 MiB aggregate scratch ceiling.
+/// Default bounded source row chunk. Quantized matrices derive a smaller
+/// physical chunk when raw BF16, decoded F32, and encoded output together
+/// approach the 96 MiB aggregate scratch ceiling.
 pub(crate) const DEFAULT_ROW_CHUNK: usize = 4_096;
 const MAX_CHUNK_BYTES: u64 = 96 * 1024 * 1024;
 /// Do not let an accidental CLI value turn a row stream into a tensor buffer.
@@ -811,6 +811,36 @@ impl ScratchTracker {
         self.high_water = self.high_water.max(total);
         Ok(())
     }
+}
+fn chunk_scratch_bytes(dtype: DType, rows: u64, k: u64) -> Result<u64, Qwen4Error> {
+    let elements = rows
+        .checked_mul(k)
+        .ok_or_else(|| Qwen4Error::Invalid("Qwen4 chunk element count overflows".to_string()))?;
+    let raw_bytes = elements
+        .checked_mul(2)
+        .ok_or_else(|| Qwen4Error::Invalid("Qwen4 raw chunk bytes overflow".to_string()))?;
+    let value_bytes = elements
+        .checked_mul(std::mem::size_of::<f32>() as u64)
+        .ok_or_else(|| Qwen4Error::Invalid("Qwen4 decoded chunk bytes overflow".to_string()))?;
+    let encoded_bytes = quantized_data_len_for_dtype(dtype, rows, k)?;
+    raw_bytes
+        .checked_add(value_bytes)
+        .and_then(|bytes| bytes.checked_add(encoded_bytes))
+        .ok_or_else(|| Qwen4Error::Invalid("Qwen4 chunk scratch bytes overflow".to_string()))
+}
+
+fn bounded_rows_for_scratch(dtype: DType, k: u64, max_rows: u64) -> Result<u64, Qwen4Error> {
+    let mut low = 0;
+    let mut high = max_rows;
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if chunk_scratch_bytes(dtype, mid, k)? <= MAX_CHUNK_BYTES {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    Ok(low)
 }
 
 fn predicted_output_bytes(
@@ -3177,7 +3207,7 @@ fn stream_quantized_rows(
     let row_bytes = k
         .checked_mul(2)
         .ok_or_else(|| Qwen4Error::Invalid(format!("{} row bytes overflow", tensor.name)))?;
-    let rows_per_chunk = if let Some(expert_rows) = expert_rows {
+    let requested_rows = if let Some(expert_rows) = expert_rows {
         if expert_rows == 0 || rows % expert_rows != 0 {
             return Err(Qwen4Error::Invalid(format!(
                 "{} expert rows {expert_rows} do not partition {rows} logical rows",
@@ -3193,12 +3223,23 @@ fn stream_quantized_rows(
     } else {
         row_chunk as u64
     };
-    let max_chunk_bytes = rows_per_chunk
-        .checked_mul(row_bytes)
-        .ok_or_else(|| Qwen4Error::Invalid(format!("{} chunk length overflows", tensor.name)))?;
-    if max_chunk_bytes > MAX_CHUNK_BYTES {
+    let candidate_rows = requested_rows.min(rows);
+    let bounded_rows = bounded_rows_for_scratch(dtype, k, candidate_rows)?;
+    let rows_per_chunk = if let Some(expert_rows) = expert_rows {
+        bounded_rows / expert_rows * expert_rows
+    } else {
+        bounded_rows
+    };
+    if rows_per_chunk == 0 {
         return Err(Qwen4Error::Invalid(format!(
-            "{} logical-row chunk is {max_chunk_bytes} bytes, exceeds bounded {MAX_CHUNK_BYTES}-byte staging",
+            "{} cannot fit one logical row within bounded {MAX_CHUNK_BYTES}-byte scratch",
+            tensor.name
+        )));
+    }
+    let max_chunk_scratch = chunk_scratch_bytes(dtype, rows_per_chunk, k)?;
+    if max_chunk_scratch > MAX_CHUNK_BYTES {
+        return Err(Qwen4Error::Invalid(format!(
+            "{} scratch high-water {max_chunk_scratch} exceeds bounded {MAX_CHUNK_BYTES} bytes",
             tensor.name
         )));
     }
@@ -4496,6 +4537,43 @@ mod tests {
         assert!(validate_row_chunk(MAX_ROW_CHUNK + 1).is_err());
         assert!(validate_row_chunk(0).is_err());
     }
+    #[test]
+    fn production_chunk_budget_splits_pinned_qsa_o_projection_exactly() {
+        // The pinned q_proj width is 24 heads * 256 head_dim = 6,144.
+        // o_proj is [hidden=2,560, q_width=6,144], so the old single
+        // chunk exceeded the aggregate raw+F32+encoded scratch bound.
+        let rows = HIDDEN_WIDTH;
+        let k = 24 * 256;
+        let dtype = DType::MQ4G256V2;
+        let unsplit = chunk_scratch_bytes(dtype, rows, k).unwrap();
+        assert_eq!(unsplit, 102_727_680);
+        assert!(unsplit > MAX_CHUNK_BYTES);
+
+        let bounded_rows = bounded_rows_for_scratch(dtype, k, rows).unwrap();
+        assert_eq!(bounded_rows, 2_508);
+        let bounded = chunk_scratch_bytes(dtype, bounded_rows, k).unwrap();
+        assert_eq!(bounded, 100_641_024);
+        assert!(bounded <= MAX_CHUNK_BYTES);
+        assert!(chunk_scratch_bytes(dtype, bounded_rows + 1, k).unwrap() > MAX_CHUNK_BYTES);
+
+        let raw_bytes = bounded_rows.checked_mul(k).unwrap().checked_mul(2).unwrap();
+        let value_bytes = bounded_rows
+            .checked_mul(k)
+            .unwrap()
+            .checked_mul(std::mem::size_of::<f32>() as u64)
+            .unwrap();
+        let encoded_bytes = quantized_data_len_for_dtype(dtype, bounded_rows, k).unwrap();
+        let mut tracker = ScratchTracker::default();
+        tracker
+            .observe(
+                usize::try_from(raw_bytes).unwrap(),
+                usize::try_from(value_bytes).unwrap(),
+                usize::try_from(encoded_bytes).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(tracker.high_water, bounded);
+    }
+
     #[test]
     fn pinned_output_prediction_is_exact_before_payload_reads() {
         assert_eq!(
