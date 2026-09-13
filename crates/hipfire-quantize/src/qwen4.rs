@@ -81,6 +81,12 @@ const MAX_CHUNK_BYTES: u64 = 96 * 1024 * 1024;
 /// Do not let an accidental CLI value turn a row stream into a tensor buffer.
 const MAX_ROW_CHUNK: usize = 4_096;
 const CAPACITY_OVERRIDE_ENV: &str = "HIPFIRE_QWEN4_CAPACITY_BYTES";
+/// Number of retries after the initial remote range attempt.  Retries are
+/// deliberately bounded because every failed range is replayed from byte zero.
+const REMOTE_RANGE_MAX_RETRIES: usize = 4;
+const REMOTE_RANGE_RETRY_BACKOFF_MS: u64 = 250;
+const REMOTE_RANGE_RETRY_BACKOFF_MAX_MS: u64 = 1_000;
+
 fn validate_row_chunk(row_chunk: usize) -> Result<(), Qwen4Error> {
     if row_chunk == 0 || row_chunk > MAX_ROW_CHUNK {
         return Err(Qwen4Error::Invalid(format!(
@@ -966,6 +972,74 @@ struct RemoteIdentityState {
     objects: HashMap<String, RemoteObjectIdentity>,
 }
 
+#[derive(Debug)]
+enum RemoteAttemptError {
+    Retryable(Qwen4Error),
+    Fatal(Qwen4Error),
+}
+
+impl RemoteAttemptError {
+    fn fatal(error: Qwen4Error) -> Self {
+        Self::Fatal(error)
+    }
+}
+
+fn retryable_remote_status(status: u16) -> bool {
+    status == 429 || (500..=599).contains(&status)
+}
+
+fn retryable_transport_io(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::TimedOut
+    ) {
+        return true;
+    }
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<ureq::Error>())
+        .is_some_and(retryable_ureq_error)
+}
+
+fn retryable_ureq_error(error: &ureq::Error) -> bool {
+    match error {
+        ureq::Error::Timeout(_) | ureq::Error::ConnectionFailed => true,
+        ureq::Error::Io(error) => retryable_transport_io(error),
+        _ => false,
+    }
+}
+
+fn remote_request_error(url: &str, error: ureq::Error) -> RemoteAttemptError {
+    let retryable = retryable_ureq_error(&error);
+    let error = Qwen4Error::Invalid(format!("remote GET {url} failed: {error}"));
+    if retryable {
+        RemoteAttemptError::Retryable(error)
+    } else {
+        RemoteAttemptError::Fatal(error)
+    }
+}
+
+fn remote_body_error(path: &str, error: io::Error) -> RemoteAttemptError {
+    let retryable = retryable_transport_io(&error);
+    let error = Qwen4Error::io(format!("read remote {path} body"), error);
+    if retryable {
+        RemoteAttemptError::Retryable(error)
+    } else {
+        RemoteAttemptError::Fatal(error)
+    }
+}
+
+fn sleep_before_remote_retry(retry_index: usize) {
+    let multiplier = 1u64 << retry_index.min(2);
+    let delay_ms = REMOTE_RANGE_RETRY_BACKOFF_MS
+        .saturating_mul(multiplier)
+        .min(REMOTE_RANGE_RETRY_BACKOFF_MAX_MS);
+    std::thread::sleep(Duration::from_millis(delay_ms));
+}
+
 struct RemoteSource {
     spec: RemoteSpec,
     base_url: String,
@@ -1108,47 +1182,78 @@ impl RemoteSource {
                 "Qwen4 bounded remote read must have non-zero capacity".to_string(),
             ));
         }
+        let mut retry_index = 0;
+        loop {
+            match self.read_bounded_attempt(path, max_bytes) {
+                Ok(bytes) => return Ok(bytes),
+                Err(RemoteAttemptError::Fatal(error)) => return Err(error),
+                Err(RemoteAttemptError::Retryable(_)) if retry_index < REMOTE_RANGE_MAX_RETRIES => {
+                    sleep_before_remote_retry(retry_index);
+                    retry_index += 1;
+                }
+                Err(RemoteAttemptError::Retryable(error)) => return Err(error),
+            }
+        }
+    }
+
+    fn read_bounded_attempt(
+        &self,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, RemoteAttemptError> {
         let mut response = self.range_request(path, 0, max_bytes)?;
         let content_range = response
             .headers()
             .get("content-range")
             .and_then(|value| value.to_str().ok())
             .ok_or_else(|| {
-                Qwen4Error::Invalid(format!(
+                RemoteAttemptError::fatal(Qwen4Error::Invalid(format!(
                     "remote {path} response is missing a valid Content-Range"
-                ))
+                )))
             })?;
-        let (start, end, total) = parse_content_range(content_range)?;
+        let (start, end, total) =
+            parse_content_range(content_range).map_err(RemoteAttemptError::fatal)?;
         let body_len = end
             .checked_sub(start)
             .and_then(|length| length.checked_add(1))
             .ok_or_else(|| {
-                Qwen4Error::Invalid(format!("remote {path} Content-Range length overflows"))
+                RemoteAttemptError::fatal(Qwen4Error::Invalid(format!(
+                    "remote {path} Content-Range length overflows"
+                )))
             })?;
         if start != 0 || body_len > max_bytes || total != body_len {
-            return Err(Qwen4Error::Invalid(format!(
+            return Err(RemoteAttemptError::fatal(Qwen4Error::Invalid(format!(
                 "remote {path} bounded range {content_range:?} is not the complete object within {} bytes",
                 max_bytes
-            )));
+            ))));
         }
-        self.remember_identity(path, response.headers(), total)?;
-        let announced = content_length(response.headers(), path)?;
+        self.remember_identity(path, response.headers(), total)
+            .map_err(RemoteAttemptError::fatal)?;
+        let announced =
+            content_length(response.headers(), path).map_err(RemoteAttemptError::fatal)?;
         if announced != body_len {
-            return Err(Qwen4Error::Invalid(format!(
+            return Err(RemoteAttemptError::fatal(Qwen4Error::Invalid(format!(
                 "remote {path} Content-Length {announced} disagrees with Content-Range length {body_len}"
-            )));
+            ))));
         }
         let length = usize::try_from(body_len).map_err(|_| {
-            Qwen4Error::Invalid(format!("remote {path} response does not fit usize"))
+            RemoteAttemptError::fatal(Qwen4Error::Invalid(format!(
+                "remote {path} response does not fit usize"
+            )))
         })?;
         let mut bytes = vec![0u8; length];
-        read_response_exact(&mut response, &mut bytes, path)?;
+        read_response_exact(&mut response, &mut bytes, path)
+            .map_err(|error| remote_body_error(path, error))?;
         Ok(bytes)
     }
 
     /// Read exactly `dst.len()` bytes from one immutable remote shard range.
     /// `expected_total` is omitted only for the initial eight-byte read used
     /// to discover a safetensors shard's total length.
+    ///
+    /// Each attempt fills the caller's staging buffer but no stream writer
+    /// sees it until this method returns successfully.  A failed body read is
+    /// therefore safely replayed from byte zero with the same Range header.
     fn read_range(
         &self,
         path: &str,
@@ -1164,22 +1269,47 @@ impl RemoteSource {
         validate_remote_path(path, Some("safetensors"))?;
         let length = u64::try_from(dst.len())
             .map_err(|_| Qwen4Error::Invalid(format!("remote {path} range is too large")))?;
+        let mut retry_index = 0;
+        loop {
+            match self.read_range_attempt(path, offset, dst, length, expected_total) {
+                Ok(total) => return Ok(total),
+                Err(RemoteAttemptError::Fatal(error)) => return Err(error),
+                Err(RemoteAttemptError::Retryable(_)) if retry_index < REMOTE_RANGE_MAX_RETRIES => {
+                    sleep_before_remote_retry(retry_index);
+                    retry_index += 1;
+                }
+                Err(RemoteAttemptError::Retryable(error)) => return Err(error),
+            }
+        }
+    }
+
+    fn read_range_attempt(
+        &self,
+        path: &str,
+        offset: u64,
+        dst: &mut [u8],
+        length: u64,
+        expected_total: Option<u64>,
+    ) -> Result<u64, RemoteAttemptError> {
         let mut response = self.range_request(path, offset, length)?;
         let content_range = response
             .headers()
             .get("content-range")
             .and_then(|value| value.to_str().ok())
             .ok_or_else(|| {
-                Qwen4Error::Invalid(format!(
+                RemoteAttemptError::fatal(Qwen4Error::Invalid(format!(
                     "remote {path} response is missing a valid Content-Range"
-                ))
+                )))
             })?;
-        let (start, end, total) = parse_content_range(content_range)?;
+        let (start, end, total) =
+            parse_content_range(content_range).map_err(RemoteAttemptError::fatal)?;
         let body_len = end
             .checked_sub(start)
             .and_then(|length| length.checked_add(1))
             .ok_or_else(|| {
-                Qwen4Error::Invalid(format!("remote {path} Content-Range length overflows"))
+                RemoteAttemptError::fatal(Qwen4Error::Invalid(format!(
+                    "remote {path} Content-Range length overflows"
+                )))
             })?;
         if start != offset
             || body_len != length
@@ -1188,19 +1318,22 @@ impl RemoteSource {
             let expected_total = expected_total
                 .map(|value| format!(" / {value}"))
                 .unwrap_or_default();
-            return Err(Qwen4Error::Invalid(format!(
+            return Err(RemoteAttemptError::fatal(Qwen4Error::Invalid(format!(
                 "remote {path} returned range {content_range:?}, expected bytes {offset}-{}{expected_total}",
                 offset.saturating_add(length).saturating_sub(1)
-            )));
+            ))));
         }
-        self.remember_identity(path, response.headers(), total)?;
-        let announced = content_length(response.headers(), path)?;
+        self.remember_identity(path, response.headers(), total)
+            .map_err(RemoteAttemptError::fatal)?;
+        let announced =
+            content_length(response.headers(), path).map_err(RemoteAttemptError::fatal)?;
         if announced != length {
-            return Err(Qwen4Error::Invalid(format!(
+            return Err(RemoteAttemptError::fatal(Qwen4Error::Invalid(format!(
                 "remote {path} Content-Length {announced} disagrees with requested range length {length}"
-            )));
+            ))));
         }
-        read_response_exact(&mut response, dst, path)?;
+        read_response_exact(&mut response, dst, path)
+            .map_err(|error| remote_body_error(path, error))?;
         Ok(total)
     }
 
@@ -1209,15 +1342,17 @@ impl RemoteSource {
         path: &str,
         offset: u64,
         length: u64,
-    ) -> Result<ureq::http::Response<ureq::Body>, Qwen4Error> {
+    ) -> Result<ureq::http::Response<ureq::Body>, RemoteAttemptError> {
         if length == 0 {
-            return Err(Qwen4Error::Invalid(format!(
+            return Err(RemoteAttemptError::fatal(Qwen4Error::Invalid(format!(
                 "remote {path} requested an empty range"
-            )));
+            ))));
         }
-        let end = offset
-            .checked_add(length - 1)
-            .ok_or_else(|| Qwen4Error::Invalid(format!("remote {path} range overflows")))?;
+        let end = offset.checked_add(length - 1).ok_or_else(|| {
+            RemoteAttemptError::fatal(Qwen4Error::Invalid(format!(
+                "remote {path} range overflows"
+            )))
+        })?;
         let url = self.url_for(path);
         let mut request = self
             .agent
@@ -1228,12 +1363,17 @@ impl RemoteSource {
         }
         let response = request
             .call()
-            .map_err(|error| Qwen4Error::Invalid(format!("remote GET {url} failed: {error}")))?;
-        if response.status().as_u16() != 206 {
-            return Err(Qwen4Error::Invalid(format!(
-                "remote GET {url} returned HTTP {}, expected 206 Partial Content",
-                response.status().as_u16()
-            )));
+            .map_err(|error| remote_request_error(&url, error))?;
+        let status = response.status().as_u16();
+        if status != 206 {
+            let error = Qwen4Error::Invalid(format!(
+                "remote GET {url} returned HTTP {status}, expected 206 Partial Content"
+            ));
+            return Err(if retryable_remote_status(status) {
+                RemoteAttemptError::Retryable(error)
+            } else {
+                RemoteAttemptError::Fatal(error)
+            });
         }
         Ok(response)
     }
@@ -1412,30 +1552,32 @@ fn read_response_exact(
     response: &mut ureq::http::Response<ureq::Body>,
     dst: &mut [u8],
     path: &str,
-) -> Result<(), Qwen4Error> {
+) -> io::Result<()> {
     let mut reader = response.body_mut().as_reader();
     let mut filled = 0usize;
     while filled < dst.len() {
-        let count = reader
-            .read(&mut dst[filled..])
-            .map_err(|error| Qwen4Error::io(format!("read remote {path} body"), error))?;
+        let count = reader.read(&mut dst[filled..])?;
         if count == 0 {
-            return Err(Qwen4Error::Invalid(format!(
-                "remote {path} body ended after {filled} bytes, expected {}",
-                dst.len()
-            )));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "remote {path} body ended after {filled} bytes, expected {}",
+                    dst.len()
+                ),
+            ));
         }
         filled += count;
     }
     let mut extra = [0u8; 1];
-    let count = reader
-        .read(&mut extra)
-        .map_err(|error| Qwen4Error::io(format!("read remote {path} body"), error))?;
+    let count = reader.read(&mut extra)?;
     if count != 0 {
-        return Err(Qwen4Error::Invalid(format!(
-            "remote {path} body exceeded the announced {} bytes",
-            dst.len()
-        )));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "remote {path} body exceeded the announced {} bytes",
+                dst.len()
+            ),
+        ));
     }
     Ok(())
 }
@@ -3738,12 +3880,11 @@ fn read_exact_at(file: &File, offset: u64, dst: &mut [u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::env;
-    use std::io::{Read as _, Write as _};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::TcpListener;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     use std::thread::{self, JoinHandle};
-    use tempfile::NamedTempFile;
+    use tempfile::{tempdir, NamedTempFile};
 
     fn test_remote_source(base_url: &str) -> RemoteSource {
         let agent = ureq::Agent::config_builder()
@@ -3808,6 +3949,60 @@ mod tests {
                 .write_all(response.as_bytes())
                 .expect("write mock headers");
             stream.write_all(&body).expect("write mock body");
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    #[derive(Clone, Copy)]
+    struct MockHttpResponse {
+        status: u16,
+        content_range: Option<&'static str>,
+        body: &'static [u8],
+        announced_length: usize,
+        etag: &'static str,
+    }
+
+    fn spawn_http_sequence(
+        responses: Vec<MockHttpResponse>,
+        assert_range: &str,
+    ) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let address = listener.local_addr().expect("mock server address");
+        let expected_range = assert_range.to_string();
+        let handle = thread::spawn(move || {
+            for response_spec in responses {
+                let (mut stream, _) = listener.accept().expect("accept mock request");
+                let mut request = [0u8; 4096];
+                let count = stream.read(&mut request).expect("read mock request");
+                let request = String::from_utf8_lossy(&request[..count]);
+                assert!(
+                    request
+                        .lines()
+                        .any(|line| line.eq_ignore_ascii_case(&format!("Range: {expected_range}"))),
+                    "request did not contain expected Range header: {request}"
+                );
+                let reason = match response_spec.status {
+                    206 => "Partial Content",
+                    200 => "OK",
+                    _ => "Response",
+                };
+                let mut response = format!(
+                    "HTTP/1.1 {} {reason}\r\nContent-Length: {}\r\n\
+                     ETag: \"{}\"\r\n\
+                     X-Repo-Commit: 0123456789abcdef0123456789abcdef01234567\r\n",
+                    response_spec.status, response_spec.announced_length, response_spec.etag
+                );
+                if let Some(content_range) = response_spec.content_range {
+                    response.push_str(&format!("Content-Range: {content_range}\r\n"));
+                }
+                response.push_str("Connection: close\r\n\r\n");
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write mock headers");
+                stream
+                    .write_all(response_spec.body)
+                    .expect("write mock body");
+            }
         });
         (format!("http://{address}"), handle)
     }
@@ -3912,6 +4107,137 @@ mod tests {
             .is_err());
         handle.join().unwrap();
     }
+
+    #[test]
+    fn remote_range_reader_retries_peer_disconnect_before_commit() {
+        let (base, handle) = spawn_http_sequence(
+            vec![
+                MockHttpResponse {
+                    status: 206,
+                    content_range: Some("bytes 2-5/8"),
+                    body: b"cd",
+                    announced_length: 4,
+                    etag: "fixture-etag",
+                },
+                MockHttpResponse {
+                    status: 206,
+                    content_range: Some("bytes 2-5/8"),
+                    body: b"cdef",
+                    announced_length: 4,
+                    etag: "fixture-etag",
+                },
+            ],
+            "bytes=2-5",
+        );
+        let source = test_remote_source(&base);
+        let mut bytes = [0u8; 4];
+        assert_eq!(
+            source
+                .read_range("model.safetensors", 2, &mut bytes, Some(8))
+                .unwrap(),
+            8
+        );
+        assert_eq!(&bytes, b"cdef");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn remote_range_reader_retries_retryable_statuses_before_success() {
+        let (base, handle) = spawn_http_sequence(
+            vec![
+                MockHttpResponse {
+                    status: 503,
+                    content_range: None,
+                    body: b"",
+                    announced_length: 0,
+                    etag: "fixture-etag",
+                },
+                MockHttpResponse {
+                    status: 429,
+                    content_range: None,
+                    body: b"",
+                    announced_length: 0,
+                    etag: "fixture-etag",
+                },
+                MockHttpResponse {
+                    status: 206,
+                    content_range: Some("bytes 2-5/8"),
+                    body: b"cdef",
+                    announced_length: 4,
+                    etag: "fixture-etag",
+                },
+            ],
+            "bytes=2-5",
+        );
+        let source = test_remote_source(&base);
+        let mut bytes = [0u8; 4];
+        source
+            .read_range("model.safetensors", 2, &mut bytes, Some(8))
+            .unwrap();
+        assert_eq!(&bytes, b"cdef");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn remote_range_reader_stops_after_bounded_transient_failures() {
+        let responses = (0..=REMOTE_RANGE_MAX_RETRIES)
+            .map(|_| MockHttpResponse {
+                status: 206,
+                content_range: Some("bytes 2-5/8"),
+                body: b"cd",
+                announced_length: 4,
+                etag: "fixture-etag",
+            })
+            .collect();
+        let (base, handle) = spawn_http_sequence(responses, "bytes=2-5");
+        let source = test_remote_source(&base);
+        let mut bytes = [0u8; 4];
+        let error = source
+            .read_range("model.safetensors", 2, &mut bytes, Some(8))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Peer disconnected"),
+            "unexpected terminal error: {error}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn remote_range_reader_rejects_identity_change_without_retry() {
+        let (base, handle) = spawn_http_sequence(
+            vec![
+                MockHttpResponse {
+                    status: 206,
+                    content_range: Some("bytes 2-5/8"),
+                    body: b"cdef",
+                    announced_length: 4,
+                    etag: "fixture-etag-a",
+                },
+                MockHttpResponse {
+                    status: 206,
+                    content_range: Some("bytes 2-5/8"),
+                    body: b"cdef",
+                    announced_length: 4,
+                    etag: "fixture-etag-b",
+                },
+            ],
+            "bytes=2-5",
+        );
+        let source = test_remote_source(&base);
+        let mut bytes = [0u8; 4];
+        source
+            .read_range("model.safetensors", 2, &mut bytes, Some(8))
+            .unwrap();
+        let error = source
+            .read_range("model.safetensors", 2, &mut bytes, Some(8))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("identity changed"),
+            "unexpected identity error: {error}"
+        );
+        handle.join().unwrap();
+    }
+
     fn source_tensor(bytes: &[u8], shape: Vec<u64>, dtype: &str) -> (NamedTempFile, SourceTensor) {
         let mut file = NamedTempFile::new().expect("temp source");
         file.write_all(bytes).expect("source bytes");
@@ -3947,6 +4273,46 @@ mod tests {
         let (file, mut tensor) = source_tensor(bytes, shape, dtype);
         tensor.name = name.to_string();
         (file, tensor)
+    }
+
+    #[test]
+    fn compact_transaction_removes_temp_after_terminal_source_failure() {
+        let destination = tempdir().expect("destination tempdir");
+        let output = destination.path().join("fixture.hfq");
+        let (mut ple_file, ple) = named_source(
+            "model.ple.ngram_embedding.shard_0.weight",
+            &vec![0u8; (PLE_ROW_WIDTH * 2) as usize],
+            vec![1, PLE_ROW_WIDTH],
+            "BF16",
+        );
+        let (_resident_file, resident) =
+            named_source("fixture.tensor", &[0, 0, 0, 0], vec![2], "BF16");
+        let source_path = ple_file.path().to_path_buf();
+        let source_identity = local_file_identity(&source_path).expect("source identity");
+        let source = SourceSet::Local {
+            paths: vec![source_path],
+            identities: vec![source_identity],
+        };
+        ple_file
+            .as_file_mut()
+            .set_len(0)
+            .expect("truncate source after identity seal");
+        let options = Qwen4Options::compact_fixture(Path::new("unused"), &output);
+        let error = write_compact_artifact(&options, &source, vec![ple, resident], &json!({}))
+            .expect_err("truncated source must fail");
+        assert!(
+            error.to_string().contains("source identity changed"),
+            "unexpected terminal error: {error}"
+        );
+        assert!(!output.exists(), "failed transaction published output");
+        let leftovers: Vec<_> = fs::read_dir(destination.path())
+            .expect("read destination")
+            .map(|entry| entry.expect("destination entry").path())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "failed transaction left temporary artifacts: {leftovers:?}"
+        );
     }
 
     fn focused_manifest_index() -> ManifestIndex {
