@@ -141,29 +141,12 @@ fn all_reduce_sum_f32_decode(
 /// The two normal modes intentionally retain their existing environment and
 /// lease policy. `PrefillSkipAllReduce` is the explicit diagnostic switch used
 /// by the prefill caller; it is not a fallback and therefore omits both the
-/// reduction and residual completion commands.
+/// reduction and residual completion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RootRoutedEpReduction {
     Decode,
     Prefill,
     PrefillSkipAllReduce,
-}
-
-/// One executable stage in the common root-routed EP schedule.
-///
-/// The command list is private on [`RootRoutedEpSchedule`], so callers cannot
-/// supply an arbitrary hand-ordered sequence. The public enum is exposed for
-/// behavioral tests and diagnostics.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RootRoutedEpCommand {
-    ZeroPartials,
-    RootComputeRoute,
-    RouteTransfer,
-    RankContribute,
-    PrepareReduction,
-    NamedReduction { name: &'static str, layer: usize },
-    ResidualFinish,
-    SkipDiagnosticReduction,
 }
 
 /// Borrowed per-rank activation operands consumed by the executable schedule.
@@ -184,11 +167,13 @@ pub struct EpRouteBuffers<'a> {
     pub weights: &'a DeviceBuffer,
 }
 
-/// Checked executable program for one admitted root-routed MoE layer.
+/// Checked root-routed execution metadata for one admitted root-routed MoE
+/// layer.
 ///
-/// `derive` binds the program to the dispatch-owned execution contract and its
-/// actual `moe`/layer/EP all-reduce row. It never infers an axis from the first
-/// row and it rejects duplicate or missing rows before the first side effect.
+/// `derive` binds the metadata to the dispatch-owned execution contract and
+/// its actual `moe`/layer/EP all-reduce row. It never infers an axis from the
+/// first row and rejects duplicate or missing rows before the first side
+/// effect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RootRoutedEpSchedule {
     contract_id: u64,
@@ -198,13 +183,11 @@ pub struct RootRoutedEpSchedule {
     partial_bytes: usize,
     reduce_count: usize,
     reduction: RootRoutedEpReduction,
-    commands: [RootRoutedEpCommand; 7],
-    command_len: usize,
 }
 
 impl RootRoutedEpSchedule {
-    /// Derive the fixed command order from one load-bound execution contract.
-    ///
+    /// Derive the checked root-routed execution metadata from one load-bound
+    /// execution contract.
     /// `n_ranks`, route length, and reduction geometry are supplied by the
     /// architecture adapter, but are checked here and again by the executor.
     /// The contract remains the only authority for the collective name/axis.
@@ -298,20 +281,6 @@ impl RootRoutedEpSchedule {
             ));
         }
 
-        let mut commands = [RootRoutedEpCommand::ZeroPartials; 7];
-        commands[0] = RootRoutedEpCommand::ZeroPartials;
-        commands[1] = RootRoutedEpCommand::RootComputeRoute;
-        commands[2] = RootRoutedEpCommand::RouteTransfer;
-        commands[3] = RootRoutedEpCommand::RankContribute;
-        commands[4] = RootRoutedEpCommand::PrepareReduction;
-        let command_len = if reduction == RootRoutedEpReduction::PrefillSkipAllReduce {
-            commands[5] = RootRoutedEpCommand::SkipDiagnosticReduction;
-            6
-        } else {
-            commands[5] = RootRoutedEpCommand::NamedReduction { name: "moe", layer };
-            commands[6] = RootRoutedEpCommand::ResidualFinish;
-            7
-        };
         Ok(Self {
             contract_id: contract.contract_id(),
             n_ranks,
@@ -320,8 +289,6 @@ impl RootRoutedEpSchedule {
             partial_bytes,
             reduce_count,
             reduction,
-            commands,
-            command_len,
         })
     }
 
@@ -333,9 +300,6 @@ impl RootRoutedEpSchedule {
         self.layer
     }
 
-    pub fn commands(&self) -> &[RootRoutedEpCommand] {
-        &self.commands[..self.command_len]
-    }
     pub fn rank_count(&self) -> usize {
         self.n_ranks
     }
@@ -442,127 +406,106 @@ where
             )));
         }
     }
-
-    let mut proof: Option<Proof> = None;
-    for command in schedule.commands() {
-        match *command {
-            RootRoutedEpCommand::ZeroPartials => {
-                for rank in 0..n {
-                    let gpu = &mut gpus.devices[rank];
-                    gpu.bind_thread().map_err(hip_err)?;
-                    let stream = gpu.active_stream.as_ref().ok_or_else(|| {
-                        DispatchError::Hip(format!(
-                            "root-routed EP device {rank} lost its active_stream"
-                        ))
-                    })?;
-                    gpu.hip
-                        .memset_async(
-                            &operands.partials[rank].buf,
-                            0,
-                            schedule.partial_bytes,
-                            stream,
-                        )
-                        .map_err(hip_err)?;
-                }
-            }
-            RootRoutedEpCommand::RootComputeRoute => {
-                let gpu = &mut gpus.devices[0];
-                gpu.bind_thread().map_err(hip_err)?;
-                proof = Some(root_compute(
-                    context,
-                    gpu,
-                    &operands.partials[0],
-                    &admission,
-                )?);
-            }
-            RootRoutedEpCommand::RouteTransfer => {
-                let mut staged_routes = [None; MAX_EP_STACK_RANKS];
-                for rank in 0..n {
-                    staged_routes[rank] = Some(route_buffers(&*context, rank)?);
-                }
-                let root = staged_routes[0].ok_or_else(|| {
-                    DispatchError::Hip(
-                        "root-routed EP root route buffers disappeared after root compute".into(),
-                    )
-                })?;
-                gpus.broadcast_ep_route(
-                    root.ids,
-                    root.weights,
-                    |rank| {
-                        let route = staged_routes[rank]
-                            .expect("root-routed EP route preflight omitted a rank");
-                        (route.ids, route.weights)
-                    },
-                    schedule.route_count,
-                )
+    if let Some(lease) = peer_lease {
+        if schedule.reduction != RootRoutedEpReduction::PrefillSkipAllReduce {
+            let partial_refs: Vec<&DeviceBuffer> = operands
+                .partials
+                .iter()
+                .map(|partial| &partial.buf)
+                .collect();
+            gpus.validate_peer_reduce_scratch_lease(lease, &partial_refs, schedule.reduce_count)
                 .map_err(hip_err)?;
-            }
-            RootRoutedEpCommand::RankContribute => {
-                let proof = proof.ok_or_else(|| {
-                    DispatchError::Hip(
-                        "root-routed EP rank contribution reached without root proof".into(),
-                    )
-                })?;
-                for rank in 1..n {
-                    let gpu = &mut gpus.devices[rank];
-                    gpu.bind_thread().map_err(hip_err)?;
-                    rank_contribute(context, rank, gpu, &proof, &operands.partials[rank])?;
-                }
-            }
-            RootRoutedEpCommand::PrepareReduction => {
-                for rank in 0..n {
-                    let gpu = &mut gpus.devices[rank];
-                    gpu.bind_thread().map_err(hip_err)?;
-                    prepare_reduce(context, rank, gpu, &operands.partials[rank])?;
-                }
-            }
-            RootRoutedEpCommand::NamedReduction { name, layer } => {
-                debug_assert_eq!(name, "moe");
-                debug_assert_eq!(layer, schedule.layer);
-                let mut staged: [&DeviceBuffer; MAX_EP_STACK_RANKS] =
-                    [&operands.partials[0].buf; MAX_EP_STACK_RANKS];
-                for rank in 1..n {
-                    staged[rank] = &operands.partials[rank].buf;
-                }
-                match schedule.reduction {
-                    RootRoutedEpReduction::Decode => {
-                        all_reduce_sum_f32_decode(
-                            gpus,
-                            &staged[..n],
-                            schedule.reduce_count,
-                            peer_lease,
-                        )?;
-                    }
-                    RootRoutedEpReduction::Prefill => {
-                        all_reduce_sum_f32_prefill(
-                            gpus,
-                            &staged[..n],
-                            schedule.reduce_count,
-                            peer_lease,
-                        )?;
-                    }
-                    RootRoutedEpReduction::PrefillSkipAllReduce => {
-                        return Err(DispatchError::Hip(
-                            "root-routed EP diagnostic skip reached a reduction command".into(),
-                        ));
-                    }
-                }
-            }
-            RootRoutedEpCommand::ResidualFinish => {
-                for rank in 0..n {
-                    let gpu = &mut gpus.devices[rank];
-                    gpu.bind_thread().map_err(hip_err)?;
-                    residual_finish(context, rank, gpu, &operands.partials[rank])?;
-                }
-            }
-            RootRoutedEpCommand::SkipDiagnosticReduction => {
-                if schedule.reduction != RootRoutedEpReduction::PrefillSkipAllReduce {
-                    return Err(DispatchError::Hip(
-                        "root-routed EP skip command is not authorized by reduction policy".into(),
-                    ));
-                }
-            }
         }
+    }
+
+    // The fixed order below is intentionally procedural rather than a second
+    // command interpreter: this function is the one root-routed EP sequencer.
+    // The proof is produced exactly once after zeroing and consumed by every
+    // non-root contribution.
+    for rank in 0..n {
+        let gpu = &mut gpus.devices[rank];
+        gpu.bind_thread().map_err(hip_err)?;
+        let stream = gpu.active_stream.as_ref().ok_or_else(|| {
+            DispatchError::Hip(format!(
+                "root-routed EP device {rank} lost its active_stream"
+            ))
+        })?;
+        gpu.hip
+            .memset_async(
+                &operands.partials[rank].buf,
+                0,
+                schedule.partial_bytes,
+                stream,
+            )
+            .map_err(hip_err)?;
+    }
+
+    let proof = {
+        let gpu = &mut gpus.devices[0];
+        gpu.bind_thread().map_err(hip_err)?;
+        root_compute(context, gpu, &operands.partials[0], &admission)?
+    };
+
+    {
+        let mut staged_routes = [None; MAX_EP_STACK_RANKS];
+        for rank in 0..n {
+            staged_routes[rank] = Some(route_buffers(&*context, rank)?);
+        }
+        let root = staged_routes[0].ok_or_else(|| {
+            DispatchError::Hip(
+                "root-routed EP root route buffers disappeared after root compute".into(),
+            )
+        })?;
+        gpus.broadcast_ep_route(
+            root.ids,
+            root.weights,
+            |rank| {
+                let route =
+                    staged_routes[rank].expect("root-routed EP route preflight omitted a rank");
+                (route.ids, route.weights)
+            },
+            schedule.route_count,
+        )
+        .map_err(hip_err)?;
+    }
+
+    for rank in 1..n {
+        let gpu = &mut gpus.devices[rank];
+        gpu.bind_thread().map_err(hip_err)?;
+        rank_contribute(context, rank, gpu, &proof, &operands.partials[rank])?;
+    }
+
+    for rank in 0..n {
+        let gpu = &mut gpus.devices[rank];
+        gpu.bind_thread().map_err(hip_err)?;
+        prepare_reduce(context, rank, gpu, &operands.partials[rank])?;
+    }
+
+    if schedule.reduction == RootRoutedEpReduction::PrefillSkipAllReduce {
+        return Ok(());
+    }
+
+    {
+        let mut staged: [&DeviceBuffer; MAX_EP_STACK_RANKS] =
+            [&operands.partials[0].buf; MAX_EP_STACK_RANKS];
+        for rank in 1..n {
+            staged[rank] = &operands.partials[rank].buf;
+        }
+        match schedule.reduction {
+            RootRoutedEpReduction::Decode => {
+                all_reduce_sum_f32_decode(gpus, &staged[..n], schedule.reduce_count, peer_lease)?;
+            }
+            RootRoutedEpReduction::Prefill => {
+                all_reduce_sum_f32_prefill(gpus, &staged[..n], schedule.reduce_count, peer_lease)?;
+            }
+            RootRoutedEpReduction::PrefillSkipAllReduce => unreachable!(),
+        }
+    }
+
+    for rank in 0..n {
+        let gpu = &mut gpus.devices[rank];
+        gpu.bind_thread().map_err(hip_err)?;
+        residual_finish(context, rank, gpu, &operands.partials[rank])?;
     }
     Ok(())
 }

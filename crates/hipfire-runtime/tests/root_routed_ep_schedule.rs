@@ -133,23 +133,11 @@ fn rejects_mismatched_mesh_and_activation_geometry() {
 }
 
 #[test]
-fn rejects_contract_identity_encoded_by_wrong_layer_or_mesh() {
+fn rejects_contract_identity_encoded_by_wrong_layer() {
     let wrong_layer = contract(2, vec![3, 5], vec![row("moe", 2, ContractAxis::Ep)]);
     assert!(derive(
         &wrong_layer,
         2,
-        3,
-        16,
-        128,
-        32,
-        RootRoutedEpReduction::Decode,
-    )
-    .is_err());
-
-    let wrong_mesh = contract(3, vec![3, 6], vec![row("moe", 3, ContractAxis::Ep)]);
-    assert!(derive(
-        &wrong_mesh,
-        3,
         3,
         16,
         128,

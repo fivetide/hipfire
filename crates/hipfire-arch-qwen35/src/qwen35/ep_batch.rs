@@ -35,7 +35,6 @@ use super::prefill::is_batchable_la;
 use super::prefill::qwen35_layer_batch_admissible;
 use super::prefill::upload_prefill_batch_inputs;
 use super::prefill::PrefillBandCtx;
-use super::prefill::PrefillRouteMode;
 use super::prefill::PREFILL_MAX_BATCH;
 use super::weights::mixed_expert_tag;
 use super::weights::DeltaNetState;
@@ -51,6 +50,8 @@ use hip_bridge::HipError;
 use hip_bridge::HipResult;
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::execute_steps;
+use hipfire_dispatch::pipeline::sealed_moe::PrefillRouteMode;
+
 use hipfire_dispatch::pipeline::GemvInput;
 use hipfire_dispatch::pipeline::Step;
 use hipfire_runtime::ep::{
@@ -72,6 +73,14 @@ fn layer_moe_ffn(layer: &LayerWeights) -> Option<&MoeFfnWeights> {
     match layer {
         LayerWeights::DeltaNetMoe(weights) => Some(&weights.ffn),
         LayerWeights::FullAttnMoe(weights) => Some(&weights.ffn),
+        _ => None,
+    }
+}
+
+fn layer_moe_ffn_norm(layer: &LayerWeights) -> Option<&GpuTensor> {
+    match layer {
+        LayerWeights::DeltaNetMoe(weights) => Some(&weights.ffn_norm),
+        LayerWeights::FullAttnMoe(weights) => Some(&weights.ffn_norm),
         _ => None,
     }
 }
@@ -1135,6 +1144,13 @@ impl PrefillRootScheduleContext<'_> {
         let ffn = self
             .ffn(rank)
             .map_err(|e| HipError::new(0, &e.to_string()))?;
+        let ffn_norm = self
+            .weights
+            .get(rank)
+            .and_then(|weights| weights.layers.get(self.layer_idx))
+            .and_then(layer_moe_ffn_norm)
+            .ok_or_else(|| HipError::new(0, "Qwen root EP preflight missing ffn norm"))?;
+
         let bound = ffn.bound_experts()?;
         let contract = bound
             .execution_contract()
@@ -1154,6 +1170,7 @@ impl PrefillRootScheduleContext<'_> {
         super::prefill::preflight_moe_ffn_batched_ep(
             gpu,
             ffn,
+            ffn_norm,
             self.config,
             self.pbs_per_rank
                 .get(rank)
@@ -1376,6 +1393,13 @@ impl TickRootScheduleContext<'_> {
         let ffn = self
             .ffn(rank)
             .map_err(|e| HipError::new(0, &e.to_string()))?;
+        let ffn_norm = self
+            .weights
+            .get(rank)
+            .and_then(|weights| weights.layers.get(self.layer_idx))
+            .and_then(layer_moe_ffn_norm)
+            .ok_or_else(|| HipError::new(0, "Qwen root EP preflight missing ffn norm"))?;
+
         let bound = ffn.bound_experts()?;
         let contract = bound
             .execution_contract()
@@ -1395,6 +1419,7 @@ impl TickRootScheduleContext<'_> {
         super::prefill::preflight_moe_ffn_batched_ep(
             gpu,
             ffn,
+            ffn_norm,
             self.config,
             &self.ranks[rank].pbs,
             self.tokens.len(),
@@ -3680,7 +3705,8 @@ fn forward_scratch_layers_multi(
                             None => &s.tmp,
                         };
                         if matches!(dt_g, DType::MQ4CG256 | DType::MQ4G256V2 | DType::MQ6G256V2) {
-                            let key = crate::forward_slots::fused_gate_up_key_for(dt_g);
+                            let key =
+                                hipfire_dispatch::families::fused_qkv::fused_gate_up_key_for(dt_g);
                             let ctx = DispatchCtx::new(gpu);
                             let params = hipfire_dispatch::families::fused_qkv::FusedQkvParams {
                                 kind: key,
@@ -4166,7 +4192,8 @@ fn forward_scratch_layers_multi(
                             None => &s.tmp,
                         };
                         if matches!(dt_g, DType::MQ4CG256 | DType::MQ4G256V2 | DType::MQ6G256V2) {
-                            let key = crate::forward_slots::fused_gate_up_key_for(dt_g);
+                            let key =
+                                hipfire_dispatch::families::fused_qkv::fused_gate_up_key_for(dt_g);
                             let ctx = DispatchCtx::new(gpu);
                             let params = hipfire_dispatch::families::fused_qkv::FusedQkvParams {
                                 kind: key,

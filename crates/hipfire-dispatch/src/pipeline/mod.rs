@@ -2,24 +2,28 @@
 // Copyright (c) 2026 Björn Bösel
 // hipfire — see LICENSE and NOTICE in the project root.
 use crate::context::DispatchCtx;
+use crate::families::fused_qkv::{fused_gate_up_key_for, FusedQkvFamily, FusedQkvParams};
+use crate::families::gemm::{GemmFamily, GemmParams};
 use crate::families::gemv::{GemvFamily, WeightRef};
+use crate::families::moe::MOE_GROUPED_BLOCK_M;
 use crate::tables::KernelRegistry;
 use crate::types::*;
 #[allow(unused_imports)]
 use hip_bridge;
 use rdna_compute::{DType, Gpu, GpuTensor};
+use std::cell::OnceCell;
 use std::sync::{LazyLock, OnceLock};
 
 pub mod sealed_moe;
 pub use sealed_moe::{
-    adopt_prefill_route, checked_grouped_m_total_bound, checked_tp_local_shapes,
-    produce_prefill_route, seal_decode, seal_decode_with_router, seal_ep_routed_contrib,
-    seal_prefill, seal_prefill_ep, seal_prefill_with_router, ActivationIdentity, ActivationInput,
-    BoundMoeExperts, ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources,
-    ExpertTable, MoeContribution, MoePrefillRouteProducerProof, MoeProtocol, MoeRouteProducerProof,
-    MoeRouteReceipt, MoeRouterInput, MoeSharedContribution, ResourceAlias, SealedMoeCall,
+    checked_grouped_m_total_bound, checked_tp_local_shapes, seal_decode, seal_ep_routed_contrib,
+    seal_prefill, seal_prefill_ep, ActivationIdentity, ActivationInput, BoundMoeExperts,
+    ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources, ExpertTable,
+    MoeContribution, MoePrefillRouteProducerProof, MoeProtocol, MoeRouteProducerProof,
+    MoeRouterInput, MoeSharedContribution, PrefillRouteMode, ResourceAlias, SealedMoeCall,
 };
 pub(crate) mod moe_program;
+pub use moe_program::SealedMoeOp;
 pub(crate) mod steps;
 pub use steps::{execute_steps, FusedPattern, GemvInput, Step};
 
@@ -166,6 +170,61 @@ fn slice_moe_f32_view(src: &GpuTensor, offset_elems: usize, len_elems: usize) ->
         buf: src.buf.byte_view(byte_offset, byte_len),
         shape: vec![len_elems],
         dtype: DType::F32,
+    }
+}
+
+/// Debug localization hook controlled by `HIPFIRE_DUMP_HIDDEN`.
+///
+/// When enabled, append the selected absolute-position row as a `u32` layer
+/// index followed by little-endian F32 values to `{prefix}.{tag}`.  The
+/// synchronous readback is intentionally refused by callers while graph
+/// capture is active; this helper preserves the existing opt-in diagnostics
+/// semantics and is otherwise allocation-free on the disabled path.
+#[allow(clippy::too_many_arguments)]
+pub fn dump_hidden_localize(
+    gpu: &Gpu,
+    x: &GpuTensor,
+    n_rows: usize,
+    abs_pos_of_row0: usize,
+    dim: usize,
+    layer_idx: usize,
+    tag: &str,
+) {
+    let prefix = match hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN") {
+        Ok(prefix) => prefix,
+        Err(_) => return,
+    };
+    let target = hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN_POS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0usize);
+    if target < abs_pos_of_row0 {
+        return;
+    }
+    let row = target - abs_pos_of_row0;
+    if row >= n_rows || gpu.hip.device_synchronize().is_err() {
+        return;
+    }
+    let all = match gpu.download_f32(x) {
+        Ok(values) => values,
+        Err(_) => return,
+    };
+    let offset = match row.checked_mul(dim) {
+        Some(offset) if offset.checked_add(dim).is_some_and(|end| end <= all.len()) => offset,
+        _ => return,
+    };
+    use std::io::Write;
+    let path = format!("{prefix}.{tag}");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let _ = file.write_all(&(layer_idx as u32).to_le_bytes());
+    for value in &all[offset..offset + dim] {
+        let _ = file.write_all(&value.to_le_bytes());
     }
 }
 
@@ -583,16 +642,6 @@ pub fn run_uniform_moe_down_expanded(
             "uniform expanded down unsupported dtype {other:?}"
         ))),
     }
-}
-
-/// Sealed indexed-decode executor. Raw `MoeParams` never reaches this helper
-/// directly; the sealed call is lowered into the typed stage program.
-pub(super) fn run_moe_decode(
-    ctx: &DispatchCtx,
-    gpu: &mut Gpu,
-    call: &SealedMoeCall<'_>,
-) -> Result<(), DispatchError> {
-    moe_program::execute_decode(ctx, gpu, call)
 }
 
 /// Build the permute-to-contiguous mapping for the mixed-tier path (pure; CPU-
@@ -1361,10 +1410,6 @@ pub fn run_moe_prefill_bias_aware(
 
 // ── Qwen3.5 batched MoE prefill (Ship 4.2) ──────────────────────────
 
-/// MoE grouped-GEMM block size (WMMA tile row count). Must match the
-/// constant in qwen35.rs and the scatter kernel.
-const MOE_GROUPED_BLOCK_M: usize = 16;
-
 /// Dispatch one grouped-GEMM for the given routed expert dtype.
 ///
 /// Deduplicates the per-dtype×i8×k8 grouped-kernel match for gate_up
@@ -1587,14 +1632,6 @@ fn dispatch_grouped_gemm(
 }
 
 /// Sealed grouped-prefill executor. The sealed call is lowered into the typed
-/// scatter/GEMM/activation/down/combine stage program.
-pub(super) fn run_moe_prefill(
-    ctx: &DispatchCtx,
-    gpu: &mut Gpu,
-    call: &SealedMoeCall<'_>,
-) -> Result<(), DispatchError> {
-    moe_program::execute_prefill(ctx, gpu, call)
-}
 
 pub fn dispatch_fused(
     ctx: &DispatchCtx,
@@ -1985,6 +2022,407 @@ mod mixed_dispatch_tests {
         // and assert equality against the per-rank mixed reference.
     }
 }
+fn prefill_shared_gemm_key(dtype: DType) -> Option<KernelKey> {
+    Some(match dtype {
+        DType::Q8_0 => KernelKey::GemmQ8_0BatchedChunked,
+        DType::F32 => KernelKey::GemmF32Batched,
+        DType::MQ4G256 => KernelKey::GemmHfq4G256,
+        DType::MQ4G256V2 => KernelKey::GemmMq4G256V2,
+        DType::MQ6G256 => return None,
+        DType::MQ6G256V2 => KernelKey::GemmMq6G256V2,
+        DType::HFQ4G128 | DType::ParoQ4G128 => KernelKey::GemmHfq4G128,
+        _ => return None,
+    })
+}
+
+fn prefill_shared_gate_up_stage(
+    ctx: &DispatchCtx,
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoePrefillParams<'_>,
+) -> Result<(), DispatchError> {
+    let shared =
+        p.prelude.shared.as_ref().ok_or_else(|| {
+            DispatchError::Hip("shared gate/up stage requires shared weights".into())
+        })?;
+    let n = p.batch_size;
+    let selector_x = match shared.weights.selector.dtype {
+        DType::Q8_0 | DType::F32 => p.x_norm_batch,
+        _ => p.x_rot_batch,
+    };
+    let gemm = GemmFamily::new();
+    let selector_key = prefill_shared_gemm_key(shared.weights.selector.dtype).ok_or(
+        DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "prefill-shared-selector-dtype",
+            arch: "",
+            quant: "",
+        },
+    )?;
+    gemm.run_key(
+        selector_key,
+        ctx,
+        gpu,
+        &GemmParams {
+            w: &shared.weights.selector,
+            x: selector_x,
+            y: shared.scalar,
+            batch_size: n,
+        },
+    )?;
+
+    let gate = &shared.weights.gate;
+    let up = &shared.weights.up;
+    let x = match gate.dtype {
+        DType::Q8_0 | DType::F32 => p.x_norm_batch,
+        _ => p.x_rot_batch,
+    };
+    match gate.dtype {
+        DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256 | DType::MQ6G256V2 => {
+            let fused = FusedQkvFamily::new();
+            let key = fused_gate_up_key_for(gate.dtype);
+            let weights = [gate.buf, up.buf];
+            let outputs = [shared.gate_out, shared.up_out];
+            let m = [gate.m, up.m];
+            fused.run(
+                ctx,
+                gpu,
+                &FusedQkvParams {
+                    kind: key,
+                    weights: &weights,
+                    x,
+                    outputs: &outputs,
+                    m: &m,
+                    k: gate.k,
+                    rot_scratch: &[],
+                    batch_size: Some(n),
+                },
+            )
+        }
+        DType::ParoQ4G128 => {
+            let gate_rot = gate.rotation.as_ref().ok_or_else(|| {
+                DispatchError::Hip("shared Paro gate has no rotation metadata".into())
+            })?;
+            let up_rot = up.rotation.as_ref().ok_or_else(|| {
+                DispatchError::Hip("shared Paro up has no rotation metadata".into())
+            })?;
+            gpu.givens_rotate_to(
+                p.x_norm_batch,
+                p.x_rot_batch,
+                gate_rot.pairs,
+                gate_rot.theta,
+                gate_rot.scales,
+                n,
+                gate.k,
+                gate_rot.krot,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            let gate_key = prefill_shared_gemm_key(gate.dtype)
+                .ok_or_else(|| DispatchError::Hip("shared Paro gate has no GEMM key".into()))?;
+            gemm.run_key(
+                gate_key,
+                ctx,
+                gpu,
+                &GemmParams {
+                    w: gate,
+                    x: p.x_rot_batch,
+                    y: shared.gate_out,
+                    batch_size: n,
+                },
+            )?;
+            gpu.givens_rotate_to(
+                p.x_norm_batch,
+                p.x_rot_batch,
+                up_rot.pairs,
+                up_rot.theta,
+                up_rot.scales,
+                n,
+                up.k,
+                up_rot.krot,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            gemm.run_key(
+                prefill_shared_gemm_key(up.dtype)
+                    .ok_or_else(|| DispatchError::Hip("shared Paro up has no GEMM key".into()))?,
+                ctx,
+                gpu,
+                &GemmParams {
+                    w: up,
+                    x: p.x_rot_batch,
+                    y: shared.up_out,
+                    batch_size: n,
+                },
+            )
+        }
+        DType::Q8_0 | DType::F32 => {
+            for (weight, out) in [(gate, shared.gate_out), (up, shared.up_out)] {
+                gemm.run_key(
+                    prefill_shared_gemm_key(weight.dtype).ok_or_else(|| {
+                        DispatchError::Hip("shared dense gate/up has no GEMM key".into())
+                    })?,
+                    ctx,
+                    gpu,
+                    &GemmParams {
+                        w: weight,
+                        x,
+                        y: out,
+                        batch_size: n,
+                    },
+                )?;
+            }
+            Ok(())
+        }
+        DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8 => {
+            let gate_f16 = gpu
+                .alloc_tensor(&[gate.m * gate.k], DType::F16)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            gpu.dequantize_mfp4g32_e8_to_f16(&gate.buf.buf, &gate_f16.buf, gate.m, gate.k)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            let up_f16 = gpu
+                .alloc_tensor(&[up.m * up.k], DType::F16)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            gpu.dequantize_mfp4g32_e8_to_f16(&up.buf.buf, &up_f16.buf, up.m, up.k)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            let gate_ref = WeightRef {
+                buf: &gate_f16,
+                dtype: DType::F16,
+                m: gate.m,
+                k: gate.k,
+                row_stride: gate.k,
+                rotation: None,
+                awq_scale: None,
+            };
+            let up_ref = WeightRef {
+                buf: &up_f16,
+                dtype: DType::F16,
+                m: up.m,
+                k: up.k,
+                row_stride: up.k,
+                rotation: None,
+                awq_scale: None,
+            };
+            let key = KernelKey::GemmF16WmmaMb8;
+            let result = gemm
+                .run_key(
+                    key,
+                    ctx,
+                    gpu,
+                    &GemmParams {
+                        w: &gate_ref,
+                        x: p.x_rot_batch,
+                        y: shared.gate_out,
+                        batch_size: n,
+                    },
+                )
+                .and_then(|_| {
+                    gemm.run_key(
+                        key,
+                        ctx,
+                        gpu,
+                        &GemmParams {
+                            w: &up_ref,
+                            x: p.x_rot_batch,
+                            y: shared.up_out,
+                            batch_size: n,
+                        },
+                    )
+                });
+            gpu.free_tensor(gate_f16)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            gpu.free_tensor(up_f16)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            result
+        }
+        _ => Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "prefill-shared-gate-up-dtype",
+            arch: "",
+            quant: "",
+        }),
+    }
+}
+
+fn prefill_shared_activation_stage(
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoePrefillParams<'_>,
+) -> Result<(), DispatchError> {
+    let shared =
+        p.prelude.shared.as_ref().ok_or_else(|| {
+            DispatchError::Hip("shared activation requires shared weights".into())
+        })?;
+    let down = &shared.weights.down;
+    if down.dtype == DType::ParoQ4G128 {
+        let rot = down.rotation.as_ref().ok_or_else(|| {
+            DispatchError::Hip("shared Paro down has no rotation metadata".into())
+        })?;
+        gpu.fused_silu_mul_givens_rotate_f32(
+            shared.gate_out,
+            shared.up_out,
+            shared.rotated,
+            rot.pairs,
+            rot.theta,
+            rot.scales,
+            p.batch_size,
+            shared.intermediate,
+            rot.krot,
+        )
+        .map_err(|e| DispatchError::Hip(e.to_string()))
+    } else if matches!(down.dtype, DType::Q8_0 | DType::F32) {
+        gpu.silu_mul_f32(shared.gate_out, shared.up_out, shared.rotated)
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+    } else if let Some(awq) = down.awq_scale {
+        gpu.fused_silu_mul_rotate_mq_awq_batched(
+            shared.gate_out,
+            shared.up_out,
+            awq,
+            shared.rotated,
+            shared.intermediate,
+            p.batch_size,
+        )
+        .map_err(|e| DispatchError::Hip(e.to_string()))
+    } else {
+        gpu.fused_silu_mul_rotate_mq_batched(
+            shared.gate_out,
+            shared.up_out,
+            shared.rotated,
+            shared.intermediate,
+            p.batch_size,
+        )
+        .map_err(|e| DispatchError::Hip(e.to_string()))
+    }
+}
+
+fn prefill_shared_down_stage(
+    ctx: &DispatchCtx,
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoePrefillParams<'_>,
+) -> Result<(), DispatchError> {
+    let shared = p
+        .prelude
+        .shared
+        .as_ref()
+        .ok_or_else(|| DispatchError::Hip("shared down requires shared weights".into()))?;
+    let down = &shared.weights.down;
+    let dim = p.down_m;
+    let down_tmp = || GpuTensor {
+        buf: unsafe { p.down_expanded.buf.alias() },
+        shape: vec![p.batch_size * dim],
+        dtype: DType::F32,
+    };
+    match down.dtype {
+        DType::MQ4G256 => gpu
+            .gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched(
+                &down.buf,
+                shared.rotated,
+                p.x_batch,
+                shared.scalar,
+                down.m,
+                down.k,
+                p.batch_size,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        DType::MQ6G256 => gpu
+            .gemv_hfq6g256_residual_sigmoid_scaled_gpu_batched(
+                &down.buf,
+                shared.rotated,
+                p.x_batch,
+                shared.scalar,
+                down.m,
+                down.k,
+                p.batch_size,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        DType::ParoQ4G128 => gpu
+            .gemv_hfq4g128_residual_sigmoid_scaled_gpu_batched(
+                &down.buf,
+                shared.rotated,
+                p.x_batch,
+                shared.scalar,
+                down.m,
+                down.k,
+                p.batch_size,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        DType::MQ4G256V2 | DType::MQ6G256V2 | DType::Q8_0 | DType::F32 => {
+            let out = down_tmp();
+            let key = if matches!(down.dtype, DType::Q8_0 | DType::F32) {
+                prefill_shared_gemm_key(down.dtype)
+            } else {
+                Some(crate::families::gemm::residual_gemm_key_for(down.dtype))
+            }
+            .ok_or_else(|| DispatchError::Hip("shared down has no GEMM key".into()))?;
+            let gemm = GemmFamily::new();
+            gemm.run_key(
+                key,
+                ctx,
+                gpu,
+                &GemmParams {
+                    w: down,
+                    x: shared.rotated,
+                    y: &out,
+                    batch_size: p.batch_size,
+                },
+            )?;
+            gpu.sigmoid_scaled_residual_add_batched_f32(
+                p.x_batch,
+                &out,
+                shared.scalar,
+                p.batch_size,
+                dim,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+        }
+        DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8 => {
+            let down_f16 = gpu
+                .alloc_tensor(&[down.m * down.k], DType::F16)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            gpu.dequantize_mfp4g32_e8_to_f16(&down.buf.buf, &down_f16.buf, down.m, down.k)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            let out = down_tmp();
+            let down_ref = WeightRef {
+                buf: &down_f16,
+                dtype: DType::F16,
+                m: down.m,
+                k: down.k,
+                row_stride: down.k,
+                rotation: None,
+                awq_scale: None,
+            };
+            let gemm = GemmFamily::new();
+            let result = gemm
+                .run_key(
+                    KernelKey::GemmF16WmmaMb8,
+                    ctx,
+                    gpu,
+                    &GemmParams {
+                        w: &down_ref,
+                        x: shared.rotated,
+                        y: &out,
+                        batch_size: p.batch_size,
+                    },
+                )
+                .and_then(|_| {
+                    gpu.sigmoid_scaled_residual_add_batched_f32(
+                        p.x_batch,
+                        &out,
+                        shared.scalar,
+                        p.batch_size,
+                        dim,
+                    )
+                    .map_err(|e| DispatchError::Hip(e.to_string()))
+                });
+            gpu.free_tensor(down_f16)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            result
+        }
+        _ => Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "prefill-shared-down-dtype",
+            arch: "",
+            quant: "",
+        }),
+    }
+}
+
 fn decode_gate_side_stage(
     ctx: &DispatchCtx,
     gpu: &mut Gpu,
@@ -1994,6 +2432,14 @@ fn decode_gate_side_stage(
     shared_gate: &GpuTensor,
     shared_up: &GpuTensor,
 ) -> Result<(), DispatchError> {
+    let shared = p.shared.as_ref().ok_or_else(|| {
+        DispatchError::Hip("shared gate-side stage requires shared weights".into())
+    })?;
+    let shared_expert_gate = &shared.weights.selector;
+    let shared_gate_w = &shared.weights.gate;
+    let shared_up_w = &shared.weights.up;
+    let smi = shared.intermediate;
+    let scalar_buf = shared.scalar;
     // ── Gate-side GEMV ───────────────────────────────────────────────────────
     // Views are borrowed from the executor so this stage does not allocate
     // duplicate tensor descriptors.
@@ -2009,35 +2455,35 @@ fn decode_gate_side_stage(
             // Exact-uniform V1 MQ4G256 gate quartet → one fused launch.
             hip!(gpu.fused_qkvza_hfq4g256(
                 &p.router.buf,
-                &p.shared_expert_gate.buf,
-                &p.shared_gate_w.buf,
-                &p.shared_up_w.buf,
+                &shared_expert_gate.buf,
+                &shared_gate_w.buf,
+                &shared_up_w.buf,
                 xr,
                 p.router_logits,
-                p.scalar_buf,
+                scalar_buf,
                 &shared_gate,
                 &shared_up,
                 p.router.m,
-                p.shared_expert_gate.m,
-                p.shared_gate_w.m,
-                p.shared_up_w.m,
+                shared_expert_gate.m,
+                shared_gate_w.m,
+                shared_up_w.m,
                 p.router.k,
             ))?;
         } else if res.gate_fusable_mq4v2
             && (ctx.arch.is_gfx1100() || ctx.arch.is_gfx1201())
             && p.batch_size == 1
             && p.router.awq_scale.is_none()
-            && p.shared_expert_gate.awq_scale.is_none()
-            && p.shared_gate_w.awq_scale.is_none()
-            && p.shared_up_w.awq_scale.is_none()
+            && shared_expert_gate.awq_scale.is_none()
+            && shared_gate_w.awq_scale.is_none()
+            && shared_up_w.awq_scale.is_none()
             && p.router.k == 2048
-            && p.shared_expert_gate.k == 2048
-            && p.shared_gate_w.k == 2048
-            && p.shared_up_w.k == 2048
+            && shared_expert_gate.k == 2048
+            && shared_gate_w.k == 2048
+            && shared_up_w.k == 2048
             && p.router.m == 256
-            && p.shared_expert_gate.m == 1
-            && p.shared_gate_w.m == 512
-            && p.shared_up_w.m == 512
+            && shared_expert_gate.m == 1
+            && shared_gate_w.m == 512
+            && shared_up_w.m == 512
         {
             let xr =
                 x_rot_local.expect("gate_fusable_mq4v2 implies x_rot_local (needs_x_rot_local)");
@@ -2046,18 +2492,18 @@ fn decode_gate_side_stage(
             // to the generic four-GEMV branch below — never errors.
             hip!(gpu.fused_qkvza_hfq4g256_mq4v2(
                 &p.router.buf,
-                &p.shared_expert_gate.buf,
-                &p.shared_gate_w.buf,
-                &p.shared_up_w.buf,
+                &shared_expert_gate.buf,
+                &shared_gate_w.buf,
+                &shared_up_w.buf,
                 xr,
                 p.router_logits,
-                p.scalar_buf,
+                scalar_buf,
                 &shared_gate,
                 &shared_up,
                 p.router.m,
-                p.shared_expert_gate.m,
-                p.shared_gate_w.m,
-                p.shared_up_w.m,
+                shared_expert_gate.m,
+                shared_gate_w.m,
+                shared_up_w.m,
                 p.router.k,
             ))?;
         } else {
@@ -2068,17 +2514,17 @@ fn decode_gate_side_stage(
             // (mixed dtype, non-MQ4 gate side, AWQ, etc.).
             let router_prerot = x_rot_local.is_some()
                 && p.router.awq_scale.is_none()
-                && p.shared_expert_gate.awq_scale.is_none()
+                && shared_expert_gate.awq_scale.is_none()
                 && matches!(
                     crate::types::dtype_post_rotation_variant(p.router.dtype),
                     crate::types::GemvVariant::Prerotated
                 )
                 && matches!(
-                    crate::types::dtype_post_rotation_variant(p.shared_expert_gate.dtype),
+                    crate::types::dtype_post_rotation_variant(shared_expert_gate.dtype),
                     crate::types::GemvVariant::Prerotated
                 )
                 && crate::types::KernelKey::dtype_arch_predicate(p.router.dtype).eval_arch(ctx)
-                && crate::types::KernelKey::dtype_arch_predicate(p.shared_expert_gate.dtype)
+                && crate::types::KernelKey::dtype_arch_predicate(shared_expert_gate.dtype)
                     .eval_arch(ctx);
             if router_prerot {
                 let xr = x_rot_local.expect("router_prerot implies x_rot_local");
@@ -2100,9 +2546,9 @@ fn decode_gate_side_stage(
                     ctx,
                     gpu,
                     &crate::families::gemv::GemvParams {
-                        w: &p.shared_expert_gate,
+                        w: shared_expert_gate,
                         x: xr,
-                        y: p.scalar_buf,
+                        y: scalar_buf,
                         variant: crate::types::GemvVariant::Prerotated,
                         residual: None,
                         gate: None,
@@ -2113,7 +2559,7 @@ fn decode_gate_side_stage(
             } else {
                 gemv.run_auto(ctx, gpu, &p.router, p.x_norm, p.router_logits)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
-                gemv.run_auto(ctx, gpu, &p.shared_expert_gate, p.x_norm, p.scalar_buf)
+                gemv.run_auto(ctx, gpu, shared_expert_gate, p.x_norm, scalar_buf)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
             }
             // Shared-expert gate/up: on a graded file the all-MQ4 fused gate path
@@ -2125,23 +2571,26 @@ fn decode_gate_side_stage(
             // identical (same rotated activation). Q8/HFQ shared weights (no rotation)
             // or AWQ-scaled shared weights fall through to run_auto unchanged.
             let shared_prerot = x_rot_local.is_some()
-            && p.shared_gate_w.awq_scale.is_none()
-            && p.shared_up_w.awq_scale.is_none()
-            && matches!(crate::types::dtype_post_rotation_variant(p.shared_gate_w.dtype), crate::types::GemvVariant::Prerotated)
-            && matches!(crate::types::dtype_post_rotation_variant(p.shared_up_w.dtype), crate::types::GemvVariant::Prerotated)
-            // The prerotated MQ GEMV must actually exist for this arch. MQ6/HFQ6
-            // prerotated is HasMmq (gfx906/RDNA3/RDNA4) → ABSENT on gfx942/CDNA, so
-            // taking this shortcut there hits MissingImpl. When unavailable, fall
-            // through to run_auto (the pre-2f38a16e gfx942 path that worked).
-            && crate::types::KernelKey::dtype_arch_predicate(p.shared_gate_w.dtype).eval_arch(ctx)
-            && crate::types::KernelKey::dtype_arch_predicate(p.shared_up_w.dtype).eval_arch(ctx);
+                && shared_gate_w.awq_scale.is_none()
+                && shared_up_w.awq_scale.is_none()
+                && matches!(
+                    crate::types::dtype_post_rotation_variant(shared_gate_w.dtype),
+                    crate::types::GemvVariant::Prerotated
+                )
+                && matches!(
+                    crate::types::dtype_post_rotation_variant(shared_up_w.dtype),
+                    crate::types::GemvVariant::Prerotated
+                )
+                && crate::types::KernelKey::dtype_arch_predicate(shared_gate_w.dtype)
+                    .eval_arch(ctx)
+                && crate::types::KernelKey::dtype_arch_predicate(shared_up_w.dtype).eval_arch(ctx);
             if shared_prerot {
                 let xr = x_rot_local.expect("shared_prerot implies x_rot_local");
                 gemv.run(
                     ctx,
                     gpu,
                     &crate::families::gemv::GemvParams {
-                        w: &p.shared_gate_w,
+                        w: shared_gate_w,
                         x: xr,
                         y: &shared_gate,
                         variant: crate::types::GemvVariant::Prerotated,
@@ -2155,7 +2604,7 @@ fn decode_gate_side_stage(
                     ctx,
                     gpu,
                     &crate::families::gemv::GemvParams {
-                        w: &p.shared_up_w,
+                        w: shared_up_w,
                         x: xr,
                         y: &shared_up,
                         variant: crate::types::GemvVariant::Prerotated,
@@ -2166,9 +2615,9 @@ fn decode_gate_side_stage(
                 )
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
             } else {
-                gemv.run_auto(ctx, gpu, &p.shared_gate_w, p.x_norm, &shared_gate)
+                gemv.run_auto(ctx, gpu, shared_gate_w, p.x_norm, &shared_gate)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
-                gemv.run_auto(ctx, gpu, &p.shared_up_w, p.x_norm, &shared_up)
+                gemv.run_auto(ctx, gpu, shared_up_w, p.x_norm, &shared_up)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
             }
         }
@@ -2185,6 +2634,11 @@ fn decode_route_gpu_stage(
     exact_wave64_router: bool,
     wave64_router: bool,
 ) -> Result<(), DispatchError> {
+    let smi = p
+        .shared
+        .as_ref()
+        .map(|shared| shared.intermediate)
+        .unwrap_or(0);
     let skip_routing = false;
     // DIAG: dump router logits before softmax (mirrors qwen35 HIPFIRE_DUMP_HIDDEN)
     // Skipped for experts-only: no router ran, so the buffer holds
@@ -2232,7 +2686,7 @@ fn decode_route_gpu_stage(
                     &shared_gate,
                     &shared_up,
                     &shared_x_rot,
-                    p.smi,
+                    smi,
                 )
             )?;
         } else if exact_wave64_router {
@@ -2274,6 +2728,13 @@ fn decode_shared_down_stage(
     target: &GpuTensor,
     router_shared_fuse: bool,
 ) -> Result<(), DispatchError> {
+    let shared = p
+        .shared
+        .as_ref()
+        .ok_or_else(|| DispatchError::Hip("shared down stage requires shared weights".into()))?;
+    let shared_down_w = &shared.weights.down;
+    let smi = shared.intermediate;
+    let scalar_buf = shared.scalar;
     let out_target = target;
     // ── Shared expert down ───────────────────────────────────────────────────
     // EP: on rank>0 `skip_shared` is set so the replicated shared expert is
@@ -2282,7 +2743,7 @@ fn decode_shared_down_stage(
     // is skipped here. Accumulates into `out_target` (= the EP partial when
     // `routed_out` is set, else `x_residual`).
     if !p.skip_shared {
-        if p.shared_down_w.dtype == DType::MQ4G256 {
+        if shared_down_w.dtype == DType::MQ4G256 {
             hip!(gpu.ensure_mq_signs())?;
             let x_rot_alias = unsafe {
                 GpuTensor {
@@ -2291,26 +2752,26 @@ fn decode_shared_down_stage(
                     dtype: DType::F32,
                 }
             };
-            if let Some(awq) = p.shared_down_w.awq_scale {
+            if let Some(awq) = shared_down_w.awq_scale {
                 hip!(gpu.fused_silu_mul_rotate_mq_awq(
                     &shared_gate,
                     &shared_up,
                     awq,
                     &x_rot_alias,
-                    p.smi
+                    smi
                 ))?;
             } else if !router_shared_fuse {
-                hip!(gpu.fused_silu_mul_rotate_mq(&shared_gate, &shared_up, &x_rot_alias, p.smi))?;
+                hip!(gpu.fused_silu_mul_rotate_mq(&shared_gate, &shared_up, &x_rot_alias, smi))?;
             }
             hip!(gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu(
-                &p.shared_down_w.buf,
+                &shared_down_w.buf,
                 &x_rot_alias,
                 out_target,
-                p.scalar_buf,
-                p.shared_down_w.m,
-                p.shared_down_w.k,
+                scalar_buf,
+                shared_down_w.m,
+                shared_down_w.k,
             ))?;
-        } else if matches!(p.shared_down_w.dtype, DType::MQ4G256V2 | DType::MQ6G256V2) {
+        } else if matches!(shared_down_w.dtype, DType::MQ4G256V2 | DType::MQ6G256V2) {
             // Exact dense V2 shared-down. qt44/qt47 dual-half headers MUST NOT
             // ride the V1 HFQ4 residual_sigmoid kernel (silent fluent corruption).
             // Sequence mirrors MQ4: silu+FWHT → prerotated dense V2 GEMV →
@@ -2324,16 +2785,16 @@ fn decode_shared_down_stage(
                     dtype: DType::F32,
                 }
             };
-            if let Some(awq) = p.shared_down_w.awq_scale {
+            if let Some(awq) = shared_down_w.awq_scale {
                 hip!(gpu.fused_silu_mul_rotate_mq_awq(
                     &shared_gate,
                     &shared_up,
                     awq,
                     &x_rot_alias,
-                    p.smi
+                    smi
                 ))?;
             } else if !router_shared_fuse {
-                hip!(gpu.fused_silu_mul_rotate_mq(&shared_gate, &shared_up, &x_rot_alias, p.smi))?;
+                hip!(gpu.fused_silu_mul_rotate_mq(&shared_gate, &shared_up, &x_rot_alias, smi))?;
             }
             // Default-on one-launch fuse for the exact Ornith qt44 shared-down
             // shape. The scalar has no later read in this executor. `ffn_out`
@@ -2346,31 +2807,31 @@ fn decode_shared_down_stage(
                     .unwrap_or(true)
             });
             let use_mq4v2_shared_down_fused = *MQ4V2_SHARED_DOWN_FUSED
-                && p.shared_down_w.dtype == DType::MQ4G256V2
-                && p.shared_down_w.awq_scale.is_none()
+                && shared_down_w.dtype == DType::MQ4G256V2
+                && shared_down_w.awq_scale.is_none()
                 && (ctx.arch.is_gfx1100() || ctx.arch.is_gfx1201())
-                && p.shared_down_w.m == 2_048
-                && p.shared_down_w.k == 512;
+                && shared_down_w.m == 2_048
+                && shared_down_w.k == 512;
             if use_mq4v2_shared_down_fused {
                 hip!(gpu.gemv_mq4g256v2_residual_sigmoid_scaled_k512(
-                    &p.shared_down_w.buf,
+                    &shared_down_w.buf,
                     &x_rot_alias,
                     out_target,
-                    p.scalar_buf,
-                    p.shared_down_w.m,
-                    p.shared_down_w.k,
+                    scalar_buf,
+                    shared_down_w.m,
+                    shared_down_w.k,
                 ))?;
             } else {
                 #[cfg(feature = "deltanet")]
                 {
-                    hip!(gpu.sigmoid_f32(p.scalar_buf))?;
+                    hip!(gpu.sigmoid_f32(scalar_buf))?;
                     static GEMV_SHARED_V2: OnceLock<GemvFamily> = OnceLock::new();
                     let gemv = GEMV_SHARED_V2.get_or_init(GemvFamily::new);
                     gemv.run(
                         ctx,
                         gpu,
                         &crate::families::gemv::GemvParams {
-                            w: &p.shared_down_w,
+                            w: shared_down_w,
                             x: &x_rot_alias,
                             y: p.ffn_out,
                             variant: crate::types::GemvVariant::Prerotated,
@@ -2379,18 +2840,14 @@ fn decode_shared_down_stage(
                             up: None,
                         },
                     )?;
-                    hip!(gpu.scaled_add_inplace_gpu_scalar_f32(
-                        out_target,
-                        p.ffn_out,
-                        p.scalar_buf
-                    ))?;
+                    hip!(gpu.scaled_add_inplace_gpu_scalar_f32(out_target, p.ffn_out, scalar_buf))?;
                 }
                 #[cfg(not(feature = "deltanet"))]
                 return Err(DispatchError::UnsupportedVariant {
                     family: "moe",
                     variant: "shared-down-v2-requires-deltanet",
                     arch: "",
-                    quant: dtype_name(p.shared_down_w.dtype),
+                    quant: dtype_name(shared_down_w.dtype),
                 });
             }
         } else {
@@ -2399,14 +2856,14 @@ fn decode_shared_down_stage(
             // feature to keep hipfire-dispatch compilable without deltanet.
             #[cfg(feature = "deltanet")]
             {
-                hip!(gpu.sigmoid_f32(p.scalar_buf))?;
-                let shared_hid = slice_moe_f32_view(p.ffn_hidden, 0, p.smi);
+                hip!(gpu.sigmoid_f32(scalar_buf))?;
+                let shared_hid = slice_moe_f32_view(p.ffn_hidden, 0, smi);
                 hip!(gpu.silu_mul_f32(&shared_gate, &shared_up, &shared_hid))?;
                 static GEMV_DOWN: OnceLock<GemvFamily> = OnceLock::new();
                 let gemv = GEMV_DOWN.get_or_init(GemvFamily::new);
-                gemv.run_auto(ctx, gpu, &p.shared_down_w, &shared_hid, p.ffn_out)
+                gemv.run_auto(ctx, gpu, shared_down_w, &shared_hid, p.ffn_out)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
-                hip!(gpu.scaled_add_inplace_gpu_scalar_f32(out_target, p.ffn_out, p.scalar_buf))?;
+                hip!(gpu.scaled_add_inplace_gpu_scalar_f32(out_target, p.ffn_out, scalar_buf))?;
             }
             #[cfg(not(feature = "deltanet"))]
             return Err(DispatchError::UnsupportedVariant {
@@ -2976,11 +3433,25 @@ fn decode_input_basis_stage(
 fn decode_route_cpu_stage(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoeParams<'_>,
-    runtime: &mut crate::pipeline::moe_program::DecodeRuntime,
+    runtime: &OnceCell<crate::pipeline::moe_program::HostRoute>,
+    router: crate::pipeline::sealed_moe::MoeRouterInput,
 ) -> Result<(), DispatchError> {
     let k = p.k;
     let n_exp = p.n_exp;
-    hip!(gpu.softmax_f32(p.router_logits))?;
+    match router {
+        crate::pipeline::sealed_moe::MoeRouterInput::SigmoidTopK => {
+            #[cfg(feature = "deltanet")]
+            hip!(gpu.sigmoid_f32(p.router_logits))?;
+            #[cfg(not(feature = "deltanet"))]
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "sigmoid-router-requires-deltanet",
+                arch: "",
+                quant: "",
+            });
+        }
+        _ => hip!(gpu.softmax_f32(p.router_logits))?,
+    }
     let (topk_indices, topk_weights): (Vec<usize>, Vec<f32>) = if k == 8 {
         hip!(gpu.moe_topk_renorm_k8(
             p.router_logits,
@@ -3021,9 +3492,46 @@ fn decode_route_cpu_stage(
         }
         (sel, wts)
     };
-    runtime.cpu_indices = Some(topk_indices);
-    runtime.cpu_weights = Some(topk_weights);
+    runtime
+        .set(crate::pipeline::moe_program::HostRoute {
+            indices: topk_indices,
+            weights: topk_weights,
+        })
+        .map_err(|_| DispatchError::Hip("sealed moe: CPU route was already published".into()))?;
     Ok(())
+}
+
+fn run_host_weight_gemv(
+    ctx: &DispatchCtx,
+    gpu: &mut Gpu,
+    gemv: &GemvFamily,
+    weight: &WeightRef<'_>,
+    x: &GpuTensor,
+    y: &GpuTensor,
+) -> Result<(), DispatchError> {
+    gpu.maybe_capture_activation(weight.buf, x, 1, weight.k);
+    gemv.run_auto(ctx, gpu, weight, x, y)
+}
+
+fn run_host_weight_gemv_residual(
+    ctx: &DispatchCtx,
+    gpu: &mut Gpu,
+    gemv: &GemvFamily,
+    weight: &WeightRef<'_>,
+    x: &GpuTensor,
+    residual: &GpuTensor,
+) -> Result<(), DispatchError> {
+    // Match weight_gemv_residual's observable host-fallback order: residual
+    // tap, temporary allocation, ordinary GEMV (and its tap), add, then free.
+    gpu.maybe_capture_activation(weight.buf, x, 1, weight.k);
+    let tmp = gpu
+        .alloc_tensor(&[weight.m], DType::F32)
+        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+    run_host_weight_gemv(ctx, gpu, gemv, weight, x, &tmp)?;
+    gpu.add_inplace_f32(residual, &tmp)
+        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+    gpu.free_tensor(tmp)
+        .map_err(|e| DispatchError::Hip(e.to_string()))
 }
 
 fn decode_cpu_experts_stage(
@@ -3037,7 +3545,9 @@ fn decode_cpu_experts_stage(
     static GEMV_FB: OnceLock<GemvFamily> = OnceLock::new();
     let gemv = GEMV_FB.get_or_init(GemvFamily::new);
 
-    let hess_x_norm: Option<Vec<f32>> = if gpu.hessian_capture.is_some() {
+    let hess_x_norm: Option<Vec<f32>> = if gpu.hessian_capture.is_some()
+        && p.recipe == crate::families::moe::MoeRecipe::SoftmaxGatedShared
+    {
         Some(hip!(gpu.download_f32(p.x_norm))?)
     } else {
         None
@@ -3063,7 +3573,7 @@ fn decode_cpu_experts_stage(
                     arch: "",
                     quant: "",
                 })?;
-        gemv.run_auto(ctx, gpu, &gate_up_w, p.x_norm, p.gate_up_buf)?;
+        run_host_weight_gemv(ctx, gpu, gemv, &gate_up_w, p.x_norm, p.gate_up_buf)?;
         let gate_view = slice_moe_f32_view(p.gate_up_buf, 0, mi);
         let up_view = slice_moe_f32_view(p.gate_up_buf, mi, mi);
         let hid_view = slice_moe_f32_view(p.ffn_hidden, 0, mi);
@@ -3080,10 +3590,24 @@ fn decode_cpu_experts_stage(
                 hid_host,
             ));
         }
-        gemv.run_auto(ctx, gpu, &down_w, &hid_view, p.ffn_out)?;
-        hip!(gpu.scaled_add_inplace_cpu_scalar_f32(p.x_residual, p.ffn_out, weight))?;
+        if p.recipe == crate::families::moe::MoeRecipe::SigmoidRoutedNoShared {
+            // Cohere folds the route weight into the activation before down;
+            // preserve this order for its F32/F16/BF16/Q8 host fallback.
+            #[cfg(feature = "deltanet")]
+            hip!(gpu.scale_f32(&hid_view, weight))?;
+            #[cfg(not(feature = "deltanet"))]
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "sigmoid-host-experts-require-deltanet",
+                arch: "",
+                quant: "",
+            });
+            run_host_weight_gemv_residual(ctx, gpu, gemv, &down_w, &hid_view, p.x_residual)?;
+        } else {
+            gemv.run_auto(ctx, gpu, &down_w, &hid_view, p.ffn_out)?;
+            hip!(gpu.scaled_add_inplace_cpu_scalar_f32(p.x_residual, p.ffn_out, weight))?;
+        }
     }
-
     if let Some(xn) = &hess_x_norm {
         let mut items: Vec<(String, &[f32], usize)> =
             Vec::with_capacity(hess_gate_keys.len() + hess_down_keys.len());
