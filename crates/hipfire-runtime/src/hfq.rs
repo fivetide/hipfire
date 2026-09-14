@@ -2929,7 +2929,7 @@ pub(crate) mod hfq_test_fixture {
                 "version": 1,
                 "multipliers": [
                     23_703_573_157_769i64,
-                    20_090_736_453_365i64,
+                    20_109_073_645_365i64,
                     8_052_911_324_071i64
                 ],
                 "head_vocab_sizes": [
@@ -2989,7 +2989,7 @@ pub(crate) mod hfq_test_fixture {
                 quant_type: 52,
                 shape: vec![3],
                 group_size: 0,
-                data: i64_bytes(&[23_703_573_157_769, 20_090_736_453_365, 8_052_911_324_071]),
+                data: i64_bytes(&[23_703_573_157_769, 20_109_073_645_365, 8_052_911_324_071]),
             },
             super::HfqMemTensor {
                 name: COMPACT_I64_NAMES[1].to_string(),
@@ -3177,7 +3177,7 @@ mod compact_qwen4_ple_tests {
 
         assert_eq!(
             i64_values(&range(&hfq, COMPACT_I64_NAMES[0])),
-            vec![23_703_573_157_769, 20_090_736_453_365, 8_052_911_324_071]
+            vec![23_703_573_157_769, 20_109_073_645_365, 8_052_911_324_071]
         );
         assert_eq!(
             i64_values(&range(&hfq, COMPACT_I64_NAMES[1])),

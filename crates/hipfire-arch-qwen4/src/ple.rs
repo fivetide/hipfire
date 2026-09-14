@@ -30,7 +30,7 @@ pub const PLE_PADDING_MULTIPLE: u64 = 128;
 /// future checkpoint with different metadata must provide its own stored
 /// values through [`PleHashMetadata::from_stored`].
 pub const PLE_MULTIPLIERS: [i64; PLE_MULTIPLIER_COUNT] =
-    [23_703_573_157_769, 20_090_736_453_365, 8_052_911_324_071];
+    [23_703_573_157_769, 20_109_073_645_365, 8_052_911_324_071];
 
 /// The exact valid row count of each stored PLE head table.
 pub const PLE_HEAD_VOCAB_SIZES: [u64; PLE_HEAD_COUNT] = [
