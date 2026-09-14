@@ -4998,10 +4998,10 @@ fn batch_chunk_full_attn_output_projection(
     Ok(())
 }
 
-/// Context length past which an admitted gfx1100/Q8 small-batch attend step
+/// Context length past which an admitted gfx1100/gfx1201 Q8 small-batch attend step
 /// leaves the batched masked FA kernel for the multi-row tile. Measured with
-/// the Qwen3.8-27B verify shape (`bench_flash_rows`, tile 128): the batched
-/// kernel still wins at 2k and loses from 4k on.
+/// the Qwen3.8-27B verify shape (`bench_flash_rows`, tile 128). The conservative
+/// 4k boundary is retained across both measured architectures.
 /// `HIPFIRE_FA_PERTOKEN_MIN_CTX` overrides; `0` disables the route.
 pub(crate) fn fa_pertoken_min_ctx() -> Option<usize> {
     use std::sync::OnceLock;
@@ -5017,7 +5017,7 @@ pub(crate) fn fa_pertoken_min_ctx() -> Option<usize> {
 
 #[allow(clippy::too_many_arguments)]
 fn q8_multirow_attn_admitted(
-    is_gfx1100: bool,
+    arch: &str,
     quant_q8: bool,
     head_dim: usize,
     n: usize,
@@ -5026,8 +5026,9 @@ fn q8_multirow_attn_admitted(
     is_tree: bool,
     is_independent: bool,
     capture_mode: bool,
+    replay_recording: bool,
 ) -> bool {
-    is_gfx1100
+    matches!(arch, "gfx1100" | "gfx1201")
         && quant_q8
         && matches!(head_dim, 128 | 256)
         && (4..=32).contains(&n)
@@ -5035,6 +5036,7 @@ fn q8_multirow_attn_admitted(
         && !is_tree
         && !is_independent
         && !capture_mode
+        && !replay_recording
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5076,7 +5078,7 @@ fn batch_chunk_fa_attend(
     }
 
     if multirow {
-        debug_assert!(gpu.arch_caps.is_gfx1100());
+        debug_assert!(gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201());
         debug_assert!(kv_cache.quant_q8);
         debug_assert!(matches!(config.head_dim, 128 | 256));
         gpu.kv_cache_write_q8_0_batched(
@@ -7095,7 +7097,7 @@ pub(crate) fn forward_batch_chunk_impl(
     // multi-row tile. Its tile grid is sized from the live logical context on
     // the host, so a captured replay would keep the first cycle's tile count.
     let fa_attn_multirow = q8_multirow_attn_admitted(
-        gpu.arch_caps.is_gfx1100(),
+        gpu.arch_caps.arch(),
         kv_cache.quant_q8,
         config.head_dim,
         n,
@@ -7104,6 +7106,7 @@ pub(crate) fn forward_batch_chunk_impl(
         tree_verify.is_some(),
         batch_semantics.is_independent(),
         gpu.graphs.capture_mode,
+        gpu.replay.is_recording(),
     );
     let logical_max_ctx = match batch_semantics {
         BatchSemantics::Sequential => start_pos + n,
@@ -7935,27 +7938,30 @@ mod tests {
     use rdna_compute::DType;
 
     #[test]
-    fn q8_multirow_attn_admits_only_measured_gfx1100_shapes() {
-        for head_dim in [128, 256] {
-            for n in [4, 8, 32] {
-                assert!(q8_multirow_attn_admitted(
-                    true,
-                    true,
-                    head_dim,
-                    n,
-                    4097,
-                    Some(4096),
-                    false,
-                    false,
-                    false,
-                ));
+    fn q8_multirow_attn_admits_only_measured_arch_shapes() {
+        for arch in ["gfx1100", "gfx1201"] {
+            for head_dim in [128, 256] {
+                for n in [4, 8, 32] {
+                    assert!(q8_multirow_attn_admitted(
+                        arch,
+                        true,
+                        head_dim,
+                        n,
+                        4097,
+                        Some(4096),
+                        false,
+                        false,
+                        false,
+                        false,
+                    ));
+                }
             }
         }
     }
 
     #[test]
     fn q8_multirow_attn_rejects_unmeasured_or_unsupported_routes() {
-        let admitted = |is_gfx1100,
+        let admitted = |arch,
                         quant_q8,
                         head_dim,
                         n,
@@ -7963,9 +7969,10 @@ mod tests {
                         min_ctx,
                         is_tree,
                         is_independent,
-                        capture_mode| {
+                        capture_mode,
+                        replay_recording| {
             q8_multirow_attn_admitted(
-                is_gfx1100,
+                arch,
                 quant_q8,
                 head_dim,
                 n,
@@ -7974,33 +7981,36 @@ mod tests {
                 is_tree,
                 is_independent,
                 capture_mode,
+                replay_recording,
             )
         };
         assert!(!admitted(
-            false,
+            "gfx1200",
             true,
             256,
             8,
             8192,
             Some(4096),
+            false,
             false,
             false,
             false,
         ));
         assert!(!admitted(
-            true,
+            "gfx1100",
             false,
             256,
             8,
             8192,
             Some(4096),
+            false,
             false,
             false,
             false,
         ));
         for head_dim in [64, 320] {
             assert!(!admitted(
-                true,
+                "gfx1100",
                 true,
                 head_dim,
                 8,
@@ -8009,11 +8019,12 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             ));
         }
         for n in [1, 3, 33] {
             assert!(!admitted(
-                true,
+                "gfx1100",
                 true,
                 256,
                 n,
@@ -8022,10 +8033,11 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             ));
         }
         assert!(!admitted(
-            true,
+            "gfx1100",
             true,
             256,
             8,
@@ -8034,12 +8046,13 @@ mod tests {
             false,
             false,
             false,
+            false,
         ));
         assert!(!admitted(
-            true, true, 256, 8, 8192, None, false, false, false,
+            "gfx1100", true, 256, 8, 8192, None, false, false, false, false,
         ));
         assert!(!admitted(
-            true,
+            "gfx1100",
             true,
             256,
             8,
@@ -8048,9 +8061,10 @@ mod tests {
             true,
             false,
             false,
+            false,
         ));
         assert!(!admitted(
-            true,
+            "gfx1100",
             true,
             256,
             8,
@@ -8059,9 +8073,10 @@ mod tests {
             false,
             true,
             false,
+            false,
         ));
         assert!(!admitted(
-            true,
+            "gfx1100",
             true,
             256,
             8,
@@ -8070,7 +8085,38 @@ mod tests {
             false,
             false,
             true,
+            false,
         ));
+    }
+
+    #[test]
+    fn q8_multirow_attn_rejects_replay_recording_on_supported_arches() {
+        for arch in ["gfx1100", "gfx1201"] {
+            assert!(q8_multirow_attn_admitted(
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                false,
+            ));
+            assert!(!q8_multirow_attn_admitted(
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                true,
+            ));
+        }
     }
 
     #[test]
