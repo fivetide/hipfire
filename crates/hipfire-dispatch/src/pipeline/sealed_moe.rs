@@ -1431,6 +1431,35 @@ impl SealedMoeCall<'_> {
         &self.experts
     }
 
+    /// Fold the gathered per-slot expert outputs into the root partial using
+    /// the same slot-order combine kernel as the single-device path.
+    pub fn execute_ep_slot_combine(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        self.validate_for_gpu(gpu)?;
+        if self.experts.rank_count() <= 1
+            || self.experts.local_rank() != 0
+            || self.contribution != MoeContribution::ZeroedPartial
+            || self.shared == MoeSharedContribution::None
+        {
+            return Err(invalid(
+                "EP slot combine requires a compact root call with a zeroed partial",
+            ));
+        }
+        match (&self.params, self.router) {
+            (SealedParams::Decode(params), MoeRouterInput::SoftmaxTopK)
+                if params.ep_mode == MoeEpMode::RootRoutedPartial
+                    && params.routed_out.is_some() => {}
+            (SealedParams::Prefill(params), MoeRouterInput::SoftmaxTopK)
+                if matches!(params.prelude.route, PrefillRouteMode::ProduceRoot { .. })
+                    && params.routed_out.is_some() => {}
+            _ => {
+                return Err(invalid(
+                    "EP slot combine requires the root-produced route and routed_out",
+                ))
+            }
+        }
+        moe_program::execute_ep_slot_combine(gpu, self)
+    }
+
     pub fn decode_params(&self) -> Option<&MoeParams<'_>> {
         match &self.params {
             SealedParams::Decode(params) => Some(params),

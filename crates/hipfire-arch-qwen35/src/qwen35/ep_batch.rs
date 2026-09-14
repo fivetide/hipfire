@@ -1117,6 +1117,8 @@ struct PrefillRootScheduleContext<'a> {
     rank_count: usize,
     reduce_count: usize,
     route_count: usize,
+    contribution_count: usize,
+    grouped_outputs: bool,
 }
 
 impl PrefillRootScheduleContext<'_> {
@@ -1291,7 +1293,60 @@ impl PrefillRootScheduleContext<'_> {
         Ok(EpRouteBuffers {
             ids: &ids.buf,
             weights: &weights.buf,
+            slot_outputs: &self.slot_outputs(rank)?.buf,
         })
+    }
+
+    fn slot_outputs(
+        &self,
+        rank: usize,
+    ) -> Result<&GpuTensor, hipfire_dispatch::types::DispatchError> {
+        let pbs = self.pbs_per_rank.get(rank).ok_or_else(|| {
+            hipfire_dispatch::types::DispatchError::Hip(format!(
+                "Qwen root EP slot-output rank {rank} PBS is unavailable"
+            ))
+        })?;
+        let output = if self.grouped_outputs {
+            pbs.moe_y_down_grouped.as_ref()
+        } else {
+            pbs.moe_down_expanded_batch.as_ref()
+        };
+        output.ok_or_else(|| {
+            hipfire_dispatch::types::DispatchError::Hip(format!(
+                "Qwen root EP slot-output rank {rank} is unavailable"
+            ))
+        })
+    }
+
+    fn finish_combine(
+        &mut self,
+        gpu: &mut Gpu,
+        partial: &GpuTensor,
+    ) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        let ffn = self.ffn(0)?;
+        let ffn_norm = self.weights[0]
+            .layers
+            .get(self.layer_idx)
+            .and_then(layer_moe_ffn_norm)
+            .ok_or_else(|| {
+                hipfire_dispatch::types::DispatchError::Hip(
+                    "Qwen root EP combine missing ffn norm".into(),
+                )
+            })?;
+        let routed = partial.sub_offset(0, self.reduce_count);
+        let dispatch_ctx = DispatchCtx::new(gpu);
+        super::prefill::finish_moe_ffn_batched_ep_slot_order(
+            gpu,
+            ffn,
+            ffn_norm,
+            self.config,
+            &self.pbs_per_rank[0],
+            self.tokens.len(),
+            &dispatch_ctx,
+            self.model_has_mq6_moe_for_rank(0),
+            &routed,
+        )
+        .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))
     }
 }
 
@@ -1309,11 +1364,14 @@ fn execute_prefill_root_schedule(
         .ok_or_else(|| HipError::new(0, "Qwen root EP partial byte count overflow"))?;
     let reduce_count = context.reduce_count;
     let route_count = context.route_count;
+    let contribution_count = context.contribution_count;
     let operands = RootRoutedEpOperands {
         partials,
         partial_bytes,
         reduce_count,
         route_count,
+        contribution_count,
+        contribution_chunk: context.reduce_count,
     };
     execute_root_routed_ep(
         gpus,
@@ -1333,6 +1391,7 @@ fn execute_prefill_root_schedule(
         |ctx, gpu, partial, _admission| ctx.root_compute(gpu, partial),
         |ctx, rank| ctx.route_buffers(rank),
         |ctx, rank, gpu, proof, partial| ctx.rank_contribute(gpu, rank, proof, partial),
+        |ctx, gpu, partial| ctx.finish_combine(gpu, partial),
         |_ctx, _rank, _gpu, _partial| Ok(()),
         |ctx, rank, gpu, partial| {
             let dst = ctx.pbs_per_rank[rank]
@@ -1364,6 +1423,8 @@ struct TickRootScheduleContext<'a> {
     rank_count: usize,
     reduce_count: usize,
     route_count: usize,
+    contribution_count: usize,
+    grouped_outputs: bool,
     model_has_mq6_moe: bool,
     full_mask: u64,
 }
@@ -1540,7 +1601,64 @@ impl TickRootScheduleContext<'_> {
         Ok(EpRouteBuffers {
             ids: &ids.buf,
             weights: &weights.buf,
+            slot_outputs: &self.slot_outputs(rank)?.buf,
         })
+    }
+
+    fn slot_outputs(
+        &self,
+        rank: usize,
+    ) -> Result<&GpuTensor, hipfire_dispatch::types::DispatchError> {
+        let pbs = &self
+            .ranks
+            .get(rank)
+            .ok_or_else(|| {
+                hipfire_dispatch::types::DispatchError::Hip(format!(
+                    "Qwen root EP slot-output rank {rank} state is unavailable"
+                ))
+            })?
+            .pbs;
+        let output = if self.grouped_outputs {
+            pbs.moe_y_down_grouped.as_ref()
+        } else {
+            pbs.moe_down_expanded_batch.as_ref()
+        };
+        output.ok_or_else(|| {
+            hipfire_dispatch::types::DispatchError::Hip(format!(
+                "Qwen root EP slot-output rank {rank} is unavailable"
+            ))
+        })
+    }
+
+    fn finish_combine(
+        &mut self,
+        gpu: &mut Gpu,
+        partial: &GpuTensor,
+    ) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        let ffn = self.ffn(0)?;
+        let ffn_norm = self.weights[0]
+            .layers
+            .get(self.layer_idx)
+            .and_then(layer_moe_ffn_norm)
+            .ok_or_else(|| {
+                hipfire_dispatch::types::DispatchError::Hip(
+                    "Qwen root EP combine missing ffn norm".into(),
+                )
+            })?;
+        let routed = partial.sub_offset(0, self.reduce_count);
+        let dispatch_ctx = DispatchCtx::new(gpu);
+        super::prefill::finish_moe_ffn_batched_ep_slot_order(
+            gpu,
+            ffn,
+            ffn_norm,
+            self.config,
+            &self.ranks[0].pbs,
+            self.tokens.len(),
+            &dispatch_ctx,
+            self.model_has_mq6_moe,
+            &routed,
+        )
+        .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))
     }
 }
 
@@ -1563,6 +1681,8 @@ fn execute_tick_root_schedule(
         partial_bytes,
         reduce_count,
         route_count,
+        contribution_count: context.contribution_count,
+        contribution_chunk: context.reduce_count,
     };
     execute_root_routed_ep(
         gpus,
@@ -1582,6 +1702,7 @@ fn execute_tick_root_schedule(
         |ctx, gpu, partial, _admission| ctx.root_compute(gpu, partial),
         |ctx, rank| ctx.route_buffers(rank),
         |ctx, rank, gpu, proof, partial| ctx.rank_contribute(gpu, rank, proof, partial),
+        |ctx, gpu, partial| ctx.finish_combine(gpu, partial),
         |ctx, _rank, gpu, partial| {
             if ctx.active_mask != ctx.full_mask {
                 gpu.zero_inactive_rows_f32(
@@ -2101,12 +2222,32 @@ impl Qwen35DecodeBatchEpState {
                         let route_count = chunk_n.checked_mul(k_top).ok_or_else(|| {
                             HipError::new(0, "prefill_lane: route count overflow")
                         })?;
+                        let ffn_norm = layer_moe_ffn_norm(&weights_per_rank[0].layers[layer_idx])
+                            .ok_or_else(|| {
+                            HipError::new(0, "prefill_lane: MoE FFN norm missing")
+                        })?;
+                        let routed = self.seed_partials[0].sub_offset(0, reduce_count);
+                        let dispatch_ctx = DispatchCtx::new(&gpus.devices[0]);
+                        let (contribution_count, grouped_outputs) =
+                            super::prefill::moe_ffn_batched_ep_slot_geometry(
+                                &gpus.devices[0],
+                                ffn,
+                                ffn_norm,
+                                config,
+                                &self.seed_pbs[0],
+                                chunk_n,
+                                &dispatch_ctx,
+                                weights_per_rank[0].moe_has_mq6,
+                                &routed,
+                            )?;
                         let schedule = RootRoutedEpSchedule::derive(
                             contract,
                             n,
                             layer_idx,
                             route_count,
                             partial_bytes,
+                            reduce_count,
+                            contribution_count,
                             reduce_count,
                             RootRoutedEpReduction::Prefill,
                         )
@@ -2132,6 +2273,8 @@ impl Qwen35DecodeBatchEpState {
                             semantics: BatchSemantics::Sequential,
                             contract_id: schedule.contract_id(),
                             rank_count: n,
+                            contribution_count,
+                            grouped_outputs,
                             reduce_count,
                             route_count,
                         };
@@ -2450,12 +2593,30 @@ impl Qwen35DecodeBatchEpState {
                     let route_count = b
                         .checked_mul(k_top)
                         .ok_or_else(|| HipError::new(0, "forward_tick: route count overflow"))?;
+                    let ffn_norm = layer_moe_ffn_norm(&weights_per_rank[0].layers[layer_idx])
+                        .ok_or_else(|| HipError::new(0, "forward_tick: MoE FFN norm missing"))?;
+                    let routed = self.decode_partials[0].sub_offset(0, reduce_count);
+                    let dispatch_ctx = DispatchCtx::new(&gpus.devices[0]);
+                    let (contribution_count, grouped_outputs) =
+                        super::prefill::moe_ffn_batched_ep_slot_geometry(
+                            &gpus.devices[0],
+                            ffn,
+                            ffn_norm,
+                            config,
+                            &self.ranks[0].pbs,
+                            b,
+                            &dispatch_ctx,
+                            weights_per_rank[0].moe_has_mq6,
+                            &routed,
+                        )?;
                     let schedule = RootRoutedEpSchedule::derive(
                         contract,
                         n,
                         layer_idx,
                         route_count,
                         partial_bytes,
+                        reduce_count,
+                        contribution_count,
                         reduce_count,
                         RootRoutedEpReduction::Decode,
                     )
@@ -2482,6 +2643,8 @@ impl Qwen35DecodeBatchEpState {
                         rank_count: n,
                         reduce_count,
                         route_count,
+                        contribution_count,
+                        grouped_outputs,
                         model_has_mq6_moe: weights_per_rank[0].moe_has_mq6,
                         full_mask,
                     };
@@ -3222,6 +3385,24 @@ pub fn forward_prefill_batch_ep(
             let route_count = n.checked_mul(k_top).ok_or_else(|| {
                 HipError::new(0, "forward_prefill_batch_ep: route count overflow")
             })?;
+            let ffn_norm =
+                layer_moe_ffn_norm(&weights_per_rank[0].layers[layer_idx]).ok_or_else(|| {
+                    HipError::new(0, "forward_prefill_batch_ep: MoE FFN norm missing")
+                })?;
+            let routed = partials[0].sub_offset(0, reduce_count);
+            let dispatch_ctx = DispatchCtx::new(&gpus.devices[0]);
+            let (contribution_count, grouped_outputs) =
+                super::prefill::moe_ffn_batched_ep_slot_geometry(
+                    &gpus.devices[0],
+                    ffn,
+                    ffn_norm,
+                    config,
+                    &pbs_per_rank[0],
+                    n,
+                    &dispatch_ctx,
+                    weights_per_rank[0].moe_has_mq6,
+                    &routed,
+                )?;
             let reduction = if ep_skip_ar {
                 RootRoutedEpReduction::PrefillSkipAllReduce
             } else {
@@ -3233,6 +3414,8 @@ pub fn forward_prefill_batch_ep(
                 layer_idx,
                 route_count,
                 partial_bytes,
+                reduce_count,
+                contribution_count,
                 reduce_count,
                 reduction,
             )
@@ -3256,6 +3439,8 @@ pub fn forward_prefill_batch_ep(
                 rank_count: n_rank,
                 reduce_count,
                 route_count,
+                contribution_count,
+                grouped_outputs,
             };
             execute_prefill_root_schedule(
                 gpus,

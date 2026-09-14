@@ -2215,6 +2215,119 @@ impl Gpus {
         }
         Ok(())
     }
+
+    /// Gather rank-local expert rows into rank 0 without changing their global
+    /// slot layout. Each element has exactly one non-zero owner; adding the
+    /// remaining zero-dummy values therefore preserves the owner's bits.
+    ///
+    /// `chunk_count` bounds scratch use and is normally one hidden-width row.
+    pub fn gather_unique_f32_to_root(
+        &mut self,
+        lease: Option<&PeerReduceScratchLease>,
+        buffers: &[&DeviceBuffer],
+        count: usize,
+        chunk_count: usize,
+    ) -> HipResult<()> {
+        let n = self.devices.len();
+        if n == 0 || buffers.len() != n || chunk_count == 0 {
+            return Err(HipError::new(
+                0,
+                "gather_unique_f32_to_root: invalid mesh or chunk geometry",
+            ));
+        }
+        let bytes = count
+            .checked_mul(4)
+            .ok_or_else(|| HipError::new(0, "gather_unique_f32_to_root: count overflow"))?;
+        for (rank, buffer) in buffers.iter().enumerate() {
+            if buffer.size() < bytes {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "gather_unique_f32_to_root: rank {rank} has {} bytes, needs {bytes}",
+                        buffer.size()
+                    ),
+                ));
+            }
+        }
+        if n == 1 || count == 0 {
+            return Ok(());
+        }
+        let scratch_count = chunk_count.min(count);
+        if let Some(lease) = lease {
+            self.validate_peer_reduce_scratch_lease(lease, buffers, scratch_count)?;
+        } else {
+            self.ensure_peer_ar_tmp(scratch_count * 4)?;
+        }
+
+        let mut offset = 0usize;
+        while offset < count {
+            let width = scratch_count.min(count - offset);
+            let root = GpuTensor {
+                buf: unsafe { buffers[0].alias() },
+                shape: vec![count],
+                dtype: DType::F32,
+            }
+            .sub_offset(offset, width);
+            for rank in 1..n {
+                let source = GpuTensor {
+                    buf: unsafe { buffers[rank].alias() },
+                    shape: vec![count],
+                    dtype: DType::F32,
+                }
+                .sub_offset(offset, width);
+                let scratch_buffer = if lease.is_some() {
+                    &self.peer_lease_buffers[0][rank - 1]
+                } else {
+                    &self.peer_ar_tmp[0][rank - 1]
+                };
+                let event = self.boundary_copy(rank, 0, &source.buf, scratch_buffer, width * 4)?;
+                self.wait_boundary(event)?;
+                let peer = GpuTensor {
+                    buf: unsafe { scratch_buffer.alias() },
+                    shape: vec![width],
+                    dtype: DType::F32,
+                };
+                self.devices[0].bind_thread()?;
+                self.devices[0].add_inplace_f32(&root, &peer)?;
+            }
+            offset += width;
+        }
+        Ok(())
+    }
+
+    /// Copy a root-combined f32 span byte-for-byte to every non-root rank.
+    pub fn broadcast_f32_from_root(
+        &mut self,
+        buffers: &[&DeviceBuffer],
+        count: usize,
+    ) -> HipResult<()> {
+        let n = self.devices.len();
+        if n == 0 || buffers.len() != n {
+            return Err(HipError::new(
+                0,
+                "broadcast_f32_from_root: buffer count disagrees with mesh",
+            ));
+        }
+        let bytes = count
+            .checked_mul(4)
+            .ok_or_else(|| HipError::new(0, "broadcast_f32_from_root: count overflow"))?;
+        for (rank, buffer) in buffers.iter().enumerate() {
+            if buffer.size() < bytes {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "broadcast_f32_from_root: rank {rank} has {} bytes, needs {bytes}",
+                        buffer.size()
+                    ),
+                ));
+            }
+        }
+        for rank in 1..n {
+            let event = self.boundary_copy(0, rank, buffers[0], buffers[rank], bytes)?;
+            self.wait_boundary(event)?;
+        }
+        Ok(())
+    }
     /// Broadcast root-authoritative EP top-k IDs and weights to every non-root rank.
     ///
     /// `root_ids` / `root_weights` hold `k` i32/f32 values on rank 0 (both stored

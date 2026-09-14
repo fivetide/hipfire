@@ -3080,11 +3080,11 @@ fn moe_ffn_dispatch_inner(
 }
 
 /// Which EP combine this rank's MoE will execute. Plan-bound compact EP
-/// bindings (an execution contract is present) run root-routed partials:
-/// the root routes once on-GPU and every rank folds its owned experts (plus
-/// the shared expert exactly once, on the root) into its zeroed partial.
+/// bindings run root-routed slot-order combination: root produces one route,
+/// every rank materializes owned expert rows in the global slot layout, and
+/// root runs the ordinary single-device combine after those rows are gathered.
 /// Anything else is not an EP binding, and `moe_ffn_dispatch_ep` on it is a
-/// fail-stop error (the single-GPU path never calls that function).
+/// fail-closed error.
 fn qwen_ep_moe_mode(ffn: &MoeFfnWeights) -> Result<EpMoeCombineMode, HipError> {
     if ffn.expert_table.execution_contract().is_none() {
         return Err(HipError::new(
@@ -6031,10 +6031,9 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             LayerWeights::FullAttnMoe(l) => (&l.ffn, &l.ffn_norm),
             _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
         };
-        // Root-routed EP dispatch: the routed combine + shared-down (gated
-        // by `skip_shared`) accumulate into `routed_out` (zeroed by the EP
-        // executor, added into `s.x` after the all-reduce). The residual
-        // `s.x` is untouched here.
+        // Legacy rank-partial dispatch retained for non-root-routed EP users:
+        // routed combine + shared-down accumulate into `routed_out`, while
+        // `s.x` remains untouched until the runtime collective completes.
         moe_ffn_dispatch_ep(gpu, ffn, &s.x, ffn_norm, config, s, routed_out, skip_shared)
             .map_err(|e| DispatchError::Hip(e.to_string()))
     }
@@ -6053,9 +6052,10 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             LayerWeights::FullAttnMoe(l) => (&l.ffn, &l.ffn_norm),
             _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
         };
-        // Root only: route once on-GPU, fold owned experts + shared once
-        // into `partial`, and mint the sealer-built producer proof. Dense
-        // layers fail here (a stray EP MoE op on dense), never silently.
+        // Root only: route once on-GPU, write owned expert rows into the
+        // global slot layout, accumulate the shared expert into `partial`,
+        // and mint the sealer-built producer proof. Routed rows are folded
+        // only after every rank's slot outputs have been gathered to root.
         moe_ffn_dispatch_root_ep(gpu, ctx, ffn, &s.x, ffn_norm, config, s, partial)
             .map_err(|e| DispatchError::Hip(e.to_string()))
     }
@@ -6076,10 +6076,28 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
         };
         // Non-root only: validate the proof before any GPU mutation, then
-        // fold owned experts over the broadcast route into `partial`. Dense
-        // layers fail here (a stray EP MoE op on dense), never silently.
+        // write owned expert rows over the broadcast route into the global
+        // slot layout. The runtime gathers these rows to root before combine.
         moe_ffn_dispatch_contrib_ep(gpu, ctx, ffn, &s.x, ffn_norm, config, s, proof, partial)
             .map_err(|e| DispatchError::Hip(e.to_string()))
+    }
+
+    fn ep_finish_moe_slot_order(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        _op: &OpBinding,
+        partial: &GpuTensor,
+    ) -> Result<(), DispatchError> {
+        let s = self.s;
+        let (ffn, ffn_norm) = match self.layer {
+            LayerWeights::DeltaNetMoe(l) => (&l.ffn, &l.ffn_norm),
+            LayerWeights::FullAttnMoe(l) => (&l.ffn, &l.ffn_norm),
+            _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
+        };
+        let sealed = moe_sealed_root_ep(ctx, ffn, &s.x, ffn_norm, self.config, s, partial)
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        sealed.execute_ep_slot_combine(gpu)
     }
 
     fn ep_preflight_moe_root(
@@ -6126,8 +6144,8 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         gpu: &mut Gpu,
         partial: &GpuTensor,
     ) -> Result<(), DispatchError> {
-        // s.x += the all-reduced routed partial (the EP MoE output summed across
-        // ranks). Mirrors the prototype's `tp_allreduce_add` residual step.
+        // s.x += the root-combined routed partial copied byte-for-byte to
+        // every rank.
         let s = self.s;
         gpu.add_inplace_f32(&s.x, partial)
             .map_err(|e| DispatchError::Hip(e.to_string()))
@@ -6170,6 +6188,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             n_exp: self.config.num_experts,
             topk_ids: s.moe_topk_indices.as_ref()?,
             topk_weights: s.moe_topk_weights.as_ref()?,
+            slot_outputs: s.moe_down_expanded.as_ref()?,
         })
     }
 

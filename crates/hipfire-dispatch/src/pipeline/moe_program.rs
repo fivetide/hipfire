@@ -886,7 +886,11 @@ fn lower_decode<'a>(
                 params.dtypes.routed_down,
                 params.expert_dtype_tags.is_some(),
             );
-        if !selection.ninepath_d4 && !down_self_combines && !params.defer_routed_combine {
+        if params.ep_mode != crate::families::moe::MoeEpMode::RootRoutedPartial
+            && !selection.ninepath_d4
+            && !down_self_combines
+            && !params.defer_routed_combine
+        {
             append_step(&mut steps, Step::MoeCombine(op(state)))?;
         }
     } else {
@@ -935,7 +939,12 @@ fn lower_prefill<'a>(
     append_step(&mut steps, Step::MoeActivation(op(state)))?;
     append_step(&mut steps, Step::MoeDown(op(state)))?;
     append_step(&mut steps, Step::MoeMutationFence(op(state)))?;
-    if selection.resolution.use_path2 || !selection.resolution.down_path0 {
+    let compact_ep = matches!(
+        params.prelude.route,
+        super::sealed_moe::PrefillRouteMode::ProduceRoot { .. }
+            | super::sealed_moe::PrefillRouteMode::AdoptRoot { .. }
+    );
+    if !compact_ep && (selection.resolution.use_path2 || !selection.resolution.down_path0) {
         append_step(&mut steps, Step::MoeCombine(op(state)))?;
     }
     Ok(steps)
@@ -951,6 +960,15 @@ pub(super) fn execute(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<(), Dis
         MoeProtocol::GroupedPrefill => lower_prefill(&state)?,
     };
     super::steps::execute_validated_steps(gpu, call.dispatch_ctx(), &steps)
+}
+
+/// Execute only the canonical slot-order combine for a validated EP call.
+pub(super) fn execute_ep_slot_combine(
+    gpu: &mut Gpu,
+    call: &SealedMoeCall<'_>,
+) -> Result<(), DispatchError> {
+    let state = MoeStepState::new(call);
+    SealedMoeOp::new(&state).combine(gpu)
 }
 
 /// Resolve all decode choices without a GPU. Dynamic GPU capture state remains
@@ -994,6 +1012,14 @@ pub(super) fn select_decode(
         if params.routed_out.is_none() {
             return Err(DispatchError::Hip(
                 "root-routed EP decode requires routed_out=Some (the zeroed partial)".into(),
+            ));
+        }
+        if !crate::families::moe::moe_down_writes_expanded(
+            params.dtypes.routed_down,
+            params.expert_dtype_tags.is_some(),
+        ) {
+            return Err(DispatchError::Hip(
+                "root-routed EP decode requires an expanded-output down projection".into(),
             ));
         }
     }
@@ -1074,7 +1100,8 @@ pub(super) fn select_decode(
     );
 
     static DOWN_LAST_COMBINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let down_last_combine = ctx.arch.is_gfx1100()
+    let down_last_combine = params.ep_mode == crate::families::moe::MoeEpMode::None
+        && ctx.arch.is_gfx1100()
         && params.batch_size == 1
         && params.k == 8
         && params.expert_dtype_tags.is_none()
@@ -1087,7 +1114,8 @@ pub(super) fn select_decode(
         hipfire_config::developer_var("HIPFIRE_MOE_NINEPATH").unwrap_or_default()
     });
     let ninepath_mode = MOE_NINEPATH.as_str();
-    let ninepath_shape_ok = params.k == 8
+    let ninepath_shape_ok = params.ep_mode == crate::families::moe::MoeEpMode::None
+        && params.k == 8
         && params.batch_size == 1
         && params.hidden <= 2048
         && params.mi == 512
@@ -1137,6 +1165,16 @@ pub(super) fn select_prefill(
         0
     };
     let force_mq4_grouped_fp16 = resolution.force_mq4_grouped_fp16 || params.force_mq4_grouped_fp16;
+    let compact_ep = matches!(
+        params.prelude.route,
+        super::sealed_moe::PrefillRouteMode::ProduceRoot { .. }
+            | super::sealed_moe::PrefillRouteMode::AdoptRoot { .. }
+    );
+    if compact_ep && resolution.down_path0 {
+        return Err(DispatchError::Hip(
+            "root-routed EP prefill requires an expanded-output down projection".into(),
+        ));
+    }
     Ok(MoePrefillSelection {
         resolution,
         path2_m_total,

@@ -60,6 +60,8 @@ fn derive(
         route_count,
         partial_bytes,
         reduce_count,
+        route_count * reduce_count,
+        reduce_count,
         reduction,
     )
 }
@@ -79,6 +81,8 @@ fn accepts_actual_moe_collective_position_and_reuses_contract_identity() {
     assert_eq!(decode.route_count(), 16);
     assert_eq!(decode.partial_bytes(), 128);
     assert_eq!(decode.reduce_count(), 32);
+    assert_eq!(decode.contribution_count(), 512);
+    assert_eq!(decode.contribution_chunk(), 32);
 }
 
 #[test]

@@ -2696,6 +2696,90 @@ pub(crate) fn preflight_moe_ffn_batched_ep(
         .map_err(HipError::from)
 }
 
+/// Return the rank-local expert output geometry that compact EP must gather to
+/// root before the canonical slot-order combine.
+pub(crate) fn moe_ffn_batched_ep_slot_geometry(
+    gpu: &Gpu,
+    ffn: &MoeFfnWeights,
+    ffn_norm: &GpuTensor,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    ctx: &DispatchCtx,
+    model_has_mq6_moe: bool,
+    routed_out: &GpuTensor,
+) -> HipResult<(usize, bool)> {
+    let proof_slot = std::cell::Cell::new(None);
+    let (bound, params) = build_moe_prefill_params(
+        gpu,
+        ffn,
+        ffn_norm,
+        config,
+        pbs,
+        n,
+        model_has_mq6_moe,
+        Some(routed_out),
+        PrefillRouteMode::ProduceRoot { slot: &proof_slot },
+    )?;
+    let resolution = hipfire_dispatch::families::moe::MoePrefillResolution::resolve(
+        &params.dtypes,
+        &ctx.arch,
+        &ctx.flags,
+    );
+    let output = if resolution.use_path2 {
+        let count = params
+            .m_total_max
+            .checked_mul(params.down_m)
+            .ok_or_else(|| HipError::new(0, "compact EP grouped output count overflow"))?;
+        (count, true)
+    } else if !resolution.down_path0 {
+        let count = params
+            .batch_size
+            .checked_mul(params.k_top)
+            .and_then(|slots| slots.checked_mul(params.down_m))
+            .ok_or_else(|| HipError::new(0, "compact EP expanded output count overflow"))?;
+        (count, false)
+    } else {
+        return Err(HipError::new(
+            0,
+            "compact EP prefill requires expanded expert outputs",
+        ));
+    };
+    hipfire_dispatch::pipeline::sealed_moe::seal_prefill_ep(bound, ctx, params)
+        .map_err(HipError::from)?;
+    Ok(output)
+}
+
+/// Fold root's gathered expert rows with the ordinary single-device combine.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_moe_ffn_batched_ep_slot_order(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    ffn_norm: &GpuTensor,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    ctx: &DispatchCtx,
+    model_has_mq6_moe: bool,
+    routed_out: &GpuTensor,
+) -> HipResult<()> {
+    let proof_slot = std::cell::Cell::new(None);
+    let (bound, params) = build_moe_prefill_params(
+        gpu,
+        ffn,
+        ffn_norm,
+        config,
+        pbs,
+        n,
+        model_has_mq6_moe,
+        Some(routed_out),
+        PrefillRouteMode::ProduceRoot { slot: &proof_slot },
+    )?;
+    let sealed = hipfire_dispatch::pipeline::sealed_moe::seal_prefill_ep(bound, ctx, params)
+        .map_err(HipError::from)?;
+    sealed.execute_ep_slot_combine(gpu).map_err(HipError::from)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
     gpu: &mut Gpu,

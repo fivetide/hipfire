@@ -6,14 +6,14 @@ Continue PR #755 from `d9b05c454097317708367ed99fa9b1638b3772fe`. Retain its man
 
 The goal is actual shared execution, not a descriptive list around an unchanged monolithic function. A sealed public call remains the only authority to execute; its private lowering describes computation. A common runtime schedule owns collective ordering; architecture adapters supply operands and execute family-specific arithmetic, not a second schedule.
 
-Non-goals: new model or topology admission, mixed TP×EP enablement, changes to kernels/quantization/reduction arithmetic, a replacement generation loop, performance promotion, or product PM4 admission. Existing retained routes and fallbacks must keep their behavior.
+Non-goals: new model or topology admission, mixed TP×EP enablement, new kernels or quantization, a replacement generation loop, performance promotion, or product PM4 admission. Existing retained routes and fallbacks must keep their behavior. The post-review slot-order correction below intentionally replaces Qwen compact EP's rank-grouped routed reduction.
 
 ## Invariants
 
 - All immutable source, shape, alias, local-slot, physical-device, scratch-capacity, and route checks remain enforced.
 - A complete program is validated before its first side effect. A bad later rank or operation must not leave an earlier rank mutated.
 - Preserve launch order and specialized fused kernels, including shared-expert treatment, CPU routing, mixed formats, Paro, expanded versus residual-fused down, and deferred combine where already supported.
-- Preserve root-authoritative route bytes, destination-owned transport events, reverse source-reuse dependencies, reduction leases, and the current fixed-rank floating-point fold.
+- Preserve root-authoritative route bytes, destination-owned transport events, reverse source-reuse dependencies, and reduction leases. Qwen compact EP must fold routed contributions in global top-k slot order, matching the single-device combine; rank-partial routes for other families retain their existing fixed-rank fold.
 - Shared contributions enter the correct residual or partial exactly once. No duplicate reduction or combine.
 - No new per-token allocation for immutable plan construction. Do not cache borrowed mutable resource identity across reuse or reload.
 - Failures retain the existing fail-stop/rollback behavior. No fallback introduced to hide an invalid program.
@@ -29,10 +29,10 @@ Non-goals: new model or topology admission, mixed TP×EP enablement, changes to 
 
 ### B. Collective program
 
-1. Introduce a typed executable mesh schedule for preflight, zeroing, root route/compute, route distribution, rank-local contribution, named reduction, and residual completion.
+1. Introduce a typed executable mesh schedule for preflight, zeroing, root route/compute, route distribution, rank-local contribution, named transport/combine, and residual completion.
 2. Bind schedule identity to the admitted mesh/sealed contract. Resolve the collective for its actual program position rather than inferring a whole program's axis from its first reduction.
 3. Migrate root-routed decode and all existing Qwen EP grouped-prefill/batch orchestration sites to the shared schedule. Preserve existing other-family rank-partial routes.
-4. Architecture adapters expose concrete resources/proofs and arithmetic actions; the shared executor owns stage order, rank traversal, and stop-on-error semantics.
+4. Gather Qwen's rank-local expert outputs in the global slot layout, run the ordinary single-device slot-order combine once on root, and byte-copy that finished partial to every rank. Architecture adapters expose resources and the existing combine; the shared executor owns stage order, rank traversal, and stop-on-error semantics.
 
 Tracks A and B own disjoint dispatch and runtime/architecture files. They preserve existing call/parameter boundaries while integrating; no temporary compatibility aliases or duplicate final execution paths.
 
@@ -47,7 +47,7 @@ Pinned baseline CLI, daemon, and `qwen35_sealed_moe_oracle` binaries are preserv
 - Dispatch retention: claim-scoped `redline_daemon_harness.py` capture, AQL contracts, and multi-position HIP/PM4 parity where the retained route is supported. This is not product PM4 admission.
 - Physical EP: current-head EP2/EP4 route/residual and lifecycle oracles on distinct GPUs when accessible. Single-device/emulated evidence cannot close this row.
 
-No performance win is claimed by this refactor. Cross-mesh numerical equivalence is not inferred from the older exact slot-transport implementation; the preserved reference is the pinned current-head reduction implementation.
+No performance win is claimed by this refactor. Qwen compact EP now restores the single-route floating-point association by gathering per-slot outputs before the ordinary combine; physical cross-mesh equivalence still requires distinct-GPU validation.
 
 ## Completion boundary
 
@@ -56,10 +56,10 @@ The production consumers execute the new computation and collective programs; ob
 ## Implemented boundaries
 
 - `hipfire-dispatch/src/pipeline/moe_program.rs` owns fixed-capacity `DecodeProgram` and `PrefillProgram` lowering and execution. Typed stages execute the existing arithmetic helpers; the public `Step::Moe(SealedMoeCall)` remains the checked entry, not the arithmetic implementation.
-- `hipfire-runtime::ep::RootRoutedEpSchedule` resolves the actual named `moe` collective row for its layer. `execute_root_routed_ep` owns the all-rank preflight barrier, zeroing, root work, route transfer, contributions, optional inactive-row preparation, reduction, and residual completion.
-- Qwen's root-routed decode, `prefill_lane`, `forward_tick`, and `forward_prefill_batch_ep` supply adapters to that executor. `build_moe_prefill_params` is shared between preflight and execution, so validation does not duplicate a parameter-builder implementation.
+- `hipfire-runtime::ep::RootRoutedEpSchedule` resolves the actual named `moe` collective row for its layer. `execute_root_routed_ep` owns the all-rank preflight barrier, zeroing, root work, route transfer, contribution gathering, root slot-order combine, byte broadcast, and residual completion.
+- Qwen's root-routed decode, `prefill_lane`, `forward_tick`, and `forward_prefill_batch_ep` supply adapters to that executor. `build_moe_prefill_params` is shared between preflight, execution, contribution-layout selection, and root combine.
 - Existing noncompact rank-partial/HC3/HC4 execution is retained. `PrefillSkipAllReduce` explicitly preserves the existing prefill diagnostic policy; it is not a fallback.
-- Seven schedule-admission regressions cover named-row and geometry refusal. A dispatch regression prevents CPU top-K from selecting shared-router fusion and skipping a required shared activation rotation.
+- Schedule-admission regressions cover named-row and geometry refusal. A dispatch regression prevents CPU top-K from selecting shared-router fusion and skipping a required shared activation rotation. The slot-order follow-up rejects self-combining EP down paths before launch and reuses the ordinary decode/prefill combine kernels.
 
 ## Validation record — 2026-09-13
 
