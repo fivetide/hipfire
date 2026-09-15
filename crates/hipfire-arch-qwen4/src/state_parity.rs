@@ -26,6 +26,7 @@ use rdna_compute::qwen4::{
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -1083,6 +1084,34 @@ impl StateParityReport {
     }
 }
 
+const PROFILE_CHECKPOINT_SCHEMA: &str = "hipfire.qwen4.profile_checkpoint.v1";
+const PROFILE_CHECKPOINT_PREFIX: &str = "HIPFIRE_QWEN4_PROFILE_CHECKPOINT ";
+
+fn emit_profile_checkpoint(
+    phase: &str,
+    wall_ns: u64,
+    hip: &Value,
+    internal: Option<&Value>,
+    ple: Option<&Value>,
+) {
+    let checkpoint = json!({
+        "schema": PROFILE_CHECKPOINT_SCHEMA,
+        "phase": phase,
+        "wall_ns": wall_ns,
+        "hip": hip,
+        "internal": internal.cloned().unwrap_or(Value::Null),
+        "ple": ple.cloned().unwrap_or(Value::Null),
+    });
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "{PROFILE_CHECKPOINT_PREFIX}{checkpoint}");
+    let _ = stderr.flush();
+}
+
+fn emit_profile_load_checkpoint(phase: &str, wall_ns: u64) {
+    let hip = hip_counter_snapshot();
+    emit_profile_checkpoint(phase, wall_ns, &hip, None, None);
+}
+
 fn profile_duration_ns(started: Instant) -> u64 {
     started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
 }
@@ -1288,11 +1317,13 @@ fn run_profile_inner(
     let hfq = hipfire_runtime::hfq::HfqFile::open(model_path)
         .map_err(|error| format!("open {}: {error}", model_path.display()))?;
     let open_ns = profile_duration_ns(open_started);
+    emit_profile_load_checkpoint("open_hfq", open_ns);
 
     let admission_started = Instant::now();
     let receipt = crate::admit_hfqm_artifact(&hfq)
         .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let admission_ns = profile_duration_ns(admission_started);
+    emit_profile_load_checkpoint("admission", admission_ns);
     let config = receipt.config.clone();
     let manifest = receipt.manifest.clone();
     let metadata = receipt.ple.clone();
@@ -1301,6 +1332,7 @@ fn run_profile_inner(
     let gpu_init_started = Instant::now();
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
     let gpu_init_ns = profile_duration_ns(gpu_init_started);
+    emit_profile_load_checkpoint("gpu_init", gpu_init_ns);
     if !gpu.arch_caps.is_gfx1151() {
         return Err(format!(
             "Qwen4 profile runner requires gfx1151, got {}",
@@ -1335,6 +1367,7 @@ fn run_profile_inner(
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     let manifest_ns = profile_duration_ns(manifest_started);
+    emit_profile_load_checkpoint("manifest_fulfillment", manifest_ns);
 
     let assemble_started = Instant::now();
     let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_metadata(
@@ -1347,6 +1380,7 @@ fn run_profile_inner(
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let assemble_ns = profile_duration_ns(assemble_started);
+    emit_profile_load_checkpoint("bundle_assembly", assemble_ns);
 
     let attach_forward_started = Instant::now();
     let setup_result = (|| -> Result<(), String> {
@@ -1356,6 +1390,7 @@ fn run_profile_inner(
         Ok(())
     })();
     let attach_forward_ns = profile_duration_ns(attach_forward_started);
+    emit_profile_load_checkpoint("attach_forward", attach_forward_ns);
     if let Err(error) = setup_result {
         let cleanup = cleanup_profile_resources(&mut gpu, bundle, None);
         return Err(match cleanup {
@@ -1369,6 +1404,7 @@ fn run_profile_inner(
         .attach_mtp(&mut gpu, 1)
         .map_err(|error| format!("qwen4 MTP setup failed: {error}"));
     let attach_mtp_ns = profile_duration_ns(attach_mtp_started);
+    emit_profile_load_checkpoint("attach_mtp", attach_mtp_ns);
     if let Err(error) = attach_mtp_result {
         let cleanup = cleanup_profile_resources(&mut gpu, bundle, None);
         return Err(match cleanup {
@@ -1421,8 +1457,10 @@ fn run_profile_inner(
         });
     }
     let setup_ns = profile_duration_ns(setup_started);
+    emit_profile_load_checkpoint("state_reset_and_scratch", setup_ns);
     let load_ns = profile_duration_ns(load_started);
     let load_hip = hip_counter_snapshot();
+    emit_profile_checkpoint("load", load_ns, &load_hip, None, None);
     let layer_families = target_layer_families_json(&config);
 
     qwen4_profile_enable(profile_enabled);
@@ -1447,6 +1485,13 @@ fn run_profile_inner(
             "after": ple_cache_stats_json(target_ple_after),
             "delta": ple_cache_delta(ple_before, target_ple_after),
         });
+        emit_profile_checkpoint(
+            "target",
+            target_ns,
+            &target_hip,
+            Some(&target_internal),
+            Some(&target_ple),
+        );
 
         qwen4_profile_reset();
         launch_counters::reset();
@@ -1467,6 +1512,7 @@ fn run_profile_inner(
             .mtp_position()
             .map_err(|error| format!("read qwen4 profile MTP end position: {error}"))?;
         let mtp_d2h = mtp_hip.get("memcpy_dtoh").cloned().unwrap_or(Value::Null);
+        emit_profile_checkpoint("mtp", mtp_ns, &mtp_hip, Some(&mtp_internal), None);
 
         Ok(json!({
             "target": {
