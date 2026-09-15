@@ -1531,6 +1531,8 @@ impl Qwen4GpuForward {
         let qk = config.linear_num_key_heads * config.linear_key_head_dim;
         let value = config.linear_num_value_heads * config.linear_value_head_dim;
         let qkv = 2 * qk + value;
+        let projection = view(&self.scratch.projection, 0, qkv);
+        let projection2 = view(&self.scratch.projection2, 0, qkv);
         let qkv_weight = weights.resident(&gdn.qkv)?;
         let conv = weights.resident(&gdn.conv)?;
         self.gemv(
@@ -1538,7 +1540,7 @@ impl Qwen4GpuForward {
             qkv_weight,
             input,
             &self.scratch.rotation,
-            &self.scratch.projection,
+            &projection,
             qkv,
             config.hidden_size,
         )?;
@@ -1551,10 +1553,10 @@ impl Qwen4GpuForward {
         qwen4_gdn_conv(
             gpu,
             &Qwen4GdnConv {
-                input: &self.scratch.projection,
+                input: &projection,
                 kernel: conv,
                 history: &state.conv,
-                output: &self.scratch.projection2,
+                output: &projection2,
                 next_history: &state.conv,
                 channels: qkv,
                 history_rows,
@@ -1596,9 +1598,9 @@ impl Qwen4GpuForward {
             },
             config.linear_num_value_heads,
         )?;
-        let q = view(&self.scratch.projection2, 0, qk);
-        let k = view(&self.scratch.projection2, qk, qk);
-        let v = view(&self.scratch.projection2, 2 * qk, value);
+        let q = view(&projection2, 0, qk);
+        let k = view(&projection2, qk, qk);
+        let v = view(&projection2, 2 * qk, value);
         qwen4_gdn_step(
             gpu,
             &Qwen4GdnStep {
