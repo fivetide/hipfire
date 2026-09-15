@@ -210,6 +210,13 @@ impl Carrier for Qwen2Carrier {
 /// Executable local-path Qwen4 carrier.  Distribution/product admission stays
 /// outside this registry; this route only makes an already admitted HFQM
 /// artifact loadable on its one supported gfx1151 device.
+fn qwen4_use_range_payload(
+    is_uma: bool,
+    residency: hipfire_runtime::weight_manifest::WeightResidency,
+) -> bool {
+    is_uma || residency.is_external()
+}
+
 pub struct Qwen4Carrier;
 
 impl Carrier for Qwen4Carrier {
@@ -336,7 +343,7 @@ impl Carrier for Qwen4Carrier {
             );
         }
         let meta = resolve_source_meta(&src, ctx.path)?;
-        let ModelSource::Hfq(hfq) = src else {
+        let ModelSource::Hfq(mut hfq) = src else {
             return Err(
                 "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
             );
@@ -347,6 +354,10 @@ impl Carrier for Qwen4Carrier {
         let manifest = receipt.manifest;
         let metadata = receipt.ple;
         let placements = receipt.placements;
+        let use_ranges = ctx.gpu.is_uma();
+        if use_ranges {
+            hfq.drop_mmap();
+        }
         let mesh = DeviceMesh::single().map_err(|error| format!("qwen4: mesh: {error}"))?;
         let expected = WeightOrigin::for_single(&mesh, ctx.gpu);
         let source = HfqModelSource::from_hfq(hfq);
@@ -357,12 +368,18 @@ impl Carrier for Qwen4Carrier {
             ctx.gpu,
             expected,
             |entry| {
-                if entry.residency.is_external() {
+                if qwen4_use_range_payload(use_ranges, entry.residency) {
                     return source
                         .tensor_range(&entry.name)
                         .map_err(|error| error.to_string())?
                         .map(SourcePayload::Range)
-                        .ok_or_else(|| format!("missing external tensor '{}'", entry.name));
+                        .ok_or_else(|| {
+                            if entry.residency.is_external() {
+                                format!("missing external tensor '{}'", entry.name)
+                            } else {
+                                format!("missing resident tensor '{}'", entry.name)
+                            }
+                        });
                 }
                 let (info, bytes) = source
                     .tensor_data(&entry.name)
@@ -3098,5 +3115,29 @@ mod gemma4_route_tests {
         assert!(gemma4_validate_drafter_route(true, true).is_err());
         assert!(gemma4_validate_drafter_route(true, false).is_ok());
         assert!(gemma4_validate_drafter_route(false, true).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod qwen4_source_policy_tests {
+    use super::qwen4_use_range_payload;
+    use hipfire_runtime::weight_manifest::WeightResidency;
+
+    #[test]
+    fn discrete_resident_payload_stays_borrowed() {
+        assert!(!qwen4_use_range_payload(false, WeightResidency::Resident));
+    }
+
+    #[test]
+    fn uma_resident_payload_uses_ranges() {
+        assert!(qwen4_use_range_payload(true, WeightResidency::Resident));
+    }
+
+    #[test]
+    fn external_payload_uses_ranges_on_discrete() {
+        assert!(qwen4_use_range_payload(
+            false,
+            WeightResidency::external_rows(128, 1)
+        ));
     }
 }
