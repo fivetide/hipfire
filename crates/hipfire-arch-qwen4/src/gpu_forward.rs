@@ -38,11 +38,103 @@ use rdna_compute::qwen4::{
     Qwen4QsaNormRope, Qwen4QsaPoolRope, Qwen4QsaSelect, Qwen4Scale,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
+use std::cell::{Cell, RefCell};
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const EPSILON: f32 = 1.0e-6;
 const PLE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Qwen4ProfileStats {
+    pub(crate) moe_seal_calls: u64,
+    pub(crate) moe_seal_ns: u64,
+    pub(crate) ple_wait_calls: u64,
+    pub(crate) ple_wait_ns: u64,
+    pub(crate) ple_stage_calls: u64,
+    pub(crate) ple_stage_ns: u64,
+    pub(crate) ple_upload_calls: u64,
+    pub(crate) ple_upload_ns: u64,
+    pub(crate) ple_apply_calls: u64,
+    pub(crate) ple_apply_ns: u64,
+}
+
+#[derive(Clone, Copy)]
+enum Qwen4ProfilePhase {
+    MoeSeal,
+    PleWait,
+    PleStage,
+    PleUpload,
+    PleApply,
+}
+
+thread_local! {
+    static QWEN4_PROFILE_ENABLED: Cell<bool> = const { Cell::new(false) };
+    static QWEN4_PROFILE_STATS: RefCell<Qwen4ProfileStats> =
+        RefCell::new(Qwen4ProfileStats::default());
+}
+
+#[inline(always)]
+fn qwen4_profile_enabled() -> bool {
+    QWEN4_PROFILE_ENABLED.with(|enabled| enabled.get())
+}
+
+pub(crate) fn qwen4_profile_enable(enabled: bool) {
+    QWEN4_PROFILE_ENABLED.with(|current| current.set(enabled));
+}
+
+pub(crate) fn qwen4_profile_reset() {
+    QWEN4_PROFILE_STATS.with(|stats| *stats.borrow_mut() = Qwen4ProfileStats::default());
+}
+
+pub(crate) fn qwen4_profile_snapshot() -> Qwen4ProfileStats {
+    QWEN4_PROFILE_STATS.with(|stats| *stats.borrow())
+}
+
+#[inline(always)]
+fn qwen4_profile_start() -> Option<Instant> {
+    if qwen4_profile_enabled() {
+        Some(Instant::now())
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+fn qwen4_profile_record(phase: Qwen4ProfilePhase, started: Option<Instant>) {
+    let Some(started) = started else {
+        return;
+    };
+    let elapsed = started.elapsed().as_nanos() as u64;
+    QWEN4_PROFILE_STATS.with(|stats| {
+        let mut stats = stats.borrow_mut();
+        match phase {
+            Qwen4ProfilePhase::MoeSeal => {
+                stats.moe_seal_calls = stats.moe_seal_calls.saturating_add(1);
+                stats.moe_seal_ns = stats.moe_seal_ns.saturating_add(elapsed);
+            }
+            Qwen4ProfilePhase::PleWait => {
+                stats.ple_wait_calls = stats.ple_wait_calls.saturating_add(1);
+                stats.ple_wait_ns = stats.ple_wait_ns.saturating_add(elapsed);
+            }
+            Qwen4ProfilePhase::PleStage => {
+                stats.ple_stage_calls = stats.ple_stage_calls.saturating_add(1);
+                stats.ple_stage_ns = stats.ple_stage_ns.saturating_add(elapsed);
+            }
+            Qwen4ProfilePhase::PleUpload => {
+                stats.ple_upload_calls = stats.ple_upload_calls.saturating_add(1);
+                stats.ple_upload_ns = stats.ple_upload_ns.saturating_add(elapsed);
+            }
+            Qwen4ProfilePhase::PleApply => {
+                stats.ple_apply_calls = stats.ple_apply_calls.saturating_add(1);
+                stats.ple_apply_ns = stats.ple_apply_ns.saturating_add(elapsed);
+            }
+        }
+    });
+}
+
+// Kept immediately above the forward error type so the disabled path remains
+// a single TLS read plus an inlined `None` branch at each diagnostic hook.
 
 /// Errors returned by the native ordinary-HIP path.
 #[derive(Debug)]
@@ -480,7 +572,10 @@ pub(crate) fn execute_moe(
     };
     let bound = BoundMoeExperts::from_cache(&runtime.table, &runtime.cache)
         .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("bound MoE experts: {error:?}")))?;
-    let sealed = seal_decode(bound, &ctx, params)
+    let seal_started = qwen4_profile_start();
+    let sealed_result = seal_decode(bound, &ctx, params);
+    qwen4_profile_record(Qwen4ProfilePhase::MoeSeal, seal_started);
+    let sealed = sealed_result
         .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("seal Qwen4 MoE: {error:?}")))?;
     execute_steps(gpu, &ctx, &[Step::Moe(sealed)])
         .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("execute Qwen4 MoE: {error:?}")))?;
@@ -1082,9 +1177,10 @@ impl Qwen4GpuForward {
                             let ticket = ple.ticket.as_ref().ok_or_else(|| {
                                 invalid("PLE layer reached without a prefetch ticket")
                             })?;
-                            let lease = ple
-                                .rows
-                                .consume_at_layer1(ticket)
+                            let wait_started = qwen4_profile_start();
+                            let lease_result = ple.rows.consume_at_layer1(ticket);
+                            qwen4_profile_record(Qwen4ProfilePhase::PleWait, wait_started);
+                            let lease = lease_result
                                 .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
                             ple.install_lease(lease);
                             let lease = ple.lease.as_ref().ok_or_else(|| {
@@ -1094,26 +1190,37 @@ impl Qwen4GpuForward {
                                 .as_bytes()
                                 .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?
                                 .len();
-                            lease
-                                .stage_into(&mut self.scratch.host_ple_bytes[..upload_len])
+                            let stage_started = qwen4_profile_start();
+                            let stage_result =
+                                lease.stage_into(&mut self.scratch.host_ple_bytes[..upload_len]);
+                            qwen4_profile_record(Qwen4ProfilePhase::PleStage, stage_started);
+                            stage_result
                                 .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
-                            gpu.memcpy_htod_auto(
+                            let upload_started = qwen4_profile_start();
+                            let upload_result = gpu.memcpy_htod_auto(
                                 &staged.buf,
                                 &self.scratch.host_ple_bytes[..upload_len],
-                            )?;
+                            );
+                            qwen4_profile_record(Qwen4ProfilePhase::PleUpload, upload_started);
+                            upload_result?;
                             lease
                                 .validate_after_upload()
                                 .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
-                            gpu.qwen4_ple_gather_convert_bf16(&staged, &ple_rows, n)?;
+                            let apply_started = qwen4_profile_start();
+                            let apply_result = (|| {
+                                gpu.qwen4_ple_gather_convert_bf16(&staged, &ple_rows, n)?;
+                                self.apply_ple(
+                                    gpu,
+                                    &config,
+                                    &bundle.weights,
+                                    &mut bundle.state.ple_conv,
+                                    &ple_rows,
+                                    token_index,
+                                )
+                            })();
+                            qwen4_profile_record(Qwen4ProfilePhase::PleApply, apply_started);
+                            apply_result?;
                         }
-                        self.apply_ple(
-                            gpu,
-                            &config,
-                            &bundle.weights,
-                            &mut bundle.state.ple_conv,
-                            &ple_rows,
-                            token_index,
-                        )?;
                     }
                     let layer = &bundle.weights.layer_refs[layer_index];
                     self.hc_read(

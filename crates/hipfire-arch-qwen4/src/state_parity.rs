@@ -10,9 +10,14 @@
 //! family digests.
 
 use crate::config::compact_test_config;
+use crate::gpu_forward::{
+    qwen4_profile_enable, qwen4_profile_reset, qwen4_profile_snapshot, Qwen4ProfileStats,
+};
 use crate::mtp_gpu::{MtpGpuState, MtpStateParityMetadata};
 use crate::mtp_spec::validate_native_mtp_prefill_request;
+use crate::ple_rows::PleCacheStats;
 use crate::state::Qwen4State;
+use hip_bridge::launch_counters;
 use hipfire_runtime::model_source::ModelSource;
 use rdna_compute::qwen4::{
     qwen4_qsa_cache_append, qwen4_qsa_pool_rope, qwen4_qsa_reuse_selection, qwen4_qsa_select,
@@ -22,6 +27,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 const MAX_SEQ: usize = 8;
 const PREFIX: usize = 4;
@@ -1075,6 +1081,490 @@ impl StateParityReport {
         )
         .map_err(|error| format!("write {}: {error}", path.display()))
     }
+}
+
+fn profile_duration_ns(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+fn hip_counter_entry(calls: u64, ffi_ns: u64, bytes: u64) -> Value {
+    json!({
+        "calls": calls,
+        "ffi_ns": ffi_ns,
+        "bytes": bytes,
+    })
+}
+
+fn hip_counter_snapshot() -> Value {
+    json!({
+        "ffi_total_calls": launch_counters::count(),
+        "ffi_total_ns": launch_counters::time_ns(),
+        "launch_kernel": hip_counter_entry(
+            launch_counters::launch_kernel::count(),
+            launch_counters::launch_kernel::time_ns(),
+            launch_counters::launch_kernel::bytes(),
+        ),
+        "memcpy_dtod": hip_counter_entry(
+            launch_counters::memcpy_dtod::count(),
+            launch_counters::memcpy_dtod::time_ns(),
+            launch_counters::memcpy_dtod::bytes(),
+        ),
+        "memcpy_htod": hip_counter_entry(
+            launch_counters::memcpy_htod::count(),
+            launch_counters::memcpy_htod::time_ns(),
+            launch_counters::memcpy_htod::bytes(),
+        ),
+        "memcpy_dtoh": hip_counter_entry(
+            launch_counters::memcpy_dtoh::count(),
+            launch_counters::memcpy_dtoh::time_ns(),
+            launch_counters::memcpy_dtoh::bytes(),
+        ),
+        "memset": hip_counter_entry(
+            launch_counters::memset::count(),
+            launch_counters::memset::time_ns(),
+            launch_counters::memset::bytes(),
+        ),
+        "ensure_kernel_lookup": hip_counter_entry(
+            launch_counters::ensure_kernel_lookup::count(),
+            launch_counters::ensure_kernel_lookup::time_ns(),
+            launch_counters::ensure_kernel_lookup::bytes(),
+        ),
+        "stream_sync": hip_counter_entry(
+            launch_counters::stream_sync::count(),
+            launch_counters::stream_sync::time_ns(),
+            launch_counters::stream_sync::bytes(),
+        ),
+        "event_sync": hip_counter_entry(
+            launch_counters::event_sync::count(),
+            launch_counters::event_sync::time_ns(),
+            launch_counters::event_sync::bytes(),
+        ),
+        "device_sync": hip_counter_entry(
+            launch_counters::device_sync::count(),
+            launch_counters::device_sync::time_ns(),
+            launch_counters::device_sync::bytes(),
+        ),
+        "graph_launch": hip_counter_entry(
+            launch_counters::graph_launch::count(),
+            launch_counters::graph_launch::time_ns(),
+            launch_counters::graph_launch::bytes(),
+        ),
+    })
+}
+
+fn qwen4_profile_stats_json(stats: Qwen4ProfileStats) -> Value {
+    json!({
+        "moe_seal": {
+            "calls": stats.moe_seal_calls,
+            "host_ns": stats.moe_seal_ns,
+        },
+        "ple_wait": {
+            "calls": stats.ple_wait_calls,
+            "host_ns": stats.ple_wait_ns,
+        },
+        "ple_stage": {
+            "calls": stats.ple_stage_calls,
+            "host_ns": stats.ple_stage_ns,
+        },
+        "ple_upload": {
+            "calls": stats.ple_upload_calls,
+            "host_ns": stats.ple_upload_ns,
+        },
+        "ple_apply": {
+            "calls": stats.ple_apply_calls,
+            "host_ns": stats.ple_apply_ns,
+        },
+    })
+}
+
+fn ple_cache_stats_json(stats: PleCacheStats) -> Value {
+    json!({
+        "capacity_bytes": stats.capacity_bytes,
+        "resident_bytes": stats.resident_bytes,
+        "resident_pages": stats.resident_pages,
+        "cache_hits": stats.cache_hits,
+        "cache_misses": stats.cache_misses,
+        "reads": stats.reads,
+        "coalesced_reads": stats.coalesced_reads,
+        "read_bytes": stats.read_bytes,
+        "evictions": stats.evictions,
+        "queue_depth": stats.queue_depth,
+        "outstanding_readers": stats.outstanding_readers,
+        "outstanding_leases": stats.outstanding_leases,
+        "staging_in_use": stats.staging_in_use,
+        "staging_high_water": stats.staging_high_water,
+    })
+}
+
+fn ple_cache_delta(before: PleCacheStats, after: PleCacheStats) -> Value {
+    json!({
+        "cache_hits": after.cache_hits.saturating_sub(before.cache_hits),
+        "cache_misses": after.cache_misses.saturating_sub(before.cache_misses),
+        "reads": after.reads.saturating_sub(before.reads),
+        "coalesced_reads": after.coalesced_reads.saturating_sub(before.coalesced_reads),
+        "read_bytes": after.read_bytes.saturating_sub(before.read_bytes),
+        "evictions": after.evictions.saturating_sub(before.evictions),
+    })
+}
+
+fn target_layer_families_json(config: &crate::config::Qwen4Config) -> Value {
+    json!({
+        "linear_attention_layers": config.n_linear_layers(),
+        "full_attention_layers": config.n_full_layers(),
+        "moe_layers": config.num_hidden_layers,
+        "ple_layer_ids": config.ple_layer_ids,
+        "attribution": "rocprofv3 kernel trace by symbol; HIP counters are phase totals",
+    })
+}
+
+fn cleanup_profile_resources(
+    gpu: &mut Gpu,
+    bundle: crate::bundle::Qwen4Bundle,
+    pending: Option<GpuTensor>,
+) -> Option<String> {
+    let mut errors = Vec::new();
+    if let Some(pending) = pending {
+        if let Err(error) = gpu.free_tensor(pending) {
+            errors.push(format!("free profile pending hidden: {error}"));
+        }
+    }
+    if let Err(error) = bundle.free_gpu(gpu) {
+        errors.push(format!("free profile bundle: {error}"));
+    }
+    if errors.is_empty() {
+        None
+    } else {
+        Some(errors.join("; "))
+    }
+}
+
+/// JSON report for one bounded production target token and one native MTP step.
+pub struct ProfileReport(Value);
+
+impl ProfileReport {
+    pub fn into_json(self) -> Value {
+        self.0
+    }
+
+    pub fn write(&self, path: &Path) -> Result<(), String> {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("create {}: {error}", parent.display()))?;
+        }
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&self.0).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| format!("write {}: {error}", path.display()))
+    }
+}
+
+/// Load the admitted production artifact, execute exactly one target token and
+/// one native MTP token, and emit host/HIP/rocprof attribution context.
+pub fn run_profile(model_path: &Path, corpus_path: &Path) -> Result<ProfileReport, String> {
+    let profile_enabled = std::env::var("HIPFIRE_PROFILE").ok().as_deref() == Some("1");
+    qwen4_profile_enable(false);
+    let result = run_profile_inner(model_path, corpus_path, profile_enabled);
+    qwen4_profile_enable(false);
+    result
+}
+
+fn run_profile_inner(
+    model_path: &Path,
+    corpus_path: &Path,
+    profile_enabled: bool,
+) -> Result<ProfileReport, String> {
+    let (tokens, corpus) = read_state_tokens(corpus_path)?;
+    let input_token = *tokens
+        .first()
+        .ok_or_else(|| "profile corpus has no input token".to_string())?;
+
+    launch_counters::reset();
+    let load_started = Instant::now();
+    let open_started = Instant::now();
+    let hfq = hipfire_runtime::hfq::HfqFile::open(model_path)
+        .map_err(|error| format!("open {}: {error}", model_path.display()))?;
+    let open_ns = profile_duration_ns(open_started);
+
+    let admission_started = Instant::now();
+    let receipt = crate::admit_hfqm_artifact(&hfq)
+        .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
+    let admission_ns = profile_duration_ns(admission_started);
+    let config = receipt.config.clone();
+    let manifest = receipt.manifest.clone();
+    let metadata = receipt.ple.clone();
+    let placements = receipt.placements.clone();
+
+    let gpu_init_started = Instant::now();
+    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    let gpu_init_ns = profile_duration_ns(gpu_init_started);
+    if !gpu.arch_caps.is_gfx1151() {
+        return Err(format!(
+            "Qwen4 profile runner requires gfx1151, got {}",
+            gpu.arch
+        ));
+    }
+
+    let mesh = hipfire_runtime::device_mesh::DeviceMesh::single()
+        .map_err(|error| format!("qwen4 mesh: {error}"))?;
+    let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
+    let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
+    let manifest_started = Instant::now();
+    let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
+        &manifest.weights,
+        &mesh,
+        config.num_hidden_layers,
+        &mut gpu,
+        expected,
+        |entry| {
+            if entry.residency.is_external() {
+                return source
+                    .tensor_range(&entry.name)
+                    .map_err(|error| error.to_string())?
+                    .map(hipfire_runtime::model_source::SourcePayload::Range)
+                    .ok_or_else(|| format!("missing external tensor '{}'", entry.name));
+            }
+            let (info, bytes) = source
+                .tensor_data(&entry.name)
+                .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
+            Ok(hipfire_runtime::model_source::SourcePayload::Borrowed { info, bytes })
+        },
+    )
+    .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
+    let manifest_ns = profile_duration_ns(manifest_started);
+
+    let assemble_started = Instant::now();
+    let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_metadata(
+        config.clone(),
+        transaction,
+        &placements,
+        &mut gpu,
+        1,
+        metadata,
+    )
+    .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
+    let assemble_ns = profile_duration_ns(assemble_started);
+
+    let attach_forward_started = Instant::now();
+    let setup_result = (|| -> Result<(), String> {
+        bundle
+            .attach_forward(&mut gpu, 1)
+            .map_err(|error| format!("qwen4 forward setup failed: {error}"))?;
+        Ok(())
+    })();
+    let attach_forward_ns = profile_duration_ns(attach_forward_started);
+    if let Err(error) = setup_result {
+        let cleanup = cleanup_profile_resources(&mut gpu, bundle, None);
+        return Err(match cleanup {
+            Some(cleanup) => format!("{error}; {cleanup}"),
+            None => error,
+        });
+    }
+
+    let attach_mtp_started = Instant::now();
+    let attach_mtp_result = bundle
+        .attach_mtp(&mut gpu, 1)
+        .map_err(|error| format!("qwen4 MTP setup failed: {error}"));
+    let attach_mtp_ns = profile_duration_ns(attach_mtp_started);
+    if let Err(error) = attach_mtp_result {
+        let cleanup = cleanup_profile_resources(&mut gpu, bundle, None);
+        return Err(match cleanup {
+            Some(cleanup) => format!("{error}; {cleanup}"),
+            None => error,
+        });
+    }
+
+    let setup_started = Instant::now();
+    let setup_result = bundle
+        .ensure_spec_hidden(&mut gpu, 1)
+        .map_err(|error| format!("qwen4 profile hidden setup failed: {error}"));
+    if let Err(error) = setup_result {
+        let cleanup = cleanup_profile_resources(&mut gpu, bundle, None);
+        return Err(match cleanup {
+            Some(cleanup) => format!("{error}; {cleanup}"),
+            None => error,
+        });
+    }
+    let hidden_width = match config.hc_count.checked_mul(config.hidden_size) {
+        Some(width) => width,
+        None => {
+            let cleanup = cleanup_profile_resources(&mut gpu, bundle, None);
+            let error = "qwen4 profile hidden width overflow".to_string();
+            return Err(match cleanup {
+                Some(cleanup) => format!("{error}; {cleanup}"),
+                None => error,
+            });
+        }
+    };
+    let pending = match gpu.zeros(&[hidden_width], DType::F32) {
+        Ok(pending) => pending,
+        Err(error) => {
+            let cleanup = cleanup_profile_resources(&mut gpu, bundle, None);
+            let error = format!("allocate qwen4 profile pending hidden: {error}");
+            return Err(match cleanup {
+                Some(cleanup) => format!("{error}; {cleanup}"),
+                None => error,
+            });
+        }
+    };
+    if let Err(error) = bundle
+        .reset(&mut gpu)
+        .map_err(|error| format!("reset qwen4 profile state: {error}"))
+    {
+        let cleanup = cleanup_profile_resources(&mut gpu, bundle, Some(pending));
+        return Err(match cleanup {
+            Some(cleanup) => format!("{error}; {cleanup}"),
+            None => error,
+        });
+    }
+    let setup_ns = profile_duration_ns(setup_started);
+    let load_ns = profile_duration_ns(load_started);
+    let load_hip = hip_counter_snapshot();
+    let layer_families = target_layer_families_json(&config);
+
+    qwen4_profile_enable(profile_enabled);
+    let execution_result = (|| -> Result<Value, String> {
+        qwen4_profile_reset();
+        launch_counters::reset();
+        let ple_before = bundle.ple_rows().cache_stats();
+        let target_started = Instant::now();
+        let target_token = bundle
+            .spec_capture_token(&mut gpu, input_token)
+            .map_err(|error| format!("qwen4 profile target token: {error}"))?;
+        let target_ns = profile_duration_ns(target_started);
+        let target_hip = hip_counter_snapshot();
+        let target_internal = qwen4_profile_stats_json(qwen4_profile_snapshot());
+        let target_ple_after = bundle.ple_rows().cache_stats();
+        let target_d2h = target_hip
+            .get("memcpy_dtoh")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let target_ple = json!({
+            "before": ple_cache_stats_json(ple_before),
+            "after": ple_cache_stats_json(target_ple_after),
+            "delta": ple_cache_delta(ple_before, target_ple_after),
+        });
+
+        qwen4_profile_reset();
+        launch_counters::reset();
+        let mtp_position = bundle
+            .mtp_position()
+            .map_err(|error| format!("read qwen4 profile MTP position: {error}"))?;
+        let mtp_started = Instant::now();
+        bundle
+            .copy_spec_hidden_row_to(&mut gpu, 0, &pending)
+            .map_err(|error| format!("qwen4 profile pending hidden copy: {error}"))?;
+        let mtp_token = bundle
+            .mtp_forward_token(&mut gpu, input_token, Some(&pending), mtp_position)
+            .map_err(|error| format!("qwen4 profile native MTP token: {error}"))?;
+        let mtp_ns = profile_duration_ns(mtp_started);
+        let mtp_hip = hip_counter_snapshot();
+        let mtp_internal = qwen4_profile_stats_json(qwen4_profile_snapshot());
+        let mtp_position_after = bundle
+            .mtp_position()
+            .map_err(|error| format!("read qwen4 profile MTP end position: {error}"))?;
+        let mtp_d2h = mtp_hip.get("memcpy_dtoh").cloned().unwrap_or(Value::Null);
+
+        Ok(json!({
+            "target": {
+                "input_token": input_token,
+                "output_token": target_token,
+                "state_position_after": bundle.state.position,
+                "wall_ns": target_ns,
+                "hip": target_hip,
+                "internal": target_internal,
+                "ple": target_ple,
+            },
+            "mtp": {
+                "input_token": input_token,
+                "output_token": mtp_token,
+                "position": mtp_position,
+                "position_after": mtp_position_after,
+                "wall_ns": mtp_ns,
+                "hip": mtp_hip,
+                "internal": mtp_internal,
+            },
+            "d2h": {
+                "target": target_d2h,
+                "mtp": mtp_d2h,
+                "attribution": "memcpy_dtoh counters are nested in the target/MTP phase that issued them",
+            },
+            "sealed_moe_validation": {
+                "target": target_internal.get("moe_seal").cloned().unwrap_or(Value::Null),
+                "mtp": mtp_internal.get("moe_seal").cloned().unwrap_or(Value::Null),
+            },
+        }))
+    })();
+
+    qwen4_profile_enable(false);
+    let teardown_started = Instant::now();
+    launch_counters::reset();
+    let pending_cleanup = gpu
+        .free_tensor(pending)
+        .err()
+        .map(|error| format!("free qwen4 profile pending hidden: {error}"));
+    let bundle_cleanup = bundle
+        .free_gpu(&mut gpu)
+        .err()
+        .map(|error| format!("free qwen4 profile bundle: {error}"));
+    let teardown_ns = profile_duration_ns(teardown_started);
+    let teardown_hip = hip_counter_snapshot();
+    let teardown_error = pending_cleanup.or(bundle_cleanup);
+
+    let execution = match execution_result {
+        Ok(execution) => execution,
+        Err(error) => {
+            return Err(match teardown_error {
+                Some(cleanup) => format!("{error}; {cleanup}"),
+                None => error,
+            });
+        }
+    };
+    if let Some(error) = teardown_error {
+        return Err(error);
+    }
+    Ok(ProfileReport(json!({
+        "schema": "hipfire.qwen4.profile.v1",
+        "gpu_arch": gpu.arch,
+        "model": model_path.display().to_string(),
+        "corpus": corpus,
+        "input_token": input_token,
+        "hipfire_profile": {
+            "enabled": profile_enabled,
+            "environment": "HIPFIRE_PROFILE=1",
+            "scope": "Qwen4 seal/PLE host hooks; rocprofv3 is authoritative for kernel timing",
+        },
+        "load": {
+            "wall_ns": load_ns,
+            "hip": load_hip,
+            "steps": {
+                "open_hfq_ns": open_ns,
+                "admission_ns": admission_ns,
+                "gpu_init_ns": gpu_init_ns,
+                "manifest_fulfillment_ns": manifest_ns,
+                "bundle_assembly_ns": assemble_ns,
+                "attach_forward_ns": attach_forward_ns,
+                "attach_mtp_ns": attach_mtp_ns,
+                "state_reset_and_scratch_ns": setup_ns,
+            },
+        },
+        "bounded_work": {
+            "target_tokens": 1,
+            "native_mtp_steps": 1,
+            "compact_state_parity": false,
+            "quality_probe": false,
+        },
+        "target_layer_families": layer_families,
+        "execution": execution,
+        "teardown": {
+            "wall_ns": teardown_ns,
+            "hip": teardown_hip,
+        },
+        "status": "pass",
+    })))
 }
 
 /// Load one real HFQ model, run the production AR/native-MTP path, and append

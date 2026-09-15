@@ -3949,6 +3949,11 @@ enum ParityMode {
         tokens: PathBuf,
         output: PathBuf,
     },
+    Profile {
+        model: PathBuf,
+        tokens: PathBuf,
+        output: PathBuf,
+    },
 }
 
 fn parse_args() -> Result<ParityMode, String> {
@@ -3971,7 +3976,7 @@ fn parse_args() -> Result<ParityMode, String> {
             "--out" => out = Some(PathBuf::from(args.next().ok_or("--out needs FILE")?)),
             other => {
                 return fail(format!(
-                    "unsupported argument {other:?}; use --fixtures DIR --out FILE, --model FILE --tokens CORPUS --out FILE, or --mode state --model FILE --tokens CORPUS --out FILE"
+                    "unsupported argument {other:?}; use --fixtures DIR --out FILE, --model FILE --tokens CORPUS --out FILE, --mode state --model FILE --tokens CORPUS --out FILE, or --mode profile --model FILE --tokens CORPUS --out FILE"
                 ))
             }
         }
@@ -3989,9 +3994,16 @@ fn parse_args() -> Result<ParityMode, String> {
             tokens,
             output,
         }),
-        (Some(other), _, _, _) => fail(format!("unsupported --mode {other:?}; only --mode state is available")),
+        (Some("profile"), None, Some(model), Some(tokens)) => Ok(ParityMode::Profile {
+            model,
+            tokens,
+            output,
+        }),
+        (Some(other), _, _, _) => fail(format!(
+            "unsupported --mode {other:?}; only --mode state and --mode profile are available"
+        )),
         _ => fail(
-            "choose exactly one mode: --fixtures DIR, --model FILE --tokens CORPUS, or --mode state --model FILE --tokens CORPUS",
+            "choose exactly one mode: --fixtures DIR, --model FILE --tokens CORPUS, --mode state --model FILE --tokens CORPUS, or --mode profile --model FILE --tokens CORPUS",
         ),
     }
 }
@@ -4079,6 +4091,16 @@ fn run() -> Result<(), String> {
             let report = hipfire_arch_qwen4::state_parity::run_state_parity(&model, &tokens)?;
             report.write(&output)?;
             println!("qwen4 state parity PASS: {}", output.display());
+            Ok(())
+        }
+        ParityMode::Profile {
+            model,
+            tokens,
+            output,
+        } => {
+            let report = hipfire_arch_qwen4::state_parity::run_profile(&model, &tokens)?;
+            report.write(&output)?;
+            println!("qwen4 bounded profile written: {}", output.display());
             Ok(())
         }
     }
