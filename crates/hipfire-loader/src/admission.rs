@@ -43,11 +43,21 @@ pub enum EffectiveTopology {
 #[derive(Clone, Copy, Default)]
 pub struct SourceAdmissionOptions {
     pub spec: SpecLoadCfg,
+    /// True only when `memory.kv_adaptive` is an active policy. The CLI
+    /// serializes its ordinary `off` schema default as a nonempty string.
+    pub kv_adaptive: bool,
     pub gemma4_drafter: bool,
     pub cask: bool,
     pub state_quant: bool,
     pub non_single_compute: bool,
     pub pflash: bool,
+}
+
+/// Return whether a per-load adaptive-KV value requests the active controller.
+/// The CLI schema default is `Some("off")`, which must remain ordinary AR.
+/// Empty values are also inactive because daemon normalization drops them.
+pub fn qwen4_kv_adaptive_requested(value: Option<&str>) -> bool {
+    value.is_some_and(|value| !value.is_empty() && value != "off")
 }
 
 /// Native Qwen4 MTP is an explicit load intent. A missing field and an
@@ -499,6 +509,7 @@ pub fn admit_source_with_options(
         // the request to attach it; `None` and `Some(false)` remain AR-only.
         let native_mtp = qwen4_native_mtp_requested(options.spec);
         if draft_path.is_some()
+            || options.kv_adaptive
             || options.gemma4_drafter
             || options.cask
             || options.state_quant
@@ -510,7 +521,7 @@ pub fn admit_source_with_options(
             || qwen4_ddtree_requested(options.spec)
         {
             return Err(
-                "qwen4: requested DFlash, DSpark, n-gram, DDTree, EAGLE, CASK, state-quant, PFlash, or non-Single option is unsupported"
+                "qwen4: requested DFlash, DSpark, n-gram, DDTree, adaptive-KV, EAGLE, CASK, state-quant, PFlash, or non-Single option is unsupported"
                     .into(),
             );
         }
@@ -725,7 +736,11 @@ mod tests {
             let _ = std::fs::remove_dir(path.parent().unwrap());
         }
 
-        fn admit(path: &std::path::Path, spec: SpecLoadCfg) -> Result<SourceAdmission, String> {
+        fn admit(
+            path: &std::path::Path,
+            spec: SpecLoadCfg,
+            kv_adaptive_override: Option<&str>,
+        ) -> Result<SourceAdmission, String> {
             admit_source_with_options(
                 path.to_str().unwrap(),
                 1,
@@ -738,6 +753,7 @@ mod tests {
                 2048,
                 SourceAdmissionOptions {
                     spec,
+                    kv_adaptive: qwen4_kv_adaptive_requested(kv_adaptive_override),
                     ..Default::default()
                 },
             )
@@ -747,11 +763,15 @@ mod tests {
         fn resolved_defaults_pass_source_gate_but_active_overrides_refuse() {
             let path = write_probe("ddtree");
             let defaults = SpecLoadCfg {
+                dflash: Some(false),
+                dspark: Some(false),
+                ngram_draft: Some(false),
                 ddtree_budget: Some(0),
                 ddtree_topk: Some(4),
+                mtp: Some(false),
                 ..SpecLoadCfg::default()
             };
-            let err = admit(&path, defaults)
+            let err = admit(&path, defaults, Some("off"))
                 .map(|_| ())
                 .expect_err("minimal probe must fail later on invalid Qwen4 config");
             assert!(
@@ -768,7 +788,7 @@ mod tests {
                 ddtree_topk: Some(4),
                 ..defaults
             };
-            let err = admit(&path, active)
+            let err = admit(&path, active, Some("off"))
                 .map(|_| ())
                 .expect_err("active DDTree must refuse");
             assert!(
@@ -781,12 +801,20 @@ mod tests {
                 ddtree_topk: Some(5),
                 ..defaults
             };
-            let err = admit(&path, nondefault_topk)
+            let err = admit(&path, nondefault_topk, Some("off"))
                 .map(|_| ())
                 .expect_err("non-default top-K must refuse");
             assert!(
                 err.contains("requested DFlash, DSpark, n-gram, DDTree"),
                 "non-default DDTree top-K must be refused at source admission: {err}"
+            );
+
+            let err = admit(&path, defaults, Some("balanced"))
+                .map(|_| ())
+                .expect_err("active adaptive KV must refuse");
+            assert!(
+                err.contains("requested DFlash, DSpark, n-gram, DDTree, adaptive-KV"),
+                "active adaptive KV must be refused at source admission: {err}"
             );
             cleanup(&path);
         }

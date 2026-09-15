@@ -2337,7 +2337,7 @@ pub fn load_model_with_kv_backend(
                 deepseek4_compute_placement,
                 hipfire_config::Deepseek4ComputePlacement::Single
             )
-            || kv_adaptive_override.is_some()
+            || crate::admission::qwen4_kv_adaptive_requested(kv_adaptive_override)
             || state_quant_override.is_some()
             || cask.sidecar.is_some()
             || spec.dflash.is_some_and(|enabled| enabled)
@@ -2561,6 +2561,7 @@ pub fn load_model_with_gemma4_drafter(
         max_seq,
         crate::admission::SourceAdmissionOptions {
             spec,
+            kv_adaptive: crate::admission::qwen4_kv_adaptive_requested(kv_adaptive_override),
             gemma4_drafter: gemma4_drafter_path.is_some(),
             cask: cask.sidecar.is_some(),
             state_quant: state_quant_override.is_some(),

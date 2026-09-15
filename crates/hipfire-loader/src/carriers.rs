@@ -14,7 +14,7 @@ use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::HfqModelSource;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama::KvCacheExt;
-use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
+use hipfire_runtime::loader_api::{LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::model_source::ModelSource as _;
 use hipfire_runtime::model_source::SourcePayload;
 use hipfire_runtime::spec::{InPlaceGuard, SpecEmit, SpecEmitCtx, SpecTargetGuard};
@@ -218,6 +218,38 @@ fn qwen4_use_range_payload(
 }
 
 pub struct Qwen4Carrier;
+impl Qwen4Carrier {
+    fn admit_request(
+        draft_path: Option<&str>,
+        gemma4_drafter_path: Option<&str>,
+        kv_adaptive_override: Option<&str>,
+        spec: SpecLoadCfg,
+        cask_active: bool,
+        state_quant_override: Option<&str>,
+        deepseek4_compute_placement: hipfire_config::Deepseek4ComputePlacement,
+    ) -> Result<(), String> {
+        if draft_path.is_some()
+            || gemma4_drafter_path.is_some()
+            || crate::admission::qwen4_kv_adaptive_requested(kv_adaptive_override)
+            || spec.dflash.is_some_and(|enabled| enabled)
+            || spec.dspark.is_some_and(|enabled| enabled)
+            || spec.ngram_draft.is_some_and(|enabled| enabled)
+            || crate::admission::qwen4_ddtree_requested(spec)
+            || cask_active
+            || state_quant_override.is_some()
+            || !matches!(
+                deepseek4_compute_placement,
+                hipfire_config::Deepseek4ComputePlacement::Single
+            )
+        {
+            return Err(
+                "qwen4: DFlash, DSpark, n-gram, DDTree, adaptive-KV, EAGLE, CASK, state-quant, and non-Single placement are unsupported"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
 
 impl Carrier for Qwen4Carrier {
     fn name(&self) -> &'static str {
@@ -307,25 +339,15 @@ impl Carrier for Qwen4Carrier {
         // tensors for capability discovery, but only `Some(true)` may attach
         // the GPU head and publish a speculative drafter.
         let native_mtp = crate::admission::qwen4_native_mtp_requested(ctx.spec);
-        if ctx.draft_path.is_some()
-            || ctx.gemma4_drafter_path.is_some()
-            || ctx.kv_adaptive_override.is_some()
-            || ctx.spec.dflash.is_some_and(|enabled| enabled)
-            || ctx.spec.dspark.is_some_and(|enabled| enabled)
-            || ctx.spec.ngram_draft.is_some_and(|enabled| enabled)
-            || crate::admission::qwen4_ddtree_requested(ctx.spec)
-            || ctx.cask.sidecar.is_some()
-            || ctx.state_quant_override.is_some()
-            || !matches!(
-                ctx.deepseek4_compute_placement,
-                hipfire_config::Deepseek4ComputePlacement::Single
-            )
-        {
-            return Err(
-                "qwen4: DFlash, DSpark, n-gram, DDTree, adaptive-KV, EAGLE, CASK, state-quant, and non-Single placement are unsupported"
-                    .into(),
-            );
-        }
+        Self::admit_request(
+            ctx.draft_path,
+            ctx.gemma4_drafter_path,
+            ctx.kv_adaptive_override,
+            ctx.spec,
+            ctx.cask.sidecar.is_some(),
+            ctx.state_quant_override,
+            ctx.deepseek4_compute_placement.clone(),
+        )?;
         if native_mtp
             && hipfire_runtime::config::retained_redline_default(
                 &ctx.gpu.arch,
@@ -3138,5 +3160,53 @@ mod qwen4_source_policy_tests {
             false,
             WeightResidency::external_rows(128, 1)
         ));
+    }
+}
+
+#[cfg(test)]
+mod qwen4_admission_tests {
+    use super::Qwen4Carrier;
+    use hipfire_runtime::loader_api::SpecLoadCfg;
+
+    fn resolved_ar_spec() -> SpecLoadCfg {
+        SpecLoadCfg {
+            dflash: Some(false),
+            dspark: Some(false),
+            ngram_draft: Some(false),
+            ddtree_budget: Some(0),
+            ddtree_topk: Some(4),
+            mtp: Some(false),
+            ..SpecLoadCfg::default()
+        }
+    }
+
+    #[test]
+    fn schema_defaults_pass_carrier_gate_but_active_adaptive_refuses() {
+        let defaults = resolved_ar_spec();
+        assert!(
+            Qwen4Carrier::admit_request(
+                None,
+                None,
+                Some("off"),
+                defaults,
+                false,
+                None,
+                hipfire_config::Deepseek4ComputePlacement::Single,
+            )
+            .is_ok(),
+            "CLI-resolved AR defaults must not trigger Qwen4 carrier refusal"
+        );
+
+        let err = Qwen4Carrier::admit_request(
+            None,
+            None,
+            Some("balanced"),
+            defaults,
+            false,
+            None,
+            hipfire_config::Deepseek4ComputePlacement::Single,
+        )
+        .expect_err("active adaptive KV must remain unsupported for Qwen4");
+        assert!(err.contains("adaptive-KV"), "refusal: {err}");
     }
 }

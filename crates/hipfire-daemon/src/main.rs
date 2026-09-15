@@ -1736,6 +1736,9 @@ fn main() {
                 // by the load route below — no re-open, no re-classify.
                 let qwen4_admission_options = hipfire_loader::admission::SourceAdmissionOptions {
                     spec: spec_cfg,
+                    kv_adaptive: hipfire_loader::admission::qwen4_kv_adaptive_requested(
+                        kv_adaptive_override.as_deref(),
+                    ),
                     gemma4_drafter: gemma4_drafter.is_some(),
                     cask: cask.sidecar.is_some(),
                     state_quant: state_quant_override.is_some(),
