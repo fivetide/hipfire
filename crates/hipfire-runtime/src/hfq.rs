@@ -21,11 +21,209 @@ use hip_bridge::{HipError, HipResult};
 use memmap2::Mmap;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
+
+/// High bit in the legacy HFQM version word indicating an appended metadata
+/// overlay. The low 31 bits remain the base container version, so the updated
+/// generic reader validates the extension and exposes `format_version == 1`.
+/// Strict architecture readers from before this extension compare the raw
+/// version word and intentionally reject overlaid files; that discoverable
+/// rejection is why an updated reader is required for repaired artifacts.
+const HFQ_METADATA_OVERLAY_FLAG: u32 = 1 << 31;
+const HFQ_BASE_FORMAT_VERSION: u32 = 1;
+const HFQ_METADATA_OVERLAY_SCHEMA: u32 = 1;
+const HFQ_METADATA_OVERLAY_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Footer layout: metadata bytes, u64 length, u32 schema, 32-byte SHA-256,
+/// and this eight-byte magic. Its fixed tail lets readers find the overlay
+/// without changing the legacy metadata/data offsets.
+const HFQ_METADATA_OVERLAY_MAGIC: &[u8; 8] = b"HFQMDOV1";
+const HFQ_METADATA_OVERLAY_FOOTER_LEN: usize = 8 + 4 + 32 + 8;
+/// Append one generic metadata overlay without moving the legacy tensor index
+/// or payload. The overlay is fsynced before the version pointer is committed;
+/// readers that see a torn/invalid pointer fail closed instead of silently
+/// falling back to stale metadata. A second committed overlay is rejected:
+/// replacement callers must start from the original artifact, not stack stale
+/// metadata generations.
+pub fn append_hfq_metadata_overlay(path: &Path, metadata_json: &str) -> std::io::Result<()> {
+    if metadata_json.len() > HFQ_METADATA_OVERLAY_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "HFQ metadata overlay is {} bytes, above {}-byte limit",
+                metadata_json.len(),
+                HFQ_METADATA_OVERLAY_MAX_BYTES
+            ),
+        ));
+    }
+    let metadata_value: serde_json::Value = serde_json::from_str(metadata_json).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("HFQ metadata overlay is not valid JSON: {error}"),
+        )
+    })?;
+    if !metadata_value.is_object() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "HFQ metadata overlay must be a JSON object",
+        ));
+    }
+
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    let mut header = [0_u8; 32];
+    file.read_exact(&mut header)?;
+    if &header[..4] != b"HFQM" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}: bad HFQ magic", path.display()),
+        ));
+    }
+    let raw_version = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    if raw_version & !HFQ_METADATA_OVERLAY_FLAG != HFQ_BASE_FORMAT_VERSION {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{}: unsupported HFQ format version {}",
+                path.display(),
+                raw_version & !HFQ_METADATA_OVERLAY_FLAG
+            ),
+        ));
+    }
+    if raw_version & HFQ_METADATA_OVERLAY_FLAG != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "{}: metadata overlay already committed; refusing a second overlay",
+                path.display()
+            ),
+        ));
+    }
+    let metadata_offset = u64::from_le_bytes(header[16..24].try_into().unwrap());
+    let data_offset = u64::from_le_bytes(header[24..32].try_into().unwrap());
+    let file_len = file.metadata()?.len();
+    if metadata_offset != 32 || metadata_offset > data_offset || data_offset > file_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{}: invalid HFQ metadata/data offsets {metadata_offset}/{data_offset} \
+                 for {file_len}-byte file",
+                path.display()
+            ),
+        ));
+    }
+    // Validate the complete legacy container before appending. This also
+    // rejects a previously torn overlay pointer rather than stacking another
+    // overlay on an already ambiguous file.
+    let _ = HfqFile::open(path)?;
+
+    let digest = Sha256::digest(metadata_json.as_bytes());
+    file.seek(SeekFrom::End(0))?;
+    file.write_all(metadata_json.as_bytes())?;
+    file.write_all(&(metadata_json.len() as u64).to_le_bytes())?;
+    file.write_all(&HFQ_METADATA_OVERLAY_SCHEMA.to_le_bytes())?;
+    file.write_all(&digest)?;
+    file.write_all(HFQ_METADATA_OVERLAY_MAGIC)?;
+    file.sync_all()?;
+
+    let committed_version = raw_version | HFQ_METADATA_OVERLAY_FLAG;
+    file.seek(SeekFrom::Start(4))?;
+    file.write_all(&committed_version.to_le_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn read_hfq_metadata_overlay(
+    mmap: &Mmap,
+    payload_end: usize,
+) -> std::io::Result<String> {
+    let file_len = mmap.len();
+    if file_len < HFQ_METADATA_OVERLAY_FOOTER_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HFQ metadata overlay footer is truncated",
+        ));
+    }
+    let footer_start = file_len - HFQ_METADATA_OVERLAY_FOOTER_LEN;
+    let metadata_len = u64::from_le_bytes(
+        mmap[footer_start..footer_start + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let metadata_len = usize::try_from(metadata_len).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HFQ metadata overlay length does not fit usize",
+        )
+    })?;
+    if metadata_len == 0 || metadata_len > HFQ_METADATA_OVERLAY_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "HFQ metadata overlay length {metadata_len} is outside 1..={HFQ_METADATA_OVERLAY_MAX_BYTES}"
+            ),
+        ));
+    }
+    let schema =
+        u32::from_le_bytes(mmap[footer_start + 8..footer_start + 12].try_into().unwrap());
+    if schema != HFQ_METADATA_OVERLAY_SCHEMA {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported HFQ metadata overlay schema {schema}"),
+        ));
+    }
+    if &mmap[footer_start + 44..footer_start + 52] != HFQ_METADATA_OVERLAY_MAGIC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HFQ metadata overlay magic is missing or corrupt",
+        ));
+    }
+    let metadata_start = footer_start.checked_sub(metadata_len).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HFQ metadata overlay length underflows file bounds",
+        )
+    })?;
+    if metadata_start < payload_end {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "HFQ metadata overlay starts at {metadata_start}, before payload end {payload_end}"
+            ),
+        ));
+    }
+    let bytes = &mmap[metadata_start..footer_start];
+    let expected = Sha256::digest(bytes);
+    if expected.as_slice() != &mmap[footer_start + 12..footer_start + 44] {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HFQ metadata overlay checksum mismatch",
+        ));
+    }
+    let metadata = std::str::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("HFQ metadata overlay is not UTF-8: {error}"),
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_str(metadata).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("HFQ metadata overlay JSON is invalid: {error}"),
+        )
+    })?;
+    if !value.is_object() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HFQ metadata overlay JSON must be an object",
+        ));
+    }
+    Ok(metadata.to_string())
+}
+
 
 /// Drop page cache for a file byte range via posix_fadvise(FADV_DONTNEED).
 /// On unified-memory APUs (e.g. Strix Halo), mmap'd model data and
@@ -609,7 +807,25 @@ impl HfqFile {
                 format!("HfqFile: not an HFQ container at offset {base}"),
             ));
         }
-        let format_version = u32::from_le_bytes(mmap[base + 4..base + 8].try_into().unwrap());
+        let raw_format_version =
+            u32::from_le_bytes(mmap[base + 4..base + 8].try_into().unwrap());
+        let has_metadata_overlay = raw_format_version & HFQ_METADATA_OVERLAY_FLAG != 0;
+        let format_version = raw_format_version & !HFQ_METADATA_OVERLAY_FLAG;
+        if format_version != HFQ_BASE_FORMAT_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "HfqFile: unsupported HFQ format version {format_version} \
+                     (raw header word {raw_format_version})"
+                ),
+            ));
+        }
+        if has_metadata_overlay && base_offset != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HfqFile: metadata overlays are only supported on standalone HFQ files",
+            ));
+        }
         let arch_id = u32::from_le_bytes(mmap[base + 8..base + 12].try_into().unwrap());
         let n_tensors = u32::from_le_bytes(mmap[base + 12..base + 16].try_into().unwrap()) as usize;
         // Stored offsets are relative to the container start; rebase to absolute
@@ -713,7 +929,7 @@ impl HfqFile {
                 ),
             ));
         }
-        let metadata_json = String::from_utf8_lossy(&meta_bytes[..json_end]).to_string();
+        let mut metadata_json = String::from_utf8_lossy(&meta_bytes[..json_end]).to_string();
 
         // Parse tensor index (follows metadata JSON)
         let mut pos = metadata_offset.checked_add(json_end).ok_or_else(|| {
@@ -815,6 +1031,9 @@ impl HfqFile {
                 data_size,
             });
             cumulative_offset = end;
+        }
+        if has_metadata_overlay {
+            metadata_json = read_hfq_metadata_overlay(&mmap, cumulative_offset)?;
         }
         let me = Self {
             _file: file,
@@ -3245,6 +3464,140 @@ mod compact_qwen4_ple_tests {
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 }
+#[cfg(test)]
+mod metadata_overlay_tests {
+    use super::hfq_test_fixture::write_min_hfq;
+    use super::*;
+    use std::io::{Seek, SeekFrom, Write};
+
+    #[test]
+    fn overlay_round_trip_preserves_legacy_offsets_and_payload() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let path = dir.path().join("model.hfq");
+        let payload = b"payload!";
+        write_min_hfq(&path, 16, &[("weight", 3, &[2, 4], payload)]);
+        let legacy = HfqFile::open(&path).expect("open legacy fixture");
+        assert_eq!(legacy.format_version, HFQ_BASE_FORMAT_VERSION);
+        assert_eq!(legacy.metadata_json, "{}");
+        assert_eq!(
+            legacy.tensor_data("weight").expect("legacy payload").1,
+            payload
+        );
+        let before = std::fs::read(&path).expect("read original fixture");
+        let metadata_offset = u64::from_le_bytes(before[16..24].try_into().unwrap());
+        let data_offset = u64::from_le_bytes(before[24..32].try_into().unwrap());
+        let original_payload = before[data_offset as usize..].to_vec();
+
+        let metadata = r#"{"tokenizer":"hf-tokenizer","marker":1}"#;
+        append_hfq_metadata_overlay(&path, metadata).expect("append overlay");
+
+        let after = std::fs::read(&path).expect("read overlaid fixture");
+        assert_eq!(
+            &after[16..24],
+            &metadata_offset.to_le_bytes(),
+            "legacy metadata offset moved"
+        );
+        assert_eq!(
+            &after[24..32],
+            &data_offset.to_le_bytes(),
+            "legacy data offset moved"
+        );
+        assert_eq!(
+            &after[data_offset as usize..data_offset as usize + original_payload.len()],
+            original_payload
+        );
+        assert_eq!(
+            after.len(),
+            before.len() + metadata.len() + HFQ_METADATA_OVERLAY_FOOTER_LEN
+        );
+        let raw_version = u32::from_le_bytes(after[4..8].try_into().unwrap());
+        assert_eq!(raw_version & !HFQ_METADATA_OVERLAY_FLAG, HFQ_BASE_FORMAT_VERSION);
+        assert_ne!(raw_version & HFQ_METADATA_OVERLAY_FLAG, 0);
+
+        let file = HfqFile::open(&path).expect("open overlaid fixture");
+        assert_eq!(file.metadata_json, metadata);
+        assert_eq!(file.tensors()[0].data_offset, data_offset as usize);
+        let (_, bytes) = file.tensor_data("weight").expect("weight payload");
+        assert_eq!(bytes, original_payload.as_slice());
+        assert_eq!(file.format_version, HFQ_BASE_FORMAT_VERSION);
+        drop(file);
+        let error = append_hfq_metadata_overlay(&path, metadata).expect_err("duplicate overlay");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn overlay_rejects_torn_checksum_and_bounds() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+
+        let torn = dir.path().join("torn.hfq");
+        write_min_hfq(&torn, 16, &[("weight", 3, &[2, 4], b"payload!")]);
+        append_hfq_metadata_overlay(&torn, r#"{"tokenizer":"x"}"#).expect("append overlay");
+        let torn_len = std::fs::metadata(&torn).expect("torn metadata").len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&torn)
+            .expect("open torn fixture")
+            .set_len(torn_len - 1)
+            .expect("truncate footer");
+        assert!(HfqFile::open(&torn).is_err(), "torn footer must fail closed");
+
+        let corrupt = dir.path().join("corrupt.hfq");
+        write_min_hfq(&corrupt, 16, &[("weight", 3, &[2, 4], b"payload!")]);
+        append_hfq_metadata_overlay(&corrupt, r#"{"tokenizer":"x"}"#)
+            .expect("append overlay");
+        let corrupt_len = std::fs::metadata(&corrupt).expect("corrupt metadata").len();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&corrupt)
+            .expect("open corrupt fixture");
+        file.seek(SeekFrom::Start(
+            corrupt_len - HFQ_METADATA_OVERLAY_FOOTER_LEN as u64 + 12,
+        ))
+        .expect("seek checksum");
+        file.write_all(&[0xFF]).expect("corrupt checksum");
+        file.sync_all().expect("sync corruption");
+        assert!(
+            HfqFile::open(&corrupt).is_err(),
+            "checksum corruption must fail closed"
+        );
+
+        let bounds = dir.path().join("bounds.hfq");
+        write_min_hfq(&bounds, 16, &[("weight", 3, &[2, 4], b"payload!")]);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&bounds)
+            .expect("open bounds fixture");
+        file.seek(SeekFrom::End(0)).expect("seek bounds footer");
+        file.write_all(&u64::MAX.to_le_bytes())
+            .expect("write huge overlay length");
+        file.write_all(&HFQ_METADATA_OVERLAY_SCHEMA.to_le_bytes())
+            .expect("write overlay schema");
+        file.write_all(&[0u8; 32]).expect("write overlay checksum");
+        file.write_all(HFQ_METADATA_OVERLAY_MAGIC)
+            .expect("write overlay magic");
+        file.seek(SeekFrom::Start(4)).expect("seek version");
+        file.write_all(&(HFQ_BASE_FORMAT_VERSION | HFQ_METADATA_OVERLAY_FLAG).to_le_bytes())
+            .expect("commit malformed pointer");
+        file.sync_all().expect("sync malformed pointer");
+        assert!(
+            HfqFile::open(&bounds).is_err(),
+            "out-of-bounds overlay length must fail closed"
+        );
+    }
+
+    #[test]
+    fn overlay_writer_rejects_non_object_without_mutating_file() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let path = dir.path().join("model.hfq");
+        write_min_hfq(&path, 16, &[("weight", 3, &[2, 4], b"payload!")]);
+        let before = std::fs::read(&path).expect("read fixture");
+        assert!(append_hfq_metadata_overlay(&path, "[]").is_err());
+        assert_eq!(std::fs::read(&path).expect("read unchanged fixture"), before);
+    }
+}
+
 // ─── Overlay resolution tests (SP3) ─────────────────────────────────────────
 
 #[cfg(test)]

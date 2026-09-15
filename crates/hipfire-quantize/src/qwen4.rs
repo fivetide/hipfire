@@ -54,6 +54,7 @@ const QWEN4_I64_QUANT_TYPE: u8 = 52;
 const MAX_HEADER_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REOPEN_REGION_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_TOKENIZER_BYTES: u64 = 64 * 1024 * 1024;
 /// The pinned checkpoint contains 1,658 records: 1,655 BF16 (including the
 /// positively excluded vision tower) and three exact I64 metadata arrays.
 const PINNED_SOURCE_TENSOR_COUNT: usize = 1_658;
@@ -237,6 +238,7 @@ pub(crate) fn write_qwen4_artifact(options: &Qwen4Options<'_>) -> Result<Qwen4Su
     if options.mode == Qwen4Mode::CompactFixture {
         return write_compact_artifact(options, &source, tensors, &config_value);
     }
+    let tokenizer = load_tokenizer_metadata(&source)?;
     let config = Qwen4Config::from_value(&config_value)
         .map_err(|error| Qwen4Error::Invalid(format!("Qwen4 config is invalid: {error}")))?;
     let manifest = Qwen4Manifest::build(&config).map_err(|error| {
@@ -254,7 +256,7 @@ pub(crate) fn write_qwen4_artifact(options: &Qwen4Options<'_>) -> Result<Qwen4Su
             PINNED_OUTPUT_ENTRY_COUNT
         )));
     }
-    let metadata_json = build_metadata(Some(&config_value), &plan, ple_metadata)?;
+    let metadata_json = build_metadata(Some(&config_value), &plan, ple_metadata, Some(&tokenizer))?;
     if plan.entries.len() > u32::MAX as usize {
         return Err(Qwen4Error::Invalid(format!(
             "Qwen4 artifact has too many entries: {}",
@@ -358,7 +360,7 @@ fn write_compact_artifact(
         .ple_metadata
         .as_ref()
         .ok_or_else(|| Qwen4Error::Invalid("compact Qwen4 plan has no PLE metadata".to_string()))?;
-    let metadata_json = build_metadata(Some(config), &plan, ple)?;
+    let metadata_json = build_metadata(Some(config), &plan, ple, None)?;
     let stream_entries: Vec<hipfire_runtime::hfq::HfqStreamEntry> = plan
         .entries
         .iter()
@@ -2098,6 +2100,146 @@ fn load_optional_config(source: &SourceSet) -> Result<Option<Value>, Qwen4Error>
     }
 }
 
+/// Canonical HF tokenizer contract copied into every production Qwen4 HFQM
+/// artifact. The tokenizer JSON is required and validated before any payload
+/// quantization; sidecars remain optional but are embedded when present.
+#[derive(Debug, Clone)]
+struct TokenizerMetadata {
+    tokenizer: String,
+    tokenizer_config: Option<Value>,
+    generation_config: Option<Value>,
+}
+
+fn load_tokenizer_metadata(source: &SourceSet) -> Result<TokenizerMetadata, Qwen4Error> {
+    let (tokenizer_bytes, mut tokenizer_config, generation_config, chat_template) = match source {
+        SourceSet::Local { paths, .. } => {
+            let first = paths.first().ok_or_else(|| {
+                Qwen4Error::Invalid("Qwen4 local source has no safetensors shards".to_string())
+            })?;
+            let parent = first.parent().unwrap_or_else(|| Path::new("."));
+            (
+                read_local_bytes(
+                    &parent.join("tokenizer.json"),
+                    MAX_TOKENIZER_BYTES,
+                    true,
+                )?
+                .expect("required local tokenizer"),
+                read_local_json(&parent.join("tokenizer_config.json"), MAX_CONFIG_BYTES)?,
+                read_local_json(&parent.join("generation_config.json"), MAX_CONFIG_BYTES)?,
+                read_local_text(&parent.join("chat_template.jinja"), MAX_CONFIG_BYTES)?,
+            )
+        }
+        SourceSet::Remote { source, .. } => (
+            source.read_bounded("tokenizer.json", MAX_TOKENIZER_BYTES)?,
+            read_remote_optional_json(source, "tokenizer_config.json", MAX_CONFIG_BYTES)?,
+            read_remote_optional_json(source, "generation_config.json", MAX_CONFIG_BYTES)?,
+            read_remote_optional_text(source, "chat_template.jinja", MAX_CONFIG_BYTES)?,
+        ),
+    };
+    let tokenizer = String::from_utf8(tokenizer_bytes)
+        .map_err(|error| Qwen4Error::Invalid(format!("Qwen4 tokenizer.json is not UTF-8: {error}")))?;
+    hipfire_runtime::tokenizer::Tokenizer::from_hf_json(&tokenizer).map_err(|error| {
+        Qwen4Error::Invalid(format!("Qwen4 tokenizer.json is invalid: {error}"))
+    })?;
+
+    if let Some(template) = chat_template {
+        let config = tokenizer_config.get_or_insert_with(|| Value::Object(Map::new()));
+        let object = config.as_object_mut().ok_or_else(|| {
+            Qwen4Error::Invalid("Qwen4 tokenizer_config.json must be a JSON object".to_string())
+        })?;
+        let has_template = object
+            .get("chat_template")
+            .map(|value| !value.is_null())
+            .unwrap_or(false);
+        if !has_template {
+            object.insert("chat_template".to_string(), Value::String(template));
+        }
+    }
+
+    Ok(TokenizerMetadata {
+        tokenizer,
+        tokenizer_config,
+        generation_config,
+    })
+}
+
+fn read_local_bytes(
+    path: &Path,
+    max_bytes: u64,
+    required: bool,
+) -> Result<Option<Vec<u8>>, Qwen4Error> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !required => return Ok(None),
+        Err(error) => return Err(Qwen4Error::io(format!("stat {}", path.display()), error)),
+    };
+    if metadata.len() > max_bytes {
+        return Err(Qwen4Error::Invalid(format!(
+            "Qwen4 metadata file {} is larger than {max_bytes} bytes",
+            path.display()
+        )));
+    }
+    let capacity = usize::try_from(metadata.len()).map_err(|_| {
+        Qwen4Error::Invalid(format!("Qwen4 metadata file {} is too large", path.display()))
+    })?;
+    let mut file =
+        File::open(path).map_err(|error| Qwen4Error::io(path.display().to_string(), error))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.read_to_end(&mut bytes)
+        .map_err(|error| Qwen4Error::io(format!("read {}", path.display()), error))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(Qwen4Error::Invalid(format!(
+            "Qwen4 metadata file {} grew above {max_bytes} bytes while reading",
+            path.display()
+        )));
+    }
+    Ok(Some(bytes))
+}
+
+fn read_local_text(path: &Path, max_bytes: u64) -> Result<Option<String>, Qwen4Error> {
+    let Some(bytes) = read_local_bytes(path, max_bytes, false)? else {
+        return Ok(None);
+    };
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| Qwen4Error::Invalid(format!("Qwen4 metadata {} is not UTF-8: {error}", path.display())))
+}
+
+fn read_local_json(path: &Path, max_bytes: u64) -> Result<Option<Value>, Qwen4Error> {
+    let Some(bytes) = read_local_bytes(path, max_bytes, false)? else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| Qwen4Error::json(format!("parse {}", path.display()), error))
+}
+
+fn read_remote_optional_json(
+    source: &RemoteSource,
+    path: &str,
+    max_bytes: u64,
+) -> Result<Option<Value>, Qwen4Error> {
+    match source.read_json(path, max_bytes) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.to_string().contains("returned HTTP 404") => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_remote_optional_text(
+    source: &RemoteSource,
+    path: &str,
+    max_bytes: u64,
+) -> Result<Option<String>, Qwen4Error> {
+    match source.read_bounded(path, max_bytes) {
+        Ok(bytes) => String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|error| Qwen4Error::Invalid(format!("remote {path} is not UTF-8: {error}"))),
+        Err(error) if error.to_string().contains("returned HTTP 404") => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum I64Role {
     Multipliers,
@@ -3043,8 +3185,9 @@ fn build_metadata(
     config: Option<&Value>,
     plan: &EntryPlan,
     ple: &PleMetadata,
+    tokenizer: Option<&TokenizerMetadata>,
 ) -> Result<String, Qwen4Error> {
-    let valid_rows =
+    let _valid_rows =
         validate_ple_metadata(&ple.multipliers, &ple.vocab_sizes, &ple.prefix_offsets)?;
     let physical_rows = (PLE_SHARD_COUNT as u64)
         .checked_mul(PLE_ROWS_PER_SHARD)
@@ -3100,6 +3243,18 @@ fn build_metadata(
             "external_ple_entries": plan.ple_shards,
         }),
     );
+    if let Some(tokenizer) = tokenizer {
+        root.insert(
+            "tokenizer".to_string(),
+            Value::String(tokenizer.tokenizer.clone()),
+        );
+        if let Some(config) = &tokenizer.tokenizer_config {
+            root.insert("tokenizer_config".to_string(), config.clone());
+        }
+        if let Some(config) = &tokenizer.generation_config {
+            root.insert("generation_config".to_string(), config.clone());
+        }
+    }
     serde_json::to_string(&Value::Object(root))
         .map_err(|error| Qwen4Error::json("serialize Qwen4 metadata", error))
 }
@@ -4575,6 +4730,136 @@ mod tests {
     }
 
     #[test]
+    fn qwen4_metadata_initializes_embedded_tokenizer() {
+        let tokenizer_json = serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "<unk>": 0,
+                    "<|startoftext|>": 1,
+                    "<|endoftext|>": 2,
+                    "h": 3,
+                    "i": 4,
+                    "\u{2581}": 5
+                },
+                "merges": []
+            },
+            "added_tokens": [
+                {"id": 1, "content": "<|startoftext|>", "special": true},
+                {"id": 2, "content": "<|endoftext|>", "special": true}
+            ]
+        })
+        .to_string();
+        let ple = PleMetadata {
+            multipliers: vec![3, 5, 7],
+            vocab_sizes: vec![127; PLE_HEAD_COUNT],
+            prefix_offsets: (0..PLE_HEAD_COUNT).map(|index| (index * 127) as i64).collect(),
+        };
+        let plan = EntryPlan {
+            entries: Vec::new(),
+            ple_metadata: None,
+            row_chunk: 1,
+            resident_entries: 0,
+            expert_entries: 0,
+            resident_bytes: 0,
+            external_ple_bytes: 0,
+            ple_shards: 0,
+        };
+        let tokenizer = TokenizerMetadata {
+            tokenizer: tokenizer_json.clone(),
+            tokenizer_config: Some(serde_json::json!({"add_bos_token": true})),
+            generation_config: Some(serde_json::json!({
+                "bos_token_id": 1,
+                "eos_token_id": 2
+            })),
+        };
+        let metadata_json =
+            build_metadata(None, &plan, &ple, Some(&tokenizer)).expect("metadata JSON");
+        let metadata: Value = serde_json::from_str(&metadata_json).expect("metadata object");
+        assert_eq!(
+            metadata.get("tokenizer").and_then(Value::as_str),
+            Some(tokenizer_json.as_str())
+        );
+        let runtime_tokenizer =
+            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&metadata_json)
+                .expect("embedded tokenizer initializes");
+        assert_eq!(runtime_tokenizer.bos_id, 1);
+        assert_eq!(runtime_tokenizer.eos_id, 2);
+        assert_eq!(runtime_tokenizer.encode("hi").first().copied(), Some(1));
+    }
+
+    #[test]
+    fn qwen4_source_metadata_loads_tokenizer_and_sidecars() {
+        let dir = tempdir().expect("source directory");
+        std::fs::write(dir.path().join("model.safetensors"), b"fixture")
+            .expect("source shard");
+        let tokenizer_json = serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "<unk>": 0,
+                    "<|startoftext|>": 1,
+                    "<|endoftext|>": 2,
+                    "h": 3,
+                    "i": 4,
+                    "\u{2581}": 5
+                },
+                "merges": []
+            },
+            "added_tokens": [
+                {"id": 1, "content": "<|startoftext|>", "special": true},
+                {"id": 2, "content": "<|endoftext|>", "special": true}
+            ]
+        })
+        .to_string();
+        std::fs::write(dir.path().join("tokenizer.json"), &tokenizer_json)
+            .expect("tokenizer");
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"add_bos_token":true}"#,
+        )
+        .expect("tokenizer config");
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            r#"{"bos_token_id":1,"eos_token_id":2}"#,
+        )
+        .expect("generation config");
+        std::fs::write(dir.path().join("chat_template.jinja"), "{{ bos_token }}")
+            .expect("chat template");
+
+        let source = source_paths(dir.path()).expect("source paths");
+        let metadata = load_tokenizer_metadata(&source).expect("tokenizer metadata");
+        assert_eq!(metadata.tokenizer, tokenizer_json);
+        assert_eq!(
+            metadata
+                .tokenizer_config
+                .as_ref()
+                .and_then(|config| config.get("chat_template"))
+                .and_then(Value::as_str),
+            Some("{{ bos_token }}")
+        );
+        assert_eq!(
+            metadata
+                .generation_config
+                .as_ref()
+                .and_then(|config| config.get("bos_token_id"))
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        let envelope = serde_json::json!({
+            "tokenizer": metadata.tokenizer,
+            "tokenizer_config": metadata.tokenizer_config,
+            "generation_config": metadata.generation_config,
+        })
+        .to_string();
+        let tokenizer =
+            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&envelope)
+                .expect("runtime tokenizer");
+        assert_eq!(tokenizer.bos_id, 1);
+        assert_eq!(tokenizer.eos_id, 2);
+    }
+
+    #[test]
     fn pinned_output_prediction_is_exact_before_payload_reads() {
         assert_eq!(
             PINNED_SOURCE_TENSOR_COUNT - PINNED_VISION_TENSOR_COUNT,
@@ -4971,7 +5256,10 @@ mod tests {
             PINNED_I64_TENSOR_COUNT
         );
         let ple = plan.ple_metadata.as_ref().expect("pinned PLE metadata");
-        let metadata_json = build_metadata(Some(&config_value), &plan, ple).expect("metadata JSON");
+        let tokenizer = load_tokenizer_metadata(&source).expect("pinned tokenizer metadata");
+        let metadata_json =
+            build_metadata(Some(&config_value), &plan, ple, Some(&tokenizer))
+                .expect("metadata JSON");
         println!("sparse metadata bytes={}", metadata_json.len());
         let stream_entries: Vec<_> = plan
             .entries
@@ -4986,7 +5274,9 @@ mod tests {
             .collect();
         let predicted = predicted_output_bytes(&metadata_json, &stream_entries)
             .expect("header-only predicted output bytes");
-        assert_eq!(predicted, PINNED_PREDICTED_OUTPUT_BYTES);
+        let data_start = 32 + metadata_json.len() as u64 + PINNED_INDEX_BYTES;
+        let data_offset = (data_start + 4_095) & !4_095;
+        assert_eq!(predicted, data_offset + PINNED_PAYLOAD_BYTES);
         assert_eq!(
             plan.entries
                 .iter()
