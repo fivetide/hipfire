@@ -507,8 +507,7 @@ pub fn admit_source_with_options(
             || options.spec.dflash.is_some_and(|enabled| enabled)
             || options.spec.dspark.is_some_and(|enabled| enabled)
             || options.spec.ngram_draft.is_some_and(|enabled| enabled)
-            || options.spec.ddtree_budget.is_some()
-            || options.spec.ddtree_topk.is_some()
+            || qwen4_ddtree_requested(options.spec)
         {
             return Err(
                 "qwen4: requested DFlash, DSpark, n-gram, DDTree, EAGLE, CASK, state-quant, PFlash, or non-Single option is unsupported"
@@ -693,30 +692,105 @@ mod tests {
         assert!(qwen4_native_mtp_requested(spec));
     }
 
-    #[test]
-    fn qwen4_ddtree_schema_defaults_are_inactive_but_overrides_refuse() {
-        let defaults = SpecLoadCfg {
-            ddtree_budget: Some(0),
-            ddtree_topk: Some(4),
-            ..SpecLoadCfg::default()
-        };
-        assert!(!qwen4_ddtree_requested(defaults));
+    mod qwen4_ddtree_admission {
+        use super::super::*;
+        use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
 
-        let active = SpecLoadCfg {
-            ddtree_budget: Some(1),
-            ddtree_topk: Some(4),
-            ..defaults
-        };
-        assert!(qwen4_ddtree_requested(active));
+        fn write_probe(name: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "hipfire-qwen4-admit-{}-{}",
+                std::process::id(),
+                name
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("{name}.hfq"));
+            write_hfqm_package_mem(
+                &path,
+                QWEN4_ARCH_ID,
+                "{}",
+                &[HfqMemTensor {
+                    name: "model.embed_tokens.weight".into(),
+                    quant_type: 1,
+                    shape: vec![4, 4],
+                    group_size: 0,
+                    data: vec![0u8; 32],
+                }],
+            )
+            .unwrap();
+            path
+        }
 
-        let nondefault_topk = SpecLoadCfg {
-            ddtree_budget: Some(0),
-            ddtree_topk: Some(5),
-            ..defaults
-        };
-        assert!(qwen4_ddtree_requested(nondefault_topk));
+        fn cleanup(path: &std::path::Path) {
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_dir(path.parent().unwrap());
+        }
+
+        fn admit(path: &std::path::Path, spec: SpecLoadCfg) -> Result<SourceAdmission, String> {
+            admit_source_with_options(
+                path.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1151",
+                None,
+                None,
+                2048,
+                SourceAdmissionOptions {
+                    spec,
+                    ..Default::default()
+                },
+            )
+        }
+
+        #[test]
+        fn resolved_defaults_pass_source_gate_but_active_overrides_refuse() {
+            let path = write_probe("ddtree");
+            let defaults = SpecLoadCfg {
+                ddtree_budget: Some(0),
+                ddtree_topk: Some(4),
+                ..SpecLoadCfg::default()
+            };
+            let err = admit(&path, defaults)
+                .map(|_| ())
+                .expect_err("minimal probe must fail later on invalid Qwen4 config");
+            assert!(
+                !err.contains("requested DFlash, DSpark, n-gram, DDTree"),
+                "resolved schema defaults must pass the DDTree source gate: {err}"
+            );
+            assert!(
+                err.contains("config admission failed"),
+                "defaults must reach Qwen4 config validation: {err}"
+            );
+
+            let active = SpecLoadCfg {
+                ddtree_budget: Some(1),
+                ddtree_topk: Some(4),
+                ..defaults
+            };
+            let err = admit(&path, active)
+                .map(|_| ())
+                .expect_err("active DDTree must refuse");
+            assert!(
+                err.contains("requested DFlash, DSpark, n-gram, DDTree"),
+                "active DDTree must be refused at source admission: {err}"
+            );
+
+            let nondefault_topk = SpecLoadCfg {
+                ddtree_budget: Some(0),
+                ddtree_topk: Some(5),
+                ..defaults
+            };
+            let err = admit(&path, nondefault_topk)
+                .map(|_| ())
+                .expect_err("non-default top-K must refuse");
+            assert!(
+                err.contains("requested DFlash, DSpark, n-gram, DDTree"),
+                "non-default DDTree top-K must be refused at source admission: {err}"
+            );
+            cleanup(&path);
+        }
     }
-
     #[test]
     fn qwen4_request_refuses_image_video_and_non_single_before_source_access() {
         let single = hipfire_arch_qwen4::EffectiveMesh::single();
