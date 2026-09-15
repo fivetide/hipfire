@@ -18,7 +18,6 @@ use crate::mtp_spec::validate_native_mtp_prefill_request;
 use crate::ple_rows::PleCacheStats;
 use crate::state::Qwen4State;
 use hip_bridge::launch_counters;
-use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
 use rdna_compute::qwen4::{
     qwen4_qsa_cache_append, qwen4_qsa_pool_rope, qwen4_qsa_reuse_selection, qwen4_qsa_select,
@@ -1337,6 +1336,17 @@ impl ProfileReport {
     }
 }
 
+fn qwen4_range_payload(
+    source: &hipfire_runtime::hfq::HfqModelSource,
+    entry: &WeightEntry,
+) -> Result<hipfire_runtime::model_source::SourcePayload<'static>, String> {
+    source
+        .tensor_range(&entry.name)
+        .map_err(|error| error.to_string())?
+        .map(hipfire_runtime::model_source::SourcePayload::Range)
+        .ok_or_else(|| format!("missing tensor '{}'", entry.name))
+}
+
 /// Load the admitted production artifact, execute exactly one target token and
 /// one native MTP token, and emit host/HIP/rocprof attribution context.
 pub fn run_profile(model_path: &Path, corpus_path: &Path) -> Result<ProfileReport, String> {
@@ -1360,7 +1370,7 @@ fn run_profile_inner(
     launch_counters::reset();
     let load_started = Instant::now();
     let open_started = Instant::now();
-    let hfq = hipfire_runtime::hfq::HfqFile::open(model_path)
+    let mut hfq = hipfire_runtime::hfq::HfqFile::open(model_path)
         .map_err(|error| format!("open {}: {error}", model_path.display()))?;
     let open_ns = profile_duration_ns(open_started);
     emit_profile_load_checkpoint("open_hfq", open_ns);
@@ -1384,6 +1394,9 @@ fn run_profile_inner(
             "Qwen4 profile runner requires gfx1151, got {}",
             gpu.arch
         ));
+    }
+    if gpu.is_uma() {
+        hfq.drop_mmap();
     }
 
     let mesh = hipfire_runtime::device_mesh::DeviceMesh::single()
@@ -1420,17 +1433,7 @@ fn run_profile_inner(
             };
             emit_profile_source_callback(index, entry, elapsed_ns, cumulative_ns);
 
-            if entry.residency.is_external() {
-                return source
-                    .tensor_range(&entry.name)
-                    .map_err(|error| error.to_string())?
-                    .map(hipfire_runtime::model_source::SourcePayload::Range)
-                    .ok_or_else(|| format!("missing external tensor '{}'", entry.name));
-            }
-            let (info, bytes) = source
-                .tensor_data(&entry.name)
-                .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
-            Ok(hipfire_runtime::model_source::SourcePayload::Borrowed { info, bytes })
+            qwen4_range_payload(&source, entry)
         },
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
@@ -1688,7 +1691,7 @@ pub fn run_state_parity(
     corpus_path: &Path,
 ) -> Result<StateParityReport, String> {
     let (tokens, corpus) = read_state_tokens(corpus_path)?;
-    let hfq = hipfire_runtime::hfq::HfqFile::open(model_path)
+    let mut hfq = hipfire_runtime::hfq::HfqFile::open(model_path)
         .map_err(|error| format!("open {}: {error}", model_path.display()))?;
     let receipt = crate::admit_hfqm_artifact(&hfq)
         .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
@@ -1703,6 +1706,9 @@ pub fn run_state_parity(
             gpu.arch
         ));
     }
+    if gpu.is_uma() {
+        hfq.drop_mmap();
+    }
     let mesh = hipfire_runtime::device_mesh::DeviceMesh::single()
         .map_err(|error| format!("qwen4 mesh: {error}"))?;
     let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
@@ -1713,19 +1719,7 @@ pub fn run_state_parity(
         config.num_hidden_layers,
         &mut gpu,
         expected,
-        |entry| {
-            if entry.residency.is_external() {
-                return source
-                    .tensor_range(&entry.name)
-                    .map_err(|error| error.to_string())?
-                    .map(hipfire_runtime::model_source::SourcePayload::Range)
-                    .ok_or_else(|| format!("missing external tensor '{}'", entry.name));
-            }
-            let (info, bytes) = source
-                .tensor_data(&entry.name)
-                .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
-            Ok(hipfire_runtime::model_source::SourcePayload::Borrowed { info, bytes })
-        },
+        |entry| qwen4_range_payload(&source, entry),
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_metadata(
