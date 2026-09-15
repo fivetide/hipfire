@@ -60,12 +60,13 @@ pub fn append_hfq_metadata_overlay(path: &Path, metadata_json: &str) -> std::io:
             ),
         ));
     }
-    let metadata_value: serde_json::Value = serde_json::from_str(metadata_json).map_err(|error| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("HFQ metadata overlay is not valid JSON: {error}"),
-        )
-    })?;
+    let metadata_value: serde_json::Value =
+        serde_json::from_str(metadata_json).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("HFQ metadata overlay is not valid JSON: {error}"),
+            )
+        })?;
     if !metadata_value.is_object() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -136,10 +137,7 @@ pub fn append_hfq_metadata_overlay(path: &Path, metadata_json: &str) -> std::io:
     Ok(())
 }
 
-fn read_hfq_metadata_overlay(
-    mmap: &Mmap,
-    payload_end: usize,
-) -> std::io::Result<String> {
+fn read_hfq_metadata_overlay(mmap: &Mmap, payload_end: usize) -> std::io::Result<String> {
     let file_len = mmap.len();
     if file_len < HFQ_METADATA_OVERLAY_FOOTER_LEN {
         return Err(std::io::Error::new(
@@ -148,11 +146,7 @@ fn read_hfq_metadata_overlay(
         ));
     }
     let footer_start = file_len - HFQ_METADATA_OVERLAY_FOOTER_LEN;
-    let metadata_len = u64::from_le_bytes(
-        mmap[footer_start..footer_start + 8]
-            .try_into()
-            .unwrap(),
-    );
+    let metadata_len = u64::from_le_bytes(mmap[footer_start..footer_start + 8].try_into().unwrap());
     let metadata_len = usize::try_from(metadata_len).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -167,8 +161,11 @@ fn read_hfq_metadata_overlay(
             ),
         ));
     }
-    let schema =
-        u32::from_le_bytes(mmap[footer_start + 8..footer_start + 12].try_into().unwrap());
+    let schema = u32::from_le_bytes(
+        mmap[footer_start + 8..footer_start + 12]
+            .try_into()
+            .unwrap(),
+    );
     if schema != HFQ_METADATA_OVERLAY_SCHEMA {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -223,7 +220,6 @@ fn read_hfq_metadata_overlay(
     }
     Ok(metadata.to_string())
 }
-
 
 /// Drop page cache for a file byte range via posix_fadvise(FADV_DONTNEED).
 /// On unified-memory APUs (e.g. Strix Halo), mmap'd model data and
@@ -807,8 +803,7 @@ impl HfqFile {
                 format!("HfqFile: not an HFQ container at offset {base}"),
             ));
         }
-        let raw_format_version =
-            u32::from_le_bytes(mmap[base + 4..base + 8].try_into().unwrap());
+        let raw_format_version = u32::from_le_bytes(mmap[base + 4..base + 8].try_into().unwrap());
         let has_metadata_overlay = raw_format_version & HFQ_METADATA_OVERLAY_FLAG != 0;
         let format_version = raw_format_version & !HFQ_METADATA_OVERLAY_FLAG;
         if format_version != HFQ_BASE_FORMAT_VERSION {
@@ -3511,7 +3506,10 @@ mod metadata_overlay_tests {
             before.len() + metadata.len() + HFQ_METADATA_OVERLAY_FOOTER_LEN
         );
         let raw_version = u32::from_le_bytes(after[4..8].try_into().unwrap());
-        assert_eq!(raw_version & !HFQ_METADATA_OVERLAY_FLAG, HFQ_BASE_FORMAT_VERSION);
+        assert_eq!(
+            raw_version & !HFQ_METADATA_OVERLAY_FLAG,
+            HFQ_BASE_FORMAT_VERSION
+        );
         assert_ne!(raw_version & HFQ_METADATA_OVERLAY_FLAG, 0);
 
         let file = HfqFile::open(&path).expect("open overlaid fixture");
@@ -3539,12 +3537,14 @@ mod metadata_overlay_tests {
             .expect("open torn fixture")
             .set_len(torn_len - 1)
             .expect("truncate footer");
-        assert!(HfqFile::open(&torn).is_err(), "torn footer must fail closed");
+        assert!(
+            HfqFile::open(&torn).is_err(),
+            "torn footer must fail closed"
+        );
 
         let corrupt = dir.path().join("corrupt.hfq");
         write_min_hfq(&corrupt, 16, &[("weight", 3, &[2, 4], b"payload!")]);
-        append_hfq_metadata_overlay(&corrupt, r#"{"tokenizer":"x"}"#)
-            .expect("append overlay");
+        append_hfq_metadata_overlay(&corrupt, r#"{"tokenizer":"x"}"#).expect("append overlay");
         let corrupt_len = std::fs::metadata(&corrupt).expect("corrupt metadata").len();
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -3594,7 +3594,10 @@ mod metadata_overlay_tests {
         write_min_hfq(&path, 16, &[("weight", 3, &[2, 4], b"payload!")]);
         let before = std::fs::read(&path).expect("read fixture");
         assert!(append_hfq_metadata_overlay(&path, "[]").is_err());
-        assert_eq!(std::fs::read(&path).expect("read unchanged fixture"), before);
+        assert_eq!(
+            std::fs::read(&path).expect("read unchanged fixture"),
+            before
+        );
     }
 }
 

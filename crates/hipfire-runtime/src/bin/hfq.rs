@@ -146,16 +146,12 @@ fn main() {
             let path = argv
                 .get(2)
                 .expect("usage: hfq meta-overlay <file> --metadata-file <f>");
-            let metadata_path =
-                flag(&argv, "--metadata-file").expect("--metadata-file required");
-            let metadata_value: serde_json::Value =
-                serde_json::from_str(
-                    &std::fs::read_to_string(metadata_path)
-                        .unwrap_or_else(|error| {
-                            panic!("read metadata file {metadata_path}: {error}")
-                        }),
-                )
-                .unwrap_or_else(|error| panic!("parse metadata file {metadata_path}: {error}"));
+            let metadata_path = flag(&argv, "--metadata-file").expect("--metadata-file required");
+            let metadata_value: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(metadata_path)
+                    .unwrap_or_else(|error| panic!("read metadata file {metadata_path}: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("parse metadata file {metadata_path}: {error}"));
             if !metadata_value.is_object() {
                 panic!("metadata file {metadata_path} must contain a complete JSON object");
             }

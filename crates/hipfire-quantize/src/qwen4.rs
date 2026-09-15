@@ -2118,12 +2118,8 @@ fn load_tokenizer_metadata(source: &SourceSet) -> Result<TokenizerMetadata, Qwen
             })?;
             let parent = first.parent().unwrap_or_else(|| Path::new("."));
             (
-                read_local_bytes(
-                    &parent.join("tokenizer.json"),
-                    MAX_TOKENIZER_BYTES,
-                    true,
-                )?
-                .expect("required local tokenizer"),
+                read_local_bytes(&parent.join("tokenizer.json"), MAX_TOKENIZER_BYTES, true)?
+                    .expect("required local tokenizer"),
                 read_local_json(&parent.join("tokenizer_config.json"), MAX_CONFIG_BYTES)?,
                 read_local_json(&parent.join("generation_config.json"), MAX_CONFIG_BYTES)?,
                 read_local_text(&parent.join("chat_template.jinja"), MAX_CONFIG_BYTES)?,
@@ -2136,8 +2132,9 @@ fn load_tokenizer_metadata(source: &SourceSet) -> Result<TokenizerMetadata, Qwen
             read_remote_optional_text(source, "chat_template.jinja", MAX_CONFIG_BYTES)?,
         ),
     };
-    let tokenizer = String::from_utf8(tokenizer_bytes)
-        .map_err(|error| Qwen4Error::Invalid(format!("Qwen4 tokenizer.json is not UTF-8: {error}")))?;
+    let tokenizer = String::from_utf8(tokenizer_bytes).map_err(|error| {
+        Qwen4Error::Invalid(format!("Qwen4 tokenizer.json is not UTF-8: {error}"))
+    })?;
     hipfire_runtime::tokenizer::Tokenizer::from_hf_json(&tokenizer).map_err(|error| {
         Qwen4Error::Invalid(format!("Qwen4 tokenizer.json is invalid: {error}"))
     })?;
@@ -2180,7 +2177,10 @@ fn read_local_bytes(
         )));
     }
     let capacity = usize::try_from(metadata.len()).map_err(|_| {
-        Qwen4Error::Invalid(format!("Qwen4 metadata file {} is too large", path.display()))
+        Qwen4Error::Invalid(format!(
+            "Qwen4 metadata file {} is too large",
+            path.display()
+        ))
     })?;
     let mut file =
         File::open(path).map_err(|error| Qwen4Error::io(path.display().to_string(), error))?;
@@ -2200,9 +2200,12 @@ fn read_local_text(path: &Path, max_bytes: u64) -> Result<Option<String>, Qwen4E
     let Some(bytes) = read_local_bytes(path, max_bytes, false)? else {
         return Ok(None);
     };
-    String::from_utf8(bytes)
-        .map(Some)
-        .map_err(|error| Qwen4Error::Invalid(format!("Qwen4 metadata {} is not UTF-8: {error}", path.display())))
+    String::from_utf8(bytes).map(Some).map_err(|error| {
+        Qwen4Error::Invalid(format!(
+            "Qwen4 metadata {} is not UTF-8: {error}",
+            path.display()
+        ))
+    })
 }
 
 fn read_local_json(path: &Path, max_bytes: u64) -> Result<Option<Value>, Qwen4Error> {
@@ -4753,7 +4756,9 @@ mod tests {
         let ple = PleMetadata {
             multipliers: vec![3, 5, 7],
             vocab_sizes: vec![127; PLE_HEAD_COUNT],
-            prefix_offsets: (0..PLE_HEAD_COUNT).map(|index| (index * 127) as i64).collect(),
+            prefix_offsets: (0..PLE_HEAD_COUNT)
+                .map(|index| (index * 127) as i64)
+                .collect(),
         };
         let plan = EntryPlan {
             entries: Vec::new(),
@@ -4791,8 +4796,7 @@ mod tests {
     #[test]
     fn qwen4_source_metadata_loads_tokenizer_and_sidecars() {
         let dir = tempdir().expect("source directory");
-        std::fs::write(dir.path().join("model.safetensors"), b"fixture")
-            .expect("source shard");
+        std::fs::write(dir.path().join("model.safetensors"), b"fixture").expect("source shard");
         let tokenizer_json = serde_json::json!({
             "model": {
                 "type": "BPE",
@@ -4812,8 +4816,7 @@ mod tests {
             ]
         })
         .to_string();
-        std::fs::write(dir.path().join("tokenizer.json"), &tokenizer_json)
-            .expect("tokenizer");
+        std::fs::write(dir.path().join("tokenizer.json"), &tokenizer_json).expect("tokenizer");
         std::fs::write(
             dir.path().join("tokenizer_config.json"),
             r#"{"add_bos_token":true}"#,
@@ -4852,9 +4855,8 @@ mod tests {
             "generation_config": metadata.generation_config,
         })
         .to_string();
-        let tokenizer =
-            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&envelope)
-                .expect("runtime tokenizer");
+        let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&envelope)
+            .expect("runtime tokenizer");
         assert_eq!(tokenizer.bos_id, 1);
         assert_eq!(tokenizer.eos_id, 2);
     }
@@ -5257,9 +5259,8 @@ mod tests {
         );
         let ple = plan.ple_metadata.as_ref().expect("pinned PLE metadata");
         let tokenizer = load_tokenizer_metadata(&source).expect("pinned tokenizer metadata");
-        let metadata_json =
-            build_metadata(Some(&config_value), &plan, ple, Some(&tokenizer))
-                .expect("metadata JSON");
+        let metadata_json = build_metadata(Some(&config_value), &plan, ple, Some(&tokenizer))
+            .expect("metadata JSON");
         println!("sparse metadata bytes={}", metadata_json.len());
         let stream_entries: Vec<_> = plan
             .entries
