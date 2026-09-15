@@ -948,7 +948,6 @@ impl Drop for PleEpochGuard<'_> {
 pub struct Qwen4GpuForward {
     pub scratch: Qwen4GpuForwardScratch,
     moe: Vec<Qwen4MoeLayerRuntime>,
-    ple_epoch: u64,
 }
 
 impl Qwen4GpuForward {
@@ -980,11 +979,7 @@ impl Qwen4GpuForward {
             let _ = scratch.free_gpu(gpu);
             return Err(error);
         }
-        Ok(Self {
-            scratch,
-            moe,
-            ple_epoch: 0,
-        })
+        Ok(Self { scratch, moe })
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), hip_bridge::HipError> {
@@ -1122,18 +1117,24 @@ impl Qwen4GpuForward {
             config.hidden_size,
         )?;
 
-        self.ple_epoch = self.ple_epoch.wrapping_add(1).max(1);
+        let ple_epoch = bundle
+            .ple_rows
+            .current_epoch()
+            .checked_add(1)
+            .ok_or_else(|| {
+                Qwen4GpuForwardError::Ple("PLE epoch exhausted at u64::MAX".to_string())
+            })?;
         bundle
-            .begin_ple_epoch(self.ple_epoch)
+            .begin_ple_epoch(ple_epoch)
             .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
         let ple_rows_resource = &bundle.ple_rows;
-        let mut ple = PleEpochGuard::new(ple_rows_resource, self.ple_epoch);
+        let mut ple = PleEpochGuard::new(ple_rows_resource, ple_epoch);
         let next_history = bundle.state.ple_history;
         let next_position = bundle.state.position;
         let attempt = (|| -> Result<(), Qwen4GpuForwardError> {
             let ticket = ple
                 .rows
-                .prefetch_before_layer0(self.ple_epoch, next_history, tokens)
+                .prefetch_before_layer0(ple_epoch, next_history, tokens)
                 .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
             ple.install_ticket(ticket);
             let mut next_history = next_history;
@@ -1375,16 +1376,10 @@ impl Qwen4GpuForward {
                 Ok(())
             }
             Err(error) => match ple.abort() {
-                Ok(next_epoch) => {
-                    self.ple_epoch = next_epoch;
-                    Err(error)
-                }
-                Err(cleanup) => {
-                    self.ple_epoch = ple.rows.current_epoch();
-                    Err(Qwen4GpuForwardError::Ple(format!(
-                        "forward attempt failed: {error}; PLE cleanup failed: {cleanup}"
-                    )))
-                }
+                Ok(_) => Err(error),
+                Err(cleanup) => Err(Qwen4GpuForwardError::Ple(format!(
+                    "forward attempt failed: {error}; PLE cleanup failed: {cleanup}"
+                ))),
             },
         }
     }
