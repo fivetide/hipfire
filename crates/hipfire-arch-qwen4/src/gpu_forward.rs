@@ -611,6 +611,7 @@ pub struct Qwen4GpuForwardScratch {
     pub qsa_k: GpuTensor,
     pub qsa_v: GpuTensor,
     pub qsa_output: GpuTensor,
+    pub attention_output: GpuTensor,
     pub ple_staged: GpuTensor,
     pub ple_rows: GpuTensor,
     pub ple_key: GpuTensor,
@@ -699,6 +700,7 @@ impl Qwen4GpuForwardScratch {
             alloc(&[config.num_key_value_heads * config.head_dim], DType::F32)?;
             alloc(&[config.num_key_value_heads * config.head_dim], DType::F32)?;
             alloc(&[q_width], DType::F32)?;
+            alloc(&[hidden], DType::F32)?;
             alloc(
                 &[max_chunk * PLE_ROWS_PER_TOKEN * (PLE_ROW_BYTES / 2)],
                 DType::BF16,
@@ -761,6 +763,7 @@ impl Qwen4GpuForwardScratch {
             qsa_k: next(),
             qsa_v: next(),
             qsa_output: next(),
+            attention_output: next(),
             ple_staged: next(),
             ple_rows: next(),
             ple_key: next(),
@@ -816,6 +819,7 @@ impl Qwen4GpuForwardScratch {
             self.qsa_k,
             self.qsa_v,
             self.qsa_output,
+            self.attention_output,
             self.ple_staged,
             self.ple_rows,
             self.ple_key,
@@ -1242,7 +1246,7 @@ impl Qwen4GpuForward {
                                 .state
                                 .gdn_mut(gdn_slot)
                                 .ok_or_else(|| invalid("GDN state slot missing"))?;
-                            let output = &self.scratch.gdn_output;
+                            let output = &self.scratch.attention_output;
                             self.apply_gdn(
                                 gpu,
                                 &config,
@@ -1261,7 +1265,7 @@ impl Qwen4GpuForward {
                                 .state
                                 .qsa_mut(qsa_slot)
                                 .ok_or_else(|| invalid("QSA state slot missing"))?;
-                            let output = &self.scratch.qsa_output;
+                            let output = &self.scratch.attention_output;
                             self.apply_qsa(
                                 gpu,
                                 &config,
