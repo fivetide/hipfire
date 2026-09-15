@@ -650,6 +650,9 @@ impl Qwen4GpuForwardScratch {
         }
         let hidden = config.hidden_size;
         let wide = config.hc_count * hidden;
+        let hc_up = wide
+            .checked_mul(config.hc_lowrank)
+            .ok_or_else(|| invalid("HC up scratch overflow"))?;
         let q_width = config.num_attention_heads * config.head_dim;
         let qsa_qgate = 2 * q_width;
         let qsa_index =
@@ -681,7 +684,7 @@ impl Qwen4GpuForwardScratch {
             alloc(&[wide], DType::F32)?;
             alloc(&[wide], DType::F32)?;
             alloc(&[config.hc_lowrank], DType::F32)?;
-            alloc(&[wide], DType::F32)?;
+            alloc(&[hc_up], DType::F32)?;
             alloc(&[hidden], DType::F32)?;
             alloc(&[config.hc_count], DType::F32)?;
             alloc(&[max_rotation], DType::F32)?;
