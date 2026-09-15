@@ -2343,8 +2343,7 @@ pub fn load_model_with_kv_backend(
             || spec.dflash.is_some_and(|enabled| enabled)
             || spec.dspark.is_some_and(|enabled| enabled)
             || spec.ngram_draft.is_some_and(|enabled| enabled)
-            || spec.ddtree_budget.is_some()
-            || spec.ddtree_topk.is_some()
+            || crate::admission::qwen4_ddtree_requested(spec)
         {
             return Err(
                 "qwen4: requested DFlash, DSpark, n-gram, DDTree, adaptive-KV, CASK, state-quant, or non-Single option is unsupported"

@@ -313,8 +313,7 @@ impl Carrier for Qwen4Carrier {
             || ctx.spec.dflash.is_some_and(|enabled| enabled)
             || ctx.spec.dspark.is_some_and(|enabled| enabled)
             || ctx.spec.ngram_draft.is_some_and(|enabled| enabled)
-            || ctx.spec.ddtree_budget.is_some()
-            || ctx.spec.ddtree_topk.is_some()
+            || crate::admission::qwen4_ddtree_requested(ctx.spec)
             || ctx.cask.sidecar.is_some()
             || ctx.state_quant_override.is_some()
             || !matches!(

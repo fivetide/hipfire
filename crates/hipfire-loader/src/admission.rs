@@ -56,6 +56,21 @@ pub(crate) const fn qwen4_native_mtp_requested(spec: SpecLoadCfg) -> bool {
     matches!(spec.mtp, Some(true))
 }
 
+const QWEN4_DDTREE_DEFAULT_BUDGET: usize = 0;
+const QWEN4_DDTREE_DEFAULT_TOPK: usize = 4;
+
+/// Return whether a Qwen4 load carries an active or non-default DDTree
+/// request. The CLI resolves schema defaults before serializing load params,
+/// so an ordinary AR load arrives as `Some(0)`/`Some(4)` rather than `None`.
+/// A non-default top-K remains unsupported even when the budget is zero.
+pub(crate) const fn qwen4_ddtree_requested(spec: SpecLoadCfg) -> bool {
+    match (spec.ddtree_budget, spec.ddtree_topk) {
+        (Some(budget), _) if budget != QWEN4_DDTREE_DEFAULT_BUDGET => true,
+        (_, Some(topk)) if topk != QWEN4_DDTREE_DEFAULT_TOPK => true,
+        _ => false,
+    }
+}
+
 /// The source-only portion of Qwen4 admission. The validated config and
 /// inventory are reused by the executable Single carrier without reopening
 /// or reclassifying the HFQM path.
@@ -676,6 +691,30 @@ mod tests {
 
         spec.mtp = Some(true);
         assert!(qwen4_native_mtp_requested(spec));
+    }
+
+    #[test]
+    fn qwen4_ddtree_schema_defaults_are_inactive_but_overrides_refuse() {
+        let defaults = SpecLoadCfg {
+            ddtree_budget: Some(0),
+            ddtree_topk: Some(4),
+            ..SpecLoadCfg::default()
+        };
+        assert!(!qwen4_ddtree_requested(defaults));
+
+        let active = SpecLoadCfg {
+            ddtree_budget: Some(1),
+            ddtree_topk: Some(4),
+            ..defaults
+        };
+        assert!(qwen4_ddtree_requested(active));
+
+        let nondefault_topk = SpecLoadCfg {
+            ddtree_budget: Some(0),
+            ddtree_topk: Some(5),
+            ..defaults
+        };
+        assert!(qwen4_ddtree_requested(nondefault_topk));
     }
 
     #[test]
