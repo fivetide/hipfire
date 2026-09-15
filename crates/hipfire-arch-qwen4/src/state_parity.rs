@@ -19,12 +19,14 @@ use crate::ple_rows::PleCacheStats;
 use crate::state::Qwen4State;
 use hip_bridge::launch_counters;
 use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
 use rdna_compute::qwen4::{
     qwen4_qsa_cache_append, qwen4_qsa_pool_rope, qwen4_qsa_reuse_selection, qwen4_qsa_select,
     Qwen4QsaCacheAppend, Qwen4QsaPoolRope, Qwen4QsaReuseSelection, Qwen4QsaSelect,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Map, Value};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -1087,6 +1089,50 @@ impl StateParityReport {
 const PROFILE_CHECKPOINT_SCHEMA: &str = "hipfire.qwen4.profile_checkpoint.v1";
 const PROFILE_CHECKPOINT_PREFIX: &str = "HIPFIRE_QWEN4_PROFILE_CHECKPOINT ";
 
+const PROFILE_SOURCE_CALLBACK_SCHEMA: &str = "hipfire.qwen4.profile_source_callback.v1";
+const PROFILE_SOURCE_CALLBACK_PREFIX: &str = "HIPFIRE_QWEN4_PROFILE_SOURCE_CALLBACK ";
+
+fn profile_elapsed_between_ns(started: Instant, ended: Instant) -> u64 {
+    ended
+        .duration_since(started)
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn profile_source_residency(residency: WeightResidency) -> Value {
+    match residency {
+        WeightResidency::Resident => json!("resident"),
+        WeightResidency::ExternalRows {
+            row_bytes,
+            valid_rows,
+        } => json!({
+            "kind": "external_rows",
+            "row_bytes": row_bytes,
+            "valid_rows": valid_rows,
+        }),
+    }
+}
+
+fn emit_profile_source_callback(
+    index: u64,
+    entry: &WeightEntry,
+    elapsed_ns: u64,
+    cumulative_ns: u64,
+) {
+    let checkpoint = json!({
+        "schema": PROFILE_SOURCE_CALLBACK_SCHEMA,
+        "index": index,
+        "name": &entry.name,
+        "layer": entry.layer,
+        "residency": profile_source_residency(entry.residency),
+        "elapsed_ns": elapsed_ns,
+        "cumulative_ns": cumulative_ns,
+    });
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "{PROFILE_SOURCE_CALLBACK_PREFIX}{checkpoint}");
+    let _ = stderr.flush();
+}
+
 fn emit_profile_checkpoint(
     phase: &str,
     wall_ns: u64,
@@ -1345,6 +1391,7 @@ fn run_profile_inner(
     let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
     let manifest_started = Instant::now();
+    let source_progress = RefCell::new((0_u64, None::<Instant>, None::<Instant>));
     let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
         &manifest.weights,
         &mesh,
@@ -1352,6 +1399,27 @@ fn run_profile_inner(
         &mut gpu,
         expected,
         |entry| {
+            let callback_started = Instant::now();
+            let (index, elapsed_ns, cumulative_ns) = {
+                let mut progress = source_progress.borrow_mut();
+                let first_started = progress.1.as_ref().copied();
+                let previous_started = progress.2.as_ref().copied();
+                let index = progress.0;
+                progress.0 = progress.0.saturating_add(1);
+                progress.1.get_or_insert(callback_started);
+                progress.2 = Some(callback_started);
+                (
+                    index,
+                    previous_started
+                        .map(|started| profile_elapsed_between_ns(started, callback_started))
+                        .unwrap_or(0),
+                    first_started
+                        .map(|started| profile_elapsed_between_ns(started, callback_started))
+                        .unwrap_or(0),
+                )
+            };
+            emit_profile_source_callback(index, entry, elapsed_ns, cumulative_ns);
+
             if entry.residency.is_external() {
                 return source
                     .tensor_range(&entry.name)
