@@ -99,11 +99,103 @@ fn is_qwen4_route(
             dtypes.shared_gate,
             dtypes.shared_expert_gate,
             dtypes.shared_expert_up,
-            dtypes.shared_expert_down,
         ]
         .contains(&DType::MQ4G128V2)
+        // The canonical Qwen4 shared-down matrix has logical K=640 and is
+        // therefore the one intentional MQ4G128V2 shared operand. Keep all
+        // other shared q53 placements out of the typed route.
+        && matches!(
+            dtypes.shared_expert_down,
+            DType::BF16 | DType::MQ4G128V2
+        )
 }
+#[cfg(test)]
+mod qwen4_route_tests {
+    use super::*;
+    use crate::families::moe::MoeDtypes;
 
+    fn canonical_dtypes() -> MoeDtypes<'static> {
+        MoeDtypes {
+            router: DType::MQ4G256V2,
+            shared_gate: DType::BF16,
+            shared_expert_gate: DType::MQ4G256V2,
+            shared_expert_up: DType::MQ4G256V2,
+            shared_expert_down: DType::MQ4G128V2,
+            experts_all_gate_up_mq4: true,
+            routed_gate_up: DType::MQ4G256V2,
+            routed_down: DType::MQ4G128V2,
+            routed_has_mixed_experts: false,
+            has_paro_shared: false,
+            per_expert_gate_up: None,
+            per_expert_down: None,
+        }
+    }
+
+    fn is_canonical_qwen4(dtypes: &MoeDtypes<'_>) -> bool {
+        is_qwen4_route(dtypes, 512, 10, 2560, 640, 2560, 2560, 640, None)
+    }
+
+    #[test]
+    fn qwen4_route_accepts_canonical_shared_down_q53() {
+        let dtypes = canonical_dtypes();
+        assert!(is_canonical_qwen4(&dtypes));
+        // The generic MoE gate remains a hard rejection; only the canonical
+        // typed route may consume this shared-down q53 operand.
+        assert!(matches!(
+            reject_mq4g128v2_moe(&dtypes),
+            Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "mq4g128v2_qwen4_typed_only",
+                quant: "MQ4G128V2",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn qwen4_route_rejects_q53_outside_shared_down_or_canonical_pair() {
+        let mut assert_rejected = |dtypes: &MoeDtypes<'_>| {
+            assert!(
+                !is_canonical_qwen4(dtypes),
+                "illegal q53 placement entered the typed Qwen4 route"
+            );
+            assert!(matches!(
+                reject_mq4g128v2_moe(dtypes),
+                Err(DispatchError::UnsupportedVariant {
+                    family: "moe",
+                    variant: "mq4g128v2_qwen4_typed_only",
+                    quant: "MQ4G128V2",
+                    ..
+                })
+            ));
+        };
+
+        let mut dtypes = canonical_dtypes();
+        dtypes.router = DType::MQ4G128V2;
+        assert_rejected(&dtypes);
+
+        let mut dtypes = canonical_dtypes();
+        dtypes.shared_gate = DType::MQ4G128V2;
+        assert_rejected(&dtypes);
+
+        let mut dtypes = canonical_dtypes();
+        dtypes.shared_expert_gate = DType::MQ4G128V2;
+        assert_rejected(&dtypes);
+
+        let mut dtypes = canonical_dtypes();
+        dtypes.shared_expert_up = DType::MQ4G128V2;
+        assert_rejected(&dtypes);
+
+        let mut dtypes = canonical_dtypes();
+        dtypes.routed_gate_up = DType::MQ4G128V2;
+        dtypes.routed_down = DType::MQ4G256V2;
+        assert_rejected(&dtypes);
+
+        let mut dtypes = canonical_dtypes();
+        dtypes.routed_gate_up = DType::MQ4G256;
+        assert_rejected(&dtypes);
+    }
+}
 
 pub struct Pipeline {
     pub ops: &'static [PipelineOp],
@@ -718,12 +810,7 @@ pub(super) fn run_moe_decode(
     // NOTE: k != 8 is intentionally NOT rejected — the fallback handles k ∈
     // [1, n_exp] (MQ4 k=4, F32 k=2, …).
     if !qwen4 {
-        check_moe_decode_supported(
-            res.use_gpu_topk,
-            p.k,
-            p.n_exp,
-            !p.routed_experts.is_empty(),
-        )?;
+        check_moe_decode_supported(res.use_gpu_topk, p.k, p.n_exp, !p.routed_experts.is_empty())?;
     }
 
     // EP (Ship 6 substrate-EP): when `routed_out` is set, the shared-down and
@@ -1857,9 +1944,9 @@ fn run_qwen4_decode(
 ) -> Result<(), DispatchError> {
     let out_target = p.routed_out.unwrap_or(p.x_residual);
 
-    // The shared expert is replicated and contributes exactly once.  Qwen4's
-    // shared projections are natural-basis dense weights, so do not reuse the
-    // routed qt44/qt53 rotations for this subgraph.
+    // The shared expert is replicated and contributes exactly once. Qwen4's
+    // gate/up projections are qt44, while its logical K=640 shared-down
+    // projection is qt53 and therefore uses the native G128 path below.
     if !p.skip_shared {
         #[cfg(feature = "deltanet")]
         {
@@ -1867,14 +1954,22 @@ fn run_qwen4_decode(
             let shared_hid = slice_moe_f32_view(p.ffn_hidden, 0, p.smi);
             hip!(gpu.silu_mul_f32(shared_gate, shared_up, &shared_hid))?;
             static GEMV_QWEN4_SHARED_DOWN: LazyLock<GemvFamily> = LazyLock::new(GemvFamily::new);
-            let gemv = &*GEMV_QWEN4_SHARED_DOWN;
-            gemv.run_auto(ctx, gpu, &p.shared_down_w, &shared_hid, p.ffn_out)
-                .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            hip!(gpu.scaled_add_inplace_gpu_scalar_f32(
-                out_target,
-                p.ffn_out,
-                p.scalar_buf
-            ))?;
+            if p.shared_down_w.dtype == DType::MQ4G128V2 {
+                let shared_down_rot = slice_moe_f32_view(p.rot_batch, 0, p.shared_down_w.k);
+                hip!(gpu.rotate_x_mq_128_v2(&shared_hid, &shared_down_rot, p.shared_down_w.k, 1,))?;
+                hip!(gpu.gemv_mq4g128v2(
+                    p.shared_down_w.buf,
+                    &shared_down_rot,
+                    p.ffn_out,
+                    p.shared_down_w.m,
+                    p.shared_down_w.k,
+                ))?;
+            } else {
+                let gemv = &*GEMV_QWEN4_SHARED_DOWN;
+                gemv.run_auto(ctx, gpu, &p.shared_down_w, &shared_hid, p.ffn_out)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            }
+            hip!(gpu.scaled_add_inplace_gpu_scalar_f32(out_target, p.ffn_out, p.scalar_buf))?;
         }
         #[cfg(not(feature = "deltanet"))]
         return Err(DispatchError::UnsupportedVariant {
@@ -3102,12 +3197,7 @@ fn run_qwen4_prefill(
     // Qwen4 gate/up weights consume the natural H->G256 FWHT basis.  The
     // model-owned x_rot_batch is overwritten here so a stale pre-rotation
     // cannot silently feed a different layer's activation.
-    hip!(gpu.rotate_x_mq_batched(
-        p.x_norm_batch,
-        p.x_rot_batch,
-        p.gate_up_k,
-        p.batch_size,
-    ))?;
+    hip!(gpu.rotate_x_mq_batched(p.x_norm_batch, p.x_rot_batch, p.gate_up_k, p.batch_size,))?;
     hip!(gpu.moe_scatter_fused_top10(
         p.topk_indices,
         p.expert_token_counts,
@@ -3146,12 +3236,7 @@ fn run_qwen4_prefill(
     let up_batch = slice_moe_f32_view(p.up_batch, 0, slots_hidden);
     let rot_batch = slice_moe_f32_view(p.rot_batch, 0, slots_hidden);
     hip!(gpu.silu_mul_f32(&gate_batch, &up_batch, &rot_batch))?;
-    hip!(gpu.rotate_x_mq_128_v2(
-        &rot_batch,
-        &rot_batch,
-        p.mi,
-        total_slots,
-    ))?;
+    hip!(gpu.rotate_x_mq_128_v2(&rot_batch, &rot_batch, p.mi, total_slots,))?;
 
     hip!(gpu.gemm_mq4g128v2_moe_grouped_top10(
         p.expert_down_ptrs,
