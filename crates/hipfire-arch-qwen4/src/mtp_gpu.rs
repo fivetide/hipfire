@@ -309,6 +309,9 @@ impl MtpGpuScratch {
             .indexer_n_heads
             .checked_mul(config.indexer_head_dim)
             .ok_or_else(|| invalid("MTP index-query width overflow"))?;
+        let hc_up = wide
+            .checked_mul(config.hc_lowrank)
+            .ok_or_else(|| invalid("MTP HC up scratch overflow"))?;
         let max_rotation = wide.max(hidden).max(config.hc_lowrank).max(q_width);
         let mut allocated = Vec::new();
         let mut alloc = |shape: &[usize], dtype: DType| -> Result<(), MtpGpuError> {
@@ -327,7 +330,7 @@ impl MtpGpuScratch {
             alloc(&[wide], DType::F32)?;
             alloc(&[wide], DType::F32)?;
             alloc(&[config.hc_lowrank], DType::F32)?;
-            alloc(&[wide], DType::F32)?;
+            alloc(&[hc_up], DType::F32)?;
             alloc(&[hidden], DType::F32)?;
             alloc(&[config.hc_count], DType::F32)?;
             alloc(&[max_rotation], DType::F32)?;
