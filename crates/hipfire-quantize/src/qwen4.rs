@@ -78,6 +78,10 @@ const PINNED_SHARD_COUNT: usize = 131;
 /// physical chunk when raw BF16, decoded F32, and encoded output together
 /// approach the 96 MiB aggregate scratch ceiling.
 pub(crate) const DEFAULT_ROW_CHUNK: usize = 4_096;
+/// External PLE rows are raw BF16 and do not need quantization scratch.  A
+/// 65,536-row range is a bounded 20 MiB request while reducing HTTP request
+/// overhead for the 128 large PLE shards.
+const EXTERNAL_PLE_ROW_CHUNK: usize = 65_536;
 const MAX_CHUNK_BYTES: u64 = 96 * 1024 * 1024;
 /// Do not let an accidental CLI value turn a row stream into a tensor buffer.
 const MAX_ROW_CHUNK: usize = 4_096;
@@ -3459,9 +3463,14 @@ fn stream_entry(
             };
             stream_raw_rows(&entry.source, row_width, 2, row_chunk, scratch, writer)
         }
-        EntryKind::Ple => {
-            stream_raw_rows(&entry.source, PLE_ROW_WIDTH, 2, row_chunk, scratch, writer)
-        }
+        EntryKind::Ple => stream_raw_rows(
+            &entry.source,
+            PLE_ROW_WIDTH,
+            2,
+            EXTERNAL_PLE_ROW_CHUNK,
+            scratch,
+            writer,
+        ),
         EntryKind::I64(_) => {
             let row_width = if entry.source.shape.len() <= 1 {
                 checked_product(&entry.source.shape, &entry.source.name)?
@@ -4172,6 +4181,7 @@ mod tests {
                 if let Some(content_range) = response_spec.content_range {
                     response.push_str(&format!("Content-Range: {content_range}\r\n"));
                 }
+
                 response.push_str("Connection: close\r\n\r\n");
                 stream
                     .write_all(response.as_bytes())
@@ -4180,6 +4190,73 @@ mod tests {
                     .write_all(response_spec.body)
                     .expect("write mock body");
             }
+        });
+        (format!("http://{address}"), handle)
+    }
+    fn spawn_http_range_counter(
+        total: u64,
+        expected_requests: usize,
+    ) -> (String, JoinHandle<Vec<(u64, u64)>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind range counter");
+        let address = listener.local_addr().expect("range counter address");
+        let handle = thread::spawn(move || {
+            let mut ranges = Vec::with_capacity(expected_requests);
+            for _ in 0..expected_requests {
+                let (mut stream, _) = listener.accept().expect("accept range request");
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0u8; 1024];
+                    let count = stream.read(&mut chunk).expect("read range request");
+                    assert!(count > 0, "range request ended before headers");
+                    request.extend_from_slice(&chunk[..count]);
+                    assert!(
+                        request.len() <= 16 * 1024,
+                        "range request headers exceeded test bound"
+                    );
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).expect("range request is UTF-8");
+                let value = request
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("Range").then(|| value.trim())
+                    })
+                    .expect("range request header");
+                let (start, end) = value
+                    .strip_prefix("bytes=")
+                    .expect("bytes range")
+                    .split_once('-')
+                    .expect("range bounds");
+                let start = start.parse::<u64>().expect("range start");
+                let end = end.parse::<u64>().expect("range end");
+                assert!(start <= end && end < total, "range exceeds fixture");
+                let length = end - start + 1;
+                let response = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {length}\r\n\
+                     Content-Range: bytes {start}-{end}/{total}\r\n\
+                     ETag: \"fixture-etag\"\r\n\
+                     X-Repo-Commit: 0123456789abcdef0123456789abcdef01234567\r\n\
+                     Connection: close\r\n\r\n"
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write range headers");
+                let mut body = [0u8; 16 * 1024];
+                let mut written = 0u64;
+                while written < length {
+                    let count = (length - written).min(body.len() as u64) as usize;
+                    for (index, byte) in body[..count].iter_mut().enumerate() {
+                        *byte = ((start + written + index as u64) % 251) as u8;
+                    }
+                    stream.write_all(&body[..count]).expect("write range body");
+                    written += count as u64;
+                }
+                ranges.push((start, end));
+            }
+            ranges
         });
         (format!("http://{address}"), handle)
     }
@@ -4953,6 +5030,195 @@ mod tests {
         let mut scratch = ScratchTracker::default();
         stream_raw_rows(&tensor, 2, 2, 1, &mut scratch, &mut output).unwrap();
         assert_eq!(output, bytes);
+    }
+
+    #[test]
+    fn external_ple_stream_uses_bounded_ranges_and_reduces_request_count() {
+        let row_bytes = PLE_ROW_WIDTH * 2;
+        let rows = EXTERNAL_PLE_ROW_CHUNK as u64 + 1;
+        let total = rows.checked_mul(row_bytes).expect("fixture length");
+        let max_range_bytes = (EXTERNAL_PLE_ROW_CHUNK as u64)
+            .checked_mul(row_bytes)
+            .expect("range length");
+        let requests_per_shard = PLE_ROWS_PER_SHARD.div_ceil(EXTERNAL_PLE_ROW_CHUNK as u64);
+        let default_requests_per_shard = PLE_ROWS_PER_SHARD.div_ceil(DEFAULT_ROW_CHUNK as u64);
+        assert_eq!(max_range_bytes, 20 * 1024 * 1024);
+        assert_eq!(requests_per_shard, 39);
+        assert_eq!(default_requests_per_shard, 611);
+        assert_eq!(
+            PLE_SHARD_COUNT * requests_per_shard as usize,
+            4_992,
+            "all external PLE shards use the larger raw range"
+        );
+        assert_eq!(
+            PLE_SHARD_COUNT * default_requests_per_shard as usize,
+            78_208,
+            "the old 4096-row request count remains the comparison baseline"
+        );
+
+        let (base, handle) = spawn_http_range_counter(total, 2);
+        let remote = Arc::new(test_remote_source(&base));
+        let path = "model.safetensors".to_string();
+        let tensor = SourceTensor {
+            name: "model.ple.ngram_embedding.shard_0.weight".to_string(),
+            dtype: "BF16".to_string(),
+            shape: vec![rows, PLE_ROW_WIDTH],
+            data_start: 0,
+            data_end: total,
+            shard: Arc::new(SourceShard {
+                path: PathBuf::from(&path),
+                kind: SourceKind::Remote {
+                    source: Arc::clone(&remote),
+                    path,
+                },
+                file_len: total,
+                local_identity: None,
+            }),
+        };
+        let entry = PlannedEntry {
+            source: tensor,
+            name: "model.ple.ngram_embedding.shard_0.weight".to_string(),
+            quant_type: 16,
+            shape: vec![rows as u32, PLE_ROW_WIDTH as u32],
+            group_size: 0,
+            data_len: total,
+            kind: EntryKind::Ple,
+        };
+        let mut scratch = ScratchTracker::default();
+        let mut output = Vec::with_capacity(total as usize);
+        stream_entry(
+            &entry,
+            DEFAULT_ROW_CHUNK,
+            &[],
+            &[],
+            &[],
+            &[],
+            &mut scratch,
+            &mut output,
+        )
+        .expect("external PLE stream");
+        let expected: Vec<u8> = (0..total).map(|offset| (offset % 251) as u8).collect();
+        assert_eq!(output, expected, "larger ranges must preserve source bytes");
+        assert_eq!(scratch.high_water, max_range_bytes);
+
+        let ranges = handle.join().expect("range counter");
+        assert_eq!(
+            ranges,
+            vec![(0, max_range_bytes - 1), (max_range_bytes, total - 1)]
+        );
+        assert_eq!(
+            ranges.iter().map(|(start, end)| end - start + 1).max(),
+            Some(max_range_bytes)
+        );
+    }
+
+    #[test]
+    fn external_ple_stream_preserves_artifact_bytes_and_plan() {
+        let rows: u32 = 3;
+        let row_bytes = PLE_ROW_WIDTH as usize * 2;
+        let bytes: Vec<u8> = (0..(rows as usize) * row_bytes)
+            .map(|offset| (offset % 251) as u8)
+            .collect();
+        let (_file, tensor) = source_tensor(&bytes, vec![rows as u64, PLE_ROW_WIDTH], "BF16");
+        let entry = PlannedEntry {
+            source: tensor,
+            name: "model.ple.ngram_embedding.shard_0.weight".to_string(),
+            quant_type: 16,
+            shape: vec![rows, PLE_ROW_WIDTH as u32],
+            group_size: 0,
+            data_len: bytes.len() as u64,
+            kind: EntryKind::Ple,
+        };
+
+        let mut baseline = Vec::new();
+        let mut baseline_scratch = ScratchTracker::default();
+        stream_raw_rows(
+            &entry.source,
+            PLE_ROW_WIDTH,
+            2,
+            DEFAULT_ROW_CHUNK,
+            &mut baseline_scratch,
+            &mut baseline,
+        )
+        .expect("baseline PLE stream");
+        let mut optimized = Vec::new();
+        let mut optimized_scratch = ScratchTracker::default();
+        stream_entry(
+            &entry,
+            DEFAULT_ROW_CHUNK,
+            &[],
+            &[],
+            &[],
+            &[],
+            &mut optimized_scratch,
+            &mut optimized,
+        )
+        .expect("optimized PLE stream");
+        assert_eq!(optimized, baseline, "PLE payload bytes must be identical");
+        assert_eq!(optimized, bytes, "PLE row order must be unchanged");
+
+        let ple = PleMetadata {
+            multipliers: vec![3, 5, 7],
+            vocab_sizes: vec![127; PLE_HEAD_COUNT],
+            prefix_offsets: (0..PLE_HEAD_COUNT)
+                .map(|index| (index * 127) as i64)
+                .collect(),
+        };
+        let plan = EntryPlan {
+            entries: vec![entry.clone()],
+            ple_metadata: Some(ple.clone()),
+            row_chunk: DEFAULT_ROW_CHUNK,
+            resident_entries: 0,
+            expert_entries: 0,
+            resident_bytes: 0,
+            external_ple_bytes: bytes.len() as u64,
+            ple_shards: 1,
+        };
+        let metadata_json = build_metadata(None, &plan, plan.ple_metadata.as_ref().unwrap(), None)
+            .expect("PLE metadata");
+        let stream_entries = vec![hipfire_runtime::hfq::HfqStreamEntry {
+            name: entry.name.clone(),
+            quant_type: entry.quant_type,
+            shape: entry.shape.clone(),
+            group_size: entry.group_size,
+            data_len: entry.data_len,
+        }];
+        let artifact = NamedTempFile::new().expect("artifact");
+        hipfire_runtime::hfq::write_hfqm_package_streaming(
+            artifact.path(),
+            QWEN4_ARCH_ID,
+            &metadata_json,
+            &stream_entries,
+            |index, writer| {
+                assert_eq!(index, 0);
+                stream_entry(
+                    &entry,
+                    DEFAULT_ROW_CHUNK,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &mut ScratchTracker::default(),
+                    writer,
+                )
+                .map_err(Qwen4Error::into_io)
+            },
+        )
+        .expect("write artifact");
+        let reopened = Qwen4ReopenPlan::open(artifact.path()).expect("reopen artifact");
+        reopened
+            .validate_against(&metadata_json, &stream_entries)
+            .expect("artifact plan");
+        let metadata: Value = serde_json::from_str(&metadata_json).expect("metadata JSON");
+        assert_eq!(
+            metadata["qwen4_streaming"]["row_chunk"].as_u64(),
+            Some(DEFAULT_ROW_CHUNK as u64)
+        );
+        let file = std::fs::File::open(artifact.path()).expect("open artifact payload");
+        let mut payload = vec![0u8; bytes.len()];
+        read_exact_at(&file, reopened.entries[0].data_offset, &mut payload)
+            .expect("read artifact payload");
+        assert_eq!(payload, bytes, "artifact payload bytes must be unchanged");
     }
 
     #[test]
