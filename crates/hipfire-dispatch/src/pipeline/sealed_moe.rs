@@ -4600,7 +4600,8 @@ mod tests {
             (MoeContribution::Residual, MoeSharedContribution::None)
         );
         assert_eq!(
-            resolve_decode_grammar(MoeEpMode::RootRoutedPartial, true, true, false, 0, 2,).unwrap(),
+            resolve_decode_grammar(MoeEpMode::RootRoutedPartial, true, false, false, 0, 2,)
+                .unwrap(),
             (
                 MoeContribution::ZeroedPartial,
                 MoeSharedContribution::RootPartial
@@ -4611,11 +4612,10 @@ mod tests {
             (MoeContribution::ZeroedPartial, MoeSharedContribution::None)
         );
         assert!(
-            resolve_decode_grammar(MoeEpMode::RootRoutedPartial, true, false, false, 0, 2,)
-                .is_err()
+            resolve_decode_grammar(MoeEpMode::RootRoutedPartial, true, true, false, 0, 2,).is_err()
         );
         assert!(
-            resolve_decode_grammar(MoeEpMode::RootRoutedPartial, false, true, false, 0, 2,)
+            resolve_decode_grammar(MoeEpMode::RootRoutedPartial, false, false, false, 0, 2,)
                 .is_err()
         );
     }
@@ -6338,6 +6338,7 @@ mod tests {
             normalized: false,
             indices: &indices,
             weights: &weights,
+            adopted_from: None,
         };
         let wrong_protocol = MoeRouteReceipt {
             invocation: expected.invocation,
@@ -6349,6 +6350,7 @@ mod tests {
             normalized: expected.normalized,
             indices: expected.indices,
             weights: expected.weights,
+            adopted_from: None,
         };
         assert!(validate_route_receipt_pair(&expected, &wrong_protocol).is_err());
 
@@ -6362,6 +6364,7 @@ mod tests {
             normalized: expected.normalized,
             indices: expected.indices,
             weights: expected.weights,
+            adopted_from: None,
         };
         assert!(validate_route_receipt_pair(&expected, &wrong_router).is_err());
 
@@ -6375,6 +6378,7 @@ mod tests {
             normalized: expected.normalized,
             indices: expected.indices,
             weights: expected.weights,
+            adopted_from: None,
         };
         assert!(validate_route_receipt_pair(&expected, &wrong_dimensions).is_err());
 
@@ -6388,6 +6392,7 @@ mod tests {
             normalized: expected.normalized,
             indices: &other_indices,
             weights: &other_weights,
+            adopted_from: None,
         };
         assert!(validate_route_receipt_pair(&expected, &swapped_buffers).is_err());
     }

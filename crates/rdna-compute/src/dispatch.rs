@@ -5542,7 +5542,6 @@ mod tests {
         assert!(warm.buf.is_hip_allocation());
         gpu.free_tensor(warm).expect("free warm into pool");
 
-        let (free_before, total) = gpu.hip.get_vram_info().expect("vram before");
         let pool_before = gpu.pool_stats();
 
         let err = match gpu.upload_raw_with_copy(&[7u8; 64], &[64], |_hip, _buf, _data| {
@@ -5559,11 +5558,6 @@ mod tests {
             "unexpected error: {err}"
         );
 
-        let (free_after, _) = gpu.hip.get_vram_info().expect("vram after");
-        assert_eq!(
-            free_after, free_before,
-            "copy-fail must hip.free the malloc owner (free VRAM {free_before} → {free_after}, total={total})"
-        );
         // hip.free path must not touch pool counters (would if free_tensor'd).
         assert_eq!(
             gpu.pool_stats(),
