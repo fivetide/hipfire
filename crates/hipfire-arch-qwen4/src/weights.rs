@@ -39,14 +39,8 @@ fn qwen4_quantized_dtype(dtype: DType) -> bool {
 }
 
 fn qwen4_quantizable_matrix(name: &str, shape: &[usize]) -> bool {
-    match shape.len() {
-        2 => {
-            !name.ends_with(".shared_expert_gate.weight")
-                && !name.contains(".ngram_embedding.shard_")
-        }
-        3 => name.ends_with(".experts.down_proj") || name.ends_with(".experts.gate_up_proj"),
-        _ => false,
-    }
+    shape.len() == 3
+        && (name.ends_with(".experts.down_proj") || name.ends_with(".experts.gate_up_proj"))
 }
 
 fn qwen4_matrix_dtype(shape: &[usize]) -> DType {
@@ -208,11 +202,7 @@ impl ExternalRowsRef {
         {
             return Err(WeightError::DescriptorMismatch(self.name.clone()));
         }
-        let Some(file) = descriptor
-            .source_identity()
-            .files
-            .get(indexed.file_index)
-        else {
+        let Some(file) = descriptor.source_identity().files.get(indexed.file_index) else {
             return Err(WeightError::DescriptorMismatch(self.name.clone()));
         };
         let end = descriptor
@@ -228,7 +218,6 @@ impl ExternalRowsRef {
         }
         Ok(())
     }
-
 }
 /// I64 metadata is retained as an exact source declaration rather than being
 /// coerced into a floating-point `WeightEntry`.  The HFQM writer serializes
@@ -1214,15 +1203,9 @@ impl Qwen4Weights {
                 "{name}: resident alias cycle"
             )));
         }
-        let Some(taken) = self
-            .taken
-            .iter()
-            .find(|taken| {
-                taken.key.name == name
-                    && taken.key.layer == layer
-                    && taken.key.device == device
-            })
-        else {
+        let Some(taken) = self.taken.iter().find(|taken| {
+            taken.key.name == name && taken.key.layer == layer && taken.key.device == device
+        }) else {
             return Err(WeightError::MissingResident {
                 name: name.to_string(),
                 layer,
@@ -1950,22 +1933,19 @@ mod tests {
                     gate_up,
                     "model.language_model.layers.0.mlp.experts.gate_up_proj"
                 );
-                assert_eq!(
-                    down,
-                    "model.language_model.layers.0.mlp.experts.down_proj"
-                );
+                assert_eq!(down, "model.language_model.layers.0.mlp.experts.down_proj");
                 assert!(sidecars.is_empty());
             }
             other => panic!("pinned Qwen4 source inventory must stay PackedFused: {other:?}"),
         }
     }
     #[test]
-    fn matrix_roles_select_q44_or_q53_and_keep_nonmatrices_bf16() {
+    fn routed_expert_matrices_quantize_and_all_rank2_nonexperts_stay_bf16() {
         let tensor = |name: &str, shape: &[usize]| {
             TensorRef::new(
                 name,
-                TensorRole::SharedExpertUp,
-                None,
+                TensorRole::RoutedGateUp,
+                Some(0),
                 shape.to_vec(),
                 DType::BF16,
             )
@@ -1973,71 +1953,114 @@ mod tests {
         };
         assert_eq!(
             tensor(
-                "model.language_model.layers.0.self_attn.q_proj.weight",
-                &[12288, 2560]
+                "model.language_model.layers.0.mlp.experts.gate_up_proj",
+                &[2, 4, 256],
             )
             .dtype,
             DType::MQ4G256V2
         );
         assert_eq!(
             tensor(
-                "model.language_model.layers.0.self_attn.q_proj.weight",
-                &[7, 641]
+                "model.language_model.layers.0.mlp.experts.down_proj",
+                &[2, 4, 128],
             )
             .dtype,
             DType::MQ4G128V2
         );
         assert_eq!(
-            tensor(
-                "model.language_model.layers.1.ple.ple_embedding.key_proj.weight",
-                &[2560, 641],
-            )
-            .dtype,
+            tensor("mtp.layers.0.mlp.experts.gate_up_proj", &[2, 4, 256]).dtype,
+            DType::MQ4G256V2
+        );
+        assert_eq!(
+            tensor("mtp.layers.0.mlp.experts.down_proj", &[2, 4, 128]).dtype,
             DType::MQ4G128V2
         );
-        assert_eq!(
-            tensor(
-                "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
-                &[PLE_SHARD_ROWS, PLE_ROW_WIDTH],
-            )
-            .dtype,
-            DType::BF16
-        );
-        assert_eq!(
-            tensor(
-                "model.language_model.layers.0.mlp.shared_expert_gate.weight",
-                &[1, 641],
-            )
-            .dtype,
-            DType::BF16
-        );
-        assert_eq!(
-            tensor(
-                "model.language_model.layers.0.linear_attn.conv1d.weight",
-                &[10240, 1, 4],
-            )
-            .dtype,
-            DType::BF16
-        );
-        assert_eq!(
-            tensor("model.language_model.layers.0.linear_attn.A_log", &[48],).dtype,
-            DType::BF16
-        );
+
+        for name in [
+            "model.language_model.embed_tokens.weight",
+            "lm_head.weight",
+            "model.language_model.layers.0.mlp.gate.weight",
+            "model.language_model.layers.0.mlp.shared_expert.up_proj.weight",
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+            "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight",
+            "model.language_model.layers.1.ple.ple_embedding.key_proj.weight",
+        ] {
+            assert_eq!(
+                tensor(name, &[2, 256]).dtype,
+                DType::BF16,
+                "rank-2 nonexpert {name} must remain source-exact BF16"
+            );
+        }
     }
 
     #[test]
-    fn quantized_matrix_entries_accept_bf16_and_both_wire_dtypes() {
+    fn manifest_admits_quantized_routed_experts_and_bf16_nonexperts() {
         let manifest = Qwen4Manifest::build(&pinned_config()).expect("pinned config manifest");
-        let entry = manifest
-            .entry(
+        for (name, layer, dtype, accepts_quant) in [
+            (
+                "model.language_model.layers.3.mlp.experts.gate_up_proj",
+                Some(3),
+                DType::MQ4G256V2,
+                true,
+            ),
+            (
+                "model.language_model.layers.3.mlp.experts.down_proj",
+                Some(3),
+                DType::MQ4G128V2,
+                true,
+            ),
+            (
+                "mtp.layers.0.mlp.experts.gate_up_proj",
+                None,
+                DType::MQ4G256V2,
+                true,
+            ),
+            (
+                "mtp.layers.0.mlp.experts.down_proj",
+                None,
+                DType::MQ4G128V2,
+                true,
+            ),
+        ] {
+            let entry = manifest.entry(name, layer).expect("routed expert entry");
+            assert_eq!(entry.dtype, dtype, "{name} target dtype");
+            assert!(entry.dtype_constraint.accepts(DType::BF16));
+            assert_eq!(
+                entry.dtype_constraint.accepts(dtype),
+                accepts_quant,
+                "{name} source constraint"
+            );
+        }
+
+        let assert_bf16 = |name: &str, layer: Option<usize>| {
+            let entry = manifest.entry(name, layer).expect("BF16 nonexpert entry");
+            assert_eq!(entry.dtype, DType::BF16, "{name} target dtype");
+            assert!(entry.dtype_constraint.accepts(DType::BF16));
+            assert!(!entry.dtype_constraint.accepts(DType::MQ4G256V2));
+            assert!(!entry.dtype_constraint.accepts(DType::MQ4G128V2));
+        };
+        for (name, layer) in [
+            (
                 "model.language_model.layers.3.self_attn.q_proj.weight",
                 Some(3),
-            )
-            .expect("q projection");
-        assert_eq!(entry.dtype, DType::MQ4G256V2);
-        assert!(entry.dtype_constraint.accepts(DType::BF16));
-        assert!(entry.dtype_constraint.accepts(DType::MQ4G256V2));
-        assert!(entry.dtype_constraint.accepts(DType::MQ4G128V2));
+            ),
+            (
+                "model.language_model.layers.2.linear_attn.in_proj_qkv.weight",
+                Some(2),
+            ),
+            ("model.language_model.layers.3.mlp.gate.weight", Some(3)),
+            (
+                "model.language_model.layers.3.mlp.shared_expert.up_proj.weight",
+                Some(3),
+            ),
+        ] {
+            assert_bf16(name, layer);
+        }
+        for name in ["model.language_model.embed_tokens.weight", "lm_head.weight"] {
+            assert_bf16(name, None);
+        }
+
         let ple = manifest
             .entry(
                 "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",

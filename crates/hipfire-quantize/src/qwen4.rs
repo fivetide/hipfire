@@ -70,9 +70,9 @@ const PINNED_METADATA_BYTES: u64 = 4_000;
 #[cfg(test)]
 const PINNED_INDEX_BYTES: u64 = 116_418;
 #[cfg(test)]
-const PINNED_PAYLOAD_BYTES: u64 = 170_625_677_336;
+const PINNED_PAYLOAD_BYTES: u64 = 177_986_811_416;
 #[cfg(test)]
-const PINNED_PREDICTED_OUTPUT_BYTES: u64 = 170_625_800_216;
+const PINNED_PREDICTED_OUTPUT_BYTES: u64 = 177_986_934_296;
 const PINNED_SHARD_COUNT: usize = 131;
 /// Default bounded source row chunk. Quantized matrices derive a smaller
 /// physical chunk when raw BF16, decoded F32, and encoded output together
@@ -551,28 +551,6 @@ fn plan_compact_entries(
                 },
                 quantized_data_len_for_dtype(dtype, rows, k)?,
                 kind,
-            )
-        } else if tensor.shape.len() == 2 && !tensor.name.ends_with(".shared_expert_gate.weight") {
-            let rows = tensor.shape[0];
-            let k = tensor.shape[1];
-            let dtype = if k % MQ4G256V2_GROUP_SIZE == 0 {
-                DType::MQ4G256V2
-            } else {
-                DType::MQ4G128V2
-            };
-            (
-                match dtype {
-                    DType::MQ4G256V2 => MQ4G256V2_QUANT_TYPE,
-                    DType::MQ4G128V2 => MQ4G128V2_QUANT_TYPE,
-                    _ => unreachable!(),
-                },
-                match dtype {
-                    DType::MQ4G256V2 => MQ4G256V2_GROUP_SIZE as u32,
-                    DType::MQ4G128V2 => MQ4G128V2_GROUP_SIZE as u32,
-                    _ => unreachable!(),
-                },
-                quantized_data_len_for_dtype(dtype, rows, k)?,
-                EntryKind::Matrix(dtype),
             )
         } else {
             (
@@ -4653,6 +4631,72 @@ mod tests {
         );
         assert!(quantized_data_len(ExpertKind::GateUp, 1, 640).is_err());
         assert!(validate_expert_shape_stub(&[512, 1280, 2559], ExpertKind::GateUp).is_err());
+    }
+    #[test]
+    fn compact_plan_preserves_nonexpert_bf16_and_quantizes_only_rank3_experts() {
+        let (_ple_file, ple) = named_source(
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
+            &vec![0u8; PLE_ROW_WIDTH as usize * 2],
+            vec![1, PLE_ROW_WIDTH],
+            "BF16",
+        );
+        let (_q_file, q_proj) = named_source(
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            &vec![0u8; 2 * 256 * 2],
+            vec![2, 256],
+            "BF16",
+        );
+        let (_shared_file, shared_up) = named_source(
+            "model.language_model.layers.0.mlp.shared_expert.up_proj.weight",
+            &vec![0u8; 2 * 256 * 2],
+            vec![2, 256],
+            "BF16",
+        );
+        let (_gate_file, gate_up) = named_source(
+            "model.language_model.layers.0.mlp.experts.gate_up_proj",
+            &vec![0u8; 2 * 2 * 256 * 2],
+            vec![2, 2, 256],
+            "BF16",
+        );
+        let (_down_file, down) = named_source(
+            "mtp.layers.0.mlp.experts.down_proj",
+            &vec![0u8; 2 * 2 * 128 * 2],
+            vec![2, 2, 128],
+            "BF16",
+        );
+
+        let plan = plan_compact_entries(vec![ple, q_proj, shared_up, gate_up, down], 2)
+            .expect("compact plan");
+        let entry = |name: &str| {
+            plan.entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap_or_else(|| panic!("missing planned entry {name}"))
+        };
+
+        for name in [
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            "model.language_model.layers.0.mlp.shared_expert.up_proj.weight",
+        ] {
+            let entry = entry(name);
+            assert_eq!(entry.kind, EntryKind::Bf16, "{name} plan kind");
+            assert_eq!(entry.quant_type, 16, "{name} quant type");
+            assert_eq!(entry.group_size, 0, "{name} group size");
+            assert_eq!(entry.data_len, 2 * 256 * 2, "{name} byte count");
+        }
+
+        let gate_up = entry("model.language_model.layers.0.mlp.experts.gate_up_proj");
+        assert_eq!(gate_up.kind, EntryKind::GateUp);
+        assert_eq!(gate_up.quant_type, MQ4G256V2_QUANT_TYPE);
+        assert_eq!(gate_up.group_size, MQ4G256V2_GROUP_SIZE as u32);
+        assert_eq!(gate_up.data_len, 4 * MQ4G256V2_GROUP_BYTES);
+
+        let down = entry("mtp.layers.0.mlp.experts.down_proj");
+        assert_eq!(down.kind, EntryKind::Down);
+        assert_eq!(down.quant_type, MQ4G128V2_QUANT_TYPE);
+        assert_eq!(down.group_size, MQ4G128V2_GROUP_SIZE as u32);
+        assert_eq!(down.data_len, 4 * MQ4G128V2_GROUP_BYTES);
+        assert_eq!(plan.expert_entries, 2);
     }
     #[test]
     fn production_chunk_budget_covers_pinned_gate_up_and_rejects_oversized_values() {
