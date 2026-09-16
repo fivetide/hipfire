@@ -4998,6 +4998,7 @@ pub fn forward_prefill_dense_tp(
                         false,
                         false,
                         None,
+                        None,
                     )?;
                     crate::qwen35::prefill::batch_chunk_upload_positions(
                         &mut gpus.devices[rank],
@@ -6053,9 +6054,10 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
         };
         // Root only: route once on-GPU, write owned expert rows into the
-        // global slot layout, accumulate the shared expert into `partial`,
-        // and mint the sealer-built producer proof. Routed rows are folded
-        // only after every rank's slot outputs have been gathered to root.
+        // global slot layout, accumulate the shared expert into the replicated
+        // residual base, and mint the sealer-built producer proof. Routed rows
+        // are folded only after every rank's slot outputs have been gathered to
+        // root.
         moe_ffn_dispatch_root_ep(gpu, ctx, ffn, &s.x, ffn_norm, config, s, partial)
             .map_err(|e| DispatchError::Hip(e.to_string()))
     }
@@ -6144,8 +6146,8 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         gpu: &mut Gpu,
         partial: &GpuTensor,
     ) -> Result<(), DispatchError> {
-        // s.x += the root-combined routed partial copied byte-for-byte to
-        // every rank.
+        // s.x already contains the shared expert on root and is synchronized
+        // to every rank before the root-combined routed partial is added.
         let s = self.s;
         gpu.add_inplace_f32(&s.x, partial)
             .map_err(|e| DispatchError::Hip(e.to_string()))
@@ -6190,6 +6192,13 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             topk_weights: s.moe_topk_weights.as_ref()?,
             slot_outputs: s.moe_down_expanded.as_ref()?,
         })
+    }
+
+    fn ep_moe_shared_residual(&self) -> Option<&GpuTensor> {
+        match self.layer {
+            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => Some(&self.s.x),
+            _ => None,
+        }
     }
 
     fn run_recurrent(

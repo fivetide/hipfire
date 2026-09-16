@@ -566,6 +566,14 @@ pub trait ForwardBindings {
         None
     }
 
+    /// Borrow the replicated residual after the root has evaluated the shared
+    /// expert. Root-routed decode synchronizes this base to non-root ranks
+    /// before gathering routed slots so the final residual add preserves the
+    /// single-device order `(residual + shared) + routed`.
+    fn ep_moe_shared_residual(&self) -> Option<&GpuTensor> {
+        None
+    }
+
     /// Whether this rank replaces replicated `Attend` with a rank-local
     /// attention projection whose hidden-width result must be all-reduced.
     /// False by default, so existing Qwen, MiniMax, and single-rank routes do

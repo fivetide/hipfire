@@ -655,7 +655,11 @@ impl<'a> SealedMoeOp<'a> {
     pub(super) fn shared_activation(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         if let Ok((params, selection)) = self.state.decode_parts() {
             let (shared_gate, shared_up) = self.state.shared_views()?;
-            let target = params.routed_out.unwrap_or(params.x_residual);
+            let target = if params.ep_mode == crate::families::moe::MoeEpMode::RootRoutedPartial {
+                params.x_residual
+            } else {
+                params.routed_out.unwrap_or(params.x_residual)
+            };
             return super::decode_shared_down_stage(
                 self.state.dispatch_ctx(),
                 gpu,
@@ -673,7 +677,11 @@ impl<'a> SealedMoeOp<'a> {
     pub(super) fn shared_down(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         if let Ok((params, selection)) = self.state.decode_parts() {
             let (shared_gate, shared_up) = self.state.shared_views()?;
-            let target = params.routed_out.unwrap_or(params.x_residual);
+            let target = if params.ep_mode == crate::families::moe::MoeEpMode::RootRoutedPartial {
+                params.x_residual
+            } else {
+                params.routed_out.unwrap_or(params.x_residual)
+            };
             return super::decode_shared_down_stage(
                 self.state.dispatch_ctx(),
                 gpu,
@@ -781,7 +789,16 @@ impl<'a> SealedMoeOp<'a> {
             selection.path2_m_total,
             total_slots,
             selection.force_mq4_grouped_fp16,
-        )
+        )?;
+        let compact_ep = matches!(
+            &params.prelude.route,
+            super::sealed_moe::PrefillRouteMode::ProduceRoot { .. }
+                | super::sealed_moe::PrefillRouteMode::AdoptRoot { .. }
+        );
+        if compact_ep && selection.resolution.use_path2 {
+            super::prefill_down_unscatter_stage(gpu, params, total_slots)?;
+        }
+        Ok(())
     }
 
     pub(super) fn combine(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
@@ -793,11 +810,17 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
+        let canonical_slot_order = matches!(
+            &params.prelude.route,
+            super::sealed_moe::PrefillRouteMode::ProduceRoot { .. }
+                | super::sealed_moe::PrefillRouteMode::AdoptRoot { .. }
+        );
         super::prefill_combine_stage(
             gpu,
             params,
             &selection.resolution,
             params.routed_out.unwrap_or(params.x_batch),
+            canonical_slot_order,
         )
     }
 

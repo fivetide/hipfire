@@ -84,6 +84,19 @@ fn accepts_actual_moe_collective_position_and_reuses_contract_identity() {
     assert_eq!(decode.contribution_count(), 512);
     assert_eq!(decode.contribution_chunk(), 32);
 }
+#[test]
+fn accepts_source_named_ep_collective_rows() {
+    let contract = contract(
+        3,
+        vec![3, 5],
+        vec![
+            row("qwen35.layer.3.expert.gate_up", 3, ContractAxis::Ep),
+            row("qwen35.layer.3.expert.down", 3, ContractAxis::Ep),
+        ],
+    );
+    derive(&contract, 2, 3, 16, 128, 32, RootRoutedEpReduction::Decode)
+        .expect("source-named EP rows must authorize the root-routed schedule");
+}
 
 #[test]
 fn rejects_duplicate_moe_collective_rows() {
@@ -101,11 +114,13 @@ fn rejects_duplicate_moe_collective_rows() {
 }
 
 #[test]
-fn rejects_missing_moe_collective_row() {
-    let contract = contract(3, vec![3, 5], vec![row("attention", 3, ContractAxis::Ep)]);
+fn rejects_missing_ep_collective_row() {
+    let contract = contract(3, vec![3, 5], Vec::new());
     let error = derive(&contract, 2, 3, 16, 128, 32, RootRoutedEpReduction::Decode)
-        .expect_err("a schedule without its named moe row must be refused");
-    assert!(error.to_string().contains("no moe EP all-reduce row"));
+        .expect_err("a schedule without an EP collective row must be refused");
+    assert!(error
+        .to_string()
+        .contains("admitted root-routed EP contract"));
 }
 
 #[test]

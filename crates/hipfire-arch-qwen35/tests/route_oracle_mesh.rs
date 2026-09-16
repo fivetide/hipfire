@@ -12,11 +12,16 @@
 //! deterministic kernels make the two equivalent). The dense PP/TP tests assert
 //! token ids, bounded logits, KV geometry/byte extents, the position counter,
 //! alias identity and route identity, then print an evidence block. The EP
-//! tests instead assert cross-rank route/state agreement inside the mesh and
-//! report the cross-route deltas/argmax as a diagnostic only (no parity
-//! bound, no argmax-identity mandate). Pattern follows the template
-//! oracle (`hipfire-arch-llama` `pinned_fixture_manifest_legacy_parity_oracle`)
-//! and goes beyond `pp_parity.rs` (which compares argmax tokens only).
+//! tests assert cross-rank route/state agreement inside the mesh and strict
+//! byte equality of the recorded rank-0 logits at every committed position.
+//! `HIPFIRE_HAVE_2_GPU=1` gates physical multi-GPU runs; the snapshotted
+//! `HIPFIRE_EMULATE_GPUS >= 2` runtime policy also admits logical EP runs on
+//! one physical device. Emulation is accepted only for the exact four-logical
+//! rank, single-gfx1151 batch shape below; it is diagnostic evidence, not
+//! physical EP transport, synchronization, throughput, or product admission.
+//! Pattern follows the template oracle
+//! (`hipfire-arch-llama` `pinned_fixture_manifest_legacy_parity_oracle`) and
+//! goes beyond `pp_parity.rs` (which compares argmax tokens only).
 //!
 //! Relationship decisions (verified from code, not assumed):
 //! * PP2-vs-single — BOUNDED (tokens `assert_eq`, max abs logit diff <= 2.0).
@@ -43,44 +48,41 @@
 //!   (3.0 with `HIPFIRE_DN_STATE_EF=0`). Bound 1.0 is 2x measured worst;
 //!   tokens exact throughout (3 runs). Precedent: `qwen_dense_tp2_parity.rs`
 //!   claims argmax-exact + relative error < 3e-3, never bit-exact.
-//! * EP2-vs-single (MoE) — ROUTE/STATE AGREEMENT + numerics diagnostic (no
-//!   universal single-parity bound). Production decode is root-routed partial
+//! * EP2-vs-single (MoE) — ROUTE/STATE AGREEMENT + strict single parity.
+//!   Production decode is root-routed partial
 //!   (`EpMoeCombineMode::RootRoutedPartial` / `indexed-decode-routed-partial`):
 //!   the root authorizes a GPU top-K route (`MoeRouteProducerProof` + route IDs);
-//!   non-roots install those IDs (no local router authority); each rank folds
-//!   owned experts into a zeroed rank partial; the driver all-reduces the
-//!   partials and each rank adds the reduced sum into its residual. The
-//!   asserted EP invariants are therefore cross-RANK, inside the mesh: after
-//!   every `forward_ep` (which ends with a per-rank `device_synchronize`),
-//!   each rank's last-layer `moe_topk_indices` + `moe_topk_weights` bytes
-//!   equal the root's, and each rank's post-collective residual `s.x`
-//!   float-bits equal the root's (the final norm reads `s.x` into `s.tmp`
-//!   on rank 0 only, so `s.x` — not `s.tmp` — is the comparable residual).
-//!   Compared logits must be finite. The independent single route runs a
-//!   different expert association (dense local top-K over all experts), so
-//!   its logits/argmax are reported per position as a diagnostic only —
-//!   no 1e-3 ceiling, no argmax-identity mandate. Snapshot lockstep pins
-//!   KV + DeltaNet + the FULL scratch (30 fixed + 14 MoE-opt incl. top-k
-//!   indices/weights and `moe_down_expanded` + pos_bufs, all by true
-//!   `DeviceBuffer::size`) so the discrete router sees identical inputs.
-//!   Lockstep (not interleaving) is the design: top-k is discrete and small
-//!   grouping noise under interleaved forcing can flip experts.
-//! * EP4-vs-EP2 (MoE) — ROUTE/STATE AGREEMENT + numerics diagnostic (no
-//!   universal bound). Same root-authoritative GPU route + rank-partial
-//!   association as EP2-vs-single; expert-to-rank stride differs (`e%4` vs
-//!   `e%2`) so the owned-expert residency map differs while the
-//!   root-authorized route and partial all-reduce stay the same. Asserted:
+//!   non-roots install those IDs (no local router authority). The repaired
+//!   path gathers the global expert slots at the root and then uses the
+//!   ordinary canonical slot-order combine. The asserted EP invariants are
+//!   therefore cross-RANK, inside the mesh: after every `forward_ep` (which
+//!   ends with a per-rank `device_synchronize`), each rank's last-layer
+//!   `moe_topk_indices` + `moe_topk_weights` bytes equal the root's, and each
+//!   rank's post-collective residual `s.x` float-bits equal the root's (the
+//!   final norm reads `s.x` into `s.tmp` on rank 0 only, so `s.x` — not `s.tmp`
+//!   — is the comparable residual). Compared logits must be finite and their
+//!   complete f32 bit vectors must equal the single route at every position.
+//!   Snapshot lockstep pins KV + DeltaNet + the FULL scratch (30 fixed + 14
+//!   MoE-opt incl. top-k indices/weights and `moe_down_expanded` + pos_bufs,
+//!   all by true `DeviceBuffer::size`) so the discrete router sees identical
+//!   inputs. Lockstep (not interleaving) is the design: top-k is discrete and
+//!   small grouping noise under interleaved forcing can flip experts.
+//! * EP4-vs-EP2 (MoE) — ROUTE/STATE AGREEMENT + strict cross-mesh parity.
+//!   Both sides gather global expert slots at the root and then use the
+//!   ordinary canonical slot-order combine; the repaired association no longer
+//!   depends on the expert-to-rank stride (`e%4` vs `e%2`). Asserted:
 //!   per-rank route-byte and post-collective residual agreement inside the
-//!   EP4 mesh, finite logits. EP2 rank-0 logits are the diagnostic reference
-//!   only (snapshot lockstep uses EP2 rank-0 pre-step bytes as the reference).
+//!   EP4 mesh, finite logits, and complete byte equality between every recorded
+//!   EP2 rank-0 logit vector and the EP4 rank-0 vector.
 //!
 //! Substrate note: the EP tests drive the qwen35-level EP substrate directly
 //! (sealed per-rank `load_weights_ep_rank` over the `init_ep` mesh +
 //! `forward_ep` root-routed partial driver) because only the direct substrate
 //! exposes the per-rank scratch/KV/DeltaNet state these snapshot/forced-state
 //! comparisons restore and download. The product TP4 EP serve path is
-//! validated separately through the daemon. No `pub` seam is missing: every
-//! symbol used here is already `pub`.
+//! validated separately through the daemon. The batch oracle uses one
+//! read-only diagnostic observation helper for its private rank outputs; no
+//! user-facing config or CLI seam is involved.
 //!
 //! Run (EVERY GPU command flock-wrapped):
 //! ```sh
@@ -91,6 +93,10 @@
 //! cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_mesh \
 //! -- --ignored --test-threads=1
 //! ```
+//!
+//! For the single-device diagnostic EP shape, leave `HIPFIRE_HAVE_2_GPU`
+//! unset, set `HIP_VISIBLE_DEVICES=0` and `HIPFIRE_EMULATE_GPUS=2` or `4`,
+//! and select the required peer-allreduce transport externally.
 
 use hipfire_arch_qwen35::qwen35::{
     self, DeltaNetState, HfqSource, Layout, Qwen35BatchLoadConfig, Qwen35Config,
@@ -123,17 +129,34 @@ const MOE_SHA256: &str = "84103fcc8ade42aa2ac8ec01176df7a4ead5e94810597c9fae2f67
 // worst-case per-position diffs (see evidence output) at ~2x headroom, rounded
 // up; a wrong expert / wrong reduction / wrong band would move logits by
 // orders of magnitude more, and any token flip inside a bound is a hard
-// failure. TP measured worst 4.6e-1 (EF-on, 27 positions) → 1.0; PP measured
-// worst 8.1e-1 → 2.0. The EP oracles assert cross-rank route/state agreement
-// instead, so they carry no logit bound (single/EP2 cross-route deltas are a
-// reported diagnostic, never a ceiling).
+// failure. The EP oracles assert cross-rank route/state agreement and strict
+// rank-0 logit equality, so they carry no logit bound.
 const BOUND_PP_ABS: f32 = 2.0;
 const BOUND_TP_ABS: f32 = 1.0;
 
 // ── gates / fixtures ─────────────────────────────────────────────────────────
 
+fn emulation_enabled() -> bool {
+    hipfire_runtime::config::get().emulate_gpus.is_some()
+}
+
 fn have_mesh() -> bool {
-    std::env::var("HIPFIRE_HAVE_2_GPU").as_deref() == Ok("1")
+    std::env::var("HIPFIRE_HAVE_2_GPU").as_deref() == Ok("1") || emulation_enabled()
+}
+
+/// Exact diagnostic exception for four logical ranks aliased to one Halo GPU.
+fn emulated_single_gfx1151_ep4(gpus: &Gpus) -> bool {
+    if !emulation_enabled() || gpus.devices.len() != 4 {
+        return false;
+    }
+    let Some(first) = gpus.devices.first() else {
+        return false;
+    };
+    first.arch == "gfx1151"
+        && gpus
+            .devices
+            .iter()
+            .all(|gpu| gpu.arch == "gfx1151" && gpu.device_id == first.device_id)
 }
 
 fn dense_fixture() -> String {
@@ -222,6 +245,32 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b.iter())
         .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()))
+}
+fn record_f32_bit_mismatch(
+    tag: &str,
+    pos: usize,
+    expected: &[f32],
+    actual: &[f32],
+    failures: &mut Vec<String>,
+) {
+    if expected.len() != actual.len() {
+        failures.push(format!(
+            "pos {pos}: {tag} width {} != {}",
+            actual.len(),
+            expected.len()
+        ));
+        return;
+    }
+    for (lane, (&want, &got)) in expected.iter().zip(actual).enumerate() {
+        if want.to_bits() != got.to_bits() {
+            failures.push(format!(
+                "pos {pos}: {tag} lane {lane}: expected {:08x} != actual {:08x}",
+                want.to_bits(),
+                got.to_bits()
+            ));
+            return;
+        }
+    }
 }
 
 fn chatml_prompt(tok: &Tokenizer) -> Vec<u32> {
@@ -1593,34 +1642,34 @@ fn assert_ep_rank_agreement(
     failures
 }
 
-// ── 3. EP2 vs single (MoE, route/state agreement + numerics diagnostic) ──────────
+// ── 3. EP2 vs single (MoE, route/state agreement + strict parity) ────────────────
 
 /// `qwen35_ep2_vs_single_oracle` — MoE A3B (256 experts, top_k=8),
 /// expert-parallel EP=2 vs single.
 ///
-/// Relationship: ROUTE/STATE AGREEMENT inside the mesh, plus a reported
-/// cross-route numerics diagnostic — NOT single parity. Asserted after every
-/// `forward_ep`: all ranks' last-layer `moe_topk_indices` + `moe_topk_weights`
-/// bytes equal the root's, all ranks' post-collective residual `s.x`
-/// float-bits equal the root's, and compared logits are finite (see
-/// `assert_ep_rank_agreement`). The independent single route associates
-/// experts differently, so its logits/argmax are logged per position for
-/// diagnosis with no ceiling and no argmax-identity mandate.
+/// Relationship: ROUTE/STATE AGREEMENT inside the mesh plus strict byte-exact
+/// single parity. Asserted after every `forward_ep`: all ranks' last-layer
+/// `moe_topk_indices` + `moe_topk_weights` bytes equal the root's, all ranks'
+/// post-collective residual `s.x` float-bits equal the root's, compared logits
+/// are finite, and the complete rank-0 logit vector equals the recorded single
+/// vector at every committed position (see `assert_ep_rank_agreement`). The
+/// repaired association gathers global expert slots at the root and then uses
+/// the ordinary canonical slot-order combine, so the strict comparison is
+/// intentional rather than a diagnostic bound.
 /// Production MoE EP decode is root-routed partial: root issues
 /// `MoeRouteProducerProof` + route IDs on the GPU top-K path; non-roots
-/// install those IDs; each rank folds owned experts into a zeroed rank
-/// partial; the runtime all-reduces the partials and each rank adds the
-/// reduced sum into its residual (not a raw-slot gather to root).
-/// Comparison is snapshot lockstep: the reference single route's KV +
-/// DeltaNet + FULL scratch (30 fixed + 14 MoE-opt + pos_bufs, true
-/// `DeviceBuffer::size`) are snapshotted pre-step and restored into both
-/// ranks, so the discrete router sees identical inputs.
+/// install those IDs. Snapshot lockstep restores the reference single route's
+/// KV + DeltaNet + FULL scratch (30 fixed + 14 MoE-opt + pos_bufs, true
+/// `DeviceBuffer::size`) before each forced mesh step, so the discrete router
+/// sees identical inputs.
 #[test]
 #[ignore]
 fn qwen35_ep2_vs_single_oracle() {
     const TEST: &str = "qwen35-ep2-oracle";
     if !have_mesh() {
-        eprintln!("skip: {TEST} needs HIPFIRE_HAVE_2_GPU=1 and 2+ GPUs");
+        eprintln!(
+            "skip: {TEST} needs HIPFIRE_HAVE_2_GPU=1 with physical ranks or runtime emulation"
+        );
         return;
     }
     let path = moe_fixture();
@@ -1746,12 +1795,10 @@ fn qwen35_ep2_vs_single_oracle() {
 
     // Snapshot-lockstep replay: restore every rank to the reference pre-step
     // bytes, step forced with the same token, then check the actual EP
-    // contract — cross-rank route/state agreement — while logging the
-    // independent-single cross-route delta as a diagnostic only (different
-    // expert association; no ceiling, no argmax-identity mandate, so a legit
-    // association delta never fails the test). Failures accumulate across
-    // all positions and the mesh is freed BEFORE the terminal assert, so a
-    // real cross-rank failure cannot leak GPU owners into the next test.
+    // contract — cross-rank route/state agreement plus strict single-route
+    // rank-0 logit equality. Failures accumulate across all positions and the
+    // mesh is freed BEFORE the terminal assert, so a real cross-rank or
+    // cross-route failure cannot leak GPU owners into the next test.
     let mut worst: f32 = 0.0;
     let mut agreement_failures: Vec<String> = Vec::new();
     for pos in 0..total {
@@ -1803,6 +1850,9 @@ fn qwen35_ep2_vs_single_oracle() {
             ));
             continue;
         }
+        if recorded[pos].iter().any(|v| !v.is_finite()) {
+            agreement_failures.push(format!("pos {pos}: single logits non-finite"));
+        }
         if ep_logits.iter().any(|v| !v.is_finite()) {
             agreement_failures.push(format!("pos {pos}: EP logits non-finite"));
         }
@@ -1817,14 +1867,17 @@ fn qwen35_ep2_vs_single_oracle() {
                 dump.as_ref(),
             ));
         }
+        record_f32_bit_mismatch(
+            "single-vs-ep rank-0 logits",
+            pos,
+            &recorded[pos],
+            &ep_logits,
+            &mut agreement_failures,
+        );
         let diff = max_abs_diff(&recorded[pos], &ep_logits);
         worst = worst.max(diff);
-        // Diagnostic only: the single route associates experts independently,
-        // so neither the delta nor any argmax divergence is asserted.
-        let single_choice = argmax(&recorded[pos]);
-        let ep_choice = argmax(&ep_logits);
         eprintln!(
-            "{TEST}: pos {pos:>2} token {token:>6} max-logit-diff {diff:.3e} (single choice {single_choice}, ep choice {ep_choice})",
+            "{TEST}: pos {pos:>2} token {token:>6} exact-logit-check max-abs-diff {diff:.3e}",
             token = committed[pos]
         );
     }
@@ -1837,8 +1890,8 @@ fn qwen35_ep2_vs_single_oracle() {
         total,
         worst,
         None,
-        "route-state-agreement",
-        "root-routed GPU route + rank-partial all-reduce (stride e%2 owned-expert map); per-rank route-byte and post-collective residual agreement asserted, logits finite; single cross-route delta/argmax reported as diagnostic only, no parity bound",
+        "root-gathered-global-slots-canonical-combine",
+        "root-gathered global expert slots followed by the ordinary canonical slot-order combine; per-rank route-byte and post-combine residual agreement asserted, logits finite, and every single-vs-EP2 rank-0 logit vector compared byte-exactly at each committed position",
     );
     mesh.free();
     assert!(
@@ -1847,32 +1900,33 @@ fn qwen35_ep2_vs_single_oracle() {
         agreement_failures.join("\n")
     );
     eprintln!(
-        "{TEST}: PASS — {total} committed positions, worst single-vs-ep logit diff {worst:.3e}"
+        "{TEST}: PASS — {total} committed positions, strict single-vs-ep rank-0 logit equality (worst abs diff {worst:.3e})"
     );
 }
 
-// ── 4. EP4 vs EP2 (MoE, route/state agreement + numerics diagnostic) ─────────────
+// ── 4. EP4 vs EP2 (MoE, route/state agreement + strict parity) ───────────────────
 
 /// `qwen35_ep4_vs_ep2_oracle` — MoE A3B, expert-parallel EP=4 vs EP=2.
 ///
-/// Relationship: ROUTE/STATE AGREEMENT inside the EP4 mesh, plus a reported
-/// cross-mesh numerics diagnostic — NOT parity. Asserted after every
-/// `forward_ep`: all four ranks' last-layer `moe_topk_indices` +
-/// `moe_topk_weights` bytes equal the EP4 root's, all four ranks'
-/// post-collective residual `s.x` float-bits equal the EP4 root's, and
-/// compared logits are finite (see `assert_ep_rank_agreement`). Both sides
-/// run the same root-authoritative GPU route + rank-partial association;
-/// expert-to-rank stride differs (`e%4` vs `e%2`), so the owned-expert
-/// residency map differs while the root-authorized route and partial
-/// all-reduce stay the same. Recorded EP2 rank-0 logits are a diagnostic
-/// reference only (snapshot lockstep uses EP2 rank-0 pre-step bytes as the
-/// reference), with no ceiling and no argmax-identity mandate.
+/// Relationship: ROUTE/STATE AGREEMENT inside the EP4 mesh plus strict
+/// cross-mesh parity. Asserted after every `forward_ep`: all four ranks'
+/// last-layer `moe_topk_indices` + `moe_topk_weights` bytes equal the EP4
+/// root's, all four ranks' post-collective residual `s.x` float-bits equal
+/// the EP4 root's, compared logits are finite, and each EP4 rank-0 logit
+/// vector equals the recorded EP2 rank-0 vector byte-for-byte. Both sides
+/// gather global expert slots at the root and then use the ordinary canonical
+/// slot-order combine; the `e%4`/`e%2` residency stride is not a numerical
+/// association difference. Snapshot lockstep restores EP2 rank-0 pre-step
+/// bytes before each forced EP4 step, so the discrete router sees identical
+/// inputs.
 #[test]
 #[ignore]
 fn qwen35_ep4_vs_ep2_oracle() {
     const TEST: &str = "qwen35-ep4-vs-ep2-oracle";
     if !have_mesh() {
-        eprintln!("skip: {TEST} needs HIPFIRE_HAVE_2_GPU=1 and 4 GPUs");
+        eprintln!(
+            "skip: {TEST} needs HIPFIRE_HAVE_2_GPU=1 with physical ranks or runtime emulation"
+        );
         return;
     }
     let path = moe_fixture();
@@ -1973,12 +2027,11 @@ fn qwen35_ep4_vs_ep2_oracle() {
 
     // Snapshot-lockstep replay: restore all four ranks to the EP=2 pre-step
     // bytes, step forced with the same token, then check the actual EP
-    // contract — cross-rank route/state agreement inside the EP4 mesh — while
-    // logging the EP2 cross-mesh delta as a diagnostic only (different
-    // owned-expert residency; no ceiling, no argmax-identity mandate, so a
-    // legit association delta never fails the test). Failures accumulate
-    // across all positions and the mesh is freed BEFORE the terminal assert,
-    // so a real cross-rank failure cannot leak GPU owners into the next test.
+    // contract — cross-rank route/state agreement inside the EP4 mesh plus
+    // strict EP2 rank-0 logit equality. Failures accumulate across all
+    // positions and the mesh is freed BEFORE the terminal assert, so a real
+    // cross-rank or cross-route failure cannot leak GPU owners into the next
+    // test.
     let mut worst: f32 = 0.0;
     let mut agreement_failures: Vec<String> = Vec::new();
     for pos in 0..total {
@@ -2011,6 +2064,9 @@ fn qwen35_ep4_vs_ep2_oracle() {
             ));
             continue;
         }
+        if recorded[pos].iter().any(|v| !v.is_finite()) {
+            agreement_failures.push(format!("pos {pos}: EP2 logits non-finite"));
+        }
         if logits4.iter().any(|v| !v.is_finite()) {
             agreement_failures.push(format!("pos {pos}: EP4 logits non-finite"));
         }
@@ -2025,15 +2081,17 @@ fn qwen35_ep4_vs_ep2_oracle() {
                 dump.as_ref(),
             ));
         }
+        record_f32_bit_mismatch(
+            "ep2-vs-ep4 rank-0 logits",
+            pos,
+            &recorded[pos],
+            &logits4,
+            &mut agreement_failures,
+        );
         let diff = max_abs_diff(&recorded[pos], &logits4);
         worst = worst.max(diff);
-        // Diagnostic only: the EP2 reference associates owned experts under a
-        // different stride, so neither the delta nor any argmax divergence is
-        // asserted.
-        let ep2_choice = argmax(&recorded[pos]);
-        let ep4_choice = argmax(&logits4);
         eprintln!(
-            "{TEST}: pos {pos:>2} token {token:>6} max-logit-diff {diff:.3e} (ep2 choice {ep2_choice}, ep4 choice {ep4_choice})",
+            "{TEST}: pos {pos:>2} token {token:>6} exact-logit-check max-abs-diff {diff:.3e}",
             token = committed[pos]
         );
     }
@@ -2046,8 +2104,8 @@ fn qwen35_ep4_vs_ep2_oracle() {
         total,
         worst,
         None,
-        "route-state-agreement",
-        "root-routed GPU route + rank-partial all-reduce on both sides; stride e%4 vs e%2 changes owned-expert residency only; per-rank route-byte and post-collective residual agreement asserted inside the EP4 mesh, logits finite; EP2 cross-mesh delta/argmax reported as diagnostic only, no parity bound",
+        "root-gathered-global-slots-canonical-combine",
+        "root-gathered global expert slots followed by the ordinary canonical slot-order combine on both sides; per-rank route-byte and post-combine residual agreement asserted inside EP4, logits finite, and every EP2-vs-EP4 rank-0 logit vector compared byte-exactly at each committed position",
     );
     ep4.free();
     assert!(
@@ -2056,7 +2114,7 @@ fn qwen35_ep4_vs_ep2_oracle() {
         agreement_failures.join("\n")
     );
     eprintln!(
-        "{TEST}: PASS — {total} committed positions, worst ep2-vs-ep4 logit diff {worst:.3e}"
+        "{TEST}: PASS — {total} committed positions, strict ep2-vs-ep4 rank-0 logit equality (worst abs diff {worst:.3e})"
     );
 }
 
@@ -2127,7 +2185,51 @@ fn batch_trace_event(
         error,
     }
 }
-
+fn observe_batch_rank_outputs(
+    batch: &Qwen35DecodeBatchEpState,
+    gpus: &mut Gpus,
+    operation: &str,
+    failures: &mut Vec<String>,
+) {
+    let (root_logits, residuals) = match batch.download_rank_outputs(gpus) {
+        Ok(outputs) => outputs,
+        Err(error) => {
+            failures.push(format!(
+                "{operation}: rank-output download failed: {error:?}"
+            ));
+            return;
+        }
+    };
+    if root_logits.iter().any(|value| !value.is_finite()) {
+        failures.push(format!("{operation}: rank-0 logits non-finite"));
+    }
+    if residuals.len() != 4 {
+        failures.push(format!(
+            "{operation}: residual rank count {} != 4",
+            residuals.len()
+        ));
+        return;
+    }
+    if residuals[0].iter().any(|value| !value.is_finite()) {
+        failures.push(format!(
+            "{operation}: rank-0 post-combine residual non-finite"
+        ));
+    }
+    for rank in 1..residuals.len() {
+        if residuals[rank].iter().any(|value| !value.is_finite()) {
+            failures.push(format!(
+                "{operation}: rank {rank} post-combine residual non-finite"
+            ));
+        }
+        record_f32_bit_mismatch(
+            &format!("{operation} post-combine residual rank {rank}"),
+            0,
+            &residuals[0],
+            &residuals[rank],
+            failures,
+        );
+    }
+}
 #[derive(Debug, Serialize)]
 struct BatchTraceFile {
     kind: &'static str,
@@ -2190,7 +2292,9 @@ fn seed_ep_batch(
 fn qwen35_ep4_batch_step_recipe_oracle() {
     const TEST: &str = "qwen35-ep4-batch-step-recipe-oracle";
     if !have_mesh() {
-        eprintln!("skip: {TEST} needs HIPFIRE_HAVE_2_GPU=1 and 4 GPUs");
+        eprintln!(
+            "skip: {TEST} needs HIPFIRE_HAVE_2_GPU=1 with physical ranks or runtime emulation"
+        );
         return;
     }
     let path = moe_fixture();
@@ -2209,11 +2313,12 @@ fn qwen35_ep4_batch_step_recipe_oracle() {
     let Some(mut mesh) = load_ep_mesh(TEST, &path, 4) else {
         return;
     };
+    let emulated_halo = emulated_single_gfx1151_ep4(&mesh.gpus);
     let mut physical_ids: Vec<i32> = mesh.gpus.devices.iter().map(|gpu| gpu.device_id).collect();
     let all_gfx1201 = mesh.gpus.devices.iter().all(|gpu| gpu.arch == "gfx1201");
     physical_ids.sort_unstable();
     let distinct_devices = physical_ids.windows(2).all(|pair| pair[0] != pair[1]);
-    if mesh.gpus.devices.len() != 4 || !all_gfx1201 || !distinct_devices {
+    if !emulated_halo && (mesh.gpus.devices.len() != 4 || !all_gfx1201 || !distinct_devices) {
         eprintln!(
             "skip: {TEST} requires four distinct gfx1201 devices (got {:?}, archs {:?})",
             physical_ids,
@@ -2306,6 +2411,12 @@ fn qwen35_ep4_batch_step_recipe_oracle() {
                 &positions,
             )
             .unwrap_or_else(|error| panic!("{TEST}: reference forward tick {tick}: {error:?}"));
+        observe_batch_rank_outputs(
+            &batch,
+            &mut mesh.gpus,
+            &format!("reference active tick {tick}"),
+            &mut failures,
+        );
         let mut sampled = [0u32; 2];
         let mut next_rng = [0u32; 2];
         for lane in 0..2 {
@@ -2438,6 +2549,12 @@ fn qwen35_ep4_batch_step_recipe_oracle() {
             &[prompt_pos, prompt_pos],
         )
         .unwrap_or_else(|error| panic!("{TEST}: valid retry failed: {error:?}"));
+    observe_batch_rank_outputs(
+        &batch,
+        &mut mesh.gpus,
+        "valid retry active tick",
+        &mut failures,
+    );
     let mut valid_sampled = [0u32; 2];
     let mut valid_rng = [0u32; 2];
     for lane in 0..2 {
@@ -2503,6 +2620,12 @@ fn qwen35_ep4_batch_step_recipe_oracle() {
             &[prompt_pos, prompt_pos],
         )
         .unwrap_or_else(|error| panic!("{TEST}: lane-0 inactive probe: {error:?}"));
+    observe_batch_rank_outputs(
+        &batch,
+        &mut mesh.gpus,
+        "inactive lane-0-only tick",
+        &mut failures,
+    );
     let (lane0_after_inactive, lane0_after_inactive_rng) = batch
         .sample_lane(
             &mut mesh.gpus,
@@ -2542,6 +2665,12 @@ fn qwen35_ep4_batch_step_recipe_oracle() {
                 &positions,
             )
             .unwrap_or_else(|error| panic!("{TEST}: replay forward tick {tick}: {error:?}"));
+        observe_batch_rank_outputs(
+            &batch,
+            &mut mesh.gpus,
+            &format!("replay active tick {tick}"),
+            &mut failures,
+        );
         let mut sampled = [0u32; 2];
         let mut next_rng = [0u32; 2];
         for lane in 0..2 {

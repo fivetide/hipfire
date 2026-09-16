@@ -85,9 +85,77 @@ fn layer_moe_ffn_norm(layer: &LayerWeights) -> Option<&GpuTensor> {
     }
 }
 
-/// Validate EP batch compatibility for the exact 4×gfx1201 MQ4R route.
-/// Fails closed on any mismatch: arch, PP, provenance, geometry, dtype,
-/// REAP/paged/AWQ/GL, Q8/EF, capacities, LDS. Returns attested receipt on success.
+fn validate_ep_batch_architecture(
+    architectures: &[&str],
+    physical_devices: &[i32],
+    emulation_enabled: bool,
+) -> HipResult<()> {
+    if architectures.len() != 4 {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "EP batch: architecture list must contain 4 ranks, got {}",
+                architectures.len()
+            ),
+        ));
+    }
+    if physical_devices.len() != 4 {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "EP batch: physical device list must contain 4 ranks, got {}",
+                physical_devices.len()
+            ),
+        ));
+    }
+    if let Some((rank, &device)) = physical_devices
+        .iter()
+        .enumerate()
+        .find(|(_, &device)| device < 0)
+    {
+        return Err(HipError::new(
+            0,
+            &format!("EP batch: rank {rank} has invalid physical device id {device}"),
+        ));
+    }
+
+    if emulation_enabled {
+        if architectures.iter().all(|&arch| arch == "gfx1151") {
+            let physical_device = physical_devices[0];
+            if physical_devices
+                .iter()
+                .all(|&device| device == physical_device)
+            {
+                return Ok(());
+            }
+            return Err(HipError::new(
+                0,
+                "EP batch: emulation requires all gfx1151 ranks to alias one physical device",
+            ));
+        }
+        return Err(HipError::new(
+            0,
+            "EP batch: emulation requires exactly four gfx1151 ranks",
+        ));
+    }
+
+    if architectures.iter().all(|&arch| arch == "gfx1201") {
+        return Ok(());
+    }
+    let (rank, arch) = architectures
+        .iter()
+        .enumerate()
+        .find(|(_, &arch)| arch != "gfx1201")
+        .expect("non-gfx1201 architecture must exist");
+    Err(HipError::new(
+        0,
+        &format!("EP batch: rank {rank} arch {arch} != gfx1201"),
+    ))
+}
+
+/// Validate EP batch compatibility for the exact four-rank MQ4R route:
+/// ordinary execution requires gfx1201 on every rank; diagnostic emulation
+/// requires four gfx1151 logical ranks aliased to one physical device.
 pub fn validate_ep_batch_compatibility(
     gpus: &Gpus,
     weights_per_rank: &[Qwen35Weights],
@@ -131,14 +199,22 @@ pub fn validate_ep_batch_compatibility(
             ),
         ));
     }
-    for (i, dev) in gpus.devices.iter().enumerate() {
-        if !dev.arch_caps.is_gfx1201() {
-            return Err(HipError::new(
-                0,
-                &format!("EP batch: rank {i} arch {} != gfx1201", dev.arch),
-            ));
-        }
-    }
+    let emulation_enabled = hipfire_runtime::config::get().emulate_gpus.is_some();
+    let architectures: Vec<&str> = gpus
+        .devices
+        .iter()
+        .map(|dev| {
+            if dev.arch_caps.is_gfx1201() {
+                "gfx1201"
+            } else if dev.arch_caps.is_gfx1151() {
+                "gfx1151"
+            } else {
+                dev.arch.as_str()
+            }
+        })
+        .collect();
+    let physical_devices: Vec<i32> = gpus.devices.iter().map(|dev| dev.device_id).collect();
+    validate_ep_batch_architecture(&architectures, &physical_devices, emulation_enabled)?;
     if gpus.layer_to_device.len() != config.n_layers {
         return Err(HipError::new(
             0,
@@ -1118,7 +1194,6 @@ struct PrefillRootScheduleContext<'a> {
     reduce_count: usize,
     route_count: usize,
     contribution_count: usize,
-    grouped_outputs: bool,
 }
 
 impl PrefillRootScheduleContext<'_> {
@@ -1306,11 +1381,7 @@ impl PrefillRootScheduleContext<'_> {
                 "Qwen root EP slot-output rank {rank} PBS is unavailable"
             ))
         })?;
-        let output = if self.grouped_outputs {
-            pbs.moe_y_down_grouped.as_ref()
-        } else {
-            pbs.moe_down_expanded_batch.as_ref()
-        };
+        let output = pbs.moe_down_expanded_batch.as_ref();
         output.ok_or_else(|| {
             hipfire_dispatch::types::DispatchError::Hip(format!(
                 "Qwen root EP slot-output rank {rank} is unavailable"
@@ -1391,6 +1462,7 @@ fn execute_prefill_root_schedule(
         |ctx, gpu, partial, _admission| ctx.root_compute(gpu, partial),
         |ctx, rank| ctx.route_buffers(rank),
         |ctx, rank, gpu, proof, partial| ctx.rank_contribute(gpu, rank, proof, partial),
+        |_ctx, _gpus, _count| Ok(()),
         |ctx, gpu, partial| ctx.finish_combine(gpu, partial),
         |_ctx, _rank, _gpu, _partial| Ok(()),
         |ctx, rank, gpu, partial| {
@@ -1424,7 +1496,6 @@ struct TickRootScheduleContext<'a> {
     reduce_count: usize,
     route_count: usize,
     contribution_count: usize,
-    grouped_outputs: bool,
     model_has_mq6_moe: bool,
     full_mask: u64,
 }
@@ -1618,11 +1689,7 @@ impl TickRootScheduleContext<'_> {
                 ))
             })?
             .pbs;
-        let output = if self.grouped_outputs {
-            pbs.moe_y_down_grouped.as_ref()
-        } else {
-            pbs.moe_down_expanded_batch.as_ref()
-        };
+        let output = pbs.moe_down_expanded_batch.as_ref();
         output.ok_or_else(|| {
             hipfire_dispatch::types::DispatchError::Hip(format!(
                 "Qwen root EP slot-output rank {rank} is unavailable"
@@ -1702,6 +1769,7 @@ fn execute_tick_root_schedule(
         |ctx, gpu, partial, _admission| ctx.root_compute(gpu, partial),
         |ctx, rank| ctx.route_buffers(rank),
         |ctx, rank, gpu, proof, partial| ctx.rank_contribute(gpu, rank, proof, partial),
+        |_ctx, _gpus, _count| Ok(()),
         |ctx, gpu, partial| ctx.finish_combine(gpu, partial),
         |ctx, _rank, gpu, partial| {
             if ctx.active_mask != ctx.full_mask {
@@ -1777,6 +1845,32 @@ impl Qwen35DecodeBatchEpState {
     pub fn lane_state(&self, lane: usize) -> Option<LaneState> {
         self.lane_states.get(lane).copied()
     }
+    /// Download the root logits and every rank's post-combine residual.
+    ///
+    /// This read-only diagnostic seam is consumed by the ignored route oracle;
+    /// it intentionally exposes no mutable batch state or product-facing API.
+    #[doc(hidden)]
+    pub fn download_rank_outputs(&self, gpus: &mut Gpus) -> HipResult<(Vec<f32>, Vec<Vec<f32>>)> {
+        if gpus.devices.len() != self.ranks.len() || gpus.devices.is_empty() {
+            return Err(HipError::new(
+                0,
+                "download_rank_outputs: rank count mismatch",
+            ));
+        }
+        let mut root_logits = None;
+        let mut residuals = Vec::with_capacity(self.ranks.len());
+        for rank in 0..self.ranks.len() {
+            let gpu = &mut gpus.devices[rank];
+            gpu.bind_thread()?;
+            gpu.hip.device_synchronize()?;
+            if rank == 0 {
+                root_logits = Some(gpu.download_f32(&self.ranks[rank].logits)?);
+            }
+            residuals.push(gpu.download_f32(&self.ranks[rank].pbs.x_batch)?);
+        }
+        Ok((root_logits.expect("non-empty rank outputs"), residuals))
+    }
+
     pub fn new(
         gpus: &mut Gpus,
         weights_per_rank: &[Qwen35Weights],
@@ -2228,18 +2322,17 @@ impl Qwen35DecodeBatchEpState {
                         })?;
                         let routed = self.seed_partials[0].sub_offset(0, reduce_count);
                         let dispatch_ctx = DispatchCtx::new(&gpus.devices[0]);
-                        let (contribution_count, grouped_outputs) =
-                            super::prefill::moe_ffn_batched_ep_slot_geometry(
-                                &gpus.devices[0],
-                                ffn,
-                                ffn_norm,
-                                config,
-                                &self.seed_pbs[0],
-                                chunk_n,
-                                &dispatch_ctx,
-                                weights_per_rank[0].moe_has_mq6,
-                                &routed,
-                            )?;
+                        let contribution_count = super::prefill::moe_ffn_batched_ep_slot_geometry(
+                            &gpus.devices[0],
+                            ffn,
+                            ffn_norm,
+                            config,
+                            &self.seed_pbs[0],
+                            chunk_n,
+                            &dispatch_ctx,
+                            weights_per_rank[0].moe_has_mq6,
+                            &routed,
+                        )?;
                         let schedule = RootRoutedEpSchedule::derive(
                             contract,
                             n,
@@ -2274,7 +2367,6 @@ impl Qwen35DecodeBatchEpState {
                             contract_id: schedule.contract_id(),
                             rank_count: n,
                             contribution_count,
-                            grouped_outputs,
                             reduce_count,
                             route_count,
                         };
@@ -2597,18 +2689,17 @@ impl Qwen35DecodeBatchEpState {
                         .ok_or_else(|| HipError::new(0, "forward_tick: MoE FFN norm missing"))?;
                     let routed = self.decode_partials[0].sub_offset(0, reduce_count);
                     let dispatch_ctx = DispatchCtx::new(&gpus.devices[0]);
-                    let (contribution_count, grouped_outputs) =
-                        super::prefill::moe_ffn_batched_ep_slot_geometry(
-                            &gpus.devices[0],
-                            ffn,
-                            ffn_norm,
-                            config,
-                            &self.ranks[0].pbs,
-                            b,
-                            &dispatch_ctx,
-                            weights_per_rank[0].moe_has_mq6,
-                            &routed,
-                        )?;
+                    let contribution_count = super::prefill::moe_ffn_batched_ep_slot_geometry(
+                        &gpus.devices[0],
+                        ffn,
+                        ffn_norm,
+                        config,
+                        &self.ranks[0].pbs,
+                        b,
+                        &dispatch_ctx,
+                        weights_per_rank[0].moe_has_mq6,
+                        &routed,
+                    )?;
                     let schedule = RootRoutedEpSchedule::derive(
                         contract,
                         n,
@@ -2644,7 +2735,6 @@ impl Qwen35DecodeBatchEpState {
                         reduce_count,
                         route_count,
                         contribution_count,
-                        grouped_outputs,
                         model_has_mq6_moe: weights_per_rank[0].moe_has_mq6,
                         full_mask,
                     };
@@ -3391,18 +3481,17 @@ pub fn forward_prefill_batch_ep(
                 })?;
             let routed = partials[0].sub_offset(0, reduce_count);
             let dispatch_ctx = DispatchCtx::new(&gpus.devices[0]);
-            let (contribution_count, grouped_outputs) =
-                super::prefill::moe_ffn_batched_ep_slot_geometry(
-                    &gpus.devices[0],
-                    ffn,
-                    ffn_norm,
-                    config,
-                    &pbs_per_rank[0],
-                    n,
-                    &dispatch_ctx,
-                    weights_per_rank[0].moe_has_mq6,
-                    &routed,
-                )?;
+            let contribution_count = super::prefill::moe_ffn_batched_ep_slot_geometry(
+                &gpus.devices[0],
+                ffn,
+                ffn_norm,
+                config,
+                &pbs_per_rank[0],
+                n,
+                &dispatch_ctx,
+                weights_per_rank[0].moe_has_mq6,
+                &routed,
+            )?;
             let reduction = if ep_skip_ar {
                 RootRoutedEpReduction::PrefillSkipAllReduce
             } else {
@@ -3440,7 +3529,6 @@ pub fn forward_prefill_batch_ep(
                 reduce_count,
                 route_count,
                 contribution_count,
-                grouped_outputs,
             };
             execute_prefill_root_schedule(
                 gpus,
@@ -5876,5 +5964,24 @@ mod tests {
         assert!(ep_tick_inputs_prepared(usize::MAX));
         // Saturating representative: any non-zero later band is prepared.
         assert!(ep_tick_inputs_prepared(usize::MAX.saturating_sub(1)));
+    }
+
+    #[test]
+    fn qwen35_ep_batch_architecture_policy_is_exact() {
+        let gfx1201 = ["gfx1201"; 4];
+        let gfx1151 = ["gfx1151"; 4];
+        let other = ["gfx1100"; 4];
+        let physical = [0, 1, 2, 3];
+        let aliased = [0, 0, 0, 0];
+
+        assert!(validate_ep_batch_architecture(&gfx1201, &physical, false).is_ok());
+        assert!(validate_ep_batch_architecture(&gfx1151, &aliased, false).is_err());
+        assert!(validate_ep_batch_architecture(&gfx1151, &aliased, true).is_ok());
+        assert!(validate_ep_batch_architecture(&gfx1151, &physical, true).is_err());
+        assert!(validate_ep_batch_architecture(&gfx1151, &[0, 0, 1, 0], true).is_err());
+        assert!(validate_ep_batch_architecture(&gfx1201, &aliased, true).is_err());
+        assert!(validate_ep_batch_architecture(&other, &aliased, true).is_err());
+        assert!(validate_ep_batch_architecture(&gfx1151, &[-1, -1, -1, -1], true).is_err());
+        assert!(validate_ep_batch_architecture(&gfx1151[..3], &aliased[..3], true).is_err());
     }
 }

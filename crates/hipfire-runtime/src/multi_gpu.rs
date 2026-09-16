@@ -22,8 +22,9 @@
 
 use crate::device_mesh::{DeviceMesh, DimKind};
 use hip_bridge::{
-    DeviceBuffer, Event, HipError, HipResult, RcclComms, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
-    HIP_ERROR_PEER_ACCESS_UNSUPPORTED, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
+    DeviceBuffer, Event, HipError, HipResult, HipRuntime, RcclComms,
+    HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
+    HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -489,6 +490,10 @@ impl Gpus {
             self.devices[i].bind_thread()?;
             for j in 0..n {
                 if i == j {
+                    continue;
+                }
+                if self.devices[i].device_id == self.devices[j].device_id {
+                    all_ok = false;
                     continue;
                 }
                 if !self.devices[i]
@@ -2536,11 +2541,19 @@ fn uniform_split_counts(n_devices: usize, n_layers: usize) -> Vec<usize> {
         .collect()
 }
 
+fn alias_ids(ids: &[i32], real_count: i32) -> Vec<i32> {
+    if real_count > 0 {
+        ids.iter().map(|&id| id.rem_euclid(real_count)).collect()
+    } else {
+        ids.to_vec()
+    }
+}
+
 /// Resolve logical device IDs after the physical `hardware.devices` list has
 /// been installed as `ROCR_VISIBLE_DEVICES` and HIP has received the matching
 /// post-filter logical IDs. When unset, take the first `n_devices` visible IDs.
 fn resolve_device_ids(n_devices: usize) -> HipResult<Vec<i32>> {
-    if let Some(ref s) = crate::config::get().devices {
+    let ids = if let Some(s) = &crate::config::get().devices {
         let ids: Vec<i32> = s
             .split(',')
             .map(|p| p.trim())
@@ -2557,9 +2570,17 @@ fn resolve_device_ids(n_devices: usize) -> HipResult<Vec<i32>> {
                 ),
             ));
         }
-        return Ok(ids[..n_devices].to_vec());
+        ids[..n_devices].to_vec()
+    } else {
+        (0..n_devices as i32).collect()
+    };
+
+    if crate::config::get().emulate_gpus.is_some() {
+        let real_count = HipRuntime::load()?.device_count()?;
+        Ok(alias_ids(&ids, real_count))
+    } else {
+        Ok(ids)
     }
-    Ok((0..n_devices as i32).collect())
 }
 
 fn construct_devices(ids: &[i32]) -> HipResult<Vec<Gpu>> {
@@ -2636,6 +2657,14 @@ mod tests {
         assert_eq!(uniform_split_counts(2, 25), vec![13, 12]);
         assert_eq!(uniform_split_counts(3, 64), vec![22, 21, 21]);
         assert_eq!(uniform_split_counts(4, 7), vec![2, 2, 2, 1]);
+    }
+
+    #[test]
+    fn alias_ids_wrap_positive_device_counts_and_preserve_invalid_counts() {
+        assert_eq!(alias_ids(&[0, 1], 1), vec![0, 0]);
+        assert_eq!(alias_ids(&[-1, 0, 1, 2], 2), vec![1, 0, 1, 0]);
+        assert_eq!(alias_ids(&[-1, 0, 1], 0), vec![-1, 0, 1]);
+        assert_eq!(alias_ids(&[-1, 0, 1], -2), vec![-1, 0, 1]);
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! Qwen3.5 batched prefill: eligibility gates, dispatch-routed GEMM helpers,
 //! `forward_prefill_batch*`, and the per-layer batched chunk bodies.
 
+use super::batch::for_each_active_span;
 use super::batch::valid_lane_mask;
 use super::batch::BatchSemantics;
 use super::batch::PrefillBatchScratch;
@@ -2479,13 +2480,13 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     // EP (Ship 6 substrate-EP prefill): when `Some`, the routed combine writes
     // into this zeroed `[n × dim]` partial instead of `pbs.x_batch` (the EP
     // driver all-reduce-sums it across ranks and adds into x_batch). The shared
-    // expert (step 5) stays in `pbs.x_batch` — replicated per rank, not
-    // redirected. `None` = byte-identical single-GPU behavior.
+    // expert stays in `pbs.x_batch` (replicated per rank — added once to each
+    // rank's own copy). `None` = byte-identical single-GPU behavior.
     routed_out: Option<&GpuTensor>,
 ) -> HipResult<()> {
     // Historical entry point: replicated local routing (Single seal path).
     // Byte-identical to before; the slot-aware forward_slots.rs callers and
-    // all single-GPU paths keep calling this unchanged.
+    // all single-GPU paths preserve the fixed-width batch semantics.
     prefill_moe_ffn_body_batched_with_route(
         gpu,
         ffn,
@@ -2696,8 +2697,8 @@ pub(crate) fn preflight_moe_ffn_batched_ep(
         .map_err(HipError::from)
 }
 
-/// Return the rank-local expert output geometry that compact EP must gather to
-/// root before the canonical slot-order combine.
+/// Return the canonical rank-local expert output geometry that compact EP
+/// gathers to root before the ordinary slot-order combine.
 pub(crate) fn moe_ffn_batched_ep_slot_geometry(
     gpu: &Gpu,
     ffn: &MoeFfnWeights,
@@ -2708,7 +2709,7 @@ pub(crate) fn moe_ffn_batched_ep_slot_geometry(
     ctx: &DispatchCtx,
     model_has_mq6_moe: bool,
     routed_out: &GpuTensor,
-) -> HipResult<(usize, bool)> {
+) -> HipResult<usize> {
     let proof_slot = std::cell::Cell::new(None);
     let (bound, params) = build_moe_prefill_params(
         gpu,
@@ -2726,28 +2727,20 @@ pub(crate) fn moe_ffn_batched_ep_slot_geometry(
         &ctx.arch,
         &ctx.flags,
     );
-    let output = if resolution.use_path2 {
-        let count = params
-            .m_total_max
-            .checked_mul(params.down_m)
-            .ok_or_else(|| HipError::new(0, "compact EP grouped output count overflow"))?;
-        (count, true)
-    } else if !resolution.down_path0 {
-        let count = params
-            .batch_size
-            .checked_mul(params.k_top)
-            .and_then(|slots| slots.checked_mul(params.down_m))
-            .ok_or_else(|| HipError::new(0, "compact EP expanded output count overflow"))?;
-        (count, false)
-    } else {
+    if resolution.down_path0 {
         return Err(HipError::new(
             0,
             "compact EP prefill requires expanded expert outputs",
         ));
-    };
+    }
+    let contribution_count = params
+        .batch_size
+        .checked_mul(params.k_top)
+        .and_then(|slots| slots.checked_mul(params.down_m))
+        .ok_or_else(|| HipError::new(0, "compact EP output count overflow"))?;
     hipfire_dispatch::pipeline::sealed_moe::seal_prefill_ep(bound, ctx, params)
         .map_err(HipError::from)?;
-    Ok(output)
+    Ok(contribution_count)
 }
 
 /// Fold root's gathered expert rows with the ordinary single-device combine.
@@ -2815,43 +2808,48 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
     }
     .map_err(HipError::from)?;
 
-    #[cfg(feature = "moe-oracle")]
-    crate::qwen35::oracle::prefill_before(
-        gpu,
-        ffn,
-        config,
-        &pbs.x_batch,
-        n,
-        crate::qwen35::oracle::prefill_start().map_err(|e| hip_bridge::HipError::new(0, &e))?,
-    )
-    .map_err(|e| hip_bridge::HipError::new(0, &e))?;
-
-    execute_steps(gpu, ctx, &[Step::Moe(sealed)]).map_err(|e| HipError::new(0, &e.to_string()))?;
-
-    #[cfg(feature = "moe-oracle")]
-    {
-        let router_logits = pbs.moe_router_logits_batch.as_ref().expect("moe scratch");
-        let oracle_start =
-            crate::qwen35::oracle::prefill_start().map_err(|e| hip_bridge::HipError::new(0, &e))?;
-        crate::qwen35::oracle::prefill_after(
+    let body_result = (|| -> HipResult<()> {
+        #[cfg(feature = "moe-oracle")]
+        crate::qwen35::oracle::prefill_before(
             gpu,
             ffn,
             config,
             &pbs.x_batch,
-            router_logits,
-            pbs.moe_topk_indices_batch.as_ref().expect("moe scratch"),
-            pbs.moe_topk_weights_batch.as_ref().expect("moe scratch"),
-            pbs.moe_gate_batch.as_ref().expect("moe scratch"),
-            pbs.moe_up_batch.as_ref().expect("moe scratch"),
-            pbs.moe_rot_batch.as_ref().expect("moe scratch"),
-            pbs.moe_down_expanded_batch.as_ref().expect("moe scratch"),
             n,
-            oracle_start,
+            crate::qwen35::oracle::prefill_start().map_err(|e| hip_bridge::HipError::new(0, &e))?,
         )
         .map_err(|e| hip_bridge::HipError::new(0, &e))?;
-    }
 
-    Ok(())
+        execute_steps(gpu, ctx, &[Step::Moe(sealed)])
+            .map_err(|e| HipError::new(0, &e.to_string()))?;
+
+        #[cfg(feature = "moe-oracle")]
+        {
+            let router_logits = pbs.moe_router_logits_batch.as_ref().expect("moe scratch");
+            let oracle_start = crate::qwen35::oracle::prefill_start()
+                .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+            crate::qwen35::oracle::prefill_after(
+                gpu,
+                ffn,
+                config,
+                &pbs.x_batch,
+                router_logits,
+                pbs.moe_topk_indices_batch.as_ref().expect("moe scratch"),
+                pbs.moe_topk_weights_batch.as_ref().expect("moe scratch"),
+                pbs.moe_gate_batch.as_ref().expect("moe scratch"),
+                pbs.moe_up_batch.as_ref().expect("moe scratch"),
+                pbs.moe_rot_batch.as_ref().expect("moe scratch"),
+                pbs.moe_down_expanded_batch.as_ref().expect("moe scratch"),
+                n,
+                oracle_start,
+            )
+            .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+        }
+
+        Ok(())
+    })();
+
+    body_result
 }
 
 /// Band view for `forward_prefill_chunk`. `None` (the default) means the
@@ -3085,6 +3083,7 @@ pub(crate) fn batch_chunk_embed_tokens(
     do_embed: bool,
     pre_embedded: bool,
     pre_uploaded: bool,
+    active_mask: Option<u64>,
     mask_override: Option<MaskEmbedOverride<'_>>,
 ) -> HipResult<()> {
     // ── 1. Embed tokens into pbs.x_batch ─────────────────────────────────
@@ -3096,12 +3095,24 @@ pub(crate) fn batch_chunk_embed_tokens(
     // AND is hipGraph-captureable — the kernel reads token ids from a
     // device pointer instead of taking them as a baked-in scalar arg.
     //
+    // Independent decode can leave lanes inactive. Restrict embedding to
+    // active contiguous spans so an inactive lane's scratch activation is
+    // not overwritten by the dummy token in the fixed-width input array.
+    //
     // Other formats fall back to the per-token loop (kept for correctness
     // breadth; the MQ4-quantized hot path doesn't hit them).
     //
     // Multi-GPU band-mode: skip embedding when this is not the first band.
     // The activation already lives in `pbs.x_batch` from a peer-copy of
     // the previous band's `pbs.x_batch`.
+    let full_mask = valid_lane_mask(n)?;
+    let embed_mask = active_mask.unwrap_or(full_mask);
+    if embed_mask == 0 || embed_mask & !full_mask != 0 {
+        return Err(HipError::new(
+            0,
+            "batch_chunk_embed_tokens: active mask out of range",
+        ));
+    }
     if do_embed
         && !pre_embedded
         && matches!(
@@ -3110,34 +3121,71 @@ pub(crate) fn batch_chunk_embed_tokens(
         )
     {
         if !pre_uploaded {
-            let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-            let tokens_bytes: &[u8] =
-                unsafe { std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4) };
-            gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
+            if embed_mask == full_mask {
+                let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+                let tokens_bytes: &[u8] =
+                    unsafe { std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4) };
+                gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
+            } else {
+                for_each_active_span(embed_mask, n, |start, len| {
+                    let tokens_host: Vec<i32> = tokens[start..start + len]
+                        .iter()
+                        .map(|&t| t as i32)
+                        .collect();
+                    let tokens_bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, len * 4)
+                    };
+                    gpu.hip
+                        .memcpy_htod_offset(&pbs.tokens.buf, start * 4, tokens_bytes)
+                })?;
+            }
         }
-        match weights.embd_format {
-            EmbeddingFormat::HFQ4G256 => {
-                gpu.embedding_lookup_hfq4g256_batched(
+        if embed_mask == full_mask {
+            match weights.embd_format {
+                EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
                     &weights.token_embd,
                     &pbs.x_batch,
                     &pbs.tokens,
                     n,
                     dim,
-                )?;
-            }
-            EmbeddingFormat::Q8_0 => {
-                gpu.embedding_lookup_q8_batched(
+                )?,
+                EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
                     &weights.token_embd,
                     &pbs.x_batch,
                     &pbs.tokens,
                     n,
                     dim,
-                )?;
+                )?,
+                _ => unreachable!(),
             }
-            _ => unreachable!(),
+        } else {
+            for_each_active_span(embed_mask, n, |start, len| {
+                let output = pbs.x_batch.sub_offset(start * dim, len * dim);
+                let token_ids = pbs.tokens.sub_offset(start, len);
+                match weights.embd_format {
+                    EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
+                        &weights.token_embd,
+                        &output,
+                        &token_ids,
+                        len,
+                        dim,
+                    ),
+                    EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
+                        &weights.token_embd,
+                        &output,
+                        &token_ids,
+                        len,
+                        dim,
+                    ),
+                    _ => unreachable!(),
+                }
+            })?;
         }
     } else if do_embed && !pre_embedded {
         for (i, &tok) in tokens.iter().enumerate() {
+            if (embed_mask >> i) & 1 == 0 {
+                continue;
+            }
             match weights.embd_format {
                 EmbeddingFormat::HFQ4G256 => unreachable!(),
                 EmbeddingFormat::HFQ4G128 => {
@@ -3170,10 +3218,8 @@ pub(crate) fn batch_chunk_embed_tokens(
     // a prompt-mean vector. Default callers pass `None` → zero overhead.
     //
     // Multi-GPU band-mode: skip on non-first bands; pbs.x_batch already
-    // holds the peer-copied activation from the previous band, so an
-    // override applied at band 0 has already propagated through the layer
-    // stack on that device — re-applying here would clobber the partial
-    // forward state.
+    // holds the peer-copied activation from the previous band's
+    // `pbs.x_batch`. Re-applying here would clobber the partial forward.
     if do_embed {
         if let Some(ovr) = mask_override {
             assert!(
@@ -3189,11 +3235,13 @@ pub(crate) fn batch_chunk_embed_tokens(
                 ovr.embed.len(),
                 dim,
             );
-            let bytes: &[u8] =
-                unsafe { std::slice::from_raw_parts(ovr.embed.as_ptr() as *const u8, dim * 4) };
-            let offset = ovr.slot * dim_row_bytes;
-            gpu.hip
-                .memcpy_htod_offset(&pbs.x_batch.buf, offset, bytes)?;
+            if (embed_mask >> ovr.slot) & 1 != 0 {
+                let bytes: &[u8] =
+                    unsafe { std::slice::from_raw_parts(ovr.embed.as_ptr() as *const u8, dim * 4) };
+                let offset = ovr.slot * dim_row_bytes;
+                gpu.hip
+                    .memcpy_htod_offset(&pbs.x_batch.buf, offset, bytes)?;
+            }
         }
     }
 
@@ -3239,21 +3287,58 @@ pub(crate) fn batch_chunk_upload_positions(
     // while KV writes + attention seq_len keep the flat physical slots
     // (no sibling write race, contiguous-cache invariants intact).
     if !pre_uploaded {
-        let positions_host: Vec<i32> = match batch_semantics {
-            BatchSemantics::Sequential => (0..n).map(|i| (start_pos + i) as i32).collect(),
-            BatchSemantics::Independent { positions, .. } => {
+        let (positions_host, active_mask) = match batch_semantics {
+            BatchSemantics::Sequential => (
+                (0..n).map(|i| (start_pos + i) as i32).collect::<Vec<_>>(),
+                valid_lane_mask(n)?,
+            ),
+            BatchSemantics::Independent {
+                positions,
+                active_mask,
+                ..
+            } => {
                 debug_assert_eq!(positions.len(), n);
-                positions.iter().map(|&p| p as i32).collect()
+                (
+                    positions.iter().map(|&p| p as i32).collect::<Vec<_>>(),
+                    active_mask,
+                )
             }
         };
-        let positions_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4) };
-        gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
-        if let Some(tv) = tree_verify.as_ref() {
-            debug_assert_eq!(tv.positions.len(), n, "tree RoPE positions length");
-            let rope_bytes: &[u8] =
-                unsafe { std::slice::from_raw_parts(tv.positions.as_ptr() as *const u8, n * 4) };
-            gpu.hip.memcpy_htod(&pbs.rope_positions.buf, rope_bytes)?;
+        let full_mask = valid_lane_mask(n)?;
+        if active_mask == full_mask {
+            let positions_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4) };
+            gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
+            if let Some(tv) = tree_verify.as_ref() {
+                debug_assert_eq!(tv.positions.len(), n, "tree RoPE positions length");
+                let rope_bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(tv.positions.as_ptr() as *const u8, n * 4)
+                };
+                gpu.hip.memcpy_htod(&pbs.rope_positions.buf, rope_bytes)?;
+            }
+        } else {
+            for_each_active_span(active_mask, n, |start, len| {
+                let positions_bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        positions_host[start..start + len].as_ptr() as *const u8,
+                        len * 4,
+                    )
+                };
+                gpu.hip
+                    .memcpy_htod_offset(&pbs.positions.buf, start * 4, positions_bytes)?;
+                if let Some(tv) = tree_verify.as_ref() {
+                    debug_assert_eq!(tv.positions.len(), n, "tree RoPE positions length");
+                    let rope_bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(
+                            tv.positions[start..start + len].as_ptr() as *const u8,
+                            len * 4,
+                        )
+                    };
+                    gpu.hip
+                        .memcpy_htod_offset(&pbs.rope_positions.buf, start * 4, rope_bytes)?;
+                }
+                Ok(())
+            })?;
         }
     }
 
@@ -6433,7 +6518,6 @@ fn batch_chunk_delta_net_moe(
             n,
         )?;
     }
-
     // Batched MoE FFN replaces the dense (rmsnorm + gate+up +
     // silu_mul + w_down) block. Takes pbs.x_batch as input AND
     // accumulates the FFN output residual back into it via the
@@ -6941,18 +7025,6 @@ fn batch_chunk_full_attn_moe(
         )?;
         let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
         gpu.add_inplace_f32(&x_n, &scratch)?;
-    } else {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::families::gemm::residual_gemm_key_for(layer.wo.gpu_dtype),
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            fa_wo_input,
-            &pbs.x_batch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
     }
 
     // Batched MoE FFN.
@@ -6968,7 +7040,6 @@ fn batch_chunk_full_attn_moe(
         routed_out,
         route,
     )?;
-
     Ok(())
 }
 
@@ -7052,6 +7123,29 @@ fn batch_chunk_final_logits(
     Ok(())
 }
 
+fn restore_inactive_residual_rows(
+    gpu: &Gpu,
+    pbs: &PrefillBatchScratch,
+    backup: &GpuTensor,
+    inactive_mask: u64,
+    n: usize,
+    dim: usize,
+) -> HipResult<()> {
+    for_each_active_span(inactive_mask, n, |start, len| {
+        let start_elems = start
+            .checked_mul(dim)
+            .ok_or_else(|| HipError::new(0, "inactive residual offset overflow"))?;
+        let bytes = len
+            .checked_mul(dim)
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or_else(|| HipError::new(0, "inactive residual span overflow"))?;
+        let offset = start_elems
+            .checked_mul(4)
+            .ok_or_else(|| HipError::new(0, "inactive residual byte offset overflow"))?;
+        gpu.memcpy_dtod_at_auto(&pbs.x_batch.buf, offset, &backup.buf, offset, bytes)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn forward_batch_chunk_impl(
     gpu: &mut Gpu,
@@ -7089,6 +7183,35 @@ pub(crate) fn forward_batch_chunk_impl(
         tree_verify,
         gdn_tape.as_deref(),
     )?;
+    let inactive_mask = match batch_semantics.active_mask() {
+        Some(active_mask) => {
+            let full_mask = valid_lane_mask(n)?;
+            if active_mask == 0 || active_mask & !full_mask != 0 {
+                return Err(HipError::new(
+                    0,
+                    "forward_batch_chunk: active mask out of range",
+                ));
+            }
+            let inactive = full_mask & !active_mask;
+            (inactive != 0).then_some(inactive)
+        }
+        None => None,
+    };
+    let inactive_backup = if inactive_mask.is_some() {
+        let backup = pbs
+            .moe_inactive_backup
+            .as_ref()
+            .ok_or_else(|| HipError::new(0, "inactive residual backup is unavailable"))?;
+        let bytes = n
+            .checked_mul(config.dim)
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or_else(|| HipError::new(0, "inactive residual backup size overflow"))?;
+        gpu.memcpy_dtod_at_auto(&backup.buf, 0, &pbs.x_batch.buf, 0, bytes)?;
+        Some(backup)
+    } else {
+        None
+    };
+
     let dispatch_workload = prefill_dispatch_workload(
         per_token_hidden_out.is_some(),
         gdn_tape.is_some(),
@@ -7151,6 +7274,7 @@ pub(crate) fn forward_batch_chunk_impl(
         do_embed,
         pre_embedded,
         pre_uploaded,
+        batch_semantics.active_mask(),
         mask_override,
     )?;
     batch_chunk_upload_positions(
@@ -7394,6 +7518,9 @@ pub(crate) fn forward_batch_chunk_impl(
                 dump_hidden_localize(gpu, &pbs.x_batch, n, start_pos, dim, layer_idx, "batched");
             }
             _ => panic!("layer type mismatch at layer {layer_idx}"),
+        }
+        if let (Some(inactive_mask), Some(backup)) = (inactive_mask, inactive_backup.as_ref()) {
+            restore_inactive_residual_rows(gpu, pbs, backup, inactive_mask, n, dim)?;
         }
     }
 

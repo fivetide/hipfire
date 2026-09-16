@@ -2344,12 +2344,10 @@ fn prefill_shared_down_stage(
             .map_err(|e| DispatchError::Hip(e.to_string())),
         DType::MQ4G256V2 | DType::MQ6G256V2 | DType::Q8_0 | DType::F32 => {
             let out = down_tmp();
-            let key = if matches!(down.dtype, DType::Q8_0 | DType::F32) {
-                prefill_shared_gemm_key(down.dtype)
-            } else {
-                Some(crate::families::gemm::residual_gemm_key_for(down.dtype))
-            }
-            .ok_or_else(|| DispatchError::Hip("shared down has no GEMM key".into()))?;
+            // This aliases reused routed scratch, not a residual. Plain GEMM
+            // must overwrite it before the gated add into x_batch.
+            let key = prefill_shared_gemm_key(down.dtype)
+                .ok_or_else(|| DispatchError::Hip("shared down has no GEMM key".into()))?;
             let gemm = GemmFamily::new();
             gemm.run_key(
                 key,
@@ -4244,13 +4242,20 @@ fn prefill_down_stage(
     Ok(())
 }
 
-fn prefill_mutation_fence_stage() -> Result<(), DispatchError> {
-    #[cfg(feature = "serve-fault-inject")]
-    if crate::pipeline::sealed_moe::take_fault_after_expert_mutation() {
-        return Err(DispatchError::Hip(
-            "injected fault after sealed MoE expert mutation before combine publication".into(),
-        ));
-    }
+fn prefill_down_unscatter_stage(
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoePrefillParams<'_>,
+    total_slots: usize,
+) -> Result<(), DispatchError> {
+    // Grouped GEMM's atomic bucket order is rank-local. Restore canonical
+    // flat slot order before this buffer participates in an EP gather.
+    hip!(gpu.moe_down_unscatter_k8(
+        p.y_down_grouped,
+        p.inverse_perm,
+        p.down_expanded,
+        p.down_m,
+        total_slots,
+    ))?;
     Ok(())
 }
 
@@ -4259,8 +4264,23 @@ fn prefill_combine_stage(
     p: &crate::families::moe::MoePrefillParams<'_>,
     res: &crate::families::moe::MoePrefillResolution,
     target: &GpuTensor,
+    canonical_slot_order: bool,
 ) -> Result<(), DispatchError> {
-    if res.use_path2 {
+    if canonical_slot_order {
+        if res.down_path0 {
+            return Err(DispatchError::Hip(
+                "canonical EP combine requires expanded expert outputs".into(),
+            ));
+        }
+        hip!(gpu.moe_down_combine_k8_batched(
+            p.down_expanded,
+            p.topk_weights,
+            target,
+            p.down_m,
+            p.k_top,
+            p.batch_size,
+        ))?;
+    } else if res.use_path2 {
         hip!(gpu.moe_down_combine_grouped_k8(
             p.y_down_grouped,
             p.inverse_perm,
@@ -4279,6 +4299,16 @@ fn prefill_combine_stage(
             p.k_top,
             p.batch_size,
         ))?;
+    }
+    Ok(())
+}
+
+fn prefill_mutation_fence_stage() -> Result<(), DispatchError> {
+    #[cfg(feature = "serve-fault-inject")]
+    if crate::pipeline::sealed_moe::take_fault_after_expert_mutation() {
+        return Err(DispatchError::Hip(
+            "injected fault after sealed MoE expert mutation before combine publication".into(),
+        ));
     }
     Ok(())
 }
