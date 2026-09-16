@@ -740,7 +740,8 @@ pub fn truncate_checkpoints(
 ///
 /// Selected once at the top of [`generate`] and is the sole authority for
 /// dispatch branch choice and tools capability. Precedence matches production:
-/// EP → Qwen dense TP semantic AR / arch short-circuits (Qwen2, DeepSeek4, LFM,
+/// EP (Qwen 5|6 → QwenAr semantic AR over `generate_ep`, which refines MoE vs
+/// dense-TP by loaded `EpArch`) / arch short-circuits (Qwen2, DeepSeek4, LFM,
 /// Cohere, MiniMax, dots) → pp>1 → Qwen/LLaMA DFlash/spec (MTP uses the generic
 /// wrapper) → default AR/unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

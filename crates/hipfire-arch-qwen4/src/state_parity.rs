@@ -11,7 +11,8 @@
 
 use crate::config::compact_test_config;
 use crate::gpu_forward::{
-    qwen4_profile_enable, qwen4_profile_reset, qwen4_profile_snapshot, Qwen4ProfileStats,
+    qwen4_profile_enable, qwen4_profile_reset, qwen4_profile_snapshot, Qwen4GpuForwardScratch,
+    Qwen4ProfileStats,
 };
 use crate::mtp_gpu::{MtpGpuState, MtpStateParityMetadata};
 use crate::mtp_spec::validate_native_mtp_prefill_request;
@@ -1250,6 +1251,74 @@ fn qwen4_profile_stats_json(stats: Qwen4ProfileStats) -> Value {
         },
     })
 }
+const PROFILE_DIRTY_BYTE: i32 = 0x3f;
+
+fn dirty_qwen4_moe_scratch(gpu: &mut Gpu, scratch: &Qwen4GpuForwardScratch) -> Result<(), String> {
+    for tensor in [
+        &scratch.router_logits,
+        &scratch.moe_x_rot,
+        &scratch.moe_gate_up,
+        &scratch.moe_gate,
+        &scratch.moe_up,
+        &scratch.moe_hidden,
+        &scratch.moe_output,
+        &scratch.moe_gate_batch,
+        &scratch.moe_up_batch,
+        &scratch.moe_rot_batch,
+        &scratch.moe_topk_indices,
+        &scratch.moe_topk_weights,
+        &scratch.moe_down_expanded,
+        &scratch.moe_scalar,
+    ] {
+        gpu.hip
+            .memset(&tensor.buf, PROFILE_DIRTY_BYTE, tensor.buf.size())
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn dirty_profile_target_moe_reuse(
+    gpu: &mut Gpu,
+    bundle: &crate::bundle::Qwen4Bundle,
+) -> Result<(), String> {
+    let forward = bundle
+        .execution
+        .as_ref()
+        .ok_or_else(|| "qwen4 profile forward resources are not attached".to_string())?;
+    dirty_qwen4_moe_scratch(gpu, &forward.scratch)
+}
+
+fn dirty_profile_mtp_moe_reuse(
+    gpu: &mut Gpu,
+    bundle: &crate::bundle::Qwen4Bundle,
+) -> Result<(), String> {
+    let mtp = bundle
+        .mtp
+        .as_ref()
+        .ok_or_else(|| "qwen4 profile MTP resources are not attached".to_string())?;
+    mtp.dirty_moe_reuse(gpu).map_err(|error| error.to_string())
+}
+
+fn sealed_moe_profile_evidence(stats: &Value, dirty_reuse: bool) -> Result<Value, String> {
+    let seal = stats
+        .get("moe_seal")
+        .ok_or_else(|| "qwen4 profile has no MoE seal counters".to_string())?;
+    let calls = seal
+        .get("calls")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "qwen4 profile MoE seal counter is malformed".to_string())?;
+    if calls == 0 {
+        return Err("qwen4 profile executed no sealed MoE calls".to_string());
+    }
+    Ok(json!({
+        "calls": calls,
+        "host_ns": seal.get("host_ns").cloned().unwrap_or(Value::Null),
+        "route": "BoundMoeExperts::from_cache -> seal_decode -> execute_steps(Step::Moe)",
+        "sealed_route_executed": true,
+        "dirty_reuse": dirty_reuse,
+        "dirty_pattern_byte": PROFILE_DIRTY_BYTE,
+    }))
+}
 
 fn ple_cache_stats_json(stats: PleCacheStats) -> Value {
     json!({
@@ -1350,7 +1419,7 @@ fn qwen4_range_payload(
 /// Load the admitted production artifact, execute exactly one target token and
 /// one native MTP token, and emit host/HIP/rocprof attribution context.
 pub fn run_profile(model_path: &Path, corpus_path: &Path) -> Result<ProfileReport, String> {
-    let profile_enabled = std::env::var("HIPFIRE_PROFILE").ok().as_deref() == Some("1");
+    let profile_enabled = true;
     qwen4_profile_enable(false);
     let result = run_profile_inner(model_path, corpus_path, profile_enabled);
     qwen4_profile_enable(false);
@@ -1540,12 +1609,14 @@ fn run_profile_inner(
         launch_counters::reset();
         let ple_before = bundle.ple_rows().cache_stats();
         let target_started = Instant::now();
+        dirty_profile_target_moe_reuse(&mut gpu, &bundle)?;
         let target_token = bundle
             .spec_capture_token(&mut gpu, input_token)
             .map_err(|error| format!("qwen4 profile target token: {error}"))?;
         let target_ns = profile_duration_ns(target_started);
         let target_hip = hip_counter_snapshot();
         let target_internal = qwen4_profile_stats_json(qwen4_profile_snapshot());
+        let target_sealed = sealed_moe_profile_evidence(&target_internal, true)?;
         let target_ple_after = bundle.ple_rows().cache_stats();
         let target_d2h = target_hip
             .get("memcpy_dtoh")
@@ -1573,12 +1644,14 @@ fn run_profile_inner(
         bundle
             .copy_spec_hidden_row_to(&mut gpu, 0, &pending)
             .map_err(|error| format!("qwen4 profile pending hidden copy: {error}"))?;
+        dirty_profile_mtp_moe_reuse(&mut gpu, &bundle)?;
         let mtp_token = bundle
             .mtp_forward_token(&mut gpu, input_token, Some(&pending), mtp_position)
             .map_err(|error| format!("qwen4 profile native MTP token: {error}"))?;
         let mtp_ns = profile_duration_ns(mtp_started);
         let mtp_hip = hip_counter_snapshot();
         let mtp_internal = qwen4_profile_stats_json(qwen4_profile_snapshot());
+        let mtp_sealed = sealed_moe_profile_evidence(&mtp_internal, true)?;
         let mtp_position_after = bundle
             .mtp_position()
             .map_err(|error| format!("read qwen4 profile MTP end position: {error}"))?;
@@ -1610,8 +1683,8 @@ fn run_profile_inner(
                 "attribution": "memcpy_dtoh counters are nested in the target/MTP phase that issued them",
             },
             "sealed_moe_validation": {
-                "target": target_internal.get("moe_seal").cloned().unwrap_or(Value::Null),
-                "mtp": mtp_internal.get("moe_seal").cloned().unwrap_or(Value::Null),
+                "target": target_sealed,
+                "mtp": mtp_sealed,
             },
         }))
     })();
@@ -1651,7 +1724,7 @@ fn run_profile_inner(
         "input_token": input_token,
         "hipfire_profile": {
             "enabled": profile_enabled,
-            "environment": "HIPFIRE_PROFILE=1",
+            "environment": "profile mode enables seal/PLE counters locally",
             "scope": "Qwen4 seal/PLE host hooks; rocprofv3 is authoritative for kernel timing",
         },
         "load": {

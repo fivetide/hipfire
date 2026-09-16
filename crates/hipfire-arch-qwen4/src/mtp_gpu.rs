@@ -1103,6 +1103,30 @@ impl Qwen4MtpGpu {
             .or(moe_error)
             .map_or(Ok(()), |error| Err(MtpGpuError::Hip(error)))
     }
+    /// Deliberately dirty the reusable MoE buffers for the bounded profile
+    /// regression.  The production caller still owns initialization: this
+    /// helper only makes stale scratch/output reads observable in that mode.
+    pub(crate) fn dirty_moe_reuse(&self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
+        for tensor in [
+            &self.scratch.router_logits,
+            &self.scratch.moe_x_rot,
+            &self.scratch.moe_gate_up,
+            &self.scratch.moe_gate,
+            &self.scratch.moe_up,
+            &self.scratch.moe_hidden,
+            &self.scratch.moe_output,
+            &self.scratch.moe_gate_batch,
+            &self.scratch.moe_up_batch,
+            &self.scratch.moe_rot_batch,
+            &self.scratch.moe_topk_indices,
+            &self.scratch.moe_topk_weights,
+            &self.scratch.moe_down_expanded,
+            &self.scratch.moe_scalar,
+        ] {
+            gpu.hip.memset(&tensor.buf, 0x3f, tensor.buf.size())?;
+        }
+        Ok(())
+    }
 
     pub(crate) fn reset(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
         self.state.reset(gpu)

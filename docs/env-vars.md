@@ -111,7 +111,8 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_DFLASH_WINDOW` | **0 / unset** (legacy), unless declared by draft metadata | Enables bounded draft SWA; refused with CASK eviction |
 | `HIPFIRE_DFLASH_MODE` | RuntimeConfig default **`off`** | Distinct from config `dflash_mode` apply path — product CLI also uses load params |
 | `HIPFIRE_DFLASH_NGRAM_BLOCK` | set/clear from config | |
-| `HIPFIRE_DFLASH_CKPT_RESUME` / `HIPFIRE_CACHE_CKPT_*` | checkpointing | Qwen DFlash path |
+| `HIPFIRE_DFLASH_CKPT_RESUME` / `HIPFIRE_CACHE_CKPT_*` | checkpointing | Qwen DFlash and MTP divergent-render resume |
+| `HIPFIRE_SPEC_WINDOW_ROLLBACK` | on unless `0` | Enables retained pre-window repair for strict-prefix speculative terminals; `0` keeps the conservative reset path. |
 | `HIPFIRE_DFLASH_VERIFY_PM4` | **unset / off**; `1` opts in | Retained-PM4 route for the fixed B=16 DFlash2 chain target-verify forward. Admitted only on exact gfx1201, single GPU, dense recurrent Qwen3.5-family target, Q8 KV + Q8 DeltaNet state, DFlash2 selector + dynamic-conv draft, `target_layer_ids == [5,19,33,47,61]`, no DDTree. Every other configuration reports a specific `disabled` reason and runs the unchanged HIP/HipGraph path. |
 | `HIPFIRE_DRAFT_MAX` | routes to active mech window | CLI |
 | `HIPFIRE_DRAFT_F16` | on unless `0` | RuntimeConfig |
@@ -178,12 +179,43 @@ diagnostic and developer harness exports pending their cleanup.
 | `HIPFIRE_MAX_REQUEST_BYTES` | Body cap |
 | `HIPFIRE_SERVE_MAX_QUEUE` / `HIPFIRE_SERVE_QUEUE_TIMEOUT_MS` | Admission queue |
 | `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | Research budget nudge |
-| `HIPFIRE_FA_PERTOKEN_MIN_CTX` | Context length past which an exact-gfx1100 Q8 small-batch (n = 4..32, head_dim 128/256, sequential non-tree, graph capture off) attend step leaves the batched flash kernel for the multi-row tile; default `4096`, `0` disables the route. Other arches, KV modes, shapes, and semantics retain the batched route. |
+| `HIPFIRE_FA_PERTOKEN_MIN_CTX` | Context length past which an exact-gfx1100 or exact-gfx1201 Q8 small-batch (n = 4..32, head_dim 128/256, sequential non-tree, HIP graph capture off, retained replay recording off) attend step leaves the batched flash kernel for the multi-row tile; default `4096`, `0` disables the route. Other arches, KV modes, shapes, and semantics retain the batched route. |
 | `HIPFIRE_RCCL_LIB` | Explicit `librccl.so` path, tried before the ROCm root. For distributions whose ROCm prefix does not carry RCCL (nixpkgs: `rocmtoolkit-merged` has HIP/HSA, `librccl` is a separate store path). |
 | `HIPFIRE_DEVICES` / `HIPFIRE_TP` / `HIPFIRE_TP_USE_RCCL` | Multi-GPU / TP. `HIPFIRE_DEVICES` is the compatibility alias for `hardware.devices`; startup lowers its physical list to ROCr selectors plus matching HIP logical selectors. |
+| `HIPFIRE_EMULATE_GPUS` | **Developer-only logical GPU emulation.** A successfully parsed integer `>=2` enables; missing, malformed, `0`, and `1` disable. Requested logical IDs are aliased modulo the loaded physical count; this switch does not choose the EP rank count and is not a product admission. |
+| `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1` | Explicit peer all-reduce selector for logical EP decode proofs; do not set it to `0`. |
+| `HIPFIRE_EP_PEER_ALLREDUCE=1` | Explicit peer all-reduce selector for logical EP batched prefill/tick proofs; do not set it to `0`. |
 | `HIPFIRE_ALLOW_MIXED_ARCH=1` | Mixed arch pairs |
 | `HIPFIRE_PP_LAYERS` / `HIPFIRE_PP_PFLASH` | Pipeline parallel |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | Uniform init tolerance |
+
+#### Logical GPU emulation (developer-only)
+
+`HIPFIRE_EMULATE_GPUS` is an environment-only diagnostic switch captured in
+the startup snapshot. It is deliberately not a user-facing CLI or persistent
+TOML/config key. The value is parsed as `usize`: only a successfully parsed
+integer `>=2` enables emulation. Missing, malformed (including negative
+values), `0`, and `1` leave emulation disabled.
+
+When enabled, each requested logical device ID is resolved modulo the loaded
+physical-device count:
+
+| Physical devices loaded | Requested logical IDs | Resolved physical IDs |
+|---|---|---|
+| 1 | `[0, 1, 2, 3]` | `[0, 0, 0, 0]` |
+| 2 | `[0, 1, 2, 3]` | `[0, 1, 0, 1]` |
+
+The switch is an enable switch, not a rank-count setting. `Gpus::init_ep(2,
+...)` owns a two-logical-rank EP layout, and `Gpus::init_ep(4, ...)` owns a
+four-logical-rank layout. Duplicate physical IDs remain rejected in ordinary
+mode; the snapshotted emulation state is the explicit diagnostic exception for
+sealed, load, and batch admission.
+
+For a one-device proof, leave `HIPFIRE_DEVICES` unset and set
+`HIP_VISIBLE_DEVICES=0`; set both peer selectors above explicitly to `1`.
+Leave `HIPFIRE_TP_USE_RCCL` unset—`=0` is not a host all-reduce fallback.
+The complete route-oracle workflow and evidence boundary are in
+[`multi-gpu.md`](multi-gpu.md#logical-gpu-emulation-developer-only).
 
 ### Redline / retained replay
 
@@ -342,8 +374,8 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_C2M_DUMP_PROMPT` | crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_C2M_EMPTY_TURN_GUARD` | crates/hipfire-arch-cohere2moe/src/spec_emit.rs, crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_C2M_NORMDUMP` | crates/hipfire-arch-cohere2moe/src/forward.rs |
-| `HIPFIRE_CACHE_CKPT_INTERVAL` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-daemon/src/main.rs |
-| `HIPFIRE_CACHE_CKPT_MAX` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-daemon/src/main.rs |
+| `HIPFIRE_CACHE_CKPT_INTERVAL` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/src/mtp_speculator.rs, crates/hipfire-daemon/src/main.rs |
+| `HIPFIRE_CACHE_CKPT_MAX` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/src/mtp_speculator.rs, crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_CACHE_CKPT_RESUME` | crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_CALIB_PROFILE` | crates/hipfire-runtime/examples/triattn_validate.rs |
 | `HIPFIRE_CANARY_MODEL` | scripts/gfx906_fallback_canary.sh |
@@ -454,7 +486,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_DETERMINISTIC` | autoresearch/ar/certify/serve_runner.py, crates/hipfire-runtime/examples/pp_parity_chatml.rs |
 | `HIPFIRE_DEVICES` | crates/hipfire-runtime/src/config.rs, crates/hipfire-runtime/src/multi_gpu.rs |
 | `HIPFIRE_DFLASH_CHAT` | crates/hipfire-daemon/src/main.rs |
-| `HIPFIRE_DFLASH_CKPT_RESUME` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-daemon/src/main.rs |
+| `HIPFIRE_DFLASH_CKPT_RESUME` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/src/mtp_speculator.rs, crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_DFLASH_CTX_CAP` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_DFLASH_DRAFT` | crates/hipfire-runtime/src/config.rs, scripts/coherence-gate-dflash.sh |
 | `HIPFIRE_DFLASH_FAST_SAMPLE` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/hipfire-daemon/src/main.rs |
@@ -1016,6 +1048,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_SMOKE_STEPS` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-runtime/examples/a3b_smoke_forward.rs |
 | `HIPFIRE_SPECULATION` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_SPEC_PHASES` | crates/hipfire-arch-qwen35/src/speculative.rs |
+| `HIPFIRE_SPEC_WINDOW_ROLLBACK` | crates/hipfire-config/src/lib.rs, crates/hipfire-arch-qwen35/src/mtp_speculator.rs |
 | `HIPFIRE_SPILL_DIR` | crates/hipfire-quantize/src/main.rs |
 | `HIPFIRE_SWEEP_MAX` | scripts/ddtree_budget_sweep.sh |
 | `HIPFIRE_SWEEP_OUT` | scripts/mq3-mq2-sweep.sh, scripts/spec_decode_genre_sweep.sh |

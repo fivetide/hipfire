@@ -1587,6 +1587,58 @@ pub fn maybe_inject_fault_after_prefill_dflash(
     true
 }
 
+/// Fire one-shot after-first-decode fault on qwen DFlash (live slot/spec path).
+///
+/// Sits with the prefill seam above, not after the first `spec.step`: the
+/// prefill already ran the first target decode (KV/recurrent/drafter advanced,
+/// `first_token` sampled), and the emitter's `begin` below makes that token
+/// wire-visible — firing later would leak a `token` before the fail-closed
+/// terminal the AR loop attests at `ar.rs:4249`. Consumes the same
+/// `test_fault_after_first_decode` arm (`take_generation_fault_after_first_decode`,
+/// armed by `RequestFaultGuard`; no new mechanism, no new wire field) and
+/// produces the same single correlated `error` terminal. Returns true when
+/// the fault was taken (caller must return immediately).
+#[cfg(feature = "serve-fault-inject")]
+pub fn maybe_inject_fault_after_first_decode_dflash(
+    arch_id: u32,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    slot: &mut dyn SpecTarget,
+    spec: &mut dyn Speculator,
+) -> bool {
+    if !take_generation_fault_after_first_decode() {
+        return false;
+    }
+    if !matches!(arch_id, 5 | 6) {
+        return false;
+    }
+    let ep = crate::common::production_fail_closed_rollback_live(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        slot,
+        spec,
+    );
+    crate::common::emit_fail_closed_error(
+        stdout,
+        Some(id),
+        "injected fault after first decode",
+        "gpu",
+        true,
+        &ep,
+    );
+    true
+}
+
 // ── G4.10 generation-fault hooks (test-only) ──
 
 // Test-only fault points for the dense/AR generation loops.
@@ -1600,6 +1652,49 @@ std::thread_local! {
         const { std::cell::Cell::new(false) };
     static GENERATION_FAULT_AFTER_FIRST_DECODE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+}
+
+// Test-only fault points for the vision (Qwen35-VL / dots.ocr) generation
+// paths (G4.8 lifecycle evidence). Same contract as the dense points above:
+// always compiled, never armed in production, one thread-local load when
+// unarmed. Unlike the dense points these carry a *site* ("prefill",
+// "decode", "argmax", "spec") because the vision matrix injects at several
+// seams. Unlike the one-shot dense points these are STICKY: several
+// generate entries share prefill helpers, so a consuming read at one entry
+// would hide the site from the loop that owns it (dots.ocr's spec loop).
+// The test clears them with `arm_*(None)` after each turn, exactly as it
+// used to unset the env. Previously these were `HIPFIRE_*_FAULT`
+// env reads, which violated the config-owned rule and could not be observed
+// through the process snapshot once the test toggled them mid-run.
+std::thread_local! {
+    static VISION_FAULT: std::cell::RefCell<Option<&'static str>> =
+        const { std::cell::RefCell::new(None) };
+    static DOTS_FAULT: std::cell::RefCell<Option<&'static str>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arm (or clear with `None`) the Qwen35-VL fault at `site`.
+#[doc(hidden)]
+pub fn arm_vision_fault(site: Option<&'static str>) {
+    VISION_FAULT.with(|c| *c.borrow_mut() = site);
+}
+
+/// Read the armed Qwen35-VL fault site without disarming it.
+#[doc(hidden)]
+pub fn peek_vision_fault() -> Option<&'static str> {
+    VISION_FAULT.with(|c| *c.borrow())
+}
+
+/// Arm (or clear with `None`) the dots.ocr fault at `site`.
+#[doc(hidden)]
+pub fn arm_dots_fault(site: Option<&'static str>) {
+    DOTS_FAULT.with(|c| *c.borrow_mut() = site);
+}
+
+/// Read the armed dots.ocr fault site without disarming it.
+#[doc(hidden)]
+pub fn peek_dots_fault() -> Option<&'static str> {
+    DOTS_FAULT.with(|c| *c.borrow())
 }
 
 /// Arm (or disarm) the after-prefill fault.

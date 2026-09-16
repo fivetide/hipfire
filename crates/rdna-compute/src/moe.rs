@@ -495,6 +495,66 @@ impl Gpu {
         result
     }
 
+    /// Materialize grouped path-2 down rows in canonical flat
+    /// `(token, k_rank)` slot order. `inverse_perm[flat_slot]` points to the
+    /// grouped row produced by the rank-local atomic bucket order. This pass
+    /// only copies live slots; the root applies top-k weights and combines
+    /// them after cross-rank gathering.
+    pub fn moe_down_unscatter_k8(
+        &mut self,
+        y_down_grouped: &GpuTensor, // [m_total × dim] f32
+        inverse_perm: &GpuTensor,   // [total_slots] i32
+        down_expanded: &GpuTensor,  // [capacity × dim] f32, written
+        dim: usize,
+        total_slots: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_down_unscatter_k8",
+            kernels::MOE_DOWN_UNSCATTER_K8_SRC,
+            "moe_down_unscatter_k8",
+        )?;
+        let yp = y_down_grouped.buf.as_ptr();
+        let ip = inverse_perm.buf.as_ptr();
+        let ep = down_expanded.buf.as_ptr();
+        let dim_val = dim as i32;
+        let ts_val = total_slots as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &yp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+            &dim_val as *const _ as *mut c_void,
+            &ts_val as *const _ as *mut c_void,
+        ];
+        let block: u32 = 256;
+        let grid_y = (dim as u32).div_ceil(block);
+        // Y_down_grouped read + down_expanded write + inverse_perm read.
+        let bytes = (total_slots * dim * 4 * 2 + total_slots * 4) as usize;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "elementwise", "moe_down_unscatter_k8", bytes);
+        let result = self.launch_maybe_blob(
+            "moe_down_unscatter_k8",
+            // Keep total_slots in grid.x; grid.y is the column tile.
+            [total_slots as u32, grid_y, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(yp);
+                b.push_ptr(ip);
+                b.push_ptr(ep);
+                b.push_i32(dim_val);
+                b.push_i32(ts_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Path 2 unscatter combine for gate_up. Reads Y_grouped[m_total ×
     /// 2*mi] and writes the gate half (rows 0..mi) into `y_gate[token,
     /// k_rank, :]` and the up half (rows mi..2*mi) into `y_up[token,
@@ -2190,11 +2250,11 @@ impl Gpu {
             &nv as *const _ as *mut c_void,
             &nev as *const _ as *mut c_void,
         ];
-        let bytes = batch_size
-            .saturating_mul(10)
-            .saturating_mul(m.saturating_mul(k.div_ceil(128).saturating_mul(68))
+        let bytes = batch_size.saturating_mul(10).saturating_mul(
+            m.saturating_mul(k.div_ceil(128).saturating_mul(68))
                 .saturating_add(k.saturating_mul(4))
-                .saturating_add(m.saturating_mul(4)));
+                .saturating_add(m.saturating_mul(4)),
+        );
         let timer = crate::profile::begin_timer(&self.hip, "gemv", FUNC, bytes);
         let result = self.launch_maybe_blob(
             FUNC,
@@ -2266,8 +2326,8 @@ impl Gpu {
             &xr as *const _ as *mut c_void,
             &ne as *const _ as *mut c_void,
         ];
-        let bytes = grouped_rows
-            .saturating_mul(m.saturating_mul(4).saturating_add(k.saturating_mul(4)));
+        let bytes =
+            grouped_rows.saturating_mul(m.saturating_mul(4).saturating_add(k.saturating_mul(4)));
         let timer = crate::profile::begin_timer(&self.hip, "gemm", FUNC, bytes);
         let result = self.launch_maybe_blob(
             FUNC,
@@ -2296,5 +2356,4 @@ impl Gpu {
         }
         result
     }
-
 }

@@ -348,11 +348,11 @@ pub enum DType {
     /// `[6..8)` fp16 z1, `[8..72)` 64 B 2-bit payload (4/B). Same half
     /// semantics as MQ6G256V2. `K % 256 == 0`, 2.25 bpw.
     MQ2G256V2,
-    MQ8G256, // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target (258 bytes/group)
-    MQ6G256, // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
-    MQ5G256, // MagnumQuant: FWHT-rotated 5-bit (168 bytes/group, 5.25 bpw)
-    MQ3G256, // MagnumQuant: FWHT-rotated HFQ3-G256 (104 bytes/group, same as HFQ3G256)
-    MQ2G256, // MagnumQuant: FWHT-rotated HFQ2-G256 (72 bytes/group, same as HFQ2G256)
+    MQ8G256,      // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target (258 bytes/group)
+    MQ6G256,      // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
+    MQ5G256,      // MagnumQuant: FWHT-rotated 5-bit (168 bytes/group, 5.25 bpw)
+    MQ3G256,      // MagnumQuant: FWHT-rotated HFQ3-G256 (104 bytes/group, same as HFQ3G256)
+    MQ2G256,      // MagnumQuant: FWHT-rotated HFQ2-G256 (72 bytes/group, same as HFQ2G256)
     MQ2G256Lloyd, // MagnumQuant 2-bit + Lloyd-Max 4-entry fp16 codebook (72 bytes/group)
     /// Unrotated MQ2-Lloyd (qt=51). Byte-identical to `MQ2G256Lloyd`
     /// (72 B/group: 4-entry fp16 codebook + 64 B of 2-bit indices), so the same
@@ -4883,6 +4883,25 @@ impl Gpu {
                     // kv_cache_write_q8_0_batched_slots) has no -I to
                     // kernels/src, so the directive must be stripped and
                     // the header body prepended instead.
+                    let stripped = kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC
+                        .replace("#include \"kv_slot_desc.h\"", "");
+                    format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
+                }));
+                specs.push(("kv_cache_write_q8_0_independent", {
+                    // Shares KV_CACHE_WRITE_Q8_0_BATCHED_SRC with the entry
+                    // above, so it needs the identical strip-and-prepend:
+                    // that source #includes kv_slot_desc.h and this
+                    // precompile path has no -I to kernels/src. Warms the
+                    // module the continuous-batch decode path JITs first.
+                    let stripped = kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC
+                        .replace("#include \"kv_slot_desc.h\"", "");
+                    format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
+                }));
+                specs.push(("kv_cache_write_q8_0_independent_masked", {
+                    // Shares KV_CACHE_WRITE_Q8_0_BATCHED_SRC with the entries
+                    // above, so it needs the identical strip-and-prepend.
+                    // Warms the module forward_tick JITs first on a
+                    // partially-active batch.
                     let stripped = kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC
                         .replace("#include \"kv_slot_desc.h\"", "");
                     format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)

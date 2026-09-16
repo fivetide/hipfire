@@ -1999,8 +1999,7 @@ pub const MQ_ROTATE_X_128_V2_SRC: &str =
 
 /// Qwen4 qt=53 ordinary projection consumer.  Rows use
 /// `68 * ceil(K / 128)` bytes and fp16 scale/zero headers.
-pub const GEMV_MQ4G128V2_SRC: &str =
-    include_str!("../../../kernels/src/gemv_mq4g128v2.hip");
+pub const GEMV_MQ4G128V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g128v2.hip");
 
 /// Qwen4 qt=53 indexed decode down consumer.  It always writes ten
 /// unweighted expanded route rows; `moe_down_combine_top10_batched` owns the
@@ -2012,7 +2011,6 @@ pub const GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC: &str =
 /// unweighted and is folded by the sealed top-10 combine.
 pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10.hip");
-
 
 /// Index-aware MoE gate_up GEMV — reads expert IDs from a device-side
 /// topk_indices buffer and the per-expert weight base from an
@@ -3157,6 +3155,11 @@ pub const MOE_SCATTER_FUSED_TOP10_SRC: &str = concat!(
     "#define moe_scatter_fused_k8 moe_scatter_fused_top10\n",
     include_str!("../../../kernels/src/moe_scatter_fused_k8.hip")
 );
+/// Restore grouped path-2 down outputs to canonical flat `(token, k_rank)`
+/// slot order. Each rank runs this before EP contribution gathering; the root
+/// then uses the ordinary slot-order weighted combine.
+pub const MOE_DOWN_UNSCATTER_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_down_unscatter_k8.hip");
 
 /// Fused single-CTA SGLang-style MoE scatter pipeline: combines
 /// histogram + padded prefix-sum + permutation in one launch. Saves

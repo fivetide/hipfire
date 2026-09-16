@@ -22,7 +22,10 @@ use crate::weights::{
 };
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::WeightRef;
-use hipfire_dispatch::families::moe::{MoeDtypes, MoeParams, RoutedExpertWeights};
+use hipfire_dispatch::families::moe::{
+    MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoeRecipe, MoeSharedDecode, MoeSharedDtypes,
+    MoeSharedWeights, RoutedExpertWeights,
+};
 use hipfire_dispatch::pipeline::{
     execute_steps, seal_decode, BoundMoeExperts, ExpertBindingCache, ExpertMetadata,
     ExpertResource, ExpertResources, ExpertTable, Step,
@@ -501,10 +504,12 @@ pub(crate) fn execute_moe(
     gpu.hip.memset(&output.buf, 0, output.buf.size())?;
     let dtypes = MoeDtypes {
         router: runtime.router.dtype,
-        shared_gate: runtime.shared_scalar.dtype,
-        shared_expert_gate: runtime.shared_gate.dtype,
-        shared_expert_up: runtime.shared_up.dtype,
-        shared_expert_down: runtime.shared_down.dtype,
+        shared: Some(MoeSharedDtypes {
+            selector: runtime.shared_scalar.dtype,
+            gate: runtime.shared_gate.dtype,
+            up: runtime.shared_up.dtype,
+            down: runtime.shared_down.dtype,
+        }),
         experts_all_gate_up_mq4: runtime
             .experts
             .iter()
@@ -526,25 +531,35 @@ pub(crate) fn execute_moe(
     };
     let params = MoeParams {
         dtypes,
+        recipe: MoeRecipe::SoftmaxGatedShared,
+        normalization: MoeNormalization::Provided,
         batch_size: 1,
         hidden: config.hidden_size,
         mi: config.moe_intermediate_size,
-        smi: config.shared_expert_intermediate_size,
         k: config.num_experts_per_tok,
         n_exp: config.num_experts,
         norm_topk_prob: config.norm_topk_prob,
         x_rot_prerotated: false,
         defer_routed_combine: false,
+        ep_mode: MoeEpMode::None,
         layer_idx: layer_index as u16,
         x_norm: input,
         x_residual: output,
         routed_out: None,
         skip_shared: false,
         router: runtime.router.dispatch_ref(),
-        shared_expert_gate: runtime.shared_scalar.dispatch_ref(),
-        shared_gate_w: runtime.shared_gate.dispatch_ref(),
-        shared_up_w: runtime.shared_up.dispatch_ref(),
-        shared_down_w: runtime.shared_down.dispatch_ref(),
+        shared: Some(MoeSharedDecode {
+            weights: MoeSharedWeights {
+                selector: runtime.shared_scalar.dispatch_ref(),
+                gate: runtime.shared_gate.dispatch_ref(),
+                up: runtime.shared_up.dispatch_ref(),
+                down: runtime.shared_down.dispatch_ref(),
+            },
+            intermediate: config.shared_expert_intermediate_size,
+            scalar: scratch.scalar_buf,
+            gate_out: scratch.gate_buf,
+            up_out: scratch.up_buf,
+        }),
         expert_gate_up_ptrs: &runtime.expert_gate_up_ptrs,
         expert_down_ptrs: &runtime.expert_down_ptrs,
         expert_down_awq_ptrs: None,
@@ -556,11 +571,8 @@ pub(crate) fn execute_moe(
         routed_gate_up_paro: None,
         routed_down_paro: None,
         router_logits: scratch.router_logits,
-        scalar_buf: scratch.scalar_buf,
         x_rot_local: scratch.x_rot_local,
         gate_up_buf: scratch.gate_up_buf,
-        gate_buf: scratch.gate_buf,
-        up_buf: scratch.up_buf,
         ffn_hidden: scratch.ffn_hidden,
         ffn_out: scratch.ffn_out,
         gate_batch: scratch.gate_batch,

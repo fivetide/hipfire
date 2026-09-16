@@ -218,15 +218,13 @@ fn fused_qkv_hfq6_resolves_cross_arch() {
     // hfq6g256, which carry the full cross-arch ladder, so they are now `Always`.
     let fam = FusedQkvFamily::new();
     for ctx in [&ctx_gfx906(), &ctx_rdna3()] {
-        assert!(
-            fam.resolve(KernelKey::FusedQkvzaHfq6G256, ctx, None)
-                .is_ok()
-        );
+        assert!(fam
+            .resolve(KernelKey::FusedQkvzaHfq6G256, ctx, None)
+            .is_ok());
         assert!(fam.resolve(KernelKey::FusedQkvHfq6G256, ctx, None).is_ok());
-        assert!(
-            fam.resolve(KernelKey::FusedGateUpHfq6G256, ctx, None)
-                .is_ok()
-        );
+        assert!(fam
+            .resolve(KernelKey::FusedGateUpHfq6G256, ctx, None)
+            .is_ok());
     }
 }
 
@@ -808,14 +806,12 @@ fn mq4g128v2_is_explicitly_rejected_by_generic_dispatch_families() {
 #[test]
 fn gemv_family_resolves_f32_on_all_archs() {
     let fam = GemvFamily::new();
-    assert!(
-        fam.resolve(DType::F32, GemvVariant::Plain, false, &ctx_rdna1(), None)
-            .is_ok()
-    );
-    assert!(
-        fam.resolve(DType::F32, GemvVariant::Plain, false, &ctx_rdna3(), None)
-            .is_ok()
-    );
+    assert!(fam
+        .resolve(DType::F32, GemvVariant::Plain, false, &ctx_rdna1(), None)
+        .is_ok());
+    assert!(fam
+        .resolve(DType::F32, GemvVariant::Plain, false, &ctx_rdna3(), None)
+        .is_ok());
 }
 
 #[test]
@@ -824,56 +820,51 @@ fn gemv_family_resolves_hfq4_on_all_archs() {
     // HFQ4G256 uses generic wave32/wave64 kernels with a fallback for every arch
     // (gfx906 via dp4a/sdot4, gfx1010 via generic). Previously gated on HasDp4a
     // (has_dot2_f32_f16 = RDNA1.1+) which excluded gfx906/gfx1010.
-    assert!(
-        fam.resolve(
+    assert!(fam
+        .resolve(
             DType::HFQ4G256,
             GemvVariant::Plain,
             false,
             &ctx_rdna1(),
             None
         )
-        .is_ok()
-    );
-    assert!(
-        fam.resolve(
+        .is_ok());
+    assert!(fam
+        .resolve(
             DType::HFQ4G256,
             GemvVariant::Plain,
             false,
             &ctx_rdna2(),
             None
         )
-        .is_ok()
-    );
-    assert!(
-        fam.resolve(
+        .is_ok());
+    assert!(fam
+        .resolve(
             DType::HFQ4G256,
             GemvVariant::Plain,
             false,
             &ctx_rdna3(),
             None
         )
-        .is_ok()
-    );
-    assert!(
-        fam.resolve(
+        .is_ok());
+    assert!(fam
+        .resolve(
             DType::MQ4G256,
             GemvVariant::Plain,
             false,
             &ctx_rdna1(),
             None
         )
-        .is_ok()
-    );
-    assert!(
-        fam.resolve(
+        .is_ok());
+    assert!(fam
+        .resolve(
             DType::MQ4G256,
             GemvVariant::Plain,
             false,
             &ctx_rdna2(),
             None
         )
-        .is_ok()
-    );
+        .is_ok());
 }
 
 #[test]
@@ -882,79 +873,72 @@ fn gemv_family_resolves_mq3_prerotated_on_all_wave32_archs_not_cdna() {
     // gate is now HasWave32 (was HasWmma), so it resolves on every RDNA gen
     // (RDNA1/2/3/4) but still NOT on CDNA wave64 (a [32,1,1] kernel needs wave32).
     let fam = GemvFamily::new();
-    assert!(
-        fam.resolve(
+    assert!(fam
+        .resolve(
             DType::MQ3G256,
             GemvVariant::Prerotated,
             false,
             &ctx_rdna1(),
             None
         )
-        .is_ok()
-    );
-    assert!(
-        fam.resolve(
+        .is_ok());
+    assert!(fam
+        .resolve(
             DType::MQ3G256,
             GemvVariant::Prerotated,
             false,
             &ctx_rdna2(),
             None
         )
-        .is_ok()
-    );
-    assert!(
-        fam.resolve(
+        .is_ok());
+    assert!(fam
+        .resolve(
             DType::MQ3G256,
             GemvVariant::Prerotated,
             false,
             &ctx_rdna3(),
             None
         )
-        .is_ok()
-    );
-    assert!(
-        fam.resolve(
+        .is_ok());
+    assert!(fam
+        .resolve(
             DType::MQ3G256,
             GemvVariant::Prerotated,
             false,
             &ctx_rdna4(),
             None
         )
-        .is_ok()
-    );
+        .is_ok());
     // CDNA wave64 (gfx906) still excluded by HasWave32.
-    assert!(
-        fam.resolve(
+    assert!(fam
+        .resolve(
             DType::MQ3G256,
             GemvVariant::Prerotated,
             false,
             &ctx_gfx906(),
             None
         )
-        .is_err()
-    );
-    assert!(
-        fam.resolve(
+        .is_err());
+    assert!(fam
+        .resolve(
             DType::MQ4G256,
             GemvVariant::Prerotated,
             false,
             &ctx_rdna2(),
             None
         )
-        .is_ok()
-    );
+        .is_ok());
     // F32 Prerotated now falls back to GemvF32 (rotation-free dtype → plain key).
     // It resolves on any arch because GemvF32 has no arch gate.
-    assert!(
-        fam.resolve(
+    assert!(fam
+        .resolve(
             DType::F32,
             GemvVariant::Prerotated,
             false,
             &ctx_rdna3(),
             None
         )
-        .is_ok()
-    );
+        .is_ok());
 }
 
 // ── Pipeline::can_satisfy ─────────────────────────────────────────────────────
@@ -998,15 +982,17 @@ fn pipeline_single_op_self_satisfies() {
 }
 
 // ── MoeResolution eligibility lattice (mirrors qwen35.rs:4598-4671) ──
-use crate::families::moe::{MoeDtypes, MoeResolution};
+use crate::families::moe::{MoeDtypes, MoeResolution, MoeSharedDtypes};
 
 fn dtypes_all_mq4() -> MoeDtypes<'static> {
     MoeDtypes {
         router: DType::MQ4G256,
-        shared_gate: DType::MQ4G256,
-        shared_expert_gate: DType::MQ4G256,
-        shared_expert_up: DType::MQ4G256,
-        shared_expert_down: DType::MQ4G256,
+        shared: Some(MoeSharedDtypes {
+            selector: DType::MQ4G256,
+            gate: DType::MQ4G256,
+            up: DType::MQ4G256,
+            down: DType::MQ4G256,
+        }),
         experts_all_gate_up_mq4: true,
         routed_gate_up: DType::MQ4G256,
         routed_down: DType::MQ4G256,
@@ -1187,10 +1173,12 @@ fn moe_res_all_mq4v2_gate_quartet_is_fusable_mq4v2() {
     // never the V1 fused route. Still needs the rotated activation.
     let mut d = dtypes_all_mq4();
     d.router = DType::MQ4G256V2;
-    d.shared_gate = DType::MQ4G256V2;
-    d.shared_expert_gate = DType::MQ4G256V2;
-    d.shared_expert_up = DType::MQ4G256V2;
-    d.shared_expert_down = DType::MQ4G256V2;
+    d.shared = Some(MoeSharedDtypes {
+        selector: DType::MQ4G256V2,
+        gate: DType::MQ4G256V2,
+        up: DType::MQ4G256V2,
+        down: DType::MQ4G256V2,
+    });
     d.routed_gate_up = DType::MQ4G256V2;
     d.routed_down = DType::MQ4G256V2;
     d.experts_all_gate_up_mq4 = true;
@@ -1235,7 +1223,7 @@ fn moe_res_mixed_v1_v2_gate_quartet_is_not_fusable() {
 
     // V1 router + one V2 shared half
     let mut d = dtypes_all_mq4();
-    d.shared_expert_up = DType::MQ4G256V2;
+    d.shared.as_mut().unwrap().up = DType::MQ4G256V2;
     let r = MoeResolution::resolve(&d, 8);
     assert!(!r.gate_fusable, "single V2 shared-up disqualifies V1 fuse");
     assert!(
@@ -1260,10 +1248,12 @@ fn moe_res_shipped_ornith15_takes_the_indexed_path() {
     // the shipped model decoded through the resident CPU-fallback path.
     let mut d = dtypes_all_mq4();
     d.router = DType::Q8_0;
-    d.shared_gate = DType::Q8_0;
-    d.shared_expert_gate = DType::MQ6G256;
-    d.shared_expert_up = DType::MQ6G256;
-    d.shared_expert_down = DType::MQ6G256;
+    d.shared = Some(MoeSharedDtypes {
+        selector: DType::Q8_0,
+        gate: DType::MQ6G256,
+        up: DType::MQ6G256,
+        down: DType::MQ6G256,
+    });
     d.routed_gate_up = DType::MQ4G256V2;
     d.routed_down = DType::MQ4G256V2;
     d.experts_all_gate_up_mq4 = false;
@@ -1366,7 +1356,7 @@ fn moe_res_lloyd_gate_up_with_nonlloyd_down_not_indexable() {
 /// pins.
 #[test]
 fn moe_res_gl_routed_indexable() {
-    use DType::{MQ2G256GL, MQ2G256Lloyd, MQ3G256GL, MQ3G256Lloyd};
+    use DType::{MQ2G256Lloyd, MQ3G256Lloyd, MQ2G256GL, MQ3G256GL};
     let codebook = [MQ2G256Lloyd, MQ3G256Lloyd, MQ2G256GL, MQ3G256GL];
     for gu in codebook {
         for dn in codebook {
@@ -1407,7 +1397,7 @@ fn moe_res_gl_gate_up_with_nonlloyd_down_not_indexable() {
 /// an un-rotated activation into a rotated weight is silent garbage.
 #[test]
 fn gl_dtypes_are_fwht_g256() {
-    use crate::types::{RotationPlan, dtype_needs_rotation, dtype_rotation_plan};
+    use crate::types::{dtype_needs_rotation, dtype_rotation_plan, RotationPlan};
     for dt in [DType::MQ2G256GL, DType::MQ3G256GL] {
         assert_eq!(dtype_rotation_plan(dt), RotationPlan::FwhtG256, "{dt:?}");
         assert!(dtype_needs_rotation(dt), "{dt:?}");
@@ -1665,7 +1655,7 @@ fn ninepath_d3_restricts_v2_to_native_gate_and_d4() {
 // ── op-list interpreter: match_prefix (pure logic) ──────────────────────────
 
 use crate::families::gemv::WeightRef;
-use crate::pipeline::steps::{GemvInput, match_prefix};
+use crate::pipeline::steps::{match_prefix, GemvInput};
 use crate::pipeline::{FusedPattern, Step};
 
 fn dummy_wr<'a>(t: &'a rdna_compute::GpuTensor) -> WeightRef<'a> {
@@ -2252,10 +2242,12 @@ use crate::families::moe::MoePrefillResolution;
 fn moe_dtypes_mq4() -> MoeDtypes<'static> {
     MoeDtypes {
         router: DType::Q8_0,
-        shared_gate: DType::Q8_0,
-        shared_expert_gate: DType::MQ4G256,
-        shared_expert_up: DType::MQ4G256,
-        shared_expert_down: DType::MQ4G256,
+        shared: Some(MoeSharedDtypes {
+            selector: DType::Q8_0,
+            gate: DType::MQ4G256,
+            up: DType::MQ4G256,
+            down: DType::MQ4G256,
+        }),
         experts_all_gate_up_mq4: true,
         routed_gate_up: DType::MQ4G256,
         routed_down: DType::MQ4G256,

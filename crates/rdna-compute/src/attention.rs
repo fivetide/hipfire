@@ -72,9 +72,14 @@ fn q8_flash_default_tile_size(
         && n_kv_heads == 2
         && head_dim == 256
         && max_seq == 2_048;
+    // gfx1100 keeps tile32 for short KV, where it was the measured winner.
+    // Past 8K, tile128 cuts the number of partials and reduction work by 4x;
+    // keep the perf choice atom-specific so unmeasured RDNA3 siblings retain
+    // their existing defaults.
+    let gfx1100_short_kv = arch == "gfx1100" && max_seq <= 8_192;
     if gfx12_small_dense_shape {
         16
-    } else if arch == "gfx1100" || gfx1151_radiowave_shape {
+    } else if gfx1100_short_kv || gfx1151_radiowave_shape {
         32
     } else {
         128
@@ -1662,11 +1667,25 @@ impl Gpu {
         lane_capacity: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "kv_cache_write_q8_0_independent",
-            kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC,
-            "kv_cache_write_q8_0_independent",
-        )?;
+        // Same strip-and-prepend as kv_cache_write_q8_0_batched_slots above:
+        // this entry point shares the KV_CACHE_WRITE_Q8_0_BATCHED_SRC
+        // translation unit, whose `#include "kv_slot_desc.h"` does not resolve
+        // in the cache-dir hipcc compile. The prepended header bytes are part
+        // of the compiled source, so the cache hash changes when the header
+        // changes. Guarded behind the functions cache like the batched sibling.
+        if !self
+            .functions
+            .contains_key("kv_cache_write_q8_0_independent")
+        {
+            let stripped =
+                kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC.replace("#include \"kv_slot_desc.h\"", "");
+            let src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
+            self.ensure_kernel(
+                "kv_cache_write_q8_0_independent",
+                &src,
+                "kv_cache_write_q8_0_independent",
+            )?;
+        }
         let mut d = dst.buf.as_ptr();
         let mut s = src.buf.as_ptr();
         let mut p = positions.buf.as_ptr();
@@ -1741,11 +1760,25 @@ impl Gpu {
             return Ok(());
         }
         self.bind_thread()?;
-        self.ensure_kernel(
-            "kv_cache_write_q8_0_independent_masked",
-            kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC,
-            "kv_cache_write_q8_0_independent_masked",
-        )?;
+        // Same strip-and-prepend as the unmasked independent sibling above:
+        // this entry point shares the KV_CACHE_WRITE_Q8_0_BATCHED_SRC
+        // translation unit, whose `#include "kv_slot_desc.h"` does not resolve
+        // in the cache-dir hipcc compile (this was the forward_tick JIT
+        // failure). Header bytes are part of the compiled source, so the
+        // cache hash changes when the header changes.
+        if !self
+            .functions
+            .contains_key("kv_cache_write_q8_0_independent_masked")
+        {
+            let stripped =
+                kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC.replace("#include \"kv_slot_desc.h\"", "");
+            let src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
+            self.ensure_kernel(
+                "kv_cache_write_q8_0_independent_masked",
+                &src,
+                "kv_cache_write_q8_0_independent_masked",
+            )?;
+        }
         let mut d = dst.buf.as_ptr();
         let mut s = src.buf.as_ptr();
         let mut p = positions.buf.as_ptr();
@@ -2569,11 +2602,23 @@ impl Gpu {
         self.bind_thread()?;
         let checked_shared_mem =
             self.ensure_attention_q8_0_kv_independent_lds(lane_capacity, head_dim)?;
-        self.ensure_kernel(
-            "attention_q8_0_kv_batched",
-            kernels::ATTENTION_Q8_0_KV_BATCHED_SRC,
-            "attention_q8_0_kv_batched",
-        )?;
+        // Same strip-and-prepend as attention_q8_0_kv_batched_masked_slots:
+        // this path launches the batched entry point (negative-max_seq lane
+        // contract) and shares its module, so the source bytes must be
+        // identical to that caller's — otherwise whichever compiles first
+        // wins the functions cache and the other silently reuses it. In the
+        // continuous-batch probe this path runs first, so the raw source used
+        // to be the one that reached hipcc and failed on the include.
+        if !self.functions.contains_key("attention_q8_0_kv_batched") {
+            let stripped =
+                kernels::ATTENTION_Q8_0_KV_BATCHED_SRC.replace("#include \"kv_slot_desc.h\"", "");
+            let src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
+            self.ensure_kernel(
+                "attention_q8_0_kv_batched",
+                &src,
+                "attention_q8_0_kv_batched",
+            )?;
+        }
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_ptr = q.buf.as_ptr();
         let mut k_ptr = k_cache.buf.as_ptr();
@@ -2777,11 +2822,24 @@ impl Gpu {
         self.bind_thread()?;
         let checked_shared_mem =
             self.ensure_attention_q8_0_kv_independent_lds(lane_capacity, head_dim)?;
-        self.ensure_kernel(
-            "attention_q8_0_kv_independent_masked_windowed",
-            kernels::ATTENTION_Q8_0_KV_BATCHED_SRC,
-            "attention_q8_0_kv_independent_masked_windowed",
-        )?;
+        // Same strip-and-prepend as attention_q8_0_kv_batched_masked_slots:
+        // this entry point shares the ATTENTION_Q8_0_KV_BATCHED_SRC
+        // translation unit, whose `#include "kv_slot_desc.h"` does not resolve
+        // in the cache-dir hipcc compile. Header bytes are part of the
+        // compiled source, so the cache hash changes when the header changes.
+        if !self
+            .functions
+            .contains_key("attention_q8_0_kv_independent_masked_windowed")
+        {
+            let stripped =
+                kernels::ATTENTION_Q8_0_KV_BATCHED_SRC.replace("#include \"kv_slot_desc.h\"", "");
+            let src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
+            self.ensure_kernel(
+                "attention_q8_0_kv_independent_masked_windowed",
+                &src,
+                "attention_q8_0_kv_independent_masked_windowed",
+            )?;
+        }
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_ptr = q.buf.as_ptr();
         let mut k_ptr = k_cache.buf.as_ptr();
@@ -3896,7 +3954,10 @@ impl Gpu {
         batch_size: usize,
         partials: &GpuTensor,
     ) -> HipResult<bool> {
-        if !self.arch_caps.is_gfx1100() {
+        if self.replay.is_recording() {
+            return Ok(false);
+        }
+        if !(self.arch_caps.is_gfx1100() || self.arch_caps.is_gfx1201()) {
             return Ok(false);
         }
         let dpt = head_dim / 32;
@@ -16304,6 +16365,23 @@ mod tests {
         assert_eq!(q8_flash_default_tile_size("gfx1100", 1, 1, 64, 8_192), 32);
         assert_eq!(
             q8_flash_default_tile_size("gfx1200", 16, 2, 256, 2_048),
+            128
+        );
+    }
+
+    #[test]
+    fn gfx1100_q8_tile128_is_long_context_only() {
+        assert_eq!(q8_flash_default_tile_size("gfx1100", 16, 8, 128, 8_192), 32);
+        assert_eq!(
+            q8_flash_default_tile_size("gfx1100", 16, 8, 128, 8_193),
+            128
+        );
+        assert_eq!(
+            q8_flash_default_tile_size("gfx1100", 16, 8, 128, 32_768),
+            128
+        );
+        assert_eq!(
+            q8_flash_default_tile_size("gfx1101", 16, 8, 128, 32_768),
             128
         );
     }

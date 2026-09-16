@@ -4071,6 +4071,47 @@ fn run_fixtures(fixtures_dir: PathBuf, output_path: PathBuf) -> Result<(), Strin
     Ok(())
 }
 
+const SEALED_MOE_ROUTE: &str =
+    "BoundMoeExperts::from_cache -> seal_decode -> execute_steps(Step::Moe)";
+
+fn write_profile_report(
+    report: hipfire_arch_qwen4::state_parity::ProfileReport,
+    output_path: &Path,
+) -> Result<(), String> {
+    let report = report.into_json();
+    for arm in ["target", "mtp"] {
+        let evidence = report
+            .pointer(&format!("/execution/sealed_moe_validation/{arm}"))
+            .ok_or_else(|| format!("profile report has no sealed MoE evidence for {arm}"))?;
+        let calls = evidence
+            .get("calls")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("profile report has malformed sealed MoE calls for {arm}"))?;
+        if calls == 0
+            || evidence.get("sealed_route_executed") != Some(&Value::Bool(true))
+            || evidence.get("dirty_reuse") != Some(&Value::Bool(true))
+            || evidence.get("route").and_then(Value::as_str) != Some(SEALED_MOE_ROUTE)
+        {
+            return fail(format!(
+                "profile report did not prove dirty sealed MoE execution for {arm}"
+            ));
+        }
+    }
+    if let Some(parent) = output_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    }
+    fs::write(
+        output_path,
+        serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("write {}: {error}", output_path.display()))?;
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     match parse_args()? {
         ParityMode::Fixtures { directory, output } => run_fixtures(directory, output),
@@ -4099,7 +4140,7 @@ fn run() -> Result<(), String> {
             output,
         } => {
             let report = hipfire_arch_qwen4::state_parity::run_profile(&model, &tokens)?;
-            report.write(&output)?;
+            write_profile_report(report, &output)?;
             println!("qwen4 bounded profile written: {}", output.display());
             Ok(())
         }
