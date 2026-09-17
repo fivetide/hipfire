@@ -195,10 +195,16 @@ pub fn hc_read(
     {
         return Err(OpError::Shape("HC learned projection dimensions"));
     }
-    let mean_square = hyper_input.iter().map(|v| v * v).sum::<f32>() / wide as f32;
-    let inv_rms = (mean_square + epsilon.max(1.0e-12)).sqrt().recip();
-    for ((dst, &value), &weight) in normalized.iter_mut().zip(hyper_input).zip(norm_weight) {
-        *dst = value * inv_rms * (1.0 + weight);
+    for branch in 0..branches {
+        let start = branch * hidden;
+        let end = start + hidden;
+        let mean_square =
+            hyper_input[start..end].iter().map(|v| v * v).sum::<f32>() / hidden as f32;
+        let inv_rms = (mean_square + epsilon.max(1.0e-12)).sqrt().recip();
+        for j in 0..hidden {
+            let column = start + j;
+            normalized[column] = hyper_input[column] * inv_rms * (1.0 + norm_weight[column]);
+        }
     }
     let mut low = vec![0.0f32; rank];
     for (r, value) in low.iter_mut().enumerate() {

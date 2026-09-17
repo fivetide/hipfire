@@ -13,9 +13,9 @@
 use crate::bundle::Qwen4Bundle;
 use crate::config::{LayerType, Qwen4Config};
 use crate::ple_rows::{
-    PlePrefetch, PleRowLease, PleRows, PleRowsError, PLE_ROWS_PER_TOKEN, PLE_ROW_BYTES,
+    PLE_ROW_BYTES, PLE_ROWS_PER_TOKEN, PlePrefetch, PleRowLease, PleRows, PleRowsError,
 };
-use crate::projection::{dispatch_embedding, dispatch_gemv, row_stride, ProjectionView};
+use crate::projection::{ProjectionView, dispatch_embedding, dispatch_gemv, row_stride};
 use crate::state::{GdnGpuState, QsaGpuState};
 use crate::weights::{
     HyperConnectionWeights, MoeWeights, Qwen4LayerWeights, Qwen4Weights, TensorRef, WeightError,
@@ -27,18 +27,19 @@ use hipfire_dispatch::families::moe::{
     MoeSharedWeights, RoutedExpertWeights,
 };
 use hipfire_dispatch::pipeline::{
-    execute_steps, seal_decode, BoundMoeExperts, ExpertBindingCache, ExpertMetadata,
-    ExpertResource, ExpertResources, ExpertTable, Step,
+    BoundMoeExperts, ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources,
+    ExpertTable, Step, execute_steps, seal_decode,
 };
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_runtime::weight_manifest::ExpertSourceLayout;
 use rdna_compute::qwen4::{
-    qwen4_argmax, qwen4_gdn_bf16_roundtrip, qwen4_gdn_conv, qwen4_gdn_gate, qwen4_gdn_params,
-    qwen4_gdn_step, qwen4_hc_norm, qwen4_hc_read, qwen4_hc_write, qwen4_qsa_attention,
+    Qwen4Argmax, Qwen4GdnBf16Roundtrip, Qwen4GdnConv, Qwen4GdnGate, Qwen4GdnParams, Qwen4GdnStep,
+    Qwen4HcNorm, Qwen4HcReadProjected, Qwen4HcWrite, Qwen4QsaAttention, Qwen4QsaCacheAppend,
+    Qwen4QsaNormRope, Qwen4QsaPoolRope, Qwen4QsaSelect, Qwen4Scale, qwen4_argmax,
+    qwen4_gdn_bf16_roundtrip, qwen4_gdn_conv, qwen4_gdn_gate, qwen4_gdn_params, qwen4_gdn_step,
+    qwen4_hc_norm, qwen4_hc_read_projected, qwen4_hc_write, qwen4_qsa_attention,
     qwen4_qsa_cache_append, qwen4_qsa_norm_rope, qwen4_qsa_pool_rope, qwen4_qsa_select,
-    qwen4_scale, Qwen4Argmax, Qwen4GdnBf16Roundtrip, Qwen4GdnConv, Qwen4GdnGate, Qwen4GdnParams,
-    Qwen4GdnStep, Qwen4HcNorm, Qwen4HcRead, Qwen4HcWrite, Qwen4QsaAttention, Qwen4QsaCacheAppend,
-    Qwen4QsaNormRope, Qwen4QsaPoolRope, Qwen4QsaSelect, Qwen4Scale,
+    qwen4_scale,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::cell::{Cell, RefCell};
@@ -135,9 +136,6 @@ fn qwen4_profile_record(phase: Qwen4ProfilePhase, started: Option<Instant>) {
         }
     });
 }
-
-// Kept immediately above the forward error type so the disabled path remains
-// a single TLS read plus an inlined `None` branch at each diagnostic hook.
 
 /// Errors returned by the native ordinary-HIP path.
 #[derive(Debug)]
@@ -638,6 +636,10 @@ pub struct Qwen4GpuForwardScratch {
     pub moe_gate: GpuTensor,
     pub moe_up: GpuTensor,
     pub moe_hidden: GpuTensor,
+    /// Separate shared-expert down output.  The public MoE output is the
+    /// routed accumulator; aliasing these buffers makes the shared GEMV
+    /// overwrite the routed contribution before the source-ordered add.
+    pub moe_shared_output: GpuTensor,
     pub moe_output: GpuTensor,
     pub moe_gate_batch: GpuTensor,
     pub moe_up_batch: GpuTensor,
@@ -734,6 +736,7 @@ impl Qwen4GpuForwardScratch {
             alloc(&[config.moe_intermediate_size], DType::F32)?;
             alloc(&[config.shared_expert_intermediate_size], DType::F32)?;
             alloc(&[hidden], DType::F32)?;
+            alloc(&[hidden], DType::F32)?;
             alloc(&[max_experts * config.moe_intermediate_size], DType::F32)?;
             alloc(&[max_experts * config.moe_intermediate_size], DType::F32)?;
             alloc(&[max_experts * config.moe_intermediate_size], DType::F32)?;
@@ -794,6 +797,7 @@ impl Qwen4GpuForwardScratch {
             moe_up: next(),
             moe_hidden: next(),
             moe_output: next(),
+            moe_shared_output: next(),
             moe_gate_batch: next(),
             moe_up_batch: next(),
             moe_rot_batch: next(),
@@ -850,6 +854,7 @@ impl Qwen4GpuForwardScratch {
             self.moe_up,
             self.moe_hidden,
             self.moe_output,
+            self.moe_shared_output,
             self.moe_gate_batch,
             self.moe_up_batch,
             self.moe_rot_batch,
@@ -1451,6 +1456,15 @@ impl Qwen4GpuForward {
             config.hc_lowrank,
             config.hc_count * config.hidden_size,
         )?;
+        qwen4_gdn_bf16_roundtrip(
+            gpu,
+            &Qwen4GdnBf16Roundtrip {
+                input: low,
+                scratch: &self.scratch.gdn_bf16,
+                output: low,
+                elements: config.hc_lowrank,
+            },
+        )?;
         qwen4_scale(
             gpu,
             &Qwen4Scale {
@@ -1458,7 +1472,25 @@ impl Qwen4GpuForward {
                 scale: 1.0 / config.hc_count as f32,
             },
         )?;
+        qwen4_gdn_bf16_roundtrip(
+            gpu,
+            &Qwen4GdnBf16Roundtrip {
+                input: low,
+                scratch: &self.scratch.gdn_bf16,
+                output: low,
+                elements: config.hc_lowrank,
+            },
+        )?;
         gpu.silu_f32(low, low)?;
+        qwen4_gdn_bf16_roundtrip(
+            gpu,
+            &Qwen4GdnBf16Roundtrip {
+                input: low,
+                scratch: &self.scratch.gdn_bf16,
+                output: low,
+                elements: config.hc_lowrank,
+            },
+        )?;
         self.gemv(
             gpu,
             up_weight,
@@ -1468,18 +1500,17 @@ impl Qwen4GpuForward {
             config.hc_count * config.hidden_size,
             config.hc_lowrank,
         )?;
-        qwen4_hc_read(
+        let projected_up = f32_view(up, 0, config.hc_count * config.hidden_size);
+        qwen4_hc_read_projected(
             gpu,
-            &Qwen4HcRead {
+            &Qwen4HcReadProjected {
                 input,
                 norm_weight: norm,
-                low,
-                up,
+                up: &projected_up,
                 normalized,
                 mixed,
                 branches: config.hc_count,
                 hidden: config.hidden_size,
-                rank: config.hc_lowrank,
             },
         )?;
         Ok(())
@@ -1678,6 +1709,15 @@ impl Qwen4GpuForward {
             config.hidden_size,
             value,
         )?;
+        qwen4_gdn_bf16_roundtrip(
+            gpu,
+            &Qwen4GdnBf16Roundtrip {
+                input: output,
+                scratch: &self.scratch.gdn_bf16,
+                output,
+                elements: config.hidden_size,
+            },
+        )?;
         Ok(())
     }
 
@@ -1727,17 +1767,9 @@ impl Qwen4GpuForward {
                 rotary_dim: index_dim.min(64),
             },
         )?;
-        qwen4_qsa_norm_rope(
-            gpu,
-            &Qwen4QsaNormRope {
-                values: &index_k,
-                norm: index_k_norm,
-                heads: config.indexer_kv_heads,
-                head_dim: index_dim,
-                position: 0,
-                rotary_dim: index_dim.min(64),
-            },
-        )?;
+        // The source cache stores raw BF16 token keys. Learned key RMSNorm
+        // and RoPE are applied only after block pooling.
+        gpu.bf16_round_trip_f32(&index_k)?;
         gpu.memcpy_dtod_at_auto(
             &state.raw_index_keys.buf,
             state.position * config.indexer_kv_heads * index_dim * 4,
@@ -1822,6 +1854,7 @@ impl Qwen4GpuForward {
                 &Qwen4QsaPoolRope {
                     raw_keys: &state.raw_index_keys,
                     pooled: &state.pooled_keys,
+                    norm: Some(index_k_norm),
                     block_count: complete,
                     compress: config.indexer_compress_ratio,
                     index_dim: config.indexer_kv_heads * index_dim,
@@ -1998,7 +2031,7 @@ impl Qwen4GpuForward {
                 gate_buf: &self.scratch.moe_gate,
                 up_buf: &self.scratch.moe_up,
                 ffn_hidden: &self.scratch.moe_hidden,
-                ffn_out: &self.scratch.moe_output,
+                ffn_out: &self.scratch.moe_shared_output,
                 gate_batch: &self.scratch.moe_gate_batch,
                 up_batch: &self.scratch.moe_up_batch,
                 rot_batch: &self.scratch.moe_rot_batch,

@@ -146,6 +146,24 @@ extern "C" __global__ void qwen4_gdn_bf16_roundtrip_f32(
     scratch[i] = rounded;
     output[i] = __bfloat162float(scratch[i]);
 }
+// Source Qwen4 shared-expert folding is BF16 at both multiply and add:
+// routed output, shared down output, and sigmoid gate are each stored as
+// BF16, then the product and residual sum are rounded independently.
+extern "C" __global__ void qwen4_bf16_scaled_add_f32(
+    float* residual,
+    const float* value,
+    const float* scalar,
+    int elements) {
+    const int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= elements) return;
+    const __hip_bfloat16 lhs = qwen4_bf16_round(residual[i]);
+    const __hip_bfloat16 rhs = qwen4_bf16_round(value[i]);
+    const __hip_bfloat16 gate = qwen4_bf16_round(scalar[0]);
+    const __hip_bfloat16 product = qwen4_bf16_round(
+        __bfloat162float(gate) * __bfloat162float(rhs));
+    residual[i] = __bfloat162float(qwen4_bf16_round(
+        __bfloat162float(lhs) + __bfloat162float(product)));
+}
 
 // Learned HC read/mix. `norm_weight` is resident BF16; down/up projections
 // have already run through the native quantized GEMV path.
@@ -159,33 +177,83 @@ extern "C" __global__ void qwen4_hc_read_f32(
     int branches,
     int hidden,
     int rank) {
-    int column = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    int wide = branches * hidden;
-    if (column >= wide) return;
-    int branch = column / hidden;
-    int branch_start = branch * hidden;
-    float sum = 0.0f;
-    for (int i = 0; i < hidden; ++i) {
-        float value = input[branch_start + i];
-        sum += value * value;
+    const int tid = (int)threadIdx.x;
+    __shared__ float rms_sum[256];
+    for (int branch = 0; branch < branches; ++branch) {
+        const int offset = branch * hidden;
+        float partial = 0.0f;
+        for (int j = tid; j < hidden; j += (int)blockDim.x) {
+            const float value =
+                __bfloat162float(qwen4_bf16_round(input[offset + j]));
+            partial += value * value;
+        }
+        rms_sum[tid] = partial;
+        __syncthreads();
+        for (int stride = (int)blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                rms_sum[tid] += rms_sum[tid + stride];
+            }
+            __syncthreads();
+        }
+        const float inv = rsqrtf(rms_sum[0] / (float)hidden + 1.0e-6f);
+        for (int j = tid; j < hidden; j += (int)blockDim.x) {
+            const int column = offset + j;
+            normalized[column] = __bfloat162float(qwen4_bf16_round(
+                __bfloat162float(qwen4_bf16_round(input[column]))
+                * inv * (1.0f + __bfloat162float(norm_weight[column]))));
+        }
+        __syncthreads();
     }
-    float inv = rsqrtf(sum / (float)hidden + 1.0e-6f);
-    float normed = input[column] * inv * (1.0f + __bfloat162float(norm_weight[column]));
-    normalized[column] = normed;
-    if (column < hidden) {
+    for (int j = tid; j < hidden; j += (int)blockDim.x) {
         float value = 0.0f;
         for (int branch = 0; branch < branches; ++branch) {
-            int offset = branch * hidden + column;
+            const int offset = branch * hidden + j;
             float gate = 0.0f;
             for (int r = 0; r < rank; ++r) {
                 gate += up[offset * rank + r] * low[r];
             }
-            gate = 1.0f / (1.0f + expf(-gate));
-            value += gate * normalized[offset];
+            gate = __bfloat162float(qwen4_bf16_round(
+                1.0f / (1.0f + expf(-gate))));
+            value += __bfloat162float(qwen4_bf16_round(
+                gate * normalized[offset]));
         }
-        mixed[column] = value / (float)branches;
+        mixed[j] = __bfloat162float(qwen4_bf16_round(value / (float)branches));
     }
 }
+// Learned HC read/mix when the up projection has already been materialized.
+// The production path runs the native quantized GEMV before this kernel, so
+// `projected_up` is one gate logit per branch/hidden column rather than the
+// raw `[branches*hidden, rank]` weight matrix consumed above.
+// Learned HC read/mix after the grouped RMSNorm has materialized `normalized`.
+// The production path runs the native quantized GEMV before this kernel, so
+// `projected_up` is one gate logit per branch/hidden column.
+extern "C" __global__ void qwen4_hc_read_projected_f32(
+    const float* input,
+    const __hip_bfloat16* norm_weight,
+    const float* projected_up,
+    float* normalized,
+    float* mixed,
+    int branches,
+    int hidden) {
+    const int column = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int wide = branches * hidden;
+    if (column >= wide) return;
+    if (column < hidden) {
+        float value = 0.0f;
+        for (int branch = 0; branch < branches; ++branch) {
+            const int offset = branch * hidden + column;
+            const float gate_input = __bfloat162float(qwen4_bf16_round(projected_up[offset]));
+            const float gate = __bfloat162float(qwen4_bf16_round(
+                1.0f / (1.0f + expf(-gate_input))));
+            const float normed = __bfloat162float(qwen4_bf16_round(normalized[offset]));
+            value += __bfloat162float(qwen4_bf16_round(gate * normed));
+        }
+        mixed[column] = __bfloat162float(qwen4_bf16_round(value / (float)branches));
+    }
+    (void)input;
+    (void)norm_weight;
+}
+
 
 extern "C" __global__ void qwen4_hc_write_f32(
     const float* input,
@@ -199,8 +267,16 @@ extern "C" __global__ void qwen4_hc_write_f32(
     int wide = branches * hidden;
     if (column >= wide) return;
     int branch = column / hidden;
-    float gate = 2.0f / (1.0f + expf(-gates[branch] / (float)branches));
-    output[column] = input[column] + gate * mixed[column % hidden];
+    const float gate_logit = __bfloat162float(qwen4_bf16_round(gates[branch]));
+    const float gate_scaled = __bfloat162float(
+        qwen4_bf16_round(gate_logit / (float)branches));
+    const float gate = __bfloat162float(qwen4_bf16_round(
+        2.0f * __bfloat162float(qwen4_bf16_round(
+            1.0f / (1.0f + expf(-gate_scaled))))));
+    const float injection = __bfloat162float(qwen4_bf16_round(
+        gate * __bfloat162float(qwen4_bf16_round(mixed[column % hidden]))));
+    const float value = __bfloat162float(qwen4_bf16_round(input[column])) + injection;
+    output[column] = __bfloat162float(qwen4_bf16_round(value));
 }
 
 extern "C" __global__ void qwen4_hc_final_f32(
@@ -222,18 +298,31 @@ extern "C" __global__ void qwen4_hc_norm_f32(
     float* normalized,
     int branches,
     int hidden) {
-    int column = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    int wide = branches * hidden;
-    if (column >= wide) return;
-    int branch = column / hidden;
-    int branch_start = branch * hidden;
-    float sum = 0.0f;
-    for (int i = 0; i < hidden; ++i) {
-        float value = input[branch_start + i];
-        sum += value * value;
+    const int branch = (int)blockIdx.x;
+    if (branch >= branches) return;
+    const int tid = (int)threadIdx.x;
+    const int offset = branch * hidden;
+    __shared__ float rms_sum[256];
+    float partial = 0.0f;
+    for (int j = tid; j < hidden; j += (int)blockDim.x) {
+        const float value = __bfloat162float(qwen4_bf16_round(input[offset + j]));
+        partial += value * value;
     }
-    float inv = rsqrtf(sum / (float)hidden + 1.0e-6f);
-    normalized[column] = input[column] * inv * (1.0f + __bfloat162float(norm_weight[column]));
+    rms_sum[tid] = partial;
+    __syncthreads();
+    for (int stride = (int)blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            rms_sum[tid] += rms_sum[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float inv = rsqrtf(rms_sum[0] / (float)hidden + 1.0e-6f);
+    for (int j = tid; j < hidden; j += (int)blockDim.x) {
+        const int column = offset + j;
+        normalized[column] = __bfloat162float(qwen4_bf16_round(
+            __bfloat162float(qwen4_bf16_round(input[column]))
+            * inv * (1.0f + __bfloat162float(norm_weight[column]))));
+    }
 }
 extern "C" __global__ void qwen4_gdn_conv_bf16_f32(
     const float* input,
@@ -247,21 +336,23 @@ extern "C" __global__ void qwen4_gdn_conv_bf16_f32(
     int cursor) {
     int channel = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (channel >= channels) return;
-    float value = __bfloat162float(kernel[channel]) * input[channel];
-    for (int tap = 1; tap < kernel_size; ++tap) {
-        int delay = tap;
-        if (history_rows > 0) {
-            int row = (cursor + history_rows - (delay % history_rows)) % history_rows;
-            value += __bfloat162float(kernel[tap * channels + channel])
-                * history[row * channels + channel];
-        }
+    const float current = __bfloat162float(qwen4_bf16_round(input[channel]));
+    float value = __bfloat162float(kernel[channel * kernel_size + history_rows]) * current;
+    // causal_conv1d uses the raw HF weight order: oldest history first,
+    // newest history last, and the current token at the final tap.
+    for (int tap = 0; tap < history_rows; ++tap) {
+        int row = (cursor + tap) % history_rows;
+        value += __bfloat162float(kernel[channel * kernel_size + tap])
+            * __bfloat162float(qwen4_bf16_round(history[row * channels + channel]));
     }
-    output[channel] = value * (1.0f / (1.0f + expf(-value)));
+    output[channel] = __bfloat162float(qwen4_bf16_round(
+        value * (1.0f / (1.0f + expf(-value)))));
     for (int row = 0; row < history_rows; ++row) {
-        next_history[row * channels + channel] = history[row * channels + channel];
+        next_history[row * channels + channel] =
+            __bfloat162float(qwen4_bf16_round(history[row * channels + channel]));
     }
     if (history_rows > 0) {
-        next_history[cursor * channels + channel] = input[channel];
+        next_history[cursor * channels + channel] = current;
     }
 }
 
@@ -277,10 +368,10 @@ extern "C" __global__ void qwen4_gdn_params_bf16_f32(
     if (head >= heads) return;
     float al = __bfloat162float(a_log[head]);
     float dt = __bfloat162float(dt_bias[head]);
-    float value = a[head] + dt;
+    float value = __bfloat162float(qwen4_bf16_round(a[head])) + dt;
     float softplus = value > 20.0f ? value : (value < -20.0f ? expf(value) : log1pf(expf(value)));
     gate[head] = -expf(al) * softplus;
-    beta[head] = 1.0f / (1.0f + expf(-b[head]));
+    beta[head] = 1.0f / (1.0f + expf(-__bfloat162float(qwen4_bf16_round(b[head]))));
 }
 
 extern "C" __global__ void qwen4_gdn_params_f32(
@@ -315,20 +406,18 @@ extern "C" __global__ void qwen4_gdn_gate_bf16_f32(
     int start = head * value_dim;
     float sum = 0.0f;
     for (int i = 0; i < value_dim; ++i) {
-        float value = recurrent[start + i];
+        float value = __bfloat162float(qwen4_bf16_round(recurrent[start + i]));
         sum += value * value;
     }
     float inv = rsqrtf(sum / (float)value_dim + 1.0e-6f);
-    float normalized = recurrent[start + channel] * inv
-        * (1.0f + __bfloat162float(norm[channel]));
-    // HF RMSNormGated casts the normalized hidden back to the input BF16
-    // dtype before applying the output sigmoid gate.
-    __hip_bfloat16 normalized_bf16 = static_cast<__hip_bfloat16>(normalized);
-    float normalized_hidden = __bfloat162float(normalized_bf16);
-    float gate = z[start + channel];
-    output[start + channel] = normalized_hidden / (1.0f + expf(-gate));
+    float normalized = __bfloat162float(qwen4_bf16_round(
+        recurrent[start + channel] * inv * __bfloat162float(norm[channel])));
+    float gate = __bfloat162float(qwen4_bf16_round(z[start + channel]));
+    output[start + channel] = __bfloat162float(qwen4_bf16_round(
+        normalized / (1.0f + expf(-gate))));
     (void)width;
 }
+
 extern "C" __global__ void qwen4_qsa_norm_rope_f32(
     float* values,
     const __hip_bfloat16* norm,
@@ -385,9 +474,13 @@ extern "C" __global__ void qwen4_qsa_cache_append_f32(
 // RMS, then the same HalfSplit RoPE used by the index key stream.  The output
 // remains in the resident pooled-key arena; no host selection metadata is
 // involved.
+// Complete-block QSA pooling: mean over raw BF16 index keys, followed by the
+// learned source key RMSNorm and HalfSplit RoPE at the block start. A null
+// `norm` is used only by synthetic parity buffers.
 extern "C" __global__ void qwen4_qsa_pool_rope_f32(
     const float* raw_keys,
     float* pooled,
+    const __hip_bfloat16* norm,
     int block_count,
     int compress,
     int index_dim) {
@@ -395,47 +488,60 @@ extern "C" __global__ void qwen4_qsa_pool_rope_f32(
     int channel = (int)(blockIdx.y * blockDim.x + threadIdx.x);
     if (block >= block_count || compress <= 0) return;
     bool active = channel < index_dim;
-    float value = 0.0f;
     int base = block * compress * index_dim;
+    float mean = 0.0f;
     if (active) {
         for (int row = 0; row < compress; ++row) {
-            value += raw_keys[base + row * index_dim + channel] / (float)compress;
+            mean += raw_keys[base + row * index_dim + channel]
+                / (float)compress;
         }
     }
+    __hip_bfloat16 mean_bf16 = qwen4_bf16_round(mean);
     __shared__ float partial[256];
-    partial[threadIdx.x] = active ? value * value : 0.0f;
+    float squared = active
+        ? __bfloat162float(qwen4_bf16_round(__bfloat162float(mean_bf16)
+            * __bfloat162float(mean_bf16)))
+        : 0.0f;
+    partial[threadIdx.x] = squared;
     __syncthreads();
-    for (int stride = 128; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+    for (int stride = (int)blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
         __syncthreads();
     }
     if (!active) return;
     float inv = rsqrtf(partial[0] / (float)index_dim + 1.0e-6f);
-    value *= inv;
+    float norm_value = norm == nullptr
+        ? 0.0f
+        : __bfloat162float(norm[channel]);
+    float value = __bfloat162float(qwen4_bf16_round(
+        __bfloat162float(mean_bf16) * inv * (1.0f + norm_value)));
     int half = index_dim / 2;
     int rotary_dim = index_dim < 64 ? index_dim : 64;
     if (channel < rotary_dim) {
         int partner = channel < half ? channel + half : channel - half;
-        float other = 0.0f;
+        float other_mean = 0.0f;
         for (int row = 0; row < compress; ++row) {
-            other += raw_keys[base + row * index_dim + partner] / (float)compress;
+            other_mean += raw_keys[base + row * index_dim + partner]
+                / (float)compress;
         }
-        float other_sum = 0.0f;
-        for (int d = 0; d < index_dim; ++d) {
-            float v = 0.0f;
-            for (int row = 0; row < compress; ++row) {
-                v += raw_keys[base + row * index_dim + d] / (float)compress;
-            }
-            other_sum += v * v;
-        }
-        other *= rsqrtf(other_sum / (float)index_dim + 1.0e-6f);
+        __hip_bfloat16 other_bf16 = qwen4_bf16_round(other_mean);
+        float other_norm = norm == nullptr
+            ? 0.0f
+            : __bfloat162float(norm[partner]);
+        float other = __bfloat162float(qwen4_bf16_round(
+            __bfloat162float(other_bf16) * inv * (1.0f + other_norm)));
         float angle = (float)(block * compress)
-            * powf(1000000.0f, -((float)(2 * (channel < half ? channel : partner))) / (float)index_dim);
-        float s = sinf(angle);
-        float c = cosf(angle);
-        value = channel < half ? value * c - other * s : other * s + value * c;
+            * powf(1000000.0f, -((float)(2 * (channel < half ? channel : partner)))
+                / (float)index_dim);
+        float sine = sinf(angle);
+        float cosine = cosf(angle);
+        value = channel < half ? value * cosine - other * sine
+            : other * sine + value * cosine;
     }
-    pooled[block * index_dim + channel] = value;
+    pooled[block * index_dim + channel] = __bfloat162float(
+        qwen4_bf16_round(value));
 }
 
 // Select complete four-token blocks by the learned index score and append the

@@ -1836,10 +1836,13 @@ impl Gpu {
     }
 
     /// Qwen4 indexed combine.  `expert_outputs` stays unweighted until this
-    /// single fixed-ten reduction.
+    /// source-ordered fixed-ten reduction.  The source implementation visits
+    /// the selected experts in ascending expert-index order, while preserving
+    /// each route slot's weight.
     pub fn moe_down_combine_top10_batched(
         &mut self,
         expert_outputs: &GpuTensor,
+        topk_indices: &GpuTensor,
         topk_weights: &GpuTensor,
         residual: &GpuTensor,
         hidden: usize,
@@ -1849,12 +1852,14 @@ impl Gpu {
         const FUNC: &str = "moe_down_combine_top10_batched";
         self.ensure_kernel(FUNC, kernels::MOE_DOWN_COMBINE_TOP10_BATCHED_SRC, FUNC)?;
         let ep = expert_outputs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
         let wp = topk_weights.buf.as_ptr();
         let rp = residual.buf.as_ptr();
         let hv = hidden as i32;
         let tv = tokens as i32;
         let mut params: Vec<*mut c_void> = vec![
             &ep as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
             &wp as *const _ as *mut c_void,
             &rp as *const _ as *mut c_void,
             &hv as *const _ as *mut c_void,
@@ -1862,7 +1867,7 @@ impl Gpu {
         ];
         let block = 256u32;
         let grid_x = (hidden as u32).div_ceil(block);
-        let bytes = (tokens * 10 * hidden + tokens * 10 + 2 * tokens * hidden) * 4;
+        let bytes = (tokens * 10 * hidden + 2 * tokens * 10 + 2 * tokens * hidden) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
         let result = self.launch_maybe_blob(
             FUNC,
@@ -1873,6 +1878,7 @@ impl Gpu {
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(ep);
+                b.push_ptr(ip);
                 b.push_ptr(wp);
                 b.push_ptr(rp);
                 b.push_i32(hv);

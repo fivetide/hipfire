@@ -21,19 +21,20 @@
 //!       --tokens benchmarks/prompts/qwen4-teacher-forced.tokens.json \
 //!       --out /tmp/qwen4-state-parity.json
 
-use hipfire_arch_qwen4::{admit_hfqm_artifact, PleHashMetadata, PleHistory, Qwen4HfqmArtifact};
+use hipfire_arch_qwen4::{PleHashMetadata, PleHistory, Qwen4HfqmArtifact, admit_hfqm_artifact};
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
 use hipfire_runtime::model_source::{ModelSource, SourcePayload};
-use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
+use hipfire_runtime::weight_store::{WeightOrigin, fulfill_manifest_from_payloads};
 use rdna_compute::qwen4::{
+    Qwen4GdnBf16Roundtrip, Qwen4GdnStep, Qwen4HcRead, Qwen4HcWrite, Qwen4QsaAttention,
+    Qwen4QsaCacheAppend, Qwen4QsaNormRope, Qwen4QsaPoolRope, Qwen4QsaSelect,
     qwen4_gdn_bf16_roundtrip, qwen4_gdn_params_f32, qwen4_gdn_step, qwen4_hc_read, qwen4_hc_write,
     qwen4_qsa_attention, qwen4_qsa_cache_append, qwen4_qsa_norm_rope, qwen4_qsa_pool_rope,
-    qwen4_qsa_select, Qwen4GdnBf16Roundtrip, Qwen4GdnStep, Qwen4HcRead, Qwen4HcWrite,
-    Qwen4QsaAttention, Qwen4QsaCacheAppend, Qwen4QsaNormRope, Qwen4QsaPoolRope, Qwen4QsaSelect,
+    qwen4_qsa_select,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
@@ -2105,6 +2106,7 @@ fn run_qsa(
         &Qwen4QsaPoolRope {
             raw_keys: &raw_gpu,
             pooled: &pooled_gpu,
+            norm: None,
             block_count: blocks,
             compress: QSA_COMPRESS,
             index_dim,
@@ -2134,13 +2136,8 @@ fn run_qsa(
         let visible = token + 1;
         let block_count = visible / QSA_COMPRESS;
         if block_count == 0 {
-            selected_actual.extend((0..capacity).map(|slot| {
-                if slot < visible {
-                    slot as i64
-                } else {
-                    -1
-                }
-            }));
+            selected_actual
+                .extend((0..capacity).map(|slot| if slot < visible { slot as i64 } else { -1 }));
             continue;
         }
         let query = gpu
@@ -2751,6 +2748,7 @@ fn run_moe_operator(
         .map_err(|error| error.to_string())?;
     gpu.moe_down_combine_top10_batched(
         &expert_gpu,
+        &selected_gpu,
         &weights_gpu,
         &residual_gpu,
         hidden_size,
@@ -3198,6 +3196,7 @@ fn run_mtp(
         &Qwen4QsaPoolRope {
             raw_keys: &raw_gpu,
             pooled: &pooled_gpu,
+            norm: None,
             block_count: 1,
             compress: QSA_COMPRESS,
             index_dim,
@@ -3971,13 +3970,15 @@ fn parse_args() -> Result<ParityMode, String> {
             }
             "--model" => model = Some(PathBuf::from(args.next().ok_or("--model needs FILE")?)),
             "--tokens" => {
-                tokens = Some(PathBuf::from(args.next().ok_or("--tokens needs metadata JSON")?))
+                tokens = Some(PathBuf::from(
+                    args.next().ok_or("--tokens needs metadata JSON")?,
+                ))
             }
             "--out" => out = Some(PathBuf::from(args.next().ok_or("--out needs FILE")?)),
             other => {
                 return fail(format!(
                     "unsupported argument {other:?}; use --fixtures DIR --out FILE, --model FILE --tokens CORPUS --out FILE, --mode state --model FILE --tokens CORPUS --out FILE, or --mode profile --model FILE --tokens CORPUS --out FILE"
-                ))
+                ));
             }
         }
     }

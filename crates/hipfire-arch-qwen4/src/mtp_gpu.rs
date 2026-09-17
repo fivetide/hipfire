@@ -11,17 +11,18 @@
 
 use crate::config::Qwen4Config;
 use crate::gpu_forward::{
-    execute_moe, Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
+    Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch, execute_moe,
 };
 use crate::projection::dispatch_gemv;
 use crate::weights::{HyperConnectionWeights, Qwen4Weights, WeightError};
 use hipfire_runtime::spec::SpecGrammar;
 use rdna_compute::qwen4::{
-    qwen4_argmax, qwen4_hc_final, qwen4_hc_norm, qwen4_hc_read, qwen4_hc_write,
-    qwen4_qsa_attention, qwen4_qsa_cache_append, qwen4_qsa_norm_rope, qwen4_qsa_pool_rope,
-    qwen4_qsa_reuse_selection, qwen4_qsa_select, qwen4_scale, Qwen4Argmax, Qwen4HcFinal,
-    Qwen4HcNorm, Qwen4HcRead, Qwen4HcWrite, Qwen4QsaAttention, Qwen4QsaCacheAppend,
-    Qwen4QsaNormRope, Qwen4QsaPoolRope, Qwen4QsaReuseSelection, Qwen4QsaSelect, Qwen4Scale,
+    Qwen4Argmax, Qwen4HcFinal, Qwen4HcNorm, Qwen4HcReadProjected, Qwen4HcWrite, Qwen4QsaAttention,
+    Qwen4QsaCacheAppend, Qwen4QsaNormRope, Qwen4QsaPoolRope, Qwen4QsaReuseSelection,
+    Qwen4QsaSelect, Qwen4Scale, qwen4_argmax, qwen4_hc_final, qwen4_hc_norm,
+    qwen4_hc_read_projected, qwen4_hc_write, qwen4_qsa_attention, qwen4_qsa_cache_append,
+    qwen4_qsa_norm_rope, qwen4_qsa_pool_rope, qwen4_qsa_reuse_selection, qwen4_qsa_select,
+    qwen4_scale,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::fmt;
@@ -100,18 +101,17 @@ fn hc_read(
         config.hc_count * config.hidden_size,
         config.hc_lowrank,
     )?;
-    qwen4_hc_read(
+    let projected_up = f32_view(up, 0, config.hc_count * config.hidden_size);
+    qwen4_hc_read_projected(
         gpu,
-        &Qwen4HcRead {
+        &Qwen4HcReadProjected {
             input,
             norm_weight: norm,
-            low,
-            up,
+            up: &projected_up,
             normalized,
             mixed,
             branches: config.hc_count,
             hidden: config.hidden_size,
-            rank: config.hc_lowrank,
         },
     )?;
     Ok(())
@@ -1373,17 +1373,9 @@ impl Qwen4MtpGpu {
                 rotary_dim: MTP_ROTARY_DIM.min(index_dim),
             },
         )?;
-        qwen4_qsa_norm_rope(
-            gpu,
-            &Qwen4QsaNormRope {
-                values: &scratch.index_key,
-                norm: index_key_norm,
-                heads: config.indexer_kv_heads,
-                head_dim: index_dim,
-                position: 0,
-                rotary_dim: MTP_ROTARY_DIM.min(index_dim),
-            },
-        )?;
+        // Keep raw BF16 index keys in the cache; source key RMSNorm and RoPE
+        // happen after four-token block pooling.
+        gpu.bf16_round_trip_f32(&scratch.index_key)?;
         let raw_offset = position
             .checked_mul(index_key_width)
             .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
@@ -1497,6 +1489,7 @@ impl Qwen4MtpGpu {
                 &Qwen4QsaPoolRope {
                     raw_keys: &state.raw_index_keys,
                     pooled: &state.pooled_keys,
+                    norm: Some(index_key_norm),
                     block_count: complete,
                     compress: config.indexer_compress_ratio,
                     index_dim: index_key_width,

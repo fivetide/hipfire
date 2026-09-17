@@ -14,7 +14,7 @@
 //!   cargo run --release --example qwen4_qt53_channel -p hipfire-runtime
 
 use half::f16;
-use rdna_compute::{gen_fwht_signs, DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor, gen_fwht_signs};
 
 const QT53_GROUP_BYTES: usize = 68;
 const QT44_GROUP_BYTES: usize = 136;
@@ -90,7 +90,10 @@ fn bf16_bits_to_f32(bits: u16) -> f32 {
 }
 
 fn f32_to_bf16_bits(value: f32) -> u16 {
-    assert!(value.is_finite(), "source BF16 harness value must be finite");
+    assert!(
+        value.is_finite(),
+        "source BF16 harness value must be finite"
+    );
     let bits = value.to_bits();
     let rounding = 0x7fffu32 + ((bits >> 16) & 1);
     (bits.wrapping_add(rounding) >> 16) as u16
@@ -106,7 +109,6 @@ fn source_bf16_words(len: usize, seed: usize) -> Vec<u16> {
         })
         .collect()
 }
-
 
 fn activation_values(k: usize, seed: usize) -> Vec<f32> {
     (0..k)
@@ -152,11 +154,7 @@ fn report_quant_loss(label: &str, source: &[f32], decoded: &[f32]) -> Result<(),
     Ok(())
 }
 
-fn hfq4g128_embedding_bytes(
-    source: &[u16],
-    rows: usize,
-    dim: usize,
-) -> Result<Vec<u8>, String> {
+fn hfq4g128_embedding_bytes(source: &[u16], rows: usize, dim: usize) -> Result<Vec<u8>, String> {
     if dim == 0 || dim % 128 != 0 || source.len() != rows.saturating_mul(dim) {
         return Err(format!(
             "HFQ4-G128 embedding geometry mismatch: rows={rows} dim={dim} source={}",
@@ -263,8 +261,7 @@ fn cpu_rotate_128(input: &[f32], batch: usize, k: usize) -> Vec<f32> {
             let mut values = [0.0f32; 128];
             values[..actual].copy_from_slice(&input[row * k + start..row * k + start + actual]);
             cpu_fwht_128(&mut values);
-            output[row * k + start..row * k + start + actual]
-                .copy_from_slice(&values[..actual]);
+            output[row * k + start..row * k + start + actual].copy_from_slice(&values[..actual]);
         }
     }
     output
@@ -669,7 +666,7 @@ fn indexed_top10(gpu: &mut Gpu) -> Result<(), String> {
         experts_count,
     )
     .map_err(|error| error.to_string())?;
-    gpu.moe_down_combine_top10_batched(&expanded, &weights, &residual, m, tokens)
+    gpu.moe_down_combine_top10_batched(&expanded, &indices, &weights, &residual, m, tokens)
         .map_err(|error| error.to_string())?;
     let actual = gpu
         .download_f32(&residual)

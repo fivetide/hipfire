@@ -183,7 +183,7 @@ impl<'a> MoeStepState<'a> {
             MoeKernelSelection::Prefill(_) => {
                 return Err(DispatchError::Hip(
                     "sealed moe: decode operation received prefill selection".into(),
-                ))
+                ));
             }
         };
         Ok((params, selection))
@@ -200,7 +200,7 @@ impl<'a> MoeStepState<'a> {
             MoeKernelSelection::Decode(_) => {
                 return Err(DispatchError::Hip(
                     "sealed moe: prefill operation received decode selection".into(),
-                ))
+                ));
             }
         };
         Ok((params, selection))
@@ -430,6 +430,7 @@ impl<'a> SealedMoeOp<'a> {
                 .then_some(params.x_rot_local),
             shared_gate,
             shared_up,
+            selection.qwen4_top10,
         )
     }
 
@@ -494,7 +495,7 @@ impl<'a> SealedMoeOp<'a> {
                                     variant: "prefill-router-dtype",
                                     arch: "",
                                     quant: "",
-                                })
+                                });
                             }
                         };
                         GEMM_ROUTER
@@ -648,6 +649,7 @@ impl<'a> SealedMoeOp<'a> {
                     .then_some(params.x_rot_local),
                 shared_gate,
                 shared_up,
+                selection.qwen4_top10,
             );
         }
         let (params, _) = self.state.prefill_parts()?;
@@ -893,9 +895,6 @@ fn lower_decode<'a>(
                 // router/selector/gate/up launch when its static quartet is
                 // admitted; the route operation then owns top-k production.
                 append_step(&mut steps, Step::MoeGateSide(op(state)))?;
-                if selection.qwen4_top10 && !params.skip_shared {
-                    append_step(&mut steps, Step::MoeSharedDown(op(state)))?;
-                }
                 append_step(&mut steps, Step::MoeRoute(op(state)))?;
             }
             if !selection.qwen4_top10 && !params.skip_shared {
@@ -924,12 +923,25 @@ fn lower_decode<'a>(
                 params.dtypes.routed_down,
                 params.expert_dtype_tags.is_some(),
             );
-        if params.ep_mode != crate::families::moe::MoeEpMode::RootRoutedPartial
+        let combine_after_down = params.ep_mode
+            != crate::families::moe::MoeEpMode::RootRoutedPartial
             && !selection.ninepath_d4
             && (selection.qwen4_top10 || !down_self_combines)
-            && !params.defer_routed_combine
-        {
+            && !params.defer_routed_combine;
+        if combine_after_down {
             append_step(&mut steps, Step::MoeCombine(op(state)))?;
+            if selection.qwen4_top10 && !params.skip_shared {
+                // Qwen4's source module performs routed index_add first and
+                // only then adds the shared expert output in BF16.
+                append_step(&mut steps, Step::MoeSharedDown(op(state)))?;
+            }
+        } else if selection.qwen4_top10
+            && !params.skip_shared
+            && params.ep_mode == crate::families::moe::MoeEpMode::RootRoutedPartial
+        {
+            // Root-routed EP folds the gathered slots outside this local
+            // program; preserve the existing shared partial contract there.
+            append_step(&mut steps, Step::MoeSharedDown(op(state)))?;
         }
     } else {
         append_step(&mut steps, Step::MoeHostExperts(op(state)))?;

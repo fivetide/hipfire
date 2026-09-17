@@ -151,6 +151,42 @@ pub fn qwen4_gdn_bf16_roundtrip(gpu: &mut Gpu, p: &Qwen4GdnBf16Roundtrip<'_>) ->
         args.as_mut_slice(),
     )
 }
+/// Source-exact BF16 product and residual add for the Qwen4 shared expert.
+pub struct Qwen4Bf16ScaledAdd<'a> {
+    pub residual: &'a GpuTensor,
+    pub value: &'a GpuTensor,
+    pub scalar: &'a GpuTensor,
+    pub elements: usize,
+}
+
+pub fn qwen4_bf16_scaled_add(gpu: &mut Gpu, p: &Qwen4Bf16ScaledAdd<'_>) -> HipResult<()> {
+    ensure_gfx1151(gpu)?;
+    ensure_f32(p.residual)?;
+    ensure_f32(p.value)?;
+    ensure_f32(p.scalar)?;
+    if p.elements == 0
+        || p.elements > i32::MAX as usize
+        || p.residual.numel() < p.elements
+        || p.value.numel() < p.elements
+        || p.scalar.numel() == 0
+    {
+        return Err(HipError::new(0, &Qwen4ComputeError::WrongShape.to_string()));
+    }
+    gpu.ensure_kernel_public("qwen4_ops", QWEN4_OPS_SRC, "qwen4_bf16_scaled_add_f32")?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.residual.buf.as_ptr());
+    args.push_ptr(p.value.buf.as_ptr());
+    args.push_ptr(p.scalar.buf.as_ptr());
+    args.push_i32(p.elements as i32);
+    args.pad_to(16);
+    gpu.launch_kernel_blob(
+        "qwen4_bf16_scaled_add_f32",
+        [blocks(p.elements), 1, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+    )
+}
 
 pub struct Qwen4HcRead<'a> {
     pub input: &'a GpuTensor,
@@ -193,6 +229,51 @@ pub fn qwen4_hc_read(gpu: &mut Gpu, p: &Qwen4HcRead<'_>) -> HipResult<()> {
     args.pad_to(16);
     gpu.launch_kernel_blob(
         "qwen4_hc_read_f32",
+        [1, 1, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+    )
+}
+
+/// HC read where the up projection has already been evaluated to one F32
+/// gate logit per branch/hidden column.
+pub struct Qwen4HcReadProjected<'a> {
+    pub input: &'a GpuTensor,
+    pub norm_weight: &'a GpuTensor,
+    pub up: &'a GpuTensor,
+    pub normalized: &'a GpuTensor,
+    pub mixed: &'a GpuTensor,
+    pub branches: usize,
+    pub hidden: usize,
+}
+
+pub fn qwen4_hc_read_projected(gpu: &mut Gpu, p: &Qwen4HcReadProjected<'_>) -> HipResult<()> {
+    ensure_gfx1151(gpu)?;
+    for tensor in [p.input, p.up, p.normalized, p.mixed] {
+        ensure_f32(tensor)?;
+    }
+    if p.norm_weight.dtype != DType::BF16
+        || p.branches == 0
+        || p.hidden == 0
+        || p.input.numel() != p.branches * p.hidden
+        || p.norm_weight.numel() != p.input.numel()
+        || p.up.numel() != p.input.numel()
+        || p.normalized.numel() != p.input.numel()
+        || p.mixed.numel() != p.hidden
+    {
+        return Err(HipError::new(0, &Qwen4ComputeError::WrongShape.to_string()));
+    }
+    gpu.ensure_kernel_public("qwen4_ops", QWEN4_OPS_SRC, "qwen4_hc_read_projected_f32")?;
+    let mut args = KernargBlob::new();
+    for tensor in [p.input, p.norm_weight, p.up, p.normalized, p.mixed] {
+        args.push_ptr(tensor.buf.as_ptr());
+    }
+    args.push_i32(p.branches as i32);
+    args.push_i32(p.hidden as i32);
+    args.pad_to(16);
+    gpu.launch_kernel_blob(
+        "qwen4_hc_read_projected_f32",
         [blocks(p.branches * p.hidden), 1, 1],
         [256, 1, 1],
         0,
@@ -307,7 +388,7 @@ pub fn qwen4_hc_norm(gpu: &mut Gpu, p: &Qwen4HcNorm<'_>) -> HipResult<()> {
     args.pad_to(16);
     gpu.launch_kernel_blob(
         "qwen4_hc_norm_f32",
-        [blocks(p.branches * p.hidden), 1, 1],
+        [p.branches as u32, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
@@ -659,6 +740,9 @@ pub fn qwen4_qsa_reuse_selection(gpu: &mut Gpu, p: &Qwen4QsaReuseSelection<'_>) 
 pub struct Qwen4QsaPoolRope<'a> {
     pub raw_keys: &'a GpuTensor,
     pub pooled: &'a GpuTensor,
+    /// Learned index-key RMSNorm. `None` is reserved for synthetic parity
+    /// buffers, which intentionally retain the plain-RMS behavior.
+    pub norm: Option<&'a GpuTensor>,
     pub block_count: usize,
     pub compress: usize,
     pub index_dim: usize,
@@ -668,6 +752,11 @@ pub fn qwen4_qsa_pool_rope(gpu: &mut Gpu, p: &Qwen4QsaPoolRope<'_>) -> HipResult
     ensure_gfx1151(gpu)?;
     for tensor in [p.raw_keys, p.pooled] {
         ensure_f32(tensor)?;
+    }
+    if let Some(norm) = p.norm {
+        if norm.dtype != DType::BF16 || norm.numel() != p.index_dim {
+            return Err(HipError::new(0, &Qwen4ComputeError::WrongShape.to_string()));
+        }
     }
     if p.block_count == 0
         || p.compress == 0
@@ -682,6 +771,11 @@ pub fn qwen4_qsa_pool_rope(gpu: &mut Gpu, p: &Qwen4QsaPoolRope<'_>) -> HipResult
     let mut args = KernargBlob::new();
     args.push_ptr(p.raw_keys.buf.as_ptr());
     args.push_ptr(p.pooled.buf.as_ptr());
+    args.push_ptr(
+        p.norm
+            .map(|norm| norm.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut()),
+    );
     args.push_i32(p.block_count as i32);
     args.push_i32(p.compress as i32);
     args.push_i32(p.index_dim as i32);

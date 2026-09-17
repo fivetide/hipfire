@@ -11,8 +11,8 @@
 
 use crate::config::compact_test_config;
 use crate::gpu_forward::{
-    qwen4_profile_enable, qwen4_profile_reset, qwen4_profile_snapshot, Qwen4GpuForwardScratch,
-    Qwen4ProfileStats,
+    Qwen4GpuForwardScratch, Qwen4ProfileStats, qwen4_profile_enable, qwen4_profile_reset,
+    qwen4_profile_snapshot,
 };
 use crate::mtp_gpu::{MtpGpuState, MtpStateParityMetadata};
 use crate::mtp_spec::validate_native_mtp_prefill_request;
@@ -21,11 +21,11 @@ use crate::state::Qwen4State;
 use hip_bridge::launch_counters;
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
 use rdna_compute::qwen4::{
-    qwen4_qsa_cache_append, qwen4_qsa_pool_rope, qwen4_qsa_reuse_selection, qwen4_qsa_select,
     Qwen4QsaCacheAppend, Qwen4QsaPoolRope, Qwen4QsaReuseSelection, Qwen4QsaSelect,
+    qwen4_qsa_cache_append, qwen4_qsa_pool_rope, qwen4_qsa_reuse_selection, qwen4_qsa_select,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -476,6 +476,7 @@ fn select_target(
                 &Qwen4QsaPoolRope {
                     raw_keys: &qsa.raw_index_keys,
                     pooled: &qsa.pooled_keys,
+                    norm: None,
                     block_count: visible / config.indexer_compress_ratio,
                     compress: config.indexer_compress_ratio,
                     index_dim: raw_width,
@@ -538,6 +539,7 @@ fn select_mtp(
             &Qwen4QsaPoolRope {
                 raw_keys: buffers.raw_index_keys,
                 pooled: buffers.pooled_keys,
+                norm: None,
                 block_count: visible / config.indexer_compress_ratio,
                 compress: config.indexer_compress_ratio,
                 index_dim: raw_width,
@@ -2241,9 +2243,11 @@ mod tests {
             .find(|scenario| field(scenario, "case").as_str() == Some("cache_suffix_refusal"))
             .expect("cache suffix refusal scenario");
         assert_eq!(field(cache, "cache_hit").as_bool(), Some(true));
-        assert!(field(cache, "refusal")
-            .as_str()
-            .unwrap()
-            .contains("cache-hit suffix"));
+        assert!(
+            field(cache, "refusal")
+                .as_str()
+                .unwrap()
+                .contains("cache-hit suffix")
+        );
     }
 }

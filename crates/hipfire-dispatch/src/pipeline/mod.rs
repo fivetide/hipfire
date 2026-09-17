@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Björn Bösel
 // hipfire — see LICENSE and NOTICE in the project root.
 use crate::context::DispatchCtx;
-use crate::families::fused_qkv::{fused_gate_up_key_for, FusedQkvFamily, FusedQkvParams};
+use crate::families::fused_qkv::{FusedQkvFamily, FusedQkvParams, fused_gate_up_key_for};
 use crate::families::gemm::{GemmFamily, GemmParams};
 use crate::families::gemv::{GemvFamily, WeightRef};
 use crate::families::moe::MOE_GROUPED_BLOCK_M;
@@ -10,22 +10,23 @@ use crate::tables::KernelRegistry;
 use crate::types::*;
 #[allow(unused_imports)]
 use hip_bridge;
+use rdna_compute::qwen4::{Qwen4Bf16ScaledAdd, qwen4_bf16_scaled_add};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::cell::OnceCell;
 use std::sync::{LazyLock, OnceLock};
 
 pub mod sealed_moe;
 pub use sealed_moe::{
-    checked_grouped_m_total_bound, checked_tp_local_shapes, seal_decode, seal_ep_routed_contrib,
-    seal_prefill, seal_prefill_ep, ActivationIdentity, ActivationInput, BoundMoeExperts,
-    ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources, ExpertTable,
-    MoeContribution, MoePrefillRouteProducerProof, MoeProtocol, MoeRouteProducerProof,
-    MoeRouterInput, MoeSharedContribution, PrefillRouteMode, ResourceAlias, SealedMoeCall,
+    ActivationIdentity, ActivationInput, BoundMoeExperts, ExpertBindingCache, ExpertMetadata,
+    ExpertResource, ExpertResources, ExpertTable, MoeContribution, MoePrefillRouteProducerProof,
+    MoeProtocol, MoeRouteProducerProof, MoeRouterInput, MoeSharedContribution, PrefillRouteMode,
+    ResourceAlias, SealedMoeCall, checked_grouped_m_total_bound, checked_tp_local_shapes,
+    seal_decode, seal_ep_routed_contrib, seal_prefill, seal_prefill_ep,
 };
 pub(crate) mod moe_program;
 pub use moe_program::SealedMoeOp;
 pub(crate) mod steps;
-pub use steps::{execute_steps, FusedPattern, GemvInput, Step};
+pub use steps::{FusedPattern, GemvInput, Step, execute_steps};
 
 // #397 Ship 6 — forward-as-pipeline C-design lowered super-op substrate (types
 // only at this step; not on any live path until wired behind HIPFIRE_FORWARD_LOWERED).
@@ -1571,8 +1572,8 @@ pub fn run_moe_prefill_bias_aware(
                         batch_size,
                     ))?;
             } else {
-                hip!(gpu
-                    .deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched_k4(
+                hip!(
+                    gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched_k4(
                         p.expert_down_ptrs,
                         p.topk_indices,
                         p.topk_weights,
@@ -1582,7 +1583,8 @@ pub fn run_moe_prefill_bias_aware(
                         im,
                         k_top,
                         batch_size,
-                    ))?;
+                    )
+                )?;
             }
         }
     }
@@ -1739,8 +1741,8 @@ fn dispatch_grouped_gemm(
         // recipe: gate_up = MQ2-Lloyd 72 B/group, down = MQ3-Lloyd 112 B/group).
         // Both entries are arch-selecting (gfx11 `_k2` / gfx12 `_gfx12`) — do NOT
         // swap either for the bare `_k2` launcher, which fails the JIT on RDNA4.
-        DType::MQ2G256Lloyd | DType::MQ2G256LloydU => hip!(gpu
-            .gemm_mq2g256_lloyd_moe_grouped_wmma(
+        DType::MQ2G256Lloyd | DType::MQ2G256LloydU => {
+            hip!(gpu.gemm_mq2g256_lloyd_moe_grouped_wmma(
                 ptrs,
                 tile_ids,
                 sorted_slot_index,
@@ -1751,7 +1753,8 @@ fn dispatch_grouped_gemm(
                 x_row_div,
                 m_total,
                 rows,
-            )),
+            ))
+        }
         DType::MQ3G256Lloyd => hip!(gpu.gemm_mq3g256_lloyd_moe_grouped_wmma(
             ptrs,
             tile_ids,
@@ -2600,6 +2603,7 @@ fn decode_gate_side_stage(
     x_rot_local: Option<&GpuTensor>,
     shared_gate: &GpuTensor,
     shared_up: &GpuTensor,
+    qwen4_top10: bool,
 ) -> Result<(), DispatchError> {
     let shared = p.shared.as_ref().ok_or_else(|| {
         DispatchError::Hip("shared gate-side stage requires shared weights".into())
@@ -2791,6 +2795,15 @@ fn decode_gate_side_stage(
             }
         }
     } // end `if !skip_routing` (gate-side GEMV)
+    // Qwen4's source model is BF16 end-to-end through the router and
+    // shared-expert projections.  The quantized GEMV contract is F32, so
+    // restore the source boundary before the downstream nonlinearities.
+    if qwen4_top10 {
+        hip!(gpu.bf16_round_trip_f32(p.router_logits))?;
+        hip!(gpu.bf16_round_trip_f32(scalar_buf))?;
+        hip!(gpu.bf16_round_trip_f32(shared_gate))?;
+        hip!(gpu.bf16_round_trip_f32(shared_up))?;
+    }
     Ok(())
 }
 
@@ -2833,10 +2846,10 @@ fn decode_route_gpu_stage(
             }
         }
     } // end `if !skip_routing` (DIAG dump)
-      // Router variant flags were resolved during typed-program lowering.
-      // Pre-routed experts-only skips top-k production: the buffers already hold
-      // the root-authoritative IDs (a per-rank re-ranking is exactly the
-      // divergence this removes).
+    // Router variant flags were resolved during typed-program lowering.
+    // Pre-routed experts-only skips top-k production: the buffers already hold
+    // the root-authoritative IDs (a per-rank re-ranking is exactly the
+    // divergence this removes).
     if !skip_routing {
         if qwen4_top10 {
             hip!(gpu.moe_router_softmax_top10_f32(
@@ -2846,6 +2859,9 @@ fn decode_route_gpu_stage(
                 1,
                 p.norm_topk_prob,
             ))?;
+            // HF casts selected top-k probabilities back to the hidden
+            // dtype before expert weighting.
+            hip!(gpu.bf16_round_trip_f32(p.topk_weights))?;
             return Ok(());
         }
         if router_shared_fuse {
@@ -2926,9 +2942,13 @@ fn decode_shared_down_stage(
     if qwen4_top10 && !p.skip_shared {
         #[cfg(feature = "deltanet")]
         {
+            // Linear and sigmoid outputs are BF16 in the source module.
+            hip!(gpu.bf16_round_trip_f32(scalar_buf))?;
             hip!(gpu.sigmoid_f32(scalar_buf))?;
+            hip!(gpu.bf16_round_trip_f32(scalar_buf))?;
             let shared_hid = slice_moe_f32_view(p.ffn_hidden, 0, smi);
             hip!(gpu.silu_mul_f32(shared_gate, shared_up, &shared_hid))?;
+            hip!(gpu.bf16_round_trip_f32(&shared_hid))?;
             static GEMV_QWEN4_SHARED_DOWN: LazyLock<GemvFamily> = LazyLock::new(GemvFamily::new);
             if shared_down_w.dtype == DType::MQ4G128V2 {
                 let shared_down_rot = slice_moe_f32_view(p.rot_batch, 0, shared_down_w.k);
@@ -2945,7 +2965,17 @@ fn decode_shared_down_stage(
                     .run_auto(ctx, gpu, shared_down_w, &shared_hid, p.ffn_out)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
             }
-            hip!(gpu.scaled_add_inplace_gpu_scalar_f32(out_target, p.ffn_out, scalar_buf))?;
+            hip!(gpu.bf16_round_trip_f32(p.ffn_out))?;
+            hip!(qwen4_bf16_scaled_add(
+                gpu,
+                &Qwen4Bf16ScaledAdd {
+                    residual: out_target,
+                    value: p.ffn_out,
+                    scalar: scalar_buf,
+                    elements: p.hidden,
+                },
+            ))?;
+            hip!(gpu.bf16_round_trip_f32(out_target))?;
             return Ok(());
         }
         #[cfg(not(feature = "deltanet"))]
@@ -3132,6 +3162,8 @@ fn decode_gate_up_stage(
             p.hidden,
             1,
         ))?;
+        hip!(gpu.bf16_round_trip_f32(&gate_batch))?;
+        hip!(gpu.bf16_round_trip_f32(&up_batch))?;
         return Ok(());
     }
     if ninepath_d3 {
@@ -3329,6 +3361,7 @@ fn decode_activation_stage(
         let up_batch = slice_moe_f32_view(p.up_batch, 0, routed_slots);
         let rot_batch = slice_moe_f32_view(p.rot_batch, 0, routed_slots);
         hip!(gpu.silu_mul_f32(&gate_batch, &up_batch, &rot_batch))?;
+        hip!(gpu.bf16_round_trip_f32(&rot_batch))?;
         hip!(gpu.rotate_x_mq_128_v2(&rot_batch, &rot_batch, p.mi, 10))?;
         return Ok(());
     }
@@ -3420,6 +3453,7 @@ fn decode_down_stage(
             1,
             p.n_exp,
         ))?;
+        hip!(gpu.bf16_round_trip_f32(&down_expanded))?;
         return Ok(());
     }
     // Expanded write — down GEMV by the DOWN dtype (mixed mq6-down lands here).
@@ -3908,11 +3942,13 @@ fn decode_combine_stage(
         let down_expanded = slice_moe_f32_view(p.down_expanded, 0, 10 * p.hidden);
         hip!(gpu.moe_down_combine_top10_batched(
             &down_expanded,
+            p.topk_indices,
             p.topk_weights,
             target,
             p.hidden,
             1,
         ))?;
+        hip!(gpu.bf16_round_trip_f32(target))?;
         return Ok(());
     }
     hip!(gpu.moe_down_combine_k8_batched(
