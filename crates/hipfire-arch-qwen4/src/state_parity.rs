@@ -11,8 +11,8 @@
 
 use crate::config::compact_test_config;
 use crate::gpu_forward::{
-    Qwen4GpuForwardScratch, Qwen4ProfileStats, qwen4_profile_enable, qwen4_profile_reset,
-    qwen4_profile_snapshot,
+    qwen4_profile_enable, qwen4_profile_reset, qwen4_profile_snapshot, Qwen4GpuForwardScratch,
+    Qwen4ProfileStats,
 };
 use crate::mtp_gpu::{MtpGpuState, MtpStateParityMetadata};
 use crate::mtp_spec::validate_native_mtp_prefill_request;
@@ -21,11 +21,11 @@ use crate::state::Qwen4State;
 use hip_bridge::launch_counters;
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
 use rdna_compute::qwen4::{
-    Qwen4QsaCacheAppend, Qwen4QsaPoolRope, Qwen4QsaReuseSelection, Qwen4QsaSelect,
     qwen4_qsa_cache_append, qwen4_qsa_pool_rope, qwen4_qsa_reuse_selection, qwen4_qsa_select,
+    Qwen4QsaCacheAppend, Qwen4QsaPoolRope, Qwen4QsaReuseSelection, Qwen4QsaSelect,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -1849,31 +1849,51 @@ fn real_model_probe(
     corpus: &Value,
 ) -> Result<Value, String> {
     let vocab = bundle.config.vocab_size;
-    let logits = gpu
-        .zeros(&[vocab], DType::F32)
-        .map_err(|error| format!("allocate real-model logits: {error}"))?;
+    let ar_elements = tokens
+        .len()
+        .checked_mul(vocab)
+        .ok_or_else(|| "real-model AR logits shape overflow".to_string())?;
+    let ar_buffer = gpu
+        .zeros(&[ar_elements], DType::F32)
+        .map_err(|error| format!("allocate real-model AR logits: {error}"))?;
     let ar_result = (|| {
         bundle.reset(gpu).map_err(|error| error.to_string())?;
         bundle
-            .forward_chunk(gpu, tokens, &logits, None)
+            .forward_chunk(gpu, tokens, &ar_buffer, None)
             .map_err(|error| format!("real AR forward: {error}"))?;
-        download_host_logits(gpu, &logits)
+        let last_row_start = tokens
+            .len()
+            .checked_sub(1)
+            .and_then(|row| row.checked_mul(vocab))
+            .ok_or_else(|| "real-model AR logits row is empty".to_string())?;
+        download_host_logits(gpu, &ar_buffer.sub_offset(last_row_start, vocab))
     })();
     let ar_logits = match ar_result {
         Ok(logits) => logits,
         Err(error) => {
-            let _ = gpu.free_tensor(logits);
+            let _ = gpu.free_tensor(ar_buffer);
             return Err(error);
         }
     };
-    bundle.reset(gpu).map_err(|error| error.to_string())?;
+    if let Err(error) = bundle.reset(gpu) {
+        let _ = gpu.free_tensor(ar_buffer);
+        return Err(error.to_string());
+    }
+    let mtp_buffer = match gpu.zeros(&[vocab], DType::F32) {
+        Ok(buffer) => buffer,
+        Err(error) => {
+            let _ = gpu.free_tensor(ar_buffer);
+            return Err(format!("allocate real-model MTP logits: {error}"));
+        }
+    };
     let mut drafter = crate::mtp_spec::Qwen4MtpDrafter::new(DRAFTS.len(), 2048);
     use hipfire_runtime::spec::MtpDrafter;
     let seed = match drafter.mtp_prefill(gpu, bundle, tokens, tokens, 0, false, &|| false) {
         Ok(seed) => seed,
         Err(error) => {
             MtpDrafter::mtp_free(Box::new(drafter), gpu);
-            let _ = gpu.free_tensor(logits);
+            let _ = gpu.free_tensor(mtp_buffer);
+            let _ = gpu.free_tensor(ar_buffer);
             return Err(format!("real native MTP prefill: {error}"));
         }
     };
@@ -1891,27 +1911,46 @@ fn real_model_probe(
         Ok(window) => window,
         Err(error) => {
             MtpDrafter::mtp_free(Box::new(drafter), gpu);
-            let _ = gpu.free_tensor(logits);
+            let _ = gpu.free_tensor(mtp_buffer);
+            let _ = gpu.free_tensor(ar_buffer);
             return Err(format!("real native MTP step: {error}"));
         }
     };
     let probe_token = window.committed.last().copied().unwrap_or(seed);
-    let mtp_position = bundle
-        .mtp_position()
-        .map_err(|error| format!("read native MTP position: {error}"))?;
-    bundle
-        .mtp_forward_token_logits(gpu, probe_token, mtp_position, &logits)
-        .map_err(|error| format!("real native MTP logits: {error}"))?;
-    let mtp_logits = match download_host_logits(gpu, &logits) {
+    let mtp_position = match bundle.mtp_position() {
+        Ok(position) => position,
+        Err(error) => {
+            MtpDrafter::mtp_free(Box::new(drafter), gpu);
+            let _ = gpu.free_tensor(mtp_buffer);
+            let _ = gpu.free_tensor(ar_buffer);
+            return Err(format!("read native MTP position: {error}"));
+        }
+    };
+    if let Err(error) = bundle.mtp_forward_token_logits(gpu, probe_token, mtp_position, &mtp_buffer)
+    {
+        MtpDrafter::mtp_free(Box::new(drafter), gpu);
+        let _ = gpu.free_tensor(mtp_buffer);
+        let _ = gpu.free_tensor(ar_buffer);
+        return Err(format!("real native MTP logits: {error}"));
+    }
+    let mtp_logits = match download_host_logits(gpu, &mtp_buffer) {
         Ok(logits) => logits,
         Err(error) => {
             MtpDrafter::mtp_free(Box::new(drafter), gpu);
-            let _ = gpu.free_tensor(logits);
+            let _ = gpu.free_tensor(mtp_buffer);
+            let _ = gpu.free_tensor(ar_buffer);
             return Err(error);
         }
     };
     MtpDrafter::mtp_free(Box::new(drafter), gpu);
-    let families = bundle_family_json(gpu, bundle)?;
+    let families = match bundle_family_json(gpu, bundle) {
+        Ok(families) => families,
+        Err(error) => {
+            let _ = gpu.free_tensor(mtp_buffer);
+            let _ = gpu.free_tensor(ar_buffer);
+            return Err(error);
+        }
+    };
     let max_abs = ar_logits
         .values
         .iter()
@@ -1923,6 +1962,8 @@ fn real_model_probe(
     let result = json!({
         "status": if finite {"pass"} else {"fail"},
         "corpus": corpus,
+        "ar_logit_row": tokens.len() - 1,
+        "ar_token_count": tokens.len(),
         "accepted_drafts": window.accepted,
         "drafts_generated": window.drafts_generated,
         "committed": window.committed,
@@ -1938,7 +1979,10 @@ fn real_model_probe(
         },
         "state_families": families,
     });
-    gpu.free_tensor(logits).map_err(|error| error.to_string())?;
+    gpu.free_tensor(mtp_buffer)
+        .map_err(|error| error.to_string())?;
+    gpu.free_tensor(ar_buffer)
+        .map_err(|error| error.to_string())?;
     Ok(result)
 }
 
@@ -2243,11 +2287,9 @@ mod tests {
             .find(|scenario| field(scenario, "case").as_str() == Some("cache_suffix_refusal"))
             .expect("cache suffix refusal scenario");
         assert_eq!(field(cache, "cache_hit").as_bool(), Some(true));
-        assert!(
-            field(cache, "refusal")
-                .as_str()
-                .unwrap()
-                .contains("cache-hit suffix")
-        );
+        assert!(field(cache, "refusal")
+            .as_str()
+            .unwrap()
+            .contains("cache-hit suffix"));
     }
 }
