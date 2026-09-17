@@ -125,3 +125,64 @@ pub(crate) fn dispatch_gemv(
     }
     Ok(())
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EmbeddingPath {
+    Mq4V2,
+    Bf16,
+}
+
+fn embedding_path(dtype: DType) -> Option<EmbeddingPath> {
+    match dtype {
+        DType::MQ4G256V2 | DType::MQ4G128V2 => Some(EmbeddingPath::Mq4V2),
+        DType::BF16 => Some(EmbeddingPath::Bf16),
+        _ => None,
+    }
+}
+
+/// Dispatch one embedding lookup according to the resident table's exact
+/// contract.  BF16 rows are widened directly; only packed MQv2 rows use the
+/// rotated staging buffer and FWHT decode.
+pub(crate) fn dispatch_embedding(
+    gpu: &mut Gpu,
+    embedding: &GpuTensor,
+    rotated: &GpuTensor,
+    output: &GpuTensor,
+    token_ids: &GpuTensor,
+    n: usize,
+    dim: usize,
+) -> hip_bridge::HipResult<()> {
+    let path = embedding_path(embedding.dtype).ok_or_else(|| {
+        hip_bridge::HipError::new(
+            0,
+            &format!(
+                "Qwen4 embedding has unsupported resident dtype {:?}",
+                embedding.dtype
+            ),
+        )
+    })?;
+    match path {
+        EmbeddingPath::Mq4V2 => {
+            gpu.embedding_lookup_mq4v2_batched(embedding, rotated, output, token_ids, n, dim)
+        }
+        EmbeddingPath::Bf16 => {
+            gpu.embedding_lookup_bf16_batched(embedding, output, token_ids, n, dim)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedding_dispatch_preserves_bf16_and_routed_mqv2_contracts() {
+        assert_eq!(embedding_path(DType::BF16), Some(EmbeddingPath::Bf16));
+        assert_eq!(embedding_path(DType::MQ4G256V2), Some(EmbeddingPath::Mq4V2));
+        assert_eq!(embedding_path(DType::MQ4G128V2), Some(EmbeddingPath::Mq4V2));
+    }
+
+    #[test]
+    fn embedding_dispatch_rejects_unadmitted_dtype() {
+        assert!(embedding_path(DType::F32).is_none());
+    }
+}

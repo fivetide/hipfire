@@ -15,7 +15,7 @@ use crate::config::{LayerType, Qwen4Config};
 use crate::ple_rows::{
     PlePrefetch, PleRowLease, PleRows, PleRowsError, PLE_ROWS_PER_TOKEN, PLE_ROW_BYTES,
 };
-use crate::projection::{dispatch_gemv, row_stride, ProjectionView};
+use crate::projection::{dispatch_embedding, dispatch_gemv, row_stride, ProjectionView};
 use crate::state::{GdnGpuState, QsaGpuState};
 use crate::weights::{
     HyperConnectionWeights, MoeWeights, Qwen4LayerWeights, Qwen4Weights, TensorRef, WeightError,
@@ -1127,7 +1127,8 @@ impl Qwen4GpuForward {
         let embedding_rot = view(&self.scratch.embedding_rot, 0, n * config.hidden_size);
         let embeddings = view(&self.scratch.embeddings, 0, n * config.hidden_size);
         let ids = view(&self.scratch.token_ids, 0, n * std::mem::size_of::<i32>());
-        gpu.embedding_lookup_mq4v2_batched(
+        dispatch_embedding(
+            gpu,
             embedding,
             &embedding_rot,
             &embeddings,
