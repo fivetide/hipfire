@@ -745,10 +745,7 @@ fn publish_qwen4(temporary: &Path, output: &Path) -> Result<(), Qwen4Error> {
         };
         if result != 0 {
             let error = io::Error::last_os_error();
-            if matches!(
-                error.raw_os_error(),
-                Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
-            ) {
+            if renameat2_needs_hard_link_fallback(&error) {
                 publish_qwen4_hard_link(temporary, output)?;
             } else {
                 return Err(Qwen4Error::io(
@@ -778,6 +775,14 @@ fn publish_qwen4(temporary: &Path, output: &Path) -> Result<(), Qwen4Error> {
             .map_err(|error| Qwen4Error::io(format!("fsync {}", parent.display()), error))?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn renameat2_needs_hard_link_fallback(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -4558,6 +4563,27 @@ mod tests {
         let (file, mut tensor) = source_tensor(bytes, shape, dtype);
         tensor.name = name.to_string();
         (file, tensor)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn qwen4_publication_fallback_errno_classification() {
+        assert!(renameat2_needs_hard_link_fallback(
+            &io::Error::from_raw_os_error(libc::EINVAL)
+        ));
+        assert!(renameat2_needs_hard_link_fallback(
+            &io::Error::from_raw_os_error(libc::ENOSYS)
+        ));
+        assert!(renameat2_needs_hard_link_fallback(
+            &io::Error::from_raw_os_error(libc::EOPNOTSUPP)
+        ));
+        assert!(!renameat2_needs_hard_link_fallback(
+            &io::Error::from_raw_os_error(libc::ENOENT)
+        ));
+        assert!(!renameat2_needs_hard_link_fallback(&io::Error::new(
+            io::ErrorKind::Other,
+            "missing errno",
+        )));
     }
 
     #[test]
