@@ -744,10 +744,18 @@ fn publish_qwen4(temporary: &Path, output: &Path) -> Result<(), Qwen4Error> {
             )
         };
         if result != 0 {
-            return Err(Qwen4Error::io(
-                format!("publish Qwen4 artifact {}", output.display()),
-                io::Error::last_os_error(),
-            ));
+            let error = io::Error::last_os_error();
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+            ) {
+                publish_qwen4_hard_link(temporary, output)?;
+            } else {
+                return Err(Qwen4Error::io(
+                    format!("publish Qwen4 artifact {}", output.display()),
+                    error,
+                ));
+            }
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -770,6 +778,29 @@ fn publish_qwen4(temporary: &Path, output: &Path) -> Result<(), Qwen4Error> {
             .map_err(|error| Qwen4Error::io(format!("fsync {}", parent.display()), error))?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn publish_qwen4_hard_link(temporary: &Path, output: &Path) -> Result<(), Qwen4Error> {
+    // A hard link publishes the complete, fsynced temporary inode atomically
+    // without replacing an existing destination.  If the process crashes
+    // before unlinking the temporary name, both names remain for cleanup; the
+    // final output is already a valid complete artifact.
+    fs::hard_link(temporary, output).map_err(|error| {
+        Qwen4Error::io(
+            format!("publish Qwen4 artifact {} via hard link", output.display()),
+            error,
+        )
+    })?;
+    fs::remove_file(temporary).map_err(|error| {
+        Qwen4Error::io(
+            format!(
+                "remove temporary Qwen4 artifact {} after publish",
+                temporary.display()
+            ),
+            error,
+        )
+    })
 }
 #[derive(Debug, Default)]
 struct ScratchTracker {
@@ -4527,6 +4558,48 @@ mod tests {
         let (file, mut tensor) = source_tensor(bytes, shape, dtype);
         tensor.name = name.to_string();
         (file, tensor)
+    }
+
+    #[test]
+    fn qwen4_publication_publishes_complete_temp_without_overwrite() {
+        let destination = tempdir().expect("destination tempdir");
+        let temporary = destination.path().join(".fixture.tmp");
+        let output = destination.path().join("fixture.mq4r");
+        fs::write(&temporary, b"complete artifact").expect("temporary artifact");
+
+        publish_qwen4(&temporary, &output).expect("publish artifact");
+
+        assert_eq!(
+            fs::read(&output).expect("read published artifact"),
+            b"complete artifact"
+        );
+        assert!(!temporary.exists(), "temporary artifact remained");
+    }
+
+    #[test]
+    fn qwen4_publication_refuses_existing_destination() {
+        let destination = tempdir().expect("destination tempdir");
+        let temporary = destination.path().join(".fixture.tmp");
+        let output = destination.path().join("fixture.mq4r");
+        fs::write(&temporary, b"new artifact").expect("temporary artifact");
+        fs::write(&output, b"existing artifact").expect("existing artifact");
+
+        let error = publish_qwen4(&temporary, &output).expect_err("replace was allowed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to replace existing Qwen4 artifact"),
+            "unexpected publication error: {error}"
+        );
+        assert_eq!(
+            fs::read(&temporary).expect("read temporary artifact"),
+            b"new artifact"
+        );
+        assert_eq!(
+            fs::read(&output).expect("read existing artifact"),
+            b"existing artifact"
+        );
     }
 
     #[test]
