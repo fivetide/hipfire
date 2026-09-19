@@ -11,18 +11,17 @@
 
 use crate::config::Qwen4Config;
 use crate::gpu_forward::{
-    Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch, execute_moe,
+    execute_moe, Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
 };
 use crate::projection::dispatch_gemv;
 use crate::weights::{HyperConnectionWeights, Qwen4Weights, WeightError};
 use hipfire_runtime::spec::SpecGrammar;
 use rdna_compute::qwen4::{
-    Qwen4Argmax, Qwen4HcFinal, Qwen4HcNorm, Qwen4HcReadProjected, Qwen4HcWrite, Qwen4QsaAttention,
-    Qwen4QsaCacheAppend, Qwen4QsaNormRope, Qwen4QsaPoolRope, Qwen4QsaReuseSelection,
-    Qwen4QsaSelect, Qwen4Scale, qwen4_argmax, qwen4_hc_final, qwen4_hc_norm,
-    qwen4_hc_read_projected, qwen4_hc_write, qwen4_qsa_attention, qwen4_qsa_cache_append,
-    qwen4_qsa_norm_rope, qwen4_qsa_pool_rope, qwen4_qsa_reuse_selection, qwen4_qsa_select,
-    qwen4_scale,
+    qwen4_argmax, qwen4_hc_final, qwen4_hc_norm, qwen4_hc_read_projected, qwen4_hc_write,
+    qwen4_qsa_attention, qwen4_qsa_cache_append, qwen4_qsa_norm_rope, qwen4_qsa_pool_rope,
+    qwen4_qsa_reuse_selection, qwen4_qsa_select, qwen4_scale, Qwen4Argmax, Qwen4HcFinal,
+    Qwen4HcNorm, Qwen4HcReadProjected, Qwen4HcWrite, Qwen4QsaAttention, Qwen4QsaCacheAppend,
+    Qwen4QsaNormRope, Qwen4QsaPoolRope, Qwen4QsaReuseSelection, Qwen4QsaSelect, Qwen4Scale,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::fmt;
@@ -265,7 +264,6 @@ pub struct MtpGpuScratch {
     index_query: GpuTensor,
     index_key: GpuTensor,
     q_and_gate: GpuTensor,
-    qsa_qgate: GpuTensor,
     qsa_k: GpuTensor,
     qsa_v: GpuTensor,
     qsa_output: GpuTensor,
@@ -341,7 +339,6 @@ impl MtpGpuScratch {
                 DType::F32,
             )?;
             alloc(&[2 * q_width], DType::F32)?;
-            alloc(&[2 * q_width], DType::F32)?;
             alloc(&[kv_width], DType::F32)?;
             alloc(&[kv_width], DType::F32)?;
             alloc(&[q_width], DType::F32)?;
@@ -402,7 +399,6 @@ impl MtpGpuScratch {
             index_query: next(),
             index_key: next(),
             q_and_gate: next(),
-            qsa_qgate: next(),
             qsa_k: next(),
             qsa_v: next(),
             qsa_output: next(),
@@ -447,7 +443,6 @@ impl MtpGpuScratch {
             self.index_query,
             self.index_key,
             self.q_and_gate,
-            self.qsa_qgate,
             self.qsa_k,
             self.qsa_v,
             self.qsa_output,
@@ -1369,6 +1364,7 @@ impl Qwen4MtpGpu {
                 norm: index_query_norm,
                 heads: config.indexer_n_heads,
                 head_dim: index_dim,
+                head_stride: config.indexer_head_dim,
                 position,
                 rotary_dim: MTP_ROTARY_DIM.min(index_dim),
             },
@@ -1421,21 +1417,18 @@ impl Qwen4MtpGpu {
             kv_width,
             config.hidden_size,
         )?;
-        gpu.copy_d2d(
-            q_and_gate,
-            &scratch.qsa_qgate,
-            scratch.qsa_qgate.byte_size(),
-        )?;
-        let q_values = f32_view(&scratch.qsa_qgate, 0, q_width);
         let q_norm = weights.resident(&qsa.q_norm)?;
         let k_norm = weights.resident(&qsa.k_norm)?;
+        // q_proj already emits [Q, gate] for each head. Normalize and rotate
+        // each Q half in place while preserving its adjacent gate half.
         qwen4_qsa_norm_rope(
             gpu,
             &Qwen4QsaNormRope {
-                values: &q_values,
+                values: q_and_gate,
                 norm: q_norm,
                 heads: config.num_attention_heads,
                 head_dim: config.head_dim,
+                head_stride: 2 * config.head_dim,
                 position,
                 rotary_dim: MTP_ROTARY_DIM.min(config.head_dim),
             },
@@ -1447,29 +1440,11 @@ impl Qwen4MtpGpu {
                 norm: k_norm,
                 heads: config.num_key_value_heads,
                 head_dim: config.head_dim,
+                head_stride: config.head_dim,
                 position,
                 rotary_dim: MTP_ROTARY_DIM.min(config.head_dim),
             },
         )?;
-        for head in 0..config.num_attention_heads {
-            let q_offset = head * config.head_dim;
-            let gate_offset = q_width + q_offset;
-            let output_offset = head * 2 * config.head_dim;
-            gpu.memcpy_dtod_at_auto(
-                &scratch.qsa_qgate.buf,
-                output_offset * std::mem::size_of::<f32>(),
-                &q_values.buf,
-                q_offset * std::mem::size_of::<f32>(),
-                config.head_dim * std::mem::size_of::<f32>(),
-            )?;
-            gpu.memcpy_dtod_at_auto(
-                &scratch.qsa_qgate.buf,
-                (output_offset + config.head_dim) * std::mem::size_of::<f32>(),
-                &q_and_gate.buf,
-                gate_offset * std::mem::size_of::<f32>(),
-                config.head_dim * std::mem::size_of::<f32>(),
-            )?;
-        }
         qwen4_qsa_cache_append(
             gpu,
             &Qwen4QsaCacheAppend {
@@ -1551,7 +1526,7 @@ impl Qwen4MtpGpu {
         qwen4_qsa_attention(
             gpu,
             &Qwen4QsaAttention {
-                q_with_gate: &scratch.qsa_qgate,
+                q_with_gate: q_and_gate,
                 full_keys: &state.full_keys,
                 full_values: &state.full_values,
                 selected: &state.selected_indices,

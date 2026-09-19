@@ -752,7 +752,7 @@ fn attn_mixer_block(
     hipfire_dispatch::pipeline::execute_steps(
         gpu,
         &ctx,
-        &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
+        &mut [hipfire_dispatch::pipeline::Step::Attend { plan, io }],
     )
     .map_err(|e| format!("lfm2moe L{l}: attention: {e:?}"))?;
     weight_gemv_residual(gpu, &a.wo, &state.fa_attn_out, &state.h)

@@ -232,15 +232,15 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
                 // llama: attention is a first-class step → one contiguous list.
                 steps.push(Step::Attend { plan, io: attn_io });
                 steps.push(o_proj);
-                execute_steps(gpu, ctx, &steps).map_err(herr)?;
+                execute_steps(gpu, ctx, &mut steps).map_err(herr)?;
             }
             None => {
                 // Bespoke-attention arch (qwen2 GQA-flash): keep the split —
                 // pre-attend steps, then the side-effecting attend, then o-proj.
                 // Identical kernels/order to the pre-seam path.
-                execute_steps(gpu, ctx, &steps).map_err(herr)?;
+                execute_steps(gpu, ctx, &mut steps).map_err(herr)?;
                 arch.attend(gpu, l)?;
-                execute_steps(gpu, ctx, &[o_proj]).map_err(herr)?;
+                execute_steps(gpu, ctx, &mut [o_proj]).map_err(herr)?;
             }
         }
 
@@ -248,7 +248,7 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
         execute_steps(
             gpu,
             ctx,
-            &[
+            &mut [
                 Step::RmsnormAutomatic {
                     x: s.x,
                     norm_weight: layer.ffn_norm,
@@ -278,7 +278,7 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
         execute_steps(
             gpu,
             ctx,
-            &[Step::GemvResidual {
+            &mut [Step::GemvResidual {
                 w: &layer.w_down,
                 input: GemvInput::Raw(s.ffn_hidden),
                 residual: s.x,

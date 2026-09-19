@@ -383,7 +383,7 @@ impl Llama {
             execute_steps(
                 gpu,
                 &ctx,
-                &[
+                &mut [
                     Step::RmsnormAutomatic {
                         x: &scratch.x,
                         norm_weight: &layer.attn_norm,
@@ -508,7 +508,7 @@ impl Llama {
             execute_steps(
                 gpu,
                 &ctx,
-                &[Step::GemvResidual {
+                &mut [Step::GemvResidual {
                     w: &wro,
                     input: GemvInput::Raw(&scratch.attn_out),
                     residual: &scratch.x,
@@ -525,7 +525,7 @@ impl Llama {
             execute_steps(
                 gpu,
                 &ctx,
-                &[
+                &mut [
                     Step::RmsnormAutomatic {
                         x: &scratch.x,
                         norm_weight: &layer.ffn_norm,
@@ -555,7 +555,7 @@ impl Llama {
             execute_steps(
                 gpu,
                 &ctx,
-                &[Step::GemvResidual {
+                &mut [Step::GemvResidual {
                     w: &wrd,
                     input: GemvInput::Raw(&scratch.ffn_hidden),
                     residual: &scratch.x,
@@ -575,7 +575,7 @@ impl Llama {
         execute_steps(
             gpu,
             &ctx,
-            &[Step::Gemv {
+            &mut [Step::Gemv {
                 w: &wr_out,
                 input: GemvInput::Raw(&scratch.tmp),
                 out: &scratch.logits,

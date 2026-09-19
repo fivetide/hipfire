@@ -2000,6 +2000,14 @@ pub const MQ_ROTATE_X_128_V2_SRC: &str =
 /// Qwen4 qt=53 ordinary projection consumer.  Rows use
 /// `68 * ceil(K / 128)` bytes and fp16 scale/zero headers.
 pub const GEMV_MQ4G128V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g128v2.hip");
+/// Qwen4 qt=53 dense batched projection.  The logical matrix is shared
+/// across prompt rows while each row consumes its own G128-rotated input.
+pub const GEMM_MQ4G128V2_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g128v2_batched.hip");
+/// gfx1151 four-row QT53 dense projection.  It reuses each decoded weight
+/// group across four prompt rows while preserving the scalar gemv reduction.
+pub const GEMM_MQ4G128V2_MULTIROW_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g128v2_multirow.gfx1151.hip");
 
 /// Qwen4 qt=53 indexed decode down consumer.  It always writes ten
 /// unweighted expanded route rows; `moe_down_combine_top10_batched` owns the
@@ -2011,6 +2019,11 @@ pub const GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC: &str =
 /// unweighted and is folded by the sealed top-10 combine.
 pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10.hip");
+/// gfx1151 parity companion for the qt53 grouped down consumer.  It preserves
+/// the indexed decode kernel's 32-lane reduction association while reusing one
+/// decoded same-expert weight across the sixteen grouped route slots.
+pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_MULTIROW_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10_multirow.gfx1151.hip");
 
 /// Index-aware MoE gate_up GEMV — reads expert IDs from a device-side
 /// topk_indices buffer and the per-expert weight base from an
@@ -2795,6 +2808,12 @@ pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC: &str =
 /// sister is `GEMM_MQ4G256V2_MOE_GROUPED_WMMA_GFX12_SRC`. No i8 MMQ variant.
 pub const GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_moe_grouped_wmma_k2.hip");
+/// gfx1151 parity companion for qt44 grouped gate/up.  It retains the indexed
+/// F32 dequant/reduction arithmetic and reuses each decoded lane across the
+/// sixteen same-expert route slots instead of staging X/accumulators through
+/// F16 WMMA.
+pub const GEMM_MQ4G256V2_MOE_GROUPED_TOP10_SIMT_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_moe_grouped_top10_simt.hip");
 
 /// gfx12 (RDNA4) sister of `GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC`.
 ///
@@ -6821,6 +6840,14 @@ pub const GEMV_BF16_XF32_SRC: &str = include_str!("../../../kernels/src/gemv_bf1
 /// Weights stay native BF16 and the output is row-major `[N, M]` F32.
 pub const GEMM_BF16_XF32_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/gemm_bf16_xf32_batched.hip");
+/// Exact BF16-weight × F32-input four-token row-tile GEMM.  Each wave reuses
+/// one widened weight across four F32 accumulators without downcasting X.
+pub const GEMM_BF16_XF32_MULTIROW_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16_xf32_multirow.hip");
+/// gfx1151-only eight-token tile; dispatched by the measured production-shape
+/// allowlist in `gemm_bf16_xf32_multirow`.
+pub const GEMM_BF16_XF32_MULTIROW_N8_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16_xf32_multirow.hip");
 
 /// DeepSeek V4 SwiGLU with swiglu_limit clamp: silu(min(gate, L)) * clamp(up, ±L)
 /// L = swiglu_limit (DeepSeek V4 config = 10.0).

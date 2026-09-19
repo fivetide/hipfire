@@ -1802,7 +1802,7 @@ impl Gpu {
         let ne = 512i32;
         let kt = 10i32;
         let norm = i32::from(normalize_topk_prob);
-        let mut params: Vec<*mut c_void> = vec![
+        let mut params = [
             &lp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
             &wp as *const _ as *mut c_void,
@@ -1815,7 +1815,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             FUNC,
             [tokens as u32, 1, 1],
-            [512, 1, 1],
+            [256, 1, 1],
             0,
             &mut params,
             || {
@@ -1857,7 +1857,7 @@ impl Gpu {
         let rp = residual.buf.as_ptr();
         let hv = hidden as i32;
         let tv = tokens as i32;
-        let mut params: Vec<*mut c_void> = vec![
+        let mut params = [
             &ep as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
             &wp as *const _ as *mut c_void,
@@ -1893,11 +1893,13 @@ impl Gpu {
     }
 
     /// Qwen4 grouped combine.  `inverse_perm` is the sealed flat-to-grouped
-    /// map and invalid rows are ignored by the bounds-safe kernel.
+    /// map and invalid rows are ignored by the bounds-safe kernel.  The
+    /// top-k expert IDs are consumed to reproduce indexed BF16 expert order.
     pub fn moe_down_combine_grouped_top10(
         &mut self,
         grouped_down: &GpuTensor,
         inverse_perm: &GpuTensor,
+        topk_indices: &GpuTensor,
         topk_weights: &GpuTensor,
         residual: &GpuTensor,
         hidden: usize,
@@ -1909,14 +1911,16 @@ impl Gpu {
         self.ensure_kernel(FUNC, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, FUNC)?;
         let gp = grouped_down.buf.as_ptr();
         let ip = inverse_perm.buf.as_ptr();
+        let tp = topk_indices.buf.as_ptr();
         let wp = topk_weights.buf.as_ptr();
         let rp = residual.buf.as_ptr();
         let hv = hidden as i32;
         let gr = grouped_rows as i32;
         let tv = tokens as i32;
-        let mut params: Vec<*mut c_void> = vec![
+        let mut params = [
             &gp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
             &wp as *const _ as *mut c_void,
             &rp as *const _ as *mut c_void,
             &hv as *const _ as *mut c_void,
@@ -1925,7 +1929,7 @@ impl Gpu {
         ];
         let block = 256u32;
         let grid_x = (hidden as u32).div_ceil(block);
-        let bytes = (grouped_rows * hidden + tokens * 10 + tokens * 10 + 2 * tokens * hidden) * 4;
+        let bytes = (grouped_rows * hidden + 3 * tokens * 10 + 2 * tokens * hidden) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
         let result = self.launch_maybe_blob(
             FUNC,
@@ -1937,6 +1941,7 @@ impl Gpu {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(gp);
                 b.push_ptr(ip);
+                b.push_ptr(tp);
                 b.push_ptr(wp);
                 b.push_ptr(rp);
                 b.push_i32(hv);
@@ -1981,7 +1986,7 @@ impl Gpu {
         let ne = num_experts as i32;
         let gr = grouped_rows as i32;
         let bm = block_m as i32;
-        let mut params: Vec<*mut c_void> = vec![
+        let mut params = [
             &ip as *const _ as *mut c_void,
             &cp as *const _ as *mut c_void,
             &op as *const _ as *mut c_void,
@@ -2041,7 +2046,7 @@ impl Gpu {
         let mi_val = mi as i32;
         let kt_val = 10i32;
         let rows_val = grouped_rows as i32;
-        let mut params: Vec<*mut c_void> = vec![
+        let mut params = [
             &yp as *const _ as *mut c_void,
             &sp as *const _ as *mut c_void,
             &gp as *const _ as *mut c_void,
@@ -2107,7 +2112,7 @@ impl Gpu {
         let kv = k as i32;
         let nv = batch_size as i32;
         let nev = n_exp as i32;
-        let mut params: Vec<*mut c_void> = vec![
+        let mut params = [
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
             &xp as *const _ as *mut c_void,
@@ -2175,7 +2180,7 @@ impl Gpu {
         let gr = grouped_rows as i32;
         let xr = x_src_rows as i32;
         let ne = n_exp as i32;
-        let mut params: Vec<*mut c_void> = vec![
+        let mut params = [
             &ep as *const _ as *mut c_void,
             &tp as *const _ as *mut c_void,
             &sp as *const _ as *mut c_void,
@@ -2246,7 +2251,7 @@ impl Gpu {
         let kv = k as i32;
         let nv = batch_size as i32;
         let nev = n_exp as i32;
-        let mut params: Vec<*mut c_void> = vec![
+        let mut params = [
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
             &xp as *const _ as *mut c_void,
@@ -2306,8 +2311,21 @@ impl Gpu {
         n_exp: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        const FUNC: &str = "gemm_mq4g128v2_moe_grouped_top10";
-        self.ensure_kernel(FUNC, kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_SRC, FUNC)?;
+        let gfx1151 = self.arch_caps.is_gfx1151();
+        let (func, source, block_x) = if gfx1151 {
+            (
+                "gemm_mq4g128v2_moe_grouped_top10_multirow_gfx1151",
+                kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_MULTIROW_GFX1151_SRC,
+                32,
+            )
+        } else {
+            (
+                "gemm_mq4g128v2_moe_grouped_top10",
+                kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_SRC,
+                256,
+            )
+        };
+        self.ensure_kernel(func, source, func)?;
         let ep = expert_ptrs.buf.as_ptr();
         let tp = expert_tile_ids.buf.as_ptr();
         let sp = sorted_slot_index.buf.as_ptr();
@@ -2319,7 +2337,7 @@ impl Gpu {
         let gr = grouped_rows as i32;
         let xr = x_src_rows as i32;
         let ne = n_exp as i32;
-        let mut params: Vec<*mut c_void> = vec![
+        let mut params = [
             &ep as *const _ as *mut c_void,
             &tp as *const _ as *mut c_void,
             &sp as *const _ as *mut c_void,
@@ -2334,11 +2352,11 @@ impl Gpu {
         ];
         let bytes =
             grouped_rows.saturating_mul(m.saturating_mul(4).saturating_add(k.saturating_mul(4)));
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", FUNC, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func, bytes);
         let result = self.launch_maybe_blob(
-            FUNC,
+            func,
             [m as u32, grouped_rows.div_ceil(16) as u32, 1],
-            [256, 1, 1],
+            [block_x, 1, 1],
             0,
             &mut params,
             || {

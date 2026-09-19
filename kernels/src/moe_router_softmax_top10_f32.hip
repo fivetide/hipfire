@@ -5,14 +5,25 @@
 #include <hip/hip_runtime.h>
 #include <math.h>
 
-// One workgroup handles one token.  The Qwen4 router has exactly 512 experts,
-// so one lane owns one logit and thread 0 performs the deterministic selection.
-// This is intentionally a new symbol: the incumbent k=8 router is not widened.
+// One 256-thread workgroup handles one token.  Each wave selects its best ten
+// from 64 logits, then wave 0 selects the global best ten from those 80
+// candidates.  This keeps stable ordering while avoiding ten serial 512-entry
+// scans and the barrier-heavy full sort.
 //
 // topk_idx is an i32 bit-pattern stored in the project's F32-typed scratch
 // convention.  `normalize_topk_prob != 0` applies the Qwen4 selected-probability
 // renormalization after the float32 softmax.
-__launch_bounds__(512, 1)
+__device__ __forceinline__ bool router_better(
+    float lhs_value,
+    int lhs_index,
+    float rhs_value,
+    int rhs_index
+) {
+    return lhs_value > rhs_value ||
+        (lhs_value == rhs_value && lhs_index < rhs_index);
+}
+
+__launch_bounds__(256, 1)
 extern "C" __global__ void moe_router_softmax_top10_f32(
     const float* __restrict__ logits, // [tokens, n_exp]
     int* __restrict__ topk_idx,       // [tokens, 10]
@@ -21,73 +32,123 @@ extern "C" __global__ void moe_router_softmax_top10_f32(
     int top_k,
     int normalize_topk_prob
 ) {
-    __shared__ float values[512];
-    const int lane = threadIdx.x;
+    __shared__ float wave_values[80];
+    __shared__ int wave_indices[80];
+    __shared__ float selected_values[10];
+    __shared__ float probabilities[10];
+    const int thread = threadIdx.x;
+    const int lane = thread & 31;
+    const int wave = thread >> 5;
     const int token = blockIdx.x;
 
-    if (lane < n_exp && lane < 512)
-        values[lane] = logits[(size_t)token * n_exp + lane];
-    else if (lane < 512)
-        values[lane] = -INFINITY;
+    // The typed Qwen4 route seals this exact geometry.  Keep the guard uniform
+    // across the workgroup so no lane can return across the block barrier.
+    if (n_exp != 512 || top_k <= 0 || top_k > 10) return;
+
+    const size_t token_base = (size_t)token * 512;
+    float first_value = logits[token_base + thread];
+    float second_value = logits[token_base + thread + 256];
+    const int first_index = thread;
+    const int second_index = thread + 256;
+
+    // The global top ten must be among each wave's local top ten.  Select those
+    // with register state and wave shuffles; no block barrier is needed here.
+    for (int rank = 0; rank < 10; ++rank) {
+        float best_value = first_value;
+        int best_index = first_index;
+        if (router_better(second_value, second_index, best_value, best_index)) {
+            best_value = second_value;
+            best_index = second_index;
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float other_value = __shfl_down(best_value, offset, 32);
+            const int other_index = __shfl_down(best_index, offset, 32);
+            if (router_better(other_value, other_index, best_value, best_index)) {
+                best_value = other_value;
+                best_index = other_index;
+            }
+        }
+        best_value = __shfl(best_value, 0, 32);
+        best_index = __shfl(best_index, 0, 32);
+        if (lane == 0) {
+            wave_values[wave * 10 + rank] = best_value;
+            wave_indices[wave * 10 + rank] = best_index;
+        }
+        if (first_index == best_index) first_value = -INFINITY;
+        if (second_index == best_index) second_value = -INFINITY;
+    }
     __syncthreads();
 
-    if (lane != 0) return;
+    // Wave 0 merges the 80 wave-local candidates.  Each lane owns at most
+    // three values and participates in the same stable wave reduction.
+    if (wave == 0) {
+        const int slot0 = lane;
+        const int slot1 = lane + 32;
+        const int slot2 = lane + 64;
+        float value0 = wave_values[slot0];
+        float value1 = wave_values[slot1];
+        float value2 = slot2 < 80 ? wave_values[slot2] : -INFINITY;
+        const int index0 = wave_indices[slot0];
+        const int index1 = wave_indices[slot1];
+        const int index2 = slot2 < 80 ? wave_indices[slot2] : 0x7fffffff;
 
-    // Stable float32 softmax.  The host-side seal fixes n_exp=512/top_k=10;
-    // the guards keep this kernel bounds-safe if a caller violates that
-    // contract before dispatch.
-    if (n_exp <= 0 || n_exp > 512 || top_k <= 0 || top_k > 10) return;
-    float max_logit = -INFINITY;
-    for (int e = 0; e < n_exp; ++e) {
-        if (values[e] > max_logit) max_logit = values[e];
-    }
-    float denom = 0.0f;
-    for (int e = 0; e < n_exp; ++e) {
-        values[e] = expf(values[e] - max_logit);
-        denom += values[e];
-    }
-    if (!(denom > 0.0f) || !isfinite(denom)) return;
-    const float inv_denom = 1.0f / denom;
-    for (int e = 0; e < n_exp; ++e) values[e] *= inv_denom;
-
-    bool selected[512];
-    for (int e = 0; e < n_exp; ++e) selected[e] = false;
-    for (int rank = 0; rank < 10; ++rank) {
-        int best = 0;
-        float best_value = -INFINITY;
-        bool found = false;
-        if (rank < top_k) {
-            for (int e = 0; e < n_exp; ++e) {
-                const float value = values[e];
-                // Strict value ordering plus lower-index tie breaking matches
-                // the reference router and is independent of wave scheduling.
-                if (selected[e]) continue;
-                if (!found || value > best_value ||
-                    (value == best_value && e < best)) {
-                    best = e;
-                    best_value = value;
-                    found = true;
+        for (int rank = 0; rank < top_k; ++rank) {
+            float best_value = value0;
+            int best_index = index0;
+            if (router_better(value1, index1, best_value, best_index)) {
+                best_value = value1;
+                best_index = index1;
+            }
+            if (router_better(value2, index2, best_value, best_index)) {
+                best_value = value2;
+                best_index = index2;
+            }
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                const float other_value = __shfl_down(best_value, offset, 32);
+                const int other_index = __shfl_down(best_index, offset, 32);
+                if (router_better(other_value, other_index, best_value, best_index)) {
+                    best_value = other_value;
+                    best_index = other_index;
                 }
             }
-            selected[best] = true;
-            topk_idx[(size_t)token * 10 + rank] = best;
-            topk_w[(size_t)token * 10 + rank] = best_value;
-        } else {
-            // The fixed Qwen4 path never takes this arm, but zeroing the tail
-            // prevents stale route data from becoming a hidden fallback.
-            topk_idx[(size_t)token * 10 + rank] = 0;
-            topk_w[(size_t)token * 10 + rank] = 0.0f;
+            best_value = __shfl(best_value, 0, 32);
+            best_index = __shfl(best_index, 0, 32);
+            if (lane == 0) {
+                topk_idx[(size_t)token * 10 + rank] = best_index;
+                selected_values[rank] = best_value;
+            }
+            if (index0 == best_index) value0 = -INFINITY;
+            if (index1 == best_index) value1 = -INFINITY;
+            if (index2 == best_index) value2 = -INFINITY;
         }
     }
 
-    if (normalize_topk_prob != 0) {
-        float selected_sum = 0.0f;
+    // Preserve the reference's float32 operation order: full softmax in
+    // expert-index order, followed by selected-probability renormalization.
+    // Selection is parallel; this one serial pass keeps routed-output numerics.
+    if (thread == 0) {
+        const size_t output_base = (size_t)token * 10;
+        const float max_logit = selected_values[0];
+        float denom = 0.0f;
+        for (int expert = 0; expert < 512; ++expert)
+            denom += expf(logits[token_base + expert] - max_logit);
+        if (!(denom > 0.0f) || !isfinite(denom)) return;
+
+        const float inv_denom = 1.0f / denom;
         for (int rank = 0; rank < top_k; ++rank)
-            selected_sum += topk_w[(size_t)token * 10 + rank];
-        if (selected_sum > 0.0f && isfinite(selected_sum)) {
+            probabilities[rank] = expf(selected_values[rank] - max_logit) * inv_denom;
+
+        if (normalize_topk_prob != 0) {
+            float selected_sum = 0.0f;
+            for (int rank = 0; rank < top_k; ++rank)
+                selected_sum += probabilities[rank];
+            if (!(selected_sum > 0.0f) || !isfinite(selected_sum)) return;
             const float inv_selected = 1.0f / selected_sum;
             for (int rank = 0; rank < top_k; ++rank)
-                topk_w[(size_t)token * 10 + rank] *= inv_selected;
+                probabilities[rank] *= inv_selected;
         }
+
+        for (int rank = 0; rank < top_k; ++rank)
+            topk_w[output_base + rank] = probabilities[rank];
     }
 }

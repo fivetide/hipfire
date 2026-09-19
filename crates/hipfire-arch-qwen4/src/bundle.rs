@@ -10,7 +10,7 @@
 //! local may outlive publication as a second owner.
 
 use crate::config::Qwen4Config;
-use crate::gpu_forward::Qwen4GpuForward;
+use crate::gpu_forward::{Qwen4GpuForward, QWEN4_PREFILL_CHUNK_CAP};
 use crate::mtp_gpu::{MtpGpuStateSnapshot, Qwen4MtpGpu};
 use crate::ple::PleHashMetadata;
 use crate::ple_rows::{PleRows, PleRowsError};
@@ -242,6 +242,12 @@ impl Qwen4Bundle {
                 "Qwen4 forward resources are already attached".to_string(),
             ));
         }
+        if max_chunk == 0 {
+            return Err(BundleError::Forward(
+                "Qwen4 forward chunk capacity is zero".to_string(),
+            ));
+        }
+        let max_chunk = max_chunk.min(QWEN4_PREFILL_CHUNK_CAP);
         let forward = Qwen4GpuForward::new(gpu, self, max_chunk)
             .map_err(|error| BundleError::Forward(error.to_string()))?;
         let logits_len = max_chunk
@@ -586,7 +592,9 @@ impl Qwen4Bundle {
         result
     }
 
-    /// Run a bounded token chunk through the same attached execution owner.
+    /// Run a token sequence through the shared execution owner.  The forward
+    /// owner tiles requests longer than its bounded scratch capacity while
+    /// preserving the public all-row logits contract.
     pub fn forward_chunk(
         &mut self,
         gpu: &mut Gpu,
@@ -599,6 +607,28 @@ impl Qwen4Bundle {
         })?;
         let result = forward
             .forward_chunk(self, gpu, tokens, logits, top1)
+            .map_err(|error| BundleError::Forward(error.to_string()));
+        self.execution = Some(forward);
+        result
+    }
+
+    /// Run a prompt through the shared execution owner and retain only its
+    /// final logits row.  Long prompts are tiled over bounded scratch.
+    ///
+    /// This is the explicit autoregressive prefill contract; `forward_chunk`
+    /// remains the public all-row API for callers that need every row.
+    pub fn forward_chunk_final(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        logits: &GpuTensor,
+        top1: Option<&GpuTensor>,
+    ) -> Result<(), BundleError> {
+        let mut forward = self.execution.take().ok_or_else(|| {
+            BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+        })?;
+        let result = forward
+            .forward_chunk_final(self, gpu, tokens, logits, top1)
             .map_err(|error| BundleError::Forward(error.to_string()));
         self.execution = Some(forward);
         result

@@ -82,6 +82,11 @@ pub enum Step<'a> {
         bias: &'a GpuTensor,
         dim: usize,
     },
+    /// Complete Qwen4 layer-major operation. The op owns mutable state views;
+    /// the mutable executor arm keeps this composite operation in the same
+    /// shared Step interpreter as all other dispatch work.
+    Qwen4Layer(crate::pipeline::qwen4_program::Qwen4LayerOp<'a>),
+    Qwen4Ple(crate::pipeline::qwen4_program::Qwen4PleOp<'a>),
     /// Complete validated MoE program. The sealed call remains the public
     /// authority; granular operands are only produced by its shared lowerer.
     Moe(sealed_moe::SealedMoeCall<'a>),
@@ -114,7 +119,9 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         Step::Rope { .. } => Some(PipelineOp::Rope),
         Step::QkNorm { .. } => Some(PipelineOp::QkNorm),
         Step::BiasAdd { .. } => Some(PipelineOp::BiasAdd),
-        Step::Moe(_)
+        Step::Qwen4Layer(_)
+        | Step::Qwen4Ple(_)
+        | Step::Moe(_)
         | Step::MoeNormalize(_)
         | Step::MoeInputBasis(_)
         | Step::MoeGateSide(_)
@@ -683,18 +690,22 @@ const FUSED_TABLE: &[FusedPattern] = &[
 static GEMV: OnceLock<GemvFamily> = OnceLock::new();
 static ROTATION: OnceLock<RotationFamily> = OnceLock::new();
 static FUSED_QKV: OnceLock<FusedQkvFamily> = OnceLock::new();
-
-pub fn execute_steps(
+pub fn execute_steps<'a>(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
-    steps: &[Step<'_>],
+    steps: &mut [Step<'a>],
 ) -> Result<(), DispatchError> {
-    // Validate every sealed call before issuing even the first non-MoE launch.
-    // This is intentionally a separate pass: a malformed later call must not
-    // leave an earlier step partially executed.
-    for step in steps {
-        if let Step::Moe(call) = step {
-            call.validate_for_gpu(gpu)?;
+    // Validate every sealed/composite call before issuing even the first
+    // non-MoE launch. A malformed later call must not leave an earlier step
+    // partially executed.
+    for step in steps.iter() {
+        match step {
+            Step::Moe(call) => call.validate_for_gpu(gpu)?,
+            Step::Qwen4Layer(op) => {
+                crate::pipeline::qwen4_program::validate_layer_for_gpu(gpu, op)?
+            }
+            Step::Qwen4Ple(op) => crate::pipeline::qwen4_program::validate_ple(op)?,
+            _ => {}
         }
     }
     execute_validated_steps(gpu, ctx, steps)
@@ -703,10 +714,10 @@ pub fn execute_steps(
 /// Execute a list whose complete-call entries have already passed whole-list
 /// preflight. Sealed MoE lowering reuses this one launch/fusion loop rather
 /// than introducing a second interpreter.
-pub(super) fn execute_validated_steps(
+pub(super) fn execute_validated_steps<'a>(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
-    steps: &[Step<'_>],
+    steps: &mut [Step<'a>],
 ) -> Result<(), DispatchError> {
     let mut i = 0;
     while i < steps.len() {
@@ -727,7 +738,7 @@ pub(super) fn execute_validated_steps(
             launch_fused(gpu, ctx, key, &steps[i..i + len])?;
             i += len;
         } else {
-            launch_op(gpu, ctx, &steps[i])?;
+            launch_op_mut(gpu, ctx, &mut steps[i])?;
             i += 1;
         }
     }
@@ -768,7 +779,10 @@ fn qkv_bias_fold_supported(key: KernelKey, ctx: &DispatchCtx) -> bool {
 /// bias tensors `[bias_q, bias_k, bias_v]`. Otherwise `None` (no fold). The
 /// ptr-identity check guarantees we only fold the qwen2 `attention_bias` adds
 /// that immediately follow this exact QKV window, never an unrelated `BiasAdd`.
-fn match_trailing_qkv_bias<'a>(steps: &'a [Step<'a>], len: usize) -> Option<[&'a GpuTensor; 3]> {
+fn match_trailing_qkv_bias<'step, 'res>(
+    steps: &'step [Step<'res>],
+    len: usize,
+) -> Option<[&'res GpuTensor; 3]> {
     if len + 3 > steps.len() {
         return None;
     }
@@ -793,7 +807,7 @@ fn match_trailing_qkv_bias<'a>(steps: &'a [Step<'a>], len: usize) -> Option<[&'a
         && std::ptr::eq(*bx_k as *const GpuTensor, out_k as *const GpuTensor)
         && std::ptr::eq(*bx_v as *const GpuTensor, out_v as *const GpuTensor)
     {
-        Some([bq, bk, bv])
+        Some([*bq, *bk, *bv])
     } else {
         None
     }
@@ -833,6 +847,18 @@ fn launch_fused_qkv_with_bias<'a>(
             bias,
         },
     )
+}
+
+fn launch_op_mut(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    step: &mut Step<'_>,
+) -> Result<(), DispatchError> {
+    match step {
+        Step::Qwen4Layer(op) => crate::pipeline::qwen4_program::execute_layer(gpu, op),
+        Step::Qwen4Ple(op) => crate::pipeline::qwen4_program::execute_ple(gpu, op),
+        _ => launch_op(gpu, ctx, step),
+    }
 }
 
 /// Per-op fallback. FULL enum match (no catch-all) so the compiler forces every
@@ -1057,6 +1083,18 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         Step::BiasAdd { x, bias, dim } => gpu
             .bias_add_f32(x, bias, 1, *dim)
             .map_err(|e| DispatchError::Hip(e.to_string())),
+        Step::Qwen4Layer(_) => Err(DispatchError::UnsupportedVariant {
+            family: "pipeline",
+            variant: "qwen4_layer_requires_mutable_executor",
+            arch: "",
+            quant: "stateful",
+        }),
+        Step::Qwen4Ple(_) => Err(DispatchError::UnsupportedVariant {
+            family: "pipeline",
+            variant: "qwen4_ple_requires_mutable_executor",
+            arch: "",
+            quant: "stateful",
+        }),
         Step::Moe(call) => sealed_moe::execute_sealed(gpu, call),
         Step::MoeNormalize(op) => op.normalize(gpu),
         Step::MoeInputBasis(op) => op.input_basis(gpu),
@@ -1076,29 +1114,25 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         Step::MoeMutationFence(op) => op.mutation_fence(gpu),
     }
 }
-
-/// Borrow `out` from a `RmsnormAutomatic` step. The guard has already confirmed
-/// step[0] is RmsnormAutomatic; this panics in debug if called incorrectly.
-fn rmsnorm_out<'a>(step: &'a Step<'a>) -> &'a rdna_compute::GpuTensor {
+fn rmsnorm_out<'a>(step: &Step<'a>) -> &'a rdna_compute::GpuTensor {
     match step {
-        Step::RmsnormAutomatic { out, .. } => out,
+        Step::RmsnormAutomatic { out, .. } => *out,
         _ => panic!("launch_fused: expected RmsnormAutomatic at step[0]"),
     }
 }
 
 /// Borrow `w` and `out` from a `Gemv` step.
-fn gemv_weight_out<'a>(step: &'a Step<'a>) -> (&'a WeightRef<'a>, &'a rdna_compute::GpuTensor) {
+fn gemv_weight_out<'a>(step: &Step<'a>) -> (&'a WeightRef<'a>, &'a rdna_compute::GpuTensor) {
     match step {
-        Step::Gemv { w, out, .. } => (w, out),
+        Step::Gemv { w, out, .. } => (*w, *out),
         _ => panic!("launch_fused: expected Gemv step"),
     }
 }
-
-fn launch_fused(
+fn launch_fused<'a>(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
     key: KernelKey,
-    steps: &[Step],
+    steps: &[Step<'a>],
 ) -> Result<(), DispatchError> {
     // Step 0 is always RmsnormAutomatic — run it to fill the activated buffer.
     launch_op(gpu, ctx, &steps[0])?;

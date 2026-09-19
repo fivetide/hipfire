@@ -21,20 +21,19 @@
 //!       --tokens benchmarks/prompts/qwen4-teacher-forced.tokens.json \
 //!       --out /tmp/qwen4-state-parity.json
 
-use hipfire_arch_qwen4::{PleHashMetadata, PleHistory, Qwen4HfqmArtifact, admit_hfqm_artifact};
+use hipfire_arch_qwen4::{admit_hfqm_artifact, PleHashMetadata, PleHistory, Qwen4HfqmArtifact};
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
 use hipfire_runtime::model_source::{ModelSource, SourcePayload};
-use hipfire_runtime::weight_store::{WeightOrigin, fulfill_manifest_from_payloads};
+use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use rdna_compute::qwen4::{
-    Qwen4GdnBf16Roundtrip, Qwen4GdnStep, Qwen4HcRead, Qwen4HcWrite, Qwen4QsaAttention,
-    Qwen4QsaCacheAppend, Qwen4QsaNormRope, Qwen4QsaPoolRope, Qwen4QsaSelect,
     qwen4_gdn_bf16_roundtrip, qwen4_gdn_params_f32, qwen4_gdn_step, qwen4_hc_read, qwen4_hc_write,
     qwen4_qsa_attention, qwen4_qsa_cache_append, qwen4_qsa_norm_rope, qwen4_qsa_pool_rope,
-    qwen4_qsa_select,
+    qwen4_qsa_select, Qwen4GdnBf16Roundtrip, Qwen4GdnStep, Qwen4HcRead, Qwen4HcWrite,
+    Qwen4QsaAttention, Qwen4QsaCacheAppend, Qwen4QsaNormRope, Qwen4QsaPoolRope, Qwen4QsaSelect,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
@@ -2121,7 +2120,7 @@ fn run_qsa(
         blocks,
         QSA_COMPRESS,
         index_dim,
-        1_000_000.0,
+        10_000_000.0,
     );
     let pool_err = compare_f32(
         &pooled_actual,
@@ -2136,8 +2135,13 @@ fn run_qsa(
         let visible = token + 1;
         let block_count = visible / QSA_COMPRESS;
         if block_count == 0 {
-            selected_actual
-                .extend((0..capacity).map(|slot| if slot < visible { slot as i64 } else { -1 }));
+            selected_actual.extend((0..capacity).map(|slot| {
+                if slot < visible {
+                    slot as i64
+                } else {
+                    -1
+                }
+            }));
             continue;
         }
         let query = gpu
@@ -2247,7 +2251,7 @@ fn run_qsa(
         n_heads,
         head_dim,
         &positions,
-        1_000_000.0,
+        10_000_000.0,
         false,
     );
     let key_rope_ref = rope_reference(
@@ -2256,7 +2260,7 @@ fn run_qsa(
         n_kv_heads,
         head_dim,
         &positions,
-        1_000_000.0,
+        10_000_000.0,
         false,
     );
     compare_f32(
@@ -2286,6 +2290,7 @@ fn run_qsa(
                 norm: &zero_norm_q,
                 heads: n_heads,
                 head_dim,
+                head_stride: head_dim,
                 position: positions[token],
                 rotary_dim: head_dim,
             },
@@ -2300,7 +2305,7 @@ fn run_qsa(
         n_heads,
         head_dim,
         &positions,
-        1_000_000.0,
+        10_000_000.0,
         true,
     );
     compare_f32(
@@ -2322,6 +2327,7 @@ fn run_qsa(
                 norm: &zero_norm_q,
                 heads: n_kv_heads,
                 head_dim,
+                head_stride: head_dim,
                 position: positions[token],
                 rotary_dim: head_dim,
             },
@@ -2336,7 +2342,7 @@ fn run_qsa(
         n_kv_heads,
         head_dim,
         &positions,
-        1_000_000.0,
+        10_000_000.0,
         true,
     );
     compare_f32(
@@ -2364,6 +2370,7 @@ fn run_qsa(
                 norm: &rope_norm,
                 heads: 2,
                 head_dim: 8,
+                head_stride: 8,
                 position: *position,
                 rotary_dim: 8,
             },
@@ -2379,7 +2386,7 @@ fn run_qsa(
         2,
         8,
         &rope_positions,
-        1_000_000.0,
+        10_000_000.0,
         true,
     );
     compare_f32(
@@ -2395,7 +2402,7 @@ fn run_qsa(
         2,
         8,
         &rope_positions,
-        1_000_000.0,
+        10_000_000.0,
         false,
     );
     compare_f32(
@@ -3269,7 +3276,7 @@ fn run_mtp(
         4,
         4,
         &positions,
-        1_000_000.0,
+        10_000_000.0,
         false,
     );
     let key_rope = rope_reference(
@@ -3278,7 +3285,7 @@ fn run_mtp(
         2,
         4,
         &positions,
-        1_000_000.0,
+        10_000_000.0,
         false,
     );
     let full_keys = gpu

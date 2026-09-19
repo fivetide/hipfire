@@ -1475,7 +1475,7 @@ impl SealedMoeCall<'_> {
             _ => {
                 return Err(invalid(
                     "EP slot combine requires the root-produced route and routed_out",
-                ))
+                ));
             }
         }
         moe_program::execute_ep_slot_combine(gpu, self)
@@ -1896,6 +1896,20 @@ pub(super) fn produce_prefill_route<'a>(
         .checked_mul(params.n_exp)
         .ok_or_else(|| invalid("prefill router score capacity overflows"))?;
     require_elements(scores, score_elements, "prefill router scores")?;
+    let qwen4_top10 = params.recipe == MoeRecipe::SoftmaxGatedShared
+        && params.routed_out.is_none()
+        && matches!(params.prelude.route, PrefillRouteMode::Replicated)
+        && super::is_qwen4_route(
+            &params.dtypes,
+            params.n_exp,
+            params.k_top,
+            params.gate_up_k,
+            params.mi,
+            params.gate_up_k,
+            params.down_m,
+            params.down_k,
+            params.expert_dtype_tags,
+        );
 
     match call.router {
         MoeRouterInput::SoftmaxTopK | MoeRouterInput::PrecomputedSoftmaxTopK => {
@@ -1907,28 +1921,43 @@ pub(super) fn produce_prefill_route<'a>(
                     "prefill softmax producer requires a 2-D [batch,n_experts] score view",
                 ));
             }
-            gpu.softmax_f32(scores)
+            if qwen4_top10 {
+                gpu.bf16_round_trip_f32(scores)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                gpu.moe_router_softmax_top10_f32(
+                    scores,
+                    params.topk_indices,
+                    params.topk_weights,
+                    params.batch_size,
+                    normalize,
+                )
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            let result = if params.k_top == 10 {
-                gpu.moe_topk_renorm_top10_batched(
-                    scores,
-                    params.topk_indices,
-                    params.topk_weights,
-                    params.n_exp,
-                    normalize,
-                    params.batch_size,
-                )
+                gpu.bf16_round_trip_f32(params.topk_weights)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
             } else {
-                gpu.moe_topk_renorm_k8_batched(
-                    scores,
-                    params.topk_indices,
-                    params.topk_weights,
-                    params.n_exp,
-                    normalize,
-                    params.batch_size,
-                )
-            };
-            result.map_err(|e| DispatchError::Hip(e.to_string()))?;
+                gpu.softmax_f32(scores)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                let result = if params.k_top == 10 {
+                    gpu.moe_topk_renorm_top10_batched(
+                        scores,
+                        params.topk_indices,
+                        params.topk_weights,
+                        params.n_exp,
+                        normalize,
+                        params.batch_size,
+                    )
+                } else {
+                    gpu.moe_topk_renorm_k8_batched(
+                        scores,
+                        params.topk_indices,
+                        params.topk_weights,
+                        params.n_exp,
+                        normalize,
+                        params.batch_size,
+                    )
+                };
+                result.map_err(|e| DispatchError::Hip(e.to_string()))?;
+            }
         }
         MoeRouterInput::SigmoidTopK | MoeRouterInput::PrecomputedSigmoidTopK => {
             #[cfg(feature = "deltanet")]
@@ -2085,12 +2114,7 @@ pub(super) fn adopt_prefill_route<'a>(
     {
         return Err(invalid(format!(
             "prefill route proof covers [{} tokens x {} x {}], call needs [{} x {} x {}]; refusing before launch",
-            proof.n_tokens,
-            proof.k,
-            proof.n_exp,
-            params.batch_size,
-            params.k_top,
-            params.n_exp
+            proof.n_tokens, proof.k, proof.n_exp, params.batch_size, params.k_top, params.n_exp
         )));
     }
     Ok(MoeRouteReceipt {
@@ -2184,13 +2208,16 @@ fn resolve_decode_normalization(
 /// the proof-validated routed-contrib path. Callers that need
 /// [`MoeRouterInput::PrecomputedSoftmaxTopK`] must go through
 /// [`seal_ep_routed_contrib`] so the route-producer proof cannot be bypassed.
-fn seal_indexed_decode<'a>(
-    experts: BoundMoeExperts<'a>,
-    ctx: &'a DispatchCtx,
+/// Shared launch-free decode admission used by both the real sealer and
+/// whole-step preflight.  Keeping this resolver single-sourced prevents the
+/// preflight path from drifting from the eventual sealed call.
+fn prepare_decode<'a>(
+    experts: &BoundMoeExperts<'a>,
+    ctx: &DispatchCtx,
     mut params: MoeParams<'a>,
     router: MoeRouterInput,
-) -> Result<SealedMoeCall<'a>, DispatchError> {
-    require_context_device(ctx, &experts)?;
+) -> Result<(MoeParams<'a>, MoeRouterInput), DispatchError> {
+    require_context_device(ctx, experts)?;
     require_recipe_feature(params.recipe)?;
     resolve_decode_normalization(ctx, &mut params)?;
     if params.recipe == MoeRecipe::SigmoidRoutedNoShared {
@@ -2214,7 +2241,7 @@ fn seal_indexed_decode<'a>(
     match params.ep_mode {
         // Single (classic or deferred-combine experiment): exactly one rank,
         // rank 0, no contract needed.
-        MoeEpMode::None => require_single_binding(&experts)?,
+        MoeEpMode::None => require_single_binding(experts)?,
         // Root-routed EP: plan-bound compact owners under the root-routed
         // execution contract, decode-eligible on this GPU.
         MoeEpMode::RootRoutedPartial => {
@@ -2228,7 +2255,7 @@ fn seal_indexed_decode<'a>(
                     ));
                 }
             } else {
-                preflight_root_routed_decode(ctx, &experts, &params)?;
+                preflight_root_routed_decode(ctx, experts, &params)?;
             }
         }
     }
@@ -2241,6 +2268,20 @@ fn seal_indexed_decode<'a>(
     ) {
         return Err(invalid("unsupported indexed decode router"));
     }
+    Ok((params, router))
+}
+
+/// Private indexed-decode sealer shared by the public SoftmaxTopK entry and
+/// the proof-validated routed-contrib path. Callers that need
+/// [`MoeRouterInput::PrecomputedSoftmaxTopK`] must go through
+/// [`seal_ep_routed_contrib`] so the route-producer proof cannot be bypassed.
+fn seal_indexed_decode<'a>(
+    experts: BoundMoeExperts<'a>,
+    ctx: &'a DispatchCtx,
+    params: MoeParams<'a>,
+    router: MoeRouterInput,
+) -> Result<SealedMoeCall<'a>, DispatchError> {
+    let (params, router) = prepare_decode(&experts, ctx, params, router)?;
     let selection = moe_program::select_decode(ctx, &params, router)?;
     validate_decode(ctx, &experts, &params)?;
     let basis = expected_basis(&experts, params.dtypes.routed_gate_up)?;
@@ -2265,6 +2306,27 @@ fn seal_indexed_decode<'a>(
         params: SealedParams::Decode(params),
         route_receipt: None,
     })
+}
+
+/// Launch-free indexed-decode preflight.  It deliberately shares the same
+/// normalization, grammar, resource validation, and kernel selection resolver
+/// as [`seal_indexed_decode`], but does not mint an invocation or allocate a
+/// sealed call.
+pub(crate) fn preflight_decode<'a>(
+    experts: BoundMoeExperts<'a>,
+    ctx: &DispatchCtx,
+    params: MoeParams<'a>,
+) -> Result<(), DispatchError> {
+    let router = match params.recipe {
+        MoeRecipe::SoftmaxGatedShared => MoeRouterInput::SoftmaxTopK,
+        MoeRecipe::SigmoidRoutedNoShared => MoeRouterInput::SigmoidTopK,
+    };
+    let (params, router) = prepare_decode(&experts, ctx, params, router)?;
+    let _selection = moe_program::select_decode(ctx, &params, router)?;
+    validate_decode(ctx, &experts, &params)?;
+    let _basis = expected_basis(&experts, params.dtypes.routed_gate_up)?;
+    let _grammar = decode_combine(&experts, &params)?;
+    Ok(())
 }
 
 /// Seal the non-root routed-contrib decode call: indexed experts (plus any
@@ -2342,17 +2404,16 @@ pub fn seal_prefill<'a>(
     seal_prefill_with_router(experts, ctx, params, router)
 }
 
-/// Internal checked prefill adapter. Public callers select the router from
-/// `MoePrefillParams.recipe`; this function remains private so an architecture
-/// cannot bypass the typed recipe declaration.
-fn seal_prefill_with_router<'a>(
-    experts: BoundMoeExperts<'a>,
-    ctx: &'a DispatchCtx,
+/// Shared launch-free prefill admission used by both the real sealer and
+/// whole-step preflight.
+fn prepare_prefill<'a>(
+    experts: &BoundMoeExperts<'a>,
+    ctx: &DispatchCtx,
     params: MoePrefillParams<'a>,
     router: MoeRouterInput,
-) -> Result<SealedMoeCall<'a>, DispatchError> {
-    require_context_device(ctx, &experts)?;
-    require_single_binding(&experts)?;
+) -> Result<(MoePrefillParams<'a>, MoeRouterInput), DispatchError> {
+    require_context_device(ctx, experts)?;
+    require_single_binding(experts)?;
     let expected = match params.recipe {
         crate::families::moe::MoeRecipe::SoftmaxGatedShared => match params.prelude.route {
             PrefillRouteMode::AdoptRoot { .. } => MoeRouterInput::PrecomputedSoftmaxTopK,
@@ -2365,7 +2426,20 @@ fn seal_prefill_with_router<'a>(
             "prefill router does not match the declared MoE recipe",
         ));
     }
-    validate_prefill(ctx, &experts, &params)?;
+    validate_prefill(ctx, experts, &params)?;
+    Ok((params, router))
+}
+
+/// Internal checked prefill adapter. Public callers select the router from
+/// [`MoePrefillParams::recipe`]; this function remains private so an
+/// architecture cannot bypass the typed recipe declaration.
+fn seal_prefill_with_router<'a>(
+    experts: BoundMoeExperts<'a>,
+    ctx: &'a DispatchCtx,
+    params: MoePrefillParams<'a>,
+    router: MoeRouterInput,
+) -> Result<SealedMoeCall<'a>, DispatchError> {
+    let (params, router) = prepare_prefill(&experts, ctx, params, router)?;
     let selection = moe_program::select_prefill(ctx, &params)?;
     let basis = expected_basis(&experts, params.dtypes.routed_gate_up)?;
     let contribution = if params.routed_out.is_some() {
@@ -2397,6 +2471,27 @@ fn seal_prefill_with_router<'a>(
         }
     }
     Ok(call)
+}
+
+/// Launch-free grouped-prefill preflight.  It shares the same binding,
+/// recipe, resource, and kernel-selection checks as `seal_prefill` without
+/// allocating a sealed call or minting an invocation.
+pub(crate) fn preflight_prefill<'a>(
+    experts: BoundMoeExperts<'a>,
+    ctx: &DispatchCtx,
+    params: MoePrefillParams<'a>,
+) -> Result<(), DispatchError> {
+    let router = match params.recipe {
+        crate::families::moe::MoeRecipe::SoftmaxGatedShared => match params.prelude.route {
+            PrefillRouteMode::AdoptRoot { .. } => MoeRouterInput::PrecomputedSoftmaxTopK,
+            _ => MoeRouterInput::SoftmaxTopK,
+        },
+        MoeRecipe::SigmoidRoutedNoShared => MoeRouterInput::SigmoidTopK,
+    };
+    let (params, _router) = prepare_prefill(&experts, ctx, params, router)?;
+    let _selection = moe_program::select_prefill(ctx, &params)?;
+    let _basis = expected_basis(&experts, params.dtypes.routed_gate_up)?;
+    Ok(())
 }
 
 fn validate_qwen4_route_width(
@@ -2450,7 +2545,7 @@ pub fn seal_prefill_ep<'a>(
         PrefillRouteMode::Replicated => {
             return Err(invalid(
                 "compact EP prefill requires ProduceRoot or AdoptRoot route authority",
-            ))
+            ));
         }
     };
     // Reuse the common binding/selection path without its Single-rank check.
@@ -2834,7 +2929,14 @@ fn validate_decode(
     require_elements(params.x_norm, params.hidden, "decode x_norm")?;
     require_elements(params.x_residual, params.hidden, "decode residual")?;
     require_elements(params.router_logits, params.n_exp, "decode router logits")?;
-    require_elements(params.topk_indices, params.k, "decode top-k indices")?;
+    require_bytes(
+        params.topk_indices,
+        params
+            .k
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| invalid("decode top-k index capacity overflows"))?,
+        "decode top-k indices",
+    )?;
     require_elements(params.topk_weights, params.k, "decode top-k weights")?;
     require_elements(
         params.x_rot_local,
@@ -2895,6 +2997,22 @@ fn validate_prefill(
         params.dtypes.routed_down,
         "prefill",
     )?;
+    if super::is_qwen4_route(
+        &params.dtypes,
+        params.n_exp,
+        params.k_top,
+        params.gate_up_k,
+        params.mi,
+        params.gate_up_k,
+        params.down_m,
+        params.down_k,
+        params.expert_dtype_tags,
+    ) && !matches!(params.prelude.route, PrefillRouteMode::Replicated)
+    {
+        return Err(invalid(
+            "Qwen4 top-10 prefill requires replicated route authority; EP is not admitted",
+        ));
+    }
     require_recipe_feature(params.recipe)?;
     if params.n_exp == 0 || params.k_top == 0 || params.k_top > params.n_exp {
         return Err(invalid(format!(
@@ -3005,7 +3123,13 @@ fn validate_prefill(
     if let Some(table) = params.expert_down_awq_ptrs {
         validate_pointer_table(table, params.n_exp, "prefill down AWQ")?;
     }
-    require_elements(params.topk_indices, total_slots, "prefill top-k indices")?;
+    require_bytes(
+        params.topk_indices,
+        total_slots
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| invalid("prefill top-k index capacity overflows"))?,
+        "prefill top-k indices",
+    )?;
     require_elements(params.topk_weights, total_slots, "prefill top-k weights")?;
     require_elements(
         params.x_batch,
@@ -3038,35 +3162,44 @@ fn validate_prefill(
             .ok_or_else(|| invalid("prefill expanded down capacity overflows"))?,
         "prefill expanded down",
     )?;
-    require_elements(
+    require_bytes(
         params.expert_token_counts,
-        params.n_exp,
+        params
+            .n_exp
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| invalid("prefill expert count capacity overflows"))?,
         "prefill expert token counts",
     )?;
-    require_elements(
+    require_bytes(
         params.expert_offsets,
         params
             .n_exp
             .checked_add(1)
+            .and_then(|count| count.checked_mul(std::mem::size_of::<u32>()))
             .ok_or_else(|| invalid("prefill expert offset capacity overflows"))?,
         "prefill expert offsets",
     )?;
-    require_elements(
+    require_bytes(
         params.sorted_slot_index,
-        params.m_total_max,
+        params
+            .m_total_max
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| invalid("prefill sorted slot capacity overflows"))?,
         "prefill sorted slots",
     )?;
     let expert_tile_bytes = (params.m_total_max / GROUPED_BLOCK_M)
         .checked_mul(std::mem::size_of::<u32>())
         .ok_or_else(|| invalid("prefill expert tile capacity overflows"))?;
-    require_elements(
+    require_bytes(
         params.expert_tile_ids,
         expert_tile_bytes,
         "prefill expert tiles",
     )?;
-    require_elements(
+    require_bytes(
         params.inverse_perm,
-        total_slots,
+        total_slots
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| invalid("prefill inverse permutation capacity overflows"))?,
         "prefill inverse permutation",
     )?;
     require_elements(
@@ -4122,6 +4255,16 @@ fn require_elements(tensor: &GpuTensor, required: usize, name: &str) -> Result<(
     if capacity < required {
         return Err(invalid(format!(
             "{name} capacity {capacity} is below required {required}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_bytes(tensor: &GpuTensor, required: usize, name: &str) -> Result<(), DispatchError> {
+    let capacity = tensor_capacity_bytes(tensor)?;
+    if capacity < required {
+        return Err(invalid(format!(
+            "{name} byte capacity {capacity} is below required {required}"
         )));
     }
     Ok(())

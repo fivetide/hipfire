@@ -24650,6 +24650,211 @@ impl Gpu {
         result
     }
 
+    /// Exact BF16-weight × F32-input four-token row-tile GEMM.
+    ///
+    /// The wave owns one output-channel row and four token rows.  It widens
+    /// each BF16 weight once and reuses that value across four F32
+    /// accumulators, preserving the scalar K traversal and shuffle reduction
+    /// without downcasting the F32 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_xf32_multirow(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if weight.dtype != DType::BF16 || x.dtype != DType::F32 || y.dtype != DType::F32 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_bf16_xf32_multirow requires BF16 weights and F32 activations/output",
+            ));
+        }
+        if m == 0 || k == 0 || batch_size == 0 || batch_size <= 1 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_bf16_xf32_multirow requires M,K>0 and batch_size>1 (got M={m} K={k} N={batch_size})"
+                ),
+            ));
+        }
+        let weight_bytes = m
+            .checked_mul(k)
+            .and_then(|elements| elements.checked_mul(2))
+            .ok_or_else(|| hip_bridge::HipError::new(0, "BF16 multirow weight size overflows"))?;
+        let x_bytes = batch_size
+            .checked_mul(k)
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or_else(|| hip_bridge::HipError::new(0, "BF16 multirow input size overflows"))?;
+        let y_bytes = batch_size
+            .checked_mul(m)
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or_else(|| hip_bridge::HipError::new(0, "BF16 multirow output size overflows"))?;
+        if weight.buf.size() < weight_bytes || x.buf.size() < x_bytes || y.buf.size() < y_bytes {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_bf16_xf32_multirow buffer capacity is too small",
+            ));
+        }
+        const KERNEL: &str = "gemm_bf16_xf32_multirow";
+        self.ensure_kernel(KERNEL, kernels::GEMM_BF16_XF32_MULTIROW_SRC, KERNEL)?;
+        let wp = weight.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mv = m as i32;
+        let kv = k as i32;
+        let nv = batch_size as i32;
+        let mut params = [
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &nv as *const _ as *mut c_void,
+        ];
+        // The N8 route is admitted only for the measured gfx1151 production
+        // shapes. All other calls retain the four-row kernel.
+        let n8_shape = self.arch_caps.is_gfx1151()
+            && k == 2560
+            && batch_size == 128
+            && matches!(m, 10240 | 12288 | 248320);
+        if n8_shape {
+            const KERNEL_N8: &str = "gemm_bf16_xf32_multirow_n8_gfx1151";
+            self.ensure_kernel(
+                KERNEL_N8,
+                kernels::GEMM_BF16_XF32_MULTIROW_N8_GFX1151_SRC,
+                KERNEL_N8,
+            )?;
+            let bytes = weight_bytes.saturating_add(x_bytes).saturating_add(y_bytes);
+            let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL_N8, bytes);
+            let result = self.launch_maybe_blob(
+                KERNEL_N8,
+                [m as u32, batch_size.div_ceil(8) as u32, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(wp);
+                    b.push_ptr(xp);
+                    b.push_ptr(yp);
+                    b.push_i32(mv);
+                    b.push_i32(kv);
+                    b.push_i32(nv);
+                    b
+                },
+            );
+            if let Some(t) = timer {
+                t.finish(&self.hip);
+            }
+            return result;
+        }
+        let bytes = weight_bytes.saturating_add(x_bytes).saturating_add(y_bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [m as u32, batch_size.div_ceil(4) as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// Qwen4 qt=53 dense batched projection against G128-rotated rows.
+    ///
+    /// gfx1151 uses a four-row kernel that shares each decoded weight group
+    /// across prompt rows but keeps the scalar gemv accumulator/reduction
+    /// association.  Other architectures retain the original one-row
+    /// batched kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq4g128v2_batched(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if batch_size == 1 {
+            return self.gemv_mq4g128v2(a_raw, x, y, m, k);
+        }
+
+        self.bind_thread()?;
+        let gfx1151_multirow = batch_size > 1 && self.arch_caps.is_gfx1151();
+        let (func, source, token_tiles) = if gfx1151_multirow {
+            (
+                "gemm_mq4g128v2_multirow_gfx1151",
+                kernels::GEMM_MQ4G128V2_MULTIROW_GFX1151_SRC,
+                batch_size.div_ceil(4),
+            )
+        } else {
+            (
+                "gemm_mq4g128v2_batched",
+                kernels::GEMM_MQ4G128V2_BATCHED_SRC,
+                batch_size,
+            )
+        };
+        self.ensure_kernel(func, source, func)?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let n_val = batch_size as i32;
+        let mut params = [
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+        ];
+        let weight_bytes = m
+            .saturating_mul(k.div_ceil(128).saturating_mul(68))
+            .saturating_mul(token_tiles);
+        let bytes = weight_bytes
+            .saturating_add(batch_size.saturating_mul(k.saturating_add(m).saturating_mul(4)));
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func, bytes);
+        let result = self.launch_maybe_blob(
+            func,
+            [m as u32, token_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// HFP4G32 / MFP4G32 grouped-WMMA-GEMM for MoE prefill — sister of
     /// `gemm_hfq4g256_moe_grouped_wmma_k2` but on the FP4G32 dequant. Same
     /// kernarg layout, same expert_tile_ids / sorted_slot_index contract.
@@ -37579,6 +37784,19 @@ impl Gpu {
                 "gemm_mq4g256v2_moe_grouped_top10: x_row_div must be sealed top-k=10",
             ));
         }
+        if self.arch_caps.is_gfx1151() {
+            return self.gemm_mq4g256v2_moe_grouped_top10_simt_gfx1151(
+                expert_weight_ptrs,
+                expert_tile_ids,
+                sorted_slot_index,
+                x_src,
+                y_grouped,
+                m,
+                k,
+                x_row_div,
+                grouped_rows,
+            );
+        }
         self.gemm_mq4g256v2_moe_grouped_wmma_k2(
             expert_weight_ptrs,
             expert_tile_ids,
@@ -37591,6 +37809,77 @@ impl Gpu {
             grouped_rows,
             x_src_rows,
         )
+    }
+    /// gfx1151 SIMT parity companion for the qt44 grouped gate/up path.  It
+    /// intentionally consumes F32 X directly and mirrors the indexed decode
+    /// reduction instead of entering the F16 WMMA arithmetic path.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_mq4g256v2_moe_grouped_top10_simt_gfx1151(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "gemm_mq4g256v2_moe_grouped_top10_simt";
+        self.ensure_kernel(
+            FUNC,
+            kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_SIMT_GFX1151_SRC,
+            FUNC,
+        )?;
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_src.buf.as_ptr();
+        let yp = y_grouped.buf.as_ptr();
+        let mv = m as i32;
+        let kv = k as i32;
+        let rd = x_row_div as i32;
+        let gr = grouped_rows as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &rd as *const _ as *mut c_void,
+            &gr as *const _ as *mut c_void,
+        ];
+        let bytes =
+            grouped_rows.saturating_mul(m.saturating_mul(4).saturating_add(k.saturating_mul(4)));
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [m as u32, grouped_rows.div_ceil(16) as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(tp);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(rd);
+                b.push_i32(gr);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 }
 

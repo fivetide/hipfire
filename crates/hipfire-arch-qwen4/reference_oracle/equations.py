@@ -402,7 +402,7 @@ def rope_half_split(value: Tensor, positions: Sequence[int], rotary_dim: int | N
         for head in range(value.shape[1]):
             base = (t * value.shape[1] + head) * value.shape[2]
             for j in range(half):
-                angle = float(position) / (1000000.0 ** (2.0 * j / dim))
+                angle = float(position) / (10000000.0 ** (2.0 * j / dim))
                 cosine, sine = math.cos(angle), math.sin(angle)
                 first = float(value.data[base + j])
                 second = float(value.data[base + j + half])

@@ -1757,21 +1757,7 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         );
         return;
     }
-    let prompt_numel = match prompt_tokens.len().checked_mul(vocab_size) {
-        Some(value) => value,
-        None => {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                "AR prompt logit shape overflow",
-                "validation",
-                false,
-                false,
-            );
-            return;
-        }
-    };
-    let prompt_logits = match gpu.zeros(&[prompt_numel], rdna_compute::DType::F32) {
+    let prompt_logits = match gpu.zeros(&[vocab_size], rdna_compute::DType::F32) {
         Ok(logits) => logits,
         Err(error) => {
             emit_active_attempt_error(
@@ -1818,9 +1804,7 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         return;
     }
 
-    let final_offset = (prompt_tokens.len() - 1) * vocab_size;
-    let final_logits = prompt_logits.sub_offset(final_offset, vocab_size);
-    let first_logits = gpu.download_f32(&final_logits);
+    let first_logits = gpu.download_f32(&prompt_logits);
     let _ = gpu.free_tensor(prompt_logits);
     let mut logits = match first_logits {
         Ok(logits) => logits,

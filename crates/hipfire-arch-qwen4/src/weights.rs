@@ -1029,6 +1029,13 @@ pub struct Qwen4Placement {
 }
 
 #[derive(Clone, Debug)]
+pub struct HyperConnectionReadWeights {
+    pub hc_norm: TensorRef,
+    pub input_mix_down: TensorRef,
+    pub input_mix_up: TensorRef,
+}
+
+#[derive(Clone, Debug)]
 pub struct HyperConnectionWeights {
     pub block_inject: TensorRef,
     pub hc_norm: TensorRef,
@@ -1109,7 +1116,7 @@ pub struct Qwen4MtpWeights {
     pub mlp_hyper: HyperConnectionWeights,
     pub attention: QsaWeights,
     pub moe: MoeWeights,
-    pub final_hyper: HyperConnectionWeights,
+    pub final_hyper: HyperConnectionReadWeights,
 }
 
 /// Typed trunk-level roots required by the native forward path.
@@ -1122,7 +1129,7 @@ pub struct Qwen4MtpWeights {
 pub struct Qwen4RootWeights {
     pub embedding: TensorRef,
     pub lm_head: TensorRef,
-    pub final_hyper: HyperConnectionWeights,
+    pub final_hyper: HyperConnectionReadWeights,
 }
 
 /// Published resident ownership.  External PLE descriptors remain in the
@@ -1266,7 +1273,7 @@ fn build_root_refs(config: &Qwen4Config) -> Result<Qwen4RootWeights, WeightError
     Ok(Qwen4RootWeights {
         embedding,
         lm_head,
-        final_hyper: build_hyper_refs(
+        final_hyper: build_hyper_read_refs(
             "model.language_model.hyper_connection_mixer",
             None,
             hc_wide,
@@ -1275,12 +1282,12 @@ fn build_root_refs(config: &Qwen4Config) -> Result<Qwen4RootWeights, WeightError
     })
 }
 
-fn build_hyper_refs(
+fn build_hyper_read_refs(
     prefix: &str,
     layer: Option<usize>,
     hc_wide: usize,
     hc_rank: usize,
-) -> Result<HyperConnectionWeights, WeightError> {
+) -> Result<HyperConnectionReadWeights, WeightError> {
     let tr = |suffix: &str, role: TensorRole, shape: Vec<usize>| {
         TensorRef::new(
             format!("{prefix}.{suffix}"),
@@ -1290,12 +1297,7 @@ fn build_hyper_refs(
             DType::BF16,
         )
     };
-    Ok(HyperConnectionWeights {
-        block_inject: tr(
-            "block_inject_weight.weight",
-            TensorRole::HyperConnectionBlockInject,
-            vec![4, hc_wide],
-        )?,
+    Ok(HyperConnectionReadWeights {
         hc_norm: tr(
             "hc_norm.weight",
             TensorRole::HyperConnectionNorm,
@@ -1311,6 +1313,28 @@ fn build_hyper_refs(
             TensorRole::HyperConnectionUp,
             vec![hc_wide, hc_rank],
         )?,
+    })
+}
+
+fn build_hyper_refs(
+    prefix: &str,
+    layer: Option<usize>,
+    hc_wide: usize,
+    hc_rank: usize,
+) -> Result<HyperConnectionWeights, WeightError> {
+    let read = build_hyper_read_refs(prefix, layer, hc_wide, hc_rank)?;
+    let block_inject = TensorRef::new(
+        format!("{prefix}.block_inject_weight.weight"),
+        TensorRole::HyperConnectionBlockInject,
+        layer,
+        vec![4, hc_wide],
+        DType::BF16,
+    )?;
+    Ok(HyperConnectionWeights {
+        block_inject,
+        hc_norm: read.hc_norm,
+        input_mix_down: read.input_mix_down,
+        input_mix_up: read.input_mix_up,
     })
 }
 
@@ -1441,7 +1465,7 @@ fn build_mtp_refs(config: &Qwen4Config) -> Result<Qwen4MtpWeights, WeightError> 
             config,
         )?,
         moe: build_moe_refs("mtp.layers.0.mlp", None, hidden, config)?,
-        final_hyper: build_hyper_refs("mtp.hyper_connection_mixer", None, hc_wide, hc_rank)?,
+        final_hyper: build_hyper_read_refs("mtp.hyper_connection_mixer", None, hc_wide, hc_rank)?,
     })
 }
 
@@ -1904,6 +1928,31 @@ mod tests {
             }
         ));
     }
+    #[test]
+    fn final_hyper_manifest_has_read_operands_only() {
+        let config = pinned_config();
+        let manifest = Qwen4Manifest::build(&config).expect("pinned config manifest");
+        assert!(
+            manifest
+                .entry(
+                    "model.language_model.hyper_connection_mixer.block_inject_weight.weight",
+                    None,
+                )
+                .is_none(),
+            "final HC must not invent a write operand"
+        );
+        let root = build_root_refs(&config).expect("root references");
+        assert_eq!(
+            root.final_hyper.hc_norm.name,
+            "model.language_model.hyper_connection_mixer.hc_norm.weight"
+        );
+        let mtp = build_mtp_refs(&config).expect("MTP references");
+        assert_eq!(
+            mtp.final_hyper.input_mix_up.name,
+            "mtp.hyper_connection_mixer.input_mix_weight_up.weight"
+        );
+    }
+
     #[test]
     fn qwen4_moe_keeps_fused_source_replicated_for_single_execution() {
         let config = pinned_config();

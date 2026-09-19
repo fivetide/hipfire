@@ -1668,7 +1668,7 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
     hipfire_dispatch::pipeline::execute_steps(
         gpu,
         &ctx,
-        &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
+        &mut [hipfire_dispatch::pipeline::Step::Attend { plan, io }],
     )
     .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 

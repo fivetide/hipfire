@@ -130,6 +130,95 @@ extern "C" __global__ void qwen4_gdn_step_f32(
     }
     output[value_head * value_dim + value_index] = out;
 }
+// gfx1151-only exact-128 path.  Q/K normalization is shared by every value
+// channel in the block, but the recurrence remains one independent row per
+// value channel and keeps the original decay -> kv_mem -> delta -> update ->
+// output order.
+extern "C" __global__ void qwen4_gdn_step_shared_norm128_gfx1151(
+    const float* q,
+    const float* k,
+    const float* v,
+    const float* gate,
+    const float* beta,
+    float* state,
+    float* output,
+    int key_heads,
+    int value_heads,
+    int key_dim,
+    int value_dim,
+    float query_scale) {
+    const int value_head = (int)blockIdx.x;
+    const int value_index = (int)(blockIdx.y * blockDim.x + threadIdx.x);
+    const bool exact_shape = key_dim == 128 && value_dim == 128;
+    const bool active = exact_shape
+        && value_head < value_heads
+        && value_index < 128;
+    __shared__ __hip_bfloat16 q_norm[128];
+    __shared__ __hip_bfloat16 k_norm[128];
+
+    if (threadIdx.x == 0 && value_head < value_heads && exact_shape) {
+        const int repeat = value_heads / key_heads;
+        const int key_head = value_head / repeat;
+        const int key_base = key_head * 128;
+        float q_sum_f32 = 0.0f;
+        float k_sum_f32 = 0.0f;
+        const __hip_bfloat16 eps = qwen4_bf16_round(1.0e-6f);
+        for (int kd = 0; kd < 128; ++kd) {
+            const __hip_bfloat16 q_value = qwen4_bf16_round(q[key_base + kd]);
+            const __hip_bfloat16 k_value = qwen4_bf16_round(k[key_base + kd]);
+            const float q_float = __bfloat162float(q_value);
+            const float k_float = __bfloat162float(k_value);
+            q_sum_f32 += __bfloat162float(qwen4_bf16_round(q_float * q_float));
+            k_sum_f32 += __bfloat162float(qwen4_bf16_round(k_float * k_float));
+        }
+        const __hip_bfloat16 q_sum = qwen4_bf16_round(q_sum_f32);
+        const __hip_bfloat16 k_sum = qwen4_bf16_round(k_sum_f32);
+        const __hip_bfloat16 q_inv = qwen4_bf16_round(
+            rsqrtf(__bfloat162float(q_sum) + __bfloat162float(eps)));
+        const __hip_bfloat16 k_inv = qwen4_bf16_round(
+            rsqrtf(__bfloat162float(k_sum) + __bfloat162float(eps)));
+        for (int kd = 0; kd < 128; ++kd) {
+            const __hip_bfloat16 q_value = qwen4_bf16_round(q[key_base + kd]);
+            const __hip_bfloat16 k_value = qwen4_bf16_round(k[key_base + kd]);
+            q_norm[kd] = qwen4_bf16_round(
+                __bfloat162float(q_value) * __bfloat162float(q_inv));
+            k_norm[kd] = qwen4_bf16_round(
+                __bfloat162float(k_value) * __bfloat162float(k_inv));
+        }
+    }
+    // Inactive lanes must reach the barrier before returning.
+    __syncthreads();
+    if (!active) return;
+
+    const int repeat = value_heads / key_heads;
+    const int key_head = value_head / repeat;
+    const float decay = expf(gate[value_head]);
+    const float beta_value = beta[value_head];
+    const int state_base = value_head * 128 * 128;
+    for (int kd = 0; kd < 128; ++kd) {
+        state[state_base + kd * 128 + value_index] *= decay;
+    }
+    float kv_mem = 0.0f;
+    for (int kd = 0; kd < 128; ++kd) {
+        const float kv = __bfloat162float(k_norm[kd]);
+        kv_mem += state[state_base + kd * 128 + value_index] * kv;
+    }
+    const __hip_bfloat16 v_value = qwen4_bf16_round(
+        v[value_head * 128 + value_index]);
+    const float delta = (__bfloat162float(v_value) - kv_mem) * beta_value;
+    for (int kd = 0; kd < 128; ++kd) {
+        const float kv = __bfloat162float(k_norm[kd]);
+        state[state_base + kd * 128 + value_index] += kv * delta;
+    }
+    float out = 0.0f;
+    for (int kd = 0; kd < 128; ++kd) {
+        float qv = __bfloat162float(q_norm[kd]);
+        qv *= query_scale;
+        out += state[state_base + kd * 128 + value_index] * qv;
+    }
+    output[value_head * 128 + value_index] = out;
+}
+
 
 // Source HF executes the recurrent/chunk result through a hidden BF16 cast
 // before RMSNormGated.  Keep the compact production buffer F32 for the
@@ -162,6 +251,27 @@ extern "C" __global__ void qwen4_bf16_scaled_add_f32(
     const __hip_bfloat16 product = qwen4_bf16_round(
         __bfloat162float(gate) * __bfloat162float(rhs));
     residual[i] = __bfloat162float(qwen4_bf16_round(
+        __bfloat162float(lhs) + __bfloat162float(product)));
+}
+// Row-batched sibling of qwen4_bf16_scaled_add_f32.  The scalar gate is one
+// BF16 value per row; every product and residual sum keeps the same source
+// rounding boundaries as the decode operation.
+extern "C" __global__ void qwen4_bf16_scaled_add_batched_f32(
+    float* residual,
+    const float* value,
+    const float* scalar,
+    int rows,
+    int elements) {
+    const int flat = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int total = rows * elements;
+    if (flat >= total) return;
+    const int row = flat / elements;
+    const __hip_bfloat16 lhs = qwen4_bf16_round(residual[flat]);
+    const __hip_bfloat16 rhs = qwen4_bf16_round(value[flat]);
+    const __hip_bfloat16 gate = qwen4_bf16_round(scalar[row]);
+    const __hip_bfloat16 product = qwen4_bf16_round(
+        __bfloat162float(gate) * __bfloat162float(rhs));
+    residual[flat] = __bfloat162float(qwen4_bf16_round(
         __bfloat162float(lhs) + __bfloat162float(product)));
 }
 
@@ -234,21 +344,26 @@ extern "C" __global__ void qwen4_hc_read_projected_f32(
     float* normalized,
     float* mixed,
     int branches,
-    int hidden) {
+    int hidden,
+    int rows) {
     const int column = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int row = (int)blockIdx.y;
     const int wide = branches * hidden;
-    if (column >= wide) return;
+    if (row >= rows || column >= wide) return;
     if (column < hidden) {
+        const int row_offset = row * wide;
+        const int mixed_offset = row * hidden;
         float value = 0.0f;
         for (int branch = 0; branch < branches; ++branch) {
-            const int offset = branch * hidden + column;
+            const int offset = row_offset + branch * hidden + column;
             const float gate_input = __bfloat162float(qwen4_bf16_round(projected_up[offset]));
             const float gate = __bfloat162float(qwen4_bf16_round(
                 1.0f / (1.0f + expf(-gate_input))));
             const float normed = __bfloat162float(qwen4_bf16_round(normalized[offset]));
             value += __bfloat162float(qwen4_bf16_round(gate * normed));
         }
-        mixed[column] = __bfloat162float(qwen4_bf16_round(value / (float)branches));
+        mixed[mixed_offset + column] =
+            __bfloat162float(qwen4_bf16_round(value / (float)branches));
     }
     (void)input;
     (void)norm_weight;
@@ -262,21 +377,27 @@ extern "C" __global__ void qwen4_hc_write_f32(
     const float* gates,
     float* output,
     int branches,
-    int hidden) {
-    int column = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    int wide = branches * hidden;
-    if (column >= wide) return;
-    int branch = column / hidden;
-    const float gate_logit = __bfloat162float(qwen4_bf16_round(gates[branch]));
+    int hidden,
+    int rows) {
+    const int column = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int row = (int)blockIdx.y;
+    const int wide = branches * hidden;
+    if (row >= rows || column >= wide) return;
+    const int row_offset = row * wide;
+    const int branch = column / hidden;
+    const float gate_logit =
+        __bfloat162float(qwen4_bf16_round(gates[row * branches + branch]));
     const float gate_scaled = __bfloat162float(
         qwen4_bf16_round(gate_logit / (float)branches));
     const float gate = __bfloat162float(qwen4_bf16_round(
         2.0f * __bfloat162float(qwen4_bf16_round(
             1.0f / (1.0f + expf(-gate_scaled))))));
     const float injection = __bfloat162float(qwen4_bf16_round(
-        gate * __bfloat162float(qwen4_bf16_round(mixed[column % hidden]))));
-    const float value = __bfloat162float(qwen4_bf16_round(input[column])) + injection;
-    output[column] = __bfloat162float(qwen4_bf16_round(value));
+        gate * __bfloat162float(
+            qwen4_bf16_round(mixed[row * hidden + column % hidden]))));
+    const float value =
+        __bfloat162float(qwen4_bf16_round(input[row_offset + column])) + injection;
+    output[row_offset + column] = __bfloat162float(qwen4_bf16_round(value));
 }
 
 extern "C" __global__ void qwen4_hc_final_f32(
@@ -297,11 +418,14 @@ extern "C" __global__ void qwen4_hc_norm_f32(
     const __hip_bfloat16* norm_weight,
     float* normalized,
     int branches,
-    int hidden) {
+    int hidden,
+    int rows) {
     const int branch = (int)blockIdx.x;
-    if (branch >= branches) return;
+    const int row = (int)blockIdx.y;
+    if (branch >= branches || row >= rows) return;
     const int tid = (int)threadIdx.x;
-    const int offset = branch * hidden;
+    const int offset = (row * branches + branch) * hidden;
+    const int weight_offset = branch * hidden;
     __shared__ float rms_sum[256];
     float partial = 0.0f;
     for (int j = tid; j < hidden; j += (int)blockDim.x) {
@@ -321,7 +445,7 @@ extern "C" __global__ void qwen4_hc_norm_f32(
         const int column = offset + j;
         normalized[column] = __bfloat162float(qwen4_bf16_round(
             __bfloat162float(qwen4_bf16_round(input[column]))
-            * inv * (1.0f + __bfloat162float(norm_weight[column]))));
+            * inv * (1.0f + __bfloat162float(norm_weight[weight_offset + j]))));
     }
 }
 extern "C" __global__ void qwen4_gdn_conv_bf16_f32(
@@ -423,32 +547,35 @@ extern "C" __global__ void qwen4_qsa_norm_rope_f32(
     const __hip_bfloat16* norm,
     int heads,
     int head_dim,
+    int head_stride,
     int position,
     int rotary_dim) {
     int head = (int)blockIdx.x;
     int channel = (int)(blockIdx.y * blockDim.x + threadIdx.x);
-    if (head >= heads || channel >= head_dim) return;
+    if (head >= heads) return;
+    int start = head * head_stride;
+    __shared__ float input_row[256];
+    if (channel < head_dim) {
+        input_row[channel] = values[start + channel];
+    }
+    __syncthreads();
+    if (channel >= head_dim) return;
     float sum = 0.0f;
-    int start = head * head_dim;
     for (int i = 0; i < head_dim; ++i) {
-        float value = values[start + i];
-        sum += value * value;
+        float row_value = input_row[i];
+        sum += row_value * row_value;
     }
     float inv = rsqrtf(sum / (float)head_dim + 1.0e-6f);
-    float value = values[start + channel] * inv
+    float value = input_row[channel] * inv
         * (1.0f + __bfloat162float(norm[channel]));
     if (channel < rotary_dim) {
         int half = rotary_dim / 2;
         int partner = channel < half ? channel + half : channel - half;
-        // Recompute the partner from the immutable input row.  The old
-        // implementation read `values[partner]` after another lane could
-        // already have overwritten it with its normalized value, making the
-        // result scheduling-dependent.
-        float other = values[start + partner] * inv
+        float other = input_row[partner] * inv
             * (1.0f + __bfloat162float(norm[partner]));
         int base = channel < half ? channel : partner;
         float angle = (float)position
-            * powf(1000000.0f, -((float)(2 * base)) / (float)rotary_dim);
+            * powf(10000000.0f, -((float)(2 * base)) / (float)rotary_dim);
         float sine = sinf(angle);
         float cosine = cosf(angle);
         value = channel < half ? value * cosine - other * sine
@@ -517,8 +644,8 @@ extern "C" __global__ void qwen4_qsa_pool_rope_f32(
         : __bfloat162float(norm[channel]);
     float value = __bfloat162float(qwen4_bf16_round(
         __bfloat162float(mean_bf16) * inv * (1.0f + norm_value)));
-    int half = index_dim / 2;
     int rotary_dim = index_dim < 64 ? index_dim : 64;
+    int half = rotary_dim / 2;
     if (channel < rotary_dim) {
         int partner = channel < half ? channel + half : channel - half;
         float other_mean = 0.0f;
@@ -533,8 +660,8 @@ extern "C" __global__ void qwen4_qsa_pool_rope_f32(
         float other = __bfloat162float(qwen4_bf16_round(
             __bfloat162float(other_bf16) * inv * (1.0f + other_norm)));
         float angle = (float)(block * compress)
-            * powf(1000000.0f, -((float)(2 * (channel < half ? channel : partner)))
-                / (float)index_dim);
+            * powf(10000000.0f, -((float)(2 * (channel < half ? channel : partner)))
+                / (float)rotary_dim);
         float sine = sinf(angle);
         float cosine = cosf(angle);
         value = channel < half ? value * cosine - other * sine
@@ -544,10 +671,31 @@ extern "C" __global__ void qwen4_qsa_pool_rope_f32(
         qwen4_bf16_round(value));
 }
 
-// Select complete four-token blocks by the learned index score and append the
-// causal tail. One workgroup owns the current query row; no score is copied to
-// host memory.
-extern "C" __global__ void qwen4_qsa_select_f32(
+// Compute one block score with the original head/dimension traversal. Keeping
+// this as one thread's serial reduction preserves the F32 association and the
+// `fmaxf` NaN/tie behavior while allowing independent blocks to run in parallel.
+static __device__ __forceinline__ float qwen4_qsa_select_score_f32(
+    const float* query,
+    const float* pooled,
+    int block,
+    int index_heads,
+    int index_dim) {
+    float score = 0.0f;
+    for (int head = 0; head < index_heads; ++head) {
+        float dot = 0.0f;
+        for (int d = 0; d < index_dim; ++d) {
+            dot += query[head * index_dim + d]
+                * pooled[block * index_dim + d];
+        }
+        score += fmaxf(dot / sqrtf((float)index_dim), 0.0f);
+    }
+    return score;
+}
+
+// Serial fallback for non-gfx1151 callers or shapes whose score array would
+// exceed the device LDS limit. This is the previous one-thread implementation,
+// including stable ascending-block tie selection and the causal tail.
+extern "C" __global__ void qwen4_qsa_select_f32_serial(
     const float* query,
     const float* pooled,
     int* selected,
@@ -570,21 +718,71 @@ extern "C" __global__ void qwen4_qsa_select_f32(
                 if (selected[prior * compress] == block * compress) used = true;
             }
             if (used) continue;
-            float score = 0.0f;
-            for (int head = 0; head < index_heads; ++head) {
-                float dot = 0.0f;
-                for (int d = 0; d < index_dim; ++d) {
-                    dot += query[head * index_dim + d]
-                        * pooled[block * index_dim + d];
-                }
-                score += fmaxf(dot / sqrtf((float)index_dim), 0.0f);
-            }
+            float score = qwen4_qsa_select_score_f32(
+                query, pooled, block, index_heads, index_dim);
             if (score > best) {
                 best = score;
                 best_block = block;
             }
         }
         if (best_block >= 0) {
+            for (int row = 0; row < compress && slot * compress + row < capacity; ++row) {
+                int token = best_block * compress + row;
+                if (token < visible) selected[slot * compress + row] = token;
+            }
+        }
+    }
+    int tail_start = block_count * compress;
+    int offset = chosen * compress;
+    for (int token = tail_start; token < visible && offset < capacity; ++token) {
+        selected[offset++] = token;
+    }
+}
+
+// Select complete four-token blocks by the learned index score and append the
+// causal tail. One workgroup owns the current query row; independent block
+// scores are staged in dynamic LDS and the stable selection reuses a sentinel
+// in that score array for the old first-slot membership predicate.
+extern "C" __global__ void qwen4_qsa_select_f32(
+    const float* query,
+    const float* pooled,
+    int* selected,
+    int block_count,
+    int index_heads,
+    int index_dim,
+    int budget_blocks,
+    int compress,
+    int visible,
+    int capacity) {
+    if (blockIdx.x != 0) return;
+    extern __shared__ float scores[];
+    int chosen = budget_blocks < block_count ? budget_blocks : block_count;
+    if (chosen > 0) {
+        for (int block = (int)threadIdx.x;
+             block < block_count;
+             block += (int)blockDim.x) {
+            scores[block] = qwen4_qsa_select_score_f32(
+                query, pooled, block, index_heads, index_dim);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    for (int i = 0; i < capacity; ++i) selected[i] = -1;
+    for (int slot = 0; slot < chosen; ++slot) {
+        float best = -3.402823466e+38f;
+        int best_block = -1;
+        for (int block = 0; block < block_count; ++block) {
+            float score = scores[block];
+            if (score == -3.402823466e+38f) continue;
+            if (score > best) {
+                best = score;
+                best_block = block;
+            }
+        }
+        if (best_block >= 0) {
+            if (slot * compress < capacity && best_block * compress < visible) {
+                scores[best_block] = -3.402823466e+38f;
+            }
             for (int row = 0; row < compress && slot * compress + row < capacity; ++row) {
                 int token = best_block * compress + row;
                 if (token < visible) selected[slot * compress + row] = token;
@@ -651,7 +849,10 @@ extern "C" __global__ void qwen4_ple_depthwise_f32(
     next_history[cursor * channels + channel] = input[channel];
 }
 
-extern "C" __global__ void qwen4_qsa_attention_f32(
+// Serial fallback for non-gfx1151 callers or shapes whose score/token rows
+// exceed the device LDS limit. Keep this body identical to the original
+// per-channel implementation so oversized shapes retain the old contract.
+extern "C" __global__ void qwen4_qsa_attention_f32_serial(
     const float* q_with_gate,
     const float* full_keys,
     const float* full_values,
@@ -688,6 +889,63 @@ extern "C" __global__ void qwen4_qsa_attention_f32(
                 * full_keys[token * n_kv_heads * head_dim + kv_head * head_dim + d];
         }
         float weight = expf(score / sqrtf((float)head_dim) - max_score);
+        denominator += weight;
+        numerator += weight * full_values[token * n_kv_heads * head_dim + kv_head * head_dim + channel];
+    }
+    float gate = q_with_gate[head * head_dim * 2 + head_dim + channel];
+    output[head * head_dim + channel] =
+        denominator > 0.0f ? numerator / denominator / (1.0f + expf(-gate)) : 0.0f;
+}
+
+// Compute each selected row's token and normalized Q/K score once per
+// channel tile, then keep the max/weight/numerator scans serial per output
+// channel in the original selected-row order.
+extern "C" __global__ void qwen4_qsa_attention_f32(
+    const float* q_with_gate,
+    const float* full_keys,
+    const float* full_values,
+    const int* selected_indices,
+    float* output,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int selected_len,
+    int full_capacity) {
+    extern __shared__ float row_scores[];
+    int* row_tokens = reinterpret_cast<int*>(row_scores + selected_len);
+    for (int row = (int)threadIdx.x;
+         row < selected_len;
+         row += (int)blockDim.x) {
+        int token = selected_indices[row];
+        row_tokens[row] = token;
+        float score = 0.0f;
+        if (token >= 0 && token < full_capacity) {
+            for (int d = 0; d < head_dim; ++d) {
+                score += q_with_gate[(int)blockIdx.x * head_dim * 2 + d]
+                    * full_keys[token * n_kv_heads * head_dim
+                        + ((int)blockIdx.x / (n_heads / n_kv_heads)) * head_dim + d];
+            }
+            score /= sqrtf((float)head_dim);
+        }
+        row_scores[row] = score;
+    }
+    __syncthreads();
+    int head = (int)blockIdx.x;
+    int channel = (int)(blockIdx.y * blockDim.x + threadIdx.x);
+    if (head >= n_heads || channel >= head_dim) return;
+    int kv_head = head / (n_heads / n_kv_heads);
+    float max_score = -3.402823466e+38f;
+    for (int row = 0; row < selected_len; ++row) {
+        int token = row_tokens[row];
+        if (token < 0 || token >= full_capacity) continue;
+        max_score = fmaxf(max_score, row_scores[row]);
+    }
+    float denominator = 0.0f;
+    float numerator = 0.0f;
+    for (int row = 0; row < selected_len; ++row) {
+        int token = row_tokens[row];
+        if (token < 0 || token >= full_capacity) continue;
+        float weight = expf(row_scores[row] - max_score);
         denominator += weight;
         numerator += weight * full_values[token * n_kv_heads * head_dim + kv_head * head_dim + channel];
     }

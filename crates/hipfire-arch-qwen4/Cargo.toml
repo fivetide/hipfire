@@ -12,5 +12,6 @@ serde_json.workspace = true
 hip-bridge = { path = "../hip-bridge" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 rdna-compute = { path = "../rdna-compute", features = ["deltanet"] }
-hipfire-dispatch = { path = "../hipfire-dispatch" }
+hipfire-dispatch = { path = "../hipfire-dispatch", features = ["deltanet"] }
+smallvec = { version = "1.15.2", features = ["const_generics"] }
 sha2.workspace = true

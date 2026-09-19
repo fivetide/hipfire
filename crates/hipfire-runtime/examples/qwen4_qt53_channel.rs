@@ -14,7 +14,7 @@
 //!   cargo run --release --example qwen4_qt53_channel -p hipfire-runtime
 
 use half::f16;
-use rdna_compute::{DType, Gpu, GpuTensor, gen_fwht_signs};
+use rdna_compute::{gen_fwht_signs, DType, Gpu, GpuTensor};
 
 const QT53_GROUP_BYTES: usize = 68;
 const QT44_GROUP_BYTES: usize = 136;
@@ -81,7 +81,11 @@ fn f16_to_f32(bits: u16) -> f32 {
     } else {
         (1.0 + fraction as f32 / 1024.0) * 2.0f32.powi(exponent as i32 - 15)
     };
-    if sign == 0 { value } else { -value }
+    if sign == 0 {
+        value
+    } else {
+        -value
+    }
 }
 const HFQ4_G128_GROUP_BYTES: usize = 72;
 
@@ -797,6 +801,7 @@ fn grouped_prefill(gpu: &mut Gpu) -> Result<(), String> {
     gpu.moe_down_combine_grouped_top10(
         &grouped_down,
         &inverse,
+        &indices,
         &weights,
         &residual,
         hidden,

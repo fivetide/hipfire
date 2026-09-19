@@ -13,12 +13,12 @@
 use crate::bundle::Qwen4Bundle;
 use crate::config::{LayerType, Qwen4Config};
 use crate::ple_rows::{
-    PLE_ROW_BYTES, PLE_ROWS_PER_TOKEN, PlePrefetch, PleRowLease, PleRows, PleRowsError,
+    PlePrefetch, PleRowLease, PleRows, PleRowsError, PLE_ROWS_PER_TOKEN, PLE_ROW_BYTES,
 };
-use crate::projection::{ProjectionView, dispatch_embedding, dispatch_gemv, row_stride};
-use crate::state::{GdnGpuState, QsaGpuState};
+use crate::projection::{dispatch_embedding, row_stride, ProjectionView};
 use crate::weights::{
-    HyperConnectionWeights, MoeWeights, Qwen4LayerWeights, Qwen4Weights, TensorRef, WeightError,
+    HyperConnectionReadWeights, HyperConnectionWeights, MoeWeights, Qwen4LayerWeights,
+    Qwen4Weights, TensorRef, WeightError,
 };
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::WeightRef;
@@ -26,28 +26,63 @@ use hipfire_dispatch::families::moe::{
     MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoeRecipe, MoeSharedDecode, MoeSharedDtypes,
     MoeSharedWeights, RoutedExpertWeights,
 };
+use hipfire_dispatch::pipeline::qwen4_program::{
+    execute_final_hyper, execute_lm_head, validate_final_hyper, validate_lm_head,
+    Qwen4AttentionWeights, Qwen4GdnState, Qwen4GdnWeights, Qwen4HyperReadWeights,
+    Qwen4HyperWeights, Qwen4LayerDescription, Qwen4LayerOp, Qwen4LayerScratch, Qwen4MoeBinding,
+    Qwen4PleOp, Qwen4PleWeights, Qwen4ProgramDims, Qwen4QsaState, Qwen4QsaWeights,
+    Qwen4ScratchLayout,
+};
 use hipfire_dispatch::pipeline::{
-    BoundMoeExperts, ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources,
-    ExpertTable, Step, execute_steps, seal_decode,
+    execute_steps, seal_decode, BoundMoeExperts, ExpertBindingCache, ExpertMetadata,
+    ExpertResource, ExpertResources, ExpertTable, Step,
 };
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_runtime::weight_manifest::ExpertSourceLayout;
-use rdna_compute::qwen4::{
-    Qwen4Argmax, Qwen4GdnBf16Roundtrip, Qwen4GdnConv, Qwen4GdnGate, Qwen4GdnParams, Qwen4GdnStep,
-    Qwen4HcNorm, Qwen4HcReadProjected, Qwen4HcWrite, Qwen4QsaAttention, Qwen4QsaCacheAppend,
-    Qwen4QsaNormRope, Qwen4QsaPoolRope, Qwen4QsaSelect, Qwen4Scale, qwen4_argmax,
-    qwen4_gdn_bf16_roundtrip, qwen4_gdn_conv, qwen4_gdn_gate, qwen4_gdn_params, qwen4_gdn_step,
-    qwen4_hc_norm, qwen4_hc_read_projected, qwen4_hc_write, qwen4_qsa_attention,
-    qwen4_qsa_cache_append, qwen4_qsa_norm_rope, qwen4_qsa_pool_rope, qwen4_qsa_select,
-    qwen4_scale,
-};
+use rdna_compute::qwen4::{qwen4_argmax, Qwen4Argmax};
 use rdna_compute::{DType, Gpu, GpuTensor};
+use smallvec::SmallVec;
 use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::time::{Duration, Instant};
 
 const EPSILON: f32 = 1.0e-6;
 const PLE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum number of rows resident in the reusable Qwen4 forward scratch.
+///
+/// Public serving calls may receive longer prompts; the forward owner tiles
+/// those requests over this bounded capacity instead of allocating
+/// prompt-sized grouped MoE buffers.
+pub(crate) const QWEN4_PREFILL_CHUNK_CAP: usize = 128;
+const QWEN4_STEP_INLINE_CAPACITY: usize = 49;
+const QWEN4_QSA_INLINE_CAPACITY: usize = 12;
+
+/// Which rows of a batched Qwen4 prefill write language-model logits.
+///
+/// `All` is the public chunk/capture contract.  `Final` keeps the complete
+/// trunk batch but emits only its final row for ordinary autoregressive AR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Qwen4OutputRows {
+    All,
+    Final,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Qwen4OutputPolicy {
+    All,
+    Final,
+    None,
+}
+
+impl Qwen4OutputPolicy {
+    fn requested_rows(self, n: usize) -> Option<usize> {
+        match self {
+            Self::All => Some(n),
+            Self::Final => Some(1),
+            Self::None => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Qwen4ProfileStats {
@@ -200,6 +235,177 @@ fn weight_dims(reference: &TensorRef) -> Result<(usize, usize), Qwen4GpuForwardE
     }
     Ok((reference.shape[0], reference.shape[1]))
 }
+fn dense_ref<'a>(
+    weights: &'a Qwen4Weights,
+    reference: &TensorRef,
+) -> Result<WeightRef<'a>, Qwen4GpuForwardError> {
+    let tensor = weights.resident(reference)?;
+    let (m, k) = weight_dims(reference)?;
+    Ok(WeightRef {
+        buf: tensor,
+        dtype: tensor.dtype,
+        m,
+        k,
+        row_stride: row_stride(tensor.dtype, k),
+        rotation: None,
+        awq_scale: None,
+    })
+}
+
+fn program_dims(config: &Qwen4Config) -> Qwen4ProgramDims {
+    Qwen4ProgramDims {
+        hidden: config.hidden_size,
+        hc_count: config.hc_count,
+        hc_lowrank: config.hc_lowrank,
+        indexer_n_heads: config.indexer_n_heads,
+        indexer_kv_heads: config.indexer_kv_heads,
+        indexer_head_dim: config.indexer_head_dim,
+        indexer_budget: config.indexer_budget,
+        indexer_compress_ratio: config.indexer_compress_ratio,
+        num_attention_heads: config.num_attention_heads,
+        num_key_value_heads: config.num_key_value_heads,
+        head_dim: config.head_dim,
+        linear_num_key_heads: config.linear_num_key_heads,
+        linear_num_value_heads: config.linear_num_value_heads,
+        linear_key_head_dim: config.linear_key_head_dim,
+        linear_value_head_dim: config.linear_value_head_dim,
+        linear_conv_kernel_dim: config.linear_conv_kernel_dim,
+        moe_intermediate: config.moe_intermediate_size,
+        shared_intermediate: config.shared_expert_intermediate_size,
+        num_experts: config.num_experts,
+        experts_per_token: config.num_experts_per_tok,
+        ple_conv_kernel_dim: config.ple_conv_kernel_size,
+        norm_eps: EPSILON,
+    }
+}
+
+fn hyper_read_desc<'a>(
+    weights: &'a Qwen4Weights,
+    hyper: &HyperConnectionReadWeights,
+) -> Result<Qwen4HyperReadWeights<'a>, Qwen4GpuForwardError> {
+    Ok(Qwen4HyperReadWeights {
+        norm: weights.resident(&hyper.hc_norm)?,
+        input_mix_down: dense_ref(weights, &hyper.input_mix_down)?,
+        input_mix_up: dense_ref(weights, &hyper.input_mix_up)?,
+    })
+}
+
+fn hyper_desc<'a>(
+    weights: &'a Qwen4Weights,
+    hyper: &HyperConnectionWeights,
+) -> Result<Qwen4HyperWeights<'a>, Qwen4GpuForwardError> {
+    let norm = weights.resident(&hyper.hc_norm)?;
+    Ok(Qwen4HyperWeights {
+        read: Qwen4HyperReadWeights {
+            norm,
+            input_mix_down: dense_ref(weights, &hyper.input_mix_down)?,
+            input_mix_up: dense_ref(weights, &hyper.input_mix_up)?,
+        },
+        write: hipfire_dispatch::pipeline::qwen4_program::Qwen4HyperWriteWeights {
+            norm,
+            block_inject: dense_ref(weights, &hyper.block_inject)?,
+        },
+    })
+}
+
+fn gdn_desc<'a>(
+    weights: &'a Qwen4Weights,
+    gdn: &crate::weights::GdnWeights,
+) -> Result<Qwen4GdnWeights<'a>, Qwen4GpuForwardError> {
+    Ok(Qwen4GdnWeights {
+        qkv: dense_ref(weights, &gdn.qkv)?,
+        conv: weights.resident(&gdn.conv)?,
+        in_proj_a: dense_ref(weights, &gdn.in_proj_a)?,
+        in_proj_b: dense_ref(weights, &gdn.in_proj_b)?,
+        a_log: weights.resident(&gdn.a_log)?,
+        dt_bias: weights.resident(&gdn.dt_bias)?,
+        z: dense_ref(weights, &gdn.z)?,
+        norm: weights.resident(&gdn.norm)?,
+        output: dense_ref(weights, &gdn.output)?,
+    })
+}
+
+fn qsa_desc<'a>(
+    weights: &'a Qwen4Weights,
+    qsa: &crate::weights::QsaWeights,
+) -> Result<Qwen4QsaWeights<'a>, Qwen4GpuForwardError> {
+    Ok(Qwen4QsaWeights {
+        indexer_qk: dense_ref(weights, &qsa.indexer_qk)?,
+        indexer_q_norm: weights.resident(&qsa.indexer_q_norm)?,
+        indexer_k_norm: weights.resident(&qsa.indexer_k_norm)?,
+        q: dense_ref(weights, &qsa.q)?,
+        k: dense_ref(weights, &qsa.k)?,
+        v: dense_ref(weights, &qsa.v)?,
+        q_norm: weights.resident(&qsa.q_norm)?,
+        k_norm: weights.resident(&qsa.k_norm)?,
+        output: dense_ref(weights, &qsa.output)?,
+    })
+}
+fn ple_desc<'a>(
+    weights: &'a Qwen4Weights,
+    ple: &crate::weights::PleWeights,
+) -> Result<Qwen4PleWeights<'a>, Qwen4GpuForwardError> {
+    Ok(Qwen4PleWeights {
+        key: dense_ref(weights, &ple.key)?,
+        value: dense_ref(weights, &ple.value)?,
+        norm_key: weights.resident(&ple.norm_key)?,
+        norm_query: weights.resident(&ple.norm_query)?,
+        norm_conv: weights.resident(&ple.norm_conv)?,
+        conv: weights.resident(&ple.conv)?,
+    })
+}
+
+fn layer_desc<'a>(
+    weights: &'a Qwen4Weights,
+    layer: &Qwen4LayerWeights,
+    moe: &'a Qwen4MoeLayerRuntime,
+    config: &Qwen4Config,
+) -> Result<Qwen4LayerDescription<'a>, Qwen4GpuForwardError> {
+    let attention = match layer.kind {
+        LayerType::LinearAttention => Qwen4AttentionWeights::Linear(gdn_desc(
+            weights,
+            layer
+                .gdn
+                .as_ref()
+                .ok_or_else(|| invalid("GDN weights missing"))?,
+        )?),
+        LayerType::FullAttention => Qwen4AttentionWeights::Full(qsa_desc(
+            weights,
+            layer
+                .attention
+                .as_ref()
+                .ok_or_else(|| invalid("QSA weights missing"))?,
+        )?),
+    };
+    Ok(Qwen4LayerDescription {
+        attn_hyper: hyper_desc(weights, &layer.attn_hyper)?,
+        mlp_hyper: hyper_desc(weights, &layer.mlp_hyper)?,
+        attention,
+        moe: Qwen4MoeBinding {
+            table: &moe.table,
+            cache: &moe.cache,
+            routed_experts: moe,
+            router: moe.router.dispatch_ref(),
+            shared: MoeSharedWeights {
+                selector: moe.shared_scalar.dispatch_ref(),
+                gate: moe.shared_gate.dispatch_ref(),
+                up: moe.shared_up.dispatch_ref(),
+                down: moe.shared_down.dispatch_ref(),
+            },
+            intermediate: moe
+                .experts
+                .first()
+                .map(|expert| expert.gate_up.m)
+                .unwrap_or_default()
+                / 2,
+            experts_all_gate_up_mq4: moe.experts_all_gate_up_mq4,
+            expert_gate_up_ptrs: &moe.expert_gate_up_ptrs,
+            expert_down_ptrs: &moe.expert_down_ptrs,
+            layer_idx: layer.layer as u16,
+            norm_topk_prob: config.norm_topk_prob,
+        },
+    })
+}
 
 pub(crate) struct Qwen4ExpertView {
     gate_up: ProjectionView,
@@ -234,6 +440,7 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     shared_up: ProjectionView,
     shared_down: ProjectionView,
     experts: Vec<Qwen4ExpertView>,
+    experts_all_gate_up_mq4: bool,
     expert_gate_up_ptrs: GpuTensor,
     expert_down_ptrs: GpuTensor,
 }
@@ -450,6 +657,7 @@ impl Qwen4MoeLayerRuntime {
             shared_gate,
             shared_up,
             shared_down,
+            experts_all_gate_up_mq4: gate_up_dtype == DType::MQ4G256V2,
             experts,
             expert_gate_up_ptrs,
             expert_down_ptrs,
@@ -587,7 +795,7 @@ pub(crate) fn execute_moe(
     qwen4_profile_record(Qwen4ProfilePhase::MoeSeal, seal_started);
     let sealed = sealed_result
         .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("seal Qwen4 MoE: {error:?}")))?;
-    execute_steps(gpu, &ctx, &[Step::Moe(sealed)])
+    execute_steps(gpu, &ctx, &mut [Step::Moe(sealed)])
         .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("execute Qwen4 MoE: {error:?}")))?;
     Ok(())
 }
@@ -648,6 +856,13 @@ pub struct Qwen4GpuForwardScratch {
     pub moe_topk_weights: GpuTensor,
     pub moe_down_expanded: GpuTensor,
     pub moe_scalar: GpuTensor,
+    pub moe_expert_token_counts: GpuTensor,
+    pub moe_expert_offsets: GpuTensor,
+    pub moe_sorted_slot_index: GpuTensor,
+    pub moe_expert_tile_ids: GpuTensor,
+    pub moe_inverse_perm: GpuTensor,
+    pub moe_y_gate_up_grouped: GpuTensor,
+    pub moe_y_down_grouped: GpuTensor,
     pub logits: GpuTensor,
     pub host_token_bytes: Vec<u8>,
     pub host_ple_bytes: Vec<u8>,
@@ -662,29 +877,49 @@ impl Qwen4GpuForwardScratch {
         if max_chunk == 0 {
             return Err(invalid("max_chunk is zero"));
         }
-        let hidden = config.hidden_size;
-        let wide = config.hc_count * hidden;
-        let hc_up = wide
-            .checked_mul(config.hc_lowrank)
-            .ok_or_else(|| invalid("HC up scratch overflow"))?;
-        let q_width = config.num_attention_heads * config.head_dim;
+        let max_chunk = max_chunk.min(QWEN4_PREFILL_CHUNK_CAP);
+        let dims = program_dims(config);
+        let layout = Qwen4ScratchLayout::for_rows(dims, max_chunk)
+            .map_err(|error| invalid(error.to_string()))?;
+        let hidden = layout.hidden;
+        let wide = layout.wide;
+        let q_width = layout.q_width;
         let qsa_qgate = 2 * q_width;
-        let qsa_index =
-            (config.indexer_n_heads + config.indexer_kv_heads) * config.indexer_head_dim;
-        let gdn_qk = config.linear_num_key_heads * config.linear_key_head_dim;
-        let gdn_value = config.linear_num_value_heads * config.linear_value_head_dim;
-        let gdn_qkv = 2 * gdn_qk + gdn_value;
+        let qsa_index = layout.index_width;
+        let gdn_value = layout.gdn_value;
+        let gdn_qkv = layout.gdn_qkv;
         let max_projection = wide.max(qsa_qgate).max(gdn_qkv).max(hidden);
         let max_rotation = wide.max(hidden).max(config.moe_intermediate_size);
         let ple_channels = config.ple_embed_dim * config.hc_count;
-        let max_experts = config.num_experts_per_tok;
-        let max_logits = max_chunk
-            .checked_mul(config.vocab_size)
-            .ok_or_else(|| invalid("logit scratch overflow"))?;
         let max_ple_bytes = max_chunk
             .checked_mul(PLE_ROWS_PER_TOKEN)
             .and_then(|bytes| bytes.checked_mul(PLE_ROW_BYTES))
             .ok_or_else(|| invalid("PLE staging size overflow"))?;
+        let i32_bytes = std::mem::size_of::<i32>();
+        let route_i32_bytes = layout
+            .slots
+            .checked_mul(i32_bytes)
+            .ok_or_else(|| invalid("MoE route index scratch overflow"))?;
+        let expert_i32_bytes = config
+            .num_experts
+            .checked_mul(i32_bytes)
+            .ok_or_else(|| invalid("MoE expert index scratch overflow"))?;
+        let expert_offsets_bytes = config
+            .num_experts
+            .checked_add(1)
+            .and_then(|count| count.checked_mul(i32_bytes))
+            .ok_or_else(|| invalid("MoE expert offset scratch overflow"))?;
+        let grouped_bound = hipfire_dispatch::pipeline::qwen4_program::grouped_m_total_bound(
+            layout.slots,
+            config.num_experts,
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+        let grouped_i32_bytes = grouped_bound
+            .checked_mul(i32_bytes)
+            .ok_or_else(|| invalid("MoE grouped index scratch overflow"))?;
+        let tile_i32_bytes = (grouped_bound / 16)
+            .checked_mul(i32_bytes)
+            .ok_or_else(|| invalid("MoE grouped tile scratch overflow"))?;
         let mut allocated = Vec::new();
         let mut alloc = |shape: &[usize], dtype: DType| -> Result<(), Qwen4GpuForwardError> {
             let tensor = gpu.zeros(shape, dtype)?;
@@ -695,56 +930,96 @@ impl Qwen4GpuForwardScratch {
             alloc(&[max_chunk * std::mem::size_of::<i32>()], DType::Raw)?;
             alloc(&[max_chunk * hidden], DType::F32)?;
             alloc(&[max_chunk * hidden], DType::F32)?;
-            alloc(&[wide], DType::F32)?;
-            alloc(&[wide], DType::F32)?;
-            alloc(&[config.hc_lowrank], DType::F32)?;
-            alloc(&[hc_up], DType::F32)?;
-            alloc(&[hidden], DType::F32)?;
-            alloc(&[config.hc_count], DType::F32)?;
-            alloc(&[max_rotation], DType::F32)?;
-            alloc(&[max_projection], DType::F32)?;
-            alloc(&[max_projection], DType::F32)?;
-            alloc(&[config.linear_num_value_heads], DType::F32)?;
-            alloc(&[config.linear_num_value_heads], DType::F32)?;
-            alloc(&[config.linear_num_value_heads], DType::F32)?;
-            alloc(&[config.linear_num_value_heads], DType::F32)?;
-            alloc(&[gdn_value], DType::F32)?;
+            alloc(&[max_chunk * wide], DType::F32)?;
+            alloc(&[max_chunk * wide], DType::F32)?;
+            alloc(&[max_chunk * config.hc_lowrank], DType::F32)?;
+            alloc(&[max_chunk * wide], DType::F32)?;
+            alloc(&[max_chunk * hidden], DType::F32)?;
+            alloc(&[max_chunk * config.hc_count], DType::F32)?;
+            alloc(&[max_chunk * max_rotation], DType::F32)?;
+            alloc(&[max_chunk * max_projection], DType::F32)?;
+            alloc(&[max_chunk * max_projection], DType::F32)?;
+            alloc(&[max_chunk * config.linear_num_value_heads], DType::F32)?;
+            alloc(&[max_chunk * config.linear_num_value_heads], DType::F32)?;
+            alloc(&[max_chunk * config.linear_num_value_heads], DType::F32)?;
+            alloc(&[max_chunk * config.linear_num_value_heads], DType::F32)?;
+            alloc(&[max_chunk * gdn_value], DType::F32)?;
             alloc(&[gdn_value], DType::BF16)?;
-            alloc(&[gdn_value], DType::F32)?;
-            alloc(&[gdn_value], DType::F32)?;
-            alloc(&[qsa_index], DType::F32)?;
-            alloc(&[qsa_qgate], DType::F32)?;
-            alloc(&[config.num_key_value_heads * config.head_dim], DType::F32)?;
-            alloc(&[config.num_key_value_heads * config.head_dim], DType::F32)?;
-            alloc(&[q_width], DType::F32)?;
-            alloc(&[hidden], DType::F32)?;
+            alloc(&[max_chunk * gdn_value], DType::F32)?;
+            alloc(&[max_chunk * gdn_value], DType::F32)?;
+            alloc(&[max_chunk * qsa_index], DType::F32)?;
+            alloc(&[max_chunk * qsa_qgate], DType::F32)?;
+            alloc(
+                &[max_chunk * config.num_key_value_heads * config.head_dim],
+                DType::F32,
+            )?;
+            alloc(
+                &[max_chunk * config.num_key_value_heads * config.head_dim],
+                DType::F32,
+            )?;
+            alloc(&[max_chunk * q_width], DType::F32)?;
+            alloc(&[max_chunk * hidden], DType::F32)?;
             alloc(
                 &[max_chunk * PLE_ROWS_PER_TOKEN * (PLE_ROW_BYTES / 2)],
                 DType::BF16,
             )?;
             alloc(&[max_chunk * hidden], DType::F32)?;
-            alloc(&[ple_channels], DType::F32)?;
-            alloc(&[hidden], DType::F32)?;
-            alloc(&[ple_channels], DType::F32)?;
-            alloc(&[ple_channels], DType::F32)?;
-            alloc(&[ple_channels], DType::F32)?;
-            alloc(&[ple_channels], DType::F32)?;
-            alloc(&[config.num_experts], DType::F32)?;
-            alloc(&[hidden], DType::F32)?;
-            alloc(&[2 * config.moe_intermediate_size], DType::F32)?;
-            alloc(&[config.moe_intermediate_size], DType::F32)?;
-            alloc(&[config.moe_intermediate_size], DType::F32)?;
-            alloc(&[config.shared_expert_intermediate_size], DType::F32)?;
-            alloc(&[hidden], DType::F32)?;
-            alloc(&[hidden], DType::F32)?;
-            alloc(&[max_experts * config.moe_intermediate_size], DType::F32)?;
-            alloc(&[max_experts * config.moe_intermediate_size], DType::F32)?;
-            alloc(&[max_experts * config.moe_intermediate_size], DType::F32)?;
-            alloc(&[max_experts], DType::F32)?;
-            alloc(&[max_experts], DType::F32)?;
-            alloc(&[max_experts * hidden + hidden.div_ceil(4)], DType::F32)?;
-            alloc(&[config.shared_expert_intermediate_size.max(1)], DType::F32)?;
-            alloc(&[max_logits], DType::F32)?;
+            alloc(&[max_chunk * ple_channels], DType::F32)?;
+            alloc(&[max_chunk * hidden], DType::F32)?;
+            alloc(&[max_chunk * ple_channels], DType::F32)?;
+            alloc(&[max_chunk * ple_channels], DType::F32)?;
+            alloc(&[max_chunk * ple_channels], DType::F32)?;
+            alloc(&[max_chunk * ple_channels], DType::F32)?;
+            alloc(&[max_chunk * config.num_experts], DType::F32)?;
+            alloc(&[max_chunk * hidden], DType::F32)?;
+            alloc(&[max_chunk * 2 * config.moe_intermediate_size], DType::F32)?;
+            alloc(
+                &[max_chunk * config.shared_expert_intermediate_size],
+                DType::F32,
+            )?;
+            alloc(
+                &[max_chunk * config.shared_expert_intermediate_size],
+                DType::F32,
+            )?;
+            alloc(
+                &[max_chunk * config.shared_expert_intermediate_size],
+                DType::F32,
+            )?;
+            alloc(&[max_chunk * hidden], DType::F32)?;
+            alloc(&[max_chunk * hidden], DType::F32)?;
+            alloc(
+                &[max_chunk * config.num_experts_per_tok * config.moe_intermediate_size],
+                DType::F32,
+            )?;
+            alloc(
+                &[max_chunk * config.num_experts_per_tok * config.moe_intermediate_size],
+                DType::F32,
+            )?;
+            alloc(
+                &[max_chunk * config.num_experts_per_tok * config.moe_intermediate_size],
+                DType::F32,
+            )?;
+            alloc(&[route_i32_bytes], DType::Raw)?;
+            alloc(&[max_chunk * config.num_experts_per_tok], DType::F32)?;
+            alloc(
+                &[max_chunk * config.num_experts_per_tok * hidden],
+                DType::F32,
+            )?;
+            alloc(
+                &[max_chunk * config.shared_expert_intermediate_size],
+                DType::F32,
+            )?;
+            alloc(&[expert_i32_bytes], DType::Raw)?;
+            alloc(&[expert_offsets_bytes], DType::Raw)?;
+            alloc(&[grouped_i32_bytes], DType::Raw)?;
+            alloc(&[tile_i32_bytes], DType::Raw)?;
+            alloc(&[route_i32_bytes], DType::Raw)?;
+            alloc(
+                &[grouped_bound * 2 * config.moe_intermediate_size],
+                DType::F32,
+            )?;
+            alloc(&[grouped_bound * hidden], DType::F32)?;
+            alloc(&[config.vocab_size], DType::F32)?;
             Ok::<(), Qwen4GpuForwardError>(())
         })();
         if let Err(error) = result {
@@ -805,6 +1080,13 @@ impl Qwen4GpuForwardScratch {
             moe_topk_weights: next(),
             moe_down_expanded: next(),
             moe_scalar: next(),
+            moe_expert_token_counts: next(),
+            moe_expert_offsets: next(),
+            moe_sorted_slot_index: next(),
+            moe_expert_tile_ids: next(),
+            moe_inverse_perm: next(),
+            moe_y_gate_up_grouped: next(),
+            moe_y_down_grouped: next(),
             logits: next(),
             host_token_bytes: vec![0; max_chunk * std::mem::size_of::<i32>()],
             host_ple_bytes: vec![0; max_ple_bytes],
@@ -862,6 +1144,13 @@ impl Qwen4GpuForwardScratch {
             self.moe_topk_weights,
             self.moe_down_expanded,
             self.moe_scalar,
+            self.moe_expert_token_counts,
+            self.moe_expert_offsets,
+            self.moe_sorted_slot_index,
+            self.moe_expert_tile_ids,
+            self.moe_inverse_perm,
+            self.moe_y_gate_up_grouped,
+            self.moe_y_down_grouped,
             self.logits,
         ];
         let mut first = None;
@@ -873,6 +1162,55 @@ impl Qwen4GpuForwardScratch {
             }
         }
         first
+    }
+}
+
+fn layer_scratch<'a>(scratch: &'a Qwen4GpuForwardScratch) -> Qwen4LayerScratch<'a> {
+    Qwen4LayerScratch {
+        streams: &scratch.streams,
+        hc_normalized: &scratch.hc_normalized,
+        hc_low: &scratch.hc_low,
+        hc_up: &scratch.hc_up,
+        hc_mixed: &scratch.hc_mixed,
+        hc_gates: &scratch.hc_gates,
+        projection: &scratch.projection,
+        projection2: &scratch.projection2,
+        gdn_a: &scratch.gdn_a,
+        gdn_b: &scratch.gdn_b,
+        gdn_gate: &scratch.gdn_gate,
+        gdn_beta: &scratch.gdn_beta,
+        gdn_recurrent_output: &scratch.gdn_recurrent_output,
+        gdn_bf16: &scratch.gdn_bf16,
+        gdn_z: &scratch.gdn_z,
+        gdn_output: &scratch.gdn_output,
+        qsa_index: &scratch.qsa_index,
+        qsa_qgate: &scratch.qsa_qgate,
+        qsa_k: &scratch.qsa_k,
+        qsa_v: &scratch.qsa_v,
+        qsa_output: &scratch.qsa_output,
+        attention_output: &scratch.attention_output,
+        moe_output: &scratch.moe_output,
+        moe_shared_output: &scratch.moe_shared_output,
+        moe_router_logits: &scratch.router_logits,
+        moe_x_rot: &scratch.moe_x_rot,
+        moe_gate_up: &scratch.moe_gate_up,
+        moe_scalar: &scratch.moe_scalar,
+        moe_gate: &scratch.moe_gate,
+        moe_up: &scratch.moe_up,
+        moe_hidden: &scratch.moe_hidden,
+        moe_gate_batch: &scratch.moe_gate_batch,
+        moe_up_batch: &scratch.moe_up_batch,
+        moe_rot_batch: &scratch.moe_rot_batch,
+        moe_topk_indices: &scratch.moe_topk_indices,
+        moe_topk_weights: &scratch.moe_topk_weights,
+        moe_down_expanded: &scratch.moe_down_expanded,
+        moe_expert_token_counts: &scratch.moe_expert_token_counts,
+        moe_expert_offsets: &scratch.moe_expert_offsets,
+        moe_sorted_slot_index: &scratch.moe_sorted_slot_index,
+        moe_expert_tile_ids: &scratch.moe_expert_tile_ids,
+        moe_inverse_perm: &scratch.moe_inverse_perm,
+        moe_y_gate_up_grouped: &scratch.moe_y_gate_up_grouped,
+        moe_y_down_grouped: &scratch.moe_y_down_grouped,
     }
 }
 
@@ -1019,6 +1357,107 @@ impl Qwen4GpuForward {
         first.map_or(Ok(()), Err)
     }
 
+    fn validate_request(
+        &self,
+        bundle: &Qwen4Bundle,
+        tokens: &[u32],
+        logits: &GpuTensor,
+        top1: Option<&GpuTensor>,
+        wide_hidden_capture: Option<&GpuTensor>,
+        output_rows: Qwen4OutputRows,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        if tokens.is_empty() {
+            return Err(invalid("Qwen4 forward cannot process an empty token slice"));
+        }
+        let config = &bundle.config;
+        let end_position = bundle
+            .state
+            .position
+            .checked_add(tokens.len())
+            .ok_or_else(|| invalid("Qwen4 forward position overflows"))?;
+        if end_position > bundle.state.max_seq_len {
+            return Err(invalid(format!(
+                "Qwen4 forward end position {end_position} exceeds context capacity {}",
+                bundle.state.max_seq_len
+            )));
+        }
+        if tokens
+            .iter()
+            .copied()
+            .any(|token| (token as usize) >= config.vocab_size)
+        {
+            return Err(invalid(
+                "Qwen4 token id is outside the embedding vocabulary",
+            ));
+        }
+        let requested_rows = match output_rows {
+            Qwen4OutputRows::All => tokens.len(),
+            Qwen4OutputRows::Final => 1,
+        };
+        let expected_logits = requested_rows
+            .checked_mul(config.vocab_size)
+            .ok_or_else(|| invalid("Qwen4 logits shape overflows"))?;
+        if logits.dtype != DType::F32 || logits.numel() != expected_logits {
+            return Err(invalid(format!(
+                "logits must be F32 with {expected_logits} elements for {output_rows:?} output"
+            )));
+        }
+        if let Some(top1) = top1 {
+            let expected = requested_rows
+                .checked_mul(std::mem::size_of::<i32>())
+                .ok_or_else(|| invalid("Qwen4 top1 shape overflows"))?;
+            if top1.dtype != DType::Raw || top1.buf.size() < expected {
+                return Err(invalid(
+                    "top1 output must be Raw with one i32 per requested output row",
+                ));
+            }
+        }
+        if let Some(capture) = wide_hidden_capture {
+            let expected = tokens
+                .len()
+                .checked_mul(program_dims(config).wide())
+                .ok_or_else(|| invalid("Qwen4 wide hidden capture shape overflows"))?;
+            if capture.dtype != DType::F32 || capture.numel() < expected {
+                return Err(invalid(format!(
+                    "wide hidden capture must be F32 with at least {expected} elements"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn preflight_output_resources(
+        &self,
+        bundle: &Qwen4Bundle,
+        rows: usize,
+        logits: &GpuTensor,
+        requested_rows: usize,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        let config = &bundle.config;
+        let dims = program_dims(config);
+        let final_hyper = hyper_read_desc(&bundle.weights, &bundle.weights.root.final_hyper)?;
+        let lm_head = dense_ref(&bundle.weights, &bundle.weights.root.lm_head)?;
+        let preflight_scratch = layer_scratch(&self.scratch);
+        validate_final_hyper(
+            dims,
+            &final_hyper,
+            &self.scratch.streams,
+            &preflight_scratch,
+            rows,
+        )
+        .map_err(|error| {
+            Qwen4GpuForwardError::Dispatch(format!("validate Qwen4 final hyper: {error:?}"))
+        })?;
+        let hidden_elements = rows
+            .checked_mul(config.hidden_size)
+            .ok_or_else(|| invalid("Qwen4 final hidden shape overflows"))?;
+        let final_hidden = view(&self.scratch.hc_mixed, 0, hidden_elements);
+        validate_lm_head(&lm_head, &final_hidden, logits, rows, requested_rows).map_err(
+            |error| Qwen4GpuForwardError::Dispatch(format!("validate Qwen4 LM head: {error:?}")),
+        )?;
+        Ok(())
+    }
+
     pub fn forward_token(
         &mut self,
         bundle: &mut Qwen4Bundle,
@@ -1034,6 +1473,7 @@ impl Qwen4GpuForward {
             logits,
             top1,
             None,
+            Qwen4OutputPolicy::Final,
         )
     }
 
@@ -1053,6 +1493,7 @@ impl Qwen4GpuForward {
             logits,
             top1,
             Some(wide_hidden),
+            Qwen4OutputPolicy::Final,
         )
     }
 
@@ -1064,7 +1505,91 @@ impl Qwen4GpuForward {
         logits: &GpuTensor,
         top1: Option<&GpuTensor>,
     ) -> Result<(), Qwen4GpuForwardError> {
-        self.forward_chunk_inner(bundle, gpu, tokens, logits, top1, None)
+        self.validate_request(bundle, tokens, logits, top1, None, Qwen4OutputRows::All)?;
+        let vocab = bundle.config.vocab_size;
+        let max_chunk = self.scratch.max_chunk;
+        let first_rows = tokens.len().min(max_chunk);
+        let first_logits = logits.sub_offset(0, first_rows * vocab);
+        self.preflight_output_resources(bundle, first_rows, &first_logits, first_rows)?;
+        let mut offset = 0usize;
+        while offset < tokens.len() {
+            let rows = (tokens.len() - offset).min(max_chunk);
+            let logits_offset = offset
+                .checked_mul(vocab)
+                .ok_or_else(|| invalid("Qwen4 chunk logits offset overflows"))?;
+            let logits_len = rows
+                .checked_mul(vocab)
+                .ok_or_else(|| invalid("Qwen4 chunk logits shape overflows"))?;
+            let logits_chunk = logits.sub_offset(logits_offset, logits_len);
+            let top1_chunk = top1.map(|destination| {
+                destination.sub_offset(
+                    offset * std::mem::size_of::<i32>(),
+                    rows * std::mem::size_of::<i32>(),
+                )
+            });
+            self.forward_chunk_inner(
+                bundle,
+                gpu,
+                &tokens[offset..offset + rows],
+                &logits_chunk,
+                top1_chunk.as_ref(),
+                None,
+                Qwen4OutputPolicy::All,
+            )?;
+            offset = offset
+                .checked_add(rows)
+                .ok_or_else(|| invalid("Qwen4 chunk offset overflows"))?;
+        }
+        Ok(())
+    }
+
+    /// Run a prompt through the shared trunk while writing only the final
+    /// language-model row.  Longer prompts are tiled over the bounded
+    /// forward scratch; intermediate tiles commit recurrent/cache state but
+    /// skip the final HC and LM head entirely.
+    pub fn forward_chunk_final(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        logits: &GpuTensor,
+        top1: Option<&GpuTensor>,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        self.validate_request(bundle, tokens, logits, top1, None, Qwen4OutputRows::Final)?;
+        let max_chunk = self.scratch.max_chunk;
+        let final_rows = {
+            let remainder = tokens.len() % max_chunk;
+            if remainder == 0 {
+                max_chunk
+            } else {
+                remainder
+            }
+        };
+        self.preflight_output_resources(bundle, final_rows, logits, 1)?;
+        let mut offset = 0usize;
+        while offset < tokens.len() {
+            let rows = (tokens.len() - offset).min(max_chunk);
+            let is_final = offset
+                .checked_add(rows)
+                .is_some_and(|end| end == tokens.len());
+            self.forward_chunk_inner(
+                bundle,
+                gpu,
+                &tokens[offset..offset + rows],
+                logits,
+                if is_final { top1 } else { None },
+                None,
+                if is_final {
+                    Qwen4OutputPolicy::Final
+                } else {
+                    Qwen4OutputPolicy::None
+                },
+            )?;
+            offset = offset
+                .checked_add(rows)
+                .ok_or_else(|| invalid("Qwen4 final chunk offset overflows"))?;
+        }
+        Ok(())
     }
 
     pub(crate) fn forward_chunk_with_wide_hidden(
@@ -1076,7 +1601,57 @@ impl Qwen4GpuForward {
         top1: Option<&GpuTensor>,
         wide_hidden: &GpuTensor,
     ) -> Result<(), Qwen4GpuForwardError> {
-        self.forward_chunk_inner(bundle, gpu, tokens, logits, top1, Some(wide_hidden))
+        self.validate_request(
+            bundle,
+            tokens,
+            logits,
+            top1,
+            Some(wide_hidden),
+            Qwen4OutputRows::All,
+        )?;
+        let vocab = bundle.config.vocab_size;
+        let wide = program_dims(&bundle.config).wide();
+        let max_chunk = self.scratch.max_chunk;
+        let first_rows = tokens.len().min(max_chunk);
+        let first_logits = logits.sub_offset(0, first_rows * vocab);
+        self.preflight_output_resources(bundle, first_rows, &first_logits, first_rows)?;
+        let mut offset = 0usize;
+        while offset < tokens.len() {
+            let rows = (tokens.len() - offset).min(max_chunk);
+            let logits_offset = offset
+                .checked_mul(vocab)
+                .ok_or_else(|| invalid("Qwen4 capture logits offset overflows"))?;
+            let logits_len = rows
+                .checked_mul(vocab)
+                .ok_or_else(|| invalid("Qwen4 capture logits shape overflows"))?;
+            let logits_chunk = logits.sub_offset(logits_offset, logits_len);
+            let top1_chunk = top1.map(|destination| {
+                destination.sub_offset(
+                    offset * std::mem::size_of::<i32>(),
+                    rows * std::mem::size_of::<i32>(),
+                )
+            });
+            let capture_offset = offset
+                .checked_mul(wide)
+                .ok_or_else(|| invalid("Qwen4 wide capture offset overflows"))?;
+            let capture_len = rows
+                .checked_mul(wide)
+                .ok_or_else(|| invalid("Qwen4 wide capture shape overflows"))?;
+            let capture_chunk = wide_hidden.sub_offset(capture_offset, capture_len);
+            self.forward_chunk_inner(
+                bundle,
+                gpu,
+                &tokens[offset..offset + rows],
+                &logits_chunk,
+                top1_chunk.as_ref(),
+                Some(&capture_chunk),
+                Qwen4OutputPolicy::All,
+            )?;
+            offset = offset
+                .checked_add(rows)
+                .ok_or_else(|| invalid("Qwen4 capture chunk offset overflows"))?;
+        }
+        Ok(())
     }
 
     fn forward_chunk_inner(
@@ -1087,6 +1662,7 @@ impl Qwen4GpuForward {
         logits: &GpuTensor,
         top1: Option<&GpuTensor>,
         wide_hidden_capture: Option<&GpuTensor>,
+        output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
         let n = tokens.len();
         if n == 0 || n > self.scratch.max_chunk {
@@ -1095,23 +1671,54 @@ impl Qwen4GpuForward {
                 self.scratch.max_chunk
             )));
         }
-        let expected_logits = n
-            .checked_mul(bundle.config.vocab_size)
-            .ok_or_else(|| invalid("logit shape overflow"))?;
-        if logits.dtype != DType::F32 || logits.numel() != expected_logits {
+        let config = bundle.config.clone();
+        let end_position = bundle
+            .state
+            .position
+            .checked_add(n)
+            .ok_or_else(|| invalid("Qwen4 forward position overflows"))?;
+        if end_position > bundle.state.max_seq_len {
             return Err(invalid(format!(
-                "logits must be F32 with {expected_logits} elements"
+                "Qwen4 forward end position {end_position} exceeds context capacity {}",
+                bundle.state.max_seq_len
             )));
         }
-        if let Some(top1) = top1 {
-            if top1.dtype != DType::Raw || top1.buf.size() < n * std::mem::size_of::<i32>() {
-                return Err(invalid("top1 output must be Raw with one i32 per token"));
+        if tokens
+            .iter()
+            .copied()
+            .any(|token| (token as usize) >= config.vocab_size)
+        {
+            return Err(invalid(
+                "Qwen4 token id is outside the embedding vocabulary",
+            ));
+        }
+        let dims = program_dims(&config);
+        let requested_rows = output_policy.requested_rows(n);
+        if let Some(requested_rows) = requested_rows {
+            let expected_logits = requested_rows
+                .checked_mul(config.vocab_size)
+                .ok_or_else(|| invalid("logit shape overflow"))?;
+            if logits.dtype != DType::F32 || logits.numel() != expected_logits {
+                return Err(invalid(format!(
+                    "logits must be F32 with {expected_logits} elements for {output_policy:?} output"
+                )));
             }
+            if let Some(top1) = top1 {
+                let expected = requested_rows
+                    .checked_mul(std::mem::size_of::<i32>())
+                    .ok_or_else(|| invalid("top1 shape overflow"))?;
+                if top1.dtype != DType::Raw || top1.buf.size() < expected {
+                    return Err(invalid(
+                        "top1 output must be Raw with one i32 per requested output row",
+                    ));
+                }
+            }
+        } else if top1.is_some() {
+            return Err(invalid("Qwen4 discarded output cannot receive top1 rows"));
         }
         if let Some(capture) = wide_hidden_capture.as_ref() {
             let expected = n
-                .checked_mul(bundle.config.hc_count)
-                .and_then(|v| v.checked_mul(bundle.config.hidden_size))
+                .checked_mul(dims.wide())
                 .ok_or_else(|| invalid("wide hidden capture shape overflow"))?;
             if capture.dtype != DType::F32 || capture.numel() < expected {
                 return Err(invalid(format!(
@@ -1119,7 +1726,56 @@ impl Qwen4GpuForward {
                 )));
             }
         }
-        let config = bundle.config.clone();
+        let ple_layer_index = config
+            .ple_layer_ids
+            .first()
+            .and_then(|id| id.checked_sub(1))
+            .ok_or_else(|| invalid("PLE layer id missing"))?;
+        if ple_layer_index >= config.num_hidden_layers {
+            return Err(invalid("PLE layer id is outside the trunk"));
+        }
+        let final_hyper = if requested_rows.is_some() {
+            Some(hyper_read_desc(
+                &bundle.weights,
+                &bundle.weights.root.final_hyper,
+            )?)
+        } else {
+            None
+        };
+        let lm_head = if requested_rows.is_some() {
+            Some(dense_ref(&bundle.weights, &bundle.weights.root.lm_head)?)
+        } else {
+            None
+        };
+        if let Some(requested_rows) = requested_rows {
+            let final_hyper = final_hyper
+                .as_ref()
+                .ok_or_else(|| invalid("Qwen4 final hyper preflight disappeared"))?;
+            let lm_head = lm_head
+                .as_ref()
+                .ok_or_else(|| invalid("Qwen4 LM head preflight disappeared"))?;
+            let preflight_scratch = layer_scratch(&self.scratch);
+            validate_final_hyper(
+                dims,
+                final_hyper,
+                &self.scratch.streams,
+                &preflight_scratch,
+                n,
+            )
+            .map_err(|error| {
+                Qwen4GpuForwardError::Dispatch(format!("validate Qwen4 final hyper: {error:?}"))
+            })?;
+            let hidden_elements = n
+                .checked_mul(config.hidden_size)
+                .ok_or_else(|| invalid("Qwen4 final hidden shape overflow"))?;
+            let final_hidden = view(&self.scratch.hc_mixed, 0, hidden_elements);
+            validate_lm_head(lm_head, &final_hidden, logits, n, requested_rows).map_err(
+                |error| {
+                    Qwen4GpuForwardError::Dispatch(format!("validate Qwen4 LM head: {error:?}"))
+                },
+            )?;
+        }
+
         for (index, token) in tokens.iter().copied().enumerate() {
             let bytes = &mut self.scratch.host_token_bytes[index * 4..index * 4 + 4];
             bytes.copy_from_slice(&(token as i32).to_ne_bytes());
@@ -1162,237 +1818,255 @@ impl Qwen4GpuForward {
                 .prefetch_before_layer0(ple_epoch, next_history, tokens)
                 .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
             ple.install_ticket(ticket);
-            let mut next_history = next_history;
-            let mut next_position = next_position;
             let ple_rows = view(&self.scratch.ple_rows, 0, n * config.hidden_size);
             let staged = view(
                 &self.scratch.ple_staged,
                 0,
                 n * PLE_ROWS_PER_TOKEN * (PLE_ROW_BYTES / 2),
             );
-            for (token_index, _) in tokens.iter().enumerate() {
-                // These are indices into the layer-type-specific state vectors,
-                // not global chunk counters.  Every token starts at its first
-                // GDN/QSA state slot; the device state itself carries time.
-                let mut gdn_slot = 0usize;
-                let mut qsa_slot = 0usize;
-                let embedding_row = f32_view(
-                    &embeddings,
-                    token_index * config.hidden_size,
-                    config.hidden_size,
-                );
-                let streams = &self.scratch.streams;
-                for branch in 0..config.hc_count {
-                    gpu.memcpy_dtod_at_auto(
-                        &streams.buf,
-                        branch * config.hidden_size * 4,
-                        &embedding_row.buf,
-                        0,
-                        config.hidden_size * 4,
-                    )?;
-                }
-                for layer_index in 0..config.num_hidden_layers {
-                    if layer_index
-                        == config
-                            .ple_layer_ids
-                            .first()
-                            .and_then(|id| id.checked_sub(1))
-                            .unwrap_or(usize::MAX)
-                    {
-                        if ple.lease.is_none() {
-                            let ticket = ple.ticket.as_ref().ok_or_else(|| {
-                                invalid("PLE layer reached without a prefetch ticket")
-                            })?;
-                            let wait_started = qwen4_profile_start();
-                            let lease_result = ple.rows.consume_at_layer1(ticket);
-                            qwen4_profile_record(Qwen4ProfilePhase::PleWait, wait_started);
-                            let lease = lease_result
-                                .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
-                            ple.install_lease(lease);
-                            let lease = ple.lease.as_ref().ok_or_else(|| {
-                                invalid("PLE lease disappeared after consumption")
-                            })?;
-                            let upload_len = lease
-                                .as_bytes()
-                                .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?
-                                .len();
-                            let stage_started = qwen4_profile_start();
-                            let stage_result =
-                                lease.stage_into(&mut self.scratch.host_ple_bytes[..upload_len]);
-                            qwen4_profile_record(Qwen4ProfilePhase::PleStage, stage_started);
-                            stage_result
-                                .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
-                            let upload_started = qwen4_profile_start();
-                            let upload_result = gpu.memcpy_htod_auto(
-                                &staged.buf,
-                                &self.scratch.host_ple_bytes[..upload_len],
-                            );
-                            qwen4_profile_record(Qwen4ProfilePhase::PleUpload, upload_started);
-                            upload_result?;
-                            lease
-                                .validate_after_upload()
-                                .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
-                            let apply_started = qwen4_profile_start();
-                            let apply_result = (|| {
-                                gpu.qwen4_ple_gather_convert_bf16(&staged, &ple_rows, n)?;
-                                self.apply_ple(
-                                    gpu,
-                                    &config,
-                                    &bundle.weights,
-                                    &mut bundle.state.ple_conv,
-                                    &ple_rows,
-                                    token_index,
-                                )
-                            })();
-                            qwen4_profile_record(Qwen4ProfilePhase::PleApply, apply_started);
-                            apply_result?;
-                        }
+
+            // Expand the embedding batch into the row-major stream basis with
+            // one broadcast kernel.  The shared HC program consumes
+            // [row, branch, hidden], so a launch-per-row/branch memcpy loop is
+            // both unnecessary and visible in short AR prefill profiles.
+            let wide = dims.wide();
+            gpu.hc_streams_init_from_embed_batched(
+                &embeddings,
+                &self.scratch.streams,
+                config.hidden_size as i32,
+                config.hc_count as i32,
+                n as i32,
+            )?;
+
+            if ple.lease.is_none() {
+                let ticket = ple
+                    .ticket
+                    .as_ref()
+                    .ok_or_else(|| invalid("PLE layer reached without a prefetch ticket"))?;
+                let wait_started = qwen4_profile_start();
+                let lease_result = ple.rows.consume_at_layer1(ticket);
+                qwen4_profile_record(Qwen4ProfilePhase::PleWait, wait_started);
+                let lease =
+                    lease_result.map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
+                ple.install_lease(lease);
+                let lease = ple
+                    .lease
+                    .as_ref()
+                    .ok_or_else(|| invalid("PLE lease disappeared after consumption"))?;
+                let upload_len = lease
+                    .as_bytes()
+                    .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?
+                    .len();
+                let stage_started = qwen4_profile_start();
+                let stage_result = lease.stage_into(&mut self.scratch.host_ple_bytes[..upload_len]);
+                qwen4_profile_record(Qwen4ProfilePhase::PleStage, stage_started);
+                stage_result.map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
+                let upload_started = qwen4_profile_start();
+                let upload_result =
+                    gpu.memcpy_htod_auto(&staged.buf, &self.scratch.host_ple_bytes[..upload_len]);
+                qwen4_profile_record(Qwen4ProfilePhase::PleUpload, upload_started);
+                upload_result?;
+                lease
+                    .validate_after_upload()
+                    .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
+                let apply_started = qwen4_profile_start();
+                gpu.qwen4_ple_gather_convert_bf16(&staged, &ple_rows, n)?;
+                qwen4_profile_record(Qwen4ProfilePhase::PleApply, apply_started);
+            }
+
+            let scratch_desc = layer_scratch(&self.scratch);
+            let expected_step_count = config
+                .num_hidden_layers
+                .checked_add(1)
+                .ok_or_else(|| invalid("Qwen4 layer program length overflows"))?;
+            if expected_step_count > QWEN4_STEP_INLINE_CAPACITY {
+                return Err(invalid(format!(
+                    "Qwen4 layer program needs {expected_step_count} inline steps, capacity is \
+                     {QWEN4_STEP_INLINE_CAPACITY}"
+                )));
+            }
+            let mut steps: SmallVec<[Step<'_>; QWEN4_STEP_INLINE_CAPACITY]> = SmallVec::new();
+            let mut gdn_slot = 0usize;
+            let mut qsa_slot = 0usize;
+            for layer_index in 0..config.num_hidden_layers {
+                let layer = &bundle.weights.layer_refs[layer_index];
+                if layer_index == ple_layer_index {
+                    let ple_weights = layer
+                        .ple
+                        .as_ref()
+                        .ok_or_else(|| invalid("PLE weights missing"))?;
+                    if steps.len() >= QWEN4_STEP_INLINE_CAPACITY {
+                        return Err(invalid("Qwen4 layer program inline capacity exhausted"));
                     }
-                    let layer = &bundle.weights.layer_refs[layer_index];
-                    self.hc_read(
-                        gpu,
-                        &config,
-                        &bundle.weights,
-                        &layer.attn_hyper,
-                        streams,
-                        &self.scratch.hc_normalized,
-                        &self.scratch.hc_low,
-                        &self.scratch.hc_up,
-                        &self.scratch.hc_mixed,
-                    )?;
-                    let attn_input = &self.scratch.hc_mixed;
-                    let attn_output = match layer.kind {
-                        LayerType::LinearAttention => {
-                            let state = bundle
-                                .state
-                                .gdn_mut(gdn_slot)
-                                .ok_or_else(|| invalid("GDN state slot missing"))?;
-                            let output = &self.scratch.attention_output;
-                            self.apply_gdn(
-                                gpu,
-                                &config,
-                                &bundle.weights,
-                                layer,
-                                state,
-                                next_position,
-                                attn_input,
-                                output,
-                            )?;
-                            gdn_slot += 1;
-                            output
-                        }
-                        LayerType::FullAttention => {
-                            let state = bundle
-                                .state
-                                .qsa_mut(qsa_slot)
-                                .ok_or_else(|| invalid("QSA state slot missing"))?;
-                            let output = &self.scratch.attention_output;
-                            self.apply_qsa(
-                                gpu,
-                                &config,
-                                &bundle.weights,
-                                layer,
-                                state,
-                                attn_input,
-                                output,
-                            )?;
-                            qsa_slot += 1;
-                            output
-                        }
-                    };
-                    self.hc_write(
-                        gpu,
-                        &config,
-                        &bundle.weights,
-                        &layer.attn_hyper,
-                        streams,
-                        &self.scratch.hc_normalized,
-                        attn_output,
-                        streams,
-                    )?;
-                    self.hc_read(
-                        gpu,
-                        &config,
-                        &bundle.weights,
-                        &layer.mlp_hyper,
-                        streams,
-                        &self.scratch.hc_normalized,
-                        &self.scratch.hc_low,
-                        &self.scratch.hc_up,
-                        &self.scratch.hc_mixed,
-                    )?;
-                    self.apply_moe(
-                        gpu,
-                        &config,
-                        layer_index,
-                        &self.moe[layer_index],
-                        &self.scratch.hc_mixed,
-                        &self.scratch.moe_output,
-                    )?;
-                    self.hc_write(
-                        gpu,
-                        &config,
-                        &bundle.weights,
-                        &layer.mlp_hyper,
-                        streams,
-                        &self.scratch.hc_normalized,
-                        &self.scratch.moe_output,
-                        streams,
-                    )?;
+                    steps.push(Step::Qwen4Ple(Qwen4PleOp {
+                        dims,
+                        weights: ple_desc(&bundle.weights, ple_weights)?,
+                        state: &bundle.state.ple_conv,
+                        streams: &self.scratch.streams,
+                        ple_rows: &self.scratch.ple_rows,
+                        query: &self.scratch.ple_query,
+                        key: &self.scratch.ple_key,
+                        value: &self.scratch.ple_value,
+                        gated: &self.scratch.ple_gated,
+                        normed: &self.scratch.ple_normed,
+                        output: &self.scratch.ple_output,
+                        rows: n,
+                    }));
                 }
-                // Capture the post-trunk 4H stream before final HC collapse.
-                // Keep the source borrow immutable and copy into the caller's
-                // model-owned destination; no drafter buffer aliases scratch.
-                if let Some(capture) = wide_hidden_capture.as_ref() {
-                    let width = config.hc_count * config.hidden_size;
-                    let trunk_wide: &GpuTensor = &self.scratch.streams;
-                    let destination = f32_view(capture, token_index * width, width);
-                    gpu.copy_d2d(trunk_wide, &destination, trunk_wide.byte_size())?;
+                let description =
+                    layer_desc(&bundle.weights, layer, &self.moe[layer_index], &config)?;
+                let (state_gdn, state_qsa) = match layer.kind {
+                    LayerType::LinearAttention => {
+                        let state = bundle
+                            .state
+                            .gdn
+                            .get(gdn_slot)
+                            .ok_or_else(|| invalid("GDN state slot missing"))?;
+                        gdn_slot += 1;
+                        (
+                            Some(Qwen4GdnState {
+                                recurrent: &state.recurrent,
+                                conv: &state.conv,
+                            }),
+                            None,
+                        )
+                    }
+                    LayerType::FullAttention => {
+                        let state = bundle
+                            .state
+                            .qsa
+                            .get(qsa_slot)
+                            .ok_or_else(|| invalid("QSA state slot missing"))?;
+                        qsa_slot += 1;
+                        (
+                            None,
+                            Some(Qwen4QsaState {
+                                full_keys: &state.full_keys,
+                                full_values: &state.full_values,
+                                raw_index_keys: &state.raw_index_keys,
+                                pooled_keys: &state.pooled_keys,
+                                selected_indices: &state.selected_indices,
+                                full_capacity: state.full_capacity,
+                                raw_capacity: state.raw_capacity,
+                                pooled_capacity: state.pooled_capacity,
+                                selected_capacity: state.selected_capacity,
+                                position_capacity: state.position_capacity,
+                                full_len: state.full_len,
+                                raw_len: state.raw_len,
+                                pooled_len: state.pooled_len,
+                                selected_len: state.selected_len,
+                                position: state.position,
+                            }),
+                        )
+                    }
+                };
+                if steps.len() >= QWEN4_STEP_INLINE_CAPACITY {
+                    return Err(invalid("Qwen4 layer program inline capacity exhausted"));
                 }
-                let final_hyper = &bundle.weights.root.final_hyper;
-                self.hc_read(
+                steps.push(Step::Qwen4Layer(Qwen4LayerOp {
+                    dims,
+                    layer: description,
+                    state_gdn,
+                    state_qsa,
+                    scratch: &scratch_desc,
+                    rows: n,
+                    start_position: next_position,
+                }));
+            }
+
+            let ctx = DispatchCtx::new(gpu);
+            execute_steps(gpu, &ctx, &mut steps).map_err(|error| {
+                Qwen4GpuForwardError::Dispatch(format!("execute Qwen4 layer program: {error:?}"))
+            })?;
+
+            let mut qsa_commits: SmallVec<
+                [(usize, usize, usize, usize, usize, usize); QWEN4_QSA_INLINE_CAPACITY],
+            > = SmallVec::new();
+            let mut commit_slot = 0usize;
+            for step in &steps {
+                if let Step::Qwen4Layer(op) = step {
+                    if let Some(state) = op.state_qsa.as_ref() {
+                        if qsa_commits.len() >= QWEN4_QSA_INLINE_CAPACITY {
+                            return Err(invalid("Qwen4 QSA commit inline capacity exhausted"));
+                        }
+                        qsa_commits.push((
+                            commit_slot,
+                            state.full_len,
+                            state.raw_len,
+                            state.pooled_len,
+                            state.selected_len,
+                            state.position,
+                        ));
+                        commit_slot += 1;
+                    }
+                }
+            }
+
+            if let Some(capture) = wide_hidden_capture.as_ref() {
+                let wide_elements = n * wide;
+                let source = view(&self.scratch.streams, 0, wide_elements);
+                let destination = f32_view(capture, 0, wide_elements);
+                gpu.copy_d2d(&source, &destination, source.byte_size())?;
+            }
+
+            if let Some(requested_rows) = requested_rows {
+                let final_hyper = final_hyper
+                    .as_ref()
+                    .ok_or_else(|| invalid("Qwen4 final hyper disappeared before execution"))?;
+                let lm_head = lm_head
+                    .as_ref()
+                    .ok_or_else(|| invalid("Qwen4 LM head disappeared before execution"))?;
+                execute_final_hyper(
                     gpu,
-                    &config,
-                    &bundle.weights,
+                    dims,
                     final_hyper,
                     &self.scratch.streams,
-                    &self.scratch.hc_normalized,
-                    &self.scratch.hc_low,
-                    &self.scratch.hc_up,
-                    &self.scratch.hc_mixed,
-                )?;
-                let final_hidden = &self.scratch.hc_mixed;
-                let lm_head = bundle.weights.resident(&bundle.weights.root.lm_head)?;
-                let output_row =
-                    f32_view(logits, token_index * config.vocab_size, config.vocab_size);
-                self.gemv(
-                    gpu,
-                    lm_head,
-                    final_hidden,
-                    &self.scratch.rotation,
-                    &output_row,
-                    config.vocab_size,
-                    config.hidden_size,
-                )?;
-                // Host-visible request state is staged only after this token's
-                // complete device path succeeds.  The next token sees the
-                // staged position while a failed token publishes nothing.
-                next_history.push(tokens[token_index]);
-                next_position = next_position.saturating_add(1);
-            }
-            if let Some(top1) = top1 {
-                qwen4_argmax(
-                    gpu,
-                    &Qwen4Argmax {
-                        logits,
-                        indices: top1,
-                        rows: n,
-                        vocab: config.vocab_size,
+                    &scratch_desc,
+                    n,
+                )
+                .map_err(|error| {
+                    Qwen4GpuForwardError::Dispatch(format!("execute Qwen4 final hyper: {error:?}"))
+                })?;
+                let final_hidden = view(&self.scratch.hc_mixed, 0, n * config.hidden_size);
+                execute_lm_head(gpu, lm_head, &final_hidden, logits, n, requested_rows).map_err(
+                    |error| {
+                        Qwen4GpuForwardError::Dispatch(format!("execute Qwen4 LM head: {error:?}"))
                     },
                 )?;
+
+                if let Some(top1) = top1 {
+                    qwen4_argmax(
+                        gpu,
+                        &Qwen4Argmax {
+                            logits,
+                            indices: top1,
+                            rows: requested_rows,
+                            vocab: config.vocab_size,
+                        },
+                    )?;
+                }
+            }
+
+            drop(steps);
+            for (slot, full_len, raw_len, pooled_len, selected_len, position) in qsa_commits {
+                let state = bundle
+                    .state
+                    .qsa_mut(slot)
+                    .ok_or_else(|| invalid("QSA state slot disappeared"))?;
+                state.full_len = full_len;
+                state.raw_len = raw_len;
+                state.pooled_len = pooled_len;
+                state.selected_len = selected_len;
+                state.position = position;
+            }
+            let mut next_history = next_history;
+            for token in tokens.iter().copied() {
+                next_history.push(token);
             }
             bundle.state.ple_history = next_history;
-            bundle.state.position = next_position;
+            bundle.state.position = next_position
+                .checked_add(n)
+                .ok_or_else(|| invalid("Qwen4 forward position overflows at commit"))?;
             Ok(())
         })();
         match attempt {
@@ -1407,638 +2081,5 @@ impl Qwen4GpuForward {
                 ))),
             },
         }
-    }
-    fn gemv(
-        &self,
-        gpu: &mut Gpu,
-        weight: &GpuTensor,
-        input: &GpuTensor,
-        rotation: &GpuTensor,
-        output: &GpuTensor,
-        m: usize,
-        k: usize,
-    ) -> Result<(), Qwen4GpuForwardError> {
-        dispatch_gemv(gpu, weight, input, rotation, output, m, k)?;
-        Ok(())
-    }
-
-    fn hc_read(
-        &self,
-        gpu: &mut Gpu,
-        config: &Qwen4Config,
-        weights: &Qwen4Weights,
-        hyper: &HyperConnectionWeights,
-        input: &GpuTensor,
-        normalized: &GpuTensor,
-        low: &GpuTensor,
-        up: &GpuTensor,
-        mixed: &GpuTensor,
-    ) -> Result<(), Qwen4GpuForwardError> {
-        let norm = weights.resident(&hyper.hc_norm)?;
-        let down = weights.resident(&hyper.input_mix_down)?;
-        let up_weight = weights.resident(&hyper.input_mix_up)?;
-        qwen4_hc_norm(
-            gpu,
-            &Qwen4HcNorm {
-                input,
-                norm_weight: norm,
-                normalized,
-                branches: config.hc_count,
-                hidden: config.hidden_size,
-            },
-        )?;
-        self.gemv(
-            gpu,
-            down,
-            normalized,
-            &self.scratch.rotation,
-            low,
-            config.hc_lowrank,
-            config.hc_count * config.hidden_size,
-        )?;
-        qwen4_gdn_bf16_roundtrip(
-            gpu,
-            &Qwen4GdnBf16Roundtrip {
-                input: low,
-                scratch: &self.scratch.gdn_bf16,
-                output: low,
-                elements: config.hc_lowrank,
-            },
-        )?;
-        qwen4_scale(
-            gpu,
-            &Qwen4Scale {
-                values: low,
-                scale: 1.0 / config.hc_count as f32,
-            },
-        )?;
-        qwen4_gdn_bf16_roundtrip(
-            gpu,
-            &Qwen4GdnBf16Roundtrip {
-                input: low,
-                scratch: &self.scratch.gdn_bf16,
-                output: low,
-                elements: config.hc_lowrank,
-            },
-        )?;
-        gpu.silu_f32(low, low)?;
-        qwen4_gdn_bf16_roundtrip(
-            gpu,
-            &Qwen4GdnBf16Roundtrip {
-                input: low,
-                scratch: &self.scratch.gdn_bf16,
-                output: low,
-                elements: config.hc_lowrank,
-            },
-        )?;
-        self.gemv(
-            gpu,
-            up_weight,
-            low,
-            &self.scratch.rotation,
-            up,
-            config.hc_count * config.hidden_size,
-            config.hc_lowrank,
-        )?;
-        let projected_up = f32_view(up, 0, config.hc_count * config.hidden_size);
-        qwen4_hc_read_projected(
-            gpu,
-            &Qwen4HcReadProjected {
-                input,
-                norm_weight: norm,
-                up: &projected_up,
-                normalized,
-                mixed,
-                branches: config.hc_count,
-                hidden: config.hidden_size,
-            },
-        )?;
-        Ok(())
-    }
-
-    fn hc_write(
-        &self,
-        gpu: &mut Gpu,
-        config: &Qwen4Config,
-        weights: &Qwen4Weights,
-        hyper: &HyperConnectionWeights,
-        input: &GpuTensor,
-        normalized: &GpuTensor,
-        mixed: &GpuTensor,
-        output: &GpuTensor,
-    ) -> Result<(), Qwen4GpuForwardError> {
-        let norm = weights.resident(&hyper.hc_norm)?;
-        let inject = weights.resident(&hyper.block_inject)?;
-        qwen4_hc_norm(
-            gpu,
-            &Qwen4HcNorm {
-                input,
-                norm_weight: norm,
-                normalized,
-                branches: config.hc_count,
-                hidden: config.hidden_size,
-            },
-        )?;
-        let gates = &self.scratch.hc_gates;
-        self.gemv(
-            gpu,
-            inject,
-            normalized,
-            &self.scratch.rotation,
-            gates,
-            config.hc_count,
-            config.hc_count * config.hidden_size,
-        )?;
-        qwen4_hc_write(
-            gpu,
-            &Qwen4HcWrite {
-                input,
-                normalized,
-                mixed,
-                gates,
-                output,
-                branches: config.hc_count,
-                hidden: config.hidden_size,
-            },
-        )?;
-        Ok(())
-    }
-
-    fn apply_gdn(
-        &self,
-        gpu: &mut Gpu,
-        config: &Qwen4Config,
-        weights: &Qwen4Weights,
-        layer: &Qwen4LayerWeights,
-        state: &mut GdnGpuState,
-        position: usize,
-        input: &GpuTensor,
-        output: &GpuTensor,
-    ) -> Result<(), Qwen4GpuForwardError> {
-        let gdn = layer
-            .gdn
-            .as_ref()
-            .ok_or_else(|| invalid("linear layer has no GDN weights"))?;
-        let qk = config.linear_num_key_heads * config.linear_key_head_dim;
-        let value = config.linear_num_value_heads * config.linear_value_head_dim;
-        let qkv = 2 * qk + value;
-        let projection = view(&self.scratch.projection, 0, qkv);
-        let projection2 = view(&self.scratch.projection2, 0, qkv);
-        let qkv_weight = weights.resident(&gdn.qkv)?;
-        let conv = weights.resident(&gdn.conv)?;
-        self.gemv(
-            gpu,
-            qkv_weight,
-            input,
-            &self.scratch.rotation,
-            &projection,
-            qkv,
-            config.hidden_size,
-        )?;
-        let history_rows = config.linear_conv_kernel_dim.saturating_sub(1);
-        let cursor = if history_rows == 0 {
-            0
-        } else {
-            position % history_rows
-        };
-        qwen4_gdn_conv(
-            gpu,
-            &Qwen4GdnConv {
-                input: &projection,
-                kernel: conv,
-                history: &state.conv,
-                output: &projection2,
-                next_history: &state.conv,
-                channels: qkv,
-                history_rows,
-                kernel_size: config.linear_conv_kernel_dim,
-                cursor,
-            },
-        )?;
-        let a_weight = weights.resident(&gdn.in_proj_a)?;
-        let b_weight = weights.resident(&gdn.in_proj_b)?;
-        self.gemv(
-            gpu,
-            a_weight,
-            input,
-            &self.scratch.rotation,
-            &self.scratch.gdn_a,
-            config.linear_num_value_heads,
-            config.hidden_size,
-        )?;
-        self.gemv(
-            gpu,
-            b_weight,
-            input,
-            &self.scratch.rotation,
-            &self.scratch.gdn_b,
-            config.linear_num_value_heads,
-            config.hidden_size,
-        )?;
-        let a_log = weights.resident(&gdn.a_log)?;
-        let dt_bias = weights.resident(&gdn.dt_bias)?;
-        qwen4_gdn_params(
-            gpu,
-            &Qwen4GdnParams {
-                a: &self.scratch.gdn_a,
-                b: &self.scratch.gdn_b,
-                a_log,
-                dt_bias,
-                gate: &self.scratch.gdn_gate,
-                beta: &self.scratch.gdn_beta,
-            },
-            config.linear_num_value_heads,
-        )?;
-        let q = view(&projection2, 0, qk);
-        let k = view(&projection2, qk, qk);
-        let v = view(&projection2, 2 * qk, value);
-        qwen4_gdn_step(
-            gpu,
-            &Qwen4GdnStep {
-                q: &q,
-                k: &k,
-                v: &v,
-                gate: &self.scratch.gdn_gate,
-                beta: &self.scratch.gdn_beta,
-                state: &state.recurrent,
-                output: &self.scratch.gdn_recurrent_output,
-                key_heads: config.linear_num_key_heads,
-                value_heads: config.linear_num_value_heads,
-                key_dim: config.linear_key_head_dim,
-                value_dim: config.linear_value_head_dim,
-            },
-        )?;
-        qwen4_gdn_bf16_roundtrip(
-            gpu,
-            &Qwen4GdnBf16Roundtrip {
-                input: &self.scratch.gdn_recurrent_output,
-                scratch: &self.scratch.gdn_bf16,
-                output: &self.scratch.gdn_recurrent_output,
-                elements: value,
-            },
-        )?;
-        let z_weight = weights.resident(&gdn.z)?;
-        self.gemv(
-            gpu,
-            z_weight,
-            input,
-            &self.scratch.rotation,
-            &self.scratch.gdn_z,
-            value,
-            config.hidden_size,
-        )?;
-        let norm = weights.resident(&gdn.norm)?;
-        qwen4_gdn_gate(
-            gpu,
-            &Qwen4GdnGate {
-                recurrent_output: &self.scratch.gdn_recurrent_output,
-                z: &self.scratch.gdn_z,
-                norm,
-                output: &self.scratch.gdn_output,
-                value_heads: config.linear_num_value_heads,
-                value_dim: config.linear_value_head_dim,
-            },
-        )?;
-        let out_weight = weights.resident(&gdn.output)?;
-        self.gemv(
-            gpu,
-            out_weight,
-            &self.scratch.gdn_output,
-            &self.scratch.rotation,
-            output,
-            config.hidden_size,
-            value,
-        )?;
-        qwen4_gdn_bf16_roundtrip(
-            gpu,
-            &Qwen4GdnBf16Roundtrip {
-                input: output,
-                scratch: &self.scratch.gdn_bf16,
-                output,
-                elements: config.hidden_size,
-            },
-        )?;
-        Ok(())
-    }
-
-    fn apply_qsa(
-        &self,
-        gpu: &mut Gpu,
-        config: &Qwen4Config,
-        weights: &Qwen4Weights,
-        layer: &Qwen4LayerWeights,
-        state: &mut QsaGpuState,
-        input: &GpuTensor,
-        output: &GpuTensor,
-    ) -> Result<(), Qwen4GpuForwardError> {
-        let qsa = layer
-            .attention
-            .as_ref()
-            .ok_or_else(|| invalid("full layer has no QSA weights"))?;
-        let index_dim = config.indexer_head_dim;
-        let index_q_width = config.indexer_n_heads * index_dim;
-        let index_width = (config.indexer_n_heads + config.indexer_kv_heads) * index_dim;
-        let index_weight = weights.resident(&qsa.indexer_qk)?;
-        self.gemv(
-            gpu,
-            index_weight,
-            input,
-            &self.scratch.rotation,
-            &self.scratch.qsa_index,
-            index_width,
-            config.hidden_size,
-        )?;
-        let index_q = view(&self.scratch.qsa_index, 0, index_q_width);
-        let index_k = view(
-            &self.scratch.qsa_index,
-            index_q_width,
-            config.indexer_kv_heads * index_dim,
-        );
-        let index_q_norm = weights.resident(&qsa.indexer_q_norm)?;
-        let index_k_norm = weights.resident(&qsa.indexer_k_norm)?;
-        qwen4_qsa_norm_rope(
-            gpu,
-            &Qwen4QsaNormRope {
-                values: &index_q,
-                norm: index_q_norm,
-                heads: config.indexer_n_heads,
-                head_dim: index_dim,
-                position: state.position,
-                rotary_dim: index_dim.min(64),
-            },
-        )?;
-        // The source cache stores raw BF16 token keys. Learned key RMSNorm
-        // and RoPE are applied only after block pooling.
-        gpu.bf16_round_trip_f32(&index_k)?;
-        gpu.memcpy_dtod_at_auto(
-            &state.raw_index_keys.buf,
-            state.position * config.indexer_kv_heads * index_dim * 4,
-            &index_k.buf,
-            0,
-            config.indexer_kv_heads * index_dim * 4,
-        )?;
-
-        let q_width = config.num_attention_heads * config.head_dim;
-        let kv_width = config.num_key_value_heads * config.head_dim;
-        let q_weight = weights.resident(&qsa.q)?;
-        let k_weight = weights.resident(&qsa.k)?;
-        let v_weight = weights.resident(&qsa.v)?;
-        self.gemv(
-            gpu,
-            q_weight,
-            input,
-            &self.scratch.rotation,
-            &self.scratch.qsa_qgate,
-            2 * q_width,
-            config.hidden_size,
-        )?;
-        self.gemv(
-            gpu,
-            k_weight,
-            input,
-            &self.scratch.rotation,
-            &self.scratch.qsa_k,
-            kv_width,
-            config.hidden_size,
-        )?;
-        self.gemv(
-            gpu,
-            v_weight,
-            input,
-            &self.scratch.rotation,
-            &self.scratch.qsa_v,
-            kv_width,
-            config.hidden_size,
-        )?;
-        let q_norm = weights.resident(&qsa.q_norm)?;
-        let k_norm = weights.resident(&qsa.k_norm)?;
-        let q_values = view(&self.scratch.qsa_qgate, 0, q_width);
-        qwen4_qsa_norm_rope(
-            gpu,
-            &Qwen4QsaNormRope {
-                values: &q_values,
-                norm: q_norm,
-                heads: config.num_attention_heads,
-                head_dim: config.head_dim,
-                position: state.position,
-                rotary_dim: config.head_dim.min(64),
-            },
-        )?;
-        qwen4_qsa_norm_rope(
-            gpu,
-            &Qwen4QsaNormRope {
-                values: &self.scratch.qsa_k,
-                norm: k_norm,
-                heads: config.num_key_value_heads,
-                head_dim: config.head_dim,
-                position: state.position,
-                rotary_dim: config.head_dim.min(64),
-            },
-        )?;
-        qwen4_qsa_cache_append(
-            gpu,
-            &Qwen4QsaCacheAppend {
-                key: &self.scratch.qsa_k,
-                value: &self.scratch.qsa_v,
-                full_keys: &state.full_keys,
-                full_values: &state.full_values,
-                position: state.position,
-                kv_width,
-            },
-        )?;
-        let visible = state.position + 1;
-        let complete = visible / config.indexer_compress_ratio;
-        if complete > 0 {
-            qwen4_qsa_pool_rope(
-                gpu,
-                &Qwen4QsaPoolRope {
-                    raw_keys: &state.raw_index_keys,
-                    pooled: &state.pooled_keys,
-                    norm: Some(index_k_norm),
-                    block_count: complete,
-                    compress: config.indexer_compress_ratio,
-                    index_dim: config.indexer_kv_heads * index_dim,
-                },
-            )?;
-        }
-        let budget_blocks = config.indexer_budget / config.indexer_compress_ratio;
-        qwen4_qsa_select(
-            gpu,
-            &Qwen4QsaSelect {
-                query: &index_q,
-                pooled: &state.pooled_keys,
-                selected: &state.selected_indices,
-                block_count: complete,
-                index_heads: config.indexer_n_heads,
-                index_dim,
-                budget_blocks,
-                compress: config.indexer_compress_ratio,
-                visible,
-                capacity: state.selected_capacity,
-            },
-        )?;
-        let selected = budget_blocks.min(complete) * config.indexer_compress_ratio + visible
-            - complete * config.indexer_compress_ratio;
-        let selected = selected.min(state.selected_capacity);
-        qwen4_qsa_attention(
-            gpu,
-            &Qwen4QsaAttention {
-                q_with_gate: &self.scratch.qsa_qgate,
-                full_keys: &state.full_keys,
-                full_values: &state.full_values,
-                selected: &state.selected_indices,
-                output: &self.scratch.qsa_output,
-                n_heads: config.num_attention_heads,
-                n_kv_heads: config.num_key_value_heads,
-                head_dim: config.head_dim,
-                selected_len: selected,
-                full_capacity: state.full_capacity,
-            },
-        )?;
-        let out_weight = weights.resident(&qsa.output)?;
-        self.gemv(
-            gpu,
-            out_weight,
-            &self.scratch.qsa_output,
-            &self.scratch.rotation,
-            output,
-            config.hidden_size,
-            q_width,
-        )?;
-        state.full_len = visible;
-        state.raw_len = visible;
-        state.pooled_len = complete;
-        state.selected_len = selected;
-        state.position = visible;
-        Ok(())
-    }
-
-    fn apply_ple(
-        &self,
-        gpu: &mut Gpu,
-        config: &Qwen4Config,
-        weights: &Qwen4Weights,
-        state: &mut GpuTensor,
-        ple_rows: &GpuTensor,
-        token_index: usize,
-    ) -> Result<(), Qwen4GpuForwardError> {
-        let layer = config
-            .ple_layer_ids
-            .first()
-            .and_then(|id| id.checked_sub(1))
-            .ok_or_else(|| invalid("PLE layer id missing"))?;
-        let ple = weights
-            .layer_refs
-            .get(layer)
-            .and_then(|layer| layer.ple.as_ref())
-            .ok_or_else(|| invalid("PLE weights missing"))?;
-        let channels = config.ple_embed_dim * config.hc_count;
-        let row = f32_view(
-            ple_rows,
-            token_index * config.hidden_size,
-            config.hidden_size,
-        );
-        let key_weight = weights.resident(&ple.key)?;
-        let value_weight = weights.resident(&ple.value)?;
-        self.gemv(
-            gpu,
-            key_weight,
-            &row,
-            &self.scratch.rotation,
-            &self.scratch.ple_key,
-            channels,
-            config.hidden_size,
-        )?;
-        self.gemv(
-            gpu,
-            value_weight,
-            &row,
-            &self.scratch.rotation,
-            &self.scratch.ple_value,
-            config.hidden_size,
-            config.hidden_size,
-        )?;
-        gpu.copy_d2d(
-            &self.scratch.streams,
-            &self.scratch.ple_query,
-            self.scratch.ple_query.byte_size(),
-        )?;
-        let norm_key = weights.resident(&ple.norm_key)?;
-        let norm_query = weights.resident(&ple.norm_query)?;
-        gpu.qwen4_ple_gate_bf16(
-            &self.scratch.ple_key,
-            &self.scratch.ple_query,
-            &self.scratch.ple_value,
-            norm_key,
-            norm_query,
-            &self.scratch.ple_gated,
-            1,
-            config.hc_count,
-            config.hidden_size,
-            EPSILON,
-        )?;
-        let norm_conv = weights.resident(&ple.norm_conv)?;
-        gpu.qwen4_ple_norm_bf16(
-            &self.scratch.ple_gated,
-            norm_conv,
-            &self.scratch.ple_normed,
-            1,
-            config.hc_count,
-            config.hidden_size,
-            EPSILON,
-        )?;
-        let conv = weights.resident(&ple.conv)?;
-        gpu.qwen4_ple_depthwise_conv_silu_add_bf16(
-            &self.scratch.ple_gated,
-            &self.scratch.ple_normed,
-            conv,
-            state,
-            &self.scratch.ple_output,
-            1,
-            channels,
-            config.ple_conv_kernel_size,
-            3,
-        )?;
-        gpu.add_f32(
-            &self.scratch.streams,
-            &self.scratch.ple_output,
-            &self.scratch.streams,
-        )?;
-        Ok(())
-    }
-
-    fn apply_moe(
-        &self,
-        gpu: &mut Gpu,
-        config: &Qwen4Config,
-        layer_index: usize,
-        runtime: &Qwen4MoeLayerRuntime,
-        input: &GpuTensor,
-        output: &GpuTensor,
-    ) -> Result<(), Qwen4GpuForwardError> {
-        execute_moe(
-            gpu,
-            config,
-            layer_index,
-            runtime,
-            input,
-            output,
-            Qwen4MoeScratch {
-                router_logits: &self.scratch.router_logits,
-                scalar_buf: &self.scratch.moe_scalar,
-                x_rot_local: &self.scratch.moe_x_rot,
-                gate_up_buf: &self.scratch.moe_gate_up,
-                gate_buf: &self.scratch.moe_gate,
-                up_buf: &self.scratch.moe_up,
-                ffn_hidden: &self.scratch.moe_hidden,
-                ffn_out: &self.scratch.moe_shared_output,
-                gate_batch: &self.scratch.moe_gate_batch,
-                up_batch: &self.scratch.moe_up_batch,
-                rot_batch: &self.scratch.moe_rot_batch,
-                topk_indices: &self.scratch.moe_topk_indices,
-                topk_weights: &self.scratch.moe_topk_weights,
-                down_expanded: &self.scratch.moe_down_expanded,
-            },
-        )
     }
 }

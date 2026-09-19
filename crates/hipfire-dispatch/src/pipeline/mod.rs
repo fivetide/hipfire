@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Björn Bösel
 // hipfire — see LICENSE and NOTICE in the project root.
 use crate::context::DispatchCtx;
-use crate::families::fused_qkv::{FusedQkvFamily, FusedQkvParams, fused_gate_up_key_for};
+use crate::families::fused_qkv::{fused_gate_up_key_for, FusedQkvFamily, FusedQkvParams};
 use crate::families::gemm::{GemmFamily, GemmParams};
 use crate::families::gemv::{GemvFamily, WeightRef};
 use crate::families::moe::MOE_GROUPED_BLOCK_M;
@@ -10,26 +10,28 @@ use crate::tables::KernelRegistry;
 use crate::types::*;
 #[allow(unused_imports)]
 use hip_bridge;
-use rdna_compute::qwen4::{Qwen4Bf16ScaledAdd, qwen4_bf16_scaled_add};
+use rdna_compute::qwen4::{qwen4_bf16_scaled_add, Qwen4Bf16ScaledAdd};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::cell::OnceCell;
 use std::sync::{LazyLock, OnceLock};
 
 pub mod sealed_moe;
 pub use sealed_moe::{
-    ActivationIdentity, ActivationInput, BoundMoeExperts, ExpertBindingCache, ExpertMetadata,
-    ExpertResource, ExpertResources, ExpertTable, MoeContribution, MoePrefillRouteProducerProof,
-    MoeProtocol, MoeRouteProducerProof, MoeRouterInput, MoeSharedContribution, PrefillRouteMode,
-    ResourceAlias, SealedMoeCall, checked_grouped_m_total_bound, checked_tp_local_shapes,
-    seal_decode, seal_ep_routed_contrib, seal_prefill, seal_prefill_ep,
+    checked_grouped_m_total_bound, checked_tp_local_shapes, seal_decode, seal_ep_routed_contrib,
+    seal_prefill, seal_prefill_ep, ActivationIdentity, ActivationInput, BoundMoeExperts,
+    ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources, ExpertTable,
+    MoeContribution, MoePrefillRouteProducerProof, MoeProtocol, MoeRouteProducerProof,
+    MoeRouterInput, MoeSharedContribution, PrefillRouteMode, ResourceAlias, SealedMoeCall,
 };
 pub(crate) mod moe_program;
+pub(crate) mod qwen4_prefill;
 pub use moe_program::SealedMoeOp;
 pub(crate) mod steps;
-pub use steps::{FusedPattern, GemvInput, Step, execute_steps};
+pub use steps::{execute_steps, FusedPattern, GemvInput, Step};
 
 // #397 Ship 6 — forward-as-pipeline C-design lowered super-op substrate (types
 // only at this step; not on any live path until wired behind HIPFIRE_FORWARD_LOWERED).
+pub mod qwen4_program;
 pub mod superop;
 
 fn reject_mq4g128v2(dtype: DType, family: &'static str) -> Result<(), DispatchError> {
@@ -1572,8 +1574,8 @@ pub fn run_moe_prefill_bias_aware(
                         batch_size,
                     ))?;
             } else {
-                hip!(
-                    gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched_k4(
+                hip!(gpu
+                    .deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched_k4(
                         p.expert_down_ptrs,
                         p.topk_indices,
                         p.topk_weights,
@@ -1583,8 +1585,7 @@ pub fn run_moe_prefill_bias_aware(
                         im,
                         k_top,
                         batch_size,
-                    )
-                )?;
+                    ))?;
             }
         }
     }
@@ -2795,9 +2796,9 @@ fn decode_gate_side_stage(
             }
         }
     } // end `if !skip_routing` (gate-side GEMV)
-    // Qwen4's source model is BF16 end-to-end through the router and
-    // shared-expert projections.  The quantized GEMV contract is F32, so
-    // restore the source boundary before the downstream nonlinearities.
+      // Qwen4's source model is BF16 end-to-end through the router and
+      // shared-expert projections.  The quantized GEMV contract is F32, so
+      // restore the source boundary before the downstream nonlinearities.
     if qwen4_top10 {
         hip!(gpu.bf16_round_trip_f32(p.router_logits))?;
         hip!(gpu.bf16_round_trip_f32(scalar_buf))?;
@@ -2846,10 +2847,10 @@ fn decode_route_gpu_stage(
             }
         }
     } // end `if !skip_routing` (DIAG dump)
-    // Router variant flags were resolved during typed-program lowering.
-    // Pre-routed experts-only skips top-k production: the buffers already hold
-    // the root-authoritative IDs (a per-rank re-ranking is exactly the
-    // divergence this removes).
+      // Router variant flags were resolved during typed-program lowering.
+      // Pre-routed experts-only skips top-k production: the buffers already hold
+      // the root-authoritative IDs (a per-rank re-ranking is exactly the
+      // divergence this removes).
     if !skip_routing {
         if qwen4_top10 {
             hip!(gpu.moe_router_softmax_top10_f32(

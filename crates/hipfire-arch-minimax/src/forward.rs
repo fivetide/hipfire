@@ -304,7 +304,7 @@ fn decode_step_body(
         execute_steps(
             gpu,
             &ctx,
-            &[Step::GemvResidual {
+            &mut [Step::GemvResidual {
                 w: &wro,
                 input: GemvInput::Raw(&state.fa_attn_out),
                 residual: &state.h,
@@ -551,7 +551,7 @@ fn qkv_via_execute_steps(
     let wrq = layer.wq.dispatch_ref();
     let wrk = layer.wk.dispatch_ref();
     let wrv = layer.wv.dispatch_ref();
-    let steps = [
+    let mut steps = [
         Step::RmsnormAutomatic {
             x: &state.h,
             norm_weight: &layer.attn_norm,
@@ -578,7 +578,7 @@ fn qkv_via_execute_steps(
             out: &state.fa_v,
         },
     ];
-    execute_steps(gpu, ctx, &steps).map_err(|e| format!("minimax qkv: {e:?}"))
+    execute_steps(gpu, ctx, &mut steps).map_err(|e| format!("minimax qkv: {e:?}"))
 }
 
 /// Attention block (attn-norm folded in). Mirrors the hand-loop attention arm.
@@ -659,7 +659,7 @@ fn minimax_attn_block(
     hipfire_dispatch::pipeline::execute_steps(
         gpu,
         &ctx,
-        &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
+        &mut [hipfire_dispatch::pipeline::Step::Attend { plan, io }],
     )
     .map_err(|e| format!("minimax L{l}: attention: {e:?}"))?;
     // o_proj + residual: h += W_o · attn_out (via execute_steps).
@@ -667,7 +667,7 @@ fn minimax_attn_block(
     execute_steps(
         gpu,
         &ctx,
-        &[Step::GemvResidual {
+        &mut [Step::GemvResidual {
             w: &wro,
             input: GemvInput::Raw(&state.fa_attn_out),
             residual: &state.h,

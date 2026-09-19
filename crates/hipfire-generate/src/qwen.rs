@@ -7802,7 +7802,7 @@ pub fn generate_qwen4_ar(
                 .ok_or_else(|| "qwen4 AR bundle disappeared before prefill".to_string())
                 .and_then(|bundle| {
                     bundle
-                        .forward_chunk(device, tokens, logits, None)
+                        .forward_chunk_final(device, tokens, logits, None)
                         .map_err(|error| error.to_string())
                 })
         },

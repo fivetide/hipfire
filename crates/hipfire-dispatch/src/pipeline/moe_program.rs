@@ -71,6 +71,10 @@ pub(super) struct MoePrefillSelection {
     pub(super) resolution: MoePrefillResolution,
     pub(super) path2_m_total: usize,
     pub(super) force_mq4_grouped_fp16: bool,
+    /// Exact Qwen4 replicated top-10/QT44/QT53 route.  This is kept beside
+    /// the generic resolution so QT53 never enters a representative-dtype
+    /// fallback.
+    pub(super) qwen4_top10: bool,
 }
 
 /// The call's static kernel selection. Neither variant stores a step list or
@@ -374,6 +378,9 @@ impl<'a> SealedMoeOp<'a> {
             return super::decode_input_basis_stage(gpu, params, selection.resolution);
         }
         let (params, selection) = self.state.prefill_parts()?;
+        if selection.qwen4_top10 {
+            return super::qwen4_prefill::input_basis(gpu, params);
+        }
         let input_weight = params
             .prelude
             .shared
@@ -454,7 +461,10 @@ impl<'a> SealedMoeOp<'a> {
                     .map_err(|e| DispatchError::Hip(e.to_string()))
             }
             MoeProtocol::GroupedPrefill => {
-                let (params, _) = self.state.prefill_parts()?;
+                let (params, selection) = self.state.prefill_parts()?;
+                if selection.qwen4_top10 {
+                    return super::qwen4_prefill::router_projection(gpu, params);
+                }
                 let prelude = &params.prelude;
                 let x = match prelude.router.dtype {
                     rdna_compute::DType::Q8_0 | rdna_compute::DType::F32 => params.x_norm_batch,
@@ -652,7 +662,10 @@ impl<'a> SealedMoeOp<'a> {
                 selection.qwen4_top10,
             );
         }
-        let (params, _) = self.state.prefill_parts()?;
+        let (params, selection) = self.state.prefill_parts()?;
+        if selection.qwen4_top10 {
+            return super::qwen4_prefill::shared_gate_up(gpu, params);
+        }
         super::prefill_shared_gate_up_stage(self.state.dispatch_ctx(), gpu, params)
     }
 
@@ -675,7 +688,10 @@ impl<'a> SealedMoeOp<'a> {
                 selection.qwen4_top10,
             );
         }
-        let (params, _) = self.state.prefill_parts()?;
+        let (params, selection) = self.state.prefill_parts()?;
+        if selection.qwen4_top10 {
+            return super::qwen4_prefill::shared_activation(gpu, params);
+        }
         super::prefill_shared_activation_stage(gpu, params)
     }
 
@@ -698,7 +714,10 @@ impl<'a> SealedMoeOp<'a> {
                 selection.qwen4_top10,
             );
         }
-        let (params, _) = self.state.prefill_parts()?;
+        let (params, selection) = self.state.prefill_parts()?;
+        if selection.qwen4_top10 {
+            return super::qwen4_prefill::shared_down(gpu, params);
+        }
         super::prefill_shared_down_stage(self.state.dispatch_ctx(), gpu, params)
     }
 
@@ -709,6 +728,9 @@ impl<'a> SealedMoeOp<'a> {
             return Err(DispatchError::Hip(
                 "sealed moe: scatter is only valid for grouped prefill path 2".into(),
             ));
+        }
+        if selection.qwen4_top10 {
+            return super::qwen4_prefill::scatter(gpu, params, selection.path2_m_total);
         }
         super::prefill_scatter_stage(gpu, params, selection.path2_m_total)
     }
@@ -730,6 +752,14 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
+        if selection.qwen4_top10 {
+            return super::qwen4_prefill::gate_up(
+                gpu,
+                params,
+                selection.resolution.use_path2,
+                selection.path2_m_total,
+            );
+        }
         let total_slots = params
             .batch_size
             .checked_mul(params.k_top)
@@ -754,6 +784,9 @@ impl<'a> SealedMoeOp<'a> {
                 "sealed moe: unscatter is only valid for grouped prefill path 2".into(),
             ));
         }
+        if selection.qwen4_top10 {
+            return super::qwen4_prefill::unscatter(gpu, params, selection.path2_m_total);
+        }
         super::prefill_gate_up_unscatter_stage(gpu, params, selection.path2_m_total)
     }
 
@@ -767,6 +800,9 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
+        if selection.qwen4_top10 {
+            return super::qwen4_prefill::activation(gpu, params);
+        }
         let total_slots = params
             .batch_size
             .checked_mul(params.k_top)
@@ -791,6 +827,14 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
+        if selection.qwen4_top10 {
+            return super::qwen4_prefill::down(
+                gpu,
+                params,
+                selection.resolution.use_path2,
+                selection.path2_m_total,
+            );
+        }
         let total_slots = params
             .batch_size
             .checked_mul(params.k_top)
@@ -824,6 +868,14 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
+        if selection.qwen4_top10 {
+            return super::qwen4_prefill::combine(
+                gpu,
+                params,
+                selection.resolution.use_path2,
+                selection.path2_m_total,
+            );
+        }
         let canonical_slot_order = matches!(
             &params.prelude.route,
             super::sealed_moe::PrefillRouteMode::ProduceRoot { .. }
@@ -955,7 +1007,27 @@ fn lower_prefill<'a>(
     let (params, selection) = state.prefill_parts()?;
     let mut steps = SmallVec::new();
     let op = |state: &'a MoeStepState<'a>| SealedMoeOp::new(state);
-    append_step(&mut steps, Step::MoeNormalize(op(state)))?;
+    if selection.qwen4_top10 {
+        append_step(&mut steps, Step::MoeNormalize(op(state)))?;
+        append_step(&mut steps, Step::MoeInputBasis(op(state)))?;
+        append_step(&mut steps, Step::MoeRouterProjection(op(state)))?;
+        append_step(&mut steps, Step::MoeSharedGateUp(op(state)))?;
+        append_step(&mut steps, Step::MoeSharedActivation(op(state)))?;
+        append_step(&mut steps, Step::MoeRoute(op(state)))?;
+        if selection.resolution.use_path2 {
+            append_step(&mut steps, Step::MoeScatter(op(state)))?;
+        }
+        append_step(&mut steps, Step::MoeGateUp(op(state)))?;
+        if selection.resolution.use_path2 {
+            append_step(&mut steps, Step::MoeUnscatter(op(state)))?;
+        }
+        append_step(&mut steps, Step::MoeActivation(op(state)))?;
+        append_step(&mut steps, Step::MoeDown(op(state)))?;
+        append_step(&mut steps, Step::MoeMutationFence(op(state)))?;
+        append_step(&mut steps, Step::MoeCombine(op(state)))?;
+        append_step(&mut steps, Step::MoeSharedDown(op(state)))?;
+        return Ok(steps);
+    }
     let adopted = matches!(
         params.prelude.route,
         super::sealed_moe::PrefillRouteMode::AdoptRoot { .. }
@@ -1005,11 +1077,11 @@ pub(super) fn execute(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<(), Dis
     // Reborrow the call at the execution lifetime. The state and every Step
     // borrow only this invocation and are dropped before the call returns.
     let state = MoeStepState::new(call);
-    let steps = match call.protocol() {
+    let mut steps = match call.protocol() {
         MoeProtocol::IndexedDecode => lower_decode(&state)?,
         MoeProtocol::GroupedPrefill => lower_prefill(&state)?,
     };
-    super::steps::execute_validated_steps(gpu, call.dispatch_ctx(), &steps)
+    super::steps::execute_validated_steps(gpu, call.dispatch_ctx(), &mut steps)
 }
 
 /// Execute only the canonical slot-order combine for a validated EP call.
@@ -1224,6 +1296,23 @@ pub(super) fn select_prefill(
     ctx: &DispatchCtx,
     params: &MoePrefillParams<'_>,
 ) -> Result<MoePrefillSelection, DispatchError> {
+    let qwen4_top10 = params.recipe == MoeRecipe::SoftmaxGatedShared
+        && params.routed_out.is_none()
+        && matches!(
+            params.prelude.route,
+            super::sealed_moe::PrefillRouteMode::Replicated
+        )
+        && super::is_qwen4_route(
+            &params.dtypes,
+            params.n_exp,
+            params.k_top,
+            params.gate_up_k,
+            params.mi,
+            params.gate_up_k,
+            params.down_m,
+            params.down_k,
+            params.expert_dtype_tags,
+        );
     let resolution = MoePrefillResolution::resolve(&params.dtypes, &ctx.arch, &ctx.flags);
     let _total_slots = params
         .batch_size
@@ -1249,6 +1338,7 @@ pub(super) fn select_prefill(
         resolution,
         path2_m_total,
         force_mq4_grouped_fp16,
+        qwen4_top10,
     })
 }
 

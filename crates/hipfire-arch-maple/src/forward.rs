@@ -216,7 +216,7 @@ fn decode_step_body(
         hipfire_dispatch::pipeline::execute_steps(
             gpu,
             &ctx,
-            &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
+            &mut [hipfire_dispatch::pipeline::Step::Attend { plan, io }],
         )
         .map_err(|e| format!("maple L{l}: attention: {e:?}"))?;
 
@@ -1281,7 +1281,7 @@ fn batched_attend(
     hipfire_dispatch::pipeline::execute_steps(
         gpu,
         &ctx,
-        &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
+        &mut [hipfire_dispatch::pipeline::Step::Attend { plan, io }],
     )
     .map_err(|e| format!("maple L{l}: batch attention: {e:?}"))
 }

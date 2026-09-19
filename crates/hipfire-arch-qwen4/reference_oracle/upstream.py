@@ -2630,7 +2630,7 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
     qsa_angles = torch.empty(13, 4, dtype=torch.float32)
     for position in range(13):
         for dimension in range(4):
-            qsa_angles[position, dimension] = position / (1000000.0 ** (2.0 * (dimension % 2) / 4.0))
+            qsa_angles[position, dimension] = position / (10000000.0 ** (2.0 * (dimension % 2) / 4.0))
     cos = qsa_angles.cos().unsqueeze(0)
     sin = qsa_angles.sin().unsqueeze(0)
     visible = torch.tril(torch.ones(1, 1, 13, 13, dtype=torch.bool))
@@ -2678,7 +2678,7 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
     rope_angles = torch.empty(5, 8, dtype=torch.float32)
     for row, position in enumerate(rope_positions):
         for dimension in range(8):
-            rope_angles[row, dimension] = position / (1000000.0 ** (2.0 * (dimension % 4) / 8.0))
+            rope_angles[row, dimension] = position / (10000000.0 ** (2.0 * (dimension % 4) / 8.0))
     source_rope = hf["apply_rotary_pos_emb"](
         rope_value,
         cos=rope_angles.cos(),
@@ -2698,7 +2698,7 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
     attention_angles = torch.empty(13, 4, dtype=torch.float32)
     for position in range(13):
         for dimension in range(4):
-            attention_angles[position, dimension] = position / (1000000.0 ** (2.0 * (dimension % 2) / 4.0))
+            attention_angles[position, dimension] = position / (10000000.0 ** (2.0 * (dimension % 2) / 4.0))
     attention_cos = attention_angles.cos().unsqueeze(0)
     attention_sin = attention_angles.sin().unsqueeze(0)
     attention_q_rot, attention_k_rot = hf["apply_rotary_pos_emb"](

@@ -255,7 +255,7 @@ fn decode_step_body(
         hipfire_dispatch::pipeline::execute_steps(
             gpu,
             &ctx,
-            &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
+            &mut [hipfire_dispatch::pipeline::Step::Attend { plan, io }],
         )
         .map_err(|e| format!("cohere2moe L{l}: attention: {e:?}"))?;
 
@@ -364,7 +364,7 @@ fn decode_step_body(
                     .map_err(|e| format!("cohere2moe L{l} bind experts: {e:?}"))?;
                 let call = seal_decode(bound, &ctx, params)
                     .map_err(|e| format!("cohere2moe L{l} seal decode: {e:?}"))?;
-                execute_steps(gpu, &ctx, &[Step::Moe(call)])
+                execute_steps(gpu, &ctx, &mut [Step::Moe(call)])
                     .map_err(|e| format!("cohere2moe L{l} sealed decode: {e:?}"))?;
             }
         }
@@ -664,7 +664,7 @@ pub fn forward_batch(
         hipfire_dispatch::pipeline::execute_steps(
             gpu,
             &ctx,
-            &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
+            &mut [hipfire_dispatch::pipeline::Step::Attend { plan, io }],
         )
         .map_err(|e| format!("cohere2moe L{l} batch attn: {e:?}"))?;
         q8_proj_raw(gpu, &layer.wo.buf, &attn_out, &o, hidden, q_dim, b, &x_f16)
@@ -819,7 +819,7 @@ pub fn forward_batch(
                 };
                 let call = seal_prefill(bound, &ctx, params)
                     .map_err(|e| format!("cohere2moe L{l} seal prefill: {e:?}"))?;
-                execute_steps(gpu, &ctx, &[Step::Moe(call)])
+                execute_steps(gpu, &ctx, &mut [Step::Moe(call)])
                     .map_err(|e| format!("cohere2moe L{l} sealed prefill: {e:?}"))?;
             }
         }

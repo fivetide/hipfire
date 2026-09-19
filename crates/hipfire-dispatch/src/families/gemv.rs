@@ -30,7 +30,7 @@ fn reject_mq4g128v2() -> Result<(), DispatchError> {
 // ── Lightweight weight descriptor ──────────────────────
 
 /// Givens rotation metadata for ParoQuant weights (mirrors ParoRotation
-/// fields, which are all rdna_compute::GpuTensor — no circular dep).
+#[derive(Clone, Copy)]
 pub struct GivensRef<'a> {
     pub pairs: &'a GpuTensor,
     pub theta: &'a GpuTensor,
@@ -38,8 +38,7 @@ pub struct GivensRef<'a> {
     pub krot: usize,
 }
 
-/// Minimal weight reference for dispatch. Carries buffer, dtype, shape,
-/// the padded row stride (Q8HFQ), and rotation metadata.
+#[derive(Clone, Copy)]
 pub struct WeightRef<'a> {
     pub buf: &'a GpuTensor,
     pub dtype: DType,
