@@ -2,7 +2,10 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Native Qwen4/ Qwen3.8-Flash-Next MTP resources and the CPU reference step.
+//! CPU/reference Qwen4 / Qwen3.8-Flash-Next MTP state and equations.
+//!
+//! This module contains the CPU/reference MTP state and equation-level
+//! implementation.  Production MTP execution lives in [`crate::mtp_gpu`].
 //!
 //! Production MTP tensor references live in [`crate::weights::Qwen4MtpWeights`].
 //! This module owns the bounded request-side QSA state and the
@@ -21,11 +24,11 @@
 use crate::ops;
 use std::fmt;
 
-/// The native Qwen4 MTP module has one full-attention layer.
+/// The CPU/reference Qwen4 MTP module has one full-attention layer.
 pub const MTP_LAYER_COUNT: usize = 1;
 /// The checkpoint's Hyper-Connection branch count.
 pub const MTP_BRANCHES: usize = 4;
-/// Native QSA geometry.
+/// CPU/reference QSA geometry.
 pub const MTP_Q_HEADS: usize = 24;
 pub const MTP_KV_HEADS: usize = 2;
 pub const MTP_HEAD_DIM: usize = 256;
@@ -82,7 +85,7 @@ impl MtpMatrix {
     }
 }
 
-/// Attention projection weights for one native MTP QSA block.
+/// Attention projection weights for one CPU/reference MTP QSA block.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MtpAttentionWeights {
     pub q_proj: MtpMatrix,
@@ -144,7 +147,7 @@ pub struct ReferenceMtpWeights {
 }
 
 impl ReferenceMtpWeights {
-    /// Validate the fixed/native dimensions and all expert tensor counts.
+    /// Validate the fixed CPU/reference dimensions and all expert tensor counts.
     pub fn validate(&self) -> Result<(), MtpError> {
         let hidden = self.fc_embedding.cols;
         if self.fc_embedding.rows != hidden
@@ -653,8 +656,8 @@ pub struct MtpForwardInput<'a> {
     pub step_index: usize,
 }
 
-/// One native MTP output: collapsed H for the distinct lm_head and wide 4H
-/// for the following draft step.  `qsa_indices` records the step-0 selection
+/// One CPU/reference MTP output: collapsed H for the distinct lm_head and wide
+/// 4H for the following draft step.  `qsa_indices` records the step-0 selection
 /// or later-step reuse for parity diagnostics.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MtpForwardOutput {
@@ -665,9 +668,9 @@ pub struct MtpForwardOutput {
     pub routing_weights: [f32; MTP_TOP_K],
 }
 
-/// Native MTP mutable state.  The target's Qwen4State is snapshotted by the
-/// SpecTarget adapter; this object independently snapshots MTP QSA side state
-/// and wide hidden so partial acceptance cannot leave a stale draft cache.
+/// CPU/reference MTP mutable state.  The target's Qwen4State is snapshotted by
+/// the SpecTarget adapter; this object independently snapshots MTP QSA side
+/// state and wide hidden so partial acceptance cannot leave a stale draft cache.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Qwen4MtpState {
     pub qsa: MtpQsaState,
@@ -1117,7 +1120,7 @@ fn hc_final_read(
     Ok((normed, mixed))
 }
 
-/// Error type shared by the native MTP resource/state and CPU reference path.
+/// Error type shared by the CPU/reference MTP resource/state and equation path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MtpError {
     Length {

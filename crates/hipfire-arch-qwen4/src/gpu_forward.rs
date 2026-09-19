@@ -4,8 +4,9 @@
 
 //! Ordinary-HIP Qwen4 forward execution.
 //!
-//! This module is the production device path.  The reference equations in
-//! `forward.rs` are intentionally separate and are never called here.  All
+//! This module is the production device path.  The CPU/reference equations in
+//! [`crate::reference_forward`] are intentionally separate and are never called
+//! here.  All
 //! learned projections consume the resident tensor supplied by the assembled
 //! bundle; MQv2 projections are rotated and dispatched through their native
 //! qt44/qt53 kernels, while recurrent/cache state remains resident on the GPU.

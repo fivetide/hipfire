@@ -2,11 +2,13 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Native Qwen4 trunk forward equations.
+//! CPU/reference Qwen4 trunk forward equations.
 //!
-//! The compact reference executor in this module is deliberately typed like
-//! the ordinary-HIP path: one resident layer record, one recurrent/cache state
-//! owner, and one shared token/chunk entry point.  It is used for fixture
+//! Production trunk execution lives in [`crate::gpu_forward`].
+//!
+//! The compact CPU/reference executor in this module is deliberately typed
+//! like the ordinary-HIP path: one resident layer record, one recurrent/cache
+//! state owner, and one shared token/chunk entry point.  It is used for fixture
 //! parity and compact end-to-end probes; it does not read checkpoint files or
 //! dequantize resident matrices.
 
@@ -317,7 +319,7 @@ impl ReferenceForwardState {
     }
 }
 
-/// A compact, typed native trunk executor.  It consumes already-resident
+/// A compact, typed CPU/reference trunk executor.  It consumes already-resident
 /// activation/weight arrays and follows the same token loop for one-token and
 /// bounded-chunk calls, which makes chunk parity a direct invariant.
 #[derive(Clone, Debug)]
@@ -1080,12 +1082,10 @@ mod tests {
         let mut chunk = ReferenceQwen4Forward::new(config, &layers).unwrap();
         let combined = chunk.forward_chunk(&embeddings, 2, &layers, None).unwrap();
         assert_eq!(second.len(), combined.len());
-        assert!(
-            second
-                .iter()
-                .zip(combined.iter())
-                .all(|(a, b)| (a - b).abs() < 1.0e-5)
-        );
+        assert!(second
+            .iter()
+            .zip(combined.iter())
+            .all(|(a, b)| (a - b).abs() < 1.0e-5));
         assert!(first.iter().all(|value| value.is_finite()));
     }
 }

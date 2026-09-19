@@ -6,8 +6,9 @@
 //!
 //! This module is the only production MTP implementation for Qwen4.  It owns
 //! one bound MTP MoE table, one reusable operator scratch set, and one bounded
-//! device-side QSA state.  The CPU equations in [`crate::mtp`] remain fixtures;
-//! they are never called from this path.
+//! device-side QSA state.  The CPU/reference equations in
+//! [`crate::reference_mtp`] remain fixtures; they are never called from this
+//! path.
 
 use crate::config::Qwen4Config;
 use crate::gpu_forward::{

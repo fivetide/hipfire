@@ -13,7 +13,7 @@
 //! accepted drafts.
 
 use crate::bundle::Qwen4Bundle;
-use crate::mtp::{MtpError, Qwen4MtpState};
+use crate::reference_mtp::{MtpError, Qwen4MtpState};
 use crate::state::Qwen4StateSnapshot;
 use hipfire_runtime::spec::{
     accept_greedy_prefix, MtpDrafter, MtpSpeculator, MtpWindow, SpecAdvance, SpecGrammar,
@@ -947,7 +947,7 @@ pub fn mtp_error(error: MtpError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mtp::{MtpQsaGeometry, Qwen4MtpState};
+    use crate::reference_mtp::{MtpQsaGeometry, Qwen4MtpState};
 
     #[test]
     fn native_count_includes_seed_and_rollback_excludes_it() {
