@@ -233,6 +233,7 @@ def log(msg: str) -> None:
 #   11 = LFM2.5 family
 #   12 = Cohere2-MoE / North-Mini-Code
 #   14 = Muse Glimmer dense text tower
+#   16 = Qwen4 experimental / Qwen3.8-Flash-Next
 #   20 = DFlash drafter sidecar (crates/hipfire-quantize/src/bin/dflash_convert.rs)
 #   23 = Muse Glimmer DFlash drafter (muse_glimmer_assistant)
 def arch_id_for(tag: str, entry: dict) -> int | None:
@@ -249,8 +250,13 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
     # architecture unchanged (dense qwen35).
     if family == "bonsai":
         return 5
+    if family == "qwen3.8" and ("flash-next" in tag or "flash-next" in file):
+        # Qwen3.8-Flash-Next is the Qwen4 experimental arch-16 carrier,
+        # not the ordinary Qwen3.8 dense arch-5 family.
+        return 16
     if family in ("qwen3.5", "qwen3.6", "qwen3.8", "qwopus3.6", "carnice", "qwopus"):
         return 6 if "a3b" in tag else 5
+
     if family == "nex-n2":
         return 6  # Nex-N2-mini = Qwen3.5-35B-A3B MoE (a3b not in tag name)
     # Ornith 1.5 = Qwen3.5-family VL finetune. 35B-A3B is qwen3_5_moe (6), the
