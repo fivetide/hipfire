@@ -1,0 +1,1471 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 Björn Bösel
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Operation contracts for stateful layer execution.
+//!
+//! The contracts in this module describe tensor roles, extents, and ordering;
+//! they do not describe a model family.  Architecture crates bind their
+//! resident weights, state, and fixed-capacity scratch to these borrowed views.
+//! [`crate::pipeline::steps::validate_steps`] preflights these composite
+//! operations and sealed MoE calls before unrelated architecture effects.
+//! Existing scalar `Step` variants retain their established launch-time
+//! validation; this module does not broaden that legacy contract.
+//! No operation owns a tensor or allocates execution-local storage.
+
+use crate::families::gemv::WeightRef;
+use crate::types::DispatchError;
+use rdna_compute::tensor_ops::{
+    argmax_f32, bf16_roundtrip_f32, gated_delta_conv, gated_delta_gate, gated_delta_params,
+    gated_delta_step, hyper_norm, hyper_read_projected, hyper_write, indexed_attention_attention,
+    indexed_attention_cache_append, indexed_attention_norm_rope, indexed_attention_pool_rope,
+    indexed_attention_select, scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv, GatedDeltaGate,
+    GatedDeltaParams, GatedDeltaStep, HyperNorm, HyperReadProjected, HyperWrite,
+    IndexedAttentionAttention, IndexedAttentionCacheAppend, IndexedAttentionNormRope,
+    IndexedAttentionPoolRope, IndexedAttentionSelect, ScaleF32,
+};
+use rdna_compute::{DType, Gpu, GpuTensor};
+
+#[inline]
+fn hip<T>(result: Result<T, hip_bridge::HipError>) -> Result<T, DispatchError> {
+    result.map_err(|error| DispatchError::Hip(error.to_string()))
+}
+
+#[inline]
+fn checked_mul(a: usize, b: usize, label: &'static str) -> Result<usize, DispatchError> {
+    a.checked_mul(b)
+        .ok_or_else(|| DispatchError::Hip(format!("{label} extent overflows")))
+}
+
+fn require_tensor(
+    tensor: &GpuTensor,
+    elements: usize,
+    dtype: DType,
+    label: &'static str,
+) -> Result<(), DispatchError> {
+    if tensor.dtype != dtype || tensor.numel() < elements {
+        return Err(DispatchError::Hip(format!(
+            "{label} requires {elements} elements of {dtype:?}, got {:?} with {} elements",
+            tensor.dtype,
+            tensor.numel()
+        )));
+    }
+    Ok(())
+}
+
+fn require_weight(
+    weight: &WeightRef<'_>,
+    m: usize,
+    k: usize,
+    dtype: DType,
+    label: &'static str,
+) -> Result<(), DispatchError> {
+    let elements = checked_mul(m, k, "weight elements")?;
+    if weight.dtype != dtype || weight.m != m || weight.k != k || weight.buf.numel() < elements {
+        return Err(DispatchError::Hip(format!(
+            "{label} has incompatible shape or dtype"
+        )));
+    }
+    Ok(())
+}
+
+#[inline]
+fn view(source: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
+    source.sub_offset(offset, len)
+}
+
+/// BF16-weight projection used by stateful operations.  Multi-row calls use
+/// the existing batched GEMM launcher; decode uses the existing GEMV launcher.
+pub(crate) fn project_bf16_batch(
+    gpu: &mut Gpu,
+    weight: &WeightRef<'_>,
+    input: &GpuTensor,
+    output: &GpuTensor,
+    rows: usize,
+) -> Result<(), DispatchError> {
+    if weight.dtype != DType::BF16 {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "layer-operations",
+            variant: "non-bf16-stateful-projection",
+            arch: "",
+            quant: "non-BF16",
+        });
+    }
+    let result = if rows > 1 {
+        gpu.gemm_bf16_xf32_multirow(weight.buf, input, output, weight.m, weight.k, rows)
+    } else {
+        gpu.gemv_bf16_xf32(weight.buf, input, output, weight.m, weight.k)
+    };
+    hip(result)
+}
+
+/// Hyper-connection read: grouped RMSNorm, low-rank down/up projections,
+/// source BF16 boundaries, sigmoid gating, and branch reduction.
+pub struct HyperReadOp<'a> {
+    pub input: &'a GpuTensor,
+    pub norm_weight: &'a GpuTensor,
+    pub input_mix_down: WeightRef<'a>,
+    pub input_mix_up: WeightRef<'a>,
+    pub normalized: &'a GpuTensor,
+    pub low: &'a GpuTensor,
+    pub up: &'a GpuTensor,
+    pub mixed: &'a GpuTensor,
+    pub bf16_scratch: &'a GpuTensor,
+    pub rows: usize,
+    pub branches: usize,
+    pub hidden: usize,
+    pub low_rank: usize,
+}
+
+impl HyperReadOp<'_> {
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        if self.rows == 0 || self.branches == 0 || self.hidden == 0 || self.low_rank == 0 {
+            return Err(DispatchError::Hip("hyper read has empty geometry".into()));
+        }
+        let wide = checked_mul(self.branches, self.hidden, "hyper read wide")?;
+        require_tensor(
+            self.input,
+            checked_mul(self.rows, wide, "hyper read input")?,
+            DType::F32,
+            "hyper read input",
+        )?;
+        require_tensor(self.norm_weight, wide, DType::BF16, "hyper read norm")?;
+        require_tensor(
+            self.normalized,
+            checked_mul(self.rows, wide, "hyper read normalized")?,
+            DType::F32,
+            "hyper read normalized",
+        )?;
+        require_tensor(
+            self.low,
+            checked_mul(self.rows, self.low_rank, "hyper read low")?,
+            DType::F32,
+            "hyper read low",
+        )?;
+        require_tensor(
+            self.up,
+            checked_mul(self.rows, wide, "hyper read up")?,
+            DType::F32,
+            "hyper read up",
+        )?;
+        require_tensor(
+            self.mixed,
+            checked_mul(self.rows, self.hidden, "hyper read mixed")?,
+            DType::F32,
+            "hyper read mixed",
+        )?;
+        require_tensor(
+            self.bf16_scratch,
+            self.low_rank.max(self.hidden),
+            DType::BF16,
+            "hyper read BF16 scratch",
+        )?;
+        require_weight(
+            &self.input_mix_down,
+            self.low_rank,
+            wide,
+            DType::BF16,
+            "hyper read down",
+        )?;
+        require_weight(
+            &self.input_mix_up,
+            wide,
+            self.low_rank,
+            DType::BF16,
+            "hyper read up",
+        )?;
+        Ok(())
+    }
+}
+
+pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), DispatchError> {
+    let wide = checked_mul(op.branches, op.hidden, "hyper read wide")?;
+    let input = view(op.input, 0, op.rows * wide);
+    let normalized = view(op.normalized, 0, op.rows * wide);
+    let low = view(op.low, 0, op.rows * op.low_rank);
+    let up = view(op.up, 0, op.rows * wide);
+    let mixed = view(op.mixed, 0, op.rows * op.hidden);
+    hip(hyper_norm(
+        gpu,
+        &HyperNorm {
+            input: &input,
+            norm_weight: op.norm_weight,
+            normalized: &normalized,
+            branches: op.branches,
+            hidden: op.hidden,
+        },
+    ))?;
+    project_bf16_batch(gpu, &op.input_mix_down, &normalized, &low, op.rows)?;
+    for row in 0..op.rows {
+        let low_row = view(&low, row * op.low_rank, op.low_rank);
+        hip(bf16_roundtrip_f32(
+            gpu,
+            &Bf16Roundtrip {
+                input: &low_row,
+                scratch: op.bf16_scratch,
+                output: &low_row,
+                elements: op.low_rank,
+            },
+        ))?;
+    }
+    hip(scale_f32(
+        gpu,
+        &ScaleF32 {
+            values: &low,
+            scale: 1.0 / op.branches as f32,
+        },
+    ))?;
+    for row in 0..op.rows {
+        let low_row = view(&low, row * op.low_rank, op.low_rank);
+        hip(bf16_roundtrip_f32(
+            gpu,
+            &Bf16Roundtrip {
+                input: &low_row,
+                scratch: op.bf16_scratch,
+                output: &low_row,
+                elements: op.low_rank,
+            },
+        ))?;
+    }
+    hip(gpu.silu_f32(&low, &low))?;
+    for row in 0..op.rows {
+        let low_row = view(&low, row * op.low_rank, op.low_rank);
+        hip(bf16_roundtrip_f32(
+            gpu,
+            &Bf16Roundtrip {
+                input: &low_row,
+                scratch: op.bf16_scratch,
+                output: &low_row,
+                elements: op.low_rank,
+            },
+        ))?;
+    }
+    project_bf16_batch(gpu, &op.input_mix_up, &low, &up, op.rows)?;
+    hip(hyper_read_projected(
+        gpu,
+        &HyperReadProjected {
+            input: &input,
+            norm_weight: op.norm_weight,
+            up: &up,
+            normalized: &normalized,
+            mixed: &mixed,
+            branches: op.branches,
+            hidden: op.hidden,
+        },
+    ))
+}
+/// Hyper-connection write: grouped normalization, branch gate projection, and
+/// in-place residual injection in the source-defined BF16 order.
+pub struct HyperWriteOp<'a> {
+    pub input: &'a GpuTensor,
+    pub norm_weight: &'a GpuTensor,
+    pub block_inject: WeightRef<'a>,
+    pub normalized: &'a GpuTensor,
+    pub mixed: &'a GpuTensor,
+    pub gates: &'a GpuTensor,
+    pub output: &'a GpuTensor,
+    pub rows: usize,
+    pub branches: usize,
+    pub hidden: usize,
+}
+
+impl HyperWriteOp<'_> {
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        if self.rows == 0 || self.branches == 0 || self.hidden == 0 {
+            return Err(DispatchError::Hip("hyper write has empty geometry".into()));
+        }
+        let wide = checked_mul(self.branches, self.hidden, "hyper write wide")?;
+        require_tensor(
+            self.input,
+            self.rows * wide,
+            DType::F32,
+            "hyper write input",
+        )?;
+        require_tensor(self.norm_weight, wide, DType::BF16, "hyper write norm")?;
+        require_tensor(
+            self.normalized,
+            self.rows * wide,
+            DType::F32,
+            "hyper write normalized",
+        )?;
+        require_tensor(
+            self.mixed,
+            self.rows * self.hidden,
+            DType::F32,
+            "hyper write mixed",
+        )?;
+        require_tensor(
+            self.gates,
+            self.rows * self.branches,
+            DType::F32,
+            "hyper write gates",
+        )?;
+        require_tensor(
+            self.output,
+            self.rows * wide,
+            DType::F32,
+            "hyper write output",
+        )?;
+        require_weight(
+            &self.block_inject,
+            self.branches,
+            wide,
+            DType::BF16,
+            "hyper write projection",
+        )?;
+        Ok(())
+    }
+}
+
+pub fn execute_hyper_write(gpu: &mut Gpu, op: &HyperWriteOp<'_>) -> Result<(), DispatchError> {
+    let wide = checked_mul(op.branches, op.hidden, "hyper write wide")?;
+    let input = view(op.input, 0, op.rows * wide);
+    let normalized = view(op.normalized, 0, op.rows * wide);
+    let mixed = view(op.mixed, 0, op.rows * op.hidden);
+    let gates = view(op.gates, 0, op.rows * op.branches);
+    let output = view(op.output, 0, op.rows * wide);
+    hip(hyper_norm(
+        gpu,
+        &HyperNorm {
+            input: &input,
+            norm_weight: op.norm_weight,
+            normalized: &normalized,
+            branches: op.branches,
+            hidden: op.hidden,
+        },
+    ))?;
+    project_bf16_batch(gpu, &op.block_inject, &normalized, &gates, op.rows)?;
+    hip(hyper_write(
+        gpu,
+        &HyperWrite {
+            input: &input,
+            normalized: &normalized,
+            mixed: &mixed,
+            gates: &gates,
+            output: &output,
+            branches: op.branches,
+            hidden: op.hidden,
+        },
+    ))
+}
+
+/// Gated DeltaNet recurrence with explicit convolution and projection order.
+pub struct GatedDeltaNetOp<'a> {
+    pub qkv: WeightRef<'a>,
+    pub conv: &'a GpuTensor,
+    pub in_proj_a: WeightRef<'a>,
+    pub in_proj_b: WeightRef<'a>,
+    pub a_log: &'a GpuTensor,
+    pub dt_bias: &'a GpuTensor,
+    pub z: WeightRef<'a>,
+    pub norm: &'a GpuTensor,
+    pub output: WeightRef<'a>,
+    pub recurrent: &'a GpuTensor,
+    pub conv_state: &'a GpuTensor,
+    pub projection: &'a GpuTensor,
+    pub projection2: &'a GpuTensor,
+    pub a: &'a GpuTensor,
+    pub b: &'a GpuTensor,
+    pub gate: &'a GpuTensor,
+    pub beta: &'a GpuTensor,
+    pub recurrent_output: &'a GpuTensor,
+    pub bf16_scratch: &'a GpuTensor,
+    pub z_output: &'a GpuTensor,
+    pub output_scratch: &'a GpuTensor,
+    pub input: &'a GpuTensor,
+    pub output_tensor: &'a GpuTensor,
+    pub rows: usize,
+    pub start_position: usize,
+    pub key_heads: usize,
+    pub value_heads: usize,
+    pub key_dim: usize,
+    pub value_dim: usize,
+    pub conv_kernel: usize,
+    pub input_width: usize,
+}
+
+impl GatedDeltaNetOp<'_> {
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        self.validate_layout()
+    }
+
+    fn validate_layout(&self) -> Result<(), DispatchError> {
+        if self.rows == 0
+            || self.input_width == 0
+            || self.key_heads == 0
+            || self.value_heads == 0
+            || self.key_dim == 0
+            || self.value_dim == 0
+            || self.conv_kernel == 0
+            || self.value_heads % self.key_heads != 0
+        {
+            return Err(DispatchError::Hip(
+                "gated delta net has invalid geometry".into(),
+            ));
+        }
+        let qk = checked_mul(self.key_heads, self.key_dim, "gated delta qk")?;
+        let value = checked_mul(self.value_heads, self.value_dim, "gated delta value")?;
+        let qkv_width = checked_mul(2, qk, "gated delta qkv")?
+            .checked_add(value)
+            .ok_or_else(|| DispatchError::Hip("gated delta qkv overflows".into()))?;
+        let qkv = checked_mul(self.rows, qkv_width, "gated delta qkv rows")?;
+        let rows_input = checked_mul(self.rows, self.input_width, "gated delta input")?;
+        let rows_value = checked_mul(self.rows, value, "gated delta value rows")?;
+        let rows_heads = checked_mul(self.rows, self.value_heads, "gated delta head rows")?;
+        require_tensor(self.input, rows_input, DType::F32, "gated delta input")?;
+        require_tensor(self.projection, qkv, DType::F32, "gated delta projection")?;
+        require_tensor(
+            self.projection2,
+            qkv,
+            DType::F32,
+            "gated delta projection scratch",
+        )?;
+        require_tensor(
+            self.recurrent,
+            checked_mul(value, self.key_dim, "gated delta state")?,
+            DType::F32,
+            "gated delta state",
+        )?;
+        require_tensor(
+            self.conv_state,
+            checked_mul(self.conv_kernel - 1, qkv_width, "gated delta conv state")?,
+            DType::F32,
+            "gated delta conv state",
+        )?;
+        require_tensor(
+            self.conv,
+            checked_mul(qkv_width, self.conv_kernel, "gated delta conv")?,
+            DType::BF16,
+            "gated delta conv",
+        )?;
+        require_tensor(self.a, rows_heads, DType::F32, "gated delta A")?;
+        require_tensor(self.b, rows_heads, DType::F32, "gated delta B")?;
+        require_tensor(self.gate, rows_heads, DType::F32, "gated delta gate")?;
+        require_tensor(self.beta, rows_heads, DType::F32, "gated delta beta")?;
+        require_tensor(
+            self.recurrent_output,
+            rows_value,
+            DType::F32,
+            "gated delta recurrent output",
+        )?;
+        require_tensor(self.z_output, rows_value, DType::F32, "gated delta Z")?;
+        require_tensor(
+            self.output_scratch,
+            rows_value,
+            DType::F32,
+            "gated delta output scratch",
+        )?;
+        require_tensor(
+            self.bf16_scratch,
+            value.max(self.input_width),
+            DType::BF16,
+            "gated delta BF16 scratch",
+        )?;
+        require_tensor(
+            self.a_log,
+            self.value_heads,
+            DType::BF16,
+            "gated delta A-log",
+        )?;
+        require_tensor(
+            self.dt_bias,
+            self.value_heads,
+            DType::BF16,
+            "gated delta dt bias",
+        )?;
+        require_tensor(self.norm, self.value_dim, DType::BF16, "gated delta norm")?;
+        require_tensor(
+            self.output_tensor,
+            rows_input,
+            DType::F32,
+            "gated delta output",
+        )?;
+        require_weight(
+            &self.qkv,
+            qkv_width,
+            self.input_width,
+            DType::BF16,
+            "gated delta qkv",
+        )?;
+        require_weight(
+            &self.in_proj_a,
+            self.value_heads,
+            self.input_width,
+            DType::BF16,
+            "gated delta a",
+        )?;
+        require_weight(
+            &self.in_proj_b,
+            self.value_heads,
+            self.input_width,
+            DType::BF16,
+            "gated delta b",
+        )?;
+        require_weight(
+            &self.z,
+            value,
+            self.input_width,
+            DType::BF16,
+            "gated delta z",
+        )?;
+        require_weight(
+            &self.output,
+            self.input_width,
+            value,
+            DType::BF16,
+            "gated delta output projection",
+        )?;
+        Ok(())
+    }
+}
+
+pub fn execute_gated_delta_net(
+    gpu: &mut Gpu,
+    op: &GatedDeltaNetOp<'_>,
+) -> Result<(), DispatchError> {
+    let qk = op.key_heads * op.key_dim;
+    let value = op.value_heads * op.value_dim;
+    let qkv = 2 * qk + value;
+    let projection = view(op.projection, 0, op.rows * qkv);
+    let projection2 = view(op.projection2, 0, op.rows * qkv);
+    project_bf16_batch(gpu, &op.qkv, op.input, &projection, op.rows)?;
+    let a = view(op.a, 0, op.rows * op.value_heads);
+    let b = view(op.b, 0, op.rows * op.value_heads);
+    let z = view(op.z_output, 0, op.rows * value);
+    project_bf16_batch(gpu, &op.in_proj_a, op.input, &a, op.rows)?;
+    project_bf16_batch(gpu, &op.in_proj_b, op.input, &b, op.rows)?;
+    project_bf16_batch(gpu, &op.z, op.input, &z, op.rows)?;
+    let history_rows = op.conv_kernel.saturating_sub(1);
+    for row in 0..op.rows {
+        let position = op.start_position.saturating_add(row);
+        let cursor = if history_rows == 0 {
+            0
+        } else {
+            position % history_rows
+        };
+        let projection_row = view(&projection, row * qkv, qkv);
+        let projection2_row = view(&projection2, row * qkv, qkv);
+        hip(gated_delta_conv(
+            gpu,
+            &GatedDeltaConv {
+                input: &projection_row,
+                kernel: op.conv,
+                history: op.conv_state,
+                output: &projection2_row,
+                next_history: op.conv_state,
+                channels: qkv,
+                history_rows,
+                kernel_size: op.conv_kernel,
+                cursor,
+            },
+        ))?;
+        let a_row = view(&a, row * op.value_heads, op.value_heads);
+        let b_row = view(&b, row * op.value_heads, op.value_heads);
+        let gate_row = view(op.gate, row * op.value_heads, op.value_heads);
+        let beta_row = view(op.beta, row * op.value_heads, op.value_heads);
+        hip(gated_delta_params(
+            gpu,
+            &GatedDeltaParams {
+                a: &a_row,
+                b: &b_row,
+                a_log: op.a_log,
+                dt_bias: op.dt_bias,
+                gate: &gate_row,
+                beta: &beta_row,
+            },
+            op.value_heads,
+        ))?;
+        let q = view(&projection2_row, 0, qk);
+        let k = view(&projection2_row, qk, qk);
+        let v = view(&projection2_row, 2 * qk, value);
+        let recurrent_output = view(op.recurrent_output, row * value, value);
+        hip(gated_delta_step(
+            gpu,
+            &GatedDeltaStep {
+                q: &q,
+                k: &k,
+                v: &v,
+                gate: &gate_row,
+                beta: &beta_row,
+                state: op.recurrent,
+                output: &recurrent_output,
+                key_heads: op.key_heads,
+                value_heads: op.value_heads,
+                key_dim: op.key_dim,
+                value_dim: op.value_dim,
+            },
+        ))?;
+        let bf16 = view(op.bf16_scratch, 0, value);
+        hip(bf16_roundtrip_f32(
+            gpu,
+            &Bf16Roundtrip {
+                input: &recurrent_output,
+                scratch: &bf16,
+                output: &recurrent_output,
+                elements: value,
+            },
+        ))?;
+        let z_row = view(&z, row * value, value);
+        let gdn_output = view(op.output_scratch, row * value, value);
+        hip(gated_delta_gate(
+            gpu,
+            &GatedDeltaGate {
+                recurrent_output: &recurrent_output,
+                z: &z_row,
+                norm: op.norm,
+                output: &gdn_output,
+                value_heads: op.value_heads,
+                value_dim: op.value_dim,
+            },
+        ))?;
+    }
+    let output_batch = view(op.output_tensor, 0, op.rows * op.output.m);
+    project_bf16_batch(
+        gpu,
+        &op.output,
+        &op.output_scratch.sub_offset(0, op.rows * value),
+        &output_batch,
+        op.rows,
+    )?;
+    let bf16 = view(op.bf16_scratch, 0, op.output.m);
+    for row in 0..op.rows {
+        let output_row = view(&output_batch, row * op.output.m, op.output.m);
+        hip(bf16_roundtrip_f32(
+            gpu,
+            &Bf16Roundtrip {
+                input: &output_row,
+                scratch: &bf16,
+                output: &output_row,
+                elements: op.output.m,
+            },
+        ))?;
+    }
+    Ok(())
+}
+
+/// Borrowed cache tensors plus scalar metadata for one operation.  The
+/// architecture commits these scalar values to persistent state after the
+/// shared step list succeeds.
+pub struct IndexedAttentionState<'a> {
+    pub full_keys: &'a GpuTensor,
+    pub full_values: &'a GpuTensor,
+    pub raw_index_keys: &'a GpuTensor,
+    pub pooled_keys: &'a GpuTensor,
+    pub selected_indices: &'a GpuTensor,
+    pub full_capacity: usize,
+    pub raw_capacity: usize,
+    pub pooled_capacity: usize,
+    pub selected_capacity: usize,
+    pub position_capacity: usize,
+    pub full_len: usize,
+    pub raw_len: usize,
+    pub pooled_len: usize,
+    pub selected_len: usize,
+    pub position: usize,
+}
+
+pub struct IndexedAttentionOp<'a> {
+    pub indexer_qk: WeightRef<'a>,
+    pub indexer_q_norm: &'a GpuTensor,
+    pub indexer_k_norm: &'a GpuTensor,
+    pub q: WeightRef<'a>,
+    pub k: WeightRef<'a>,
+    pub v: WeightRef<'a>,
+    pub q_norm: &'a GpuTensor,
+    pub k_norm: &'a GpuTensor,
+    pub output: WeightRef<'a>,
+    pub state: IndexedAttentionState<'a>,
+    pub input: &'a GpuTensor,
+    pub index_scratch: &'a GpuTensor,
+    pub qgate_scratch: &'a GpuTensor,
+    pub k_scratch: &'a GpuTensor,
+    pub v_scratch: &'a GpuTensor,
+    pub qsa_output: &'a GpuTensor,
+    pub attention_output: &'a GpuTensor,
+    pub bf16_scratch: &'a GpuTensor,
+    pub rows: usize,
+    pub index_heads: usize,
+    pub index_kv_heads: usize,
+    pub index_dim: usize,
+    pub budget: usize,
+    pub compress: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub input_width: usize,
+}
+
+impl IndexedAttentionOp<'_> {
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        if self.rows == 0
+            || self.input_width == 0
+            || self.index_heads == 0
+            || self.index_kv_heads == 0
+            || self.index_dim == 0
+            || self.index_dim > 256
+            || self.index_dim % 2 != 0
+            || self.compress == 0
+            || self.heads == 0
+            || self.kv_heads == 0
+            || self.head_dim == 0
+            || self.head_dim > 256
+            || (self.head_dim < 64 && self.head_dim % 2 != 0)
+            || self.kv_heads > self.heads
+            || self.heads % self.kv_heads != 0
+            || self.state.full_capacity == 0
+            || self.state.raw_capacity == 0
+            || self.state.pooled_capacity == 0
+            || self.state.selected_capacity == 0
+            || self.state.position_capacity == 0
+        {
+            return Err(DispatchError::Hip(
+                "indexed attention has invalid geometry".into(),
+            ));
+        }
+        let index_width = checked_mul(
+            self.index_heads
+                .checked_add(self.index_kv_heads)
+                .ok_or_else(|| {
+                    DispatchError::Hip("indexed attention index width overflows".into())
+                })?,
+            self.index_dim,
+            "indexed attention index width",
+        )?;
+        let index_kv_width = checked_mul(
+            self.index_kv_heads,
+            self.index_dim,
+            "indexed attention index KV",
+        )?;
+        let q_width = checked_mul(self.heads, self.head_dim, "indexed attention Q width")?;
+        let qgate_width = checked_mul(2, q_width, "indexed attention Q/G width")?;
+        let kv_width = checked_mul(self.kv_heads, self.head_dim, "indexed attention KV width")?;
+        let rows_index = checked_mul(self.rows, index_width, "indexed attention index rows")?;
+        let rows_q = checked_mul(self.rows, q_width, "indexed attention Q rows")?;
+        let rows_kv = checked_mul(self.rows, kv_width, "indexed attention KV rows")?;
+        let rows_input = checked_mul(self.rows, self.input_width, "indexed attention input")?;
+        if self.state.position > self.state.position_capacity
+            || self.state.full_len > self.state.full_capacity
+            || self.state.raw_len > self.state.raw_capacity
+            || self.state.pooled_len > self.state.pooled_capacity
+            || self.state.selected_len > self.state.selected_capacity
+            || self.state.position != self.state.full_len
+            || self.state.position != self.state.raw_len
+            || self.state.pooled_len != self.state.position / self.compress
+            || self.state.selected_len > self.state.position
+            || self.rows > self.state.position_capacity - self.state.position
+        {
+            return Err(DispatchError::Hip(
+                "indexed attention state length/capacity mismatch".into(),
+            ));
+        }
+        require_tensor(
+            self.input,
+            rows_input,
+            DType::F32,
+            "indexed attention input",
+        )?;
+        require_tensor(
+            self.index_scratch,
+            rows_index,
+            DType::F32,
+            "indexed attention index scratch",
+        )?;
+        require_tensor(
+            self.qgate_scratch,
+            checked_mul(self.rows, qgate_width, "indexed attention q/g rows")?,
+            DType::F32,
+            "indexed attention q/g scratch",
+        )?;
+        require_tensor(
+            self.k_scratch,
+            rows_kv,
+            DType::F32,
+            "indexed attention k scratch",
+        )?;
+        require_tensor(
+            self.v_scratch,
+            rows_kv,
+            DType::F32,
+            "indexed attention v scratch",
+        )?;
+        require_tensor(
+            self.qsa_output,
+            rows_q,
+            DType::F32,
+            "indexed attention output scratch",
+        )?;
+        require_tensor(
+            self.attention_output,
+            checked_mul(
+                self.rows,
+                self.input_width,
+                "indexed attention projected rows",
+            )?,
+            DType::F32,
+            "indexed attention projected output",
+        )?;
+        require_tensor(
+            self.state.full_keys,
+            checked_mul(
+                self.state.full_capacity,
+                kv_width,
+                "indexed attention full keys",
+            )?,
+            DType::F32,
+            "indexed attention full keys",
+        )?;
+        require_tensor(
+            self.state.full_values,
+            checked_mul(
+                self.state.full_capacity,
+                kv_width,
+                "indexed attention full values",
+            )?,
+            DType::F32,
+            "indexed attention full values",
+        )?;
+        require_tensor(
+            self.state.raw_index_keys,
+            checked_mul(
+                self.state.raw_capacity,
+                index_kv_width,
+                "indexed attention raw keys",
+            )?,
+            DType::F32,
+            "indexed attention raw keys",
+        )?;
+        require_tensor(
+            self.state.pooled_keys,
+            checked_mul(
+                self.state.pooled_capacity,
+                index_kv_width,
+                "indexed attention pooled keys",
+            )?,
+            DType::F32,
+            "indexed attention pooled keys",
+        )?;
+        require_tensor(
+            self.state.selected_indices,
+            checked_mul(
+                self.state.selected_capacity,
+                std::mem::size_of::<i32>(),
+                "indexed attention selected bytes",
+            )?,
+            DType::Raw,
+            "indexed attention selected",
+        )?;
+        require_tensor(
+            self.indexer_q_norm,
+            self.index_dim,
+            DType::BF16,
+            "indexed attention index Q norm",
+        )?;
+        require_tensor(
+            self.indexer_k_norm,
+            self.index_dim,
+            DType::BF16,
+            "indexed attention index K norm",
+        )?;
+        require_tensor(
+            self.q_norm,
+            self.head_dim,
+            DType::BF16,
+            "indexed attention Q norm",
+        )?;
+        require_tensor(
+            self.k_norm,
+            self.head_dim,
+            DType::BF16,
+            "indexed attention K norm",
+        )?;
+        require_tensor(
+            self.bf16_scratch,
+            q_width.max(kv_width),
+            DType::BF16,
+            "indexed attention BF16 scratch",
+        )?;
+        require_weight(
+            &self.indexer_qk,
+            index_width,
+            self.input_width,
+            DType::BF16,
+            "indexed attention index projection",
+        )?;
+        require_weight(
+            &self.q,
+            qgate_width,
+            self.input_width,
+            DType::BF16,
+            "indexed attention q projection",
+        )?;
+        require_weight(
+            &self.k,
+            kv_width,
+            self.input_width,
+            DType::BF16,
+            "indexed attention k projection",
+        )?;
+        require_weight(
+            &self.v,
+            kv_width,
+            self.input_width,
+            DType::BF16,
+            "indexed attention v projection",
+        )?;
+        require_weight(
+            &self.output,
+            self.input_width,
+            q_width,
+            DType::BF16,
+            "indexed attention output projection",
+        )?;
+        Ok(())
+    }
+}
+
+pub fn execute_indexed_attention(
+    gpu: &mut Gpu,
+    op: &mut IndexedAttentionOp<'_>,
+) -> Result<(), DispatchError> {
+    let index_width = (op.index_heads + op.index_kv_heads) * op.index_dim;
+    let index_q_width = op.index_heads * op.index_dim;
+    let q_width = op.heads * op.head_dim;
+    let kv_width = op.kv_heads * op.head_dim;
+    let index_batch = view(op.index_scratch, 0, op.rows * index_width);
+    let qgate_batch = view(op.qgate_scratch, 0, op.rows * 2 * q_width);
+    let k_batch = view(op.k_scratch, 0, op.rows * kv_width);
+    let v_batch = view(op.v_scratch, 0, op.rows * kv_width);
+    project_bf16_batch(gpu, &op.indexer_qk, op.input, &index_batch, op.rows)?;
+    project_bf16_batch(gpu, &op.q, op.input, &qgate_batch, op.rows)?;
+    project_bf16_batch(gpu, &op.k, op.input, &k_batch, op.rows)?;
+    project_bf16_batch(gpu, &op.v, op.input, &v_batch, op.rows)?;
+    let initial_position = op.state.position;
+    let qsa_output_batch = view(op.qsa_output, 0, op.rows * q_width);
+    for row in 0..op.rows {
+        let position = initial_position
+            .checked_add(row)
+            .ok_or_else(|| DispatchError::Hip("indexed attention position overflows".into()))?;
+        let index_row = view(&index_batch, row * index_width, index_width);
+        let index_q = view(&index_row, 0, index_q_width);
+        let index_k = view(&index_row, index_q_width, op.index_kv_heads * op.index_dim);
+        hip(indexed_attention_norm_rope(
+            gpu,
+            &IndexedAttentionNormRope {
+                values: &index_q,
+                norm: op.indexer_q_norm,
+                heads: op.index_heads,
+                head_dim: op.index_dim,
+                head_stride: op.index_dim,
+                position,
+                rotary_dim: op.index_dim.min(64),
+            },
+        ))?;
+        hip(gpu.bf16_round_trip_f32(&index_k))?;
+        hip(gpu.memcpy_dtod_at_auto(
+            &op.state.raw_index_keys.buf,
+            position * op.index_kv_heads * op.index_dim * 4,
+            &index_k.buf,
+            0,
+            op.index_kv_heads * op.index_dim * 4,
+        ))?;
+        let qgate_row = view(&qgate_batch, row * 2 * q_width, 2 * q_width);
+        let k_row = view(&k_batch, row * kv_width, kv_width);
+        let v_row = view(&v_batch, row * kv_width, kv_width);
+        hip(indexed_attention_norm_rope(
+            gpu,
+            &IndexedAttentionNormRope {
+                values: &qgate_row,
+                norm: op.q_norm,
+                heads: op.heads,
+                head_dim: op.head_dim,
+                head_stride: 2 * op.head_dim,
+                position,
+                rotary_dim: op.head_dim.min(64),
+            },
+        ))?;
+        hip(indexed_attention_norm_rope(
+            gpu,
+            &IndexedAttentionNormRope {
+                values: &k_row,
+                norm: op.k_norm,
+                heads: op.kv_heads,
+                head_dim: op.head_dim,
+                head_stride: op.head_dim,
+                position,
+                rotary_dim: op.head_dim.min(64),
+            },
+        ))?;
+        hip(indexed_attention_cache_append(
+            gpu,
+            &IndexedAttentionCacheAppend {
+                key: &k_row,
+                value: &v_row,
+                full_keys: op.state.full_keys,
+                full_values: op.state.full_values,
+                position,
+                kv_width,
+            },
+        ))?;
+        let visible = position.checked_add(1).ok_or_else(|| {
+            DispatchError::Hip("indexed attention visible length overflows".into())
+        })?;
+        let complete = visible / op.compress;
+        if complete > 0 {
+            hip(indexed_attention_pool_rope(
+                gpu,
+                &IndexedAttentionPoolRope {
+                    raw_keys: op.state.raw_index_keys,
+                    pooled: op.state.pooled_keys,
+                    norm: Some(op.indexer_k_norm),
+                    block_count: complete,
+                    compress: op.compress,
+                    index_dim: op.index_kv_heads * op.index_dim,
+                },
+            ))?;
+        }
+        let budget_blocks = op.budget / op.compress;
+        hip(indexed_attention_select(
+            gpu,
+            &IndexedAttentionSelect {
+                query: &index_q,
+                pooled: op.state.pooled_keys,
+                selected: op.state.selected_indices,
+                block_count: complete,
+                index_heads: op.index_heads,
+                index_dim: op.index_dim,
+                budget_blocks,
+                compress: op.compress,
+                visible,
+                capacity: op.state.selected_capacity,
+            },
+        ))?;
+        let selected = (budget_blocks.min(complete) * op.compress + visible
+            - complete * op.compress)
+            .min(op.state.selected_capacity);
+        let qsa_row = view(&qsa_output_batch, row * q_width, q_width);
+        hip(indexed_attention_attention(
+            gpu,
+            &IndexedAttentionAttention {
+                q_with_gate: &qgate_row,
+                full_keys: op.state.full_keys,
+                full_values: op.state.full_values,
+                selected: op.state.selected_indices,
+                output: &qsa_row,
+                n_heads: op.heads,
+                n_kv_heads: op.kv_heads,
+                head_dim: op.head_dim,
+                selected_len: selected,
+                full_capacity: op.state.full_capacity,
+            },
+        ))?;
+        op.state.full_len = visible;
+        op.state.raw_len = visible;
+        op.state.pooled_len = complete;
+        op.state.selected_len = selected;
+        op.state.position = visible;
+    }
+    op.state.position = initial_position
+        .checked_add(op.rows)
+        .ok_or_else(|| DispatchError::Hip("indexed attention position overflows".into()))?;
+    project_bf16_batch(
+        gpu,
+        &op.output,
+        &qsa_output_batch,
+        &view(op.attention_output, 0, op.rows * op.output.m),
+        op.rows,
+    )
+}
+
+/// Grouped causal convolution contract used by PLE-like layers.  Geometry and
+/// kernel/dilation are supplied by the architecture; the low-level wrapper
+/// does not know a model's fixed layer index or hidden width.
+pub struct GroupedDepthwiseOp<'a> {
+    pub key: WeightRef<'a>,
+    pub value: WeightRef<'a>,
+    pub norm_key: &'a GpuTensor,
+    pub norm_query: &'a GpuTensor,
+    pub norm_conv: &'a GpuTensor,
+    pub conv: &'a GpuTensor,
+    pub state: &'a GpuTensor,
+    pub streams: &'a GpuTensor,
+    pub rows_tensor: &'a GpuTensor,
+    pub query: &'a GpuTensor,
+    pub key_scratch: &'a GpuTensor,
+    pub value_scratch: &'a GpuTensor,
+    pub gated: &'a GpuTensor,
+    pub normed: &'a GpuTensor,
+    pub output: &'a GpuTensor,
+    pub rows: usize,
+    pub branches: usize,
+    pub hidden: usize,
+    pub kernel_size: usize,
+    pub dilation: usize,
+    pub epsilon: f32,
+}
+
+impl GroupedDepthwiseOp<'_> {
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        if self.rows == 0
+            || self.branches == 0
+            || self.hidden == 0
+            || self.kernel_size == 0
+            || self.dilation == 0
+        {
+            return Err(DispatchError::Hip(
+                "grouped depthwise operation has invalid geometry".into(),
+            ));
+        }
+        let channels = checked_mul(self.branches, self.hidden, "grouped channels")?;
+        let history_rows =
+            checked_mul(self.kernel_size - 1, self.dilation, "grouped history rows")?;
+        let rows_channels = checked_mul(self.rows, channels, "grouped row channels")?;
+        let rows_hidden = checked_mul(self.rows, self.hidden, "grouped row hidden")?;
+        let conv_elements = checked_mul(channels, self.kernel_size, "grouped convolution")?;
+        let state_elements = checked_mul(history_rows, channels, "grouped state")?;
+        require_tensor(self.streams, rows_channels, DType::F32, "grouped streams")?;
+        require_tensor(self.query, rows_channels, DType::F32, "grouped query")?;
+        require_tensor(
+            self.key_scratch,
+            rows_channels,
+            DType::F32,
+            "grouped key scratch",
+        )?;
+        require_tensor(self.gated, rows_channels, DType::F32, "grouped gated")?;
+        require_tensor(self.normed, rows_channels, DType::F32, "grouped normed")?;
+        require_tensor(self.output, rows_channels, DType::F32, "grouped output")?;
+        require_tensor(self.rows_tensor, rows_hidden, DType::F32, "grouped rows")?;
+        require_tensor(
+            self.value_scratch,
+            rows_hidden,
+            DType::F32,
+            "grouped value scratch",
+        )?;
+        require_tensor(self.state, state_elements, DType::F32, "grouped state")?;
+        require_tensor(self.norm_key, channels, DType::BF16, "grouped key norm")?;
+        require_tensor(self.norm_query, channels, DType::BF16, "grouped query norm")?;
+        require_tensor(
+            self.norm_conv,
+            channels,
+            DType::BF16,
+            "grouped convolution norm",
+        )?;
+        require_tensor(self.conv, conv_elements, DType::BF16, "grouped convolution")?;
+        require_weight(&self.key, channels, self.hidden, DType::BF16, "grouped key")?;
+        require_weight(
+            &self.value,
+            self.hidden,
+            self.hidden,
+            DType::BF16,
+            "grouped value",
+        )?;
+        Ok(())
+    }
+}
+
+pub fn execute_grouped_depthwise(
+    gpu: &mut Gpu,
+    op: &GroupedDepthwiseOp<'_>,
+) -> Result<(), DispatchError> {
+    let channels = op.branches * op.hidden;
+    let streams = view(op.streams, 0, op.rows * channels);
+    let query = view(op.query, 0, op.rows * channels);
+    let key = view(op.key_scratch, 0, op.rows * channels);
+    let value = view(op.value_scratch, 0, op.rows * op.hidden);
+    let gated = view(op.gated, 0, op.rows * channels);
+    let normed = view(op.normed, 0, op.rows * channels);
+    let output = view(op.output, 0, op.rows * channels);
+    project_bf16_batch(gpu, &op.key, op.rows_tensor, &key, op.rows)?;
+    project_bf16_batch(gpu, &op.value, op.rows_tensor, &value, op.rows)?;
+    hip(gpu.copy_d2d(&streams, &query, streams.byte_size()))?;
+    hip(rdna_compute::grouped_ops::grouped_gate_bf16(
+        gpu,
+        &rdna_compute::grouped_ops::GroupedGate {
+            key: &key,
+            query: &query,
+            value: &value,
+            norm_key: op.norm_key,
+            norm_query: op.norm_query,
+            gated: &gated,
+            rows: op.rows,
+            groups: op.branches,
+            group_size: op.hidden,
+            epsilon: op.epsilon,
+        },
+    ))?;
+    hip(rdna_compute::grouped_ops::grouped_norm_bf16(
+        gpu,
+        &rdna_compute::grouped_ops::GroupedNorm {
+            input: &gated,
+            weight: op.norm_conv,
+            output: &normed,
+            tokens: op.rows,
+            groups: op.branches,
+            group_size: op.hidden,
+            epsilon: op.epsilon,
+        },
+    ))?;
+    hip(
+        rdna_compute::grouped_ops::grouped_depthwise_conv_silu_add_bf16(
+            gpu,
+            &rdna_compute::grouped_ops::GroupedDepthwiseConv {
+                gated: &gated,
+                normed: &normed,
+                conv_weight: op.conv,
+                state: op.state,
+                output: &output,
+                tokens: op.rows,
+                channels,
+                kernel_size: op.kernel_size,
+                dilation: op.dilation,
+            },
+        ),
+    )?;
+    hip(gpu.add_f32(&streams, &output, &streams))
+}
+
+/// Clear an F32 scratch prefix before a sealed routed execution.
+pub struct ClearOp<'a> {
+    pub tensor: &'a GpuTensor,
+    pub elements: usize,
+}
+
+impl ClearOp<'_> {
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        require_tensor(self.tensor, self.elements, DType::F32, "clear target")
+    }
+}
+
+pub fn execute_clear(gpu: &mut Gpu, op: &ClearOp<'_>) -> Result<(), DispatchError> {
+    hip(gpu.hip.memset(
+        &op.tensor.buf,
+        0,
+        checked_mul(op.elements, std::mem::size_of::<f32>(), "clear bytes")?,
+    ))
+}
+
+/// Final hyper read uses the same operation contract as a regular read; this
+/// helper only supplies the projection-free final output shape.
+pub fn execute_final_hyper(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), DispatchError> {
+    op.validate_for_gpu(gpu)?;
+    execute_hyper_read(gpu, op)
+}
+
+pub fn validate_lm_head(
+    weight: &WeightRef<'_>,
+    hidden_batch: &GpuTensor,
+    logits: &GpuTensor,
+    rows: usize,
+    requested_rows: usize,
+) -> Result<(), DispatchError> {
+    if rows == 0 || requested_rows == 0 || requested_rows > rows || weight.m == 0 || weight.k == 0 {
+        return Err(DispatchError::Hip("LM-head geometry is invalid".into()));
+    }
+    if !matches!(weight.dtype, DType::BF16 | DType::F32) {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "lm-head",
+            variant: "dtype",
+            arch: "",
+            quant: "unsupported",
+        });
+    }
+    require_tensor(hidden_batch, rows * weight.k, DType::F32, "LM-head hidden")?;
+    require_tensor(
+        logits,
+        requested_rows * weight.m,
+        DType::F32,
+        "LM-head output",
+    )
+}
+
+pub fn execute_lm_head(
+    gpu: &mut Gpu,
+    weight: &WeightRef<'_>,
+    hidden_batch: &GpuTensor,
+    logits: &GpuTensor,
+    rows: usize,
+    requested_rows: usize,
+) -> Result<(), DispatchError> {
+    validate_lm_head(weight, hidden_batch, logits, rows, requested_rows)?;
+    if requested_rows == rows {
+        match weight.dtype {
+            DType::BF16 => project_bf16_batch(gpu, weight, hidden_batch, logits, rows),
+            DType::F32 => hip(gpu.gemm_f32_batched(
+                weight.buf,
+                hidden_batch,
+                logits,
+                weight.m,
+                weight.k,
+                rows,
+            )),
+            _ => unreachable!(),
+        }
+    } else if requested_rows == 1 {
+        let input = view(hidden_batch, (rows - 1) * weight.k, weight.k);
+        match weight.dtype {
+            DType::BF16 => hip(gpu.gemv_bf16_xf32(weight.buf, &input, logits, weight.m, weight.k)),
+            DType::F32 => {
+                hip(gpu.gemm_f32_batched(weight.buf, &input, logits, weight.m, weight.k, 1))
+            }
+            _ => unreachable!(),
+        }
+    } else {
+        Err(DispatchError::Hip(
+            "LM-head supports all rows or final row only".into(),
+        ))
+    }
+}
+
+pub fn execute_argmax(
+    gpu: &mut Gpu,
+    logits: &GpuTensor,
+    indices: &GpuTensor,
+    rows: usize,
+    vocab: usize,
+) -> Result<(), DispatchError> {
+    hip(argmax_f32(
+        gpu,
+        &ArgmaxF32 {
+            logits,
+            indices,
+            rows,
+            vocab,
+        },
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tensor(elements: usize, dtype: DType) -> GpuTensor {
+        let mut tensor = GpuTensor::null_for_test();
+        tensor.shape = vec![elements];
+        tensor.dtype = dtype;
+        tensor
+    }
+
+    struct GdnFixture {
+        qkv: GpuTensor,
+        conv: GpuTensor,
+        in_proj_a: GpuTensor,
+        in_proj_b: GpuTensor,
+        a_log: GpuTensor,
+        dt_bias: GpuTensor,
+        z: GpuTensor,
+        norm: GpuTensor,
+        output: GpuTensor,
+        recurrent: GpuTensor,
+        conv_state: GpuTensor,
+        projection: GpuTensor,
+        projection2: GpuTensor,
+        a: GpuTensor,
+        b: GpuTensor,
+        gate: GpuTensor,
+        beta: GpuTensor,
+        recurrent_output: GpuTensor,
+        bf16_scratch: GpuTensor,
+        z_output: GpuTensor,
+        output_scratch: GpuTensor,
+        input: GpuTensor,
+        output_tensor: GpuTensor,
+    }
+
+    impl GdnFixture {
+        fn new() -> Self {
+            Self {
+                qkv: tensor(8, DType::BF16),
+                conv: tensor(8, DType::BF16),
+                in_proj_a: tensor(2, DType::BF16),
+                in_proj_b: tensor(2, DType::BF16),
+                a_log: tensor(1, DType::BF16),
+                dt_bias: tensor(1, DType::BF16),
+                z: tensor(4, DType::BF16),
+                norm: tensor(2, DType::BF16),
+                output: tensor(4, DType::BF16),
+                recurrent: tensor(2, DType::F32),
+                conv_state: tensor(4, DType::F32),
+                projection: tensor(4, DType::F32),
+                projection2: tensor(4, DType::F32),
+                a: tensor(1, DType::F32),
+                b: tensor(1, DType::F32),
+                gate: tensor(1, DType::F32),
+                beta: tensor(1, DType::F32),
+                recurrent_output: tensor(2, DType::F32),
+                bf16_scratch: tensor(2, DType::BF16),
+                z_output: tensor(2, DType::F32),
+                output_scratch: tensor(2, DType::F32),
+                input: tensor(2, DType::F32),
+                output_tensor: tensor(2, DType::F32),
+            }
+        }
+
+        fn op(&self) -> GatedDeltaNetOp<'_> {
+            fn weight(buf: &GpuTensor, m: usize, k: usize) -> WeightRef<'_> {
+                WeightRef {
+                    buf,
+                    dtype: DType::BF16,
+                    m,
+                    k,
+                    row_stride: k,
+                    rotation: None,
+                    awq_scale: None,
+                }
+            }
+
+            GatedDeltaNetOp {
+                qkv: weight(&self.qkv, 4, 2),
+                conv: &self.conv,
+                in_proj_a: weight(&self.in_proj_a, 1, 2),
+                in_proj_b: weight(&self.in_proj_b, 1, 2),
+                a_log: &self.a_log,
+                dt_bias: &self.dt_bias,
+                z: weight(&self.z, 2, 2),
+                norm: &self.norm,
+                output: weight(&self.output, 2, 2),
+                recurrent: &self.recurrent,
+                conv_state: &self.conv_state,
+                projection: &self.projection,
+                projection2: &self.projection2,
+                a: &self.a,
+                b: &self.b,
+                gate: &self.gate,
+                beta: &self.beta,
+                recurrent_output: &self.recurrent_output,
+                bf16_scratch: &self.bf16_scratch,
+                z_output: &self.z_output,
+                output_scratch: &self.output_scratch,
+                input: &self.input,
+                output_tensor: &self.output_tensor,
+                rows: 1,
+                start_position: 0,
+                key_heads: 1,
+                value_heads: 1,
+                key_dim: 1,
+                value_dim: 2,
+                conv_kernel: 2,
+                input_width: 2,
+            }
+        }
+    }
+
+    #[test]
+    fn gdn_accepts_bf16_metadata_and_rejects_f32_metadata() {
+        let mut fixture = GdnFixture::new();
+        assert!(fixture.op().validate_layout().is_ok());
+
+        fixture.a_log.dtype = DType::F32;
+        let error = fixture
+            .op()
+            .validate_layout()
+            .expect_err("F32 A-log must not pass the BF16 kernel contract");
+        assert!(error.to_string().contains("gated delta A-log"));
+
+        fixture.a_log.dtype = DType::BF16;
+        fixture.dt_bias.dtype = DType::F32;
+        let error = fixture
+            .op()
+            .validate_layout()
+            .expect_err("F32 dt bias must not pass the BF16 kernel contract");
+        assert!(error.to_string().contains("gated delta dt bias"));
+    }
+}

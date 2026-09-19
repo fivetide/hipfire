@@ -82,11 +82,19 @@ pub enum Step<'a> {
         bias: &'a GpuTensor,
         dim: usize,
     },
-    /// Complete Qwen4 layer-major operation. The op owns mutable state views;
-    /// the mutable executor arm keeps this composite operation in the same
-    /// shared Step interpreter as all other dispatch work.
-    Qwen4Layer(crate::pipeline::qwen4_program::Qwen4LayerOp<'a>),
-    Qwen4Ple(crate::pipeline::qwen4_program::Qwen4PleOp<'a>),
+    /// Grouped hyper-connection read.  The operation contract is model-neutral;
+    /// architecture crates bind the resident projections and fixed-capacity views.
+    HyperRead(crate::pipeline::layer_ops::HyperReadOp<'a>),
+    /// Gated DeltaNet recurrent attention with borrowed state and scratch.
+    GatedDeltaNet(crate::pipeline::layer_ops::GatedDeltaNetOp<'a>),
+    /// Indexed causal attention with borrowed cache metadata.
+    IndexedAttention(crate::pipeline::layer_ops::IndexedAttentionOp<'a>),
+    /// Grouped hyper-connection write with in-place residual injection.
+    HyperWrite(crate::pipeline::layer_ops::HyperWriteOp<'a>),
+    /// Grouped causal convolution/gating operation.
+    GroupedDepthwise(crate::pipeline::layer_ops::GroupedDepthwiseOp<'a>),
+    /// Launch-free clear of a preallocated scratch prefix.
+    Clear(crate::pipeline::layer_ops::ClearOp<'a>),
     /// Complete validated MoE program. The sealed call remains the public
     /// authority; granular operands are only produced by its shared lowerer.
     Moe(sealed_moe::SealedMoeCall<'a>),
@@ -117,11 +125,15 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         Step::RmsnormAutomatic { .. } => Some(PipelineOp::RmsnormAutomatic),
         Step::Attend { .. } => Some(PipelineOp::Attend),
         Step::Rope { .. } => Some(PipelineOp::Rope),
-        Step::QkNorm { .. } => Some(PipelineOp::QkNorm),
+        Step::HyperRead(_)
+        | Step::GatedDeltaNet(_)
+        | Step::IndexedAttention(_)
+        | Step::HyperWrite(_)
+        | Step::GroupedDepthwise(_)
+        | Step::Clear(_)
+        | Step::QkNorm { .. } => Some(PipelineOp::QkNorm),
         Step::BiasAdd { .. } => Some(PipelineOp::BiasAdd),
-        Step::Qwen4Layer(_)
-        | Step::Qwen4Ple(_)
-        | Step::Moe(_)
+        Step::Moe(_)
         | Step::MoeNormalize(_)
         | Step::MoeInputBasis(_)
         | Step::MoeGateSide(_)
@@ -690,31 +702,42 @@ const FUSED_TABLE: &[FusedPattern] = &[
 static GEMV: OnceLock<GemvFamily> = OnceLock::new();
 static ROTATION: OnceLock<RotationFamily> = OnceLock::new();
 static FUSED_QKV: OnceLock<FusedQkvFamily> = OnceLock::new();
+/// Preflight every new composite operation and sealed MoE call in a typed
+/// program without launching or mutating state.  The legacy scalar `Step`
+/// variants deliberately retain their existing launch-time validation and are
+/// not widened by this seam.
+///
+/// Architecture binders use this before unrelated effects (embedding, cache
+/// staging, or PLE leases) begin.
+pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchError> {
+    for step in steps {
+        match step {
+            Step::Moe(call) => call.validate_for_gpu(gpu)?,
+            Step::HyperRead(op) => op.validate_for_gpu(gpu)?,
+            Step::GatedDeltaNet(op) => op.validate_for_gpu(gpu)?,
+            Step::IndexedAttention(op) => op.validate_for_gpu(gpu)?,
+            Step::HyperWrite(op) => op.validate_for_gpu(gpu)?,
+            Step::GroupedDepthwise(op) => op.validate_for_gpu(gpu)?,
+            Step::Clear(op) => op.validate_for_gpu(gpu)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub fn execute_steps<'a>(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
     steps: &mut [Step<'a>],
 ) -> Result<(), DispatchError> {
-    // Validate every sealed/composite call before issuing even the first
-    // non-MoE launch. A malformed later call must not leave an earlier step
-    // partially executed.
-    for step in steps.iter() {
-        match step {
-            Step::Moe(call) => call.validate_for_gpu(gpu)?,
-            Step::Qwen4Layer(op) => {
-                crate::pipeline::qwen4_program::validate_layer_for_gpu(gpu, op)?
-            }
-            Step::Qwen4Ple(op) => crate::pipeline::qwen4_program::validate_ple(op)?,
-            _ => {}
-        }
-    }
+    validate_steps(gpu, steps)?;
     execute_validated_steps(gpu, ctx, steps)
 }
 
-/// Execute a list whose complete-call entries have already passed whole-list
-/// preflight. Sealed MoE lowering reuses this one launch/fusion loop rather
-/// than introducing a second interpreter.
-pub(super) fn execute_validated_steps<'a>(
+/// Execute a list after [`validate_steps`] has completed.  This entry point is
+/// for architecture owners that must preflight the entire list before other
+/// request effects begin.
+pub fn execute_validated_steps<'a>(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
     steps: &mut [Step<'a>],
@@ -855,8 +878,16 @@ fn launch_op_mut(
     step: &mut Step<'_>,
 ) -> Result<(), DispatchError> {
     match step {
-        Step::Qwen4Layer(op) => crate::pipeline::qwen4_program::execute_layer(gpu, op),
-        Step::Qwen4Ple(op) => crate::pipeline::qwen4_program::execute_ple(gpu, op),
+        Step::HyperRead(op) => crate::pipeline::layer_ops::execute_hyper_read(gpu, op),
+        Step::GatedDeltaNet(op) => crate::pipeline::layer_ops::execute_gated_delta_net(gpu, op),
+        Step::IndexedAttention(op) => {
+            crate::pipeline::layer_ops::execute_indexed_attention(gpu, op)
+        }
+        Step::HyperWrite(op) => crate::pipeline::layer_ops::execute_hyper_write(gpu, op),
+        Step::GroupedDepthwise(op) => {
+            crate::pipeline::layer_ops::execute_grouped_depthwise(gpu, op)
+        }
+        Step::Clear(op) => crate::pipeline::layer_ops::execute_clear(gpu, op),
         _ => launch_op(gpu, ctx, step),
     }
 }
@@ -1083,15 +1114,14 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         Step::BiasAdd { x, bias, dim } => gpu
             .bias_add_f32(x, bias, 1, *dim)
             .map_err(|e| DispatchError::Hip(e.to_string())),
-        Step::Qwen4Layer(_) => Err(DispatchError::UnsupportedVariant {
+        Step::HyperRead(_)
+        | Step::GatedDeltaNet(_)
+        | Step::IndexedAttention(_)
+        | Step::HyperWrite(_)
+        | Step::GroupedDepthwise(_)
+        | Step::Clear(_) => Err(DispatchError::UnsupportedVariant {
             family: "pipeline",
-            variant: "qwen4_layer_requires_mutable_executor",
-            arch: "",
-            quant: "stateful",
-        }),
-        Step::Qwen4Ple(_) => Err(DispatchError::UnsupportedVariant {
-            family: "pipeline",
-            variant: "qwen4_ple_requires_mutable_executor",
+            variant: "stateful-operation-requires-mutable-executor",
             arch: "",
             quant: "stateful",
         }),

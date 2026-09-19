@@ -16,12 +16,13 @@ use crate::gpu_forward::{
 use crate::projection::dispatch_gemv;
 use crate::weights::{HyperConnectionWeights, Qwen4Weights, WeightError};
 use hipfire_runtime::spec::SpecGrammar;
-use rdna_compute::qwen4::{
-    qwen4_argmax, qwen4_hc_final, qwen4_hc_norm, qwen4_hc_read_projected, qwen4_hc_write,
-    qwen4_qsa_attention, qwen4_qsa_cache_append, qwen4_qsa_norm_rope, qwen4_qsa_pool_rope,
-    qwen4_qsa_reuse_selection, qwen4_qsa_select, qwen4_scale, Qwen4Argmax, Qwen4HcFinal,
-    Qwen4HcNorm, Qwen4HcReadProjected, Qwen4HcWrite, Qwen4QsaAttention, Qwen4QsaCacheAppend,
-    Qwen4QsaNormRope, Qwen4QsaPoolRope, Qwen4QsaReuseSelection, Qwen4QsaSelect, Qwen4Scale,
+use rdna_compute::tensor_ops::{
+    argmax_f32, hyper_final, hyper_norm, hyper_read_projected, hyper_write,
+    indexed_attention_attention, indexed_attention_cache_append, indexed_attention_norm_rope,
+    indexed_attention_pool_rope, indexed_attention_reuse_selection, indexed_attention_select,
+    scale_f32, ArgmaxF32, HyperFinal, HyperNorm, HyperReadProjected, HyperWrite,
+    IndexedAttentionAttention, IndexedAttentionCacheAppend, IndexedAttentionNormRope,
+    IndexedAttentionPoolRope, IndexedAttentionReuseSelection, IndexedAttentionSelect, ScaleF32,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::fmt;
@@ -64,9 +65,9 @@ fn hc_read(
     let norm = weights.resident(&hyper.hc_norm)?;
     let down = weights.resident(&hyper.input_mix_down)?;
     let up_weight = weights.resident(&hyper.input_mix_up)?;
-    qwen4_hc_norm(
+    hyper_norm(
         gpu,
-        &Qwen4HcNorm {
+        &HyperNorm {
             input,
             norm_weight: norm,
             normalized,
@@ -83,9 +84,9 @@ fn hc_read(
         config.hc_lowrank,
         config.hc_count * config.hidden_size,
     )?;
-    qwen4_scale(
+    scale_f32(
         gpu,
-        &Qwen4Scale {
+        &ScaleF32 {
             values: low,
             scale: 1.0 / config.hc_count as f32,
         },
@@ -101,9 +102,9 @@ fn hc_read(
         config.hc_lowrank,
     )?;
     let projected_up = f32_view(up, 0, config.hc_count * config.hidden_size);
-    qwen4_hc_read_projected(
+    hyper_read_projected(
         gpu,
-        &Qwen4HcReadProjected {
+        &HyperReadProjected {
             input,
             norm_weight: norm,
             up: &projected_up,
@@ -130,9 +131,9 @@ fn hc_write(
 ) -> Result<(), MtpGpuError> {
     let norm = weights.resident(&hyper.hc_norm)?;
     let inject = weights.resident(&hyper.block_inject)?;
-    qwen4_hc_norm(
+    hyper_norm(
         gpu,
-        &Qwen4HcNorm {
+        &HyperNorm {
             input,
             norm_weight: norm,
             normalized,
@@ -149,9 +150,9 @@ fn hc_write(
         config.hc_count,
         config.hc_count * config.hidden_size,
     )?;
-    qwen4_hc_write(
+    hyper_write(
         gpu,
-        &Qwen4HcWrite {
+        &HyperWrite {
             input,
             normalized,
             mixed,
@@ -1255,9 +1256,9 @@ impl Qwen4MtpGpu {
         embed_token(gpu, weights, config, scratch)?;
 
         let embedding_norm_weight = weights.resident(&weights.mtp.pre_fc_norm_embedding)?;
-        qwen4_hc_norm(
+        hyper_norm(
             gpu,
-            &Qwen4HcNorm {
+            &HyperNorm {
                 input: &scratch.token_embedding,
                 norm_weight: embedding_norm_weight,
                 normalized: &scratch.embedding_norm,
@@ -1277,9 +1278,9 @@ impl Qwen4MtpGpu {
         )?;
 
         let hidden_norm_weight = weights.resident(&weights.mtp.pre_fc_norm_hidden)?;
-        qwen4_hc_norm(
+        hyper_norm(
             gpu,
-            &Qwen4HcNorm {
+            &HyperNorm {
                 input: backbone_hidden,
                 norm_weight: hidden_norm_weight,
                 normalized: &scratch.hidden_norm,
@@ -1357,9 +1358,9 @@ impl Qwen4MtpGpu {
         )?;
         let index_query_norm = weights.resident(&qsa.indexer_q_norm)?;
         let index_key_norm = weights.resident(&qsa.indexer_k_norm)?;
-        qwen4_qsa_norm_rope(
+        indexed_attention_norm_rope(
             gpu,
-            &Qwen4QsaNormRope {
+            &IndexedAttentionNormRope {
                 values: &scratch.index_query,
                 norm: index_query_norm,
                 heads: config.indexer_n_heads,
@@ -1421,9 +1422,9 @@ impl Qwen4MtpGpu {
         let k_norm = weights.resident(&qsa.k_norm)?;
         // q_proj already emits [Q, gate] for each head. Normalize and rotate
         // each Q half in place while preserving its adjacent gate half.
-        qwen4_qsa_norm_rope(
+        indexed_attention_norm_rope(
             gpu,
-            &Qwen4QsaNormRope {
+            &IndexedAttentionNormRope {
                 values: q_and_gate,
                 norm: q_norm,
                 heads: config.num_attention_heads,
@@ -1433,9 +1434,9 @@ impl Qwen4MtpGpu {
                 rotary_dim: MTP_ROTARY_DIM.min(config.head_dim),
             },
         )?;
-        qwen4_qsa_norm_rope(
+        indexed_attention_norm_rope(
             gpu,
-            &Qwen4QsaNormRope {
+            &IndexedAttentionNormRope {
                 values: &scratch.qsa_k,
                 norm: k_norm,
                 heads: config.num_key_value_heads,
@@ -1445,9 +1446,9 @@ impl Qwen4MtpGpu {
                 rotary_dim: MTP_ROTARY_DIM.min(config.head_dim),
             },
         )?;
-        qwen4_qsa_cache_append(
+        indexed_attention_cache_append(
             gpu,
-            &Qwen4QsaCacheAppend {
+            &IndexedAttentionCacheAppend {
                 key: &scratch.qsa_k,
                 value: &scratch.qsa_v,
                 full_keys: &state.full_keys,
@@ -1459,9 +1460,9 @@ impl Qwen4MtpGpu {
         let visible = next_position;
         let complete = visible / config.indexer_compress_ratio;
         if complete > 0 {
-            qwen4_qsa_pool_rope(
+            indexed_attention_pool_rope(
                 gpu,
-                &Qwen4QsaPoolRope {
+                &IndexedAttentionPoolRope {
                     raw_keys: &state.raw_index_keys,
                     pooled: &state.pooled_keys,
                     norm: Some(index_key_norm),
@@ -1473,9 +1474,9 @@ impl Qwen4MtpGpu {
         }
         let budget_blocks = config.indexer_budget / config.indexer_compress_ratio;
         if state.step_index == 0 {
-            qwen4_qsa_select(
+            indexed_attention_select(
                 gpu,
-                &Qwen4QsaSelect {
+                &IndexedAttentionSelect {
                     query: &scratch.index_query,
                     pooled: &state.pooled_keys,
                     selected: &state.selected_indices,
@@ -1492,9 +1493,9 @@ impl Qwen4MtpGpu {
                 - complete * config.indexer_compress_ratio;
             state.selected_len = selected.min(state.selected_capacity);
         } else {
-            qwen4_qsa_reuse_selection(
+            indexed_attention_reuse_selection(
                 gpu,
-                &Qwen4QsaReuseSelection {
+                &IndexedAttentionReuseSelection {
                     selected: &state.selected_indices,
                     selected_len: state.selected_len,
                     position,
@@ -1523,9 +1524,9 @@ impl Qwen4MtpGpu {
             state.selected_len = selected_len;
         }
         let selected = state.selected_len;
-        qwen4_qsa_attention(
+        indexed_attention_attention(
             gpu,
-            &Qwen4QsaAttention {
+            &IndexedAttentionAttention {
                 q_with_gate: q_and_gate,
                 full_keys: &state.full_keys,
                 full_values: &state.full_values,
@@ -1610,9 +1611,9 @@ impl Qwen4MtpGpu {
             &scratch.rotation,
         )?;
         let final_norm = weights.resident(&weights.mtp.final_hyper.hc_norm)?;
-        qwen4_hc_norm(
+        hyper_norm(
             gpu,
-            &Qwen4HcNorm {
+            &HyperNorm {
                 input: &scratch.wide,
                 norm_weight: final_norm,
                 normalized: &scratch.hc_normalized,
@@ -1620,9 +1621,9 @@ impl Qwen4MtpGpu {
                 hidden: config.hidden_size,
             },
         )?;
-        qwen4_hc_final(
+        hyper_final(
             gpu,
-            &Qwen4HcFinal {
+            &HyperFinal {
                 normalized: &scratch.hc_normalized,
                 output: &scratch.hc_mixed,
                 branches: MTP_BRANCHES,
@@ -1639,9 +1640,9 @@ impl Qwen4MtpGpu {
             config.vocab_size,
             config.hidden_size,
         )?;
-        qwen4_argmax(
+        argmax_f32(
             gpu,
-            &Qwen4Argmax {
+            &ArgmaxF32 {
                 logits: &scratch.logits,
                 indices: &scratch.top1,
                 rows: 1,

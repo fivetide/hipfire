@@ -644,3 +644,70 @@ scoped Rust formatting checks all completed with exit 0; raw host-gate logs
 and all GPU evidence are retained at the paths in the dated record. Physical
 EP2/EP4, retained replay/PM4 admission, and product promotion remain outside
 this checkpoint.
+
+## Verification checkpoint — current typed Qwen4 ownership (2026-09-19)
+
+This dated section records the ownership cutover after a real gfx1151 short
+smoke. Earlier checkpoints remain historical and append-only; their source
+paths and evidence are not rewritten here.
+
+### Current ownership and path map
+
+- `crates/hipfire-arch-qwen4/src/program.rs` owns the Qwen4 program
+  dimensions, fixed-capacity scratch layout, typed layer descriptors, and the
+  architecture-bound MoE binding/sealing entry. Qwen4 supplies its typed
+  dimensions and resident weight formats; shared sealing still applies the
+  immutable canonical QT44/QT53 grouped capability checks.
+- `crates/hipfire-arch-qwen4/src/gpu_forward.rs` owns GPU scratch allocation,
+  row-bounded typed `Step` construction, the logical `[rows, experts]` router
+  view used by both MoE preflight and execution, and whole-program preflight
+  before token upload, embedding, stream setup, or PLE effects. QSA scalar
+  metadata is copied from request-local operation state only after the
+  validated program and final-output path succeed.
+- `crates/hipfire-dispatch/src/pipeline/layer_ops.rs` owns neutral
+  `HyperRead`, `HyperWrite`, `GatedDeltaNet`, `IndexedAttention`,
+  `GroupedDepthwise`, and `Clear` contracts plus their shape/dtype
+  validation and execution. Reusable max-chunk arenas remain capacity-checked;
+  exact-row views are passed to wrappers whose low-level contracts infer
+  logical row counts. GDN A-log and dt-bias validation follows the BF16
+  `gated_delta_params` wrapper contract.
+- `crates/hipfire-dispatch/src/pipeline/steps.rs` owns typed schedule order and
+  composite/MoE preflight. Legacy scalar `Step` variants retain their
+  established launch-time validation and are not widened by this cutover.
+  `crates/hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs` owns the exact
+  QT44/QT53 grouped format stages, while
+  `pipeline/sealed_moe.rs` and `pipeline/moe_program.rs` remain the shared
+  sealed route and lowering owners.
+- `crates/rdna-compute/src/tensor_ops.rs` and
+  `crates/rdna-compute/src/grouped_ops.rs` own neutral tensor/kernel wrappers
+  and their executable dtype contracts. Fixed Qwen4 HIP helpers live in
+  `crates/hipfire-arch-qwen4/src/gpu_ops.rs` and
+  `crates/hipfire-arch-qwen4/src/qwen4_specific.hip`.
+- The superseded shared Qwen4-specific interpreter/helper paths
+  (`crates/hipfire-dispatch/src/pipeline/qwen4_program.rs`,
+  `crates/hipfire-dispatch/src/pipeline/qwen4_prefill.rs`,
+  `crates/rdna-compute/src/qwen4.rs`, and
+  `crates/rdna-compute/src/qwen4_ple_ops.rs`) are removed from the current
+  production path. No second architecture-owned interpreter or duplicate
+  Qwen4 sequencing loop remains.
+
+The current typed sequence uses the architecture-owned fixed inline capacity
+of 384 steps; the configured 48-layer sequence consumes 337 composite/MoE
+steps at its maximum. This is a bounded scheduling resource, not a
+prompt-sized allocation.
+
+### Scoped evidence and boundary
+
+| Check | Current evidence |
+|---|---|
+| GDN metadata contract | Host fake-tensor regression accepts BF16 A-log/dt-bias and rejects F32 metadata; `cargo test -p hipfire-dispatch --lib pipeline::layer_ops::tests::gdn_accepts_bf16_metadata_and_rejects_f32_metadata --locked` passed. |
+| Architecture binding compile | `cargo check -p hipfire-arch-qwen4 --lib --locked` passed after the shaped router-view repair. |
+| Real-device short smoke | `.codeinsight+research/qwen4/architecture-seam-20260919/runs/post-refactor/oracle/short-two-token-moefixed.json` reports `status=pass`, `exact_bits=true`, `ids_equal=true`, gfx1151, and one continuation step. The earlier HyperRead and flat-router failures remain preserved in their dated stderr artifacts. |
+| Full natural oracle and frozen comparisons | `.codeinsight+research/qwen4/architecture-seam-20260919/runs/post-refactor/oracle/full-result.json` reports `status=pass`, `exact_bits=true`, `ids_equal=true`, gfx1151, 16 continuation steps, and natural chunks `[128,128,35]`; `.codeinsight+research/qwen4/architecture-seam-20260919/runs/post-refactor/oracle/parity-check.json` also reports `status=pass`, exact prefill state, exact per-step outputs, and equality with the immutable original, frozen HC, and frozen N8 references. |
+| AR/MTP serve smoke | `.codeinsight+research/qwen4/architecture-seam-20260919/runs/post-refactor/serve-final3/corrected-validation.json` reports `status=pass`: both arms return `Paris`, `finish=stop`, `saw_done=true`, nonempty output, no runaway, and no stream error; AR reports `mtp=null`, while native MTP reports `mtp=true` (`.codeinsight+research/qwen4/architecture-seam-20260919/runs/post-refactor/serve-final3/mtp/harness.json` records `tau=1.0`, `cycles=1`). The earlier malformed-environment attempt remains preserved under `.codeinsight+research/qwen4/architecture-seam-20260919/runs/post-refactor/serve/ar/`. |
+| Final host gates | `.codeinsight+research/qwen4/architecture-seam-20260919/host-checks/rustfmt-check-scoped-bounded-views-final.log`, `.codeinsight+research/qwen4/architecture-seam-20260919/host-checks/cargo-build-release-workspace-all-targets-locked-bounded-views-final.log`, `.codeinsight+research/qwen4/architecture-seam-20260919/host-checks/cargo-test-release-workspace-lib-locked-bounded-views-final.log`, and `.codeinsight+research/qwen4/architecture-seam-20260919/host-checks/cargo-clippy-release-workspace-all-targets-locked-bounded-views-final.log` all record exit 0; the workspace library suites include rdna-compute 253/253 and hipfire-dispatch 285/285. |
+
+This cutover is an ownership, ordering, shape, and dtype correction. It does
+not admit a replay/PM4 route, physical EP2/EP4, retained admission, throughput
+promotion, or quality/marketing claim. The exact oracle, serve, and host
+artifacts above are correctness and integration evidence only.

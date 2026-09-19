@@ -37,6 +37,58 @@ pub enum MoeRecipe {
     SigmoidRoutedNoShared,
 }
 
+/// Architecture-owned geometry and format contract for a specialized grouped
+/// route.  The shared executor only consumes this declaration; it never
+/// invents model-specific expert counts, top-k widths, or QT formats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoeRoutePolicy {
+    /// Architecture-selected shared kernel capability. Geometry and formats
+    /// are immutable shared-kernel constraints, not caller-supplied authority.
+    pub capability: MoeRouteCapability,
+}
+
+/// Concrete grouped kernel capability implemented by shared dispatch.
+///
+/// Architecture admission may select this capability only after validating a
+/// model's source layout; the shared executor still checks the full fixed
+/// geometry below and never treats caller-supplied dimensions as proof that a
+/// new kernel exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeRouteCapability {
+    Qt44Qt53Grouped,
+}
+pub(crate) fn grouped_route_kernel_capable(policy: &MoeRoutePolicy) -> bool {
+    matches!(policy.capability, MoeRouteCapability::Qt44Qt53Grouped)
+}
+
+/// Immutable geometry and wire-format contract for the implemented grouped
+/// QT44/QT53 kernels. Model dimensions are checked against this capability
+/// before any route producer, grouped launch, or combine can run.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn grouped_route_geometry_supported(
+    policy: &MoeRoutePolicy,
+    experts: usize,
+    top_k: usize,
+    hidden: usize,
+    intermediate: usize,
+    gate_up_k: usize,
+    down_m: usize,
+    down_k: usize,
+    gate_up: DType,
+    down: DType,
+) -> bool {
+    grouped_route_kernel_capable(policy)
+        && experts == 512
+        && top_k == 10
+        && hidden == 2560
+        && intermediate == 640
+        && gate_up_k == 2560
+        && down_m == 2560
+        && down_k == 640
+        && gate_up == DType::MQ4G256V2
+        && down == DType::MQ4G128V2
+}
+
 /// Source of the activation consumed by a MoE recipe.
 pub enum MoeNormalization<'a> {
     Provided,
@@ -57,6 +109,7 @@ pub struct MoeSharedDtypes {
 }
 
 /// Borrowed weights for the optional replicated/shared expert.
+#[derive(Clone, Copy)]
 pub struct MoeSharedWeights<'a> {
     pub selector: WeightRef<'a>,
     pub gate: WeightRef<'a>,
@@ -586,6 +639,8 @@ pub trait RoutedExpertWeights {
 pub struct MoeParams<'a> {
     pub dtypes: MoeDtypes<'a>,
     pub recipe: MoeRecipe,
+    /// Optional specialized route declaration supplied by the architecture.
+    pub route_policy: Option<MoeRoutePolicy>,
     pub normalization: MoeNormalization<'a>,
     /// Token-batch width. Decode = 1. >1 must route to grouped prefill (Step 8).
     pub batch_size: usize,
@@ -913,6 +968,8 @@ pub struct MoePrefillParams<'a> {
     // dtype snapshot
     pub dtypes: MoeDtypes<'a>,
     pub recipe: MoeRecipe,
+    /// Optional specialized route declaration supplied by the architecture.
+    pub route_policy: Option<MoeRoutePolicy>,
     /// Complete normalization/router/shared prelude. The routed tail below
     /// remains unchanged and consumes the declared route buffers.
     pub prelude: MoePrefillPrelude<'a>,

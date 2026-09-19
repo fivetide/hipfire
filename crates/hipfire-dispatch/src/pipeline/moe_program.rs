@@ -379,7 +379,7 @@ impl<'a> SealedMoeOp<'a> {
         }
         let (params, selection) = self.state.prefill_parts()?;
         if selection.qwen4_top10 {
-            return super::qwen4_prefill::input_basis(gpu, params);
+            return super::qt44_qt53_prefill::input_basis(gpu, params);
         }
         let input_weight = params
             .prelude
@@ -463,7 +463,7 @@ impl<'a> SealedMoeOp<'a> {
             MoeProtocol::GroupedPrefill => {
                 let (params, selection) = self.state.prefill_parts()?;
                 if selection.qwen4_top10 {
-                    return super::qwen4_prefill::router_projection(gpu, params);
+                    return super::qt44_qt53_prefill::router_projection(gpu, params);
                 }
                 let prelude = &params.prelude;
                 let x = match prelude.router.dtype {
@@ -664,7 +664,7 @@ impl<'a> SealedMoeOp<'a> {
         }
         let (params, selection) = self.state.prefill_parts()?;
         if selection.qwen4_top10 {
-            return super::qwen4_prefill::shared_gate_up(gpu, params);
+            return super::qt44_qt53_prefill::shared_gate_up(gpu, params);
         }
         super::prefill_shared_gate_up_stage(self.state.dispatch_ctx(), gpu, params)
     }
@@ -690,7 +690,7 @@ impl<'a> SealedMoeOp<'a> {
         }
         let (params, selection) = self.state.prefill_parts()?;
         if selection.qwen4_top10 {
-            return super::qwen4_prefill::shared_activation(gpu, params);
+            return super::qt44_qt53_prefill::shared_activation(gpu, params);
         }
         super::prefill_shared_activation_stage(gpu, params)
     }
@@ -716,7 +716,7 @@ impl<'a> SealedMoeOp<'a> {
         }
         let (params, selection) = self.state.prefill_parts()?;
         if selection.qwen4_top10 {
-            return super::qwen4_prefill::shared_down(gpu, params);
+            return super::qt44_qt53_prefill::shared_down(gpu, params);
         }
         super::prefill_shared_down_stage(self.state.dispatch_ctx(), gpu, params)
     }
@@ -730,7 +730,7 @@ impl<'a> SealedMoeOp<'a> {
             ));
         }
         if selection.qwen4_top10 {
-            return super::qwen4_prefill::scatter(gpu, params, selection.path2_m_total);
+            return super::qt44_qt53_prefill::scatter(gpu, params, selection.path2_m_total);
         }
         super::prefill_scatter_stage(gpu, params, selection.path2_m_total)
     }
@@ -753,7 +753,7 @@ impl<'a> SealedMoeOp<'a> {
         }
         let (params, selection) = self.state.prefill_parts()?;
         if selection.qwen4_top10 {
-            return super::qwen4_prefill::gate_up(
+            return super::qt44_qt53_prefill::gate_up(
                 gpu,
                 params,
                 selection.resolution.use_path2,
@@ -785,7 +785,7 @@ impl<'a> SealedMoeOp<'a> {
             ));
         }
         if selection.qwen4_top10 {
-            return super::qwen4_prefill::unscatter(gpu, params, selection.path2_m_total);
+            return super::qt44_qt53_prefill::unscatter(gpu, params, selection.path2_m_total);
         }
         super::prefill_gate_up_unscatter_stage(gpu, params, selection.path2_m_total)
     }
@@ -801,7 +801,7 @@ impl<'a> SealedMoeOp<'a> {
         }
         let (params, selection) = self.state.prefill_parts()?;
         if selection.qwen4_top10 {
-            return super::qwen4_prefill::activation(gpu, params);
+            return super::qt44_qt53_prefill::activation(gpu, params);
         }
         let total_slots = params
             .batch_size
@@ -828,7 +828,7 @@ impl<'a> SealedMoeOp<'a> {
         }
         let (params, selection) = self.state.prefill_parts()?;
         if selection.qwen4_top10 {
-            return super::qwen4_prefill::down(
+            return super::qt44_qt53_prefill::down(
                 gpu,
                 params,
                 selection.resolution.use_path2,
@@ -869,7 +869,7 @@ impl<'a> SealedMoeOp<'a> {
         }
         let (params, selection) = self.state.prefill_parts()?;
         if selection.qwen4_top10 {
-            return super::qwen4_prefill::combine(
+            return super::qt44_qt53_prefill::combine(
                 gpu,
                 params,
                 selection.resolution.use_path2,
@@ -1126,6 +1126,7 @@ pub(super) fn select_decode(
             params.routed_down_m,
             params.routed_down_k,
             params.expert_dtype_tags,
+            params.route_policy,
         );
     if qwen4_top10 {
         resolution.use_gpu_topk = true;
@@ -1312,6 +1313,7 @@ pub(super) fn select_prefill(
             params.down_m,
             params.down_k,
             params.expert_dtype_tags,
+            params.route_policy,
         );
     let resolution = MoePrefillResolution::resolve(&params.dtypes, &ctx.arch, &ctx.flags);
     let _total_slots = params

@@ -10,7 +10,7 @@ use crate::tables::KernelRegistry;
 use crate::types::*;
 #[allow(unused_imports)]
 use hip_bridge;
-use rdna_compute::qwen4::{qwen4_bf16_scaled_add, Qwen4Bf16ScaledAdd};
+use rdna_compute::tensor_ops::{bf16_scaled_add, Bf16ScaledAdd};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::cell::OnceCell;
 use std::sync::{LazyLock, OnceLock};
@@ -24,14 +24,22 @@ pub use sealed_moe::{
     MoeRouterInput, MoeSharedContribution, PrefillRouteMode, ResourceAlias, SealedMoeCall,
 };
 pub(crate) mod moe_program;
-pub(crate) mod qwen4_prefill;
+pub(crate) mod qt44_qt53_prefill;
 pub use moe_program::SealedMoeOp;
+pub(crate) mod layer_ops;
 pub(crate) mod steps;
-pub use steps::{execute_steps, FusedPattern, GemvInput, Step};
+pub use layer_ops::{
+    execute_argmax, execute_clear, execute_final_hyper, execute_gated_delta_net,
+    execute_grouped_depthwise, execute_hyper_read, execute_hyper_write, execute_indexed_attention,
+    execute_lm_head, validate_lm_head, ClearOp, GatedDeltaNetOp, GroupedDepthwiseOp, HyperReadOp,
+    HyperWriteOp, IndexedAttentionOp, IndexedAttentionState,
+};
+pub use steps::{
+    execute_steps, execute_validated_steps, validate_steps, FusedPattern, GemvInput, Step,
+};
 
 // #397 Ship 6 — forward-as-pipeline C-design lowered super-op substrate (types
 // only at this step; not on any live path until wired behind HIPFIRE_FORWARD_LOWERED).
-pub mod qwen4_program;
 pub mod superop;
 
 fn reject_mq4g128v2(dtype: DType, family: &'static str) -> Result<(), DispatchError> {
@@ -64,12 +72,10 @@ fn reject_mq4g128v2_moe(dtypes: &crate::families::moe::MoeDtypes<'_>) -> Result<
     }
     Ok(())
 }
-/// Exact sealed Qwen4 routed-expert contract.
+/// Exact architecture-declared routed-expert contract.
 ///
-/// Qwen4 is the only production route that pairs qt44 G256 gate/up with
-/// qt53 G128 down.  Keep this predicate narrow: generic MoE dispatch must
-/// continue rejecting qt53 rather than accidentally selecting a route whose
-/// activation basis or top-k ABI is different.
+/// The architecture supplies the geometry and formats; shared dispatch only
+/// checks that declaration before selecting the specialized route.
 fn is_qwen4_route(
     dtypes: &crate::families::moe::MoeDtypes<'_>,
     n_exp: usize,
@@ -80,39 +86,40 @@ fn is_qwen4_route(
     down_m: usize,
     down_k: usize,
     dtype_tags: Option<&GpuTensor>,
+    route_policy: Option<crate::families::moe::MoeRoutePolicy>,
 ) -> bool {
+    let Some(policy) = route_policy else {
+        return false;
+    };
     let Some(shared) = dtypes.shared else {
         return false;
     };
     let uniform = |table: Option<&[DType]>, expected: DType| {
         table.map_or(true, |values| values.iter().all(|dtype| *dtype == expected))
     };
-    n_exp == 512
-        && k_top == 10
-        && hidden == 2560
-        && intermediate == 640
-        && gate_up_k == hidden
-        && down_m == hidden
-        && down_k == intermediate
-        && dtypes.routed_gate_up == DType::MQ4G256V2
-        && dtypes.routed_down == DType::MQ4G128V2
-        && !dtypes.routed_has_mixed_experts
+    crate::families::moe::grouped_route_geometry_supported(
+        &policy,
+        n_exp,
+        k_top,
+        hidden,
+        intermediate,
+        gate_up_k,
+        down_m,
+        down_k,
+        dtypes.routed_gate_up,
+        dtypes.routed_down,
+    ) && !dtypes.routed_has_mixed_experts
         && !dtypes.has_paro_shared
         && uniform(dtypes.per_expert_gate_up, DType::MQ4G256V2)
         && uniform(dtypes.per_expert_down, DType::MQ4G128V2)
         && dtype_tags.is_none()
-        && ![dtypes.router, shared.selector, shared.gate, shared.up]
-            .contains(&DType::MQ4G128V2)
-        // The canonical Qwen4 shared-down matrix has logical K=640 and is
-        // therefore the one intentional MQ4G128V2 shared operand. Keep all
-        // other shared q53 placements out of the typed route.
+        && ![dtypes.router, shared.selector, shared.gate, shared.up].contains(&DType::MQ4G128V2)
         && matches!(shared.down, DType::BF16 | DType::MQ4G128V2)
 }
 #[cfg(test)]
 mod qwen4_route_tests {
     use super::*;
-    use crate::families::moe::{MoeDtypes, MoeSharedDtypes};
-
+    use crate::families::moe::{MoeDtypes, MoeRouteCapability, MoeRoutePolicy, MoeSharedDtypes};
     fn canonical_dtypes() -> MoeDtypes<'static> {
         MoeDtypes {
             router: DType::MQ4G256V2,
@@ -132,8 +139,50 @@ mod qwen4_route_tests {
         }
     }
 
+    fn route_for_shape(
+        dtypes: &MoeDtypes<'_>,
+        n_exp: usize,
+        k_top: usize,
+        hidden: usize,
+        intermediate: usize,
+        gate_up_k: usize,
+        down_m: usize,
+        down_k: usize,
+    ) -> bool {
+        is_qwen4_route(
+            dtypes,
+            n_exp,
+            k_top,
+            hidden,
+            intermediate,
+            gate_up_k,
+            down_m,
+            down_k,
+            None,
+            Some(MoeRoutePolicy {
+                capability: MoeRouteCapability::Qt44Qt53Grouped,
+            }),
+        )
+    }
+
     fn is_canonical_qwen4(dtypes: &MoeDtypes<'_>) -> bool {
-        is_qwen4_route(dtypes, 512, 10, 2560, 640, 2560, 2560, 640, None)
+        route_for_shape(dtypes, 512, 10, 2560, 640, 2560, 2560, 640)
+    }
+
+    #[test]
+    fn qwen4_route_rejects_noncanonical_geometry_and_wire_dtype() {
+        let dtypes = canonical_dtypes();
+        assert!(!route_for_shape(
+            &dtypes, 513, 10, 2560, 640, 2560, 2560, 640
+        ));
+        assert!(!route_for_shape(
+            &dtypes, 512, 7, 2560, 640, 2560, 2560, 640
+        ));
+        assert!(!route_for_shape(&dtypes, 512, 10, 2560, 640, 2560, 1, 640));
+
+        let mut dtypes = canonical_dtypes();
+        dtypes.routed_gate_up = DType::BF16;
+        assert!(!is_canonical_qwen4(&dtypes));
     }
 
     #[test]
@@ -2967,9 +3016,9 @@ fn decode_shared_down_stage(
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
             }
             hip!(gpu.bf16_round_trip_f32(p.ffn_out))?;
-            hip!(qwen4_bf16_scaled_add(
+            hip!(bf16_scaled_add(
                 gpu,
-                &Qwen4Bf16ScaledAdd {
+                &Bf16ScaledAdd {
                     residual: out_target,
                     value: p.ffn_out,
                     scalar: scalar_buf,

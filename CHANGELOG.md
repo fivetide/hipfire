@@ -3,6 +3,19 @@
 ## Unreleased
 
 - Sealed MoE calls lower to granular computation programs; Qwen root-routed EP decode and batched prefill share a checked collective schedule. Compact EP gathers expert outputs in global top-k slot layout and runs the ordinary single-device slot-order combine once on root before byte-broadcasting the finished partial, avoiding rank-grouped floating-point reassociation. Existing kernels, ownership, other-family reduction order, and diagnostic policies are retained. This does not admit new parallel axes or product replay routes; see [the design and validation boundary](docs/design/sealed-granular-moe.md).
+- Qwen4's production layer path now binds architecture-owned typed
+  descriptors to neutral shared HyperRead/Write, GDN, QSA, grouped-depthwise,
+  Clear, and sealed-MoE contracts. Composite steps are preflighted before
+  token/embedding/PLE effects, exact row views preserve reusable arena
+  capacity semantics, and QSA scalar metadata publishes only after success.
+  Gfx1151 two-token and full natural `[128,128,35]` scalar/natural smokes are
+  bit-exact; the full oracle also matches the immutable original, frozen HC,
+  and frozen N8 references. Corrected AR and native MTP serve smokes both
+  return `Paris` with `finish=stop`, `saw_done=true`, nonempty output, no
+  runaway, and no stream error; MTP reports `tau=1.0`, one cycle, and
+  `mtp=true`. This is an ownership/correctness seam only: no replay/PM4,
+  throughput, or quality promotion claim. See [the current ownership
+  record](docs/design/qwen4-shared-token-batched-prefill-progress-20260918.md).
 - Qwen4's centralized bounded token-batched prefill now carries conservative HC row/grid-Y batching with scalar rows=1 unchanged and exact natural 128/128/35 oracle parity. Explicit marker evidence records frozen-N8 natural HC calls 112,326 versus candidate 1,158; fresh product ABBAAB remains below the requested 500 prefill / 25 decode tok/s thresholds (both open/blocked), with no product throughput or decode-win claim. A deterministic Paris fixture independently passes ordinary AR and native MTP correctness. See [the implementation record](docs/design/qwen4-shared-token-batched-prefill-progress-20260918.md) and [the historical measurement](docs/perf-checkpoints/2026-09-19-qwen4-hc-rows-gridy-final-measurement.md).
 - The Qwen4 `gfx1151` prefill tuning lineage is documented across six staged
   levers: QSA selection-only, QSA selection-plus-attention, the selection

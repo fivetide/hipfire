@@ -320,6 +320,7 @@ fn decode_step_body(
                         per_expert_down: down_mixed.then_some(down_dtypes),
                     },
                     recipe: MoeRecipe::SigmoidRoutedNoShared,
+                    route_policy: None,
                     normalization: MoeNormalization::Provided,
                     batch_size: 1,
                     hidden,
@@ -767,6 +768,7 @@ pub fn forward_batch(
                         per_expert_down: down_mixed.then_some(down_dtypes),
                     },
                     recipe: MoeRecipe::SigmoidRoutedNoShared,
+                    route_policy: None,
                     prelude: MoePrefillPrelude {
                         normalization: MoeNormalization::Provided,
                         router: m.router.dispatch_ref(),

@@ -2,22 +2,18 @@
 // Copyright (c) 2026 Björn Bösel
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Exact Qwen4 top-10/QT44/QT53 grouped-prefill lowering.
+//! Exact QT44/QT53 top-10 grouped-prefill lowering.
 //!
 //! This module is deliberately narrow.  It is reached only after the sealed
-//! MoE predicate has admitted the fixed Qwen4 geometry and replicated route.
+//! MoE predicate has admitted the immutable grouped-kernel geometry and replicated route.
 //! Generic MoE prefill continues to own the k=8 path; no QT53 format is
 //! admitted by this module through a representative-dtype fallback.
 
 use crate::families::gemv::WeightRef;
 use crate::families::moe::MoePrefillParams;
 use crate::types::DispatchError;
-use rdna_compute::qwen4::{qwen4_bf16_scaled_add_batched, Qwen4Bf16ScaledAddBatched};
+use rdna_compute::tensor_ops::{bf16_scaled_add_batched, Bf16ScaledAddBatched};
 use rdna_compute::{DType, Gpu, GpuTensor};
-
-const QWEN4_TOP_K: usize = 10;
-const QWEN4_EXPERTS: usize = 512;
-const GROUPED_BLOCK_M: usize = 16;
 
 #[inline]
 fn hip<T>(result: Result<T, hip_bridge::HipError>) -> Result<T, DispatchError> {
@@ -29,33 +25,63 @@ fn f32_view(source: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
     source.sub_offset(offset, len)
 }
 
+pub(crate) fn project_bf16_batch(
+    gpu: &mut Gpu,
+    weight: &WeightRef<'_>,
+    input: &GpuTensor,
+    output: &GpuTensor,
+    rows: usize,
+) -> Result<(), DispatchError> {
+    if weight.dtype != DType::BF16 {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "grouped-prefill",
+            variant: "non-bf16-projection",
+            arch: "",
+            quant: "non-BF16",
+        });
+    }
+    let result = if rows > 1 {
+        gpu.gemm_bf16_xf32_multirow(weight.buf, input, output, weight.m, weight.k, rows)
+    } else {
+        gpu.gemv_bf16_xf32(weight.buf, input, output, weight.m, weight.k)
+    };
+    hip(result)
+}
+
 #[inline]
-fn qwen4_geometry(p: &MoePrefillParams<'_>) -> bool {
+fn grouped_geometry(p: &MoePrefillParams<'_>) -> bool {
+    let Some(policy) = p.route_policy else {
+        return false;
+    };
     p.batch_size > 0
-        && p.k_top == QWEN4_TOP_K
-        && p.n_exp == QWEN4_EXPERTS
-        && p.gate_up_k == 2560
-        && p.down_m == 2560
-        && p.down_k == 640
-        && p.mi == 640
-        && p.dtypes.routed_gate_up == DType::MQ4G256V2
-        && p.dtypes.routed_down == DType::MQ4G128V2
+        && crate::families::moe::grouped_route_geometry_supported(
+            &policy,
+            p.n_exp,
+            p.k_top,
+            p.gate_up_k,
+            p.mi,
+            p.gate_up_k,
+            p.down_m,
+            p.down_k,
+            p.dtypes.routed_gate_up,
+            p.dtypes.routed_down,
+        )
 }
 
 fn require_geometry(p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
-    if qwen4_geometry(p) {
+    if grouped_geometry(p) {
         Ok(())
     } else {
         Err(DispatchError::UnsupportedVariant {
             family: "moe",
-            variant: "qwen4-prefill-shape",
+            variant: "grouped-prefill-shape",
             arch: "",
-            quant: "QT44/QT53",
+            quant: "declared route",
         })
     }
 }
 
-/// Prepare the routed expert activation basis.  Qwen4's router/shared
+/// Prepare the routed expert activation basis.  The route's router/shared
 /// projections are BF16 and consume the natural input, while routed QT44
 /// gate/up consumes the FWHT basis.
 pub(crate) fn input_basis(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
@@ -71,7 +97,7 @@ fn batch_projection(
     batch_size: usize,
 ) -> Result<(), DispatchError> {
     match weight.dtype {
-        DType::BF16 => super::qwen4_program::project_bf16_batch(gpu, weight, x, y, batch_size),
+        DType::BF16 => project_bf16_batch(gpu, weight, x, y, batch_size),
         DType::F32 => hip(gpu.gemm_f32_batched(weight.buf, x, y, weight.m, weight.k, batch_size)),
         DType::MQ4G256V2 => {
             hip(gpu.gemm_mq4g256v2(weight.buf, x, y, weight.m, weight.k, batch_size))
@@ -81,15 +107,15 @@ fn batch_projection(
         }
         _ => Err(DispatchError::UnsupportedVariant {
             family: "moe",
-            variant: "qwen4-shared-projection-dtype",
+            variant: "qt44-qt53-shared-projection-dtype",
             arch: "",
             quant: "unsupported",
         }),
     }
 }
 
-/// Qwen4's router is a row-batched projection even though the generic MoE
-/// table intentionally has no BF16 router entry on RDNA3.
+/// The grouped route's router is a row-batched projection even though the
+/// generic MoE table intentionally has no BF16 router entry on RDNA3.
 pub(crate) fn router_projection(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
@@ -105,23 +131,23 @@ pub(crate) fn router_projection(
 }
 
 /// Shared selector and gate/up are ordinary batched projections.  This is the
-/// Qwen4-specific BF16 exception to the generic MoE prefill table: the common
-/// family remains fail-closed for QT53 while this exact typed route uses the
-/// native BF16 XF32 GEMM launcher.
+/// typed route's BF16 exception to the generic MoE prefill table: the common
+/// family remains fail-closed for QT53 while this exact route uses the native
+/// BF16 XF32 GEMM launcher.
 pub(crate) fn shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
     require_geometry(p)?;
     let shared = p
         .prelude
         .shared
         .as_ref()
-        .ok_or_else(|| DispatchError::Hip("Qwen4 prefill shared weights missing".into()))?;
+        .ok_or_else(|| DispatchError::Hip("grouped prefill shared weights missing".into()))?;
     let x_selector = match shared.weights.selector.dtype {
         DType::BF16 | DType::F32 => p.x_norm_batch,
         DType::MQ4G256V2 => p.x_rot_batch,
         _ => {
             return Err(DispatchError::UnsupportedVariant {
                 family: "moe",
-                variant: "qwen4-shared-selector-dtype",
+                variant: "qt44-qt53-shared-selector-dtype",
                 arch: "",
                 quant: "unsupported",
             })
@@ -140,7 +166,7 @@ pub(crate) fn shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<
         _ => {
             return Err(DispatchError::UnsupportedVariant {
                 family: "moe",
-                variant: "qwen4-shared-gate-dtype",
+                variant: "qt44-qt53-shared-gate-dtype",
                 arch: "",
                 quant: "unsupported",
             })
@@ -154,9 +180,9 @@ pub(crate) fn shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<
         p.batch_size,
     )?;
     batch_projection(gpu, &shared.weights.up, x_gate, shared.up_out, p.batch_size)?;
-    // Qwen4's source arithmetic stores the gate-side BF16 values before the
-    // nonlinear route.  Keep the explicit round trips even when the resident
-    // projection happens to be F32 so the typed route remains source-bound.
+    // Source arithmetic stores the gate-side BF16 values before the nonlinear
+    // route.  Keep the explicit round trips even when the resident projection
+    // happens to be F32 so the typed route remains source-bound.
     hip(gpu.bf16_round_trip_f32(p.prelude.router_logits))?;
     hip(gpu.bf16_round_trip_f32(shared.scalar))?;
     hip(gpu.bf16_round_trip_f32(shared.gate_out))?;
@@ -173,7 +199,7 @@ pub(crate) fn shared_activation(
         .prelude
         .shared
         .as_ref()
-        .ok_or_else(|| DispatchError::Hip("Qwen4 prefill shared weights missing".into()))?;
+        .ok_or_else(|| DispatchError::Hip("grouped prefill shared weights missing".into()))?;
     let scalar = f32_view(shared.scalar, 0, p.batch_size);
     #[cfg(feature = "deltanet")]
     {
@@ -183,7 +209,7 @@ pub(crate) fn shared_activation(
     {
         return Err(DispatchError::UnsupportedVariant {
             family: "moe",
-            variant: "qwen4-shared-sigmoid-requires-deltanet",
+            variant: "grouped-shared-sigmoid-requires-deltanet",
             arch: "",
             quant: "",
         });
@@ -211,7 +237,7 @@ pub(crate) fn shared_down(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(),
         .prelude
         .shared
         .as_ref()
-        .ok_or_else(|| DispatchError::Hip("Qwen4 prefill shared weights missing".into()))?;
+        .ok_or_else(|| DispatchError::Hip("grouped prefill shared weights missing".into()))?;
     let down = &shared.weights.down;
     let target = p.routed_out.unwrap_or(p.x_batch);
     let out = f32_view(p.down_expanded, 0, p.batch_size * p.down_m);
@@ -226,16 +252,16 @@ pub(crate) fn shared_down(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(),
         _ => {
             return Err(DispatchError::UnsupportedVariant {
                 family: "moe",
-                variant: "qwen4-shared-down-dtype",
+                variant: "qt44-qt53-shared-down-dtype",
                 arch: "",
                 quant: "unsupported",
             })
         }
     }
     hip(gpu.bf16_round_trip_f32(&out))?;
-    qwen4_bf16_scaled_add_batched(
+    bf16_scaled_add_batched(
         gpu,
-        &Qwen4Bf16ScaledAddBatched {
+        &Bf16ScaledAddBatched {
             residual: target,
             value: &out,
             scalar: shared.scalar,
@@ -253,7 +279,7 @@ pub(crate) fn scatter(
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
-    let total_slots = p.batch_size * QWEN4_TOP_K;
+    let total_slots = p.batch_size * p.k_top;
     hip(gpu.moe_scatter_fused_top10(
         p.topk_indices,
         p.expert_token_counts,
@@ -262,9 +288,9 @@ pub(crate) fn scatter(
         p.expert_tile_ids,
         p.inverse_perm,
         total_slots,
-        QWEN4_EXPERTS,
+        p.n_exp,
         grouped_rows,
-        GROUPED_BLOCK_M,
+        crate::families::moe::MOE_GROUPED_BLOCK_M,
     ))
 }
 
@@ -284,7 +310,7 @@ pub(crate) fn gate_up(
             p.y_gate_up_grouped,
             2 * p.mi,
             p.gate_up_k,
-            QWEN4_TOP_K,
+            p.k_top,
             grouped_rows,
             p.batch_size,
         ))
@@ -301,9 +327,9 @@ pub(crate) fn gate_up(
         ))?;
         let active = p
             .batch_size
-            .checked_mul(QWEN4_TOP_K)
+            .checked_mul(p.k_top)
             .and_then(|slots| slots.checked_mul(p.mi))
-            .ok_or_else(|| DispatchError::Hip("Qwen4 gate/up extent overflows".into()))?;
+            .ok_or_else(|| DispatchError::Hip("grouped gate/up extent overflows".into()))?;
         hip(gpu.bf16_round_trip_f32(&f32_view(p.gate_batch, 0, active)))?;
         hip(gpu.bf16_round_trip_f32(&f32_view(p.up_batch, 0, active)))?;
         Ok(())
@@ -327,16 +353,16 @@ pub(crate) fn unscatter(
     ))?;
     let active = p
         .batch_size
-        .checked_mul(QWEN4_TOP_K)
+        .checked_mul(p.k_top)
         .and_then(|slots| slots.checked_mul(p.mi))
-        .ok_or_else(|| DispatchError::Hip("Qwen4 gate/up extent overflows".into()))?;
+        .ok_or_else(|| DispatchError::Hip("grouped gate/up extent overflows".into()))?;
     hip(gpu.bf16_round_trip_f32(&f32_view(p.gate_batch, 0, active)))?;
     hip(gpu.bf16_round_trip_f32(&f32_view(p.up_batch, 0, active)))
 }
 
 pub(crate) fn activation(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
     require_geometry(p)?;
-    let total_slots = p.batch_size * QWEN4_TOP_K;
+    let total_slots = p.batch_size * p.k_top;
     hip(gpu.silu_mul_f32(p.gate_batch, p.up_batch, p.rot_batch))?;
     hip(gpu.bf16_round_trip_f32(p.rot_batch))?;
     hip(gpu.rotate_x_mq_128_v2(p.rot_batch, p.rot_batch, p.mi, total_slots))
@@ -349,7 +375,7 @@ pub(crate) fn down(
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
-    let total_slots = p.batch_size * QWEN4_TOP_K;
+    let total_slots = p.batch_size * p.k_top;
     if use_path2 {
         hip(gpu.gemm_mq4g128v2_moe_grouped_top10(
             p.expert_down_ptrs,
@@ -362,7 +388,7 @@ pub(crate) fn down(
             1,
             grouped_rows,
             total_slots,
-            QWEN4_EXPERTS,
+            p.n_exp,
         ))?;
         // The scalar QT53 route rounds each expert output to BF16 before
         // weighted combination.  The grouped kernel only decodes/accumulates
@@ -379,7 +405,7 @@ pub(crate) fn down(
             p.down_m,
             p.down_k,
             p.batch_size,
-            QWEN4_EXPERTS,
+            p.n_exp,
         ))?;
         let expanded = f32_view(p.down_expanded, 0, total_slots * p.down_m);
         hip(gpu.bf16_round_trip_f32(&expanded))?;
@@ -407,7 +433,7 @@ pub(crate) fn combine(
             p.batch_size,
         ))?;
     } else {
-        let expanded = f32_view(p.down_expanded, 0, p.batch_size * QWEN4_TOP_K * p.down_m);
+        let expanded = f32_view(p.down_expanded, 0, p.batch_size * p.k_top * p.down_m);
         hip(gpu.moe_down_combine_top10_batched(
             &expanded,
             p.topk_indices,

@@ -26,11 +26,12 @@ use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
 use hipfire_runtime::model_source::{ModelSource, SourcePayload};
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
-use rdna_compute::qwen4::{
-    qwen4_gdn_bf16_roundtrip, qwen4_gdn_params_f32, qwen4_gdn_step, qwen4_hc_read, qwen4_hc_write,
-    qwen4_qsa_attention, qwen4_qsa_cache_append, qwen4_qsa_norm_rope, qwen4_qsa_pool_rope,
-    qwen4_qsa_select, Qwen4GdnBf16Roundtrip, Qwen4GdnStep, Qwen4HcRead, Qwen4HcWrite,
-    Qwen4QsaAttention, Qwen4QsaCacheAppend, Qwen4QsaNormRope, Qwen4QsaPoolRope, Qwen4QsaSelect,
+use rdna_compute::tensor_ops::{
+    bf16_roundtrip_f32, gated_delta_params_f32, gated_delta_step, hyper_read, hyper_write,
+    indexed_attention_attention, indexed_attention_cache_append, indexed_attention_norm_rope,
+    indexed_attention_pool_rope, indexed_attention_select, Bf16Roundtrip, GatedDeltaStep,
+    HyperRead, HyperWrite, IndexedAttentionAttention, IndexedAttentionCacheAppend,
+    IndexedAttentionNormRope, IndexedAttentionPoolRope, IndexedAttentionSelect,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
@@ -592,7 +593,7 @@ fn gpu_ple_linear_rows(
         let y = gpu
             .zeros(&[out_dim], DType::F32)
             .map_err(|error| error.to_string())?;
-        gpu.qwen4_ple_linear_f32(&x, &weight_gpu, &y, 1, in_dim, out_dim)
+        gpu.grouped_linear_f32(&x, &weight_gpu, &y, 1, in_dim, out_dim)
             .map_err(|error| error.to_string())?;
         output.extend(gpu.download_f32(&y).map_err(|error| error.to_string())?);
         free(gpu, x)?;
@@ -725,7 +726,7 @@ fn gpu_ple_norm_rows(
     let output = gpu
         .zeros(&[rows, width], DType::F32)
         .map_err(|error| error.to_string())?;
-    gpu.qwen4_ple_norm_f32(&input, &norm, &output, rows, groups, group_size, RMS_EPS)
+    gpu.grouped_norm_f32(&input, &norm, &output, rows, groups, group_size, RMS_EPS)
         .map_err(|error| error.to_string())?;
     let result = gpu
         .download_f32(&output)
@@ -852,7 +853,7 @@ fn run_ple_hash(gpu: &mut Gpu, arrays: &BTreeMap<String, Array>) -> Result<Value
     let widened = gpu
         .zeros(&[tokens.len(), PLE_HEADS * PLE_WIDTH], DType::F32)
         .map_err(|error| error.to_string())?;
-    gpu.qwen4_ple_gather_convert_bf16(&staged, &widened, tokens.len())
+    gpu.grouped_gather_convert_bf16(&staged, &widened, tokens.len(), PLE_HEADS, PLE_WIDTH)
         .map_err(|error| error.to_string())?;
     let actual_embedding = gpu
         .download_f32(&widened)
@@ -986,7 +987,7 @@ fn run_ple_projection(
     let gated_gpu = gpu
         .zeros(&[tokens, channels], DType::F32)
         .map_err(|error| error.to_string())?;
-    gpu.qwen4_ple_gate_f32(
+    gpu.grouped_gate_f32(
         &key_gpu,
         &query_gpu,
         &value_gpu,
@@ -1086,7 +1087,7 @@ fn run_ple_projection(
         let output = gpu
             .zeros(&[end - begin, channels], DType::F32)
             .map_err(|error| error.to_string())?;
-        gpu.qwen4_ple_depthwise_conv_silu_add_f32(
+        gpu.grouped_depthwise_conv_silu_add_f32(
             &gated_chunk,
             &norm_chunk,
             &conv_weight_gpu,
@@ -1242,9 +1243,9 @@ fn run_gdn_params(
         let beta_gpu = gpu
             .zeros(&[heads], DType::F32)
             .map_err(|error| error.to_string())?;
-        qwen4_gdn_params_f32(
+        gated_delta_params_f32(
             gpu,
-            &rdna_compute::qwen4::Qwen4GdnParams {
+            &rdna_compute::tensor_ops::GatedDeltaParams {
                 a: &a_gpu,
                 b: &b_gpu,
                 a_log: &a_log_gpu,
@@ -1318,9 +1319,9 @@ fn run_gdn_sequence(
                     &[value_heads],
                 )
                 .map_err(|error| error.to_string())?;
-            qwen4_gdn_step(
+            gated_delta_step(
                 gpu,
-                &Qwen4GdnStep {
+                &GatedDeltaStep {
                     q: &q_t,
                     k: &k_t,
                     v: &v_t,
@@ -1579,9 +1580,9 @@ fn run_gdn(
                 &[value_heads * value_dim],
             )
             .map_err(|error| error.to_string())?;
-        qwen4_gdn_bf16_roundtrip(
+        bf16_roundtrip_f32(
             gpu,
-            &Qwen4GdnBf16Roundtrip {
+            &Bf16Roundtrip {
                 input: &recurrent,
                 scratch: &recurrent_bf16,
                 output: &recurrent_rounded,
@@ -1628,9 +1629,9 @@ fn run_gdn(
                 &[value_heads * value_dim],
             )
             .map_err(|error| error.to_string())?;
-        qwen4_gdn_bf16_roundtrip(
+        bf16_roundtrip_f32(
             gpu,
-            &Qwen4GdnBf16Roundtrip {
+            &Bf16Roundtrip {
                 input: &norm_input,
                 scratch: &recurrent_bf16,
                 output: &recurrent_rounded,
@@ -1676,9 +1677,9 @@ fn run_gdn(
         let output = gpu
             .zeros(&[value_heads * value_dim], DType::F32)
             .map_err(|error| error.to_string())?;
-        rdna_compute::qwen4::qwen4_gdn_gate(
+        rdna_compute::tensor_ops::gated_delta_gate(
             gpu,
-            &rdna_compute::qwen4::Qwen4GdnGate {
+            &rdna_compute::tensor_ops::GatedDeltaGate {
                 recurrent_output: &recurrent,
                 z: &z_gpu,
                 norm: &norm_bf16,
@@ -1944,9 +1945,9 @@ fn hc_read_case(
             let y = gpu
                 .zeros(&[wide], DType::F32)
                 .map_err(|error| error.to_string())?;
-            rdna_compute::qwen4::qwen4_hc_norm(
+            rdna_compute::tensor_ops::hyper_norm(
                 gpu,
-                &rdna_compute::qwen4::Qwen4HcNorm {
+                &rdna_compute::tensor_ops::HyperNorm {
                     input: &x,
                     norm_weight: &norm_gpu,
                     normalized: &y,
@@ -1992,9 +1993,9 @@ fn hc_read_case(
         let out = gpu
             .zeros(&[hidden], DType::F32)
             .map_err(|error| error.to_string())?;
-        qwen4_hc_read(
+        hyper_read(
             gpu,
-            &Qwen4HcRead {
+            &HyperRead {
                 input: &x,
                 norm_weight: &norm_gpu,
                 low: &low,
@@ -2057,9 +2058,9 @@ fn hc_inject_case(
         let y = gpu
             .zeros(&[wide], DType::F32)
             .map_err(|error| error.to_string())?;
-        qwen4_hc_write(
+        hyper_write(
             gpu,
-            &Qwen4HcWrite {
+            &HyperWrite {
                 input: &x,
                 normalized: &n,
                 mixed: &m,
@@ -2100,9 +2101,9 @@ fn run_qsa(
     let pooled_gpu = gpu
         .zeros(&[blocks, index_dim], DType::F32)
         .map_err(|error| error.to_string())?;
-    qwen4_qsa_pool_rope(
+    indexed_attention_pool_rope(
         gpu,
-        &Qwen4QsaPoolRope {
+        &IndexedAttentionPoolRope {
             raw_keys: &raw_gpu,
             pooled: &pooled_gpu,
             norm: None,
@@ -2150,9 +2151,9 @@ fn run_qsa(
         let selected = gpu
             .upload_raw(&vec![0u8; capacity * 4], &[capacity * 4])
             .map_err(|error| error.to_string())?;
-        qwen4_qsa_select(
+        indexed_attention_select(
             gpu,
-            &Qwen4QsaSelect {
+            &IndexedAttentionSelect {
                 query: &query,
                 pooled: &pooled_gpu,
                 selected: &selected,
@@ -2283,9 +2284,9 @@ fn run_qsa(
         let row = gpu
             .upload_f32(queries_raw.row(token)?, &[n_heads * head_dim])
             .map_err(|error| error.to_string())?;
-        qwen4_qsa_norm_rope(
+        indexed_attention_norm_rope(
             gpu,
-            &Qwen4QsaNormRope {
+            &IndexedAttentionNormRope {
                 values: &row,
                 norm: &zero_norm_q,
                 heads: n_heads,
@@ -2320,9 +2321,9 @@ fn run_qsa(
         let row = gpu
             .upload_f32(keys_raw.row(token)?, &[n_kv_heads * head_dim])
             .map_err(|error| error.to_string())?;
-        qwen4_qsa_norm_rope(
+        indexed_attention_norm_rope(
             gpu,
-            &Qwen4QsaNormRope {
+            &IndexedAttentionNormRope {
                 values: &row,
                 norm: &zero_norm_q,
                 heads: n_kv_heads,
@@ -2363,9 +2364,9 @@ fn run_qsa(
             )
             .map_err(|error| error.to_string())?;
         let rope_norm = upload_bf16(gpu, &vec![0.0; 8], &[8])?;
-        qwen4_qsa_norm_rope(
+        indexed_attention_norm_rope(
             gpu,
-            &Qwen4QsaNormRope {
+            &IndexedAttentionNormRope {
                 values: &row,
                 norm: &rope_norm,
                 heads: 2,
@@ -2427,9 +2428,9 @@ fn run_qsa(
         let value = gpu
             .upload_f32(values.row(token)?, &[n_kv_heads * head_dim])
             .map_err(|error| error.to_string())?;
-        qwen4_qsa_cache_append(
+        indexed_attention_cache_append(
             gpu,
-            &Qwen4QsaCacheAppend {
+            &IndexedAttentionCacheAppend {
                 key: &key,
                 value: &value,
                 full_keys: &full_keys,
@@ -2462,9 +2463,9 @@ fn run_qsa(
         let output = gpu
             .zeros(&[n_heads * head_dim], DType::F32)
             .map_err(|error| error.to_string())?;
-        qwen4_qsa_attention(
+        indexed_attention_attention(
             gpu,
-            &Qwen4QsaAttention {
+            &IndexedAttentionAttention {
                 q_with_gate: &query,
                 full_keys: &full_keys,
                 full_values: &full_values,
@@ -3198,9 +3199,9 @@ fn run_mtp(
     let pooled_gpu = gpu
         .zeros(&[1, index_dim], DType::F32)
         .map_err(|error| error.to_string())?;
-    qwen4_qsa_pool_rope(
+    indexed_attention_pool_rope(
         gpu,
-        &Qwen4QsaPoolRope {
+        &IndexedAttentionPoolRope {
             raw_keys: &raw_gpu,
             pooled: &pooled_gpu,
             norm: None,
@@ -3224,9 +3225,9 @@ fn run_mtp(
         let selected_gpu = gpu
             .upload_raw(&vec![0u8; capacity * 4], &[capacity * 4])
             .map_err(|error| error.to_string())?;
-        qwen4_qsa_select(
+        indexed_attention_select(
             gpu,
-            &Qwen4QsaSelect {
+            &IndexedAttentionSelect {
                 query: &query,
                 pooled: &pooled_gpu,
                 selected: &selected_gpu,
@@ -3304,9 +3305,9 @@ fn run_mtp(
                 &[8],
             )
             .map_err(|error| error.to_string())?;
-        qwen4_qsa_cache_append(
+        indexed_attention_cache_append(
             gpu,
-            &Qwen4QsaCacheAppend {
+            &IndexedAttentionCacheAppend {
                 key: &key,
                 value: &value,
                 full_keys: &full_keys,
@@ -3338,9 +3339,9 @@ fn run_mtp(
         let heads = gpu
             .zeros(&[16], DType::F32)
             .map_err(|error| error.to_string())?;
-        qwen4_qsa_attention(
+        indexed_attention_attention(
             gpu,
-            &Qwen4QsaAttention {
+            &IndexedAttentionAttention {
                 q_with_gate: &q_gate_gpu,
                 full_keys: &full_keys,
                 full_values: &full_values,

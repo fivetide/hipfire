@@ -15,6 +15,12 @@ use crate::config::{LayerType, Qwen4Config};
 use crate::ple_rows::{
     PlePrefetch, PleRowLease, PleRows, PleRowsError, PLE_ROWS_PER_TOKEN, PLE_ROW_BYTES,
 };
+use crate::program::{
+    execute_final_hyper, execute_lm_head, validate_final_hyper, validate_lm_head,
+    Qwen4AttentionWeights, Qwen4GdnWeights, Qwen4HyperReadWeights, Qwen4HyperWeights,
+    Qwen4LayerDescription, Qwen4LayerScratch, Qwen4MoeBinding, Qwen4PleWeights, Qwen4ProgramDims,
+    Qwen4QsaWeights, Qwen4ScratchLayout,
+};
 use crate::projection::{dispatch_embedding, row_stride, ProjectionView};
 use crate::weights::{
     HyperConnectionReadWeights, HyperConnectionWeights, MoeWeights, Qwen4LayerWeights,
@@ -23,23 +29,18 @@ use crate::weights::{
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::moe::{
-    MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoeRecipe, MoeSharedDecode, MoeSharedDtypes,
-    MoeSharedWeights, RoutedExpertWeights,
-};
-use hipfire_dispatch::pipeline::qwen4_program::{
-    execute_final_hyper, execute_lm_head, validate_final_hyper, validate_lm_head,
-    Qwen4AttentionWeights, Qwen4GdnState, Qwen4GdnWeights, Qwen4HyperReadWeights,
-    Qwen4HyperWeights, Qwen4LayerDescription, Qwen4LayerOp, Qwen4LayerScratch, Qwen4MoeBinding,
-    Qwen4PleOp, Qwen4PleWeights, Qwen4ProgramDims, Qwen4QsaState, Qwen4QsaWeights,
-    Qwen4ScratchLayout,
+    MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoeRecipe, MoeRouteCapability,
+    MoeRoutePolicy, MoeSharedDecode, MoeSharedDtypes, MoeSharedWeights, RoutedExpertWeights,
 };
 use hipfire_dispatch::pipeline::{
-    execute_steps, seal_decode, BoundMoeExperts, ExpertBindingCache, ExpertMetadata,
-    ExpertResource, ExpertResources, ExpertTable, Step,
+    execute_steps, execute_validated_steps, seal_decode, validate_steps, BoundMoeExperts, ClearOp,
+    ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources, ExpertTable,
+    GatedDeltaNetOp, GroupedDepthwiseOp, HyperReadOp, HyperWriteOp, IndexedAttentionOp,
+    IndexedAttentionState, Step,
 };
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_runtime::weight_manifest::ExpertSourceLayout;
-use rdna_compute::qwen4::{qwen4_argmax, Qwen4Argmax};
+use rdna_compute::tensor_ops::{argmax_f32, ArgmaxF32};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use smallvec::SmallVec;
 use std::cell::{Cell, RefCell};
@@ -54,7 +55,7 @@ const PLE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// those requests over this bounded capacity instead of allocating
 /// prompt-sized grouped MoE buffers.
 pub(crate) const QWEN4_PREFILL_CHUNK_CAP: usize = 128;
-const QWEN4_STEP_INLINE_CAPACITY: usize = 49;
+const QWEN4_STEP_INLINE_CAPACITY: usize = 384;
 const QWEN4_QSA_INLINE_CAPACITY: usize = 12;
 
 /// Which rows of a batched Qwen4 prefill write language-model logits.
@@ -225,6 +226,18 @@ fn f32_view(tensor: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
 fn view(tensor: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
     tensor.sub_offset(offset, len)
 }
+fn matrix_view(
+    tensor: &GpuTensor,
+    rows: usize,
+    columns: usize,
+) -> Result<GpuTensor, Qwen4GpuForwardError> {
+    let elements = rows
+        .checked_mul(columns)
+        .ok_or_else(|| invalid("Qwen4 matrix view shape overflows"))?;
+    let mut view = tensor.sub_offset(0, elements);
+    view.shape = vec![rows, columns];
+    Ok(view)
+}
 
 fn weight_dims(reference: &TensorRef) -> Result<(usize, usize), Qwen4GpuForwardError> {
     if reference.shape.len() != 2 {
@@ -252,6 +265,13 @@ fn dense_ref<'a>(
     })
 }
 
+/// The admitted Qwen4 grouped route is declared by this architecture
+/// constructor and consumed as data by shared sealing/lowering.
+fn qwen4_route_policy() -> MoeRoutePolicy {
+    MoeRoutePolicy {
+        capability: MoeRouteCapability::Qt44Qt53Grouped,
+    }
+}
 fn program_dims(config: &Qwen4Config) -> Qwen4ProgramDims {
     Qwen4ProgramDims {
         hidden: config.hidden_size,
@@ -301,7 +321,7 @@ fn hyper_desc<'a>(
             input_mix_down: dense_ref(weights, &hyper.input_mix_down)?,
             input_mix_up: dense_ref(weights, &hyper.input_mix_up)?,
         },
-        write: hipfire_dispatch::pipeline::qwen4_program::Qwen4HyperWriteWeights {
+        write: crate::program::Qwen4HyperWriteWeights {
             norm,
             block_inject: dense_ref(weights, &hyper.block_inject)?,
         },
@@ -382,6 +402,7 @@ fn layer_desc<'a>(
         mlp_hyper: hyper_desc(weights, &layer.mlp_hyper)?,
         attention,
         moe: Qwen4MoeBinding {
+            route_policy: qwen4_route_policy(),
             table: &moe.table,
             cache: &moe.cache,
             routed_experts: moe,
@@ -738,6 +759,7 @@ pub(crate) fn execute_moe(
     let params = MoeParams {
         dtypes,
         recipe: MoeRecipe::SoftmaxGatedShared,
+        route_policy: Some(qwen4_route_policy()),
         normalization: MoeNormalization::Provided,
         batch_size: 1,
         hidden: config.hidden_size,
@@ -864,8 +886,6 @@ pub struct Qwen4GpuForwardScratch {
     pub moe_y_gate_up_grouped: GpuTensor,
     pub moe_y_down_grouped: GpuTensor,
     pub logits: GpuTensor,
-    pub host_token_bytes: Vec<u8>,
-    pub host_ple_bytes: Vec<u8>,
 }
 
 impl Qwen4GpuForwardScratch {
@@ -873,7 +893,7 @@ impl Qwen4GpuForwardScratch {
         gpu: &mut Gpu,
         config: &Qwen4Config,
         max_chunk: usize,
-    ) -> Result<Self, Qwen4GpuForwardError> {
+    ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
         if max_chunk == 0 {
             return Err(invalid("max_chunk is zero"));
         }
@@ -909,11 +929,8 @@ impl Qwen4GpuForwardScratch {
             .checked_add(1)
             .and_then(|count| count.checked_mul(i32_bytes))
             .ok_or_else(|| invalid("MoE expert offset scratch overflow"))?;
-        let grouped_bound = hipfire_dispatch::pipeline::qwen4_program::grouped_m_total_bound(
-            layout.slots,
-            config.num_experts,
-        )
-        .map_err(|error| invalid(error.to_string()))?;
+        let grouped_bound = crate::program::grouped_m_total_bound(layout.slots, config.num_experts)
+            .map_err(|error| invalid(error.to_string()))?;
         let grouped_i32_bytes = grouped_bound
             .checked_mul(i32_bytes)
             .ok_or_else(|| invalid("MoE grouped index scratch overflow"))?;
@@ -1029,68 +1046,70 @@ impl Qwen4GpuForwardScratch {
             return Err(error);
         }
         let mut next = || allocated.remove(0);
-        Ok(Self {
-            max_chunk,
-            token_ids: next(),
-            embedding_rot: next(),
-            embeddings: next(),
-            streams: next(),
-            hc_normalized: next(),
-            hc_low: next(),
-            hc_up: next(),
-            hc_mixed: next(),
-            hc_gates: next(),
-            rotation: next(),
-            projection: next(),
-            projection2: next(),
-            gdn_a: next(),
-            gdn_b: next(),
-            gdn_gate: next(),
-            gdn_beta: next(),
-            gdn_recurrent_output: next(),
-            gdn_bf16: next(),
-            gdn_z: next(),
-            gdn_output: next(),
-            qsa_index: next(),
-            qsa_qgate: next(),
-            qsa_k: next(),
-            qsa_v: next(),
-            qsa_output: next(),
-            attention_output: next(),
-            ple_staged: next(),
-            ple_rows: next(),
-            ple_key: next(),
-            ple_value: next(),
-            ple_query: next(),
-            ple_gated: next(),
-            ple_normed: next(),
-            ple_output: next(),
-            router_logits: next(),
-            moe_x_rot: next(),
-            moe_gate_up: next(),
-            moe_gate: next(),
-            moe_up: next(),
-            moe_hidden: next(),
-            moe_output: next(),
-            moe_shared_output: next(),
-            moe_gate_batch: next(),
-            moe_up_batch: next(),
-            moe_rot_batch: next(),
-            moe_topk_indices: next(),
-            moe_topk_weights: next(),
-            moe_down_expanded: next(),
-            moe_scalar: next(),
-            moe_expert_token_counts: next(),
-            moe_expert_offsets: next(),
-            moe_sorted_slot_index: next(),
-            moe_expert_tile_ids: next(),
-            moe_inverse_perm: next(),
-            moe_y_gate_up_grouped: next(),
-            moe_y_down_grouped: next(),
-            logits: next(),
-            host_token_bytes: vec![0; max_chunk * std::mem::size_of::<i32>()],
-            host_ple_bytes: vec![0; max_ple_bytes],
-        })
+        Ok((
+            Self {
+                max_chunk,
+                token_ids: next(),
+                embedding_rot: next(),
+                embeddings: next(),
+                streams: next(),
+                hc_normalized: next(),
+                hc_low: next(),
+                hc_up: next(),
+                hc_mixed: next(),
+                hc_gates: next(),
+                rotation: next(),
+                projection: next(),
+                projection2: next(),
+                gdn_a: next(),
+                gdn_b: next(),
+                gdn_gate: next(),
+                gdn_beta: next(),
+                gdn_recurrent_output: next(),
+                gdn_bf16: next(),
+                gdn_z: next(),
+                gdn_output: next(),
+                qsa_index: next(),
+                qsa_qgate: next(),
+                qsa_k: next(),
+                qsa_v: next(),
+                qsa_output: next(),
+                attention_output: next(),
+                ple_staged: next(),
+                ple_rows: next(),
+                ple_key: next(),
+                ple_value: next(),
+                ple_query: next(),
+                ple_gated: next(),
+                ple_normed: next(),
+                ple_output: next(),
+                router_logits: next(),
+                moe_x_rot: next(),
+                moe_gate_up: next(),
+                moe_gate: next(),
+                moe_up: next(),
+                moe_hidden: next(),
+                moe_output: next(),
+                moe_shared_output: next(),
+                moe_gate_batch: next(),
+                moe_up_batch: next(),
+                moe_rot_batch: next(),
+                moe_topk_indices: next(),
+                moe_topk_weights: next(),
+                moe_down_expanded: next(),
+                moe_scalar: next(),
+                moe_expert_token_counts: next(),
+                moe_expert_offsets: next(),
+                moe_sorted_slot_index: next(),
+                moe_expert_tile_ids: next(),
+                moe_inverse_perm: next(),
+                moe_y_gate_up_grouped: next(),
+                moe_y_down_grouped: next(),
+                logits: next(),
+            },
+            vec![0; max_chunk * std::mem::size_of::<i32>()],
+            vec![0; max_ple_bytes],
+        ))
     }
 
     fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
@@ -1165,7 +1184,10 @@ impl Qwen4GpuForwardScratch {
     }
 }
 
-fn layer_scratch<'a>(scratch: &'a Qwen4GpuForwardScratch) -> Qwen4LayerScratch<'a> {
+fn layer_scratch<'a>(
+    scratch: &'a Qwen4GpuForwardScratch,
+    router_logits: &'a GpuTensor,
+) -> Qwen4LayerScratch<'a> {
     Qwen4LayerScratch {
         streams: &scratch.streams,
         hc_normalized: &scratch.hc_normalized,
@@ -1191,7 +1213,7 @@ fn layer_scratch<'a>(scratch: &'a Qwen4GpuForwardScratch) -> Qwen4LayerScratch<'
         attention_output: &scratch.attention_output,
         moe_output: &scratch.moe_output,
         moe_shared_output: &scratch.moe_shared_output,
-        moe_router_logits: &scratch.router_logits,
+        moe_router_logits: router_logits,
         moe_x_rot: &scratch.moe_x_rot,
         moe_gate_up: &scratch.moe_gate_up,
         moe_scalar: &scratch.moe_scalar,
@@ -1309,6 +1331,8 @@ impl Drop for PleEpochGuard<'_> {
 /// exact same chunk implementation.
 pub struct Qwen4GpuForward {
     pub scratch: Qwen4GpuForwardScratch,
+    host_token_bytes: Vec<u8>,
+    host_ple_bytes: Vec<u8>,
     moe: Vec<Qwen4MoeLayerRuntime>,
 }
 
@@ -1321,7 +1345,8 @@ impl Qwen4GpuForward {
         if !gpu.arch_caps.is_gfx1151() {
             return Err(invalid("Qwen4 ordinary-HIP path requires gfx1151"));
         }
-        let scratch = Qwen4GpuForwardScratch::new(gpu, &bundle.config, max_chunk)?;
+        let (scratch, host_token_bytes, host_ple_bytes) =
+            Qwen4GpuForwardScratch::new(gpu, &bundle.config, max_chunk)?;
         let mut moe = Vec::with_capacity(bundle.config.num_hidden_layers);
         let result = (|| {
             for layer in &bundle.weights.layer_refs {
@@ -1341,7 +1366,12 @@ impl Qwen4GpuForward {
             let _ = scratch.free_gpu(gpu);
             return Err(error);
         }
-        Ok(Self { scratch, moe })
+        Ok(Self {
+            scratch,
+            host_token_bytes,
+            host_ple_bytes,
+            moe,
+        })
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), hip_bridge::HipError> {
@@ -1437,7 +1467,7 @@ impl Qwen4GpuForward {
         let dims = program_dims(config);
         let final_hyper = hyper_read_desc(&bundle.weights, &bundle.weights.root.final_hyper)?;
         let lm_head = dense_ref(&bundle.weights, &bundle.weights.root.lm_head)?;
-        let preflight_scratch = layer_scratch(&self.scratch);
+        let preflight_scratch = layer_scratch(&self.scratch, &self.scratch.router_logits);
         validate_final_hyper(
             dims,
             &final_hyper,
@@ -1754,7 +1784,7 @@ impl Qwen4GpuForward {
             let lm_head = lm_head
                 .as_ref()
                 .ok_or_else(|| invalid("Qwen4 LM head preflight disappeared"))?;
-            let preflight_scratch = layer_scratch(&self.scratch);
+            let preflight_scratch = layer_scratch(&self.scratch, &self.scratch.router_logits);
             validate_final_hyper(
                 dims,
                 final_hyper,
@@ -1776,13 +1806,251 @@ impl Qwen4GpuForward {
             )?;
         }
 
+        let router_logits = matrix_view(&self.scratch.router_logits, n, dims.num_experts)?;
+        let scratch_desc = layer_scratch(&self.scratch, &router_logits);
+        if config.num_hidden_layers.saturating_mul(7).saturating_add(1) > QWEN4_STEP_INLINE_CAPACITY
+        {
+            return Err(invalid(
+                "Qwen4 generic layer program inline capacity exhausted",
+            ));
+        }
+        let ctx = DispatchCtx::new(gpu);
+        let mut steps: SmallVec<[Step<'_>; QWEN4_STEP_INLINE_CAPACITY]> = SmallVec::new();
+        let mut gdn_slot = 0usize;
+        let mut qsa_slot = 0usize;
+        for layer_index in 0..config.num_hidden_layers {
+            let layer = &bundle.weights.layer_refs[layer_index];
+            if layer_index == ple_layer_index {
+                let ple_weights = layer
+                    .ple
+                    .as_ref()
+                    .ok_or_else(|| invalid("PLE weights missing"))?;
+                if steps.len() >= QWEN4_STEP_INLINE_CAPACITY {
+                    return Err(invalid(
+                        "Qwen4 generic layer program inline capacity exhausted",
+                    ));
+                }
+                let ple = ple_desc(&bundle.weights, ple_weights)?;
+                steps.push(Step::GroupedDepthwise(GroupedDepthwiseOp {
+                    key: ple.key,
+                    value: ple.value,
+                    norm_key: ple.norm_key,
+                    norm_query: ple.norm_query,
+                    norm_conv: ple.norm_conv,
+                    conv: ple.conv,
+                    state: &bundle.state.ple_conv,
+                    streams: &self.scratch.streams,
+                    rows_tensor: &self.scratch.ple_rows,
+                    query: &self.scratch.ple_query,
+                    key_scratch: &self.scratch.ple_key,
+                    value_scratch: &self.scratch.ple_value,
+                    gated: &self.scratch.ple_gated,
+                    normed: &self.scratch.ple_normed,
+                    output: &self.scratch.ple_output,
+                    rows: n,
+                    branches: dims.hc_count,
+                    hidden: config.hidden_size,
+                    kernel_size: dims.ple_conv_kernel_dim,
+                    dilation: 3,
+                    epsilon: EPSILON,
+                }));
+            }
+
+            let description = layer_desc(&bundle.weights, layer, &self.moe[layer_index], &config)?;
+            let attn_read = &description.attn_hyper.read;
+            if steps.len() >= QWEN4_STEP_INLINE_CAPACITY {
+                return Err(invalid(
+                    "Qwen4 generic layer program inline capacity exhausted",
+                ));
+            }
+            steps.push(Step::HyperRead(HyperReadOp {
+                input: &self.scratch.streams,
+                norm_weight: attn_read.norm,
+                input_mix_down: attn_read.input_mix_down,
+                input_mix_up: attn_read.input_mix_up,
+                normalized: &self.scratch.hc_normalized,
+                low: &self.scratch.hc_low,
+                up: &self.scratch.hc_up,
+                mixed: &self.scratch.hc_mixed,
+                bf16_scratch: &self.scratch.gdn_bf16,
+                rows: n,
+                branches: dims.hc_count,
+                hidden: config.hidden_size,
+                low_rank: dims.hc_lowrank,
+            }));
+
+            match layer.kind {
+                LayerType::LinearAttention => {
+                    let state = bundle
+                        .state
+                        .gdn
+                        .get(gdn_slot)
+                        .ok_or_else(|| invalid("GDN state slot missing"))?;
+                    gdn_slot += 1;
+                    let weights = match &description.attention {
+                        Qwen4AttentionWeights::Linear(weights) => weights,
+                        _ => return Err(invalid("GDN descriptor kind mismatch")),
+                    };
+                    steps.push(Step::GatedDeltaNet(GatedDeltaNetOp {
+                        qkv: weights.qkv,
+                        conv: weights.conv,
+                        in_proj_a: weights.in_proj_a,
+                        in_proj_b: weights.in_proj_b,
+                        a_log: weights.a_log,
+                        dt_bias: weights.dt_bias,
+                        z: weights.z,
+                        norm: weights.norm,
+                        output: weights.output,
+                        recurrent: &state.recurrent,
+                        conv_state: &state.conv,
+                        projection: &self.scratch.projection,
+                        projection2: &self.scratch.projection2,
+                        a: &self.scratch.gdn_a,
+                        b: &self.scratch.gdn_b,
+                        gate: &self.scratch.gdn_gate,
+                        beta: &self.scratch.gdn_beta,
+                        recurrent_output: &self.scratch.gdn_recurrent_output,
+                        bf16_scratch: &self.scratch.gdn_bf16,
+                        z_output: &self.scratch.gdn_z,
+                        output_scratch: &self.scratch.gdn_output,
+                        input: &self.scratch.hc_mixed,
+                        output_tensor: &self.scratch.attention_output,
+                        rows: n,
+                        start_position: bundle.state.position,
+                        key_heads: dims.linear_num_key_heads,
+                        value_heads: dims.linear_num_value_heads,
+                        key_dim: dims.linear_key_head_dim,
+                        value_dim: dims.linear_value_head_dim,
+                        conv_kernel: dims.linear_conv_kernel_dim,
+                        input_width: dims.hidden,
+                    }));
+                }
+                LayerType::FullAttention => {
+                    let state = bundle
+                        .state
+                        .qsa
+                        .get(qsa_slot)
+                        .ok_or_else(|| invalid("QSA state slot missing"))?;
+                    qsa_slot += 1;
+                    let weights = match &description.attention {
+                        Qwen4AttentionWeights::Full(weights) => weights,
+                        _ => return Err(invalid("QSA descriptor kind mismatch")),
+                    };
+                    steps.push(Step::IndexedAttention(IndexedAttentionOp {
+                        indexer_qk: weights.indexer_qk,
+                        indexer_q_norm: weights.indexer_q_norm,
+                        indexer_k_norm: weights.indexer_k_norm,
+                        q: weights.q,
+                        k: weights.k,
+                        v: weights.v,
+                        q_norm: weights.q_norm,
+                        k_norm: weights.k_norm,
+                        output: weights.output,
+                        state: IndexedAttentionState {
+                            full_keys: &state.full_keys,
+                            full_values: &state.full_values,
+                            raw_index_keys: &state.raw_index_keys,
+                            pooled_keys: &state.pooled_keys,
+                            selected_indices: &state.selected_indices,
+                            full_capacity: state.full_capacity,
+                            raw_capacity: state.raw_capacity,
+                            pooled_capacity: state.pooled_capacity,
+                            selected_capacity: state.selected_capacity,
+                            position_capacity: state.position_capacity,
+                            full_len: state.full_len,
+                            raw_len: state.raw_len,
+                            pooled_len: state.pooled_len,
+                            selected_len: state.selected_len,
+                            position: state.position,
+                        },
+                        input: &self.scratch.hc_mixed,
+                        index_scratch: &self.scratch.qsa_index,
+                        qgate_scratch: &self.scratch.qsa_qgate,
+                        k_scratch: &self.scratch.qsa_k,
+                        v_scratch: &self.scratch.qsa_v,
+                        qsa_output: &self.scratch.qsa_output,
+                        attention_output: &self.scratch.attention_output,
+                        bf16_scratch: &self.scratch.gdn_bf16,
+                        rows: n,
+                        index_heads: dims.indexer_n_heads,
+                        index_kv_heads: dims.indexer_kv_heads,
+                        index_dim: dims.indexer_head_dim,
+                        budget: dims.indexer_budget,
+                        compress: dims.indexer_compress_ratio,
+                        heads: dims.num_attention_heads,
+                        kv_heads: dims.num_key_value_heads,
+                        head_dim: dims.head_dim,
+                        input_width: dims.hidden,
+                    }));
+                }
+            }
+
+            let attn_write = &description.attn_hyper.write;
+            steps.push(Step::HyperWrite(HyperWriteOp {
+                input: &self.scratch.streams,
+                norm_weight: attn_write.norm,
+                block_inject: attn_write.block_inject,
+                normalized: &self.scratch.hc_normalized,
+                mixed: &self.scratch.attention_output,
+                gates: &self.scratch.hc_gates,
+                output: &self.scratch.streams,
+                rows: n,
+                branches: dims.hc_count,
+                hidden: config.hidden_size,
+            }));
+
+            let mlp_read = &description.mlp_hyper.read;
+            steps.push(Step::HyperRead(HyperReadOp {
+                input: &self.scratch.streams,
+                norm_weight: mlp_read.norm,
+                input_mix_down: mlp_read.input_mix_down,
+                input_mix_up: mlp_read.input_mix_up,
+                normalized: &self.scratch.hc_normalized,
+                low: &self.scratch.hc_low,
+                up: &self.scratch.hc_up,
+                mixed: &self.scratch.hc_mixed,
+                bf16_scratch: &self.scratch.gdn_bf16,
+                rows: n,
+                branches: dims.hc_count,
+                hidden: config.hidden_size,
+                low_rank: dims.hc_lowrank,
+            }));
+
+            let sealed =
+                crate::program::seal_moe_for_layer(&ctx, dims, &description, &scratch_desc, n)
+                    .map_err(|error| {
+                        Qwen4GpuForwardError::Dispatch(format!("seal Qwen4 MoE: {error:?}"))
+                    })?;
+            steps.push(Step::Clear(ClearOp {
+                tensor: &self.scratch.moe_output,
+                elements: n * config.hidden_size,
+            }));
+            steps.push(Step::Moe(sealed));
+
+            let mlp_write = &description.mlp_hyper.write;
+            steps.push(Step::HyperWrite(HyperWriteOp {
+                input: &self.scratch.streams,
+                norm_weight: mlp_write.norm,
+                block_inject: mlp_write.block_inject,
+                normalized: &self.scratch.hc_normalized,
+                mixed: &self.scratch.moe_output,
+                gates: &self.scratch.hc_gates,
+                output: &self.scratch.streams,
+                rows: n,
+                branches: dims.hc_count,
+                hidden: config.hidden_size,
+            }));
+        }
+        validate_steps(gpu, &steps).map_err(|error| {
+            Qwen4GpuForwardError::Dispatch(format!("preflight Qwen4 typed program: {error:?}"))
+        })?;
         for (index, token) in tokens.iter().copied().enumerate() {
-            let bytes = &mut self.scratch.host_token_bytes[index * 4..index * 4 + 4];
+            let bytes = &mut self.host_token_bytes[index * 4..index * 4 + 4];
             bytes.copy_from_slice(&(token as i32).to_ne_bytes());
         }
         gpu.memcpy_htod_auto(
             &self.scratch.token_ids.buf,
-            &self.scratch.host_token_bytes[..n * std::mem::size_of::<i32>()],
+            &self.host_token_bytes[..n * std::mem::size_of::<i32>()],
         )?;
         let embedding = bundle.weights.resident(&bundle.weights.root.embedding)?;
         let embedding_rot = view(&self.scratch.embedding_rot, 0, n * config.hidden_size);
@@ -1812,7 +2080,10 @@ impl Qwen4GpuForward {
         let mut ple = PleEpochGuard::new(ple_rows_resource, ple_epoch);
         let next_history = bundle.state.ple_history;
         let next_position = bundle.state.position;
-        let attempt = (|| -> Result<(), Qwen4GpuForwardError> {
+        let attempt = (|| -> Result<
+            SmallVec<[(usize, usize, usize, usize, usize, usize); QWEN4_QSA_INLINE_CAPACITY]>,
+            Qwen4GpuForwardError,
+        > {
             let ticket = ple
                 .rows
                 .prefetch_before_layer0(ple_epoch, next_history, tokens)
@@ -1858,124 +2129,30 @@ impl Qwen4GpuForward {
                     .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?
                     .len();
                 let stage_started = qwen4_profile_start();
-                let stage_result = lease.stage_into(&mut self.scratch.host_ple_bytes[..upload_len]);
+                let stage_result = lease.stage_into(&mut self.host_ple_bytes[..upload_len]);
                 qwen4_profile_record(Qwen4ProfilePhase::PleStage, stage_started);
                 stage_result.map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
                 let upload_started = qwen4_profile_start();
                 let upload_result =
-                    gpu.memcpy_htod_auto(&staged.buf, &self.scratch.host_ple_bytes[..upload_len]);
+                    gpu.memcpy_htod_auto(&staged.buf, &self.host_ple_bytes[..upload_len]);
                 qwen4_profile_record(Qwen4ProfilePhase::PleUpload, upload_started);
                 upload_result?;
                 lease
                     .validate_after_upload()
                     .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
                 let apply_started = qwen4_profile_start();
-                gpu.qwen4_ple_gather_convert_bf16(&staged, &ple_rows, n)?;
+                gpu.grouped_gather_convert_bf16(
+                    &staged,
+                    &ple_rows,
+                    n,
+                    PLE_ROWS_PER_TOKEN,
+                    PLE_ROW_BYTES / 2,
+                )?;
                 qwen4_profile_record(Qwen4ProfilePhase::PleApply, apply_started);
             }
 
-            let scratch_desc = layer_scratch(&self.scratch);
-            let expected_step_count = config
-                .num_hidden_layers
-                .checked_add(1)
-                .ok_or_else(|| invalid("Qwen4 layer program length overflows"))?;
-            if expected_step_count > QWEN4_STEP_INLINE_CAPACITY {
-                return Err(invalid(format!(
-                    "Qwen4 layer program needs {expected_step_count} inline steps, capacity is \
-                     {QWEN4_STEP_INLINE_CAPACITY}"
-                )));
-            }
-            let mut steps: SmallVec<[Step<'_>; QWEN4_STEP_INLINE_CAPACITY]> = SmallVec::new();
-            let mut gdn_slot = 0usize;
-            let mut qsa_slot = 0usize;
-            for layer_index in 0..config.num_hidden_layers {
-                let layer = &bundle.weights.layer_refs[layer_index];
-                if layer_index == ple_layer_index {
-                    let ple_weights = layer
-                        .ple
-                        .as_ref()
-                        .ok_or_else(|| invalid("PLE weights missing"))?;
-                    if steps.len() >= QWEN4_STEP_INLINE_CAPACITY {
-                        return Err(invalid("Qwen4 layer program inline capacity exhausted"));
-                    }
-                    steps.push(Step::Qwen4Ple(Qwen4PleOp {
-                        dims,
-                        weights: ple_desc(&bundle.weights, ple_weights)?,
-                        state: &bundle.state.ple_conv,
-                        streams: &self.scratch.streams,
-                        ple_rows: &self.scratch.ple_rows,
-                        query: &self.scratch.ple_query,
-                        key: &self.scratch.ple_key,
-                        value: &self.scratch.ple_value,
-                        gated: &self.scratch.ple_gated,
-                        normed: &self.scratch.ple_normed,
-                        output: &self.scratch.ple_output,
-                        rows: n,
-                    }));
-                }
-                let description =
-                    layer_desc(&bundle.weights, layer, &self.moe[layer_index], &config)?;
-                let (state_gdn, state_qsa) = match layer.kind {
-                    LayerType::LinearAttention => {
-                        let state = bundle
-                            .state
-                            .gdn
-                            .get(gdn_slot)
-                            .ok_or_else(|| invalid("GDN state slot missing"))?;
-                        gdn_slot += 1;
-                        (
-                            Some(Qwen4GdnState {
-                                recurrent: &state.recurrent,
-                                conv: &state.conv,
-                            }),
-                            None,
-                        )
-                    }
-                    LayerType::FullAttention => {
-                        let state = bundle
-                            .state
-                            .qsa
-                            .get(qsa_slot)
-                            .ok_or_else(|| invalid("QSA state slot missing"))?;
-                        qsa_slot += 1;
-                        (
-                            None,
-                            Some(Qwen4QsaState {
-                                full_keys: &state.full_keys,
-                                full_values: &state.full_values,
-                                raw_index_keys: &state.raw_index_keys,
-                                pooled_keys: &state.pooled_keys,
-                                selected_indices: &state.selected_indices,
-                                full_capacity: state.full_capacity,
-                                raw_capacity: state.raw_capacity,
-                                pooled_capacity: state.pooled_capacity,
-                                selected_capacity: state.selected_capacity,
-                                position_capacity: state.position_capacity,
-                                full_len: state.full_len,
-                                raw_len: state.raw_len,
-                                pooled_len: state.pooled_len,
-                                selected_len: state.selected_len,
-                                position: state.position,
-                            }),
-                        )
-                    }
-                };
-                if steps.len() >= QWEN4_STEP_INLINE_CAPACITY {
-                    return Err(invalid("Qwen4 layer program inline capacity exhausted"));
-                }
-                steps.push(Step::Qwen4Layer(Qwen4LayerOp {
-                    dims,
-                    layer: description,
-                    state_gdn,
-                    state_qsa,
-                    scratch: &scratch_desc,
-                    rows: n,
-                    start_position: next_position,
-                }));
-            }
 
-            let ctx = DispatchCtx::new(gpu);
-            execute_steps(gpu, &ctx, &mut steps).map_err(|error| {
+            execute_validated_steps(gpu, &ctx, &mut steps).map_err(|error| {
                 Qwen4GpuForwardError::Dispatch(format!("execute Qwen4 layer program: {error:?}"))
             })?;
 
@@ -1984,21 +2161,19 @@ impl Qwen4GpuForward {
             > = SmallVec::new();
             let mut commit_slot = 0usize;
             for step in &steps {
-                if let Step::Qwen4Layer(op) = step {
-                    if let Some(state) = op.state_qsa.as_ref() {
-                        if qsa_commits.len() >= QWEN4_QSA_INLINE_CAPACITY {
-                            return Err(invalid("Qwen4 QSA commit inline capacity exhausted"));
-                        }
-                        qsa_commits.push((
-                            commit_slot,
-                            state.full_len,
-                            state.raw_len,
-                            state.pooled_len,
-                            state.selected_len,
-                            state.position,
-                        ));
-                        commit_slot += 1;
+                if let Step::IndexedAttention(op) = step {
+                    if qsa_commits.len() >= QWEN4_QSA_INLINE_CAPACITY {
+                        return Err(invalid("Qwen4 QSA commit inline capacity exhausted"));
                     }
+                    qsa_commits.push((
+                        commit_slot,
+                        op.state.full_len,
+                        op.state.raw_len,
+                        op.state.pooled_len,
+                        op.state.selected_len,
+                        op.state.position,
+                    ));
+                    commit_slot += 1;
                 }
             }
 
@@ -2035,43 +2210,41 @@ impl Qwen4GpuForward {
                 )?;
 
                 if let Some(top1) = top1 {
-                    qwen4_argmax(
+                    argmax_f32(
                         gpu,
-                        &Qwen4Argmax {
-                            logits,
-                            indices: top1,
-                            rows: requested_rows,
-                            vocab: config.vocab_size,
-                        },
+                        &ArgmaxF32 { logits,
+                        indices: top1,
+                        rows: requested_rows,
+                        vocab: config.vocab_size, },
                     )?;
                 }
             }
 
             drop(steps);
-            for (slot, full_len, raw_len, pooled_len, selected_len, position) in qsa_commits {
-                let state = bundle
-                    .state
-                    .qsa_mut(slot)
-                    .ok_or_else(|| invalid("QSA state slot disappeared"))?;
-                state.full_len = full_len;
-                state.raw_len = raw_len;
-                state.pooled_len = pooled_len;
-                state.selected_len = selected_len;
-                state.position = position;
-            }
-            let mut next_history = next_history;
-            for token in tokens.iter().copied() {
-                next_history.push(token);
-            }
-            bundle.state.ple_history = next_history;
-            bundle.state.position = next_position
-                .checked_add(n)
-                .ok_or_else(|| invalid("Qwen4 forward position overflows at commit"))?;
-            Ok(())
+            Ok(qsa_commits)
         })();
         match attempt {
-            Ok(()) => {
+            Ok(qsa_commits) => {
                 ple.complete();
+                for (slot, full_len, raw_len, pooled_len, selected_len, position) in qsa_commits {
+                    let state = bundle
+                        .state
+                        .qsa_mut(slot)
+                        .ok_or_else(|| invalid("QSA state slot disappeared"))?;
+                    state.full_len = full_len;
+                    state.raw_len = raw_len;
+                    state.pooled_len = pooled_len;
+                    state.selected_len = selected_len;
+                    state.position = position;
+                }
+                let mut next_history = next_history;
+                for token in tokens.iter().copied() {
+                    next_history.push(token);
+                }
+                bundle.state.ple_history = next_history;
+                bundle.state.position = next_position
+                    .checked_add(n)
+                    .ok_or_else(|| invalid("Qwen4 forward position overflows at commit"))?;
                 Ok(())
             }
             Err(error) => match ple.abort() {

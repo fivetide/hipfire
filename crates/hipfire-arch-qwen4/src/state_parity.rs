@@ -20,9 +20,10 @@ use crate::ple_rows::PleCacheStats;
 use crate::state::Qwen4State;
 use hip_bridge::launch_counters;
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
-use rdna_compute::qwen4::{
-    qwen4_qsa_cache_append, qwen4_qsa_pool_rope, qwen4_qsa_reuse_selection, qwen4_qsa_select,
-    Qwen4QsaCacheAppend, Qwen4QsaPoolRope, Qwen4QsaReuseSelection, Qwen4QsaSelect,
+use rdna_compute::tensor_ops::{
+    indexed_attention_cache_append, indexed_attention_pool_rope, indexed_attention_reuse_selection,
+    indexed_attention_select, IndexedAttentionCacheAppend, IndexedAttentionPoolRope,
+    IndexedAttentionReuseSelection, IndexedAttentionSelect,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Map, Value};
@@ -352,9 +353,9 @@ fn append_target_single(
             }
         };
         let result = (|| {
-            qwen4_qsa_cache_append(
+            indexed_attention_cache_append(
                 gpu,
-                &Qwen4QsaCacheAppend {
+                &IndexedAttentionCacheAppend {
                     key: &key,
                     value: &value,
                     full_keys: &qsa.full_keys,
@@ -403,9 +404,9 @@ fn append_mtp_single(
     let result = (|| {
         let metadata = state.parity_metadata();
         let buffers = state.parity_buffers();
-        qwen4_qsa_cache_append(
+        indexed_attention_cache_append(
             gpu,
-            &Qwen4QsaCacheAppend {
+            &IndexedAttentionCacheAppend {
                 key: &key,
                 value: &value,
                 full_keys: buffers.full_keys,
@@ -471,9 +472,9 @@ fn select_target(
     let raw_width = config.indexer_kv_heads * config.indexer_head_dim;
     let result = (|| {
         for qsa in &mut state.qsa {
-            qwen4_qsa_pool_rope(
+            indexed_attention_pool_rope(
                 gpu,
-                &Qwen4QsaPoolRope {
+                &IndexedAttentionPoolRope {
                     raw_keys: &qsa.raw_index_keys,
                     pooled: &qsa.pooled_keys,
                     norm: None,
@@ -483,9 +484,9 @@ fn select_target(
                 },
             )
             .map_err(|e| e.to_string())?;
-            qwen4_qsa_select(
+            indexed_attention_select(
                 gpu,
-                &Qwen4QsaSelect {
+                &IndexedAttentionSelect {
                     query: &query,
                     pooled: &qsa.pooled_keys,
                     selected: &qsa.selected_indices,
@@ -534,9 +535,9 @@ fn select_mtp(
     let raw_width = config.indexer_kv_heads * config.indexer_head_dim;
     let result = (|| {
         let buffers = state.parity_buffers();
-        qwen4_qsa_pool_rope(
+        indexed_attention_pool_rope(
             gpu,
-            &Qwen4QsaPoolRope {
+            &IndexedAttentionPoolRope {
                 raw_keys: buffers.raw_index_keys,
                 pooled: buffers.pooled_keys,
                 norm: None,
@@ -546,9 +547,9 @@ fn select_mtp(
             },
         )
         .map_err(|e| e.to_string())?;
-        qwen4_qsa_select(
+        indexed_attention_select(
             gpu,
-            &Qwen4QsaSelect {
+            &IndexedAttentionSelect {
                 query: &query,
                 pooled: buffers.pooled_keys,
                 selected: buffers.selected_indices,
@@ -583,9 +584,9 @@ fn reuse(
     state: &MtpGpuState,
 ) -> Result<(), String> {
     let buffers = state.parity_buffers();
-    qwen4_qsa_reuse_selection(
+    indexed_attention_reuse_selection(
         gpu,
-        &Qwen4QsaReuseSelection {
+        &IndexedAttentionReuseSelection {
             selected: buffers.selected_indices,
             selected_len: PREFIX,
             position: PREFIX,

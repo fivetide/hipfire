@@ -5,7 +5,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
 
-static __device__ __forceinline__ float qwen4_ple_sigmoid(float value) {
+static __device__ __forceinline__ float grouped_sigmoid(float value) {
     if (value >= 0.0f) {
         const float z = expf(-value);
         return 1.0f / (1.0f + z);
@@ -14,11 +14,11 @@ static __device__ __forceinline__ float qwen4_ple_sigmoid(float value) {
     return z / (1.0f + z);
 }
 
-static __device__ __forceinline__ float qwen4_ple_silu(float value) {
-    return value * qwen4_ple_sigmoid(value);
+static __device__ __forceinline__ float grouped_silu(float value) {
+    return value * grouped_sigmoid(value);
 }
 
-extern "C" __global__ void qwen4_ple_gather_convert_bf16(
+extern "C" __global__ void grouped_gather_convert_bf16(
     const unsigned short* __restrict__ staged,
     float* __restrict__ output,
     int tokens,
@@ -32,7 +32,7 @@ extern "C" __global__ void qwen4_ple_gather_convert_bf16(
     output[index] = __uint_as_float(static_cast<unsigned int>(staged[index]) << 16);
 }
 
-extern "C" __global__ void qwen4_ple_linear_f32(
+extern "C" __global__ void grouped_linear_f32(
     const float* __restrict__ input,
     const float* __restrict__ weight,
     float* __restrict__ output,
@@ -57,7 +57,7 @@ extern "C" __global__ void qwen4_ple_linear_f32(
 // correctness-first fallback; the surrounding projection kernels remain
 // independently batchable and can be replaced by a tiled implementation
 // without changing this ABI or equation.
-extern "C" __global__ void qwen4_ple_gate_f32(
+extern "C" __global__ void grouped_gate_f32(
     const float* __restrict__ key,
     const float* __restrict__ query,
     const float* __restrict__ value,
@@ -98,7 +98,7 @@ extern "C" __global__ void qwen4_ple_gate_f32(
     dot /= sqrtf(static_cast<float>(hidden_size));
     const float sign = dot >= 0.0f ? 1.0f : -1.0f;
     const float transformed = sign * sqrtf(fmaxf(fabsf(dot), 1.0e-6f));
-    const float gate = qwen4_ple_sigmoid(transformed);
+    const float gate = grouped_sigmoid(transformed);
     const float* value_row = value + token * hidden_size;
     float* gated_row = gated + base;
     for (int index = 0; index < hidden_size; ++index) {
@@ -108,7 +108,7 @@ extern "C" __global__ void qwen4_ple_gate_f32(
 
 // Grouped RMS normalization with the checkpoint's `(1 + weight)` multiplier.
 // Grid is [groups, tokens], block is 256 threads.
-extern "C" __global__ void qwen4_ple_norm_f32(
+extern "C" __global__ void grouped_norm_f32(
     const float* __restrict__ input,
     const float* __restrict__ weight,
     float* __restrict__ output,
@@ -146,7 +146,7 @@ extern "C" __global__ void qwen4_ple_norm_f32(
 // Each thread owns one channel and evaluates the fixture's dilated window over
 // the concatenated history/input stream.  The state is the trailing history
 // rows, so token chunks compose without changing the oracle's indexing.
-extern "C" __global__ void qwen4_ple_depthwise_conv_silu_add_f32(
+extern "C" __global__ void grouped_depthwise_conv_silu_add_f32(
     const float* __restrict__ gated,
     const float* __restrict__ normed,
     const float* __restrict__ conv_weight,
@@ -177,7 +177,7 @@ extern "C" __global__ void qwen4_ple_depthwise_conv_silu_add_f32(
             total += value * conv_weight[channel * kernel_size + tap];
         }
         output[token * channels + channel] =
-            gated[token * channels + channel] + qwen4_ple_silu(total);
+            gated[token * channels + channel] + grouped_silu(total);
     }
     for (int row = 0; row < history_rows; ++row) {
         const int source = tokens + row;
@@ -189,7 +189,7 @@ extern "C" __global__ void qwen4_ple_depthwise_conv_silu_add_f32(
         }
     }
 }
-extern "C" __global__ void qwen4_ple_gate_bf16_f32(
+extern "C" __global__ void grouped_gate_bf16(
     const float* __restrict__ key,
     const float* __restrict__ query,
     const float* __restrict__ value,
@@ -228,7 +228,7 @@ extern "C" __global__ void qwen4_ple_gate_bf16_f32(
     dot /= sqrtf(static_cast<float>(hidden_size));
     const float sign = dot >= 0.0f ? 1.0f : -1.0f;
     const float transformed = sign * sqrtf(fmaxf(fabsf(dot), 1.0e-6f));
-    const float gate = qwen4_ple_sigmoid(transformed);
+    const float gate = grouped_sigmoid(transformed);
     const float* value_row = value + token * hidden_size;
     float* gated_row = gated + base;
     for (int index = 0; index < hidden_size; ++index) {
@@ -236,7 +236,7 @@ extern "C" __global__ void qwen4_ple_gate_bf16_f32(
     }
 }
 
-extern "C" __global__ void qwen4_ple_norm_bf16(
+extern "C" __global__ void grouped_norm_bf16(
     const float* __restrict__ input,
     const hip_bfloat16* __restrict__ weight,
     float* __restrict__ output,
@@ -269,7 +269,7 @@ extern "C" __global__ void qwen4_ple_norm_bf16(
     }
 }
 
-extern "C" __global__ void qwen4_ple_depthwise_conv_silu_add_bf16(
+extern "C" __global__ void grouped_depthwise_conv_silu_add_bf16(
     const float* __restrict__ gated,
     const float* __restrict__ normed,
     const hip_bfloat16* __restrict__ conv_weight,
@@ -298,7 +298,7 @@ extern "C" __global__ void qwen4_ple_depthwise_conv_silu_add_bf16(
             total += value * static_cast<float>(conv_weight[channel * kernel_size + tap]);
         }
         output[token * channels + channel] =
-            gated[token * channels + channel] + qwen4_ple_silu(total);
+            gated[token * channels + channel] + grouped_silu(total);
     }
     for (int row = 0; row < history_rows; ++row) {
         const int source = tokens + row;

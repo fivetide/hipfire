@@ -16,7 +16,7 @@ use crate::context::DispatchCtx;
 use crate::families::gemv::WeightRef;
 use crate::families::moe::{
     MoeEpMode, MoeNormalization, MoeParams, MoePrefillParams, MoeQ8RouterPolicy, MoeRecipe,
-    MoeResolution, RoutedExpertWeights,
+    MoeResolution, MoeRouteCapability, MoeRoutePolicy, RoutedExpertWeights,
 };
 use crate::types::{dtype_rotation_plan, DispatchError, RotationPlan};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -1826,13 +1826,13 @@ impl<'a> SealedMoeCall<'a> {
                 gpu.device_id
             )));
         }
-        let qwen4_route = match &self.params {
-            SealedParams::Decode(params) => params.dtypes.routed_down == DType::MQ4G128V2,
-            SealedParams::Prefill(params) => params.dtypes.routed_down == DType::MQ4G128V2,
+        let specialized_route = match &self.params {
+            SealedParams::Decode(params) => params.route_policy.is_some(),
+            SealedParams::Prefill(params) => params.route_policy.is_some(),
         };
-        if qwen4_route && gpu.replay.is_enabled() {
+        if specialized_route && gpu.replay.is_enabled() {
             return Err(invalid(
-                "Qwen4 sealed MoE has no retained-replay pointer contract; refusing before launch",
+                "specialized sealed MoE has no retained-replay pointer contract; refusing before launch",
             ));
         }
 
@@ -1909,6 +1909,7 @@ pub(super) fn produce_prefill_route<'a>(
             params.down_m,
             params.down_k,
             params.expert_dtype_tags,
+            params.route_policy,
         );
 
     match call.router {
@@ -2312,7 +2313,7 @@ fn seal_indexed_decode<'a>(
 /// normalization, grammar, resource validation, and kernel selection resolver
 /// as [`seal_indexed_decode`], but does not mint an invocation or allocate a
 /// sealed call.
-pub(crate) fn preflight_decode<'a>(
+pub fn preflight_decode<'a>(
     experts: BoundMoeExperts<'a>,
     ctx: &DispatchCtx,
     params: MoeParams<'a>,
@@ -2476,7 +2477,7 @@ fn seal_prefill_with_router<'a>(
 /// Launch-free grouped-prefill preflight.  It shares the same binding,
 /// recipe, resource, and kernel-selection checks as `seal_prefill` without
 /// allocating a sealed call or minting an invocation.
-pub(crate) fn preflight_prefill<'a>(
+pub fn preflight_prefill<'a>(
     experts: BoundMoeExperts<'a>,
     ctx: &DispatchCtx,
     params: MoePrefillParams<'a>,
@@ -2499,23 +2500,46 @@ fn validate_qwen4_route_width(
     k: usize,
     hidden: usize,
     intermediate: usize,
+    gate_up_k: usize,
+    down_m: usize,
+    down_k: usize,
     gate_up: DType,
     down: DType,
     protocol: &str,
+    route_policy: Option<MoeRoutePolicy>,
 ) -> Result<(), DispatchError> {
-    let qt53 = down == DType::MQ4G128V2;
-    let qwen4_pair = gate_up == DType::MQ4G256V2 && qt53;
-    if qt53 && !qwen4_pair {
+    let Some(policy) = route_policy else {
+        if down == DType::MQ4G128V2 {
+            return Err(invalid(format!(
+                "{protocol} qt53 down requires an architecture-declared projection pair"
+            )));
+        }
+        return Ok(());
+    };
+    if down == DType::MQ4G128V2
+        && !crate::families::moe::grouped_route_geometry_supported(
+            &policy,
+            n_experts,
+            k,
+            hidden,
+            intermediate,
+            gate_up_k,
+            down_m,
+            down_k,
+            gate_up,
+            down,
+        )
+    {
         return Err(invalid(format!(
-            "{protocol} qt53 down requires the Qwen4 qt44/qt53 projection pair"
+            "{protocol} QT44/QT53 grouped route geometry or wire format is unsupported"
         )));
     }
-    if !qwen4_pair {
+    if down != DType::MQ4G128V2 {
         return Ok(());
     }
-    if n_experts != 512 || k != 10 || hidden != 2560 || intermediate != 640 {
+    if gate_up != DType::MQ4G256V2 {
         return Err(invalid(format!(
-            "{protocol} Qwen4 qt53 route requires n_experts=512, k=10, hidden=2560, intermediate=640 (got experts={n_experts}, k={k}, hidden={hidden}, intermediate={intermediate})"
+            "{protocol} QT53 down requires the canonical QT44 gate/up format"
         )));
     }
     Ok(())
@@ -2862,9 +2886,13 @@ fn validate_decode(
         params.k,
         params.hidden,
         params.mi,
+        params.routed_gate_up_k,
+        params.routed_down_m,
+        params.routed_down_k,
         params.dtypes.routed_gate_up,
         params.dtypes.routed_down,
         "decode",
+        params.route_policy,
     )?;
 
     if params.n_exp == 0 || params.k == 0 || params.k > params.n_exp {
@@ -2991,11 +3019,15 @@ fn validate_prefill(
     validate_qwen4_route_width(
         params.n_exp,
         params.k_top,
-        params.gate_up_k,
+        params.down_m,
         params.mi,
+        params.gate_up_k,
+        params.down_m,
+        params.down_k,
         params.dtypes.routed_gate_up,
         params.dtypes.routed_down,
         "prefill",
+        params.route_policy,
     )?;
     if super::is_qwen4_route(
         &params.dtypes,
@@ -3007,6 +3039,7 @@ fn validate_prefill(
         params.down_m,
         params.down_k,
         params.expert_dtype_tags,
+        params.route_policy,
     ) && !matches!(params.prelude.route, PrefillRouteMode::Replicated)
     {
         return Err(invalid(
@@ -4702,6 +4735,12 @@ mod tests {
         assert!(table.prepare_binding(0, 1, -1).is_err());
     }
 
+    fn qwen4_route_policy() -> MoeRoutePolicy {
+        MoeRoutePolicy {
+            capability: MoeRouteCapability::Qt44Qt53Grouped,
+        }
+    }
+
     #[test]
     fn qwen4_topk_width_and_projection_pair_are_sealed_before_gpu_work() {
         assert!(validate_qwen4_route_width(
@@ -4709,9 +4748,13 @@ mod tests {
             10,
             2560,
             640,
+            2560,
+            2560,
+            640,
             DType::MQ4G256V2,
             DType::MQ4G128V2,
             "test",
+            Some(qwen4_route_policy()),
         )
         .is_ok());
         assert!(validate_qwen4_route_width(
@@ -4719,9 +4762,13 @@ mod tests {
             8,
             2560,
             640,
+            2560,
+            2560,
+            640,
             DType::MQ4G256V2,
             DType::MQ4G128V2,
             "test",
+            Some(qwen4_route_policy()),
         )
         .is_err());
         assert!(validate_qwen4_route_width(
@@ -4729,9 +4776,27 @@ mod tests {
             10,
             2560,
             640,
+            2560,
+            2560,
+            640,
             DType::MQ4G256,
             DType::MQ4G128V2,
             "test",
+            Some(qwen4_route_policy()),
+        )
+        .is_err());
+        assert!(validate_qwen4_route_width(
+            512,
+            10,
+            2560,
+            640,
+            123,
+            1,
+            999,
+            DType::MQ4G256V2,
+            DType::MQ4G128V2,
+            "test",
+            Some(qwen4_route_policy()),
         )
         .is_err());
     }
@@ -5559,6 +5624,7 @@ mod tests {
                 per_expert_down: None,
             },
             recipe: crate::families::moe::MoeRecipe::SoftmaxGatedShared,
+            route_policy: None,
             normalization: crate::families::moe::MoeNormalization::Provided,
             batch_size: 1,
             hidden: 4,
@@ -5757,6 +5823,7 @@ mod tests {
                 per_expert_down: None,
             },
             recipe: crate::families::moe::MoeRecipe::SoftmaxGatedShared,
+            route_policy: None,
             normalization: crate::families::moe::MoeNormalization::Provided,
             batch_size: 1,
             hidden: 4,
@@ -6266,6 +6333,7 @@ mod tests {
                 per_expert_down: None,
             },
             recipe: crate::families::moe::MoeRecipe::SoftmaxGatedShared,
+            route_policy: None,
             prelude: crate::families::moe::MoePrefillPrelude {
                 normalization: crate::families::moe::MoeNormalization::RmsNorm {
                     weight: &s.x_norm_batch,
