@@ -1800,6 +1800,95 @@ impl Gpu {
         result
     }
 
+    /// In-place exact BF16 round-trip over a contiguous slice in each strided
+    /// row. QSA uses this for the index-K half of an interleaved projection;
+    /// keep this on the bit-level round-trip kernel rather than the generic
+    /// tensor-op cast path.
+    pub fn bf16_round_trip_f32_strided(
+        &mut self,
+        x: &GpuTensor,
+        rows: usize,
+        row_offset: usize,
+        row_stride: usize,
+        width: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if x.dtype != DType::F32
+            || rows == 0
+            || width == 0
+            || row_offset
+                .checked_add(width)
+                .map_or(true, |end| end > row_stride)
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "bf16_round_trip_f32_strided: invalid shape",
+            ));
+        }
+        let last = (rows - 1)
+            .checked_mul(row_stride)
+            .and_then(|base| base.checked_add(row_offset))
+            .and_then(|base| base.checked_add(width))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: shape overflow")
+            })?;
+        if last > x.numel() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "bf16_round_trip_f32_strided: buffer too small",
+            ));
+        }
+        let total = rows.checked_mul(width).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: extent overflow")
+        })?;
+        let rows_i = i32::try_from(rows).map_err(|_| {
+            hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: rows exceed i32")
+        })?;
+        let row_offset_i = i32::try_from(row_offset).map_err(|_| {
+            hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: offset exceeds i32")
+        })?;
+        let row_stride_i = i32::try_from(row_stride).map_err(|_| {
+            hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: stride exceeds i32")
+        })?;
+        let width_i = i32::try_from(width).map_err(|_| {
+            hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: width exceeds i32")
+        })?;
+        let total_i = i32::try_from(total).map_err(|_| {
+            hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: extent exceeds i32")
+        })?;
+        self.ensure_kernel(
+            "bf16_round_trip",
+            kernels::BF16_ROUND_TRIP_SRC,
+            "bf16_round_trip_f32_strided",
+        )?;
+        let xp = x.buf.as_ptr();
+        let block_size = 256u32;
+        let grid = ((total_i as u32 + block_size - 1) / block_size).max(1);
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &rows_i as *const _ as *mut c_void,
+            &row_offset_i as *const _ as *mut c_void,
+            &row_stride_i as *const _ as *mut c_void,
+            &width_i as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "bf16_round_trip_f32_strided",
+            [grid, 1, 1],
+            [block_size, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_i32(rows_i);
+                b.push_i32(row_offset_i);
+                b.push_i32(row_stride_i);
+                b.push_i32(width_i);
+                b
+            },
+        )
+    }
+
     /// Sigmoid activation, in-place.
     #[cfg(feature = "deltanet")]
     /// Repeat-interleave Q and K key heads up to value heads count.

@@ -2024,6 +2024,28 @@ pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_SRC: &str =
 /// decoded same-expert weight across the sixteen grouped route slots.
 pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_MULTIROW_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10_multirow.gfx1151.hip");
+/// gfx1151 exact-shape O4×R16 companion for the QT53 grouped down consumer.
+/// It handles four adjacent output rows per wave while preserving the
+/// production sibling's R16 slot mapping, decode arithmetic, padded-K
+/// handling, and wave32 reduction association. One decoded weight group now
+/// feeds four row chains, so each output element pays half the X traffic its
+/// two-row predecessor did.
+pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O4_R16_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10_o4_r16.gfx1151.hip");
+/// gfx1151 exact-shape O4×R4 QT44 grouped gate/up consumer.
+/// It pairs four adjacent output rows with four route slots at the same
+/// 4-chain × 4-slot × 4-row = 64 accumulator budget, so each group's eight X
+/// scalars feed four rows instead of two, while the 16-slot metadata and the
+/// static four-chain reduction order stay identical to the O2×R8 sibling.
+pub const GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R4_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_moe_grouped_top10_o4_r4.gfx1151.hip");
+/// gfx1151 exact-shape O2×R8 QT44 grouped gate/up consumer.
+/// It pairs two adjacent output rows with eight route slots while retaining
+/// the existing 16-slot metadata and the static four-chain reduction order.
+/// The O4×R4 consumer above serves the M=1280, K=2560 shape; this source is
+/// retained as that arm's bitwise reference and rollback path.
+pub const GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O2_R8_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_moe_grouped_top10_o2_r8.gfx1151.hip");
 
 /// Index-aware MoE gate_up GEMV — reads expert IDs from a device-side
 /// topk_indices buffer and the per-expert weight base from an
@@ -6844,10 +6866,10 @@ pub const GEMM_BF16_XF32_BATCHED_SRC: &str =
 /// one widened weight across four F32 accumulators without downcasting X.
 pub const GEMM_BF16_XF32_MULTIROW_SRC: &str =
     include_str!("../../../kernels/src/gemm_bf16_xf32_multirow.hip");
-/// gfx1151-only eight-token tile; dispatched by the measured production-shape
+/// gfx1151-only sixteen-token tile; dispatched by the measured production-shape
 /// allowlist in `gemm_bf16_xf32_multirow`.
-pub const GEMM_BF16_XF32_MULTIROW_N8_GFX1151_SRC: &str =
-    include_str!("../../../kernels/src/gemm_bf16_xf32_multirow.hip");
+pub const GEMM_BF16_XF32_MULTIROW_R16_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16_xf32_multirow_r16.gfx1151.hip");
 
 /// DeepSeek V4 SwiGLU with swiglu_limit clamp: silu(min(gate, L)) * clamp(up, ±L)
 /// L = swiglu_limit (DeepSeek V4 config = 10.0).

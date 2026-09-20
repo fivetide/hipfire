@@ -2310,19 +2310,27 @@ impl Gpu {
         x_src_rows: usize,
         n_exp: usize,
     ) -> HipResult<()> {
-        self.bind_thread()?;
-        let gfx1151 = self.arch_caps.is_gfx1151();
-        let (func, source, block_x) = if gfx1151 {
+        let use_o4_r16 = self.arch_caps.is_gfx1151() && m == 2560 && k == 640;
+        let (func, source, block_x, grid_x) = if use_o4_r16 {
+            (
+                "gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151",
+                kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O4_R16_GFX1151_SRC,
+                32,
+                m.div_ceil(4),
+            )
+        } else if self.arch_caps.is_gfx1151() {
             (
                 "gemm_mq4g128v2_moe_grouped_top10_multirow_gfx1151",
                 kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_MULTIROW_GFX1151_SRC,
                 32,
+                m,
             )
         } else {
             (
                 "gemm_mq4g128v2_moe_grouped_top10",
                 kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_SRC,
                 256,
+                m,
             )
         };
         self.ensure_kernel(func, source, func)?;
@@ -2355,7 +2363,7 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "gemm", func, bytes);
         let result = self.launch_maybe_blob(
             func,
-            [m as u32, grouped_rows.div_ceil(16) as u32, 1],
+            [grid_x as u32, grouped_rows.div_ceil(16) as u32, 1],
             [block_x, 1, 1],
             0,
             &mut params,

@@ -153,11 +153,13 @@ pub fn gated_delta_step(gpu: &mut Gpu, p: &GatedDeltaStep<'_>) -> HipResult<()> 
     let value_dim = checked_i32(p.value_dim, "GDN value width")?;
     let value_heads_grid = checked_u32(p.value_heads, "GDN value-head grid")?;
     let value_dim_grid = blocks(p.value_dim)?;
-    let kernel = if p.key_dim == 128 && p.value_dim == 128 {
+    let shared_norm128 = gpu.arch_caps.is_gfx1151() && p.key_dim == 128 && p.value_dim == 128;
+    let kernel = if shared_norm128 {
         "gated_delta_step_shared_norm128_gfx1151"
     } else {
         "gated_delta_step_f32"
     };
+    let block_x = if shared_norm128 { 128 } else { 256 };
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
     args.push_ptr(p.q.buf.as_ptr());
@@ -176,12 +178,94 @@ pub fn gated_delta_step(gpu: &mut Gpu, p: &GatedDeltaStep<'_>) -> HipResult<()> 
     gpu.launch_kernel_blob(
         kernel,
         [value_heads_grid, value_dim_grid, 1],
+        [block_x, 1, 1],
+        0,
+        args.as_mut_slice(),
+    )
+}
+/// Persistent row-batched GDN recurrence for the exact gfx1151 128x128 route.
+/// The kernel partitions each value channel's 128-state column across two
+/// 64-value halves and serializes the cross-half dot chains in shared memory.
+pub struct GatedDeltaStepBatched<'a> {
+    pub projection: &'a GpuTensor,
+    pub gate: &'a GpuTensor,
+    pub beta: &'a GpuTensor,
+    pub state: &'a GpuTensor,
+    pub output: &'a GpuTensor,
+    pub rows: usize,
+    pub qkv_width: usize,
+    pub key_heads: usize,
+    pub value_heads: usize,
+    pub key_dim: usize,
+    pub value_dim: usize,
+}
+
+pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) -> HipResult<()> {
+    ensure_gfx1151(gpu)?;
+    for tensor in [p.projection, p.gate, p.beta, p.state, p.output] {
+        ensure_f32(tensor)?;
+    }
+    if p.rows == 0
+        || p.key_heads == 0
+        || p.value_heads == 0
+        || p.value_heads % p.key_heads != 0
+        || p.key_dim != 128
+        || p.value_dim != 128
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let qk = checked_product(p.key_heads, p.key_dim, "GDN batched qk extent")?;
+    let value = checked_product(p.value_heads, p.value_dim, "GDN batched value extent")?;
+    let expected_qkv = checked_add(
+        checked_product(2, qk, "GDN batched qkv")?,
+        value,
+        "GDN batched qkv",
+    )?;
+    let rows_qkv = checked_product(p.rows, expected_qkv, "GDN batched projection extent")?;
+    let rows_value = checked_product(p.rows, value, "GDN batched output extent")?;
+    let rows_heads = checked_product(p.rows, p.value_heads, "GDN batched parameter extent")?;
+    let state_elements = checked_product(value, p.key_dim, "GDN batched state extent")?;
+    if p.qkv_width != expected_qkv
+        || p.projection.numel() != rows_qkv
+        || p.gate.numel() != rows_heads
+        || p.beta.numel() != rows_heads
+        || p.state.numel() != state_elements
+        || p.output.numel() != rows_value
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let rows = checked_i32(p.rows, "GDN batched rows")?;
+    let qkv_width = checked_i32(p.qkv_width, "GDN batched qkv width")?;
+    let key_heads = checked_i32(p.key_heads, "GDN batched key heads")?;
+    let value_heads = checked_i32(p.value_heads, "GDN batched value heads")?;
+    let key_dim = checked_i32(p.key_dim, "GDN batched key width")?;
+    let value_dim = checked_i32(p.value_dim, "GDN batched value width")?;
+    let value_heads_grid = checked_u32(p.value_heads, "GDN batched value-head grid")?;
+    gpu.ensure_kernel_public(
+        "tensor_ops",
+        TENSOR_OPS_SRC,
+        "gated_delta_step_halves_state128_persistent256_gfx1151",
+    )?;
+    let mut args = KernargBlob::new();
+    for tensor in [p.projection, p.gate, p.beta, p.state, p.output] {
+        args.push_ptr(tensor.buf.as_ptr());
+    }
+    args.push_i32(rows);
+    args.push_i32(qkv_width);
+    args.push_i32(key_heads);
+    args.push_i32(value_heads);
+    args.push_i32(key_dim);
+    args.push_i32(value_dim);
+    args.push_f32((p.key_dim as f32).sqrt().recip());
+    args.pad_to(16);
+    gpu.launch_kernel_blob(
+        "gated_delta_step_halves_state128_persistent256_gfx1151",
+        [value_heads_grid, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
     )
 }
-
 /// Device-side F32 -> BF16 storage -> F32 conversion at a source activation
 /// boundary.  `scratch` is caller-owned and is allocated with the forward
 /// arena; no host transfer or per-token allocation occurs.
@@ -222,6 +306,37 @@ pub fn bf16_roundtrip_f32(gpu: &mut Gpu, p: &Bf16Roundtrip<'_>) -> HipResult<()>
         args.as_mut_slice(),
     )
 }
+/// HC-specific in-place fusion of three source BF16 boundaries, F32 scaling,
+/// and the existing SiLU expression over a contiguous low-rank buffer.
+pub struct HcActivationFused<'a> {
+    pub values: &'a GpuTensor,
+    pub scale: f32,
+}
+
+pub fn hc_activation_fused_f32(gpu: &mut Gpu, p: &HcActivationFused<'_>) -> HipResult<()> {
+    ensure_gfx1151(gpu)?;
+    ensure_f32(p.values)?;
+    let elements = checked_extent(p.values.numel(), "HC activation extent")?;
+    if elements == 0 {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let elements_i = checked_i32(elements, "HC activation extent")?;
+    let grid = blocks(elements)?;
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "hc_activation_fused_f32")?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.values.buf.as_ptr());
+    args.push_i32(elements_i);
+    args.push_f32(p.scale);
+    args.pad_to(16);
+    gpu.launch_kernel_blob(
+        "hc_activation_fused_f32",
+        [grid, 1, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+    )
+}
+
 /// Source-exact BF16 product and residual add for the shared expert.
 pub struct Bf16ScaledAdd<'a> {
     pub residual: &'a GpuTensor,
@@ -612,6 +727,80 @@ pub fn gated_delta_conv(gpu: &mut Gpu, p: &GatedDeltaConv<'_>) -> HipResult<()> 
         args.as_mut_slice(),
     )
 }
+/// Ordered K=4 causal convolution over row-major `[rows, channels]` input.
+/// Each channel keeps its BF16-rounded history ring across the whole batch.
+pub struct GatedDeltaConvBatched<'a> {
+    pub input: &'a GpuTensor,
+    pub kernel: &'a GpuTensor,
+    pub history: &'a GpuTensor,
+    pub output: &'a GpuTensor,
+    pub next_history: &'a GpuTensor,
+    pub rows: usize,
+    pub channels: usize,
+    pub history_rows: usize,
+    pub kernel_size: usize,
+    pub start_cursor: usize,
+}
+
+pub fn gated_delta_conv_batched(gpu: &mut Gpu, p: &GatedDeltaConvBatched<'_>) -> HipResult<()> {
+    ensure_gfx1151(gpu)?;
+    for tensor in [p.input, p.history, p.output, p.next_history] {
+        ensure_f32(tensor)?;
+    }
+    if p.kernel.dtype != DType::BF16
+        || p.rows == 0
+        || p.channels == 0
+        || p.history_rows != 3
+        || p.kernel_size != 4
+        || p.start_cursor >= p.history_rows
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let input_elements = checked_product(p.rows, p.channels, "GDN batched convolution input")?;
+    let history_elements = checked_product(
+        p.channels,
+        p.history_rows,
+        "GDN batched convolution history",
+    )?;
+    let kernel_elements =
+        checked_product(p.channels, p.kernel_size, "GDN batched convolution kernel")?;
+    if p.input.numel() != input_elements
+        || p.output.numel() != input_elements
+        || p.history.numel() != history_elements
+        || p.next_history.numel() != history_elements
+        || p.kernel.numel() != kernel_elements
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let rows = checked_i32(p.rows, "GDN batched convolution rows")?;
+    let channels = checked_i32(p.channels, "GDN batched convolution channels")?;
+    let history_rows = checked_i32(p.history_rows, "GDN batched convolution history rows")?;
+    let kernel_size = checked_i32(p.kernel_size, "GDN batched convolution kernel width")?;
+    let start_cursor = checked_i32(p.start_cursor, "GDN batched convolution cursor")?;
+    let grid = blocks(p.channels)?;
+    gpu.ensure_kernel_public(
+        "tensor_ops",
+        TENSOR_OPS_SRC,
+        "gated_delta_conv_bf16_f32_batched_k4_gfx1151",
+    )?;
+    let mut args = KernargBlob::new();
+    for tensor in [p.input, p.kernel, p.history, p.output, p.next_history] {
+        args.push_ptr(tensor.buf.as_ptr());
+    }
+    args.push_i32(rows);
+    args.push_i32(channels);
+    args.push_i32(history_rows);
+    args.push_i32(kernel_size);
+    args.push_i32(start_cursor);
+    args.pad_to(16);
+    gpu.launch_kernel_blob(
+        "gated_delta_conv_bf16_f32_batched_k4_gfx1151",
+        [grid, 1, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+    )
+}
 
 pub struct GatedDeltaParams<'a> {
     pub a: &'a GpuTensor,
@@ -650,6 +839,60 @@ pub fn gated_delta_params(gpu: &mut Gpu, p: &GatedDeltaParams<'_>, heads: usize)
     args.pad_to(16);
     gpu.launch_kernel_blob(
         "gated_delta_params_bf16_f32",
+        [grid, 1, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+    )
+}
+/// Row-batched parameter expansion for the exact Qwen4 prefill route.
+pub struct GatedDeltaParamsBatched<'a> {
+    pub a: &'a GpuTensor,
+    pub b: &'a GpuTensor,
+    pub a_log: &'a GpuTensor,
+    pub dt_bias: &'a GpuTensor,
+    pub gate: &'a GpuTensor,
+    pub beta: &'a GpuTensor,
+    pub rows: usize,
+    pub heads: usize,
+}
+
+pub fn gated_delta_params_batched(gpu: &mut Gpu, p: &GatedDeltaParamsBatched<'_>) -> HipResult<()> {
+    ensure_gfx1151(gpu)?;
+    for tensor in [p.a, p.b, p.gate, p.beta] {
+        ensure_f32(tensor)?;
+    }
+    if p.rows == 0 || p.heads == 0 || p.a_log.dtype != DType::BF16 || p.dt_bias.dtype != DType::BF16
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let elements = checked_product(p.rows, p.heads, "GDN batched parameter extent")?;
+    if p.a.numel() != elements
+        || p.b.numel() != elements
+        || p.gate.numel() != elements
+        || p.beta.numel() != elements
+        || p.a_log.numel() != p.heads
+        || p.dt_bias.numel() != p.heads
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let rows = checked_i32(p.rows, "GDN batched parameter rows")?;
+    let heads = checked_i32(p.heads, "GDN batched parameter heads")?;
+    let grid = blocks(elements)?;
+    gpu.ensure_kernel_public(
+        "tensor_ops",
+        TENSOR_OPS_SRC,
+        "gated_delta_params_bf16_f32_batched",
+    )?;
+    let mut args = KernargBlob::new();
+    for tensor in [p.a, p.b, p.a_log, p.dt_bias, p.gate, p.beta] {
+        args.push_ptr(tensor.buf.as_ptr());
+    }
+    args.push_i32(rows);
+    args.push_i32(heads);
+    args.pad_to(16);
+    gpu.launch_kernel_blob(
+        "gated_delta_params_bf16_f32_batched",
         [grid, 1, 1],
         [256, 1, 1],
         0,
@@ -739,6 +982,61 @@ pub fn gated_delta_gate(gpu: &mut Gpu, p: &GatedDeltaGate<'_>) -> HipResult<()> 
         args.as_mut_slice(),
     )
 }
+/// Row-batched gated RMSNorm with the exact BF16 recurrent boundary folded
+/// into the kernel.
+pub struct GatedDeltaGateBatched<'a> {
+    pub recurrent_output: &'a GpuTensor,
+    pub z: &'a GpuTensor,
+    pub norm: &'a GpuTensor,
+    pub output: &'a GpuTensor,
+    pub rows: usize,
+    pub value_heads: usize,
+    pub value_dim: usize,
+}
+
+pub fn gated_delta_gate_batched(gpu: &mut Gpu, p: &GatedDeltaGateBatched<'_>) -> HipResult<()> {
+    ensure_gfx1151(gpu)?;
+    for tensor in [p.recurrent_output, p.z, p.output] {
+        ensure_f32(tensor)?;
+    }
+    if p.norm.dtype != DType::BF16 || p.rows == 0 || p.value_heads == 0 || p.value_dim != 128 {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let row_elements = checked_product(p.value_heads, p.value_dim, "GDN batched gate row extent")?;
+    let elements = checked_product(p.rows, row_elements, "GDN batched gate extent")?;
+    if p.recurrent_output.numel() != elements
+        || p.z.numel() != elements
+        || p.norm.numel() != p.value_dim
+        || p.output.numel() != elements
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let rows = checked_i32(p.rows, "GDN batched gate rows")?;
+    let value_heads = checked_i32(p.value_heads, "GDN batched gate heads")?;
+    let value_dim = checked_i32(p.value_dim, "GDN batched gate width")?;
+    let value_heads_grid = checked_u32(elements / p.value_dim, "GDN batched gate grid")?;
+    let value_dim_grid = blocks(p.value_dim)?;
+    gpu.ensure_kernel_public(
+        "tensor_ops",
+        TENSOR_OPS_SRC,
+        "gated_delta_gate_bf16_f32_batched",
+    )?;
+    let mut args = KernargBlob::new();
+    for tensor in [p.recurrent_output, p.z, p.norm, p.output] {
+        args.push_ptr(tensor.buf.as_ptr());
+    }
+    args.push_i32(rows);
+    args.push_i32(value_heads);
+    args.push_i32(value_dim);
+    args.pad_to(16);
+    gpu.launch_kernel_blob(
+        "gated_delta_gate_bf16_f32_batched",
+        [value_heads_grid, value_dim_grid, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+    )
+}
 pub struct IndexedAttentionNormRope<'a> {
     pub values: &'a GpuTensor,
     pub norm: &'a GpuTensor,
@@ -802,6 +1100,95 @@ pub fn indexed_attention_norm_rope(
     )
 }
 
+pub struct IndexedAttentionNormRopeBatch<'a> {
+    pub values: &'a GpuTensor,
+    pub norm: &'a GpuTensor,
+    pub rows: usize,
+    pub row_stride: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub head_stride: usize,
+    pub position_start: usize,
+    pub rotary_dim: usize,
+}
+
+pub fn indexed_attention_norm_rope_batch(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionNormRopeBatch<'_>,
+) -> HipResult<()> {
+    ensure_gfx1151(gpu)?;
+    ensure_f32(p.values)?;
+    if p.norm.dtype != DType::BF16
+        || p.rows == 0
+        || p.row_stride == 0
+        || p.heads == 0
+        || p.head_dim == 0
+        || p.head_dim > 256
+        || p.head_stride < p.head_dim
+        || p.rotary_dim == 0
+        || p.rotary_dim % 2 != 0
+        || p.rotary_dim > p.head_dim
+        || p.position_start
+            .checked_add(p.rows)
+            .map_or(true, |end| end > i32::MAX as usize)
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let head_span = checked_product(
+        p.heads - 1,
+        p.head_stride,
+        "indexed attention batch head span",
+    )
+    .and_then(|base| checked_add(base, p.head_dim, "indexed attention batch head span"))?;
+    if p.row_stride < head_span
+        || p.norm.numel() != p.head_dim
+        || p.values.numel()
+            < checked_product(p.rows - 1, p.row_stride, "indexed attention batch rows")?
+                .checked_add(head_span)
+                .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let rows = checked_i32(p.rows, "indexed attention batch rows")?;
+    let row_stride = checked_i32(p.row_stride, "indexed attention batch row stride")?;
+    let heads = checked_i32(p.heads, "indexed attention batch head count")?;
+    let head_dim = checked_i32(p.head_dim, "indexed attention batch head width")?;
+    let head_stride = checked_i32(p.head_stride, "indexed attention batch head stride")?;
+    let position_start = checked_i32(p.position_start, "indexed attention batch position")?;
+    let rotary_dim = checked_i32(p.rotary_dim, "indexed attention batch rotary width")?;
+    let head_grid = checked_u32(p.heads, "indexed attention batch head grid")?;
+    let dim_grid = blocks(p.head_dim)?;
+    let row_grid = checked_u32(p.rows, "indexed attention batch row grid")?;
+    gpu.ensure_kernel_public(
+        "tensor_ops",
+        TENSOR_OPS_SRC,
+        "indexed_attention_norm_rope_f32_batched",
+    )?;
+    let mut args = KernargBlob::new();
+    for tensor in [p.values, p.norm] {
+        args.push_ptr(tensor.buf.as_ptr());
+    }
+    for value in [
+        rows,
+        row_stride,
+        heads,
+        head_dim,
+        head_stride,
+        position_start,
+        rotary_dim,
+    ] {
+        args.push_i32(value);
+    }
+    args.pad_to(16);
+    gpu.launch_kernel_blob(
+        "indexed_attention_norm_rope_f32_batched",
+        [head_grid, dim_grid, row_grid],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+    )
+}
+
 pub struct IndexedAttentionCacheAppend<'a> {
     pub key: &'a GpuTensor,
     pub value: &'a GpuTensor,
@@ -855,6 +1242,66 @@ pub fn indexed_attention_cache_append(
     )
 }
 
+pub struct IndexedAttentionCacheAppendBatch<'a> {
+    pub key: &'a GpuTensor,
+    pub value: &'a GpuTensor,
+    pub full_keys: &'a GpuTensor,
+    pub full_values: &'a GpuTensor,
+    pub rows: usize,
+    pub position_start: usize,
+    pub kv_width: usize,
+}
+
+pub fn indexed_attention_cache_append_batch(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionCacheAppendBatch<'_>,
+) -> HipResult<()> {
+    ensure_gfx1151(gpu)?;
+    for tensor in [p.key, p.value, p.full_keys, p.full_values] {
+        ensure_f32(tensor)?;
+    }
+    if p.rows == 0
+        || p.kv_width == 0
+        || p.key.numel() < checked_product(p.rows, p.kv_width, "indexed attention batch key")?
+        || p.value.numel() < checked_product(p.rows, p.kv_width, "indexed attention batch value")?
+        || p.full_keys.numel() != p.full_values.numel()
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let end_position = p
+        .position_start
+        .checked_add(p.rows)
+        .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
+    let end = checked_product(end_position, p.kv_width, "indexed attention batch cache")?;
+    if end > p.full_keys.numel() || end_position > i32::MAX as usize {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let rows = checked_i32(p.rows, "indexed attention batch rows")?;
+    let position_start = checked_i32(p.position_start, "indexed attention batch position")?;
+    let kv_width = checked_i32(p.kv_width, "indexed attention batch width")?;
+    let grid = blocks(p.kv_width)?;
+    let row_grid = checked_u32(p.rows, "indexed attention batch row grid")?;
+    gpu.ensure_kernel_public(
+        "tensor_ops",
+        TENSOR_OPS_SRC,
+        "indexed_attention_cache_append_f32_batched",
+    )?;
+    let mut args = KernargBlob::new();
+    for tensor in [p.key, p.value, p.full_keys, p.full_values] {
+        args.push_ptr(tensor.buf.as_ptr());
+    }
+    for value in [rows, position_start, kv_width] {
+        args.push_i32(value);
+    }
+    args.pad_to(16);
+    gpu.launch_kernel_blob(
+        "indexed_attention_cache_append_f32_batched",
+        [grid, row_grid, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+    )
+}
 pub struct IndexedAttentionSelect<'a> {
     pub query: &'a GpuTensor,
     pub pooled: &'a GpuTensor,
@@ -891,6 +1338,7 @@ pub fn indexed_attention_select(gpu: &mut Gpu, p: &IndexedAttentionSelect<'_>) -
         .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
     let block_count = checked_i32(p.block_count, "QSA select block count")?;
     let index_heads = checked_i32(p.index_heads, "QSA select index-head count")?;
+
     let index_dim = checked_i32(p.index_dim, "QSA select index width")?;
     let budget_blocks = checked_i32(p.budget_blocks, "QSA select budget")?;
     let compress = checked_i32(p.compress, "QSA select compression")?;
@@ -935,6 +1383,121 @@ pub fn indexed_attention_select(gpu: &mut Gpu, p: &IndexedAttentionSelect<'_>) -
     gpu.launch_kernel_blob(
         kernel_name,
         [1, 1, 1],
+        block,
+        shared_mem,
+        args.as_mut_slice(),
+    )
+}
+
+pub struct IndexedAttentionSelectBatch<'a> {
+    pub query: &'a GpuTensor,
+    pub pooled: &'a GpuTensor,
+    pub selected: &'a GpuTensor,
+    pub rows: usize,
+    pub query_row_stride: usize,
+    pub block_count: usize,
+    pub index_heads: usize,
+    pub index_dim: usize,
+    pub budget_blocks: usize,
+    pub compress: usize,
+    pub position_start: usize,
+    pub capacity: usize,
+}
+
+pub fn indexed_attention_select_batch(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionSelectBatch<'_>,
+) -> HipResult<()> {
+    ensure_gfx1151(gpu)?;
+    for tensor in [p.query, p.pooled] {
+        ensure_f32(tensor)?;
+    }
+    if p.selected.dtype != DType::Raw
+        || p.rows == 0
+        || p.query_row_stride == 0
+        || p.block_count > 0 && p.compress == 0
+        || p.index_heads == 0
+        || p.index_dim == 0
+        || p.compress == 0
+        || p.capacity == 0
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let query_elements = checked_product(p.index_heads, p.index_dim, "QSA batch select query")?;
+    if p.query_row_stride < query_elements {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let query_last = checked_product(
+        p.rows - 1,
+        p.query_row_stride,
+        "QSA batch select query rows",
+    )?
+    .checked_add(query_elements)
+    .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
+    let pooled_elements = checked_product(p.block_count, p.index_dim, "QSA batch select pooled")?;
+    let selected_bytes = checked_product(
+        checked_product(p.rows, p.capacity, "QSA batch select rows")?,
+        std::mem::size_of::<i32>(),
+        "QSA batch select selected",
+    )?;
+    let end_position = p
+        .position_start
+        .checked_add(p.rows)
+        .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
+    if end_position > i32::MAX as usize
+        || p.query.numel() < query_last
+        || p.pooled.numel() < pooled_elements
+        || p.selected.numel() < selected_bytes
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let rows = checked_i32(p.rows, "QSA batch select rows")?;
+    let query_row_stride = checked_i32(p.query_row_stride, "QSA batch select query stride")?;
+    let block_count = checked_i32(p.block_count, "QSA batch select blocks")?;
+    let index_heads = checked_i32(p.index_heads, "QSA batch select heads")?;
+    let index_dim = checked_i32(p.index_dim, "QSA batch select dim")?;
+    let budget_blocks = checked_i32(p.budget_blocks, "QSA batch select budget")?;
+    let compress = checked_i32(p.compress, "QSA batch select compress")?;
+    let position_start = checked_i32(p.position_start, "QSA batch select position")?;
+    let capacity = checked_i32(p.capacity, "QSA batch select capacity")?;
+    let row_grid = checked_u32(p.rows, "QSA batch select row grid")?;
+    let (kernel_name, block, shared_mem) =
+        match p.block_count.checked_mul(std::mem::size_of::<f32>()) {
+            Some(bytes)
+                if p.block_count > 0
+                    && bytes <= QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES
+                    && bytes <= u32::MAX as usize =>
+            {
+                (
+                    "indexed_attention_select_f32_batched",
+                    [QSA_SELECT_PARALLEL_THREADS, 1, 1],
+                    bytes as u32,
+                )
+            }
+            _ => ("indexed_attention_select_f32_batched_serial", [1, 1, 1], 0),
+        };
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel_name)?;
+    let mut args = KernargBlob::new();
+    for tensor in [p.query, p.pooled, p.selected] {
+        args.push_ptr(tensor.buf.as_ptr());
+    }
+    for value in [
+        rows,
+        query_row_stride,
+        block_count,
+        index_heads,
+        index_dim,
+        budget_blocks,
+        compress,
+        position_start,
+        capacity,
+    ] {
+        args.push_i32(value);
+    }
+    args.pad_to(16);
+    gpu.launch_kernel_blob(
+        kernel_name,
+        [row_grid, 1, 1],
         block,
         shared_mem,
         args.as_mut_slice(),
@@ -1150,6 +1713,145 @@ pub fn indexed_attention_attention(
         kernel_name,
         [head_grid, dim_grid, 1],
         [QSA_ATTENTION_PARALLEL_THREADS, 1, 1],
+        shared_mem,
+        args.as_mut_slice(),
+    )
+}
+
+pub struct IndexedAttentionAttentionBatch<'a> {
+    pub q_with_gate: &'a GpuTensor,
+    pub full_keys: &'a GpuTensor,
+    pub full_values: &'a GpuTensor,
+    pub selected: &'a GpuTensor,
+    pub output: &'a GpuTensor,
+    pub rows: usize,
+    pub position_start: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub budget_blocks: usize,
+    pub compress: usize,
+    pub capacity: usize,
+    pub full_capacity: usize,
+}
+
+pub fn indexed_attention_attention_batch(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+) -> HipResult<()> {
+    ensure_gfx1151(gpu)?;
+    for tensor in [p.q_with_gate, p.full_keys, p.full_values, p.output] {
+        ensure_f32(tensor)?;
+    }
+    if p.selected.dtype != DType::Raw
+        || p.rows == 0
+        || p.position_start.checked_add(p.rows).is_none()
+        || p.n_heads == 0
+        || p.n_kv_heads == 0
+        || p.head_dim == 0
+        || p.n_heads % p.n_kv_heads != 0
+        || p.compress == 0
+        || p.capacity == 0
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let head_elements = checked_product(p.n_heads, p.head_dim, "QSA batch attention heads")?;
+    let q_elements = checked_product(2, head_elements, "QSA batch attention query")?;
+    let kv_elements = checked_product3(
+        p.n_kv_heads,
+        p.head_dim,
+        p.full_capacity,
+        "QSA batch attention cache",
+    )?;
+    let q_rows = checked_product(p.rows, q_elements, "QSA batch attention query rows")?;
+    let output_rows = checked_product(p.rows, head_elements, "QSA batch attention output rows")?;
+    let selected_bytes = checked_product(
+        checked_product(p.rows, p.capacity, "QSA batch attention selected rows")?,
+        std::mem::size_of::<i32>(),
+        "QSA batch attention selected",
+    )?;
+    let end_position = p
+        .position_start
+        .checked_add(p.rows)
+        .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
+    if end_position > i32::MAX as usize
+        || end_position > p.full_capacity
+        || p.q_with_gate.numel() < q_rows
+        || p.output.numel() < output_rows
+        || p.full_keys.numel() < kv_elements
+        || p.full_values.numel() < p.full_keys.numel()
+        || p.selected.numel() < selected_bytes
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let selected_bound = checked_product(
+        p.budget_blocks,
+        p.compress,
+        "QSA batch attention selected bound",
+    )?
+    .checked_add(p.compress - 1)
+    .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
+    let max_selected = end_position.min(p.capacity).min(selected_bound);
+    let rows = checked_i32(p.rows, "QSA batch attention rows")?;
+    let position_start = checked_i32(p.position_start, "QSA batch attention position")?;
+    let n_heads = checked_i32(p.n_heads, "QSA batch attention heads")?;
+    let n_kv_heads = checked_i32(p.n_kv_heads, "QSA batch attention KV heads")?;
+    let head_dim = checked_i32(p.head_dim, "QSA batch attention head width")?;
+    let budget_blocks = checked_i32(p.budget_blocks, "QSA batch attention budget")?;
+    let compress = checked_i32(p.compress, "QSA batch attention compress")?;
+    let capacity = checked_i32(p.capacity, "QSA batch attention capacity")?;
+    let full_capacity = checked_i32(p.full_capacity, "QSA batch attention cache capacity")?;
+    let head_grid = checked_u32(p.n_heads, "QSA batch attention head grid")?;
+    let dim_grid = blocks(p.head_dim)?;
+    let row_grid = checked_u32(p.rows, "QSA batch attention row grid")?;
+    let (kernel_name, block, shared_mem) =
+        match max_selected.checked_mul(QSA_ATTENTION_LDS_BYTES_PER_ROW) {
+            Some(bytes)
+                if max_selected > 0
+                    && bytes <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
+                    && bytes <= u32::MAX as usize =>
+            {
+                (
+                    "indexed_attention_attention_f32_batched",
+                    [QSA_ATTENTION_PARALLEL_THREADS, 1, 1],
+                    bytes as u32,
+                )
+            }
+            _ => (
+                "indexed_attention_attention_f32_batched_serial",
+                [QSA_ATTENTION_PARALLEL_THREADS, 1, 1],
+                0,
+            ),
+        };
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel_name)?;
+    let mut args = KernargBlob::new();
+    for tensor in [
+        p.q_with_gate,
+        p.full_keys,
+        p.full_values,
+        p.selected,
+        p.output,
+    ] {
+        args.push_ptr(tensor.buf.as_ptr());
+    }
+    for value in [
+        rows,
+        position_start,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        budget_blocks,
+        compress,
+        capacity,
+        full_capacity,
+    ] {
+        args.push_i32(value);
+    }
+    args.pad_to(16);
+    gpu.launch_kernel_blob(
+        kernel_name,
+        [head_grid, dim_grid, row_grid],
+        block,
         shared_mem,
         args.as_mut_slice(),
     )

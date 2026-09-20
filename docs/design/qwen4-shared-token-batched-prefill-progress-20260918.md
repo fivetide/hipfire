@@ -711,3 +711,295 @@ This cutover is an ownership, ordering, shape, and dtype correction. It does
 not admit a replay/PM4 route, physical EP2/EP4, retained admission, throughput
 promotion, or quality/marketing claim. The exact oracle, serve, and host
 artifacts above are correctness and integration evidence only.
+
+## Verification checkpoint — HC bounded BF16 boundary batching (2026-09-19, rejected)
+
+This was a candidate-only gfx1151 experiment in
+`crates/hipfire-dispatch/src/pipeline/layer_ops.rs`.  It replaced the three
+row-wise uses of the existing `rdna_compute::tensor_ops::bf16_roundtrip_f32`
+boundary in shared `execute_hyper_read` with contiguous chunks bounded by the
+already-owned `bf16_scratch.numel()` capacity.  The candidate added no kernel,
+scratch allocation, precision/reduction change, architecture gate, or GDN
+change.  The candidate source diff and snapshot remain preserved in
+[`candidate-git-diff.patch`](../../.codeinsight+research/qwen4/current-pp-profile-20260919-v1/metadata/candidate-git-diff.patch)
+and
+[`candidate-source-snapshot.json`](../../.codeinsight+research/qwen4/current-pp-profile-20260919-v1/metadata/candidate-source-snapshot.json).
+
+The candidate profile established a genuine launch-count reduction on the
+natural `[128,128,35]` path (`observed_target_natural_launches=4656`) while
+leaving the scalar `grid512` count unchanged at `84681`; see
+[`candidate-profile-summary.json`](../../.codeinsight+research/qwen4/current-pp-profile-20260919-v1/candidate/profile/rocprof/current-marker-20260919/candidate-profile-summary.json).
+The host tail/row-crossing probe was exact for rows `1`, `35`, and `128`, but
+is explicitly a host simulation:
+[`chunk-tail-row-crossing-probe.json`](../../.codeinsight+research/qwen4/current-pp-profile-20260919-v1/metadata/chunk-tail-row-crossing-probe.json).
+The candidate full GPU oracle remained exact (`exact_bits=true`,
+`state_exact=true`, `ids_equal=true`) and the AR/native-MTP Paris smoke passed,
+but these are correctness and integration evidence, not throughput promotion:
+[`result.json`](../../.codeinsight+research/qwen4/current-pp-profile-20260919-v1/candidate/oracle/result.json)
+and
+[`summary.json`](../../.codeinsight+research/qwen4/current-pp-profile-20260919-v1/candidate/serve-smoke-20260919-paris/summary.json).
+
+For the natural marker, the all-symbol raw-trace ranking (not the
+target-only hot-symbol filter) sums `4,715.890965 ms` of device duration over
+`107,195` dispatches and `39` symbols inside the actual ROCTX bounds
+(`7,142.418151 ms` marker wall time).  The top five are
+`gemm_mq4g256v2_moe_grouped_top10_simt` (`1,109.758875 ms`),
+`gemm_mq4g128v2_moe_grouped_top10_multirow_gfx1151` (`836.797373 ms`),
+`gemm_bf16_xf32_multirow` (`740.026696 ms`),
+`gemm_bf16_xf32_multirow_n8_gfx1151` (`718.992121 ms`), and
+`gated_delta_step_shared_norm128_gfx1151` (`493.483439 ms`).  This profile
+attribution is retained for a better next-lever choice and is not a native
+throughput claim:
+[`natural-marker-all-symbol-top5.json`](../../.codeinsight+research/qwen4/current-pp-profile-20260919-v1/metadata/natural-marker-all-symbol-top5.json).
+
+The valid native primary measurement used fixed products, private
+`max_seq=2048` configuration, DPM warmup `10s`, the exact 291-token prompt,
+and six manually ordered ABBAAB arms.  The standard non-matrix native bench
+ignores `--warmups`; its one internal `Hello` warmup is not a matching
+291-token warmup.  The declared protocol therefore used native `--runs 11`,
+discarded zero-based samples `0..9`, and retained only sample `10`; all raw
+arrays of length `11` are preserved.  The cooperative GPU lock serialized
+these arms, but unrelated GPU clients were preserved, so this is not an
+uncontended measurement.  The durable record is
+[`primary-summary.json`](../../.codeinsight+research/qwen4/current-pp-profile-20260919-v1/candidate/perf-v3-abbaab-20260919/primary-summary.json):
+A prefill median was `51.4 tok/s`, B was `53.4 tok/s` (`+2.0 tok/s`,
+`+3.9%`), but that delta was below the maximum observed arm spread
+(`2.2 tok/s`); decode medians were equal at `13.2 tok/s`.  This is
+`no_clear_win`, not a performance promotion.  The earlier invalid
+`v1` configuration run and cold exploratory `v2` timings are excluded from
+the decision; their artifacts remain preserved.
+
+The separately run 24-token France fixture is exploratory only: the bench
+itself warns that its prefill number is launch overhead, not throughput.
+Its A/B raw records are retained under
+[`second-prompt-20260919`](../../.codeinsight+research/qwen4/current-pp-profile-20260919-v1/candidate/perf-v3-abbaab-20260919/second-prompt-20260919/),
+but this short prompt cannot repair the primary no-clear-win result or serve
+as transfer evidence.
+
+Decision: reject and do not retain this HC chunk lever.  The authored source
+was surgically restored to the pre-experiment identity
+`30984594a8bd6055e8deba1e487422a43a86292f514b0cbcc8e697043d06b496`;
+candidate binaries, raw traces, oracle/smoke proofs, and corrected warmup
+protocol evidence remain available for archaeology.  No 500-token/s prefill
+or product throughput claim is made, and no replay/PM4, retained admission,
+QT53 policy, or other route was changed.
+
+## Verification checkpoint — grouped-down O4×R16 and dense LM-head dispatch (2026-09-20)
+
+Two gfx1151 changes landed on top of the HC activation fusion candidate and
+were verified against the frozen full-model oracle.
+
+**QT53 grouped down O4×R16.** The routed down projection
+(`m=2560, k=640`) moves from one wave covering two output rows and sixteen
+route slots (`gemm_mq4g128v2_moe_grouped_top10_o2_r16_gfx1151`) to one wave
+covering four output rows and sixteen route slots with a single accumulator
+chain per slot — the same 64 accumulators, four-row batched weight loads,
+vector four-K loads with a peeled K tail, and a per-slot gated wave32
+reduction.  Each expert's weight rows are still fetched once per padded tile
+while the number of X-reading waves halves.  The O2×R16 kernel, its registry
+const and its launcher were removed on the same change; every non-gfx1151
+path is untouched.  Evidence: 23/23 focused-driver cases bitwise equal, a
+real-layer-0-input driver showing 0/409600 differing raw cells against the
+production kernel blob, and the full oracle reporting
+`comparison.exact_bits=true` with prefill logits `max_abs=0.0` on both the
+291-token fixture and the 513-token/511-chunk boundary fixture.  Focused
+driver timing on the production-shaped case: 5.521 ms vs 8.957 ms, 1.62×.
+
+**Dense BF16 multirow LM-head dispatch.** A 14-shape focused measurement found
+the r16 variant fastest on every production shape and also on the
+`(248320, 2560, *)` logits family, which had been dispatched to the plain
+four-row kernel and would have used the dominated n8 route at 128 rows.
+`(248320, 2560)` was added to the gfx1151 r16 allowlist and the now-unreachable
+n8 branch, its const and its kernel body were removed.  Measured
+`(248320,2560,291)`: 400.8 ms plain, 266.9 ms n8, 164.6 ms r16.  This is a
+latent-path and quality fix, not a change to the measured 291-token prefill
+number: the current 291-token production trace contains no `(248320, 2560)`
+multirow dispatch.
+
+**Methodology correction (load-bearing for this thread).** The scratch
+per-kernel drivers had been compiling kernels with `-ffast-math` while
+production compiles without it.  Under `-ffast-math` clang may reassociate
+`acc += a + b + c + d`, so such a driver does not compare the production tree;
+one candidate was pinned to a non-production association and reported 18965 of
+409600 raw output cells differing.  Production `-O3` without `-ffast-math`
+reproduces the shipped kernel-cache blob exactly (the `-ffast-math` build
+differs by 296 instructions on that kernel).  Focused drivers for this
+workstream must be built with production flags.  The full-model oracle always
+used production flags and was never affected.
+
+**Measured effect.** Three fresh native processes of the landed tree,
+byte-identical 291-token prompt (md5 `973900074bfd15d4adeeecdff3359082`),
+`q8`/`contiguous`, `--spec off`, `noslots`, unrelated llama servers paused for
+the whole measurement: prefill **114.0 / 119.2 / 113.0** tok/s (median 114.0),
+decode 12.6–12.7 tok/s.  The preceding candidate measured 105.5 / 105.7 / 108.1
+(prefill `hipfire` md5 `ed15c814`, `daemon` md5 `8949e51a`).  This is a
+measured local delta under a paused-GPU protocol, not a product admission, a
+speed-floor update, or a 500-token/s claim.  The pp500 target remains unmet:
+MoE expert-weight traffic for one ≥291-token chunk is the full 512-expert
+union (≈64.2 GB), which at the measured 223.9 GB/s streaming ceiling is
+≈287 ms before any dense, attention, GDN or HC work, and the 500 tok/s budget
+at 291 prompt tokens is 582 ms total.  The grouped gate kernel already runs at
+about 90% of that ceiling, so gate retiling has little headroom; the remaining
+headroom is concentrated in the dense BF16 projections (≈2.1 TFLOP/s, ≈12% of
+FP32 peak) and the grouped down GEMM.
+
+Rejected on the same day and not retained: a single-row gate O1×R16 tile
+(104.0 vs 105.5–108.1 tok/s — the O2×R8 gate is already bandwidth bound, so
+halving weight fetches is cancelled by doubled X traffic) and a half-slotted
+gate O2×R16 tile that failed bitwise parity.  Both are recorded with raw
+numbers in
+[`REJECTED-TILE-EXPERIMENTS-20260920.md`](../../.codeinsight+research/qwen4/pp500-kernel-check/REJECTED-TILE-EXPERIMENTS-20260920.md).
+
+### 2026-09-20 second pass — dense kernel rewrite, gate liveness elision, and the half-slotted defect
+
+**Dense BF16 multirow rewrite.** `gemm_bf16_xf32_multirow_r16_gfx1151` was
+rebuilt in place: one wave now owns sixteen output rows and two token rows
+(grid `[ceil(N/2), ceil(M/16), 1]`, token tile on `blockIdx.x` so a row group's
+weight rows stay cached), which takes activation bytes per FMA from 4.0 to
+0.25 and load instructions per FMA from 0.258 to 0.078.  Measured per-shape
+medians against the previous kernel: `(10240,2560,291)` 7.132 → 2.838 ms
+(2.51×), `(12288,2560,291)` 8.517 → 3.403 ms, `(2560,6144,291)` 3.667 →
+1.783 ms, `(320,10240,291)` 0.636 → 0.367 ms, `(10240,2560,512)` 11.957 →
+4.964 ms, `(248320,2560,291)` 163.157 → 75.116 ms; required-shape geomean
+2.21×, all twenty measured shapes 1.94×.  Every arm bitwise equal to the
+four-row reference.  VGPR 241, no spills.  The r16 allowlist gained the
+measured `(6144,2560)` entry (1.763× on that shape, 0.128 s of the plain path);
+`(10240,320)` stays on the plain path because the same measurement showed
+0.713× there.
+
+**Gate liveness elision.** In
+`gemm_mq4g256v2_moe_grouped_top10_o2_r8.gfx1151.hip`, a subtile with no live
+slot now elides its whole K walk (`group_walk = any_live ? groups_per_row : 0`)
+instead of decoding weights that are multiplied by nothing.  The fold, the
+shuffle and the store loop still run and still write the zero every sentinel
+slot owes, so the output is bit-identical; VGPR, symbol, grid and metadata
+contract are unchanged.  Focused driver 7/7 bitwise equal; real-workload gate
+device time −5.7%.
+
+**Located defect (recorded because a silent structural bug is worth the
+space).** The earlier half-slotted gate O2×R16 candidate failed full-model
+parity with prefill logits `max_abs` 12.77 and no associativity explanation.
+The cause was accumulator *lifetime*, not ordering: the design shared one
+4-chain × 8-slot × 2-row accumulator set across both slot halves and never
+re-zeroed or folded it between them, so half 0's partial sums survived into
+half 1's epilogue and half 1's stores wrote `half0 + half1` for the second
+eight slots — the normal production case being a second half that is entirely
+sentinel, where slots 8..15 simply received slots 0..7's values (reproduced
+exactly as `slot 8 = slot 0`, `slot 9 = slot 1`, … in five independent focused
+cases).  Re-zeroing and folding per half makes the same design raw-F32 bitwise
+equal, which confirms the diagnosis; both the half-slotted and the
+128-accumulator O2×R16 designs nevertheless measured slower than production
+(1.20× and 1.07× on the production-shaped case), so only the liveness elision
+was kept.
+
+**Final measured state.** Four fresh native processes of the landed tree,
+byte-identical 291-token fixture (md5 `973900074bfd15d4adeeecdff3359082`),
+unrelated llama servers paused for the whole measurement:
+**143.3 / 137.7 / 148.9 / 142.8** tok/s (median 142.8), decode 12.6–12.8.
+Full-model oracle on the same tree: `exact_bits=true`, `ids_equal=true`,
+`state_exact=true`, prefill logits `max_abs=0.0` on both the 291-token and the
+513-token/511-chunk fixtures.  The AR `serve_harness.py` battery route on the
+same binaries finishes `Paris` with one terminal event and zero post-terminal
+bytes.  Day progression at the pinned fixture: 105.7 → 114.0 → 141.8 → 142.8
+tok/s median.  `hipfire` md5 `1c336a8ba4ae01fa79f6c7852c046a6f`, `daemon` md5
+`134a263ab37fd823831d3c9b120d12c7`.
+
+The pp500 target is **not** met and the remaining distance is structural, not
+incremental.  The batched-prefill window is now 1.58 s of which the grouped
+gate is 0.43 s, the dense projections 0.54 s, the grouped down 0.23 s and the
+batchable attention/GDN/HC remainder ~0.34 s; roughly 0.47 s of the 2.03 s
+time-to-first-token is outside that window (embedding, PLE gather, final-row
+LM head, sampling, host setup).  MoE expert-weight traffic for one
+≥291-token chunk is the full 512-expert union (48 × 1.337 GB ≈ 64.2 GB), which
+at the measured 223.9 GB/s streaming ceiling is ≈0.29 s before any other work,
+against a 0.58 s budget for 500 tok/s at 291 prompt tokens.  Reaching 500 tok/s
+from here would need the remaining grouped and dense GEMMs to run several
+times closer to their ceilings simultaneously, which the bitwise-parity
+contract (no tensor cores, no reassociation) and the measured gate behaviour
+at ~90% of the streaming ceiling do not presently allow.  No promotion,
+admission, or speed-floor claim is made; these are measured local deltas under
+a paused-GPU protocol.
+
+### Certified identities for the 2026-09-20 final state
+
+| artifact | digest |
+|---|---|
+| `target/release/hipfire` | md5 `a9be601fc3824da20a5dde8c829a58db` |
+| `target/release/daemon` | md5 `91cfdcf51dd825e64084b8f5fdaf3ad1` |
+| oracle `qwen4_greedy16_continuation` | md5 `a0b071d5e88f4a9af68fdc6baf4343f5` |
+| `kernels/src/gemm_mq4g256v2_moe_grouped_top10_o2_r8.gfx1151.hip` | sha256 `353dcc2d236170a824545cd013c405483182b85c43316668fee65a7ba9b3987c` |
+| `kernels/src/gemm_bf16_xf32_multirow_r16.gfx1151.hip` | sha256 `151ace64c9301556727eb82647ef7a5eb557276067264c9008fe2983793e9fc4` |
+| `kernels/src/gemm_mq4g128v2_moe_grouped_top10_o4_r16.gfx1151.hip` | sha256 `26409eaba0f059d006e125d58a9e88dceb2fe1bd312854c2cd5c802c159959ce` |
+| `crates/rdna-compute/src/gemm.rs` | sha256 `8ce64ce241b9f5946de5c32bdfb4a2278c4a6a30ba3850b545bebe993db3ce39` |
+| `crates/rdna-compute/src/kernels.rs` | sha256 `9c1827ad6b9beb1eb53012cd8d18c6c8f656b009523522f1aa79324659375964` |
+
+These binaries were rebuilt after the final `rustfmt` pass so the certified
+binary corresponds to the exact source text above; the oracle re-run on them is
+`FINAL2-oracle/result.json` (`exact_bits=true`, `max_abs=0.0`,
+`state_exact=true`).  Seven fresh native processes across the two final passes
+give **143.3 / 137.7 / 148.9 / 142.8 / 147.4 / 146.4 / 143.3** tok/s (median
+143.3, best 148.9).  The serialized full-library workspace suite passes on this
+tree (including `rdna-compute` 253 tests), and every touched Rust file is
+`rustfmt`-clean.
+
+### 2026-09-20 third pass — PLE read granularity (the largest remaining host cost)
+
+Product-path attribution of the ~0.45-0.56 s that sat outside the batched GPU
+window found a single dominant item: **492 ms of GPU idle on the PLE lease
+wait**.  The cause was a chosen userspace page size, not an artifact
+requirement: `PLE_PAGE_TARGET_BYTES` was 2 MiB rounded down to rows
+(`PLE_PAGE_BYTES` 2,096,960 B), and because that value is both the cache unit
+and the read unit, one 320-byte PLE row cost a full 2,096,960-byte positioned
+read.  PLE reads sixteen rows per token scattered across 128 shards, so a
+291-token chunk pulled ~4,656 rows / **2,998 distinct windows ≈ 6.29 GB for
+1.49 MB of needed bytes (4,219× amplification)**, measured at 21.3 GB/s of
+page-cached `pread` and ~19 GB/s of subsequent copy.
+
+The fix reduces `PLE_PAGE_TARGET_BYTES` to 4 KiB (`PLE_PAGE_BYTES` 3,840 B =
+12 rows), which bounds the amplification to ≤16×, and replaces the page
+cache's recency scan with a `BTreeMap<stamp, PageKey>` index because a 4 KiB
+page yields ~70k cache entries for which the previous `min_by_key` scan was not
+viable.  LRU semantics are preserved exactly (`cache_is_bounded_and_evicts_lru`
+unchanged), and a new regression test
+(`read_window_stays_within_the_row_page`) pins the read window: a 64-row
+prefetch must read one window per distinct page and at most 16× the requested
+bytes; it fails on the old 2 MiB window with 6,553×.  Untouched: no mmap, no
+pinned fd, 256 MiB page-cache budget, two-buffer staging pool, ticket/epoch and
+cancellation semantics, artifact format, descriptor validation.
+
+Evidence: `.codeinsight+research/qwen4/ple-window/` (read accounting, mark
+tables for both arms, oracle runs, three candidate runs plus an in-session
+control, serve smoke, summary).  Oracle on the landed tree: `exact_bits=true`,
+`ids_equal=true`, `state_exact=true`, prefill logits `max_abs=0.0` on both the
+291-token and the 513-token/511-chunk fixtures.  AR serve route: `Paris`,
+`finish=stop`, one terminal event, zero post-terminal bytes.
+
+**Effect.** Four fresh native processes: **184.6 / 184.0 / 184.9 / 183.9** tok/s
+(median 184.0), decode 13.3-13.4.  Two things changed at once: the level rose
+25.7% over the previous median 146.4, and the fresh-process spread fell from
+±4-5% to **0.7%** — the page-cache/I/O variance that had been polluting every
+earlier measurement is gone, so the remaining deltas on this thread can now be
+resolved much more finely.
+
+Day progression at the pinned fixture: 105.7 → 114.0 → 141.8 → 146.4 → **184.0**
+tok/s median; 88.6 → 184.0 (~2.08×) across the session.
+
+**Identity caveat, corrective.** Binary md5s in this checkout are not a tree
+fingerprint: rebuilding an untouched crate twice produced `60d5835d` then
+`e29322e2` for identical sources, and the `hipfire` CLI md5 stayed `a9be601f`
+across the PLE change because that code is not in the CLI's dependency graph.
+Source sha256 remains the reliable identity; binary md5s in this document
+should be read as "the binary that produced the recorded numbers", not as
+reproducible fingerprints.  `crates/hipfire-arch-qwen4/src/ple_rows.rs` md5
+`e7f55a70c4204937ce7e8dd72384c6d4` (landed), `crates/hipfire-arch-qwen4/src/gpu_forward.rs`
+carries only the pre-existing HC-batch change.
+
+**Where the remaining time is.** The batched window is now 1.495 s against a
+1.576 s time-to-first-token, so out-of-window overhead is down to ~81 ms: gate
+0.399 s, dense r16 0.329 s, grouped down 0.223 s, plain dense 0.156 s, GDN
+0.117 s, attention 0.074 s.  The 500 tok/s budget at 291 prompt tokens is
+0.582 s.  Even setting every GEMM to zero would only reach ~0.47 s, and the
+MoE expert-weight traffic alone (the full 512-expert union, ≈64 GB, at the
+measured 223.9 GB/s streaming ceiling) is ≈0.29 s of unavoidable traffic.  A
+realistic floor with this kernel family is therefore ≈1.1-1.2 s (≈250 tok/s),
+not 0.58 s.  No promotion, admission, or speed-floor claim is made.

@@ -71,41 +71,59 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_simt(
 
     // Keep the indexed kernel's four accumulators: group g contributes to
     // accumulator g&3, then the four partials are combined in the same order.
-    // A single loop also handles non-multiple-of-four tails (Qwen4 K=2560
-    // has groups 0..9, so groups 8 and 9 are real work).
-    for (int g = 0; g < groups_per_row; ++g) {
-        const char* gp = row_ptr + g * 136;
-        unsigned int h = *(const unsigned int*)(gp + hoff);
-        const float sc = __half2float(__ushort_as_half((unsigned short)(h & 0xFFFFu)));
-        const float zp = __half2float(__ushort_as_half((unsigned short)(h >> 16)));
-        const unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
-        const int base = g * 256 + tid * 8;
-        float* accum = (g & 3) == 0 ? acc0
-            : (g & 3) == 1 ? acc1
-            : (g & 3) == 2 ? acc2
-            : acc3;
+    // Process complete four-group quads with statically named accumulator
+    // arrays. The remaining 0..3 groups use the same static calls, retaining
+    // the generic K/groups_per_row contract without a dynamic array pointer.
+    #define ACCUM_GROUP(G, ACC) do { \
+        const char* gp = row_ptr + (G) * 136; \
+        const unsigned int h = *(const unsigned int*)(gp + hoff); \
+        const float sc = __half2float(__ushort_as_half((unsigned short)(h & 0xFFFFu))); \
+        const float zp = __half2float(__ushort_as_half((unsigned short)(h >> 16))); \
+        const unsigned int pk = *(const unsigned int*)(gp + 8 + boff); \
+        const int base = (G) * 256 + tid * 8; \
+        const float w0 = sc * (float)((pk >> 0) & 0xFu) + zp; \
+        const float w1 = sc * (float)((pk >> 4) & 0xFu) + zp; \
+        const float w2 = sc * (float)((pk >> 8) & 0xFu) + zp; \
+        const float w3 = sc * (float)((pk >> 12) & 0xFu) + zp; \
+        const float w4 = sc * (float)((pk >> 16) & 0xFu) + zp; \
+        const float w5 = sc * (float)((pk >> 20) & 0xFu) + zp; \
+        const float w6 = sc * (float)((pk >> 24) & 0xFu) + zp; \
+        const float w7 = sc * (float)((pk >> 28) & 0xFu) + zp; \
+        _Pragma("unroll") \
+        for (int slot = 0; slot < 16; ++slot) { \
+            const float* x = x_rows[slot]; \
+            if (x == nullptr) continue; \
+            (ACC)[slot] += w0 * x[base + 0] + w1 * x[base + 1] \
+                + w2 * x[base + 2] + w3 * x[base + 3] \
+                + w4 * x[base + 4] + w5 * x[base + 5] \
+                + w6 * x[base + 6] + w7 * x[base + 7]; \
+        } \
+    } while (0)
 
-        // The f16 affine header is widened once per lane and its decoded
-        // eight-weight lane is reused for every routed slot in this tile.
-        const float w0 = sc * (float)((pk >> 0) & 0xFu) + zp;
-        const float w1 = sc * (float)((pk >> 4) & 0xFu) + zp;
-        const float w2 = sc * (float)((pk >> 8) & 0xFu) + zp;
-        const float w3 = sc * (float)((pk >> 12) & 0xFu) + zp;
-        const float w4 = sc * (float)((pk >> 16) & 0xFu) + zp;
-        const float w5 = sc * (float)((pk >> 20) & 0xFu) + zp;
-        const float w6 = sc * (float)((pk >> 24) & 0xFu) + zp;
-        const float w7 = sc * (float)((pk >> 28) & 0xFu) + zp;
-
-        #pragma unroll
-        for (int slot = 0; slot < 16; ++slot) {
-            const float* x = x_rows[slot];
-            if (x == nullptr) continue;
-            accum[slot] += w0 * x[base + 0] + w1 * x[base + 1]
-                + w2 * x[base + 2] + w3 * x[base + 3]
-                + w4 * x[base + 4] + w5 * x[base + 5]
-                + w6 * x[base + 6] + w7 * x[base + 7];
+    int g = 0;
+    for (; g + 3 < groups_per_row; g += 4) {
+        ACCUM_GROUP(g, acc0);
+        ACCUM_GROUP(g + 1, acc1);
+        ACCUM_GROUP(g + 2, acc2);
+        ACCUM_GROUP(g + 3, acc3);
+    }
+    for (; g < groups_per_row; ++g) {
+        switch (g & 3) {
+        case 0:
+            ACCUM_GROUP(g, acc0);
+            break;
+        case 1:
+            ACCUM_GROUP(g, acc1);
+            break;
+        case 2:
+            ACCUM_GROUP(g, acc2);
+            break;
+        default:
+            ACCUM_GROUP(g, acc3);
+            break;
         }
     }
+    #undef ACCUM_GROUP
 
     float acc[16];
     #pragma unroll

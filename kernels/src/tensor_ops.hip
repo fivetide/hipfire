@@ -130,17 +130,28 @@ extern "C" __global__ void gated_delta_step_shared_norm128_gfx1151(
         && value_index < 128;
     __shared__ __hip_bfloat16 q_norm[128];
     __shared__ __hip_bfloat16 k_norm[128];
+    __shared__ __hip_bfloat16 q_inv_shared;
+    __shared__ __hip_bfloat16 k_inv_shared;
 
-    if (threadIdx.x == 0 && value_head < value_heads && exact_shape) {
+    // Load the BF16-rounded q/k vectors cooperatively.  Threads beyond the
+    // exact 128-wide vector remain barrier participants so the old 256-wide
+    // launch remains safe for direct callers.
+    if (exact_shape && value_head < value_heads && threadIdx.x < 128) {
         const int repeat = value_heads / key_heads;
         const int key_head = value_head / repeat;
         const int key_base = key_head * 128;
+        q_norm[threadIdx.x] = bf16_round(q[key_base + threadIdx.x]);
+        k_norm[threadIdx.x] = bf16_round(k[key_base + threadIdx.x]);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0 && value_head < value_heads && exact_shape) {
         float q_sum_f32 = 0.0f;
         float k_sum_f32 = 0.0f;
         const __hip_bfloat16 eps = bf16_round(1.0e-6f);
         for (int kd = 0; kd < 128; ++kd) {
-            const __hip_bfloat16 q_value = bf16_round(q[key_base + kd]);
-            const __hip_bfloat16 k_value = bf16_round(k[key_base + kd]);
+            const __hip_bfloat16 q_value = q_norm[kd];
+            const __hip_bfloat16 k_value = k_norm[kd];
             const float q_float = bf16_to_f32(q_value);
             const float k_float = bf16_to_f32(k_value);
             q_sum_f32 += bf16_to_f32(bf16_round(q_float * q_float));
@@ -148,20 +159,21 @@ extern "C" __global__ void gated_delta_step_shared_norm128_gfx1151(
         }
         const __hip_bfloat16 q_sum = bf16_round(q_sum_f32);
         const __hip_bfloat16 k_sum = bf16_round(k_sum_f32);
-        const __hip_bfloat16 q_inv = bf16_round(
+        q_inv_shared = bf16_round(
             rsqrtf(bf16_to_f32(q_sum) + bf16_to_f32(eps)));
-        const __hip_bfloat16 k_inv = bf16_round(
+        k_inv_shared = bf16_round(
             rsqrtf(bf16_to_f32(k_sum) + bf16_to_f32(eps)));
-        for (int kd = 0; kd < 128; ++kd) {
-            const __hip_bfloat16 q_value = bf16_round(q[key_base + kd]);
-            const __hip_bfloat16 k_value = bf16_round(k[key_base + kd]);
-            q_norm[kd] = bf16_round(
-                bf16_to_f32(q_value) * bf16_to_f32(q_inv));
-            k_norm[kd] = bf16_round(
-                bf16_to_f32(k_value) * bf16_to_f32(k_inv));
-        }
     }
-    // Inactive lanes must reach the barrier before returning.
+    __syncthreads();
+
+    if (threadIdx.x < 128) {
+        const __hip_bfloat16 q_inv = q_inv_shared;
+        const __hip_bfloat16 k_inv = k_inv_shared;
+        q_norm[threadIdx.x] = bf16_round(
+            bf16_to_f32(q_norm[threadIdx.x]) * bf16_to_f32(q_inv));
+        k_norm[threadIdx.x] = bf16_round(
+            bf16_to_f32(k_norm[threadIdx.x]) * bf16_to_f32(k_inv));
+    }
     __syncthreads();
     if (!active) return;
 
@@ -193,6 +205,169 @@ extern "C" __global__ void gated_delta_step_shared_norm128_gfx1151(
     }
     output[value_head * 128 + value_index] = out;
 }
+// gfx1151-only persistent row-batched path for the exact 128x128 geometry.
+// A block owns one value head and 256 threads.  tid%128 is the output channel
+// and tid/128 selects the half; each thread retains 64 state values in
+// registers.  Shared handoffs serialize the kd=0..127 kv and output chains:
+// half 1 continues half 0's accumulator rather than combining partial sums.
+__launch_bounds__(256)
+extern "C" __global__ void gated_delta_step_halves_state128_persistent256_gfx1151(
+    const float* projection,
+    const float* gate,
+    const float* beta,
+    float* state,
+    float* output,
+    int rows,
+    int qkv_width,
+    int key_heads,
+    int value_heads,
+    int key_dim,
+    int value_dim,
+    float query_scale) {
+    const int value_head = (int)blockIdx.x;
+    const int thread = (int)threadIdx.x;
+    const int value_index = thread & 127;
+    const int half = thread >> 7;
+    const bool exact_shape = key_dim == 128 && value_dim == 128;
+    if (!exact_shape || value_head >= value_heads) return;
+
+    const int qk_width = key_heads * 128;
+    const int value_width = value_heads * 128;
+    const int repeat = value_heads / key_heads;
+    const int key_head = value_head / repeat;
+    const int kd_base = half * 64;
+    const int state_base = value_head * 128 * 128;
+
+    __shared__ __hip_bfloat16 q_norm[128];
+    __shared__ __hip_bfloat16 k_norm[128];
+    __shared__ __hip_bfloat16 q_inv_shared;
+    __shared__ __hip_bfloat16 k_inv_shared;
+    __shared__ float handoff[128];
+
+    float state_half[64];
+    #pragma unroll
+    for (int kd = 0; kd < 64; ++kd) {
+        state_half[kd] =
+            state[state_base + (kd_base + kd) * 128 + value_index];
+    }
+
+    for (int row = 0; row < rows; ++row) {
+        const int row_base = row * qkv_width;
+        const int key_base = row_base + key_head * 128;
+
+        if (half == 0) {
+            q_norm[value_index] = bf16_round(projection[key_base + value_index]);
+            k_norm[value_index] = bf16_round(
+                projection[row_base + qk_width + key_head * 128 + value_index]);
+        }
+        __syncthreads();
+
+        if (thread == 0) {
+            float q_sum_f32 = 0.0f;
+            float k_sum_f32 = 0.0f;
+            const __hip_bfloat16 eps = bf16_round(1.0e-6f);
+            for (int kd = 0; kd < 128; ++kd) {
+                const __hip_bfloat16 q_value = q_norm[kd];
+                const __hip_bfloat16 k_value = k_norm[kd];
+                const float q_float = bf16_to_f32(q_value);
+                const float k_float = bf16_to_f32(k_value);
+                q_sum_f32 += bf16_to_f32(bf16_round(q_float * q_float));
+                k_sum_f32 += bf16_to_f32(bf16_round(k_float * k_float));
+            }
+            const __hip_bfloat16 q_sum = bf16_round(q_sum_f32);
+            const __hip_bfloat16 k_sum = bf16_round(k_sum_f32);
+            q_inv_shared = bf16_round(
+                rsqrtf(bf16_to_f32(q_sum) + bf16_to_f32(eps)));
+            k_inv_shared = bf16_round(
+                rsqrtf(bf16_to_f32(k_sum) + bf16_to_f32(eps)));
+        }
+        __syncthreads();
+
+        if (half == 0) {
+            const __hip_bfloat16 q_inv = q_inv_shared;
+            const __hip_bfloat16 k_inv = k_inv_shared;
+            q_norm[value_index] = bf16_round(
+                bf16_to_f32(q_norm[value_index]) * bf16_to_f32(q_inv));
+            k_norm[value_index] = bf16_round(
+                bf16_to_f32(k_norm[value_index]) * bf16_to_f32(k_inv));
+        }
+        __syncthreads();
+
+        const float decay = expf(gate[row * value_heads + value_head]);
+        const float beta_value = beta[row * value_heads + value_head];
+
+        #pragma unroll
+        for (int kd = 0; kd < 64; ++kd) {
+            state_half[kd] *= decay;
+        }
+
+        float kv_mem = 0.0f;
+        #pragma unroll
+        for (int kd = 0; kd < 64; ++kd) {
+            const float kv = bf16_to_f32(k_norm[kd_base + kd]);
+            kv_mem += state_half[kd] * kv;
+        }
+        if (half == 0) {
+            handoff[value_index] = kv_mem;
+        }
+        __syncthreads();
+
+        if (half == 1) {
+            kv_mem = handoff[value_index];
+            #pragma unroll
+            for (int kd = 0; kd < 64; ++kd) {
+                const float kv = bf16_to_f32(k_norm[64 + kd]);
+                kv_mem += state_half[kd] * kv;
+            }
+            const __hip_bfloat16 v_value =
+                bf16_round(projection[row_base + 2 * qk_width
+                                      + value_head * 128 + value_index]);
+            const float delta =
+                (bf16_to_f32(v_value) - kv_mem) * beta_value;
+            handoff[value_index] = delta;
+        }
+        __syncthreads();
+
+        const float delta = handoff[value_index];
+        __syncthreads();
+        #pragma unroll
+        for (int kd = 0; kd < 64; ++kd) {
+            const float kv = bf16_to_f32(k_norm[kd_base + kd]);
+            state_half[kd] += kv * delta;
+        }
+
+        float out = 0.0f;
+        #pragma unroll
+        for (int kd = 0; kd < 64; ++kd) {
+            float qv = bf16_to_f32(q_norm[kd_base + kd]);
+            qv *= query_scale;
+            out += state_half[kd] * qv;
+        }
+        if (half == 0) {
+            handoff[value_index] = out;
+        }
+        __syncthreads();
+
+        if (half == 1) {
+            out = handoff[value_index];
+            #pragma unroll
+            for (int kd = 0; kd < 64; ++kd) {
+                float qv = bf16_to_f32(q_norm[64 + kd]);
+                qv *= query_scale;
+                out += state_half[kd] * qv;
+            }
+            output[row * value_width + value_head * 128 + value_index] = out;
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int kd = 0; kd < 64; ++kd) {
+        state[state_base + (kd_base + kd) * 128 + value_index] =
+            state_half[kd];
+    }
+}
+
 
 
 // Source HF executes the recurrent/chunk result through a hidden BF16 cast
@@ -351,6 +526,7 @@ extern "C" __global__ void hyper_write_f32(
     const float* mixed,
     const float* gates,
     float* output,
+
     int branches,
     int hidden,
     int rows) {
@@ -454,6 +630,77 @@ extern "C" __global__ void gated_delta_conv_bf16_f32(
         next_history[cursor * channels + channel] = current;
     }
 }
+// K=4 ordered causal convolution. Each channel owns a local BF16 ring and
+// advances it through all rows, preserving the rowwise source boundaries.
+extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4_gfx1151(
+    const float* input,
+    const __hip_bfloat16* kernel,
+    const float* history,
+    float* output,
+    float* next_history,
+    int rows,
+    int channels,
+    int history_rows,
+    int kernel_size,
+    int start_cursor) {
+    const int channel = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (channel >= channels || rows <= 0
+        || history_rows != 3 || kernel_size != 4) {
+        return;
+    }
+
+    __hip_bfloat16 history_ring[3];
+    for (int history_row = 0; history_row < 3; ++history_row) {
+        history_ring[history_row] = bf16_round(
+            history[history_row * channels + channel]);
+    }
+
+    int cursor = start_cursor;
+    for (int row = 0; row < rows; ++row) {
+        const int input_offset = row * channels + channel;
+        const __hip_bfloat16 current_bf16 = bf16_round(input[input_offset]);
+        const float current = bf16_to_f32(current_bf16);
+        float value = bf16_to_f32(kernel[channel * 4 + 3]) * current;
+        for (int tap = 0; tap < 3; ++tap) {
+            const int history_index = (cursor + tap) % 3;
+            value += bf16_to_f32(kernel[channel * 4 + tap])
+                * bf16_to_f32(history_ring[history_index]);
+        }
+        output[input_offset] = bf16_to_f32(bf16_round(
+            value * (1.0f / (1.0f + expf(-value)))));
+        history_ring[cursor] = current_bf16;
+        cursor = cursor == 2 ? 0 : cursor + 1;
+    }
+
+    for (int history_row = 0; history_row < 3; ++history_row) {
+        next_history[history_row * channels + channel] =
+            bf16_to_f32(history_ring[history_row]);
+    }
+}
+
+// Row-batched parameter expansion; source BF16 boundaries match decode.
+extern "C" __global__ void gated_delta_params_bf16_f32_batched(
+    const float* a,
+    const float* b,
+    const __hip_bfloat16* a_log,
+    const __hip_bfloat16* dt_bias,
+    float* gate,
+    float* beta,
+    int rows,
+    int heads) {
+    const int flat = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int total = rows * heads;
+    if (flat >= total) return;
+    const int head = flat % heads;
+    const float al = bf16_to_f32(a_log[head]);
+    const float dt = bf16_to_f32(dt_bias[head]);
+    const float value = bf16_to_f32(bf16_round(a[flat])) + dt;
+    const float softplus = value > 20.0f
+        ? value
+        : (value < -20.0f ? expf(value) : log1pf(expf(value)));
+    gate[flat] = -expf(al) * softplus;
+    beta[flat] = 1.0f / (1.0f + expf(-bf16_to_f32(bf16_round(b[flat]))));
+}
 
 extern "C" __global__ void gated_delta_params_bf16_f32(
     const float* a,
@@ -516,6 +763,44 @@ extern "C" __global__ void gated_delta_gate_bf16_f32(
         normalized / (1.0f + expf(-gate))));
     (void)width;
 }
+// Row-batched gated RMSNorm. The recurrent output is rounded in place before
+// the norm reduction, matching the scalar BF16 boundary.
+extern "C" __global__ void gated_delta_gate_bf16_f32_batched(
+    float* recurrent,
+    const float* z,
+    const __hip_bfloat16* norm,
+    float* output,
+    int rows,
+    int value_heads,
+    int value_dim) {
+    const int flat_head = (int)blockIdx.x;
+    const int channel = (int)(blockIdx.y * blockDim.x + threadIdx.x);
+    const int total_heads = rows * value_heads;
+    if (flat_head >= total_heads || value_dim != 128) return;
+    const int row = flat_head / value_heads;
+    const int head = flat_head % value_heads;
+    const int width = value_heads * value_dim;
+    const int start = row * width + head * value_dim;
+
+    if (channel < value_dim) {
+        recurrent[start + channel] =
+            bf16_to_f32(bf16_round(recurrent[start + channel]));
+    }
+    __syncthreads();
+    if (channel >= value_dim) return;
+
+    float sum = 0.0f;
+    for (int i = 0; i < value_dim; ++i) {
+        const float value = bf16_to_f32(bf16_round(recurrent[start + i]));
+        sum += value * value;
+    }
+    const float inv = rsqrtf(sum / (float)value_dim + 1.0e-6f);
+    const float normalized = bf16_to_f32(bf16_round(
+        recurrent[start + channel] * inv * bf16_to_f32(norm[channel])));
+    const float gate = bf16_to_f32(bf16_round(z[start + channel]));
+    output[start + channel] = bf16_to_f32(bf16_round(
+        normalized / (1.0f + expf(-gate))));
+}
 
 extern "C" __global__ void indexed_attention_norm_rope_f32(
     float* values,
@@ -558,6 +843,52 @@ extern "C" __global__ void indexed_attention_norm_rope_f32(
     }
     values[start + channel] = value;
 }
+ 
+extern "C" __global__ void indexed_attention_norm_rope_f32_batched(
+    float* values,
+    const __hip_bfloat16* norm,
+    int rows,
+    int row_stride,
+    int heads,
+    int head_dim,
+    int head_stride,
+    int position_start,
+    int rotary_dim) {
+    int row = (int)blockIdx.z;
+    int head = (int)blockIdx.x;
+    int channel = (int)(blockIdx.y * blockDim.x + threadIdx.x);
+    if (row >= rows || head >= heads) return;
+    int start = row * row_stride + head * head_stride;
+    __shared__ float input_row[256];
+    if (channel < head_dim) {
+        input_row[channel] = values[start + channel];
+    }
+    __syncthreads();
+    if (channel >= head_dim) return;
+    float sum = 0.0f;
+    for (int i = 0; i < head_dim; ++i) {
+        float row_value = input_row[i];
+        sum += row_value * row_value;
+    }
+    float inv = rsqrtf(sum / (float)head_dim + 1.0e-6f);
+    float value = input_row[channel] * inv
+        * (1.0f + bf16_to_f32(norm[channel]));
+    if (channel < rotary_dim) {
+        int half = rotary_dim / 2;
+        int partner = channel < half ? channel + half : channel - half;
+        float other = input_row[partner] * inv
+            * (1.0f + bf16_to_f32(norm[partner]));
+        int base = channel < half ? channel : partner;
+        float angle = (float)(position_start + row)
+            * powf(10000000.0f, -((float)(2 * base)) / (float)rotary_dim);
+        float sine = sinf(angle);
+        float cosine = cosf(angle);
+        value = channel < half ? value * cosine - other * sine
+            : other * sine + value * cosine;
+    }
+    values[start + channel] = value;
+}
+ 
 
 extern "C" __global__ void indexed_attention_cache_append_f32(
     const float* key,
@@ -570,6 +901,22 @@ extern "C" __global__ void indexed_attention_cache_append_f32(
     if (channel >= kv_width) return;
     full_keys[position * kv_width + channel] = key[channel];
     full_values[position * kv_width + channel] = value[channel];
+}
+ 
+extern "C" __global__ void indexed_attention_cache_append_f32_batched(
+    const float* key,
+    const float* value,
+    float* full_keys,
+    float* full_values,
+    int rows,
+    int position_start,
+    int kv_width) {
+    int row = (int)blockIdx.y;
+    int channel = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= rows || channel >= kv_width) return;
+    int position = position_start + row;
+    full_keys[position * kv_width + channel] = key[row * kv_width + channel];
+    full_values[position * kv_width + channel] = value[row * kv_width + channel];
 }
 
 // Complete-block QSA pooling: mean over `compress` raw index keys, grouped
@@ -670,6 +1017,124 @@ static __device__ __forceinline__ float indexed_attention_select_score_f32(
 // Serial fallback for non-gfx1151 callers or shapes whose score array would
 // exceed the device LDS limit. This is the previous one-thread implementation,
 // including stable ascending-block tie selection and the causal tail.
+// Batched selection keeps one independent workgroup per query row. The row's
+// visible prefix derives from position_start, so complete blocks that belong
+// only to later rows can never enter an earlier row's candidate set.
+extern "C" __global__ void indexed_attention_select_f32_batched_serial(
+    const float* query,
+    const float* pooled,
+    int* selected,
+    int rows,
+    int query_row_stride,
+    int block_count,
+    int index_heads,
+    int index_dim,
+    int budget_blocks,
+    int compress,
+    int position_start,
+    int capacity) {
+    int row = (int)blockIdx.x;
+    if (row >= rows || threadIdx.x != 0) return;
+    int visible = position_start + row + 1;
+    int row_block_count = visible / compress;
+    if (row_block_count > block_count) row_block_count = block_count;
+    int* row_selected = selected + row * capacity;
+    const float* row_query = query + row * query_row_stride;
+    for (int i = 0; i < capacity; ++i) row_selected[i] = -1;
+    int chosen = budget_blocks < row_block_count ? budget_blocks : row_block_count;
+    for (int slot = 0; slot < chosen; ++slot) {
+        float best = -3.402823466e+38f;
+        int best_block = -1;
+        for (int block = 0; block < row_block_count; ++block) {
+            bool used = false;
+            for (int prior = 0; prior < slot; ++prior) {
+                if (row_selected[prior * compress] == block * compress) used = true;
+            }
+            if (used) continue;
+            float score = indexed_attention_select_score_f32(
+                row_query, pooled, block, index_heads, index_dim);
+            if (score > best) {
+                best = score;
+                best_block = block;
+            }
+        }
+        if (best_block >= 0) {
+            for (int slot_row = 0;
+                 slot_row < compress && slot * compress + slot_row < capacity;
+                 ++slot_row) {
+                int token = best_block * compress + slot_row;
+                if (token < visible) row_selected[slot * compress + slot_row] = token;
+            }
+        }
+    }
+    int tail_start = row_block_count * compress;
+    int offset = chosen * compress;
+    for (int token = tail_start; token < visible && offset < capacity; ++token) {
+        row_selected[offset++] = token;
+    }
+}
+
+extern "C" __global__ void indexed_attention_select_f32_batched(
+    const float* query,
+    const float* pooled,
+    int* selected,
+    int rows,
+    int query_row_stride,
+    int block_count,
+    int index_heads,
+    int index_dim,
+    int budget_blocks,
+    int compress,
+    int position_start,
+    int capacity) {
+    int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    extern __shared__ float scores[];
+    int visible = position_start + row + 1;
+    int row_block_count = visible / compress;
+    if (row_block_count > block_count) row_block_count = block_count;
+    const float* row_query = query + row * query_row_stride;
+    if (row_block_count > 0) {
+        for (int block = (int)threadIdx.x;
+             block < row_block_count;
+             block += (int)blockDim.x) {
+            scores[block] = indexed_attention_select_score_f32(
+                row_query, pooled, block, index_heads, index_dim);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    int* row_selected = selected + row * capacity;
+    int chosen = budget_blocks < row_block_count ? budget_blocks : row_block_count;
+    for (int i = 0; i < capacity; ++i) row_selected[i] = -1;
+    for (int slot = 0; slot < chosen; ++slot) {
+        float best = -3.402823466e+38f;
+        int best_block = -1;
+        for (int block = 0; block < row_block_count; ++block) {
+            float score = scores[block];
+            if (score == -3.402823466e+38f) continue;
+            if (score > best) {
+                best = score;
+                best_block = block;
+            }
+        }
+        if (best_block >= 0) {
+            scores[best_block] = -3.402823466e+38f;
+            for (int slot_row = 0;
+                 slot_row < compress && slot * compress + slot_row < capacity;
+                 ++slot_row) {
+                int token = best_block * compress + slot_row;
+                if (token < visible) row_selected[slot * compress + slot_row] = token;
+            }
+        }
+    }
+    int tail_start = row_block_count * compress;
+    int offset = chosen * compress;
+    for (int token = tail_start; token < visible && offset < capacity; ++token) {
+        row_selected[offset++] = token;
+    }
+}
+
 extern "C" __global__ void indexed_attention_select_f32_serial(
     const float* query,
     const float* pooled,
@@ -802,6 +1267,136 @@ extern "C" __global__ void indexed_attention_reuse_selection(
 // Serial fallback for non-gfx1151 callers or shapes whose score/token rows
 // exceed the device LDS limit. Keep this body identical to the original
 // per-channel implementation so oversized shapes retain the old contract.
+extern "C" __global__ void indexed_attention_attention_f32_batched_serial(
+    const float* q_with_gate,
+    const float* full_keys,
+    const float* full_values,
+    const int* selected_indices,
+    float* output,
+    int rows,
+    int position_start,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int budget_blocks,
+    int compress,
+    int capacity,
+    int full_capacity) {
+    int row = (int)blockIdx.z;
+    int head = (int)blockIdx.x;
+    int channel = (int)(blockIdx.y * blockDim.x + threadIdx.x);
+    if (row >= rows || head >= n_heads || channel >= head_dim) return;
+    int visible = position_start + row + 1;
+    int block_count = visible / compress;
+    int chosen = budget_blocks < block_count ? budget_blocks : block_count;
+    int selected_len = chosen * compress + visible - block_count * compress;
+    if (selected_len > capacity) selected_len = capacity;
+    int kv_head = head / (n_heads / n_kv_heads);
+    int q_row_stride = 2 * n_heads * head_dim;
+    int q_head_offset = row * q_row_stride + head * head_dim * 2;
+    const int* row_selected = selected_indices + row * capacity;
+    float max_score = -3.402823466e+38f;
+    for (int selected_row = 0; selected_row < selected_len; ++selected_row) {
+        int token = row_selected[selected_row];
+        if (token < 0 || token >= full_capacity || token >= visible) continue;
+        float score = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+            score += q_with_gate[q_head_offset + d]
+                * full_keys[token * n_kv_heads * head_dim + kv_head * head_dim + d];
+        }
+        max_score = fmaxf(max_score, score / sqrtf((float)head_dim));
+    }
+    float denominator = 0.0f;
+    float numerator = 0.0f;
+    for (int selected_row = 0; selected_row < selected_len; ++selected_row) {
+        int token = row_selected[selected_row];
+        if (token < 0 || token >= full_capacity || token >= visible) continue;
+        float score = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+            score += q_with_gate[q_head_offset + d]
+                * full_keys[token * n_kv_heads * head_dim + kv_head * head_dim + d];
+        }
+        float weight = expf(score / sqrtf((float)head_dim) - max_score);
+        denominator += weight;
+        numerator += weight
+            * full_values[token * n_kv_heads * head_dim + kv_head * head_dim + channel];
+    }
+    float gate = q_with_gate[q_head_offset + head_dim + channel];
+    int output_offset = row * n_heads * head_dim + head * head_dim + channel;
+    output[output_offset] =
+        denominator > 0.0f ? numerator / denominator / (1.0f + expf(-gate)) : 0.0f;
+}
+
+extern "C" __global__ void indexed_attention_attention_f32_batched(
+    const float* q_with_gate,
+    const float* full_keys,
+    const float* full_values,
+    const int* selected_indices,
+    float* output,
+    int rows,
+    int position_start,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int budget_blocks,
+    int compress,
+    int capacity,
+    int full_capacity) {
+    int row = (int)blockIdx.z;
+    if (row >= rows) return;
+    int visible = position_start + row + 1;
+    int block_count = visible / compress;
+    int chosen = budget_blocks < block_count ? budget_blocks : block_count;
+    int selected_len = chosen * compress + visible - block_count * compress;
+    if (selected_len > capacity) selected_len = capacity;
+    extern __shared__ float row_scores[];
+    int* row_tokens = reinterpret_cast<int*>(row_scores + selected_len);
+    const int* row_selected = selected_indices + row * capacity;
+    int q_row_stride = 2 * n_heads * head_dim;
+    int q_head_offset = row * q_row_stride + (int)blockIdx.x * head_dim * 2;
+    for (int selected_row = (int)threadIdx.x;
+         selected_row < selected_len;
+         selected_row += (int)blockDim.x) {
+        int token = row_selected[selected_row];
+        row_tokens[selected_row] = token;
+        float score = 0.0f;
+        if (token >= 0 && token < full_capacity && token < visible) {
+            int kv_head = (int)blockIdx.x / (n_heads / n_kv_heads);
+            for (int d = 0; d < head_dim; ++d) {
+                score += q_with_gate[q_head_offset + d]
+                    * full_keys[token * n_kv_heads * head_dim + kv_head * head_dim + d];
+            }
+            score /= sqrtf((float)head_dim);
+        }
+        row_scores[selected_row] = score;
+    }
+    __syncthreads();
+    int head = (int)blockIdx.x;
+    int channel = (int)(blockIdx.y * blockDim.x + threadIdx.x);
+    if (head >= n_heads || channel >= head_dim) return;
+    int kv_head = head / (n_heads / n_kv_heads);
+    float max_score = -3.402823466e+38f;
+    for (int selected_row = 0; selected_row < selected_len; ++selected_row) {
+        int token = row_tokens[selected_row];
+        if (token < 0 || token >= full_capacity || token >= visible) continue;
+        max_score = fmaxf(max_score, row_scores[selected_row]);
+    }
+    float denominator = 0.0f;
+    float numerator = 0.0f;
+    for (int selected_row = 0; selected_row < selected_len; ++selected_row) {
+        int token = row_tokens[selected_row];
+        if (token < 0 || token >= full_capacity || token >= visible) continue;
+        float weight = expf(row_scores[selected_row] - max_score);
+        denominator += weight;
+        numerator += weight
+            * full_values[token * n_kv_heads * head_dim + kv_head * head_dim + channel];
+    }
+    int output_offset = row * n_heads * head_dim + head * head_dim + channel;
+    float gate = q_with_gate[q_head_offset + head_dim + channel];
+    output[output_offset] =
+        denominator > 0.0f ? numerator / denominator / (1.0f + expf(-gate)) : 0.0f;
+}
+
 extern "C" __global__ void indexed_attention_attention_f32_serial(
     const float* q_with_gate,
     const float* full_keys,
@@ -909,6 +1504,23 @@ extern "C" __global__ void scale_f32(
     float scale) {
     int index = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (index < elements) values[index] *= scale;
+}
+// HC-specific pointwise fusion.  This preserves the source order of the
+// three F32->BF16->F32 boundaries around scale and SiLU while replacing the
+// per-row roundtrip, flat scale, flat SiLU, and per-row roundtrip launches
+// with one launch over the contiguous low-rank buffer.
+extern "C" __global__ void hc_activation_fused_f32(
+    float* values,
+    int elements,
+    float scale) {
+    const int index = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (index >= elements) return;
+
+    float value = bf16_to_f32(bf16_round(values[index]));
+    value *= scale;
+    value = bf16_to_f32(bf16_round(value));
+    value = value / (1.0f + expf(-value));
+    values[index] = bf16_to_f32(bf16_round(value));
 }
 
 // Deterministic device-side greedy top-1 over one or more contiguous logits

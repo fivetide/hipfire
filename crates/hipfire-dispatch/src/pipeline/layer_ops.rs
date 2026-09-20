@@ -16,13 +16,16 @@
 use crate::families::gemv::WeightRef;
 use crate::types::DispatchError;
 use rdna_compute::tensor_ops::{
-    argmax_f32, bf16_roundtrip_f32, gated_delta_conv, gated_delta_gate, gated_delta_params,
-    gated_delta_step, hyper_norm, hyper_read_projected, hyper_write, indexed_attention_attention,
-    indexed_attention_cache_append, indexed_attention_norm_rope, indexed_attention_pool_rope,
-    indexed_attention_select, scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv, GatedDeltaGate,
-    GatedDeltaParams, GatedDeltaStep, HyperNorm, HyperReadProjected, HyperWrite,
-    IndexedAttentionAttention, IndexedAttentionCacheAppend, IndexedAttentionNormRope,
-    IndexedAttentionPoolRope, IndexedAttentionSelect, ScaleF32,
+    argmax_f32, bf16_roundtrip_f32, gated_delta_conv, gated_delta_conv_batched, gated_delta_gate,
+    gated_delta_gate_batched, gated_delta_params, gated_delta_params_batched, gated_delta_step,
+    gated_delta_step_batched, hc_activation_fused_f32, hyper_norm, hyper_read_projected,
+    hyper_write, indexed_attention_attention_batch, indexed_attention_cache_append_batch,
+    indexed_attention_norm_rope_batch, indexed_attention_pool_rope, indexed_attention_select_batch,
+    scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv, GatedDeltaConvBatched, GatedDeltaGate,
+    GatedDeltaGateBatched, GatedDeltaParams, GatedDeltaParamsBatched, GatedDeltaStep,
+    GatedDeltaStepBatched, HcActivationFused, HyperNorm, HyperReadProjected, HyperWrite,
+    IndexedAttentionAttentionBatch, IndexedAttentionCacheAppendBatch,
+    IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope, IndexedAttentionSelectBatch, ScaleF32,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -196,49 +199,59 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
         },
     ))?;
     project_bf16_batch(gpu, &op.input_mix_down, &normalized, &low, op.rows)?;
-    for row in 0..op.rows {
-        let low_row = view(&low, row * op.low_rank, op.low_rank);
-        hip(bf16_roundtrip_f32(
+    if gpu.arch_caps.is_gfx1151() {
+        hip(hc_activation_fused_f32(
             gpu,
-            &Bf16Roundtrip {
-                input: &low_row,
-                scratch: op.bf16_scratch,
-                output: &low_row,
-                elements: op.low_rank,
+            &HcActivationFused {
+                values: &low,
+                scale: 1.0 / op.branches as f32,
             },
         ))?;
-    }
-    hip(scale_f32(
-        gpu,
-        &ScaleF32 {
-            values: &low,
-            scale: 1.0 / op.branches as f32,
-        },
-    ))?;
-    for row in 0..op.rows {
-        let low_row = view(&low, row * op.low_rank, op.low_rank);
-        hip(bf16_roundtrip_f32(
+    } else {
+        for row in 0..op.rows {
+            let low_row = view(&low, row * op.low_rank, op.low_rank);
+            hip(bf16_roundtrip_f32(
+                gpu,
+                &Bf16Roundtrip {
+                    input: &low_row,
+                    scratch: op.bf16_scratch,
+                    output: &low_row,
+                    elements: op.low_rank,
+                },
+            ))?;
+        }
+        hip(scale_f32(
             gpu,
-            &Bf16Roundtrip {
-                input: &low_row,
-                scratch: op.bf16_scratch,
-                output: &low_row,
-                elements: op.low_rank,
+            &ScaleF32 {
+                values: &low,
+                scale: 1.0 / op.branches as f32,
             },
         ))?;
-    }
-    hip(gpu.silu_f32(&low, &low))?;
-    for row in 0..op.rows {
-        let low_row = view(&low, row * op.low_rank, op.low_rank);
-        hip(bf16_roundtrip_f32(
-            gpu,
-            &Bf16Roundtrip {
-                input: &low_row,
-                scratch: op.bf16_scratch,
-                output: &low_row,
-                elements: op.low_rank,
-            },
-        ))?;
+        for row in 0..op.rows {
+            let low_row = view(&low, row * op.low_rank, op.low_rank);
+            hip(bf16_roundtrip_f32(
+                gpu,
+                &Bf16Roundtrip {
+                    input: &low_row,
+                    scratch: op.bf16_scratch,
+                    output: &low_row,
+                    elements: op.low_rank,
+                },
+            ))?;
+        }
+        hip(gpu.silu_f32(&low, &low))?;
+        for row in 0..op.rows {
+            let low_row = view(&low, row * op.low_rank, op.low_rank);
+            hip(bf16_roundtrip_f32(
+                gpu,
+                &Bf16Roundtrip {
+                    input: &low_row,
+                    scratch: op.bf16_scratch,
+                    output: &low_row,
+                    elements: op.low_rank,
+                },
+            ))?;
+        }
     }
     project_bf16_batch(gpu, &op.input_mix_up, &low, &up, op.rows)?;
     hip(hyper_read_projected(
@@ -531,93 +544,162 @@ pub fn execute_gated_delta_net(
     project_bf16_batch(gpu, &op.qkv, op.input, &projection, op.rows)?;
     let a = view(op.a, 0, op.rows * op.value_heads);
     let b = view(op.b, 0, op.rows * op.value_heads);
+    let gate = view(op.gate, 0, op.rows * op.value_heads);
+    let beta = view(op.beta, 0, op.rows * op.value_heads);
     let z = view(op.z_output, 0, op.rows * value);
     project_bf16_batch(gpu, &op.in_proj_a, op.input, &a, op.rows)?;
     project_bf16_batch(gpu, &op.in_proj_b, op.input, &b, op.rows)?;
     project_bf16_batch(gpu, &op.z, op.input, &z, op.rows)?;
     let history_rows = op.conv_kernel.saturating_sub(1);
-    for row in 0..op.rows {
-        let position = op.start_position.saturating_add(row);
-        let cursor = if history_rows == 0 {
-            0
-        } else {
-            position % history_rows
-        };
-        let projection_row = view(&projection, row * qkv, qkv);
-        let projection2_row = view(&projection2, row * qkv, qkv);
-        hip(gated_delta_conv(
+    let persistent_batch = gpu.arch_caps.is_gfx1151()
+        && op.rows > 1
+        && op.key_dim == 128
+        && op.value_dim == 128
+        && op.conv_kernel == 4;
+    if persistent_batch {
+        let start_cursor = op.start_position % history_rows;
+        hip(gated_delta_conv_batched(
             gpu,
-            &GatedDeltaConv {
-                input: &projection_row,
+            &GatedDeltaConvBatched {
+                input: &projection,
                 kernel: op.conv,
                 history: op.conv_state,
-                output: &projection2_row,
+                output: &projection2,
                 next_history: op.conv_state,
+                rows: op.rows,
                 channels: qkv,
                 history_rows,
                 kernel_size: op.conv_kernel,
-                cursor,
+                start_cursor,
             },
         ))?;
-        let a_row = view(&a, row * op.value_heads, op.value_heads);
-        let b_row = view(&b, row * op.value_heads, op.value_heads);
-        let gate_row = view(op.gate, row * op.value_heads, op.value_heads);
-        let beta_row = view(op.beta, row * op.value_heads, op.value_heads);
-        hip(gated_delta_params(
+        hip(gated_delta_params_batched(
             gpu,
-            &GatedDeltaParams {
-                a: &a_row,
-                b: &b_row,
+            &GatedDeltaParamsBatched {
+                a: &a,
+                b: &b,
                 a_log: op.a_log,
                 dt_bias: op.dt_bias,
-                gate: &gate_row,
-                beta: &beta_row,
+                gate: &gate,
+                beta: &beta,
+                rows: op.rows,
+                heads: op.value_heads,
             },
-            op.value_heads,
         ))?;
-        let q = view(&projection2_row, 0, qk);
-        let k = view(&projection2_row, qk, qk);
-        let v = view(&projection2_row, 2 * qk, value);
-        let recurrent_output = view(op.recurrent_output, row * value, value);
-        hip(gated_delta_step(
+        let recurrent_output = view(op.recurrent_output, 0, op.rows * value);
+        hip(gated_delta_step_batched(
             gpu,
-            &GatedDeltaStep {
-                q: &q,
-                k: &k,
-                v: &v,
-                gate: &gate_row,
-                beta: &beta_row,
+            &GatedDeltaStepBatched {
+                projection: &projection2,
+                gate: &gate,
+                beta: &beta,
                 state: op.recurrent,
                 output: &recurrent_output,
+                rows: op.rows,
+                qkv_width: qkv,
                 key_heads: op.key_heads,
                 value_heads: op.value_heads,
                 key_dim: op.key_dim,
                 value_dim: op.value_dim,
             },
         ))?;
-        let bf16 = view(op.bf16_scratch, 0, value);
-        hip(bf16_roundtrip_f32(
+        let gdn_output = view(op.output_scratch, 0, op.rows * value);
+        hip(gated_delta_gate_batched(
             gpu,
-            &Bf16Roundtrip {
-                input: &recurrent_output,
-                scratch: &bf16,
-                output: &recurrent_output,
-                elements: value,
-            },
-        ))?;
-        let z_row = view(&z, row * value, value);
-        let gdn_output = view(op.output_scratch, row * value, value);
-        hip(gated_delta_gate(
-            gpu,
-            &GatedDeltaGate {
+            &GatedDeltaGateBatched {
                 recurrent_output: &recurrent_output,
-                z: &z_row,
+                z: &z,
                 norm: op.norm,
                 output: &gdn_output,
+                rows: op.rows,
                 value_heads: op.value_heads,
                 value_dim: op.value_dim,
             },
         ))?;
+    } else {
+        for row in 0..op.rows {
+            let position = op.start_position.saturating_add(row);
+            let cursor = if history_rows == 0 {
+                0
+            } else {
+                position % history_rows
+            };
+            let projection_row = view(&projection, row * qkv, qkv);
+            let projection2_row = view(&projection2, row * qkv, qkv);
+            hip(gated_delta_conv(
+                gpu,
+                &GatedDeltaConv {
+                    input: &projection_row,
+                    kernel: op.conv,
+                    history: op.conv_state,
+                    output: &projection2_row,
+                    next_history: op.conv_state,
+                    channels: qkv,
+                    history_rows,
+                    kernel_size: op.conv_kernel,
+                    cursor,
+                },
+            ))?;
+            let a_row = view(&a, row * op.value_heads, op.value_heads);
+            let b_row = view(&b, row * op.value_heads, op.value_heads);
+            let gate_row = view(op.gate, row * op.value_heads, op.value_heads);
+            let beta_row = view(op.beta, row * op.value_heads, op.value_heads);
+            hip(gated_delta_params(
+                gpu,
+                &GatedDeltaParams {
+                    a: &a_row,
+                    b: &b_row,
+                    a_log: op.a_log,
+                    dt_bias: op.dt_bias,
+                    gate: &gate_row,
+                    beta: &beta_row,
+                },
+                op.value_heads,
+            ))?;
+            let q = view(&projection2_row, 0, qk);
+            let k = view(&projection2_row, qk, qk);
+            let v = view(&projection2_row, 2 * qk, value);
+            let recurrent_output = view(op.recurrent_output, row * value, value);
+            hip(gated_delta_step(
+                gpu,
+                &GatedDeltaStep {
+                    q: &q,
+                    k: &k,
+                    v: &v,
+                    gate: &gate_row,
+                    beta: &beta_row,
+                    state: op.recurrent,
+                    output: &recurrent_output,
+                    key_heads: op.key_heads,
+                    value_heads: op.value_heads,
+                    key_dim: op.key_dim,
+                    value_dim: op.value_dim,
+                },
+            ))?;
+            let bf16 = view(op.bf16_scratch, 0, value);
+            hip(bf16_roundtrip_f32(
+                gpu,
+                &Bf16Roundtrip {
+                    input: &recurrent_output,
+                    scratch: &bf16,
+                    output: &recurrent_output,
+                    elements: value,
+                },
+            ))?;
+            let z_row = view(&z, row * value, value);
+            let gdn_output = view(op.output_scratch, row * value, value);
+            hip(gated_delta_gate(
+                gpu,
+                &GatedDeltaGate {
+                    recurrent_output: &recurrent_output,
+                    z: &z_row,
+                    norm: op.norm,
+                    output: &gdn_output,
+                    value_heads: op.value_heads,
+                    value_dim: op.value_dim,
+                },
+            ))?;
+        }
     }
     let output_batch = view(op.output_tensor, 0, op.rows * op.output.m);
     project_bf16_batch(
@@ -681,6 +763,7 @@ pub struct IndexedAttentionOp<'a> {
     pub k_scratch: &'a GpuTensor,
     pub v_scratch: &'a GpuTensor,
     pub qsa_output: &'a GpuTensor,
+    pub selected_scratch: &'a GpuTensor,
     pub attention_output: &'a GpuTensor,
     pub bf16_scratch: &'a GpuTensor,
     pub rows: usize,
@@ -855,6 +938,20 @@ impl IndexedAttentionOp<'_> {
             "indexed attention selected",
         )?;
         require_tensor(
+            self.selected_scratch,
+            checked_mul(
+                checked_mul(
+                    self.rows,
+                    self.state.selected_capacity,
+                    "indexed attention selected rows",
+                )?,
+                std::mem::size_of::<i32>(),
+                "indexed attention selected scratch bytes",
+            )?,
+            DType::Raw,
+            "indexed attention selected scratch",
+        )?;
+        require_tensor(
             self.indexer_q_norm,
             self.index_dim,
             DType::BF16,
@@ -929,151 +1026,186 @@ pub fn execute_indexed_attention(
 ) -> Result<(), DispatchError> {
     let index_width = (op.index_heads + op.index_kv_heads) * op.index_dim;
     let index_q_width = op.index_heads * op.index_dim;
+    let index_kv_width = op.index_kv_heads * op.index_dim;
     let q_width = op.heads * op.head_dim;
     let kv_width = op.kv_heads * op.head_dim;
+    let initial_position = op.state.position;
+    let final_position = initial_position
+        .checked_add(op.rows)
+        .ok_or_else(|| DispatchError::Hip("indexed attention position overflows".into()))?;
     let index_batch = view(op.index_scratch, 0, op.rows * index_width);
     let qgate_batch = view(op.qgate_scratch, 0, op.rows * 2 * q_width);
     let k_batch = view(op.k_scratch, 0, op.rows * kv_width);
     let v_batch = view(op.v_scratch, 0, op.rows * kv_width);
+    let qsa_output_batch = view(op.qsa_output, 0, op.rows * q_width);
+    let selected_batch = view(
+        op.selected_scratch,
+        0,
+        op.rows * op.state.selected_capacity * std::mem::size_of::<i32>(),
+    );
     project_bf16_batch(gpu, &op.indexer_qk, op.input, &index_batch, op.rows)?;
     project_bf16_batch(gpu, &op.q, op.input, &qgate_batch, op.rows)?;
     project_bf16_batch(gpu, &op.k, op.input, &k_batch, op.rows)?;
     project_bf16_batch(gpu, &op.v, op.input, &v_batch, op.rows)?;
-    let initial_position = op.state.position;
-    let qsa_output_batch = view(op.qsa_output, 0, op.rows * q_width);
-    for row in 0..op.rows {
-        let position = initial_position
-            .checked_add(row)
-            .ok_or_else(|| DispatchError::Hip("indexed attention position overflows".into()))?;
-        let index_row = view(&index_batch, row * index_width, index_width);
-        let index_q = view(&index_row, 0, index_q_width);
-        let index_k = view(&index_row, index_q_width, op.index_kv_heads * op.index_dim);
-        hip(indexed_attention_norm_rope(
+
+    hip(indexed_attention_norm_rope_batch(
+        gpu,
+        &IndexedAttentionNormRopeBatch {
+            values: &index_batch,
+            norm: op.indexer_q_norm,
+            rows: op.rows,
+            row_stride: index_width,
+            heads: op.index_heads,
+            head_dim: op.index_dim,
+            head_stride: op.index_dim,
+            position_start: initial_position,
+            rotary_dim: op.index_dim.min(64),
+        },
+    ))?;
+    hip(gpu.bf16_round_trip_f32_strided(
+        &index_batch,
+        op.rows,
+        index_q_width,
+        index_width,
+        index_kv_width,
+    ))?;
+    let index_k_batch = view(
+        &index_batch,
+        index_q_width,
+        op.rows * index_width - index_q_width,
+    );
+    let raw_batch = view(
+        op.state.raw_index_keys,
+        initial_position * index_kv_width,
+        op.rows * index_kv_width,
+    );
+    hip(gpu.copy_rows_strided_f32(
+        &index_k_batch,
+        &raw_batch,
+        op.rows,
+        index_kv_width,
+        index_width,
+        index_kv_width,
+        0,
+    ))?;
+    hip(indexed_attention_norm_rope_batch(
+        gpu,
+        &IndexedAttentionNormRopeBatch {
+            values: &qgate_batch,
+            norm: op.q_norm,
+            rows: op.rows,
+            row_stride: 2 * q_width,
+            heads: op.heads,
+            head_dim: op.head_dim,
+            head_stride: 2 * op.head_dim,
+            position_start: initial_position,
+            rotary_dim: op.head_dim.min(64),
+        },
+    ))?;
+    hip(indexed_attention_norm_rope_batch(
+        gpu,
+        &IndexedAttentionNormRopeBatch {
+            values: &k_batch,
+            norm: op.k_norm,
+            rows: op.rows,
+            row_stride: kv_width,
+            heads: op.kv_heads,
+            head_dim: op.head_dim,
+            head_stride: op.head_dim,
+            position_start: initial_position,
+            rotary_dim: op.head_dim.min(64),
+        },
+    ))?;
+    hip(indexed_attention_cache_append_batch(
+        gpu,
+        &IndexedAttentionCacheAppendBatch {
+            key: &k_batch,
+            value: &v_batch,
+            full_keys: op.state.full_keys,
+            full_values: op.state.full_values,
+            rows: op.rows,
+            position_start: initial_position,
+            kv_width,
+        },
+    ))?;
+
+    let complete = final_position / op.compress;
+    if complete > 0 {
+        hip(indexed_attention_pool_rope(
             gpu,
-            &IndexedAttentionNormRope {
-                values: &index_q,
-                norm: op.indexer_q_norm,
-                heads: op.index_heads,
-                head_dim: op.index_dim,
-                head_stride: op.index_dim,
-                position,
-                rotary_dim: op.index_dim.min(64),
-            },
-        ))?;
-        hip(gpu.bf16_round_trip_f32(&index_k))?;
-        hip(gpu.memcpy_dtod_at_auto(
-            &op.state.raw_index_keys.buf,
-            position * op.index_kv_heads * op.index_dim * 4,
-            &index_k.buf,
-            0,
-            op.index_kv_heads * op.index_dim * 4,
-        ))?;
-        let qgate_row = view(&qgate_batch, row * 2 * q_width, 2 * q_width);
-        let k_row = view(&k_batch, row * kv_width, kv_width);
-        let v_row = view(&v_batch, row * kv_width, kv_width);
-        hip(indexed_attention_norm_rope(
-            gpu,
-            &IndexedAttentionNormRope {
-                values: &qgate_row,
-                norm: op.q_norm,
-                heads: op.heads,
-                head_dim: op.head_dim,
-                head_stride: 2 * op.head_dim,
-                position,
-                rotary_dim: op.head_dim.min(64),
-            },
-        ))?;
-        hip(indexed_attention_norm_rope(
-            gpu,
-            &IndexedAttentionNormRope {
-                values: &k_row,
-                norm: op.k_norm,
-                heads: op.kv_heads,
-                head_dim: op.head_dim,
-                head_stride: op.head_dim,
-                position,
-                rotary_dim: op.head_dim.min(64),
-            },
-        ))?;
-        hip(indexed_attention_cache_append(
-            gpu,
-            &IndexedAttentionCacheAppend {
-                key: &k_row,
-                value: &v_row,
-                full_keys: op.state.full_keys,
-                full_values: op.state.full_values,
-                position,
-                kv_width,
-            },
-        ))?;
-        let visible = position.checked_add(1).ok_or_else(|| {
-            DispatchError::Hip("indexed attention visible length overflows".into())
-        })?;
-        let complete = visible / op.compress;
-        if complete > 0 {
-            hip(indexed_attention_pool_rope(
-                gpu,
-                &IndexedAttentionPoolRope {
-                    raw_keys: op.state.raw_index_keys,
-                    pooled: op.state.pooled_keys,
-                    norm: Some(op.indexer_k_norm),
-                    block_count: complete,
-                    compress: op.compress,
-                    index_dim: op.index_kv_heads * op.index_dim,
-                },
-            ))?;
-        }
-        let budget_blocks = op.budget / op.compress;
-        hip(indexed_attention_select(
-            gpu,
-            &IndexedAttentionSelect {
-                query: &index_q,
+            &IndexedAttentionPoolRope {
+                raw_keys: op.state.raw_index_keys,
                 pooled: op.state.pooled_keys,
-                selected: op.state.selected_indices,
+                norm: Some(op.indexer_k_norm),
                 block_count: complete,
-                index_heads: op.index_heads,
-                index_dim: op.index_dim,
-                budget_blocks,
                 compress: op.compress,
-                visible,
-                capacity: op.state.selected_capacity,
+                index_dim: index_kv_width,
             },
         ))?;
-        let selected = (budget_blocks.min(complete) * op.compress + visible
-            - complete * op.compress)
-            .min(op.state.selected_capacity);
-        let qsa_row = view(&qsa_output_batch, row * q_width, q_width);
-        hip(indexed_attention_attention(
-            gpu,
-            &IndexedAttentionAttention {
-                q_with_gate: &qgate_row,
-                full_keys: op.state.full_keys,
-                full_values: op.state.full_values,
-                selected: op.state.selected_indices,
-                output: &qsa_row,
-                n_heads: op.heads,
-                n_kv_heads: op.kv_heads,
-                head_dim: op.head_dim,
-                selected_len: selected,
-                full_capacity: op.state.full_capacity,
-            },
-        ))?;
-        op.state.full_len = visible;
-        op.state.raw_len = visible;
-        op.state.pooled_len = complete;
-        op.state.selected_len = selected;
-        op.state.position = visible;
     }
-    op.state.position = initial_position
-        .checked_add(op.rows)
-        .ok_or_else(|| DispatchError::Hip("indexed attention position overflows".into()))?;
+    let budget_blocks = op.budget / op.compress;
+    hip(indexed_attention_select_batch(
+        gpu,
+        &IndexedAttentionSelectBatch {
+            query: &index_batch,
+            pooled: op.state.pooled_keys,
+            selected: &selected_batch,
+            rows: op.rows,
+            query_row_stride: index_width,
+            block_count: complete,
+            index_heads: op.index_heads,
+            index_dim: op.index_dim,
+            budget_blocks,
+            compress: op.compress,
+            position_start: initial_position,
+            capacity: op.state.selected_capacity,
+        },
+    ))?;
+    hip(indexed_attention_attention_batch(
+        gpu,
+        &IndexedAttentionAttentionBatch {
+            q_with_gate: &qgate_batch,
+            full_keys: op.state.full_keys,
+            full_values: op.state.full_values,
+            selected: &selected_batch,
+            output: &qsa_output_batch,
+            rows: op.rows,
+            position_start: initial_position,
+            n_heads: op.heads,
+            n_kv_heads: op.kv_heads,
+            head_dim: op.head_dim,
+            budget_blocks,
+            compress: op.compress,
+            capacity: op.state.selected_capacity,
+            full_capacity: op.state.full_capacity,
+        },
+    ))?;
     project_bf16_batch(
         gpu,
         &op.output,
         &qsa_output_batch,
         &view(op.attention_output, 0, op.rows * op.output.m),
         op.rows,
-    )
+    )?;
+    let selected_len = (budget_blocks.min(complete) * op.compress + final_position
+        - complete * op.compress)
+        .min(op.state.selected_capacity);
+    let final_selected = view(
+        &selected_batch,
+        (op.rows - 1) * op.state.selected_capacity * std::mem::size_of::<i32>(),
+        op.state.selected_capacity * std::mem::size_of::<i32>(),
+    );
+    hip(gpu.copy_d2d(
+        &final_selected,
+        op.state.selected_indices,
+        final_selected.byte_size(),
+    ))?;
+    op.state.full_len = final_position;
+    op.state.raw_len = final_position;
+    op.state.pooled_len = complete;
+    op.state.selected_len = selected_len;
+    op.state.position = final_position;
+    Ok(())
 }
 
 /// Grouped causal convolution contract used by PLE-like layers.  Geometry and

@@ -24650,12 +24650,10 @@ impl Gpu {
         result
     }
 
-    /// Exact BF16-weight × F32-input four-token row-tile GEMM.
-    ///
-    /// The wave owns one output-channel row and four token rows.  It widens
-    /// each BF16 weight once and reuses that value across four F32
-    /// accumulators, preserving the scalar K traversal and shuffle reduction
-    /// without downcasting the F32 activations.
+    /// Exact BF16-weight × F32-input multirow GEMM with four- and
+    /// sixteen-token tile variants. The four-row reference and the gfx1151
+    /// variant reuse widened weights across their token rows while retaining
+    /// the reference accumulation and reduction association.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_bf16_xf32_multirow(
         &mut self,
@@ -24699,8 +24697,55 @@ impl Gpu {
                 "gemm_bf16_xf32_multirow buffer capacity is too small",
             ));
         }
-        const KERNEL: &str = "gemm_bf16_xf32_multirow";
-        self.ensure_kernel(KERNEL, kernels::GEMM_BF16_XF32_MULTIROW_SRC, KERNEL)?;
+        // gfx1151 tile selection, measured on the production prefill shapes
+        // (`.codeinsight+research/qwen4/pp500-kernel-check/dense-multirow-pick`
+        // for the original sixteen-token tile, `dense-loadvec` for the
+        // sixteen-row tile below: every arm bitwise-equal to the four-row
+        // kernel on the twenty-shape list, 10 warmups + 5 alternating event
+        // pairs per arm against it).
+        //
+        // The gfx1151 tile owns sixteen output rows and two token rows per
+        // wave, which is four times less activation traffic per FMA than the
+        // four-row tile.  Its token tile is the fast-varying grid dimension so
+        // a row group's sixteen weight rows stay resident across the tile
+        // sweep; without that ordering the weight stream leaves DRAM once per
+        // tile and the shape is several times slower.  Measured against the
+        // previous sixteen-token tile (2.30x geomean over the six required
+        // shapes, 2.02x over all twenty):
+        //
+        //   (10240,2560, 291)  7.26 ms -> 2.96 ms | (12288,2560, 291) 8.51 -> 3.43
+        //   (2560, 6144, 291)  3.67 ms -> 1.71 ms | (320, 10240, 291) 0.62 -> 0.36
+        //   (10240,2560, 512) 12.02 ms -> 5.00 ms | (248320,2560, 291) 166.8 -> 75.3
+        //
+        // The allowlist is unchanged; only the tile shape and grid inside this
+        // route change.  blockIdx.y is sixteen bits, so a wave may only cover
+        // a token tile while the row groups fit that limit.
+        let r16_shape = self.arch_caps.is_gfx1151()
+            && (128..=512).contains(&batch_size)
+            && m.div_ceil(16) <= 0xffff
+            && matches!(
+                (m, k),
+                (10240, 2560)
+                    | (12288, 2560)
+                    | (2560, 6144)
+                    | (6144, 2560)
+                    | (320, 10240)
+                    | (248320, 2560)
+            );
+        let (kernel, source, grid) = if r16_shape {
+            (
+                "gemm_bf16_xf32_multirow_r16_gfx1151",
+                kernels::GEMM_BF16_XF32_MULTIROW_R16_GFX1151_SRC,
+                [batch_size.div_ceil(2) as u32, m.div_ceil(16) as u32, 1],
+            )
+        } else {
+            (
+                "gemm_bf16_xf32_multirow",
+                kernels::GEMM_BF16_XF32_MULTIROW_SRC,
+                [m as u32, batch_size.div_ceil(4) as u32, 1],
+            )
+        };
+        self.ensure_kernel(kernel, source, kernel)?;
         let wp = weight.buf.as_ptr();
         let xp = x.buf.as_ptr();
         let yp = y.buf.as_ptr();
@@ -24715,62 +24760,18 @@ impl Gpu {
             &kv as *const _ as *mut c_void,
             &nv as *const _ as *mut c_void,
         ];
-        // The N8 route is admitted only for the measured gfx1151 production
-        // shapes. All other calls retain the four-row kernel.
-        let n8_shape = self.arch_caps.is_gfx1151()
-            && k == 2560
-            && batch_size == 128
-            && matches!(m, 10240 | 12288 | 248320);
-        if n8_shape {
-            const KERNEL_N8: &str = "gemm_bf16_xf32_multirow_n8_gfx1151";
-            self.ensure_kernel(
-                KERNEL_N8,
-                kernels::GEMM_BF16_XF32_MULTIROW_N8_GFX1151_SRC,
-                KERNEL_N8,
-            )?;
-            let bytes = weight_bytes.saturating_add(x_bytes).saturating_add(y_bytes);
-            let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL_N8, bytes);
-            let result = self.launch_maybe_blob(
-                KERNEL_N8,
-                [m as u32, batch_size.div_ceil(8) as u32, 1],
-                [32, 1, 1],
-                0,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(wp);
-                    b.push_ptr(xp);
-                    b.push_ptr(yp);
-                    b.push_i32(mv);
-                    b.push_i32(kv);
-                    b.push_i32(nv);
-                    b
-                },
-            );
-            if let Some(t) = timer {
-                t.finish(&self.hip);
-            }
-            return result;
-        }
         let bytes = weight_bytes.saturating_add(x_bytes).saturating_add(y_bytes);
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
-        let result = self.launch_maybe_blob(
-            KERNEL,
-            [m as u32, batch_size.div_ceil(4) as u32, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(wp);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(mv);
-                b.push_i32(kv);
-                b.push_i32(nv);
-                b
-            },
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
+        let result = self.launch_maybe_blob(kernel, grid, [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(wp);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mv);
+            b.push_i32(kv);
+            b.push_i32(nv);
+            b
+        });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -37785,6 +37786,19 @@ impl Gpu {
             ));
         }
         if self.arch_caps.is_gfx1151() {
+            if m == 1280 && k == 2560 {
+                return self.gemm_mq4g256v2_moe_grouped_top10_o4_r4_gfx1151(
+                    expert_weight_ptrs,
+                    expert_tile_ids,
+                    sorted_slot_index,
+                    x_src,
+                    y_grouped,
+                    m,
+                    k,
+                    x_row_div,
+                    grouped_rows,
+                );
+            }
             return self.gemm_mq4g256v2_moe_grouped_top10_simt_gfx1151(
                 expert_weight_ptrs,
                 expert_tile_ids,
@@ -37810,6 +37824,80 @@ impl Gpu {
             x_src_rows,
         )
     }
+    /// gfx1151 exact-shape O4×R4 companion for the Qwen4 QT44 grouped gate/up
+    /// path.  Four adjacent output rows are paired with four route slots at the
+    /// same 4-chain × 4-slot × 4-row = 64 accumulator budget as the O2×R8
+    /// sibling, so each group's X scalars feed four rows instead of two.  Like
+    /// the O2×R8 arm this is deliberately selected only for M=1280, K=2560.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_mq4g256v2_moe_grouped_top10_o4_r4_gfx1151(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "gemm_mq4g256v2_moe_grouped_top10_o4_r4";
+        self.ensure_kernel(
+            FUNC,
+            kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R4_GFX1151_SRC,
+            FUNC,
+        )?;
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_src.buf.as_ptr();
+        let yp = y_grouped.buf.as_ptr();
+        let mv = m as i32;
+        let kv = k as i32;
+        let rd = x_row_div as i32;
+        let gr = grouped_rows as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &rd as *const _ as *mut c_void,
+            &gr as *const _ as *mut c_void,
+        ];
+        let bytes =
+            grouped_rows.saturating_mul(m.saturating_mul(4).saturating_add(k.saturating_mul(4)));
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [m.div_ceil(4) as u32, grouped_rows.div_ceil(4) as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(tp);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(rd);
+                b.push_i32(gr);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// gfx1151 SIMT parity companion for the qt44 grouped gate/up path.  It
     /// intentionally consumes F32 X directly and mirrors the indexed decode
     /// reduction instead of entering the F16 WMMA arithmetic path.

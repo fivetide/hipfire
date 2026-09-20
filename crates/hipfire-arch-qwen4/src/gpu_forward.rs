@@ -55,7 +55,7 @@ const PLE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Public serving calls may receive longer prompts; the forward owner tiles
 /// those requests over this bounded capacity instead of allocating
 /// prompt-sized grouped MoE buffers.
-pub(crate) const QWEN4_PREFILL_CHUNK_CAP: usize = 128;
+pub(crate) const QWEN4_PREFILL_CHUNK_CAP: usize = 512;
 const QWEN4_STEP_INLINE_CAPACITY: usize = 384;
 const QWEN4_QSA_INLINE_CAPACITY: usize = 12;
 
@@ -852,6 +852,7 @@ pub struct Qwen4GpuForwardScratch {
     pub qsa_k: GpuTensor,
     pub qsa_v: GpuTensor,
     pub qsa_output: GpuTensor,
+    pub qsa_selected: GpuTensor,
     pub attention_output: GpuTensor,
     pub ple_staged: GpuTensor,
     pub ple_rows: GpuTensor,
@@ -917,6 +918,10 @@ impl Qwen4GpuForwardScratch {
             .and_then(|bytes| bytes.checked_mul(PLE_ROW_BYTES))
             .ok_or_else(|| invalid("PLE staging size overflow"))?;
         let i32_bytes = std::mem::size_of::<i32>();
+        let qsa_selected_bytes = max_chunk
+            .checked_mul(config.qsa_selected_capacity())
+            .and_then(|elements| elements.checked_mul(i32_bytes))
+            .ok_or_else(|| invalid("QSA selected scratch size overflow"))?;
         let route_i32_bytes = layout
             .slots
             .checked_mul(i32_bytes)
@@ -976,6 +981,7 @@ impl Qwen4GpuForwardScratch {
                 DType::F32,
             )?;
             alloc(&[max_chunk * q_width], DType::F32)?;
+            alloc(&[qsa_selected_bytes], DType::Raw)?;
             alloc(&[max_chunk * hidden], DType::F32)?;
             alloc(
                 &[max_chunk * PLE_ROWS_PER_TOKEN * (PLE_ROW_BYTES / 2)],
@@ -1075,6 +1081,7 @@ impl Qwen4GpuForwardScratch {
                 qsa_k: next(),
                 qsa_v: next(),
                 qsa_output: next(),
+                qsa_selected: next(),
                 attention_output: next(),
                 ple_staged: next(),
                 ple_rows: next(),
@@ -1140,6 +1147,7 @@ impl Qwen4GpuForwardScratch {
             self.qsa_k,
             self.qsa_v,
             self.qsa_output,
+            self.qsa_selected,
             self.attention_output,
             self.ple_staged,
             self.ple_rows,
@@ -1970,6 +1978,7 @@ impl Qwen4GpuForward {
                         k_scratch: &self.scratch.qsa_k,
                         v_scratch: &self.scratch.qsa_v,
                         qsa_output: &self.scratch.qsa_output,
+                        selected_scratch: &self.scratch.qsa_selected,
                         attention_output: &self.scratch.attention_output,
                         bf16_scratch: &self.scratch.gdn_bf16,
                         rows: n,
