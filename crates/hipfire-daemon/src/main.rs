@@ -4332,12 +4332,16 @@ fn main() {
                 // in which forward they call.
                 if m.pp > 1
                     || m.ep.is_some()
-                    || (m.arch_id != 5 && m.arch_id != 6 && m.arch_id != 13 && m.arch_id != 14)
+                    || (m.arch_id != 5
+                        && m.arch_id != 6
+                        && m.arch_id != 13
+                        && m.arch_id != 14
+                        && m.arch_id != 16)
                 {
                     emit_uncorrelated_error(
                         &mut stdout,
                         None,
-                        "bench_decode requires a single-GPU Qwen3.5, Gemma4, or Muse Glimmer model",
+                        "bench_decode requires a single-GPU Qwen3.5, Qwen4, Gemma4, or Muse Glimmer model",
                         "unsupported",
                         false,
                         false,
@@ -4410,6 +4414,7 @@ fn main() {
                 let prime_error: Option<String> =
                     match hipfire_loader::bench_decode_route(m.arch_id) {
                         hipfire_loader::BenchDecodeRoute::Qwen35
+                        | hipfire_loader::BenchDecodeRoute::Qwen4
                         | hipfire_loader::BenchDecodeRoute::Gemma4
                         | hipfire_loader::BenchDecodeRoute::MuseGlimmer => {
                             hipfire_loader::carrier_for(m.arch_id)
@@ -4469,6 +4474,7 @@ fn main() {
                 let mut decode_err: Option<String> = None;
                 let run_ok = match hipfire_loader::bench_decode_route(m.arch_id) {
                     hipfire_loader::BenchDecodeRoute::Qwen35
+                    | hipfire_loader::BenchDecodeRoute::Qwen4
                     | hipfire_loader::BenchDecodeRoute::Gemma4
                     | hipfire_loader::BenchDecodeRoute::MuseGlimmer => {
                         hipfire_loader::carrier_for(m.arch_id)

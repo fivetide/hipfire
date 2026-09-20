@@ -465,6 +465,57 @@ impl Carrier for Qwen4Carrier {
         }
         Ok(model)
     }
+
+    /// Bench-decode prime for Qwen4: reset the request state, then run the
+    /// synthetic context through the final-row prefill the AR path uses.
+    fn bench_decode_prime(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+    ) -> Option<Option<String>> {
+        let bundle = m.qwen4_mut()?;
+        let vocab = bundle.config.vocab_size;
+        if let Err(error) = bundle.reset(gpu) {
+            return Some(Some(format!("qwen4 bench prime reset: {error}")));
+        }
+        let logits = match gpu.zeros(&[vocab], rdna_compute::DType::F32) {
+            Ok(logits) => logits,
+            Err(error) => return Some(Some(format!("qwen4 bench prime logits: {error:?}"))),
+        };
+        let result = bundle
+            .forward_chunk_final(gpu, synthetic, &logits, None)
+            .err()
+            .map(|error| error.to_string());
+        let _ = gpu.free_tensor(logits);
+        Some(result)
+    }
+
+    /// Bench-decode run for Qwen4: one single-token forward per iteration, the
+    /// same call the AR producer makes.
+    fn bench_decode_run(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        context: usize,
+        iterations: usize,
+        decode_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let bundle = m.qwen4_mut()?;
+        let vocab = bundle.config.vocab_size;
+        let logits = gpu.zeros(&[vocab], rdna_compute::DType::F32).ok()?;
+        let mut ok = true;
+        for i in 0..iterations {
+            let token = 101 + (i as u32 % 1000);
+            if let Err(error) = bundle.forward_token(gpu, token, &logits, None) {
+                *decode_err = Some(format!("iter {i} pos {}: {error}", context + i));
+                ok = false;
+                break;
+            }
+        }
+        let _ = gpu.free_tensor(logits);
+        Some(ok)
+    }
 }
 
 // ─── Qwen35Carrier ───────────────────────────────────────────────────
