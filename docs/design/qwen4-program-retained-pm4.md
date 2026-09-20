@@ -811,6 +811,84 @@ discovery evidence; the route is implemented, not certified.
 Until G4 lands, an explicit `HIPFIRE_REPLAY_BACKEND=hip` run is the healthy
 baseline (REDLINE gate 1), and it is also the A/B arm for the later census.
 
+## Certification status: REDLINE §7 gates (evidence collected 2026-09-20)
+
+Instrument: `tools/redline bench` (the route-proof product harness) against the
+Qwen4 `.mq4r` fixture on gfx1151, plus the CLI, the serve harness and the
+diagnostic census. Raw reports are archived locally under
+`.codeinsight+research/qwen4-retained/` (gitignored):
+`qwen4-route-proof-coherent.json`, `qwen4-route-proof-settled.json`,
+`qwen4-route-proof-longctx.json`, `qwen4-swap-serve.log`.
+
+| Gate | Required evidence | Collected | Where |
+|---:|---|---|---|
+| 1. Baseline correctness | Ordinary HIP stable and coherent on the exact fixture | **yes** | `HIPFIRE_REPLAY_BACKEND=hip` CLI runs (116-token greedy stream, `finish=stop`); bench HIP arm `measurement_validation.valid=true`, median 13.584 tok/s; `coherence: HIP passed` |
+| 2. Capture completeness | compute/external/retained counts, unique kernels, ordered sequence hash, fresh-process stability | **yes** | census `computed=2845 recorded=2845 external=0 unique_kernels=33 sequence_hash=e4a03ba84c837714`, non-launch effects `htod=0 dtod=0 dtoh=0 memset=0`; the same hash from four independent fresh processes (CLI, serve daemon, two bench runs) |
+| 3. ABI/artifact validation | every symbol resolves to the exact artifact plus loader metadata; padded blobs, geometry, effects, dynamic bindings validate | **yes** | prepare-time: `certified_artifacts=16/16`, `certified_launches=2845 fallback_launches=0 unknown_launches=0`, PM4 wait audit `covered=2844`, prepare reached `ready` with `dispatches=2845 packets=1 queue_id=2 dwords=67508 queues=1 phases=1`; any failure would have refused before `Ready` |
+| 4. Multi-position shadow parity | HIP, retained PM4 and the exact HIP-kernarg-blob oracle agree for logits, KV, recurrent state, guards, blobs | **NO — instrument missing** | see "Gate 4 gap" below; partial: the retained route's output is byte-identical to HIP across 115 consecutive positions |
+| 5. Route proof | request/transport, preparation, `Ready`, observed replay at multiple positions, dispatch/packet/queue/dword identity, sequence hash, no fault, fallback reason per arm | **yes** | auto arm: `route_proof.valid=true`, `retained_rows=5`, `observed_positions=[1500,1547]`, `prepared_identities=[[2845,1,2,67508,1,1]]`, `sequences=[[2845,33,"e4a03ba84c837714"]]`, `errors=[]`, `lifecycle_route_proof.valid=true` with `retained_rows=36` at positions `[1500,1501,1511,1547]`; HIP arm `route_proof.valid=true`, `retained_rows=0`, `state=hip`, `fallback_reason=null` |
+| 6. Production serve | user-facing generation with healthy output, finish state, attractors, framing | **yes** (bench coherence both arms; chain coherent answers) | `coherence.mode=custom`, `hip: valid=true`, `auto: valid=true` (CLI/serve prompt `benchmarks/prompts/qwen4_ar_primes.txt`, expected `2, 3, 5, 7`); serve-harness chain produced coherent answers under the route (`replays=104/132` at positions 168/284) with the empty-turn artifact appearing on *both* arms (3/5 routed vs 4/5 HIP) |
+| 7. Stationary matched performance | identical binary/model/prompt/settings/clocks; tok/s and ms/token | **yes** (one fully valid run) | long-context fixture: `hip` 8.347 vs `auto` 8.507 tok/s, `speedup=1.019`, `valid=true`, both arms stationary and route-proven, coherence both arms. The short-context (128) fixture produced arm-symmetric harness rejections across three attempts — all with valid route proofs, `retained_rows=5`, coherent output on both arms, and stable medians (`hip` 13.570-13.584, `auto` 14.164-14.248) — failing only the measured 5-row window's policy limits (`spread<=1.0%`, `slope<=0.05%/row`, `drift<=0.5%`): `auto` drift 0.141%/0.215% in two attempts, and in the long-settle attempt `hip` itself at spread 1.027%/slope -0.101%/row from a single first-row downclock outlier. Not route-attributable; the valid gate-7 numbers are the long-context run |
+| 8. Long-context and lifecycle | dynamic position, geometry, KV growth, recurrent state, request reset, failure behaviour, model swap | **partly** | long context ✓ (positions 1500–1547, see gate 7); request reset ✓ (multi-turn `replays=104/132` across turns); capture-window failure ✓ (poisons to HIP, no plan installed); model swap **blocked by a pre-existing loader/VMM teardown guard** (see below); replay-execution failure path needs the `serve-fault-inject` daemon |
+
+Claims carried by this table: gates 1, 2, 3, 5, 6 and one gate-7 run. **No
+promotion, admission, or performance claim** follows — gate 4 is uncollected and
+gate 8 is partial.
+
+### Gate 4 gap: the Qwen4 shadow arm
+
+Gate 4 needs three arms to agree on state, not just on decoded text. The
+recorded-HIP-blob oracle itself is generic
+(`Gpu::replay_recorded_hip_prefix_at`, shared binding application), and the Qwen4
+crate already carries a state-parity oracle (`crates/hipfire-arch-qwen4/src/state_parity.rs`).
+What is missing is the driver:
+
+1. **A `redline_shadow_qwen4` arm** in `crates/hipfire-generate/src/redline.rs`
+   next to `redline_shadow_gemma4`/`redline_shadow_deepseek4`, dispatched from
+   `handle_redline_shadow`'s downcast chain, with a Qwen4 state snapshot
+   (logits, QSA full/raw/pooled keys and selected indices, GDN recurrent and
+   convolution state, PLE history) captured before and after each arm at several
+   positions.
+2. **Manual-capture arming at the boundary.** The shadow harness runs the daemon
+   with `HIPFIRE_REPLAY_MANUAL_CAPTURE=1` and `HIPFIRE_REPLAY_BACKEND=shadow`;
+   that controller has `auto_lifecycle=false`, so the forward's
+   `begin_auto_capture_if_armed()` no-ops and the manual window never opens. The
+   boundary must also arm an explicit manual capture (a controller entry that
+   covers both modes, ~10 lines), which is what
+   `scripts/redline_daemon_harness.py --pm4 --shadow-iterations N` needs.
+3. Nothing else: the oracle, the binding application, and the report plumbing
+   already exist and are exercised by the other families.
+
+### Gate 8 blockers found
+
+- **Model swap: pre-existing loader/VMM guard, route-independent.** Reloading the
+  Qwen4 artifact after serving a different model in the same daemon fails with
+  `refusing load: prior VMM teardown still pending (… 16 live VMM tensor owner(s)
+  remain …)`. The identical failure reproduces with
+  `HIPFIRE_REPLAY_BACKEND=hip` (control run), so it is not a retained-route
+  defect: the swap *away* from Qwen4 succeeds and the retained plan is reset by
+  `configure_model_default` on the intervening load, but the loader refuses the
+  swap *back*. This needs a loader/VMM lifecycle fix (or a documented
+  single-model-per-process requirement) before gate 8's model-swap row can pass.
+- **Replay-execution failure.** The captured-failure path (poison → sticky
+  fallback, later forwards on HIP) is exercised by the diagnostic capture, but
+  the *replay* failure path (error this forward, poison the route) has no
+  induced-failure driver yet; the repo has one behind the `serve-fault-inject`
+  feature (`hipfire_generate::common`'s per-request fault arming) which can be
+  wired to a fresh-process round to collect it.
+
+### Record-schema gaps for a promotion claim
+
+The bench report carries host, model path/bytes/SHA-256, daemon and CLI digests,
+`git_commit`, UTC start, transport, every `HIPFIRE_REPLAY_PM4_*` knob, KV mode,
+context/iterations/runs/warmups, device visibility, automatic clocks, stationarity
+per arm, coherence (prompt file, digest, expected substrings, thinking, max
+tokens, sampling) and the per-arm route proofs. Missing for §8 completeness: GPU
+product and PCI identity, gfx architecture string, ROCm/runtime/driver identity,
+the timed arm's prompt/token-stream digest and sampler seed, and the author's
+predeclared promotion rule plus disposition. Those are report-level additions, not
+route work.
+
 ## Verification ladder
 
 | Stage | Route | State |
@@ -858,6 +936,13 @@ Append-only. One line per landed change with the commit hash once it exists.
 - 2026-09-20 — Default-path probe re-run after G1/G2: still the sealed-MoE
   preflight refusal, i.e. G4 remains the gate for any capture. Unchanged behavior
   is the expected result here, not a regression.
+- 2026-09-20 — **Certification evidence collected** (no promotion): gates 1, 2, 3,
+  5, 6 and one fully valid gate-7 run are collected through the route-proof
+  product harness; gate 4 is blocked on a Qwen4 shadow arm (plus manual-capture
+  arming at the boundary) and gate 8 is partial (long context and request reset
+  pass; model swap is blocked by a route-independent loader/VMM teardown guard;
+  replay-failure behaviour needs the `serve-fault-inject` driver). Details and raw
+  report paths in the certification-status section.
 - 2026-09-20 — **G4 complete (B1 + admission), route replays end to end**
   (branch-implemented, uncertified) in `67704ed34`: the in-window memsets and device copies are
   recorded launches, the eligible-forward boundary moved into the Qwen4 forward so
