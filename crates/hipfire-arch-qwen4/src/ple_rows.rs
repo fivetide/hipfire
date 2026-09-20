@@ -17,7 +17,7 @@
 use crate::ple::{PleHashMetadata, PleHistory, PLE_HEAD_COUNT, PLE_ROW_WIDTH};
 use crate::weights::{PLE_SHARD_COUNT, PLE_SHARD_ROWS};
 use hipfire_runtime::model_source::{SourceError, SourceRangeDescriptor};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -32,7 +32,17 @@ pub const PLE_ROW_BYTES: usize = PLE_ROW_WIDTH * 2;
 /// runtime knob: the model's SSD path must remain bounded on every request.
 pub const PLE_PAGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 /// Target page size used by the userspace cache.
-const PLE_PAGE_TARGET_BYTES: usize = 2 * 1024 * 1024;
+///
+/// A page is both the cache unit and the read unit, so this constant bounds how
+/// many bytes one 320-byte row can cost.  Requested rows are drawn at random
+/// over the whole 102 GB physical table, so a page read almost never serves any
+/// other requested row and the cost of one row is the whole page.  Measured on
+/// gfx1151 with a 2 MiB target: a 291-token chunk requested 4656 rows in 4483
+/// distinct windows and pulled ~9.4 GB for ~1.5 MB of useful bytes — 492 ms of
+/// page-cache copy (1810 ms cold) spent with the GPU idle waiting for the lease.
+/// Matching the OS page (whose cache line the read lands in anyway) keeps the
+/// window within the row's own file page instead of amplifying it ~6500x.
+const PLE_PAGE_TARGET_BYTES: usize = 4 * 1024;
 /// Page size rounded down to a whole number of physical rows.
 ///
 /// Keeping the public geometry row aligned avoids partial-row pages and makes
@@ -1525,6 +1535,10 @@ struct CachedPage {
 struct PageCache {
     capacity_bytes: usize,
     pages: HashMap<PageKey, CachedPage>,
+    /// Recency index over [`CachedPage::last_used`]: stamp -> page.  A page is
+    /// small, so the cache holds tens of thousands of entries and the least
+    /// recently used page must be found without scanning the map.
+    by_stamp: BTreeMap<u64, PageKey>,
     resident_bytes: usize,
     clock: u64,
     hits: u64,
@@ -1540,6 +1554,7 @@ impl PageCache {
         Self {
             capacity_bytes,
             pages: HashMap::new(),
+            by_stamp: BTreeMap::new(),
             resident_bytes: 0,
             clock: 0,
             hits: 0,
@@ -1554,7 +1569,9 @@ impl PageCache {
     fn touch(&mut self, key: PageKey) {
         self.clock = self.clock.wrapping_add(1);
         if let Some(page) = self.pages.get_mut(&key) {
+            self.by_stamp.remove(&page.last_used);
             page.last_used = self.clock;
+            self.by_stamp.insert(self.clock, key);
         }
     }
 
@@ -1563,17 +1580,14 @@ impl PageCache {
             return;
         }
         if let Some(previous) = self.pages.remove(&key) {
+            self.by_stamp.remove(&previous.last_used);
             self.resident_bytes = self.resident_bytes.saturating_sub(previous.bytes.len());
         }
         while self.resident_bytes.saturating_add(bytes.len()) > self.capacity_bytes {
-            let victim = self
-                .pages
-                .iter()
-                .min_by_key(|(_, page)| page.last_used)
-                .map(|(key, _)| *key);
-            let Some(victim) = victim else {
+            let Some((&stamp, &victim)) = self.by_stamp.iter().next() else {
                 break;
             };
+            self.by_stamp.remove(&stamp);
             if let Some(page) = self.pages.remove(&victim) {
                 self.resident_bytes = self.resident_bytes.saturating_sub(page.bytes.len());
                 self.evictions += 1;
@@ -1581,6 +1595,7 @@ impl PageCache {
         }
         self.clock = self.clock.wrapping_add(1);
         self.resident_bytes += bytes.len();
+        self.by_stamp.insert(self.clock, key);
         self.pages.insert(
             key,
             CachedPage {
@@ -1593,6 +1608,7 @@ impl PageCache {
     fn clear(&mut self) -> usize {
         let dropped = self.resident_bytes;
         self.pages.clear();
+        self.by_stamp.clear();
         self.resident_bytes = 0;
         dropped
     }
@@ -1936,11 +1952,24 @@ mod tests {
         lease.stage_into(&mut copied).unwrap();
         assert_eq!(copied, lease.as_bytes().unwrap());
         drop(lease);
-        assert_eq!(source.reads.load(Ordering::Acquire), 1);
+        // Every distinct physical page is read exactly once for one ticket;
+        // adjacent pages may coalesce into one call.
+        let mut distinct = std::collections::HashSet::new();
+        let mut expected_bytes = 0usize;
+        for &row in expected_ids.iter().flatten() {
+            let key = rows.locate_row(row).unwrap().page_key();
+            if distinct.insert(key) {
+                expected_bytes += rows.inner.page_len(key).unwrap();
+            }
+        }
+        let stats = rows.cache_stats();
+        assert_eq!(stats.read_bytes as usize, expected_bytes);
+        assert!(stats.reads as usize <= distinct.len());
+        assert_eq!(source.reads.load(Ordering::Acquire) as u64, stats.reads);
         let second = rows.prefetch(0, PleHistory::new(99), &[0, 1]).unwrap();
         let lease = rows.wait_completed_lease(&second).unwrap();
         drop(lease);
-        assert_eq!(source.reads.load(Ordering::Acquire), 1);
+        assert_eq!(rows.cache_stats().read_bytes, stats.read_bytes);
         assert!(rows.unload().unwrap().is_clean());
     }
 
@@ -2016,6 +2045,60 @@ mod tests {
             ]
         );
     }
+    /// One requested 320-byte row must not drag a multi-megabyte window out of
+    /// the source.  The page unit is also the read unit, so this pins the
+    /// per-row amplification that the lease wait depends on: with a 2 MiB
+    /// window a 291-token chunk read ~9.4 GB for ~1.5 MB of rows, which cost
+    /// 492 ms of page-cache copy with the GPU idle.
+    #[test]
+    fn read_window_stays_within_the_row_page() {
+        // Big enough that hashed rows land in distinct windows the way the
+        // production table spreads them.
+        let source = Arc::new(MemoryRowSource {
+            shards: rows_source(2, 32768),
+            reads: AtomicUsize::new(0),
+            fail: None,
+        });
+        let rows = PleRows::from_test_source_with_page_rows(
+            metadata_with_head_size(4096, 65536),
+            32768,
+            PLE_ROWS_PER_PAGE,
+            source.clone(),
+        )
+        .unwrap();
+        let tokens: Vec<u32> = (0..4).collect();
+        let ticket = rows.prefetch(0, PleHistory::new(7), &tokens).unwrap();
+        let expected_ids = ticket.row_ids().unwrap();
+        let lease = rows.wait_completed_lease(&ticket).unwrap();
+        for (token, ids) in expected_ids.iter().enumerate() {
+            for (head, &row_id) in ids.iter().enumerate() {
+                let row = lease.row_bytes(token, head).unwrap();
+                assert_eq!(u16::from_le_bytes([row[0], row[1]]) as u64, row_id);
+            }
+        }
+        drop(lease);
+
+        let mut distinct = std::collections::HashSet::new();
+        let mut expected_bytes = 0usize;
+        for &row in expected_ids.iter().flatten() {
+            let key = rows.locate_row(row).unwrap().page_key();
+            if distinct.insert(key) {
+                expected_bytes += rows.inner.page_len(key).unwrap();
+            }
+        }
+        let stats = rows.cache_stats();
+        assert_eq!(stats.read_bytes as usize, expected_bytes);
+        assert!(stats.reads as usize <= distinct.len());
+        assert_eq!(source.reads.load(Ordering::Acquire) as u64, stats.reads);
+
+        let needed = expected_ids.iter().flatten().count() * PLE_ROW_BYTES;
+        assert!(
+            expected_bytes <= needed * 16,
+            "requested {needed} bytes and read {expected_bytes} bytes"
+        );
+        assert!(rows.unload().unwrap().is_clean());
+    }
+
     #[test]
     fn direct_fill_handles_partial_pages_duplicates_and_cache_pressure() {
         assert_eq!(PLE_PAGE_BYTES % PLE_ROW_BYTES, 0);
