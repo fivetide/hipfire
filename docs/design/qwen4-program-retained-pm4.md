@@ -2,14 +2,15 @@
 
 ## Status and purpose
 
-**Status: G1 and G2 implemented on `feat/qwen38-flash-next` (branch-implemented,
-not certified).** Two remaining gaps — G3 (QSA geometry/shared-memory shape) and
-G4 (sealed MoE pointer contract) — are **open decisions** and are not started.
+**Status: G1–G3 implemented on `feat/qwen38-flash-next` (branch-implemented, not
+certified); G4 analyzed with a recommended package.** G4 — the sealed-MoE pointer
+contract and the refusal's blast radius — is the only blocker left before a Qwen4
+tape can exist; its analysis is in this record and no decision has been taken.
 
 This record is the tracking document for enabling Redline retained PM4 replay for
 Qwen3.8 Flash-Next (`hipfire-arch-qwen4`) **at the shared engine/dispatch level**,
 without adding PM4-specific code to the architecture crate. `hipfire-arch-qwen4`
-still contains zero Redline references after G1/G2.
+still contains zero Redline references after G1–G3.
 
 Follow [the design-record lifecycle](README.md): this file is intent plus a
 progress ledger, not a claim of implementation, admission, or speed. Runtime
@@ -105,7 +106,7 @@ formula). That is exactly what G2 makes declarable, and it is declared at the
 | G1 | Half the decode program never reaches the recorder: `tensor_ops.rs` was 31 wrappers, 31 raw `Gpu::launch_kernel_blob`, 0 funnel launches | `crates/rdna-compute` | **done** (branch-implemented) |
 | G2 | Binding vocabulary could not express a quotient/modulo of position, and declared bindings could not be attached to a launch | `crates/rdna-compute`, `hipfire-dispatch` | **done** (branch-implemented) |
 | G3 | Position-switched kernel symbol and dynamic shared memory in QSA (`complete > 0` conditional launch, grid growing with position) | engine (lowering) + a kernel contract decision | **decided + done** (branch-implemented; route arming deferred to the G4 hook) |
-| G4 | Sealed MoE "no retained-replay pointer contract" refusal: `route_policy` is `Some(Qt44Qt53Grouped)` for qwen4 decode | engine (dispatch) | open decision |
+| G4 | Sealed MoE "no retained-replay pointer contract" refusal: `route_policy` is `Some(Qt44Qt53Grouped)` for qwen4 decode | engine (dispatch) | **analyzed**; recommended A2 (scope) + B1 with C2 (contract) — decision pending |
 
 ## G1 — recorder funnel coverage (done)
 
@@ -460,28 +461,185 @@ the pool wrapper to accept a zero count. Also outstanding: the launch census
 (REDLINE §7 gate 3) that asserts every position-derived kernarg in a *recorded*
 Qwen4 forward is declared — it needs a capturable forward, i.e. G4.
 
-## G4 — open decision: the sealed MoE pointer contract
+## G4 — the sealed MoE pointer contract and the refusal's blast radius
 
-Not started. `crates/hipfire-arch-qwen4/src/program.rs` binds
-`route_policy: Some(MoeRoutePolicy { capability: Qt44Qt53Grouped })`, and
-`sealed_moe.rs` refuses every launch while `gpu.replay.is_enabled()` with
-"no retained-replay pointer contract". The refusal is correct for what the route
-currently guarantees; it must be replaced by a contract, not deleted.
+**Status: analyzed, no decision taken.** No code changed. Evidence below is
+source-derived (two read-only surveys plus direct reading); option weights are
+judgements and are marked as such.
 
-Decision content to settle and record:
+### The problem, precisely
 
-1. Which pointers in the specialized route are host-derived (expert pointer
-   tables, bound expert ownership, rank/plan-local views) and which are
-   allocation-stable for the plan lifetime.
-2. Whether the contract is (a) a validated stable pointer set carried by the
-   route policy declaration, or (b) a rejection narrowed to the exact sub-case
-   that is unstable, with the stable case admitted.
-3. The admissibility rule that replaces the blanket refusal: every
-   position/state-dependent scalar is either indirect through a persistent buffer
-   or covered by a declared binding (the REDLINE §4 rule), enforced in
-   `validate_sealed`, with a negative test per rejected shape.
-4. Whether qwen4 decode stays the *specialized* route at all for the retained
-   body, or whether the retained body is defined over the generic top-10 path.
+`crates/hipfire-dispatch/src/pipeline/sealed_moe.rs:1829-1837`:
+
+```rust
+let specialized_route = match &self.params {
+    SealedParams::Decode(params) => params.route_policy.is_some(),
+    SealedParams::Prefill(params) => params.route_policy.is_some(),
+};
+if specialized_route && gpu.replay.is_enabled() {
+    return Err(invalid(
+        "specialized sealed MoE has no retained-replay pointer contract; refusing before launch",
+    ));
+}
+```
+
+Qwen4 binds that policy unconditionally (`crates/hipfire-arch-qwen4/src/program.rs`
+decode and prefill, plus the legacy `execute_moe`), `is_enabled()` is
+`request != Hip && state != Fallback`, and the guard sits in `validate_for_gpu`,
+which runs at **preflight** — before any launch, for **every** forward, including
+prefill.
+
+Two distinct defects are tangled in that one predicate:
+
+**D1 — the refusal's blast radius exceeds the retained contract.** The tape never
+exists for prefill (REDLINE §3 requires prefill to stay outside it), and
+`Fallback`/`Hip` forwards would run HIP anyway. Refusing them means a `.mq4r`
+Qwen4 artifact on gfx1151 (where `retained_redline_default` arms automatically)
+**cannot serve at all**: no prefill, no generation, no fallback. The reproduced
+probe in the Baseline section is exactly this. The engine's own fallback semantics
+(REDLINE §3: a poisoned route falls back to HIP; an ineligible forward never
+records or replays) describe the correct scope, and the current guard does not
+implement it. There is no Qwen4 arming/poison hook at all
+(`crates/hipfire-arch-qwen4` contains no replay reference), so even a scoped guard
+would leave the capture window erroring per token instead of degrading to HIP.
+
+**D2 — the route has no *stated* contract, so the engine refuses instead of
+validating.** The survey says the route is already close to conformant:
+
+| Fact | Evidence |
+|---|---|
+| Expert pointer tables are built **once at load** from load-time device addresses and uploaded once; nothing rewrites them (no Qwen4 weight pager) | `gpu_forward.rs:629-658`, freed only in `free_gpu:694-706` |
+| Every kernarg pointer is a model/`Gpu`-lifetime tensor, a pure address-arithmetic slice view, or geometry — no per-forward host-built table, no per-forward H2D inside the sealed call | `mod.rs:393-405`, `dispatch.rs:317-325`, `gpu_forward.rs:643/654` are the only `memcpy_htod_auto` on the path |
+| **No position-derived scalar exists anywhere in this route** — every non-pointer kernarg is m/k/batch/top-k/n_exp | `gemv.rs:11884-11892`, `moe.rs:1797-1810` |
+| Pointer identity is already re-proved **every seal** against identities frozen at a one-shot bind | `validate_live_binding` (`sealed_moe.rs:3957-4015`), `bind_live` one-shot (`:1148-1172`), `build_live_binding` (`:3476-3545`) |
+| A per-expert pointer **mapping fingerprint** already exists | `mapping_fingerprint`, `sealed_moe.rs:3523-3545` |
+| Single-rank, single-device only; EP/root-routed/gather paths are never entered | `:1759-1764`, `:1822`, `:1777-1791` |
+| The generic path is **not** an alternative: `MQ4G128V2` down requires the policy, and the k=10 generic path is CPU-host-routed and separately refused under capture | `sealed_moe.rs:2511-2516`, `families/moe.rs:493`, `moe_program.rs:1131-1134`, `sealed_moe.rs:1746-1753` |
+
+What is genuinely missing is therefore small and specific:
+
+1. **Table *contents* are not proved on the Single path.** `validate_pointer_table`
+   checks dtype and byte capacity only; the *compact* path additionally proves each
+   owned entry points at its own local tensor (`sealed_moe.rs:3660-3680`), the
+   Single path does not. A stale entry would be dereferenced by the kernel while
+   the live-expert check looks satisfied.
+2. **The mapping fingerprint is not part of any plan identity.** It is
+   dispatch-private, so a retained plan cannot pin "the pointer mapping this tape
+   was captured against" and re-prove it at prepare/replay.
+3. **Lifetime hazards outside the route's own checks are unnamed**: `gpu.scratch`
+   FWHT sign tables are lazily allocated on first use (`gemv.rs:3437-3443`,
+   `3560-3562`, `scratch.rs:366-420`) — if first touched *inside* a recorded body
+   the tape holds an address nobody promised to keep, and a scratch rebuild while
+   a plan lives would dangle it; `HIPFIRE_DUMP_HIDDEN` performs a D2H inside the
+   route; `invalidate_for_kv_mode_switch` and model reset/swap must invalidate the
+   plan (the switch path already poisons, `dispatch.rs:4253-4255`).
+4. **No census exists.** Launch count and geometry stability across positions are
+   unverified (REDLINE gate 2), and the census needs a capturable forward — which
+   the refusal prevents, while the census is one of the things that would justify
+   admission.
+
+### Options
+
+**D1 scope — how wide should the refusal be?**
+
+- **A1 — keep the blanket guard.** Rejected: it makes the model unservable, blocks
+  the prefill evidence as well, contradicts REDLINE's fallback semantics, and is
+  the one behavior in this area with a product-visible regression. Cost if kept:
+  every `.mq4r` Qwen4 forward fails on gfx1151.
+- **A2 — scope to the eligible retained body (recommended, independently).**
+  Refuse only when the controller would record or route
+  (`is_recording() || should_route_pm4() || should_route_aql()`); prefill, `Hip`,
+  and `Fallback` forwards launch normally, and a failure inside the capture window
+  poisons the controller (sticky fallback) instead of erroring each request. Needs
+  the Qwen4 arming/poison/fallback hook — which is also where G3's "arm once
+  `complete > 0`" condition lives, so the two remaining items share one hook.
+  Pros: restores serving and the prefill evidence; keeps the tape fail-closed
+  (capture still refused until D2 is closed); small, testable change (a `.mq4r`
+  serve with Redline armed must reach HIP and log a fallback reason). Cons: no
+  tape yet; adds a hook whose correctness (poison-on-capture-failure) matters and
+  must be tested.
+- **A3 — A2 plus admission (D2).** The actual goal.
+
+**D2 contract — how to obtain an admissible route?**
+
+- **B1 — validate-and-admit by extending the existing machinery (recommended).**
+  (i) Prove table contents on the Single path (mirror the compact path's entry
+  check); (ii) expose the mapping fingerprint as plan identity and require
+  capture/prepare/replay to observe the same fingerprint; (iii) name the lifetime
+  rules: sign tables resident before the capture window, no scratch rebuild while a
+  plan lives, `HIPFIRE_DUMP_HIDDEN` refused while recording, existing invalidation
+  paths wired to the plan; (iv) replace the blanket guard with these checks plus
+  *named* refusals for the sub-cases that stay out (paged residency, EP>1,
+  host-routed fallback); (v) census as gate-2 evidence, with a negative test per
+  refused shape. Pros: the route already satisfies the substance per the inventory;
+  the checks are cheap and two of them already exist in the compact path; no kernel
+  or lowering change; the refusal becomes narrow and self-explaining. Cons: the
+  proof burden lands here; the census needs a capturable forward, which needs
+  either this admission to be complete or the diagnostic route below.
+- **B2 — make stability structural.** Absolute (base-relative) expert addressing or
+  a device-side indirection so that residency/placement changes never touch a
+  recorded kernarg, plus load-time sign tables. Pros: the contract becomes trivial
+  and survives a future weight pager. Cons: kernel/dispatch work for hazards
+  nothing currently exercises (no pager, single rank, table written once); the
+  cheap half (sign tables resident before capture) belongs in B1 regardless.
+  Defer.
+- **B3 — run the retained body over the generic route.** Rejected on evidence:
+  `MQ4G128V2` down is refused without an architecture-declared policy, and the k=10
+  generic path is host-routed (CPU top-K with readback) and separately
+  capture-refused. There is no second route to fall back to.
+- **B4 — do not admit; keep the route HIP-only.** Honest and cheap. Two spellings:
+  (a) add a Qwen4 carve-out to `retained_redline_default` — the Muse Glimmer
+  precedent, whose comment says automatic admission is withheld "until that
+  lowering lands", so a carve-out would be policy-consistent; and/or (b) rely on
+  A2's scoping. Pros: no risk, removes the brick, keeps the product honest about
+  an unadmitted route. Cons: G1–G3 stay latent, the census stays unreachable, and a
+  carve-out would be a policy decision taken *without* the measurement that would
+  justify or refute it. Fallback position, not a first move.
+
+**C — evidence sequencing.**
+
+- **C1 — contract first, then census.** The REDLINE-correct order, but the census
+  is the evidence that tells us whether the contract's assumptions hold (launch-set
+  and geometry stability across positions), so it is partly circular.
+- **C2 — diagnostic capture first, then contract (recommended with B1).** Add an
+  explicit, non-default diagnostic that lets a capture proceed with the specialized
+  route for *measurement only*: it must not install a plan, must not serve, and
+  must never count as route proof — the same posture `HIPFIRE_REPLAY_MANUAL_CAPTURE`
+  already has. This yields the launch census and the shape-stability answer (G3's
+  last outstanding item) before the admission rule is frozen. Pros: breaks the
+  circularity with an existing precedent; cheap. Cons: it is a bypass of a
+  fail-closed guard, so its scope, naming, and evidence class must be explicit in
+  the code and in this record.
+
+### Weighing
+
+| Package | Cost | Risk of silent wrongness | Evidence produced | Verdict |
+|---|---|---|---|---|
+| A1 | none | none (refuses) | none | reject — model unservable |
+| A2 | low (scope + poison + Qwen4 hook) | low (fallback path must be tested) | serving restored; prefill evidence | **do first**, independently of D2 |
+| A2 + B1 + C2 | medium (contents proof, fingerprint identity, census, hook, negative tests) | low — every new check fails closed | census, mapping identity, named refusals, then the REDLINE ladder | **recommended path to admission** |
+| A2 + B2 | high (kernel/dispatch) | low | trivial contract | defer; fold the sign-table half into B1 |
+| A2 + B3 | — | — | — | reject (no such route) |
+| A2/B4 | low | none | none | fallback if the census refutes B1's assumptions |
+
+Recommendation: **A2 now** (it is a defect in its own right: a contract question
+must not make a model unservable), then **B1 with C2** for admission, with B4 held
+as the honest fallback if the census shows the launch set or geometry moving with
+position.
+
+### Acceptance evidence per option
+
+- A2: a `.mq4r` Qwen4 serve with a replay backend armed loads, prefills, and
+  generates on HIP, logging a fallback reason; a capture-window failure poisons
+  rather than erroring the request; a unit test pins the guard's new predicate
+  (`is_recording`/`should_route_*`, not `is_enabled`).
+- B1: table-content proof with a negative test (a mutated entry must refuse);
+  mapping fingerprint recorded with the tape and re-proved at prepare with a
+  negative test; sign tables proven resident before the capture window;
+  `HIPFIRE_DUMP_HIDDEN` refused while recording; census (REDLINE §7 gate 2) with a
+  reconciled count; then gates 3–8 of the REDLINE ladder.
+- C2: the diagnostic override is non-default, cannot install a plan, and any number
+  it produces is labelled discovery-only in this record.
 
 Until G4 lands, an explicit `HIPFIRE_REPLAY_BACKEND=hip` run is the healthy
 baseline (REDLINE gate 1), and it is also the A/B arm for the later census.
@@ -530,6 +688,17 @@ Append-only. One line per landed change with the commit hash once it exists.
 - 2026-09-20 — Default-path probe re-run after G1/G2: still the sealed-MoE
   preflight refusal, i.e. G4 remains the gate for any capture. Unchanged behavior
   is the expected result here, not a regression.
+- 2026-09-20 — **G4 analyzed** (no decision): split into D1 (the refusal's blast
+  radius — it disables prefill, fallback and every forward, making the `.mq4r`
+  artifact unservable) and D2 (the unstated pointer contract). The route is already
+  close to conformant: load-time pointer tables that are never rewritten, no
+  per-forward host table or H2D, no position-derived scalar anywhere in the route,
+  and per-seal pointer-identity re-proof with an existing mapping fingerprint. The
+  real gaps are table-*content* proof on the Single path, a plan-pinned mapping
+  identity, names for the lifetime hazards (lazy FWHT sign tables, dump-hidden D2H,
+  invalidation paths), and the census. Options A1–A3, B1–B4, C1–C2 recorded with
+  weights; recommended A2 now and B1+C2 for admission, with B4 as the honest
+  fallback.
 - 2026-09-20 — **G3 decided and landed** (branch-implemented, uncertified) in
   `360a44ab1`:
   capacity-fixed pool grid + capacity-pinned LDS with a constant symbol + declared
