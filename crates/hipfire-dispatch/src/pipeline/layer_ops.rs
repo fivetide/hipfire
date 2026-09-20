@@ -1207,10 +1207,13 @@ pub fn execute_indexed_attention(
         (op.rows - 1) * op.state.selected_capacity * std::mem::size_of::<i32>(),
         op.state.selected_capacity * std::mem::size_of::<i32>(),
     );
-    hip(gpu.copy_d2d(
-        &final_selected,
+    // A recorded launch, not a `copy_d2d`: the retained tape replays dispatches,
+    // so a device copy inside the body would be state the replay cannot
+    // reproduce. `copy_f32_buffer` moves the same bytes with an explicit ABI.
+    hip(gpu.copy_f32_buffer(
         op.state.selected_indices,
-        final_selected.byte_size(),
+        &final_selected,
+        op.state.selected_capacity,
     ))?;
     op.state.full_len = final_position;
     op.state.raw_len = final_position;
@@ -1320,7 +1323,9 @@ pub fn execute_grouped_depthwise(
     let output = view(op.output, 0, op.rows * channels);
     project_bf16_batch(gpu, &op.key, op.rows_tensor, &key, op.rows)?;
     project_bf16_batch(gpu, &op.value, op.rows_tensor, &value, op.rows)?;
-    hip(gpu.copy_d2d(&streams, &query, streams.byte_size()))?;
+    // A recorded launch, not a `copy_d2d`: a retained tape replays dispatches, so
+    // a device copy inside the body would be state the replay cannot reproduce.
+    hip(gpu.copy_f32_buffer(&query, &streams, op.rows * channels))?;
     hip(rdna_compute::grouped_ops::grouped_gate_bf16(
         gpu,
         &rdna_compute::grouped_ops::GroupedGate {
@@ -1380,11 +1385,18 @@ impl ClearOp<'_> {
 }
 
 pub fn execute_clear(gpu: &mut Gpu, op: &ClearOp<'_>) -> Result<(), DispatchError> {
-    hip(gpu.hip.memset(
-        &op.tensor.buf,
-        0,
-        checked_mul(op.elements, std::mem::size_of::<f32>(), "clear bytes")?,
-    ))
+    // A recorded launch, not a `hipMemset`: a retained tape replays dispatches,
+    // so a memset inside the body would be state the replay cannot reproduce.
+    // `zero_f32` writes exact +0.0f, so the result is byte-identical.
+    if op.elements > op.tensor.numel() {
+        return Err(DispatchError::Hip(format!(
+            "clear op declares {} elements but the tensor holds {}",
+            op.elements,
+            op.tensor.numel()
+        )));
+    }
+    let span = op.tensor.sub_offset(0, op.elements);
+    hip(gpu.zero_f32(&span))
 }
 
 /// Final hyper read uses the same operation contract as a regular read; this

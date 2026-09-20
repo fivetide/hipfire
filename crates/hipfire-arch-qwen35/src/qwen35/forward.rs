@@ -605,6 +605,7 @@ fn moe_params_for_decode<'a>(
         shared,
         expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
         expert_down_ptrs: &ffn.expert_down_ptrs,
+        expert_ptrs_host: None,
         expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
         expert_dtype_tags: ffn.expert_dtype_tags.as_ref(),
         routed_gate_up_k: ffn.experts.first().map_or(0, |e| e.gate_up.k),

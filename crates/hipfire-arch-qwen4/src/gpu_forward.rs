@@ -210,6 +210,37 @@ impl From<WeightError> for Qwen4GpuForwardError {
     }
 }
 
+/// Per-layer QSA bookkeeping for one forward, derived from the layer's start
+/// position before the body runs.
+///
+/// A replayed forward cannot read these back from executed steps, so both paths
+/// derive them; the HIP path also checks the derivation against the readback, so
+/// drift between this and the lowering is a loud error instead of a silent state
+/// divergence. The formulas mirror `execute_indexed_attention`.
+fn derived_qsa_lengths(
+    start_position: usize,
+    rows: usize,
+    compress: usize,
+    budget: usize,
+    selected_capacity: usize,
+) -> Result<(usize, usize, usize, usize, usize), Qwen4GpuForwardError> {
+    let final_position = start_position
+        .checked_add(rows)
+        .ok_or_else(|| invalid("Qwen4 QSA position overflows"))?;
+    let complete = final_position / compress;
+    let budget_blocks = budget / compress;
+    let selected_len = (budget_blocks.min(complete) * compress + final_position
+        - complete * compress)
+        .min(selected_capacity);
+    Ok((
+        final_position,
+        final_position,
+        complete,
+        selected_len,
+        final_position,
+    ))
+}
+
 fn invalid(message: impl Into<String>) -> Qwen4GpuForwardError {
     Qwen4GpuForwardError::Invalid(message.into())
 }
@@ -423,6 +454,8 @@ fn layer_desc<'a>(
             experts_all_gate_up_mq4: moe.experts_all_gate_up_mq4,
             expert_gate_up_ptrs: &moe.expert_gate_up_ptrs,
             expert_down_ptrs: &moe.expert_down_ptrs,
+            expert_gate_up_entries: &moe.expert_gate_up_entries,
+            expert_down_entries: &moe.expert_down_entries,
             layer_idx: layer.layer as u16,
             norm_topk_prob: config.norm_topk_prob,
         },
@@ -465,6 +498,11 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     experts_all_gate_up_mq4: bool,
     expert_gate_up_ptrs: GpuTensor,
     expert_down_ptrs: GpuTensor,
+    /// Host entries the two tables above were uploaded from. Kept so dispatch can
+    /// prove the table contents name the live expert tensors before a retained
+    /// body records them.
+    expert_gate_up_entries: Vec<usize>,
+    expert_down_entries: Vec<usize>,
 }
 
 impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
@@ -626,15 +664,21 @@ impl Qwen4MoeLayerRuntime {
                 Qwen4GpuForwardError::Dispatch(format!("expert binding: {error:?}"))
             })?;
 
-        let gate_ptrs = experts
+        let gate_entries = experts
             .iter()
             .map(|expert| expert.gate_up.tensor.buf.as_ptr() as usize)
-            .flat_map(usize::to_ne_bytes)
             .collect::<Vec<_>>();
-        let down_ptrs = experts
+        let down_entries = experts
             .iter()
             .map(|expert| expert.down.tensor.buf.as_ptr() as usize)
-            .flat_map(usize::to_ne_bytes)
+            .collect::<Vec<_>>();
+        let gate_ptrs = gate_entries
+            .iter()
+            .flat_map(|entry| entry.to_ne_bytes())
+            .collect::<Vec<_>>();
+        let down_ptrs = down_entries
+            .iter()
+            .flat_map(|entry| entry.to_ne_bytes())
             .collect::<Vec<_>>();
         let expert_gate_up_ptrs = match gpu.alloc_tensor(&[2 * config.num_experts], DType::F32) {
             Ok(tensor) => tensor,
@@ -683,6 +727,8 @@ impl Qwen4MoeLayerRuntime {
             experts,
             expert_gate_up_ptrs,
             expert_down_ptrs,
+            expert_gate_up_entries: gate_entries,
+            expert_down_entries: down_entries,
         })
     }
 
@@ -791,6 +837,7 @@ pub(crate) fn execute_moe(
         }),
         expert_gate_up_ptrs: &runtime.expert_gate_up_ptrs,
         expert_down_ptrs: &runtime.expert_down_ptrs,
+        expert_ptrs_host: None,
         expert_down_awq_ptrs: None,
         expert_dtype_tags: None,
         routed_gate_up_k: config.hidden_size,
@@ -2161,31 +2208,116 @@ impl Qwen4GpuForward {
                 qwen4_profile_record(Qwen4ProfilePhase::PleApply, apply_started);
             }
 
+            // ── Retained-body boundary ────────────────────────────────────────
+            // Everything above materialises this forward's inputs — token ids,
+            // embeddings, HC stream init, and the PLE staging/upload/gather — and
+            // stays outside a retained tape, so it runs on both the HIP path and a
+            // replay. Everything below is the body the tape covers.
+            // Eligible only for a plain single-token continuation: the wide-hidden
+            // capture is the speculative-verify shape and must never enter the tape.
+            gpu.replay
+                .set_forward_eligible(n == 1 && wide_hidden_capture.is_none());
+            gpu.replay
+                .begin_auto_capture_if_armed()
+                .map_err(|reason| invalid(reason))?;
+            let routed = if gpu.replay.should_route_pm4() {
+                // SAFETY: the boundary above staged every host input the tape's
+                // recorded launches read, and every pointer in the tape is owned by
+                // this bundle for the plan's lifetime.
+                match unsafe { gpu.replay.replay_pm4(next_position) } {
+                    Ok(_) => true,
+                    Err(reason) => {
+                        gpu.replay.poison(format!("Qwen4 PM4 replay failed: {reason}"));
+                        return Err(invalid(format!("Qwen4 retained replay failed: {reason}")));
+                    }
+                }
+            } else if gpu.replay.should_route_aql() {
+                // SAFETY: same contract as the PM4 route above.
+                match unsafe { gpu.replay.replay_linear_aql(next_position) } {
+                    Ok(_) => true,
+                    Err(reason) => {
+                        gpu.replay.poison(format!("Qwen4 AQL replay failed: {reason}"));
+                        return Err(invalid(format!("Qwen4 retained replay failed: {reason}")));
+                    }
+                }
+            } else {
+                false
+            };
 
-            execute_validated_steps(gpu, &ctx, &mut steps).map_err(|error| {
-                Qwen4GpuForwardError::Dispatch(format!("execute Qwen4 layer program: {error:?}"))
-            })?;
+            // Start positions before the body runs: the lowering advances both the
+            // op's step state and the lengths, so the derivation must read them from
+            // here rather than after execution.
+            let mut qsa_plans: SmallVec<
+                [(usize, usize, usize, usize, usize); QWEN4_QSA_INLINE_CAPACITY],
+            > = SmallVec::new();
+            for step in &steps {
+                if let Step::IndexedAttention(op) = step {
+                    if qsa_plans.len() >= QWEN4_QSA_INLINE_CAPACITY {
+                        return Err(invalid("Qwen4 QSA commit inline capacity exhausted"));
+                    }
+                    qsa_plans.push((
+                        op.state.position,
+                        op.rows,
+                        op.compress,
+                        op.budget,
+                        op.state.selected_capacity,
+                    ));
+                }
+            }
 
             let mut qsa_commits: SmallVec<
                 [(usize, usize, usize, usize, usize, usize); QWEN4_QSA_INLINE_CAPACITY],
             > = SmallVec::new();
-            let mut commit_slot = 0usize;
-            for step in &steps {
-                if let Step::IndexedAttention(op) = step {
-                    if qsa_commits.len() >= QWEN4_QSA_INLINE_CAPACITY {
-                        return Err(invalid("Qwen4 QSA commit inline capacity exhausted"));
-                    }
+            if routed {
+                // The body was replayed, so its host bookkeeping is derived from the
+                // pre-body plans instead of read back from executed steps.
+                for (commit_slot, plan) in qsa_plans.iter().copied().enumerate() {
+                    let (full_len, raw_len, pooled_len, selected_len, position) =
+                        derived_qsa_lengths(plan.0, plan.1, plan.2, plan.3, plan.4)?;
                     qsa_commits.push((
                         commit_slot,
-                        op.state.full_len,
-                        op.state.raw_len,
-                        op.state.pooled_len,
-                        op.state.selected_len,
-                        op.state.position,
+                        full_len,
+                        raw_len,
+                        pooled_len,
+                        selected_len,
+                        position,
                     ));
-                    commit_slot += 1;
                 }
-            }
+            } else {
+                execute_validated_steps(gpu, &ctx, &mut steps).map_err(|error| {
+                    Qwen4GpuForwardError::Dispatch(format!(
+                        "execute Qwen4 layer program: {error:?}"
+                    ))
+                })?;
+
+                let mut commit_slot = 0usize;
+                for step in &steps {
+                    if let Step::IndexedAttention(op) = step {
+                        if qsa_commits.len() >= QWEN4_QSA_INLINE_CAPACITY {
+                            return Err(invalid("Qwen4 QSA commit inline capacity exhausted"));
+                        }
+                        // Cross-check the derivation both paths rely on against
+                        // what the lowering actually recorded on the step.
+                        let plan = qsa_plans[commit_slot];
+                        let derived =
+                            derived_qsa_lengths(plan.0, plan.1, plan.2, plan.3, plan.4)?;
+                        let executed = (
+                            op.state.full_len,
+                            op.state.raw_len,
+                            op.state.pooled_len,
+                            op.state.selected_len,
+                            op.state.position,
+                        );
+                        if derived != executed {
+                            return Err(invalid(format!(
+                                "Qwen4 QSA bookkeeping drift: derived {derived:?} vs executed \
+                                 {executed:?} (the replayed path would advance state wrongly)"
+                            )));
+                        }
+                        qsa_commits.push((commit_slot, executed.0, executed.1, executed.2, executed.3, executed.4));
+                        commit_slot += 1;
+                    }
+                }
 
             if let Some(capture) = wide_hidden_capture.as_ref() {
                 let wide_elements = n * wide;
@@ -2227,6 +2359,7 @@ impl Qwen4GpuForward {
                         rows: requested_rows,
                         vocab: config.vocab_size, },
                     )?;
+                }
                 }
             }
 

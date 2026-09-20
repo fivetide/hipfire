@@ -15,8 +15,8 @@ use super::moe_program::{self, MoeKernelSelection};
 use crate::context::DispatchCtx;
 use crate::families::gemv::WeightRef;
 use crate::families::moe::{
-    MoeEpMode, MoeNormalization, MoeParams, MoePrefillParams, MoeQ8RouterPolicy, MoeRecipe,
-    MoeResolution, MoeRouteCapability, MoeRoutePolicy, RoutedExpertWeights,
+    MoeEpMode, MoeNormalization, MoeParams, MoePointerEntries, MoePrefillParams, MoeQ8RouterPolicy,
+    MoeRecipe, MoeResolution, MoeRouteCapability, MoeRoutePolicy, RoutedExpertWeights,
 };
 use crate::types::{dtype_rotation_plan, DispatchError, RotationPlan};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -41,14 +41,14 @@ pub enum SpecializedRouteAdmission {
 /// Admission rule for letting a specialized (route-policy) sealed MoE route enter
 /// a retained body.
 ///
-/// The route may be admitted only once its pointer contract is stated *and*
-/// enforced: expert pointer-table contents proved against the live expert
-/// tensors, a pointer-mapping identity pinned into the plan, and the lifetime
-/// rules named (sign tables, in-route diagnostic readback, plan invalidation).
-/// Until then this is the single place that says so — the launch guard refuses the
-/// retained body with this reason, and the engine-side arming hook reads the same
-/// answer instead of starting a capture the route will refuse, so both decisions
-/// cannot drift apart.
+/// Admitted on the evidence in `docs/design/qwen4-program-retained-pm4.md` § G4:
+/// the launch census reconciles against an independent count and is stable across
+/// positions, the window holds no device copy, memset or readback, and the
+/// retained body additionally *proves* at launch time that the expert pointer
+/// tables name the live experts (host entries) and that the pointer mapping is the
+/// one the tape latched (`ReplayController::note_route_identity`). Refusal remains
+/// the answer for any route that cannot supply those proofs — the guard and the
+/// engine-side arming hook read this one answer so both cannot drift apart.
 ///
 /// `HIPFIRE_REPLAY_DIAGNOSTIC_SPECIALIZED_MOE_CAPTURE=1` is the one exception, and
 /// it is measurement only: it may not install a plan, may not route a forward, and
@@ -60,10 +60,7 @@ pub fn specialized_sealed_moe_retained_admission() -> SpecializedRouteAdmission 
     if diagnostic_specialized_capture_requested() {
         return SpecializedRouteAdmission::DiagnosticCapture;
     }
-    SpecializedRouteAdmission::Refused {
-        reason: "specialized sealed MoE has no retained-replay pointer contract; refusing the \
-                 retained body (the model runs on HIP)",
-    }
+    SpecializedRouteAdmission::Admitted
 }
 
 /// Non-default diagnostic capture for a specialized route (see
@@ -1886,10 +1883,23 @@ impl<'a> SealedMoeCall<'a> {
         // model unservable. `docs/REDLINE.md` §3 keeps prefill out of the tape and
         // defines the poisoned route as a HIP fallback.
         if specialized_route && gpu.replay.retained_body_active() {
-            if let SpecializedRouteAdmission::Refused { reason } =
-                specialized_sealed_moe_retained_admission()
-            {
-                return Err(invalid(reason));
+            match specialized_sealed_moe_retained_admission() {
+                SpecializedRouteAdmission::Refused { reason } => return Err(invalid(reason)),
+                SpecializedRouteAdmission::Admitted
+                | SpecializedRouteAdmission::DiagnosticCapture => {}
+            }
+            // A replay dereferences this route's pointer tables and expert views
+            // without re-uploading or re-validating them, so the retained body
+            // additionally requires the two proofs capture depends on: the table
+            // contents must name the live experts, and the pointer mapping must be
+            // the one this tape latched.
+            if let SealedParams::Decode(params) = &self.params {
+                if params.expert_ptrs_host.is_none() {
+                    return Err(invalid(
+                        "specialized sealed MoE retained body requires the host expert pointer \
+                         entries (expert_ptrs_host) that the pointer tables were uploaded from",
+                    ));
+                }
             }
         }
 
@@ -2061,7 +2071,41 @@ pub(super) fn produce_prefill_route<'a>(
 /// the bound-call checks and prevents callers from bypassing them.
 pub(crate) fn execute_sealed(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<(), DispatchError> {
     call.validate_for_gpu(gpu)?;
+    call.note_retained_route_identity(gpu)?;
     moe_program::execute(gpu, call)
+}
+
+impl SealedMoeCall<'_> {
+    /// Latch this launch's pointer mapping into the retained tape.
+    ///
+    /// Runs where the launch actually executes rather than in the read-only
+    /// preflight, so the identity belongs to the tape exactly when its dispatches
+    /// are recorded. A replay dereferences the expert pointer tables and per-expert
+    /// views without re-uploading or re-validating them, so a mapping change
+    /// between capture and replay has to be an error instead of a silent
+    /// dereference of tensors the prepared plan never validated.
+    fn note_retained_route_identity(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        if !gpu.replay.retained_body_active() {
+            return Ok(());
+        }
+        let specialized = match &self.params {
+            SealedParams::Decode(params) => params.route_policy.is_some(),
+            SealedParams::Prefill(params) => params.route_policy.is_some(),
+        };
+        if !specialized {
+            return Ok(());
+        }
+        let Some(live) = self.experts.cache.live.as_ref() else {
+            return Err(invalid(
+                "specialized sealed MoE retained body requires a live expert binding",
+            ));
+        };
+        let identity = live.mapping_fingerprint.clone();
+        let key = live.table_identity;
+        gpu.replay
+            .note_route_identity(key, &identity)
+            .map_err(|reason| invalid(reason))
+    }
 }
 
 /// Opaque sealer-issued proof that the root produced the authoritative
@@ -3000,6 +3044,7 @@ fn validate_decode(
         params.expert_down_ptrs,
         params.expert_down_awq_ptrs,
         params.expert_dtype_tags,
+        params.expert_ptrs_host,
     )?;
     validate_dtype_tag_table(
         params.expert_dtype_tags,
@@ -3202,6 +3247,7 @@ fn validate_prefill(
         params.expert_down_ptrs,
         params.expert_down_awq_ptrs,
         params.expert_dtype_tags,
+        None,
     )?;
     validate_dtype_tag_table(
         params.expert_dtype_tags,
@@ -4018,6 +4064,7 @@ fn validate_live_binding(
     down_ptrs: &GpuTensor,
     down_awq_ptrs: Option<&GpuTensor>,
     dtype_tags: Option<&GpuTensor>,
+    host_entries: Option<MoePointerEntries<'_>>,
 ) -> Result<(), DispatchError> {
     let Some(live) = experts.cache.live.as_ref() else {
         return Err(invalid("expert binding cache has no live resource binding"));
@@ -4054,6 +4101,33 @@ fn validate_live_binding(
     live.gate_up_ptrs
         .matches(gate_up_ptrs, "gate/up pointer table")?;
     live.down_ptrs.matches(down_ptrs, "down pointer table")?;
+    // Table *contents*, not just the table tensor: a replay dereferences these
+    // entries without re-uploading them, so each entry must point at the live
+    // expert tensor it claims to name. Mirrors the compact path's check.
+    if let Some(entries) = host_entries {
+        if entries.gate_up.len() != live.experts.len() || entries.down.len() != live.experts.len() {
+            return Err(invalid(format!(
+                "expert pointer entries cover {} gate/up and {} down, expected {}",
+                entries.gate_up.len(),
+                entries.down.len(),
+                live.experts.len()
+            )));
+        }
+        for (index, (expected_gate_up, expected_down)) in live.experts.iter().enumerate() {
+            if entries.gate_up[index] != expected_gate_up.buffer.ptr {
+                return Err(invalid(format!(
+                    "expert {index} gate/up table entry {:x} does not point at its live tensor {:x}",
+                    entries.gate_up[index], expected_gate_up.buffer.ptr
+                )));
+            }
+            if entries.down[index] != expected_down.buffer.ptr {
+                return Err(invalid(format!(
+                    "expert {index} down table entry {:x} does not point at its live tensor {:x}",
+                    entries.down[index], expected_down.buffer.ptr
+                )));
+            }
+        }
+    }
     match (&live.down_awq_ptrs, down_awq_ptrs) {
         (Some(expected), Some(actual)) => expected.matches(actual, "down AWQ pointer table")?,
         (None, None) => {}
@@ -4608,6 +4682,7 @@ mod tests {
             &fixture.down_ptrs,
             None,
             None,
+            None,
         )
         .is_err());
     }
@@ -4627,6 +4702,7 @@ mod tests {
             &fixture.down_ptrs,
             None,
             None,
+            None,
         )
         .is_err());
     }
@@ -4644,6 +4720,7 @@ mod tests {
                 Some(&fixture.routed),
                 &fixture.gate_up_ptrs,
                 &fixture.down_ptrs,
+                None,
                 None,
                 None,
             )
@@ -5712,6 +5789,7 @@ mod tests {
             }),
             expert_gate_up_ptrs: gate_up_ptrs,
             expert_down_ptrs: down_ptrs,
+            expert_ptrs_host: None,
             expert_down_awq_ptrs: None,
             expert_dtype_tags: None,
             routed_gate_up_k: 4,
@@ -5911,6 +5989,7 @@ mod tests {
             router: shaped_weight(&s.backing, DType::MQ4G256, n_exp, 4),
             expert_gate_up_ptrs: gate_up_ptrs,
             expert_down_ptrs: down_ptrs,
+            expert_ptrs_host: None,
             expert_down_awq_ptrs: None,
             expert_dtype_tags: None,
             routed_gate_up_k: 4,

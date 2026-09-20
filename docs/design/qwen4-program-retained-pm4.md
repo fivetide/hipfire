@@ -2,11 +2,14 @@
 
 ## Status and purpose
 
-**Status: G1–G3 implemented; G4's scope fix (A2) and the diagnostic census (C2)
-landed on `feat/qwen38-flash-next` (branch-implemented, not certified).** The
-census now runs and shows the tape is launch-complete and position-stable but
-*effect-incomplete*, so admission stays refused until the in-window effects are
-kernelised and the external input boundary is declared.
+**Status: implementation complete on `feat/qwen38-flash-next`; certification not
+claimed (branch-implemented, uncertified).** G1–G3 plus G4's A2 (scope), C2
+(census) and B1 (admission contract) landed: the specialized sealed-MoE route is
+admitted, and a Qwen4 `.mq4r` decode body captures, prepares and *replays* through
+retained PM4 on gfx1151 with byte-identical output. The REDLINE §7 ladder —
+shadow-parity across positions, the `tools.redline` route-proof ledger, serve
+health, long-context/reset — remains the certification step and is **not**
+claimed.
 
 This record is the tracking document for enabling Redline retained PM4 replay for
 Qwen3.8 Flash-Next (`hipfire-arch-qwen4`) **at the shared engine/dispatch level**,
@@ -107,7 +110,7 @@ formula). That is exactly what G2 makes declarable, and it is declared at the
 | G1 | Half the decode program never reaches the recorder: `tensor_ops.rs` was 31 wrappers, 31 raw `Gpu::launch_kernel_blob`, 0 funnel launches | `crates/rdna-compute` | **done** (branch-implemented) |
 | G2 | Binding vocabulary could not express a quotient/modulo of position, and declared bindings could not be attached to a launch | `crates/rdna-compute`, `hipfire-dispatch` | **done** (branch-implemented) |
 | G3 | Position-switched kernel symbol and dynamic shared memory in QSA (`complete > 0` conditional launch, grid growing with position) | engine (lowering) + a kernel contract decision | **decided + done** (branch-implemented; route arming deferred to the G4 hook) |
-| G4 | Sealed MoE "no retained-replay pointer contract" refusal: `route_policy` is `Some(Qt44Qt53Grouped)` for qwen4 decode | engine (dispatch) | **A2 + C2 landed** (scoped refusal, engine-side policy, diagnostic census); admission refused pending effect-completeness + B1 |
+| G4 | Sealed MoE "no retained-replay pointer contract" refusal: `route_policy` is `Some(Qt44Qt53Grouped)` for qwen4 decode | engine (dispatch) | **A2 + C2 + B1 landed**: scoped refusal, engine-side boundary, census, admitted with per-launch proofs — the route replays on gfx1151 |
 
 ## G1 — recorder funnel coverage (done)
 
@@ -721,23 +724,75 @@ launch, funnel or raw), so the comparison is not the recorder grading itself.
    coverage is not a smaller valid tape unless every omitted launch belongs to a
    named external adapter boundary and launch accounting reconciles exactly."*
 
-**Consequence: admission stays refused.** A route that replays a launch-complete
-tape while dropping 48 zeroings and 13 state copies per token is not the same
-computation, and the launch census alone would never have shown it. The remaining
-work is now specific:
+Those three items are closed (see "Completion" below), which is what turned the
+census from "launch-complete but effect-incomplete" into the admission evidence.
 
-1. **Kernelise the in-window effects** so they are recorded dispatches: the layer
-   `Clear` needs a zeroing kernel reached through the funnel (multiply-by-zero is
-   not equivalent — NaN survives), and the `selected_indices` copy needs a recorded
-   raw/i32 copy kernel, or the select kernel should write that row directly.
-2. **Name the external input boundary.** The two H2D uploads must happen *before*
-   the retained submission on the replay path, so the capture window has to open
-   after them: a boundary declaration in the Qwen4 forward. REDLINE §3 assigns the
-   eligible-forward boundary to the model adapter, so this is a boundary marker,
-   not PM4 machinery — a refinement of this plan's "no Qwen4-side replay code"
-   rule, recorded here so it is a decision and not a drift.
-3. Only then re-run the census and take the B1 admission decision (table-contents
-   proof, mapping-identity pinning) with a tape that is effect-complete.
+### Completion (B1)
+
+1. **In-window effects are recorded dispatches.** The layer `Clear` now launches
+   `zero_f32` (a recorded kernel; multiply-by-zero would preserve NaN) and the two
+   device copies — the QSA `selected_indices` row and the PLE depthwise
+   `streams→query` copy — go through the recorded `copy_f32_buffer`. The census
+   over the same forward reports `dtod=0 memset=0 dtoh=0`.
+2. **The external input boundary is inside the Qwen4 forward.** Everything that
+   materialises inputs — token-id upload, embedding, HC stream init, PLE
+   prefetch/stage/upload/gather — runs before the boundary on every forward, HIP or
+   replayed; the tape covers only the body. The forward declares eligibility
+   (`n == 1 && wide_hidden_capture.is_none()`, so the speculative shape can never
+   enter the tape), arms the capture and submits a prepared plan at that boundary.
+   REDLINE §3 assigns this boundary to the model adapter, so this is a boundary
+   marker rather than PM4 machinery — the engine still owns the policy, the tape
+   machinery and the route-proof instrumentation.
+3. **A replayed forward derives its host bookkeeping.** The lowering advances
+   per-layer QSA lengths and positions while executing, which a replay cannot read
+   back; both paths now derive them from the pre-body plans, and the HIP path
+   cross-checks the derivation against the readback, so drift is a loud error
+   instead of a silent state divergence.
+4. **The admission rests on per-launch proofs, not on an argument.**
+   `specialized_sealed_moe_retained_admission()` now answers `Admitted` (with
+   `DiagnosticCapture` still available as a measurement-only override), and a
+   retained body additionally requires, at launch time: the host expert pointer
+   entries that the device tables were uploaded from must be present *and* must
+   match the live expert tensors (the contents proof the compact path already had),
+   and each table's pointer mapping must be the one this tape latched
+   (`ReplayController::note_route_identity`, keyed per table because one model has
+   one mapping per layer). A mismatch refuses the launch, and the forward's capture
+   failure poisons the route to HIP.
+
+**End-to-end evidence (gfx1151, `.mq4r`, greedy, `benchmarks/prompts/qwen4_ar_primes.txt`):**
+
+```text
+[redline] qwen4 capture census: computed=2848 recorded=2845 external=3 unique_kernels=33 sequence_hash=e4a03ba84c837714
+[redline] qwen4 capture census: effects inside window — htod=2 dtod=0 dtoh=0 memset=0
+[redline] qwen4 retained body prepared: transport=pm4 dispatches=2845
+HIPFIRE_REPLAY_ROUTE_PROOF transport=pm4 position=65 request_id=run replays=115
+{"content":"2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37","tokens":116,"tok_s":12.0,"finish_reason":"stop"}
+```
+
+`external=3` is the named input boundary (embedding, HC stream init, PLE gather);
+the 2845 dispatches are the body, replayed 115 times — i.e. every decode step after
+the capture warmup — producing the byte-identical stream the HIP path produces.
+
+**Cross-turn evidence (serve harness `--mode chain`, same daemon, capped think
+span):** one capture and prepare per daemon process — `dispatches=2845` with
+`sequence_hash=e4a03ba84c837714`, the same tape identity the CLI run produced — then
+every later turn's decode ran on retained replays: `replays=104` at `position=168`
+and `replays=132` at `position=284`, i.e. one replay per decoded token across the
+per-turn state reset, with coherent answers. The harness's empty turns (3/5 with
+the route, 4/5 on the HIP arm under the same budget) are the artifact's think-span
+framing under a capped thinking budget; they appear on both arms and are not a
+route effect.
+
+**A/B (3 interleaved fresh processes per arm, greedy, 116 tokens):** retained
+11.9 / 8.6 / 12.2 tok/s (median 11.9) vs HIP 11.4 / 11.4 / 11.5 (median 11.4),
+byte-identical output in all six runs and in the earlier 5-pair shape A/B. **No
+performance claim** follows: three samples with one outlier, within this box's
+within-session spread, and no timed-arm route proof.
+
+**Not claimed:** REDLINE §7 gates 4–8 (multi-position HIP/PM4/recorded-blob shadow
+parity, the `tools.redline` timed-arm route-proof ledger, serve health, long
+context, reset and model swap) and any performance promotion. The census is
+discovery evidence; the route is implemented, not certified.
 
 ### Acceptance evidence per option
 
@@ -803,6 +858,16 @@ Append-only. One line per landed change with the commit hash once it exists.
 - 2026-09-20 — Default-path probe re-run after G1/G2: still the sealed-MoE
   preflight refusal, i.e. G4 remains the gate for any capture. Unchanged behavior
   is the expected result here, not a regression.
+- 2026-09-20 — **G4 complete (B1 + admission), route replays end to end**
+  (branch-implemented, uncertified): the in-window memsets and device copies are
+  recorded launches, the eligible-forward boundary moved into the Qwen4 forward so
+  the tape covers only the body, a replayed forward derives its per-layer QSA
+  bookkeeping (cross-checked against the HIP readback), and admission is granted
+  with per-launch proofs (host pointer-table contents vs live experts; per-table
+  pointer-mapping identity latched into the tape). Evidence: census 2845/2848 with
+  `external=3` and zero in-window effects, then `dispatches=2845` prepared and
+  `replays=115` observed with the byte-identical decoded stream. Certification
+  (REDLINE §7 gates 4–8) not claimed.
 - 2026-09-20 — **G4 C2 landed** (branch-implemented, uncertified) in
   `1182b046f`: the
   diagnostic capture + launch census + effect audit. It found a recorder gap G1

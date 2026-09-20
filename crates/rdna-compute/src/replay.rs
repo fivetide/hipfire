@@ -4110,6 +4110,12 @@ pub struct ReplayController {
     unknown_effect_launches: usize,
     /// Opt-in latch for daemon-owned post-generate route-proof markers.
     route_proof_log: bool,
+    /// Route identities (live expert pointer mappings) the tape was captured
+    /// against, keyed by the route's own stable table identity. A retained plan
+    /// dereferences pointer tables without re-uploading them, so a different
+    /// mapping for the same key means the tape names different tensors. Keyed,
+    /// not single-valued: one model has one mapping per layer.
+    route_identities: BTreeMap<u64, String>,
     prepared_max_position: Option<usize>,
     synthesized_position_bindings: Vec<(usize, ReplayKernargBinding)>,
     position_bindings_calibrated: bool,
@@ -4163,6 +4169,7 @@ impl ReplayController {
             radiowave_effect_launches: 0,
             fallback_effect_launches: 0,
             route_proof_log: route_proof_log_requested(),
+            route_identities: BTreeMap::new(),
             prepared_max_position: None,
             synthesized_position_bindings: Vec::new(),
             position_bindings_calibrated: false,
@@ -4274,6 +4281,7 @@ impl ReplayController {
         self.fallback_effect_launches = 0;
         self.unknown_effect_launches = 0;
         self.prepared_max_position = None;
+        self.route_identities.clear();
         self.synthesized_position_bindings.clear();
         self.position_bindings_calibrated = false;
     }
@@ -5593,6 +5601,7 @@ impl ReplayController {
         self.prepared_pm4 = None;
         self.prepared = None;
         self.prepared_max_position = None;
+        self.route_identities.clear();
         self.synthesized_position_bindings.clear();
         self.position_bindings_calibrated = false;
         Ok(())
@@ -5999,6 +6008,27 @@ impl ReplayController {
     /// instead of making every forward fail.
     pub fn retained_body_active(&self) -> bool {
         self.is_recording() || self.should_route_aql() || self.should_route_pm4()
+    }
+
+    /// Latch one route identity (a live expert pointer mapping) for the tape
+    /// being recorded, keyed by the route's own stable table identity, and
+    /// require every later observation under that key to match.
+    ///
+    /// Called by a route that knows its pointer mapping while the retained body is
+    /// active. A mismatch means the tape was captured against a different mapping,
+    /// so replaying it would dereference tensors the plan never validated.
+    pub fn note_route_identity(&mut self, key: u64, identity: &str) -> Result<(), String> {
+        match self.route_identities.get(&key) {
+            None => {
+                self.route_identities.insert(key, identity.to_owned());
+                Ok(())
+            }
+            Some(latched) if latched == identity => Ok(()),
+            Some(latched) => Err(format!(
+                "retained route identity for table {key:#x} changed while recording: latched \
+                 {latched}, observed {identity}"
+            )),
+        }
     }
 
     pub fn poison(&mut self, reason: impl Into<String>) {

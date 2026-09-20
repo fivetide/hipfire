@@ -217,6 +217,10 @@ pub struct Qwen4MoeBinding<'a> {
     pub experts_all_gate_up_mq4: bool,
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
+    /// Host entries the pointer tables above were uploaded from, so dispatch can
+    /// prove the table contents name the live experts (a retained body requires it).
+    pub expert_gate_up_entries: &'a [usize],
+    pub expert_down_entries: &'a [usize],
     pub layer_idx: u16,
     pub norm_topk_prob: bool,
 }
@@ -682,6 +686,10 @@ fn build_moe_decode<'a>(
         }),
         expert_gate_up_ptrs: moe.expert_gate_up_ptrs,
         expert_down_ptrs: moe.expert_down_ptrs,
+        expert_ptrs_host: Some(hipfire_dispatch::families::moe::MoePointerEntries {
+            gate_up: moe.expert_gate_up_entries,
+            down: moe.expert_down_entries,
+        }),
         expert_down_awq_ptrs: None,
         expert_dtype_tags: None,
         routed_gate_up_k: dims.hidden,

@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Qwen4 decode now runs on the retained PM4 route end to end on gfx1151. The
+  specialized sealed-MoE route is admitted on evidence rather than argument: the
+  capture census reconciles against an independent launch count (2845 recorded plus
+  3 named external input-boundary launches), is stable across positions, and the
+  window contains no device copy, memset or readback — the per-layer `Clear` and the
+  QSA/depthwise device copies are now recorded launches (`zero_f32`,
+  `copy_f32_buffer`). At launch the retained body also proves the expert pointer
+  tables name the live expert tensors and that each table's pointer mapping is the
+  one the tape latched. The eligible-forward boundary moved into the Qwen4 forward
+  so the tape covers only the body, and a replayed forward derives its per-layer QSA
+  bookkeeping with a cross-check against the HIP readback. Measured: a 116-token
+  greedy prompt decoded through 115 retained PM4 replays produces the byte-identical
+  stream. REDLINE §7 certification (shadow parity, route-proof ledger, serve,
+  long-context, reset) is not claimed by this change; see
+  [the plan record](docs/design/qwen4-program-retained-pm4.md).
 - Retained capture now has a diagnostic census for the Qwen4 declarative program
   (`HIPFIRE_REPLAY_DIAGNOSTIC_SPECIALIZED_MOE_CAPTURE=1`, measurement only: it never
   installs a plan and never routes). It reconciles the retained tape against an

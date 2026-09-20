@@ -340,6 +340,7 @@ fn decode_step_body(
                     shared: None,
                     expert_gate_up_ptrs: &m.expert_gate_up_ptrs,
                     expert_down_ptrs: &m.expert_down_ptrs,
+                    expert_ptrs_host: None,
                     expert_down_awq_ptrs: None,
                     expert_dtype_tags: None,
                     routed_gate_up_k: m.experts[0].gate_up.k,

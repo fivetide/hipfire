@@ -30,6 +30,13 @@ use crate::types::*;
 /// Grouped-MoE WMMA tile row count used by capacity bounds and scatter.
 pub const MOE_GROUPED_BLOCK_M: usize = 16;
 
+/// Host entries a binder uploaded into a routed-expert pointer table.
+#[derive(Clone, Copy)]
+pub struct MoePointerEntries<'a> {
+    pub gate_up: &'a [usize],
+    pub down: &'a [usize],
+}
+
 /// The complete semantic recipe selected by an architecture binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoeRecipe {
@@ -671,6 +678,13 @@ pub struct MoeParams<'a> {
     // routed expert pointer tables + dims
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
+    /// Host entries behind `expert_gate_up_ptrs` / `expert_down_ptrs`.
+    ///
+    /// Supplying them lets dispatch prove the table *contents* point at the live
+    /// expert tensors instead of trusting the upload. `None` keeps the historical
+    /// contract (contents unchecked); a retained body requires `Some`, because a
+    /// replay dereferences those entries without re-uploading them.
+    pub expert_ptrs_host: Option<MoePointerEntries<'a>>,
     /// Route A MoE-AWQ: per-routed-expert down `awq_scale` pointer table
     /// (`[2·n_exp]` f32 = n_exp `u64` ptrs → each expert's `[routed_down_k]`
     /// f32 scale). `Some` only when the `.hfq` carries per-expert
