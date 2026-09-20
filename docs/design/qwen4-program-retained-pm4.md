@@ -530,7 +530,8 @@ Append-only. One line per landed change with the commit hash once it exists.
 - 2026-09-20 — Default-path probe re-run after G1/G2: still the sealed-MoE
   preflight refusal, i.e. G4 remains the gate for any capture. Unchanged behavior
   is the expected result here, not a regression.
-- 2026-09-20 — **G3 decided and landed** (branch-implemented, uncertified):
+- 2026-09-20 — **G3 decided and landed** (branch-implemented, uncertified) in
+  `360a44ab1`:
   capacity-fixed pool grid + capacity-pinned LDS with a constant symbol + declared
   position fields (including the new `PositionMulU32` for the index-key row offset,
   which replaced a position-shifted destination pointer) + `copy_rows_strided_f32`
