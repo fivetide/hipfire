@@ -859,7 +859,7 @@ Append-only. One line per landed change with the commit hash once it exists.
   preflight refusal, i.e. G4 remains the gate for any capture. Unchanged behavior
   is the expected result here, not a regression.
 - 2026-09-20 — **G4 complete (B1 + admission), route replays end to end**
-  (branch-implemented, uncertified): the in-window memsets and device copies are
+  (branch-implemented, uncertified) in `67704ed34`: the in-window memsets and device copies are
   recorded launches, the eligible-forward boundary moved into the Qwen4 forward so
   the tape covers only the body, a replayed forward derives its per-layer QSA
   bookkeeping (cross-checked against the HIP readback), and admission is granted
