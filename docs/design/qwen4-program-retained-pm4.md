@@ -901,17 +901,30 @@ Two semantics worth stating, both learned by running it:
   this rules out is the same-forward fallback claim: the failing forward does
   **not** let HIP finish the transition the retained body started.
 
-### Record-schema gaps for a promotion claim
+### Record schema (REDLINE §8)
 
 The bench report carries host, model path/bytes/SHA-256, daemon and CLI digests,
 `git_commit`, UTC start, transport, every `HIPFIRE_REPLAY_PM4_*` knob, KV mode,
 context/iterations/runs/warmups, device visibility, automatic clocks, stationarity
 per arm, coherence (prompt file, digest, expected substrings, thinking, max
-tokens, sampling) and the per-arm route proofs. Missing for §8 completeness: GPU
-product and PCI identity, gfx architecture string, ROCm/runtime/driver identity,
-the timed arm's prompt/token-stream digest and sampler seed, and the author's
-predeclared promotion rule plus disposition. Those are report-level additions, not
-route work.
+tokens, sampling) and the per-arm route proofs. Environment identity for the
+runs recorded here:
+
+| Field | Value |
+|---|---|
+| Host | `halo` |
+| GPU | AMD RYZEN AI MAX+ 395 w/ Radeon 8060S (Strix Halo, gfx1151) |
+| PCI | `1002:1586`, subsystem `2014:801D`, driver `amdgpu` |
+| Kernel | `7.0.9-cachyos-lto` |
+| Runtime | `libamdhip64.so.7.2.53211` (ROCm 7.2.x, via the merged root `/home/bjoern/.hipfire/rocm-merged`) |
+| Timed prompt digest | `benchmarks/prompts/qwen4_ar_primes.txt` — md5 `0508eec29a44323f62e70fa77d92b834`, sha256 `16c282e391cce0c1ad4b702cdacc1b25c126c474de842f2e9c6d32b7ebd9a752` |
+| Clock policy | automatic (`automatic_clocks: true`), DPM settle + stationarity gate per arm |
+
+Still missing for a promotion record, and all of it report-level rather than route
+work: the timed arm's prompt/token-stream digest where the harness synthesises
+tokens, the timed arm's sampler seed, and the author's predeclared promotion rule
+plus disposition. No promotion rule exists yet, so nothing here may be cited as
+an admission.
 
 ## Verification ladder
 
