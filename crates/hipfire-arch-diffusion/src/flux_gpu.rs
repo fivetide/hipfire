@@ -1416,7 +1416,7 @@ impl<'a> Gpuf<'a> {
     ) -> Result<(), String> {
         for &(dcol, src, len) in chunks {
             self.gpu
-                .copy_rows_strided_f32(src, dst, n_rows, len, len, dst_row_stride, dcol)
+                .copy_rows_strided_f32(src, dst, n_rows, len, len, dst_row_stride, dcol, None)
                 .map_err(|e| format!("assemble_rows chunk@{dcol}: {e:?}"))?;
         }
         Ok(())

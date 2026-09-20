@@ -1075,19 +1075,19 @@ pub fn execute_indexed_attention(
         index_q_width,
         op.rows * index_width - index_q_width,
     );
-    let raw_batch = view(
-        op.state.raw_index_keys,
-        initial_position * index_kv_width,
-        op.rows * index_kv_width,
-    );
+    // The destination row offset travels as a scalar (`= position *
+    // index_kv_width`) against the base tensor, and the recorder declares it, so
+    // the tape keeps a position-independent pointer and replay re-derives the
+    // offset for its own position instead of replaying the capture-position row.
     hip(gpu.copy_rows_strided_f32(
         &index_k_batch,
-        &raw_batch,
+        op.state.raw_index_keys,
         op.rows,
         index_kv_width,
         index_width,
         index_kv_width,
-        0,
+        initial_position * index_kv_width,
+        Some(index_kv_width),
     ))?;
     hip(indexed_attention_norm_rope_batch(
         gpu,
@@ -1131,6 +1131,10 @@ pub fn execute_indexed_attention(
     ))?;
 
     let complete = final_position / op.compress;
+    // Every QSA launch declares a position-independent shape: the pool grid and
+    // both dynamic-LDS reservations come from the declared capacities while the
+    // active lengths stay scalars. Measured bit-identical to the position-derived
+    // shapes with no throughput delta (docs/design/qwen4-program-retained-pm4.md).
     if complete > 0 {
         hip(indexed_attention_pool_rope(
             gpu,
@@ -1141,6 +1145,11 @@ pub fn execute_indexed_attention(
                 block_count: complete,
                 compress: op.compress,
                 index_dim: index_kv_width,
+                position: Some(rdna_compute::tensor_ops::QsaPositionBinding {
+                    position_start: initial_position,
+                    rows: op.rows,
+                }),
+                grid_bound: op.state.pooled_capacity,
             },
         ))?;
     }
@@ -1160,6 +1169,7 @@ pub fn execute_indexed_attention(
             compress: op.compress,
             position_start: initial_position,
             capacity: op.state.selected_capacity,
+            shape_blocks: op.state.pooled_capacity,
         },
     ))?;
     hip(indexed_attention_attention_batch(
@@ -1179,6 +1189,7 @@ pub fn execute_indexed_attention(
             compress: op.compress,
             capacity: op.state.selected_capacity,
             full_capacity: op.state.full_capacity,
+            shape_selected: op.state.selected_capacity,
         },
     ))?;
     project_bf16_batch(

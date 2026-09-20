@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Qwen4 QSA launches now declare position-independent shapes and position-derived
+  fields, so a retained tape cannot bake a capture position into them. The pool
+  grid, the select LDS/symbol, and the attention LDS/symbol come from declared
+  capacities while the active lengths stay scalars; `position_start` and the
+  pooling count are declared at the launch that computes them (the pooling-count
+  declaration is verified against the launched value); and the index-key write
+  passes its row offset as a scalar (`ReplayKernargBinding::PositionMulU32`)
+  instead of a position-shifted device pointer, which required
+  `copy_rows_strided_f32` to bound a row-absolute column offset by the destination
+  extent rather than by one row pitch. Measured on gfx1151: pinned shapes are
+  bit-identical to the position-derived ones (including the batched select symbol
+  at an active count of zero), a 116-token greedy stream is byte-identical across
+  5 interleaved fresh-process pairs with equal tok/s medians, and no route is
+  admitted. See [the plan record](docs/design/qwen4-program-retained-pm4.md).
 - Retained-replay funnel coverage for the Qwen4 declarative program: the shared
   tensor-op owner (`rdna-compute::tensor_ops`) launched every Qwen4 GDN/QSA/HC
   op through the raw `launch_kernel_blob` entry, so those launches never reached

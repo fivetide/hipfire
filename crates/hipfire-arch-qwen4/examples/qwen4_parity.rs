@@ -2110,6 +2110,8 @@ fn run_qsa(
             block_count: blocks,
             compress: QSA_COMPRESS,
             index_dim,
+            position: None,
+            grid_bound: blocks,
         },
     )
     .map_err(|error| error.to_string())?;
@@ -3208,6 +3210,8 @@ fn run_mtp(
             block_count: 1,
             compress: QSA_COMPRESS,
             index_dim,
+            position: None,
+            grid_bound: 1,
         },
     )
     .map_err(|error| error.to_string())?;

@@ -1470,6 +1470,11 @@ impl Qwen4MtpGpu {
                     block_count: complete,
                     compress: config.indexer_compress_ratio,
                     index_dim: index_key_width,
+                    position: Some(rdna_compute::tensor_ops::QsaPositionBinding {
+                        position_start: visible.saturating_sub(1),
+                        rows: 1,
+                    }),
+                    grid_bound: complete,
                 },
             )?;
         }

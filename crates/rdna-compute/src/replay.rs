@@ -3024,6 +3024,13 @@ pub enum ReplayKernargBinding {
         addend: u32,
         modulus: u32,
     },
+    /// Product form: `position * factor`. Declared by a lowering that turns a
+    /// per-row buffer offset into a scalar (`dst_col_offset`) so the tape keeps
+    /// a position-independent pointer.
+    PositionMulU32 {
+        offset: usize,
+        factor: u32,
+    },
 }
 
 impl ReplayKernargBinding {
@@ -3034,7 +3041,8 @@ impl ReplayKernargBinding {
             Self::GdnFrameU32 { offset, .. }
             | Self::PositionPlusU32 { offset, .. }
             | Self::PositionDivU32 { offset, .. }
-            | Self::PositionModU32 { offset, .. } => offset,
+            | Self::PositionModU32 { offset, .. }
+            | Self::PositionMulU32 { offset, .. } => offset,
         }
     }
 
@@ -3047,6 +3055,7 @@ impl ReplayKernargBinding {
             Self::PositionPlusU32 { .. }
                 | Self::PositionDivU32 { .. }
                 | Self::PositionModU32 { .. }
+                | Self::PositionMulU32 { .. }
         )
     }
 
@@ -3062,6 +3071,7 @@ impl ReplayKernargBinding {
             Self::PositionModU32 {
                 addend, modulus, ..
             } => (3u8, addend, modulus),
+            Self::PositionMulU32 { factor, .. } => (4u8, factor, 0u32),
         };
         let mut bytes = [0u8; 17];
         bytes[0] = tag;
@@ -3111,6 +3121,12 @@ impl ReplayKernargBinding {
                     .checked_add(addend)
                     .ok_or_else(|| "PositionModU32 overflow".to_owned())?
                     % modulus;
+                write_kernarg_u32(kernarg_bytes, offset, value, "kernarg binding")
+            }
+            Self::PositionMulU32 { offset, factor } => {
+                let value = position_u32
+                    .checked_mul(factor)
+                    .ok_or_else(|| "PositionMulU32 overflow".to_owned())?;
                 write_kernarg_u32(kernarg_bytes, offset, value, "kernarg binding")
             }
         }
@@ -8751,6 +8767,34 @@ mod tests {
         assert!(overflow
             .apply(&mut kernarg, (u32::MAX - 1) as usize)
             .is_err());
+    }
+
+    #[test]
+    fn position_mul_binding_rederives_a_row_offset() {
+        // `dst_col_offset = position * index_kv_width` for the index-key write.
+        let mut kernarg = vec![0u8; 40];
+        let binding = ReplayKernargBinding::PositionMulU32 {
+            offset: 32,
+            factor: 128,
+        };
+        for (position, expected) in [(0usize, 0u32), (1, 128), (17, 2176), (2047, 262_016)] {
+            binding.apply(&mut kernarg, position).unwrap();
+            assert_eq!(
+                u32::from_ne_bytes(kernarg[32..36].try_into().unwrap()),
+                expected,
+                "position {position}"
+            );
+        }
+        let out_of_range = ReplayKernargBinding::PositionMulU32 {
+            offset: 37,
+            factor: 128,
+        };
+        assert!(out_of_range.apply(&mut kernarg, 1).is_err());
+        let overflow = ReplayKernargBinding::PositionMulU32 {
+            offset: 0,
+            factor: u32::MAX,
+        };
+        assert!(overflow.apply(&mut kernarg, 2).is_err());
     }
 
     #[test]

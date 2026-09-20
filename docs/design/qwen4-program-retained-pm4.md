@@ -104,7 +104,7 @@ formula). That is exactly what G2 makes declarable, and it is declared at the
 |---|---|---|---|
 | G1 | Half the decode program never reaches the recorder: `tensor_ops.rs` was 31 wrappers, 31 raw `Gpu::launch_kernel_blob`, 0 funnel launches | `crates/rdna-compute` | **done** (branch-implemented) |
 | G2 | Binding vocabulary could not express a quotient/modulo of position, and declared bindings could not be attached to a launch | `crates/rdna-compute`, `hipfire-dispatch` | **done** (branch-implemented) |
-| G3 | Position-switched kernel symbol and dynamic shared memory in QSA (`complete > 0` conditional launch, grid growing with position) | engine (lowering) + a kernel contract decision | open decision |
+| G3 | Position-switched kernel symbol and dynamic shared memory in QSA (`complete > 0` conditional launch, grid growing with position) | engine (lowering) + a kernel contract decision | **decided + done** (branch-implemented; route arming deferred to the G4 hook) |
 | G4 | Sealed MoE "no retained-replay pointer contract" refusal: `route_policy` is `Some(Qt44Qt53Grouped)` for qwen4 decode | engine (dispatch) | open decision |
 
 ## G1 — recorder funnel coverage (done)
@@ -195,11 +195,12 @@ declared binding, not a smarter heuristic.
 **Not yet evidenced.** Nothing here has been through PM4 preparation, because a
 Qwen4 tape cannot yet be captured or prepared (G3/G4).
 
-## G3 — open decision: QSA geometry, shared memory, and position fields
+## G3 — QSA geometry, shared memory, and position fields
 
-**Status: analysis complete, decision not taken.** No code changed. This section
-is the decision record; the weights below are source-derived for the admitted
-geometry and *unmeasured* for cost — the measurement plan is at the end.
+**Status: decided and implemented (branch-implemented, uncertified).** Decision:
+capacity-fixed pool grid, capacity-pinned LDS with a constant symbol, and every
+position-derived field declared at the launch that computes it. Evidence below;
+the alternatives and their weights are kept in this record.
 
 ### The problem, precisely
 
@@ -265,6 +266,64 @@ the admitted range** (attention needs `max_selected > 8192`); for `complete ≥ 
 dynamic-LDS requests are small enough that a capacity-sized reservation fits the
 64 KiB device limit with room to spare. The attention grid is 24 workgroups on a
 40-CU device, so LDS reservation cannot become an occupancy limiter there.
+
+### Decision and measurement (2026-09-20)
+
+**Decided: A1 + B1 + C1.** Capacity-fixed pool grid, capacity-pinned LDS with a
+constant symbol, position-derived fields declared at the launch that computes
+them. A2 (dynamic grid narrowing) was dropped once A1 measured free: it would add
+an environment gate, a single-queue restriction, and a PM4-only grid binding that
+the recorded-HIP oracle does not share, for no measurable gain. B2 was dropped
+because the select `_serial` variant launches one thread per row. C4 stays the
+fallback if the declared-field count ever becomes unwieldy.
+
+What the measurement showed (fixture: `qwen3.8-flash-next.mq4r`, md5
+`fda74d3760dc803e778e9b30a2fe0ebd`; binary md5s recorded in `/tmp/qsa-shape-cost.log`;
+prompt `benchmarks/prompts/qwen4_ar_primes.txt`, md5 `0508eec29a44323f62e70fa77d92b834`;
+greedy `-n 512 -t 0`, HIP backend, isolated `HOME` with `max_seq=2048`):
+
+| Arm | runs (tok/s) | stream |
+|---|---|---|
+| position-derived shapes (before) | 10.9, 11.5, 11.4, 8.1, 11.5 → median 11.4 | `2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37`, 116 tokens, `finish=stop` |
+| capacity-pinned shapes | 11.4, 11.4, 11.4, 11.4, 11.4 → median 11.4 | byte-identical to the arm above in all 5 pairs |
+
+Interleaved fresh-process pairs. The pinned arm showed no spread at all in five
+samples while the derived arm showed one 8.1 outlier; that variance difference is
+recorded as an observation, not a claim (5 samples, unknown cause). The
+conservative direction is the measurement itself: both knobs are at their worst at
+a short context (the attention LDS reservation is pinned at its maximum while the
+live length is small, and the pool grid masks the largest share of workgroups), so
+this is the arrangement most likely to expose a cost.
+
+Unit evidence, all on gfx1151:
+
+- `tensor_ops::tests::pinned_qsa_shapes_are_bit_identical_to_derived_shapes` —
+  an oversized masked pool grid, a larger select LDS reservation, a larger
+  attention LDS reservation, and the batched select symbol at an active count of
+  zero (against the serial symbol it replaces) are each bit-identical.
+- `tensor_ops::tests::qsa_position_fields_are_declared_to_the_recorder` — with a
+  recording window open, each QSA launch reports the declared binding the lowering
+  intends, and the recorded bytes *at that offset* equal the value the launch
+  used, so a drifted offset fails in the test rather than at replay.
+- `test_copy_rows_strided_f32_parity` (7 cases, now including
+  `row-absolute/dcol=7*len`) — the relaxed `copy_rows_strided_f32` contract is
+  bit-exact against the per-row `copy_d2d` reference.
+- `cargo test -p rdna-compute --lib` 263 pass; `cargo test -p hipfire-dispatch`
+  285 pass.
+
+**Not evidenced.** No tape has been captured, prepared, or replayed: the shapes
+are validated on the ordinary HIP path only, and G4 still refuses any Qwen4
+forward with a replay backend enabled. The pool launch also remains absent for the
+first `compress-1` positions (`layer_ops` keeps `if complete > 0`), so the route
+that eventually arms a tape must arm once `complete > 0` — a monotone, one-time
+condition — or the pool kernel must accept a zero count. That arming decision
+belongs with the G4 hook and is deliberately not pre-empted here.
+
+**Bound-of-record.** `pooled_capacity = ceil(max_seq / compress)` and
+`qsa_selected_capacity = budget + compress - 1` are both derived from the admitted
+geometry, so the pinned shapes cover every position the admitted configuration can
+reach. A different `max_seq` is a different tape identity, which is correct: it is
+a reload with different capacities.
 
 ### Options
 
@@ -374,25 +433,32 @@ device cost is bounded by ~512 masked workgroups per QSA layer per token plus tw
 constant LDS reservations, and both are unmeasured — which is what the next step
 must fix.
 
-### Measurement plan (before any code)
+### Landing
 
-1. **Bit-exactness of pinning.** On the ordinary HIP path, A/B the pinned shapes
-   against today's shapes on the same prompt: outputs must be bit-identical
-   (pinning changes only launch geometry, never arithmetic). Any difference means
-   a premise is wrong (most likely B1's LDS-reservation assumption).
-2. **Cost of A1's masked grid and B1's reservations.** Decode tok/s over a fixed
-   prompt at several context lengths, ≥3 fresh processes, prompt md5 + binary
-   md5 recorded. Expectation is within noise; anything above noise makes A2 the
-   pool choice.
-3. **Zero-count behaviour, only if D2 is preferred over A4:** prove the batched
-   select variant at `block_count == 0` bit-identical to the `_serial` variant
-   that the wrapper would pick today, or keep A4 and never launch it.
-4. **Binding census.** With a capture window open, assert every position-derived
-   kernarg in the QSA step is either declared or provably position-free — the
-   concrete form of REDLINE §7 gate 3 for this route.
+- `IndexedAttentionPoolRope` takes a declared `grid_bound` (the lowering passes
+  `pooled_capacity`) and, when the caller declares a position source, the active
+  count as `PositionDivU32 { addend: rows, divisor: compress }`; the wrapper
+  verifies the caller's count *equals* the declared formula, so the declaration
+  cannot drift from the launch.
+- `IndexedAttentionSelectBatch` takes a declared `shape_blocks` (LDS + symbol come
+  from the bound, not the active count) and declares both its active count and
+  `position_start`. `IndexedAttentionAttentionBatch` takes a declared
+  `shape_selected` and declares `position_start`.
+- `indexed_attention_norm_rope_batch` and `indexed_attention_cache_append_batch`
+  declare `position_start`.
+- The index-key write no longer bakes `position * index_kv_width` into a device
+  pointer: `copy_rows_strided_f32` receives the base tensor plus a
+  `dst_col_offset` scalar (its row-absolute contract is now bounded by the
+  destination extent rather than by one row pitch) and declares it with the new
+  `ReplayKernargBinding::PositionMulU32`. Kernarg offsets are captured where the
+  scalar is written (`args.len() - 4`), never hand-counted.
+- The `HIPFIRE_QSA_STABLE_SHAPES` measurement gate is gone: the pinned shape is the
+  only production shape, so the HIP and replay paths cannot diverge.
 
-Nothing above requires G4, but the *end-to-end* form of 1–4 does, because today
-no Qwen4 forward can complete with a replay backend enabled.
+**Remaining for the route (with G4):** arm the tape once `complete > 0`, or teach
+the pool wrapper to accept a zero count. Also outstanding: the launch census
+(REDLINE §7 gate 3) that asserts every position-derived kernarg in a *recorded*
+Qwen4 forward is declared — it needs a capturable forward, i.e. G4.
 
 ## G4 — open decision: the sealed MoE pointer contract
 
@@ -425,7 +491,10 @@ baseline (REDLINE gate 1), and it is also the A/B arm for the later census.
 | Stage | Route | State |
 |---|---|---|
 | Unit: G1 funnel entry | GPU test `tensor_ops::tests::recorded_blob_launch_enters_the_tape_with_the_bytes_it_launched` (gfx1151; skips elsewhere) | **passing** |
-| Unit: G2 binding vocabulary | 6 tests in `crates/rdna-compute/src/replay.rs` | **passing** |
+| Unit: G2 binding vocabulary | 7 tests in `crates/rdna-compute/src/replay.rs` | **passing** |
+| Unit: G3 pinned shapes + declarations | `tensor_ops::tests::{pinned_qsa_shapes_are_bit_identical_to_derived_shapes, qsa_position_fields_are_declared_to_the_recorder}` (gfx1151) | **passing** |
+| Contract: row-absolute column offset | `test_copy_rows_strided_f32_parity` 7/7 cases bit-exact (needs `--features lab`) | **passing** |
+| Real-model shape pin A/B | 5 interleaved fresh-process pairs, greedy 116-token stream bit-identical, tok/s medians equal | **passing** (HIP path only) |
 | Structural: no raw launch left in the program's op owner | `tensor_ops.rs` launch-discipline review (0 raw sites) | **passing** |
 | Ordinary HIP baseline | `HIPFIRE_REPLAY_BACKEND=hip` daemon probe: loads, generates (`PARIS`), commits | **passing** |
 | End-to-end census: recorded launches == compute launches | needs G4 | blocked by design |
@@ -461,6 +530,16 @@ Append-only. One line per landed change with the commit hash once it exists.
 - 2026-09-20 — Default-path probe re-run after G1/G2: still the sealed-MoE
   preflight refusal, i.e. G4 remains the gate for any capture. Unchanged behavior
   is the expected result here, not a regression.
+- 2026-09-20 — **G3 decided and landed** (branch-implemented, uncertified):
+  capacity-fixed pool grid + capacity-pinned LDS with a constant symbol + declared
+  position fields (including the new `PositionMulU32` for the index-key row offset,
+  which replaced a position-shifted destination pointer) + `copy_rows_strided_f32`
+  bounded by the destination extent instead of one row pitch. Evidence: 2 new GPU
+  tests (shape pin bit-exactness incl. the zero-count symbol swap; declarations
+  point at the recorded slots), 7/7 copy-parity cases, 5 interleaved fresh-process
+  A/B pairs with a bit-identical 116-token greedy stream and equal tok/s medians,
+  263 + 285 regression tests. The `HIPFIRE_QSA_STABLE_SHAPES` measurement gate was
+  consumed and deleted. Route arming (`complete > 0`) still belongs with G4.
 - 2026-09-20 — **G3 analyzed, no decision taken** (this section): problem split
   into P1 pool presence/grid, P2 dynamic shared memory, P3 a position-shifted
   destination pointer in the index-key write, and P4 the finding that the

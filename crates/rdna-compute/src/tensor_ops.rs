@@ -1231,25 +1231,30 @@ pub fn indexed_attention_norm_rope_batch(
     for tensor in [p.values, p.norm] {
         args.push_ptr(tensor.buf.as_ptr());
     }
-    for value in [
-        rows,
-        row_stride,
-        heads,
-        head_dim,
-        head_stride,
-        position_start,
-        rotary_dim,
-    ] {
+    for value in [rows, row_stride, heads, head_dim, head_stride] {
         args.push_i32(value);
     }
+    args.push_i32(position_start);
+    // Declared dynamic field: the chunk's start position. Replay re-derives it
+    // from its own position instead of replaying the capture-position angle
+    // base; the kernel adds the row index itself.
+    let position_offset = args.len() - 4;
+    args.push_i32(rotary_dim);
     args.pad_to(16);
+    let position_binding = [crate::replay::ReplayKernargBinding::PositionPlusU32 {
+        offset: position_offset,
+        addend: 0,
+    }];
     gpu.launch_blob_recorded(
         "indexed_attention_norm_rope_f32_batched",
         [head_grid, dim_grid, row_grid],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
-        crate::dispatch::ReplayLaunchBindings::NONE,
+        crate::dispatch::ReplayLaunchBindings {
+            grid: None,
+            kernargs: &position_binding,
+        },
     )
 }
 
@@ -1355,17 +1360,27 @@ pub fn indexed_attention_cache_append_batch(
     for tensor in [p.key, p.value, p.full_keys, p.full_values] {
         args.push_ptr(tensor.buf.as_ptr());
     }
-    for value in [rows, position_start, kv_width] {
-        args.push_i32(value);
-    }
+    args.push_i32(rows);
+    args.push_i32(position_start);
+    // Declared dynamic field: the chunk's start position. Replay re-derives it,
+    // so the cache row this launch writes follows the replay position.
+    let position_offset = args.len() - 4;
+    args.push_i32(kv_width);
     args.pad_to(16);
+    let position_binding = [crate::replay::ReplayKernargBinding::PositionPlusU32 {
+        offset: position_offset,
+        addend: 0,
+    }];
     gpu.launch_blob_recorded(
         "indexed_attention_cache_append_f32_batched",
         [grid, row_grid, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
-        crate::dispatch::ReplayLaunchBindings::NONE,
+        crate::dispatch::ReplayLaunchBindings {
+            grid: None,
+            kernargs: &position_binding,
+        },
     )
 }
 pub struct IndexedAttentionSelect<'a> {
@@ -1469,6 +1484,11 @@ pub struct IndexedAttentionSelectBatch<'a> {
     pub compress: usize,
     pub position_start: usize,
     pub capacity: usize,
+    /// Declared shape bound for the LDS reservation and the kernel symbol. A
+    /// retained tape needs both to be position-independent, so callers pass the
+    /// pooling capacity (`>= block_count`); a caller without a capacity passes
+    /// the active count. Must be `>= block_count`.
+    pub shape_blocks: usize,
 }
 
 pub fn indexed_attention_select_batch(
@@ -1528,10 +1548,41 @@ pub fn indexed_attention_select_batch(
     let position_start = checked_i32(p.position_start, "QSA batch select position")?;
     let capacity = checked_i32(p.capacity, "QSA batch select capacity")?;
     let row_grid = checked_u32(p.rows, "QSA batch select row grid")?;
+    // The active count is declared to the recorder as `(position_start + rows) /
+    // compress`, so replay re-derives it. Verify the caller used that formula:
+    // a mismatch would make replay select against a different block count.
+    let expected_blocks = p
+        .position_start
+        .checked_add(p.rows)
+        .ok_or_else(|| HipError::new(0, "QSA batch select position overflow"))?
+        / p.compress;
+    if expected_blocks != p.block_count {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "QSA batch select block count {} is not (position_start {} + rows {}) / compress {} = {expected_blocks}",
+                p.block_count, p.position_start, p.rows, p.compress
+            ),
+        ));
+    }
+    // Reserved LDS bytes and kernel symbol come from the *bound*, not from the
+    // active count, so a pinned bound makes both position-independent. The
+    // kernel indexes its LDS by the active clamp (`row_block_count`), so a
+    // larger reservation is never read.
+    if p.shape_blocks < p.block_count {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "QSA batch select shape bound {} is below the active block count {}",
+                p.shape_blocks, p.block_count
+            ),
+        ));
+    }
+    let shape_blocks = p.shape_blocks;
     let (kernel_name, block, shared_mem) =
-        match p.block_count.checked_mul(std::mem::size_of::<f32>()) {
+        match shape_blocks.checked_mul(std::mem::size_of::<f32>()) {
             Some(bytes)
-                if p.block_count > 0
+                if shape_blocks > 0
                     && bytes <= QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES
                     && bytes <= u32::MAX as usize =>
             {
@@ -1548,27 +1599,45 @@ pub fn indexed_attention_select_batch(
     for tensor in [p.query, p.pooled, p.selected] {
         args.push_ptr(tensor.buf.as_ptr());
     }
-    for value in [
-        rows,
-        query_row_stride,
-        block_count,
-        index_heads,
-        index_dim,
-        budget_blocks,
-        compress,
-        position_start,
-        capacity,
-    ] {
+    for value in [rows, query_row_stride] {
         args.push_i32(value);
     }
+    args.push_i32(block_count);
+    let block_count_offset = args.len() - 4;
+    for value in [index_heads, index_dim, budget_blocks, compress] {
+        args.push_i32(value);
+    }
+    args.push_i32(position_start);
+    let position_offset = args.len() - 4;
+    args.push_i32(capacity);
     args.pad_to(16);
+    // Both declared fields make the selection follow the replay position instead
+    // of the capture position.
+    let addend =
+        u32::try_from(p.rows).map_err(|_| HipError::new(0, "QSA batch select rows exceed u32"))?;
+    let divisor = u32::try_from(p.compress)
+        .map_err(|_| HipError::new(0, "QSA batch select compression exceeds u32"))?;
+    let bindings = [
+        crate::replay::ReplayKernargBinding::PositionDivU32 {
+            offset: block_count_offset,
+            addend,
+            divisor,
+        },
+        crate::replay::ReplayKernargBinding::PositionPlusU32 {
+            offset: position_offset,
+            addend: 0,
+        },
+    ];
     gpu.launch_blob_recorded(
         kernel_name,
         [row_grid, 1, 1],
         block,
         shared_mem,
         args.as_mut_slice(),
-        crate::dispatch::ReplayLaunchBindings::NONE,
+        crate::dispatch::ReplayLaunchBindings {
+            grid: None,
+            kernargs: &bindings,
+        },
     )
 }
 /// Device-side stable reuse of a prior MTP QSA selection row.
@@ -1628,6 +1697,19 @@ pub fn indexed_attention_reuse_selection(
     )
 }
 
+/// Formula inputs for a QSA launch whose active count is a quotient of the
+/// decode position (`(position_start + rows) / compress`).
+///
+/// Declaring them lets the retained recorder re-derive the count for a replay
+/// position instead of replaying the capture-position count. The wrapper
+/// verifies the caller's count *equals* the declared formula, so the
+/// declaration cannot drift from the launch.
+#[derive(Clone, Copy, Debug)]
+pub struct QsaPositionBinding {
+    pub position_start: usize,
+    pub rows: usize,
+}
+
 pub struct IndexedAttentionPoolRope<'a> {
     pub raw_keys: &'a GpuTensor,
     pub pooled: &'a GpuTensor,
@@ -1637,6 +1719,14 @@ pub struct IndexedAttentionPoolRope<'a> {
     pub block_count: usize,
     pub compress: usize,
     pub index_dim: usize,
+    /// Declared source of `block_count`, or `None` for a synthetic caller whose
+    /// count is not position-derived (which then declares nothing).
+    pub position: Option<QsaPositionBinding>,
+    /// Declared `grid.x` for this launch. A retained tape needs the grid to be
+    /// position-independent, so callers pass the capacity the kernel masks
+    /// against (`>= block_count`); a caller without a capacity passes the active
+    /// count. Must be `>= block_count`.
+    pub grid_bound: usize,
 }
 
 pub fn indexed_attention_pool_rope(
@@ -1666,7 +1756,37 @@ pub fn indexed_attention_pool_rope(
     let block_count = checked_i32(p.block_count, "QSA pool/RoPE block count")?;
     let compress = checked_i32(p.compress, "QSA pool/RoPE compression")?;
     let index_dim = checked_i32(p.index_dim, "QSA pool/RoPE index width")?;
-    let block_grid = checked_u32(p.block_count, "QSA pool/RoPE block grid")?;
+    // A declared position source must reproduce the count this launch performs;
+    // otherwise replay would re-derive a different amount of pooling.
+    if let Some(position) = p.position {
+        let expected = position
+            .position_start
+            .checked_add(position.rows)
+            .ok_or_else(|| HipError::new(0, "QSA pool/RoPE position overflow"))?
+            / p.compress;
+        if expected != p.block_count {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "QSA pool/RoPE block count {} is not (position_start {} + rows {}) / compress {} = {expected}",
+                    p.block_count, position.position_start, position.rows, p.compress
+                ),
+            ));
+        }
+    }
+    // The kernel masks inactive blocks before its first read, so a bound above
+    // the active count only skips workgroups; a bound below it would leave work
+    // undone and is refused.
+    if p.grid_bound < p.block_count {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "QSA pool/RoPE grid bound {} is below the active block count {}",
+                p.grid_bound, p.block_count
+            ),
+        ));
+    }
+    let block_grid = checked_u32(p.grid_bound, "QSA pool/RoPE block grid")?;
     let dim_grid = blocks(p.index_dim)?;
     if p.raw_keys.numel() < raw_elements || p.pooled.numel() < pooled_elements {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
@@ -1685,16 +1805,40 @@ pub fn indexed_attention_pool_rope(
             .unwrap_or(std::ptr::null_mut()),
     );
     args.push_i32(block_count);
+    // Declared dynamic field: replay re-derives `(position + rows) / compress`
+    // rather than replaying the capture-position pooling count.
+    let block_count_offset = args.len() - 4;
     args.push_i32(compress);
     args.push_i32(index_dim);
     args.pad_to(16);
+    let block_count_binding = match p.position {
+        None => None,
+        Some(position) => {
+            let addend = u32::try_from(position.rows)
+                .map_err(|_| HipError::new(0, "QSA pool/RoPE rows exceed u32"))?;
+            let divisor = u32::try_from(p.compress)
+                .map_err(|_| HipError::new(0, "QSA pool/RoPE compression exceeds u32"))?;
+            Some([crate::replay::ReplayKernargBinding::PositionDivU32 {
+                offset: block_count_offset,
+                addend,
+                divisor,
+            }])
+        }
+    };
+    let kernargs: &[crate::replay::ReplayKernargBinding] = match block_count_binding.as_ref() {
+        None => &[],
+        Some(bindings) => &bindings[..],
+    };
     gpu.launch_blob_recorded(
         "indexed_attention_pool_rope_f32",
         [block_grid, dim_grid, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
-        crate::dispatch::ReplayLaunchBindings::NONE,
+        crate::dispatch::ReplayLaunchBindings {
+            grid: None,
+            kernargs,
+        },
     )
 }
 
@@ -1804,6 +1948,14 @@ pub struct IndexedAttentionAttentionBatch<'a> {
     pub compress: usize,
     pub capacity: usize,
     pub full_capacity: usize,
+    /// Declared shape bound for the LDS reservation and the kernel symbol. A
+    /// retained tape needs both to be position-independent, so callers pass the
+    /// selected-row capacity (`>= max_selected`); a caller without a capacity
+    /// passes the position-derived length. Must be `>= max_selected`.
+    ///
+    /// `grid.x` must stay exactly `n_heads` in either case: the batched kernel
+    /// reads `blockIdx.x` before its head mask.
+    pub shape_selected: usize,
 }
 
 pub fn indexed_attention_attention_batch(
@@ -1863,6 +2015,20 @@ pub fn indexed_attention_attention_batch(
     .checked_add(p.compress - 1)
     .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
     let max_selected = end_position.min(p.capacity).min(selected_bound);
+    // Shape bound, not active length: the LDS reservation and symbol are what
+    // must be position-independent. The kernel derives its own active
+    // `selected_len` from the scalars, and the reservation is never read past
+    // that length.
+    if p.shape_selected < max_selected {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "QSA batch attention shape bound {} is below the active selected length {max_selected}",
+                p.shape_selected
+            ),
+        ));
+    }
+    let shape_selected = p.shape_selected;
     let rows = checked_i32(p.rows, "QSA batch attention rows")?;
     let position_start = checked_i32(p.position_start, "QSA batch attention position")?;
     let n_heads = checked_i32(p.n_heads, "QSA batch attention heads")?;
@@ -1876,9 +2042,9 @@ pub fn indexed_attention_attention_batch(
     let dim_grid = blocks(p.head_dim)?;
     let row_grid = checked_u32(p.rows, "QSA batch attention row grid")?;
     let (kernel_name, block, shared_mem) =
-        match max_selected.checked_mul(QSA_ATTENTION_LDS_BYTES_PER_ROW) {
+        match shape_selected.checked_mul(QSA_ATTENTION_LDS_BYTES_PER_ROW) {
             Some(bytes)
-                if max_selected > 0
+                if shape_selected > 0
                     && bytes <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
                     && bytes <= u32::MAX as usize =>
             {
@@ -1905,9 +2071,12 @@ pub fn indexed_attention_attention_batch(
     ] {
         args.push_ptr(tensor.buf.as_ptr());
     }
+    args.push_i32(rows);
+    args.push_i32(position_start);
+    // Declared dynamic field: the chunk's start position. Replay re-derives it,
+    // so the attention window follows the replay position.
+    let position_offset = args.len() - 4;
     for value in [
-        rows,
-        position_start,
         n_heads,
         n_kv_heads,
         head_dim,
@@ -1919,13 +2088,20 @@ pub fn indexed_attention_attention_batch(
         args.push_i32(value);
     }
     args.pad_to(16);
+    let position_binding = [crate::replay::ReplayKernargBinding::PositionPlusU32 {
+        offset: position_offset,
+        addend: 0,
+    }];
     gpu.launch_blob_recorded(
         kernel_name,
         [head_grid, dim_grid, row_grid],
         block,
         shared_mem,
         args.as_mut_slice(),
-        crate::dispatch::ReplayLaunchBindings::NONE,
+        crate::dispatch::ReplayLaunchBindings {
+            grid: None,
+            kernargs: &position_binding,
+        },
     )
 }
 
@@ -2252,6 +2428,463 @@ mod tests {
             .expect_err("byte capacity must be checked");
         assert!(error.to_string().contains("tensor shape mismatch"));
         assert_eq!(gpu.last_launched_kernel(), None);
+    }
+
+    /// Every position-derived QSA field must reach the recorder as a declaration
+    /// pointing at the right kernarg slot: nothing else re-derives these values
+    /// for a replay position. The assertion decodes the recorded bytes at each
+    /// declared offset, so a wrong offset fails here rather than at replay.
+    #[test]
+    fn qsa_position_fields_are_declared_to_the_recorder() {
+        let Some(mut gpu) = try_gfx1151_gpu() else {
+            eprintln!("skip: no gfx1151 GPU");
+            return;
+        };
+        gpu.replay =
+            crate::replay::ReplayController::new_armed(crate::replay::ReplayBackendRequest::Auto);
+        gpu.replay.begin_capture().expect("open recording window");
+
+        let compress = 4usize;
+        let blocks = 2usize;
+        let index_dim = 8usize;
+        let index_heads = 2usize;
+        let rows = 1usize;
+        let position_start = blocks * compress - rows;
+        let capacity = 8usize;
+        let budget_blocks = 2usize;
+        let cells = blocks * compress * index_dim;
+        let raw: Vec<f32> = (0..cells).map(|i| (i % 17) as f32 * 0.5).collect();
+        let raw_gpu = gpu.upload_f32(&raw, &[cells]).expect("raw upload");
+        let pooled_gpu = gpu
+            .zeros(&[blocks * index_dim], DType::F32)
+            .expect("pooled allocation");
+        indexed_attention_pool_rope(
+            &mut gpu,
+            &IndexedAttentionPoolRope {
+                raw_keys: &raw_gpu,
+                pooled: &pooled_gpu,
+                norm: None,
+                block_count: blocks,
+                compress,
+                index_dim,
+                position: Some(QsaPositionBinding {
+                    position_start,
+                    rows,
+                }),
+                grid_bound: blocks,
+            },
+        )
+        .expect("QSA pool/RoPE");
+
+        let query_elements = index_heads * index_dim;
+        let query: Vec<f32> = (0..query_elements)
+            .map(|i| (i % 13) as f32 * 0.25)
+            .collect();
+        let query_gpu = gpu
+            .upload_f32(&query, &[query_elements])
+            .expect("query upload");
+        let selected_gpu = gpu
+            .zeros(&[rows * capacity * std::mem::size_of::<i32>()], DType::Raw)
+            .expect("selected allocation");
+        indexed_attention_select_batch(
+            &mut gpu,
+            &IndexedAttentionSelectBatch {
+                query: &query_gpu,
+                pooled: &pooled_gpu,
+                selected: &selected_gpu,
+                rows,
+                query_row_stride: query_elements,
+                block_count: blocks,
+                index_heads,
+                index_dim,
+                budget_blocks,
+                compress,
+                position_start,
+                capacity,
+                shape_blocks: blocks,
+            },
+        )
+        .expect("QSA select");
+
+        let n_heads = 2usize;
+        let n_kv_heads = 1usize;
+        let head_dim = 4usize;
+        let full_capacity = 8usize;
+        let q_with_gate_gpu = gpu
+            .zeros(&[rows * n_heads * 2 * head_dim], DType::F32)
+            .expect("q allocation");
+        let full_keys_gpu = gpu
+            .zeros(&[full_capacity * n_kv_heads * head_dim], DType::F32)
+            .expect("keys allocation");
+        let full_values_gpu = gpu
+            .zeros(&[full_capacity * n_kv_heads * head_dim], DType::F32)
+            .expect("values allocation");
+        let output_gpu = gpu
+            .zeros(&[rows * n_heads * head_dim], DType::F32)
+            .expect("attention output allocation");
+        indexed_attention_attention_batch(
+            &mut gpu,
+            &IndexedAttentionAttentionBatch {
+                q_with_gate: &q_with_gate_gpu,
+                full_keys: &full_keys_gpu,
+                full_values: &full_values_gpu,
+                selected: &selected_gpu,
+                output: &output_gpu,
+                rows,
+                position_start,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                budget_blocks,
+                compress,
+                capacity,
+                full_capacity,
+                shape_selected: capacity,
+            },
+        )
+        .expect("QSA attention");
+
+        // The index-key write: a row offset that moves with the position.
+        let index_kv_width = 128usize;
+        let dco = position_start * index_kv_width;
+        let copy_src = gpu
+            .zeros(&[index_kv_width], DType::F32)
+            .expect("copy src allocation");
+        let copy_dst = gpu
+            .zeros(&[dco + index_kv_width], DType::F32)
+            .expect("copy dst allocation");
+        gpu.copy_rows_strided_f32(
+            &copy_src,
+            &copy_dst,
+            rows,
+            index_kv_width,
+            index_kv_width,
+            index_kv_width,
+            dco,
+            Some(index_kv_width),
+        )
+        .expect("index-key write");
+
+        let launches = gpu.replay.recorded_launches();
+        let kernels: Vec<&str> = launches
+            .iter()
+            .map(|launch| launch.kernel.as_str())
+            .collect();
+        assert_eq!(
+            kernels,
+            vec![
+                "indexed_attention_pool_rope_f32",
+                "indexed_attention_select_f32_batched",
+                "indexed_attention_attention_f32_batched",
+                "copy_rows_strided_f32",
+            ],
+            "recording window captured an unexpected launch set"
+        );
+
+        // The declared slot must hold the value this very launch used.
+        let check = |launch: &crate::replay::RecordedHipLaunch,
+                     binding: crate::replay::ReplayKernargBinding,
+                     expected: u32,
+                     label: &str| {
+            assert!(
+                launch.declared_kernarg_bindings().contains(&binding),
+                "{label}: missing declaration {binding:?} in {:?}",
+                launch.declared_kernarg_bindings()
+            );
+            let offset = binding.offset();
+            let recorded = u32::from_ne_bytes(
+                launch.kernarg[offset..offset + 4]
+                    .try_into()
+                    .expect("binding offset"),
+            );
+            assert_eq!(
+                recorded, expected,
+                "{label}: declaration points at the wrong slot"
+            );
+        };
+
+        let pool_blocks = crate::replay::ReplayKernargBinding::PositionDivU32 {
+            offset: 24,
+            addend: rows as u32,
+            divisor: compress as u32,
+        };
+        let pool_binding = launches[0]
+            .declared_kernarg_bindings()
+            .iter()
+            .find(|binding| {
+                matches!(
+                    binding,
+                    crate::replay::ReplayKernargBinding::PositionDivU32 { .. }
+                )
+            })
+            .copied()
+            .expect("pool declares its block count");
+        assert_eq!(pool_binding, pool_blocks, "pool block-count offset drifted");
+        check(
+            &launches[0],
+            pool_binding,
+            blocks as u32,
+            "pool block count",
+        );
+
+        let select_div = launches[1]
+            .declared_kernarg_bindings()
+            .iter()
+            .find(|binding| {
+                matches!(
+                    binding,
+                    crate::replay::ReplayKernargBinding::PositionDivU32 { .. }
+                )
+            })
+            .copied()
+            .expect("select declares its block count");
+        let select_pos = launches[1]
+            .declared_kernarg_bindings()
+            .iter()
+            .find(|binding| {
+                matches!(
+                    binding,
+                    crate::replay::ReplayKernargBinding::PositionPlusU32 { .. }
+                )
+            })
+            .copied()
+            .expect("select declares its start position");
+        check(
+            &launches[1],
+            select_div,
+            blocks as u32,
+            "select block count",
+        );
+        check(
+            &launches[1],
+            select_pos,
+            position_start as u32,
+            "select position",
+        );
+
+        let attention_pos = launches[2]
+            .declared_kernarg_bindings()
+            .first()
+            .copied()
+            .expect("attention declares its start position");
+        check(
+            &launches[2],
+            attention_pos,
+            position_start as u32,
+            "attention position",
+        );
+
+        let copy_mul = launches[3]
+            .declared_kernarg_bindings()
+            .first()
+            .copied()
+            .expect("index-key write declares its row offset");
+        assert_eq!(
+            copy_mul,
+            crate::replay::ReplayKernargBinding::PositionMulU32 {
+                offset: copy_mul.offset(),
+                factor: index_kv_width as u32,
+            },
+            "index-key write must declare `position * index_kv_width`"
+        );
+        check(&launches[3], copy_mul, dco as u32, "index-key row offset");
+
+        gpu.free_tensor(raw_gpu).expect("free raw");
+        gpu.free_tensor(pooled_gpu).expect("free pooled");
+        gpu.free_tensor(query_gpu).expect("free query");
+        gpu.free_tensor(selected_gpu).expect("free selected");
+        gpu.free_tensor(q_with_gate_gpu).expect("free q");
+        gpu.free_tensor(full_keys_gpu).expect("free keys");
+        gpu.free_tensor(full_values_gpu).expect("free values");
+        gpu.free_tensor(output_gpu).expect("free attention output");
+        gpu.free_tensor(copy_src).expect("free copy src");
+        gpu.free_tensor(copy_dst).expect("free copy dst");
+    }
+
+    /// The retained-replay shape pin (a fixed grid or LDS bound larger than the
+    /// active length) must not change a single output byte: the kernels mask, so
+    /// a bigger reservation is never read. This is the premise the G3 shape
+    /// decision rests on, tested directly for all three QSA launches, including
+    /// the `block_count == 0` case where the wrapper's symbol choice differs.
+    #[test]
+    fn pinned_qsa_shapes_are_bit_identical_to_derived_shapes() {
+        let Some(mut gpu) = try_gfx1151_gpu() else {
+            eprintln!("skip: no gfx1151 GPU");
+            return;
+        };
+
+        // ── pool: an oversized masked grid ──
+        let index_dim = 8usize;
+        let compress = 4usize;
+        let blocks = 2usize;
+        let cells = blocks * compress * index_dim;
+        let raw: Vec<f32> = (0..cells)
+            .map(|i| ((i * 37 % 251) as f32 - 125.0) / 37.0)
+            .collect();
+        let raw_gpu = gpu.upload_f32(&raw, &[cells]).expect("raw upload");
+        let pool_run = |gpu: &mut Gpu, bound: usize| {
+            let pooled = gpu
+                .zeros(&[blocks * index_dim], DType::F32)
+                .expect("pooled allocation");
+            indexed_attention_pool_rope(
+                gpu,
+                &IndexedAttentionPoolRope {
+                    raw_keys: &raw_gpu,
+                    pooled: &pooled,
+                    norm: None,
+                    block_count: blocks,
+                    compress,
+                    index_dim,
+                    position: None,
+                    grid_bound: bound,
+                },
+            )
+            .expect("QSA pool/RoPE");
+            let values = gpu.download_f32(&pooled).expect("pooled download");
+            gpu.free_tensor(pooled).expect("free pooled");
+            values
+        };
+        let pooled_derived = pool_run(&mut gpu, blocks);
+        let pooled_pinned = pool_run(&mut gpu, blocks + 6);
+        assert_eq!(
+            pooled_pinned, pooled_derived,
+            "a masked pool grid above the active block count changed the result"
+        );
+
+        // ── select: a larger LDS reservation, at an active count and at zero ──
+        let index_heads = 2usize;
+        let query_elements = index_heads * index_dim;
+        let rows = 1usize;
+        let capacity = 8usize;
+        let budget_blocks = 2usize;
+        let query: Vec<f32> = (0..rows * query_elements)
+            .map(|i| ((i * 53 % 199) as f32 - 100.0) / 199.0)
+            .collect();
+        let query_gpu = gpu
+            .upload_f32(&query, &[rows * query_elements])
+            .expect("query upload");
+        let pooled_gpu = gpu
+            .zeros(&[blocks * index_dim], DType::F32)
+            .expect("pooled allocation");
+        // `position_start` must satisfy the declared formula
+        // `(position_start + rows) / compress == active`, so the active count and
+        // the position are always consistent (the wrapper refuses a mismatch).
+        let select_run = |gpu: &mut Gpu, active: usize, bound: usize, position_start: usize| {
+            let selected = gpu
+                .zeros(&[rows * capacity * std::mem::size_of::<i32>()], DType::Raw)
+                .expect("selected allocation");
+            indexed_attention_select_batch(
+                gpu,
+                &IndexedAttentionSelectBatch {
+                    query: &query_gpu,
+                    pooled: &pooled_gpu,
+                    selected: &selected,
+                    rows,
+                    query_row_stride: query_elements,
+                    block_count: active,
+                    index_heads,
+                    index_dim,
+                    budget_blocks,
+                    compress,
+                    position_start,
+                    capacity,
+                    shape_blocks: bound,
+                },
+            )
+            .expect("QSA select");
+            let mut bytes = vec![0u8; rows * capacity * std::mem::size_of::<i32>()];
+            gpu.hip
+                .memcpy_dtoh(&mut bytes, &selected.buf)
+                .expect("selected download");
+            gpu.free_tensor(selected).expect("free selected");
+            bytes
+        };
+        let active_position = blocks * compress - rows;
+        assert_eq!(
+            select_run(&mut gpu, blocks, capacity, active_position),
+            select_run(&mut gpu, blocks, blocks, active_position),
+            "a larger select LDS reservation changed the selection"
+        );
+        // Zero complete blocks: position 0 with one row. This is the shape the
+        // production lowering hits on the first `compress` tokens, so the
+        // batched symbol at zero must equal the serial symbol it replaces.
+        assert_eq!(
+            select_run(&mut gpu, 0, capacity, 0),
+            select_run(&mut gpu, 0, 0, 0),
+            "the batched select symbol at an active count of zero diverged from the serial symbol"
+        );
+
+        // ── attention: a larger LDS reservation ──
+        let n_heads = 2usize;
+        let n_kv_heads = 1usize;
+        let head_dim = 4usize;
+        let full_capacity = 8usize;
+        let position_start = 2usize;
+        let q_with_gate: Vec<f32> = (0..rows * n_heads * 2 * head_dim)
+            .map(|i| ((i * 29 % 173) as f32 - 86.0) / 173.0)
+            .collect();
+        let kv: Vec<f32> = (0..full_capacity * n_kv_heads * head_dim)
+            .map(|i| ((i * 41 % 211) as f32 - 105.0) / 211.0)
+            .collect();
+        let selected_tokens: Vec<i32> = vec![0, 1, 2, -1, -1, -1, -1, -1];
+        let q_with_gate_gpu = gpu
+            .upload_f32(&q_with_gate, &[q_with_gate.len()])
+            .expect("q upload");
+        let full_keys_gpu = gpu.upload_f32(&kv, &[kv.len()]).expect("keys upload");
+        let full_values_gpu = gpu.upload_f32(&kv, &[kv.len()]).expect("values upload");
+        let selected_gpu = gpu
+            .zeros(&[rows * capacity * std::mem::size_of::<i32>()], DType::Raw)
+            .expect("selected allocation");
+        let selected_bytes = selected_tokens
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect::<Vec<_>>();
+        gpu.hip
+            .memcpy_htod(&selected_gpu.buf, &selected_bytes)
+            .expect("selected upload");
+        let attention_run = |gpu: &mut Gpu, bound: usize| {
+            let output = gpu
+                .zeros(&[rows * n_heads * head_dim], DType::F32)
+                .expect("attention output allocation");
+            indexed_attention_attention_batch(
+                gpu,
+                &IndexedAttentionAttentionBatch {
+                    q_with_gate: &q_with_gate_gpu,
+                    full_keys: &full_keys_gpu,
+                    full_values: &full_values_gpu,
+                    selected: &selected_gpu,
+                    output: &output,
+                    rows,
+                    position_start,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    budget_blocks,
+                    compress,
+                    capacity,
+                    full_capacity,
+                    shape_selected: bound,
+                },
+            )
+            .expect("QSA attention");
+            let values = gpu.download_f32(&output).expect("attention download");
+            gpu.free_tensor(output).expect("free attention output");
+            values
+        };
+        let derived_selected = (position_start + rows).min(capacity);
+        assert_eq!(
+            attention_run(&mut gpu, capacity),
+            attention_run(&mut gpu, derived_selected),
+            "a larger attention LDS reservation changed the output"
+        );
+
+        gpu.free_tensor(raw_gpu).expect("free raw");
+        gpu.free_tensor(query_gpu).expect("free query");
+        gpu.free_tensor(pooled_gpu).expect("free pooled");
+        gpu.free_tensor(q_with_gate_gpu).expect("free q");
+        gpu.free_tensor(full_keys_gpu).expect("free keys");
+        gpu.free_tensor(full_values_gpu).expect("free values");
+        gpu.free_tensor(selected_gpu).expect("free selected");
     }
 
     #[test]

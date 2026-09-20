@@ -4079,6 +4079,14 @@ impl Gpu {
     /// block's `linear2` input assemble issued 2 × 4608 = 9216 tiny D2D
     /// memcpys per block, which is launch-latency bound, not bandwidth bound.
     ///
+    /// `dst_col_offset` may address a position past the first row (the kernel
+    /// computes `r * dst_row_stride + dst_col_offset + c` with no assumption
+    /// that the offset sits inside one row); only the resulting extent has to
+    /// fit the destination buffer. A caller that derives the offset from a
+    /// position passes it through `dst_col_offset_per_position` so the retained
+    /// recorder can declare it and replay can re-derive it from the replay
+    /// position instead of replaying a capture-position offset.
+    ///
     /// A `float4` fast path is taken automatically when `len`, both row
     /// strides and `dst_col_offset` are multiples of 4 and both device
     /// pointers are 16-byte aligned; every other shape falls back to the
@@ -4096,6 +4104,7 @@ impl Gpu {
         src_row_stride: usize,
         dst_row_stride: usize,
         dst_col_offset: usize,
+        dst_col_offset_per_position: Option<usize>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if src.dtype != DType::F32 || dst.dtype != DType::F32 {
@@ -4115,14 +4124,6 @@ impl Gpu {
                 0,
                 &format!(
                     "copy_rows_strided_f32: len {len} exceeds src_row_stride {src_row_stride}"
-                ),
-            ));
-        }
-        if dst_col_offset + len > dst_row_stride {
-            return Err(HipError::new(
-                0,
-                &format!(
-                    "copy_rows_strided_f32: dst_col_offset {dst_col_offset} + len {len} exceeds dst_row_stride {dst_row_stride}"
                 ),
             ));
         }
@@ -4184,16 +4185,37 @@ impl Gpu {
             .map_err(|_| HipError::new(0, "copy_rows_strided_f32: dst_col_offset exceeds i32"))?;
         let vec4_i = i32::from(aligned);
 
-        let mut params: Vec<*mut c_void> = vec![
-            &sp as *const _ as *mut c_void,
-            &dp as *const _ as *mut c_void,
-            &n_rows_i as *const _ as *mut c_void,
-            &len_i as *const _ as *mut c_void,
-            &ss_i as *const _ as *mut c_void,
-            &ds_i as *const _ as *mut c_void,
-            &dco_i as *const _ as *mut c_void,
-            &vec4_i as *const _ as *mut c_void,
-        ];
+        let mut blob = hip_bridge::KernargBlob::new();
+        blob.push_ptr(sp);
+        blob.push_ptr(dp);
+        blob.push_i32(n_rows_i);
+        blob.push_i32(len_i);
+        blob.push_i32(ss_i);
+        blob.push_i32(ds_i);
+        blob.push_i32(dco_i);
+        // The offset the scalar actually landed at, not a hand-counted layout
+        // constant. The kernel reads it as `i32`, so the declared product must
+        // stay inside `i32` for every replay position it can see.
+        let dco_offset = blob.len() - 4;
+        blob.push_i32(vec4_i);
+        blob.pad_to(16);
+        let dco_binding = match dst_col_offset_per_position {
+            None => None,
+            Some(factor) => {
+                let factor = u32::try_from(factor).map_err(|_| {
+                    HipError::new(
+                        0,
+                        "copy_rows_strided_f32: per-position offset factor exceeds u32",
+                    )
+                })?;
+                Some([crate::replay::ReplayKernargBinding::PositionMulU32 {
+                    offset: dco_offset,
+                    factor,
+                }])
+            }
+        };
+        let kernargs: &[crate::replay::ReplayKernargBinding] =
+            dco_binding.as_ref().map_or(&[], |bindings| &bindings[..]);
 
         const BLOCK: u32 = 256;
         let cols = if aligned { len / 4 } else { len };
@@ -4203,23 +4225,15 @@ impl Gpu {
         let grid_y = (n_rows as u32).min(65535);
         let bytes = n_rows * len * f32_sz * 2; // read + write
         let timer = crate::profile::begin_timer(&self.hip, KERNEL, KERNEL, bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_blob_recorded(
             KERNEL,
             [grid_x, grid_y, 1],
             [BLOCK, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut blob = hip_bridge::KernargBlob::new();
-                blob.push_ptr(sp);
-                blob.push_ptr(dp);
-                blob.push_i32(n_rows_i);
-                blob.push_i32(len_i);
-                blob.push_i32(ss_i);
-                blob.push_i32(ds_i);
-                blob.push_i32(dco_i);
-                blob.push_i32(vec4_i);
-                blob
+            blob.as_mut_slice(),
+            ReplayLaunchBindings {
+                grid: None,
+                kernargs,
             },
         );
         if let Some(t) = timer {

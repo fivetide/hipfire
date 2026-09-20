@@ -481,6 +481,11 @@ fn select_target(
                     block_count: visible / config.indexer_compress_ratio,
                     compress: config.indexer_compress_ratio,
                     index_dim: raw_width,
+                    position: Some(rdna_compute::tensor_ops::QsaPositionBinding {
+                        position_start: visible.saturating_sub(1),
+                        rows: 1,
+                    }),
+                    grid_bound: visible / config.indexer_compress_ratio,
                 },
             )
             .map_err(|e| e.to_string())?;
@@ -544,6 +549,11 @@ fn select_mtp(
                 block_count: visible / config.indexer_compress_ratio,
                 compress: config.indexer_compress_ratio,
                 index_dim: raw_width,
+                position: Some(rdna_compute::tensor_ops::QsaPositionBinding {
+                    position_start: visible.saturating_sub(1),
+                    rows: 1,
+                }),
+                grid_bound: visible / config.indexer_compress_ratio,
             },
         )
         .map_err(|e| e.to_string())?;
