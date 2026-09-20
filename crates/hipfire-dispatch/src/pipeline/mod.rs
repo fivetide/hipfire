@@ -408,8 +408,10 @@ fn slice_moe_f32_view(src: &GpuTensor, offset_elems: usize, len_elems: usize) ->
 ///
 /// When enabled, append the selected absolute-position row as a `u32` layer
 /// index followed by little-endian F32 values to `{prefix}.{tag}`.  The
-/// synchronous readback is intentionally refused by callers while graph
-/// capture is active; this helper preserves the existing opt-in diagnostics
+/// synchronous readback is refused while graph capture is active or while the
+/// retained body is being recorded or routed — a host sync and a D2H inside
+/// either window would break the tape — so the check lives here rather than in
+/// every caller. This helper preserves the existing opt-in diagnostics
 /// semantics and is otherwise allocation-free on the disabled path.
 #[allow(clippy::too_many_arguments)]
 pub fn dump_hidden_localize(
@@ -425,6 +427,11 @@ pub fn dump_hidden_localize(
         Ok(prefix) => prefix,
         Err(_) => return,
     };
+    // A readback cannot happen inside a window whose contents are being recorded
+    // or replayed, nor while a hipGraph is capturing.
+    if gpu.replay.retained_body_active() || gpu.graphs.capture_mode {
+        return;
+    }
     let target = hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN_POS")
         .ok()
         .and_then(|value| value.parse().ok())

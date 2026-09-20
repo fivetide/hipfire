@@ -2,10 +2,11 @@
 
 ## Status and purpose
 
-**Status: G1–G3 implemented and G4's scope fix (A2) landed on
-`feat/qwen38-flash-next` (branch-implemented, not certified).** The remaining
-decision is G4's admission contract (B1, with C2 for the census): until it lands, a
-Qwen4 tape cannot exist, so the census, parity, and route proof stay unreachable.
+**Status: G1–G3 implemented; G4's scope fix (A2) and the diagnostic census (C2)
+landed on `feat/qwen38-flash-next` (branch-implemented, not certified).** The
+census now runs and shows the tape is launch-complete and position-stable but
+*effect-incomplete*, so admission stays refused until the in-window effects are
+kernelised and the external input boundary is declared.
 
 This record is the tracking document for enabling Redline retained PM4 replay for
 Qwen3.8 Flash-Next (`hipfire-arch-qwen4`) **at the shared engine/dispatch level**,
@@ -106,7 +107,7 @@ formula). That is exactly what G2 makes declarable, and it is declared at the
 | G1 | Half the decode program never reaches the recorder: `tensor_ops.rs` was 31 wrappers, 31 raw `Gpu::launch_kernel_blob`, 0 funnel launches | `crates/rdna-compute` | **done** (branch-implemented) |
 | G2 | Binding vocabulary could not express a quotient/modulo of position, and declared bindings could not be attached to a launch | `crates/rdna-compute`, `hipfire-dispatch` | **done** (branch-implemented) |
 | G3 | Position-switched kernel symbol and dynamic shared memory in QSA (`complete > 0` conditional launch, grid growing with position) | engine (lowering) + a kernel contract decision | **decided + done** (branch-implemented; route arming deferred to the G4 hook) |
-| G4 | Sealed MoE "no retained-replay pointer contract" refusal: `route_policy` is `Some(Qt44Qt53Grouped)` for qwen4 decode | engine (dispatch) | **A2 landed** (scoped refusal + engine-side retained-body policy); B1 + C2 pending decision |
+| G4 | Sealed MoE "no retained-replay pointer contract" refusal: `route_policy` is `Some(Qt44Qt53Grouped)` for qwen4 decode | engine (dispatch) | **A2 + C2 landed** (scoped refusal, engine-side policy, diagnostic census); admission refused pending effect-completeness + B1 |
 
 ## G1 — recorder funnel coverage (done)
 
@@ -678,6 +679,66 @@ present) is knowable. This is recorded rather than half-built.
   path arms a window while admission is refused, so the guard is a backstop rather
   than a reachable refusal today.
 
+### Diagnostic capture and census (C2)
+
+`HIPFIRE_REPLAY_DIAGNOSTIC_SPECIALIZED_MOE_CAPTURE=1` lets the retained body be
+*recorded* while admission is refused, for measurement only: the hook closes the
+window, reports the census, and poisons, so no plan is ever installed and no
+forward routes. Any number it produces is discovery evidence, never route proof.
+
+Two fresh processes, `.mq4r` artifact, greedy, two different prompt lengths:
+
+```text
+[redline] qwen4 capture census: launched=2787 recorded=2787 unique_kernels=34 sequence_hash=a0c943b0e4046077 launch_count=2787
+[redline] qwen4 capture census: launch-complete
+[redline] qwen4 capture census: effects inside window — htod=2 dtod=13 dtoh=0 memset=48
+[redline] qwen4 capture census: effect-incomplete — 13 device copy(ies) and 48 memset(s) inside the window are state the tape cannot replay (kernelise them, or move them into the external boundary)
+```
+
+`launched` is an independent count from `hip_bridge::launch_counters` (every
+launch, funnel or raw), so the comparison is not the recorder grading itself.
+
+**What the census found.** Three things, only one of which was expected:
+
+1. **A recorder gap G1 missed.** The first run reconciled at 2786/2787: one kernel
+   per decode forward escaped the tape. The diagnostic named it by
+   loaded-kernel delta: `Gpu::add_f32` (`norm.rs`) was a raw launch while a
+   funnel-based twin (`add_f32_graph_safe`) existed for the same kernel. `add_f32`
+   is now the funnel path and the twin is gone (callers migrated), which moved the
+   census to 2787/2787 and changed the tape identity (34 unique kernels, new
+   sequence hash) — a silent one-launch-per-forward truncation that no test
+   covered.
+2. **Launch stability across positions.** Both runs, at different prompt lengths,
+   produced the same count, the same unique-kernel set and the same sequence hash:
+   the decode body's launch set and geometry are position-independent, which is the
+   discovery form of REDLINE §5 stage 5 and closes G3's last outstanding question.
+3. **The tape is launch-complete but effect-incomplete.** Per decode forward, the
+   window also contains 48 `memset`s (one `Step::Clear` per layer) and 13
+   device-to-device copies (one `selected_indices` copy per full-attention layer) —
+   device work that is not a kernel launch, so the recorder cannot replay it, plus
+   2 host→device uploads (token ids, PLE staging). `dtoh=0`, i.e. nothing reads
+   back inside the window. REDLINE §4 makes this decisive: *"Incomplete recorder
+   coverage is not a smaller valid tape unless every omitted launch belongs to a
+   named external adapter boundary and launch accounting reconciles exactly."*
+
+**Consequence: admission stays refused.** A route that replays a launch-complete
+tape while dropping 48 zeroings and 13 state copies per token is not the same
+computation, and the launch census alone would never have shown it. The remaining
+work is now specific:
+
+1. **Kernelise the in-window effects** so they are recorded dispatches: the layer
+   `Clear` needs a zeroing kernel reached through the funnel (multiply-by-zero is
+   not equivalent — NaN survives), and the `selected_indices` copy needs a recorded
+   raw/i32 copy kernel, or the select kernel should write that row directly.
+2. **Name the external input boundary.** The two H2D uploads must happen *before*
+   the retained submission on the replay path, so the capture window has to open
+   after them: a boundary declaration in the Qwen4 forward. REDLINE §3 assigns the
+   eligible-forward boundary to the model adapter, so this is a boundary marker,
+   not PM4 machinery — a refinement of this plan's "no Qwen4-side replay code"
+   rule, recorded here so it is a decision and not a drift.
+3. Only then re-run the census and take the B1 admission decision (table-contents
+   proof, mapping-identity pinning) with a tape that is effect-complete.
+
 ### Acceptance evidence per option
 
 - A2: a `.mq4r` Qwen4 serve with a replay backend armed loads, prefills, and
@@ -708,6 +769,7 @@ baseline (REDLINE gate 1), and it is also the A/B arm for the later census.
 | Ordinary HIP baseline | `HIPFIRE_REPLAY_BACKEND=hip` daemon probe: loads, generates (`PARIS`), commits | **passing** |
 | G4 A2 scope | armed-default `.mq4r` probe: serves on HIP, logs the refusal reason, stream identical to the HIP baseline | **passing** |
 | G4 A2 policy | `replay::tests::retained_body_scope_*`, `ar::route_scope_tests::retained_body_action_*` | **passing** |
+| G4 C2 census | `HIPFIRE_REPLAY_DIAGNOSTIC_SPECIALIZED_MOE_CAPTURE=1` + `.mq4r` probe: launched==recorded (2787/2787), identical hash across two prompt lengths, effect audit printed | **passing** (discovery evidence, not route proof) |
 | End-to-end census: recorded launches == compute launches | needs G4 | blocked by design |
 | Multi-position HIP vs recorded-blob vs PM4 parity | needs G3, G4 | blocked by design |
 | Serve health, stationary matched performance | REDLINE §7 gates 6–7 | blocked by design |
@@ -741,6 +803,13 @@ Append-only. One line per landed change with the commit hash once it exists.
 - 2026-09-20 — Default-path probe re-run after G1/G2: still the sealed-MoE
   preflight refusal, i.e. G4 remains the gate for any capture. Unchanged behavior
   is the expected result here, not a regression.
+- 2026-09-20 — **G4 C2 landed** (branch-implemented, uncertified): the
+  diagnostic capture + launch census + effect audit. It found a recorder gap G1
+  missed (`Gpu::add_f32` raw while a funnel twin existed for the same kernel; now
+  one funnel path, twin deleted, callers migrated), proved launch stability across
+  two prompt lengths, and quantified the effect gap that blocks admission (48
+  memsets + 13 D2D copies + 2 H2D per decode forward inside the window). Admission
+  remains refused; the three remaining work items are listed in the C2 section.
 - 2026-09-20 — **G4 A2 landed** (branch-implemented, uncertified) in
   `0c758739b`: the refusal is
   scoped to the retained body (`ReplayController::retained_body_active()` plus one

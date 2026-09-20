@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Retained capture now has a diagnostic census for the Qwen4 declarative program
+  (`HIPFIRE_REPLAY_DIAGNOSTIC_SPECIALIZED_MOE_CAPTURE=1`, measurement only: it never
+  installs a plan and never routes). It reconciles the retained tape against an
+  independent `hip_bridge` launch count, audits non-launch effects inside the
+  capture window, and names any kernel that escaped the recorder. First use found
+  one such launch (`Gpu::add_f32` was raw while a funnel-based twin existed for the
+  same kernel — now a single funnel path with the twin deleted and its callers
+  migrated), proved the decode body's launch set position-stable across prompt
+  lengths, and quantified the remaining admission blocker: per decode forward the
+  window still contains 48 layer memsets, 13 device-to-device state copies and 2
+  host uploads, none of which a launch tape replays. Admission therefore stays
+  refused. See [the plan record](docs/design/qwen4-program-retained-pm4.md).
 - Retained replay no longer refuses the *whole model* when a family's MoE route has no
   admitted pointer contract: the specialized sealed-MoE guard is now scoped to the
   retained body (`is_recording()` or a routed plan), so prefill, ineligible forwards,

@@ -1107,6 +1107,18 @@ impl Gpu {
         self.last_kernel.as_deref()
     }
 
+    /// Every kernel name currently loaded on this device, sorted.
+    ///
+    /// Diagnostic only: a retained-capture census uses it to name the kernels a
+    /// model actually loaded, so a launch that never reached the recorder can be
+    /// identified by set difference against the recorded tape instead of by
+    /// guessing at call sites.
+    pub fn loaded_kernel_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.functions.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     /// Build the timeout error directly (no device call). Split out so the
     /// message is unit-testable on CPU-only hosts where the blocking-sync
     /// path cannot be driven.

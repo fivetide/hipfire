@@ -5939,8 +5939,10 @@ pub enum RetainedBodyAction {
     /// Eligible, and the family's route cannot be retained: poison with this
     /// reason and run this forward on HIP.
     Refuse { reason: &'static str },
-    /// Open the capture window for this eligible forward.
-    Arm,
+    /// Open the capture window for this eligible forward. `diagnostic` marks a
+    /// measurement-only capture: the tape may be observed, but no plan may be
+    /// installed and no later forward may route.
+    Arm { diagnostic: bool },
     /// Submit the prepared plan; the HIP body must not run.
     Route,
 }
@@ -5953,8 +5955,9 @@ pub enum RetainedBodyAction {
 pub fn retained_body_action(
     eligible: bool,
     state: rdna_compute::replay::ReplayState,
-    admission: Result<(), &'static str>,
+    admission: hipfire_dispatch::pipeline::sealed_moe::SpecializedRouteAdmission,
 ) -> RetainedBodyAction {
+    use hipfire_dispatch::pipeline::sealed_moe::SpecializedRouteAdmission;
     use rdna_compute::replay::ReplayState;
 
     if !eligible {
@@ -5966,8 +5969,11 @@ pub fn retained_body_action(
         ReplayState::Hip | ReplayState::Fallback => RetainedBodyAction::Ineligible,
         ReplayState::Ready => RetainedBodyAction::Route,
         ReplayState::Armed => match admission {
-            Ok(()) => RetainedBodyAction::Arm,
-            Err(reason) => RetainedBodyAction::Refuse { reason },
+            SpecializedRouteAdmission::Admitted => RetainedBodyAction::Arm { diagnostic: false },
+            SpecializedRouteAdmission::DiagnosticCapture => {
+                RetainedBodyAction::Arm { diagnostic: true }
+            }
+            SpecializedRouteAdmission::Refused { reason } => RetainedBodyAction::Refuse { reason },
         },
         // A window is already open (the body records itself), and a captured but
         // unprepared tape routes nothing yet.
@@ -5993,7 +5999,10 @@ mod route_scope_tests {
 
     #[test]
     fn retained_body_action_keeps_hip_for_every_non_eligible_or_refused_forward() {
+        use hipfire_dispatch::pipeline::sealed_moe::SpecializedRouteAdmission;
         use rdna_compute::replay::ReplayState;
+
+        let admitted = SpecializedRouteAdmission::Admitted;
 
         // Not the eligible forward: prefill, spec/MTP, batch — whatever the
         // backend state, these run on HIP and neither record nor route.
@@ -6007,7 +6016,7 @@ mod route_scope_tests {
             ReplayState::Fallback,
         ] {
             assert_eq!(
-                retained_body_action(false, state, Ok(())),
+                retained_body_action(false, state, admitted),
                 RetainedBodyAction::Ineligible,
                 "ineligible forward must run on HIP in {state:?}"
             );
@@ -6016,28 +6025,51 @@ mod route_scope_tests {
         // A refused route must never arm a capture: this is what keeps an
         // unadmitted route from turning every decode into a failing forward.
         assert_eq!(
-            retained_body_action(true, ReplayState::Armed, Err("no pointer contract")),
+            retained_body_action(
+                true,
+                ReplayState::Armed,
+                SpecializedRouteAdmission::Refused {
+                    reason: "no pointer contract"
+                }
+            ),
             RetainedBodyAction::Refuse {
                 reason: "no pointer contract"
             }
         );
         // With admission, the eligible forward opens the capture window.
         assert_eq!(
-            retained_body_action(true, ReplayState::Armed, Ok(())),
-            RetainedBodyAction::Arm
+            retained_body_action(true, ReplayState::Armed, admitted),
+            RetainedBodyAction::Arm { diagnostic: false }
         );
-        // An already-poisoned route keeps generating on HIP.
+        // The diagnostic capture opens the same window, marked measurement-only.
         assert_eq!(
-            retained_body_action(true, ReplayState::Fallback, Err("no pointer contract")),
+            retained_body_action(
+                true,
+                ReplayState::Armed,
+                SpecializedRouteAdmission::DiagnosticCapture
+            ),
+            RetainedBodyAction::Arm { diagnostic: true }
+        );
+        // An already-poisoned route keeps generating on HIP either way.
+        assert_eq!(
+            retained_body_action(
+                true,
+                ReplayState::Fallback,
+                SpecializedRouteAdmission::Refused { reason: "x" }
+            ),
             RetainedBodyAction::Ineligible
         );
         assert_eq!(
-            retained_body_action(true, ReplayState::Hip, Err("no pointer contract")),
+            retained_body_action(
+                true,
+                ReplayState::Hip,
+                SpecializedRouteAdmission::Refused { reason: "x" }
+            ),
             RetainedBodyAction::Ineligible
         );
         // Only a prepared plan routes, and it must not run the HIP body.
         assert_eq!(
-            retained_body_action(true, ReplayState::Ready, Ok(())),
+            retained_body_action(true, ReplayState::Ready, admitted),
             RetainedBodyAction::Route
         );
     }

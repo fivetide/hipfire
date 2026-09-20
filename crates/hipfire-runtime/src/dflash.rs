@@ -2595,7 +2595,7 @@ fn draft_ffn_layer(
         scratch.mq_x_rot_f16.as_ref(),
     )?;
     if graph_safe {
-        gpu.add_f32_graph_safe(&scratch.residual, &scratch.x, &scratch.x)
+        gpu.add_f32(&scratch.residual, &scratch.x, &scratch.x)
     } else {
         gpu.add_f32(&scratch.residual, &scratch.x, &scratch.x)
     }

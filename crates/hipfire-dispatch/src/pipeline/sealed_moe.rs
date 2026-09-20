@@ -25,25 +25,52 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const DEVICE_POINTER_BYTES: usize = 8;
 
+/// Admission of a specialized (route-policy) sealed MoE route to a retained body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpecializedRouteAdmission {
+    /// The route may be recorded *and* prepared for a retained body.
+    Admitted,
+    /// A non-default diagnostic capture is requested: the route may be recorded so
+    /// the launch census and tape stability can be observed, but no plan may be
+    /// installed and no forward may route.
+    DiagnosticCapture,
+    /// No contract: the retained body is refused and the model runs on HIP.
+    Refused { reason: &'static str },
+}
+
 /// Admission rule for letting a specialized (route-policy) sealed MoE route enter
 /// a retained body.
 ///
-/// The route may be recorded only once its pointer contract is stated *and*
+/// The route may be admitted only once its pointer contract is stated *and*
 /// enforced: expert pointer-table contents proved against the live expert
 /// tensors, a pointer-mapping identity pinned into the plan, and the lifetime
-/// hazards named (lazily allocated FWHT sign tables, in-route diagnostic
-/// readback, plan-invalidation triggers). Until then this is the single place that
-/// says so — the launch guard refuses the retained body with this reason, and the
-/// engine-side arming hook reads the same answer instead of starting a capture the
-/// route will refuse, so both decisions cannot drift apart.
+/// rules named (sign tables, in-route diagnostic readback, plan invalidation).
+/// Until then this is the single place that says so — the launch guard refuses the
+/// retained body with this reason, and the engine-side arming hook reads the same
+/// answer instead of starting a capture the route will refuse, so both decisions
+/// cannot drift apart.
 ///
+/// `HIPFIRE_REPLAY_DIAGNOSTIC_SPECIALIZED_MOE_CAPTURE=1` is the one exception, and
+/// it is measurement only: it may not install a plan, may not route a forward, and
+/// any number it produces is discovery evidence, never route proof — the posture
+/// `HIPFIRE_REPLAY_MANUAL_CAPTURE` already has (docs/REDLINE.md §5 stage 5).
 /// Evidence and the option analysis live in
 /// `docs/design/qwen4-program-retained-pm4.md` § G4 (options B1/C2).
-pub fn specialized_sealed_moe_retained_admission() -> Result<(), &'static str> {
-    Err(
-        "specialized sealed MoE has no retained-replay pointer contract; refusing the retained body \
-         (the model runs on HIP)",
-    )
+pub fn specialized_sealed_moe_retained_admission() -> SpecializedRouteAdmission {
+    if diagnostic_specialized_capture_requested() {
+        return SpecializedRouteAdmission::DiagnosticCapture;
+    }
+    SpecializedRouteAdmission::Refused {
+        reason: "specialized sealed MoE has no retained-replay pointer contract; refusing the \
+                 retained body (the model runs on HIP)",
+    }
+}
+
+/// Non-default diagnostic capture for a specialized route (see
+/// [`specialized_sealed_moe_retained_admission`]).
+fn diagnostic_specialized_capture_requested() -> bool {
+    hipfire_config::process_value("HIPFIRE_REPLAY_DIAGNOSTIC_SPECIALIZED_MOE_CAPTURE")
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
 }
 
 /// Grouped-GEMM rows are emitted in fixed-width tiles. Keep this tied to the
@@ -1859,7 +1886,9 @@ impl<'a> SealedMoeCall<'a> {
         // model unservable. `docs/REDLINE.md` §3 keeps prefill out of the tape and
         // defines the poisoned route as a HIP fallback.
         if specialized_route && gpu.replay.retained_body_active() {
-            if let Err(reason) = specialized_sealed_moe_retained_admission() {
+            if let SpecializedRouteAdmission::Refused { reason } =
+                specialized_sealed_moe_retained_admission()
+            {
                 return Err(invalid(reason));
             }
         }

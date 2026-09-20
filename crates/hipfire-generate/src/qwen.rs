@@ -7815,9 +7815,30 @@ pub fn generate_qwen4_ar(
             device.replay.set_forward_eligible(true);
             let admission =
                 hipfire_dispatch::pipeline::sealed_moe::specialized_sealed_moe_retained_admission();
+            let mut diagnostic_capture = false;
+            let mut launched_before = 0u64;
+            let mut loaded_before: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            let mut effects_before = (0u64, 0u64, 0u64, 0u64);
             match crate::ar::retained_body_action(true, device.replay.state(), admission) {
                 crate::ar::RetainedBodyAction::Ineligible => {}
-                crate::ar::RetainedBodyAction::Arm => {
+                crate::ar::RetainedBodyAction::Arm { diagnostic } => {
+                    diagnostic_capture = diagnostic;
+                    // Independent count of every kernel launch (funnel or raw) so
+                    // the capture census can reconcile the tape against them, plus
+                    // the loaded-kernel set so a launch that escapes the recorder
+                    // can be named by difference instead of by call-site hunting.
+                    launched_before = hip_bridge::launch_counters::launch_kernel::count();
+                    loaded_before = device.loaded_kernel_names().into_iter().collect();
+                    // Non-launch effects the tape cannot replay. A device copy or a
+                    // memset inside the window is invisible to the launch census, so
+                    // it is counted separately (see the effect verdict below).
+                    effects_before = (
+                        hip_bridge::launch_counters::memcpy_htod::count(),
+                        hip_bridge::launch_counters::memcpy_dtod::count(),
+                        hip_bridge::launch_counters::memcpy_dtoh::count(),
+                        hip_bridge::launch_counters::memset::count(),
+                    );
                     if let Err(reason) = device.replay.begin_auto_capture_if_armed() {
                         device.replay.poison(reason);
                         eprintln!("[redline] qwen4 capture could not start: {reason}");
@@ -7848,6 +7869,101 @@ pub fn generate_qwen4_ar(
                         .forward_token(device, token, logits, None)
                         .map_err(|error| error.to_string())
                 });
+            if device.replay.should_auto_finalize_capture() {
+                // Close the window and report the census, then refuse to install a
+                // plan: routing is not implemented for this family, and a
+                // diagnostic capture must never install one.
+                let launched = hip_bridge::launch_counters::launch_kernel::count();
+                if let Err(reason) = device.hip.device_synchronize() {
+                    device
+                        .replay
+                        .poison(format!("qwen4 capture sync failed: {reason:?}"));
+                    eprintln!("[redline] qwen4 capture sync failed: {reason:?}");
+                } else if let Err(reason) = device.replay.finish_capture() {
+                    device.replay.poison(reason);
+                    eprintln!("[redline] qwen4 capture could not be closed: {reason}");
+                } else {
+                    let summary = device.replay.capture_summary();
+                    let effects = (
+                        hip_bridge::launch_counters::memcpy_htod::count()
+                            .saturating_sub(effects_before.0),
+                        hip_bridge::launch_counters::memcpy_dtod::count()
+                            .saturating_sub(effects_before.1),
+                        hip_bridge::launch_counters::memcpy_dtoh::count()
+                            .saturating_sub(effects_before.2),
+                        hip_bridge::launch_counters::memset::count()
+                            .saturating_sub(effects_before.3),
+                    );
+                    let recorded = summary.launch_count;
+                    let launched_delta = launched.saturating_sub(launched_before) as usize;
+                    eprintln!(
+                        "[redline] qwen4 capture census: launched={launched_delta} \
+                         recorded={recorded} unique_kernels={} sequence_hash={:016x} \
+                         launch_count={}",
+                        summary.unique_kernel_count, summary.sequence_hash, summary.launch_count
+                    );
+                    if launched_delta != recorded {
+                        eprintln!(
+                            "[redline] qwen4 capture census: MISMATCH — {} launch(es) never reached \
+                             the recorder (#397-style truncated tape)",
+                            launched_delta.abs_diff(recorded)
+                        );
+                        // Name the escapee: kernels first loaded *inside* the window
+                        // that the tape never recorded. Pre-existing (prefill) loads
+                        // are excluded by the delta, so this is exact.
+                        let recorded_names: std::collections::BTreeSet<String> = device
+                            .replay
+                            .recorded_launches()
+                            .iter()
+                            .map(|launch| launch.kernel.clone())
+                            .collect();
+                        let unrecorded: Vec<String> = device
+                            .loaded_kernel_names()
+                            .into_iter()
+                            .filter(|name| {
+                                !loaded_before.contains(name) && !recorded_names.contains(name)
+                            })
+                            .collect();
+                        eprintln!(
+                            "[redline] qwen4 capture census: launched-inside-window-but-unrecorded = \
+                             {unrecorded:?}"
+                        );
+                    } else {
+                        eprintln!("[redline] qwen4 capture census: launch-complete");
+                    }
+                    // Effects: a readback is never allowed inside the window; a
+                    // device copy or memset inside it is state the tape does not
+                    // replay; an H2D is the external input boundary and must happen
+                    // before the retained submission on the replay path.
+                    eprintln!(
+                        "[redline] qwen4 capture census: effects inside window — htod={} \
+                         dtod={} dtoh={} memset={}",
+                        effects.0, effects.1, effects.2, effects.3
+                    );
+                    if effects.2 > 0 {
+                        eprintln!(
+                            "[redline] qwen4 capture census: D2H INSIDE the window — a readback \
+                             cannot belong to a retained body"
+                        );
+                    }
+                    if effects.1 > 0 || effects.3 > 0 {
+                        eprintln!(
+                            "[redline] qwen4 capture census: effect-incomplete — {} device copy(ies) \
+                             and {} memset(s) inside the window are state the tape cannot replay \
+                             (kernelise them, or move them into the external boundary)",
+                            effects.1, effects.3
+                        );
+                    }
+                    let reason = if diagnostic_capture {
+                        "diagnostic specialized-MoE capture only; no plan installed (the model runs \
+                         on HIP)"
+                    } else {
+                        "qwen4 retained-body prepare is not implemented"
+                    };
+                    device.replay.poison(reason);
+                    eprintln!("[redline] qwen4: {reason}");
+                }
+            }
             // A capture window that failed inside the body must not keep failing
             // every following forward: the failure poisons the route, and later
             // forwards fall back to HIP.

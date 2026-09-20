@@ -270,11 +270,15 @@ impl Gpu {
         result
     }
 
-    /// c = a + b (element-wise)
+    /// `c = a + b`, element-wise.
+    ///
+    /// Launched through the shared dispatch funnel so the kernarg pointers survive
+    /// stream capture and the launch reaches the retained recorder. The funnel
+    /// falls back to the ordinary `kernelParams` launch when nothing is capturing
+    /// or recording, so this is the plain path in the steady state.
     pub fn add_f32(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("add", kernels::ADD_SRC, "add_f32")?;
-        let func = &self.functions["add_f32"];
 
         let n = a.numel() as i32;
         let mut a_ptr = a.buf.as_ptr();
@@ -290,39 +294,7 @@ impl Gpu {
         ];
 
         let block = 256u32;
-        let grid = ((n as u32) + block - 1) / block;
-        unsafe {
-            self.hip
-                .launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params)
-        }
-    }
-
-    /// HIP-graphs-safe variant of `add_f32`. Uses `launch_maybe_blob` instead of
-    /// raw `launch_kernel` so kernarg pointers survive stream capture.
-    pub fn add_f32_graph_safe(
-        &mut self,
-        a: &GpuTensor,
-        b: &GpuTensor,
-        c: &GpuTensor,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_kernel("add", kernels::ADD_SRC, "add_f32")?;
-
-        let n = a.numel() as i32;
-        let mut a_ptr = a.buf.as_ptr();
-        let mut b_ptr = b.buf.as_ptr();
-        let mut c_ptr = c.buf.as_ptr();
-        let mut n_val = n;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut b_ptr as *mut _ as *mut c_void,
-            &mut c_ptr as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
-        ];
-
-        let block = 256u32;
-        let grid = ((n as u32) + block - 1) / block;
+        let grid = (n as u32).div_ceil(block);
         self.launch_maybe_blob(
             "add_f32",
             [grid, 1, 1],
@@ -330,12 +302,12 @@ impl Gpu {
             0,
             &mut params,
             || {
-                let mut bb = hip_bridge::KernargBlob::new();
-                bb.push_ptr(a_ptr);
-                bb.push_ptr(b_ptr);
-                bb.push_ptr(c_ptr);
-                bb.push_i32(n_val);
-                bb
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(a_ptr);
+                blob.push_ptr(b_ptr);
+                blob.push_ptr(c_ptr);
+                blob.push_i32(n_val);
+                blob
             },
         )
     }
