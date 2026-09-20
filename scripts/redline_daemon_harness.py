@@ -193,6 +193,23 @@ def qwen4_shadow_failures(shadow):
         )
     else:
         failures.extend(qwen4_row_failures(row, "blob.recorded_hip"))
+
+    failure = shadow.get("failure_behavior") or {}
+    if not failure:
+        failures.append("failure_behavior missing")
+    else:
+        if not failure.get("route_poisoned"):
+            failures.append("induced replay failure did not poison the route")
+        if "exceeds prepared max_position" not in (failure.get("error") or ""):
+            failures.append(
+                f"induced failure did not surface the plan's refusal: {failure.get('error')!r}"
+            )
+        if not failure.get("fallback_reason"):
+            failures.append("poisoned route has no fallback reason")
+        if not failure.get("recovery_uses_hip"):
+            failures.append("recovery forward is not on HIP")
+        if not failure.get("recovered_bit_exact_against_clean_hip"):
+            failures.append("recovery forward is not bit-exact against clean HIP")
     return failures
 
 
