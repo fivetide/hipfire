@@ -70,6 +70,64 @@ fn diagnostic_specialized_capture_requested() -> bool {
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
 }
 
+/// What a model adapter's eligible-forward boundary must do with the retained
+/// body on one forward.
+///
+/// The policy lives next to the admission rule so the launch guard, the arming
+/// boundary and the engine-side policy cannot drift apart: the retained body is the
+/// *eligible* forward only (a plain single-token continuation), and a route whose
+/// pointer contract is not admitted is refused up front instead of arming a capture
+/// the route would refuse on every token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetainedBodyAction {
+    /// Not the eligible forward, or nothing to do: runs on HIP, records nothing and
+    /// routes nothing.
+    Ineligible,
+    /// Eligible, and the route cannot be retained: poison with this reason and run
+    /// this forward on HIP.
+    Refuse { reason: &'static str },
+    /// Open the capture window for this eligible forward. `diagnostic` marks a
+    /// measurement-only capture: the tape may be observed, but no plan may be
+    /// installed and no later forward may route.
+    Arm { diagnostic: bool },
+    /// Submit the prepared plan; the HIP body must not run.
+    Route,
+}
+
+/// Decide the retained-body action for one eligible-forward boundary.
+///
+/// `admission` is [`specialized_sealed_moe_retained_admission`]'s answer for the
+/// route the forward is about to run.
+pub fn retained_body_action(
+    eligible: bool,
+    state: rdna_compute::replay::ReplayState,
+    admission: SpecializedRouteAdmission,
+) -> RetainedBodyAction {
+    use rdna_compute::replay::ReplayState;
+
+    if !eligible {
+        return RetainedBodyAction::Ineligible;
+    }
+    match state {
+        // Nothing to do: either the backend is off, or the route already fell back
+        // and this forward belongs to HIP.
+        ReplayState::Hip | ReplayState::Fallback => RetainedBodyAction::Ineligible,
+        ReplayState::Ready => RetainedBodyAction::Route,
+        ReplayState::Armed => match admission {
+            SpecializedRouteAdmission::Admitted => RetainedBodyAction::Arm { diagnostic: false },
+            SpecializedRouteAdmission::DiagnosticCapture => {
+                RetainedBodyAction::Arm { diagnostic: true }
+            }
+            SpecializedRouteAdmission::Refused { reason } => RetainedBodyAction::Refuse { reason },
+        },
+        // A window is already open (the body records itself), and a captured but
+        // unprepared tape routes nothing yet.
+        ReplayState::RecordingWarmup | ReplayState::Captured | ReplayState::ShadowValidated => {
+            RetainedBodyAction::Ineligible
+        }
+    }
+}
+
 /// Grouped-GEMM rows are emitted in fixed-width tiles. Keep this tied to the
 /// dispatch implementation in `pipeline::mod` rather than letting callers
 /// choose a second alignment policy.

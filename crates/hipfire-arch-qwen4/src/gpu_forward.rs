@@ -33,6 +33,9 @@ use hipfire_dispatch::families::moe::{
     MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoeRecipe, MoeRouteCapability,
     MoeRoutePolicy, MoeSharedDecode, MoeSharedDtypes, MoeSharedWeights, RoutedExpertWeights,
 };
+use hipfire_dispatch::pipeline::sealed_moe::{
+    retained_body_action, specialized_sealed_moe_retained_admission, RetainedBodyAction,
+};
 use hipfire_dispatch::pipeline::{
     execute_steps, execute_validated_steps, seal_decode, validate_steps, BoundMoeExperts, ClearOp,
     ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources, ExpertTable,
@@ -2137,6 +2140,12 @@ impl Qwen4GpuForward {
         let mut ple = PleEpochGuard::new(ple_rows_resource, ple_epoch);
         let next_history = bundle.state.ple_history;
         let next_position = bundle.state.position;
+        // Boundary samples, hoisted so the post-body finalize outside this closure
+        // can report them: they are taken where the window opens, which is what
+        // makes the census an exact bracket of one recorded body.
+        let mut diagnostic_capture = false;
+        let mut launched_before = 0u64;
+        let mut effects_before = (0u64, 0u64, 0u64, 0u64);
         let attempt = (|| -> Result<
             SmallVec<[(usize, usize, usize, usize, usize, usize); QWEN4_QSA_INLINE_CAPACITY]>,
             Qwen4GpuForwardError,
@@ -2212,14 +2221,42 @@ impl Qwen4GpuForward {
             // Everything above materialises this forward's inputs — token ids,
             // embeddings, HC stream init, and the PLE staging/upload/gather — and
             // stays outside a retained tape, so it runs on both the HIP path and a
-            // replay. Everything below is the body the tape covers.
+            // replay. Everything below is the body the tape covers, and this
+            // boundary owns the whole per-forward retained-body lifecycle (arm,
+            // route, close, prepare) so any driver — the generation loop, a
+            // benchmark carrier — leaves the controller in a defined state.
+            //
             // Eligible only for a plain single-token continuation: the wide-hidden
             // capture is the speculative-verify shape and must never enter the tape.
-            gpu.replay
-                .set_forward_eligible(n == 1 && wide_hidden_capture.is_none());
-            gpu.replay
-                .begin_auto_capture_if_armed()
-                .map_err(|reason| invalid(reason))?;
+            let eligible = n == 1 && wide_hidden_capture.is_none();
+            gpu.replay.set_forward_eligible(eligible);
+            match retained_body_action(
+                eligible,
+                gpu.replay.state(),
+                specialized_sealed_moe_retained_admission(),
+            ) {
+                RetainedBodyAction::Ineligible => {}
+                RetainedBodyAction::Refuse { reason } => {
+                    // The route cannot be retained: poison before the body so this
+                    // and every later forward runs on HIP.
+                    gpu.replay.poison(reason);
+                    eprintln!("[redline] qwen4 retained body unavailable: {reason}");
+                }
+                RetainedBodyAction::Arm { diagnostic } => {
+                    diagnostic_capture = diagnostic;
+                    launched_before = hip_bridge::launch_counters::launch_kernel::count();
+                    effects_before = (
+                        hip_bridge::launch_counters::memcpy_htod::count(),
+                        hip_bridge::launch_counters::memcpy_dtod::count(),
+                        hip_bridge::launch_counters::memcpy_dtoh::count(),
+                        hip_bridge::launch_counters::memset::count(),
+                    );
+                    gpu.replay
+                        .begin_auto_capture_if_armed()
+                        .map_err(|reason| invalid(reason))?;
+                }
+                RetainedBodyAction::Route => {}
+            }
             let routed = if gpu.replay.should_route_pm4() {
                 // SAFETY: the boundary above staged every host input the tape's
                 // recorded launches read, and every pointer in the tape is owned by
@@ -2388,14 +2425,115 @@ impl Qwen4GpuForward {
                 bundle.state.position = next_position
                     .checked_add(n)
                     .ok_or_else(|| invalid("Qwen4 forward position overflows at commit"))?;
+                // Close the retained window this forward opened, report the census
+                // and install (or refuse) the prepared plan. This is the only place
+                // that knows both ends of one recorded body, so the window can never
+                // outlive the forward that opened it.
+                if gpu.replay.should_auto_finalize_capture() {
+                    finish_qwen4_capture(gpu, diagnostic_capture, launched_before, effects_before);
+                }
                 Ok(())
             }
-            Err(error) => match ple.abort() {
-                Ok(_) => Err(error),
-                Err(cleanup) => Err(Qwen4GpuForwardError::Ple(format!(
-                    "forward attempt failed: {error}; PLE cleanup failed: {cleanup}"
-                ))),
-            },
+            Err(error) => {
+                if gpu.replay.is_recording() {
+                    // A capture window that failed inside the body must not keep
+                    // failing every later forward.
+                    gpu.replay
+                        .poison("qwen4 capture failed; later forwards fall back to HIP");
+                    eprintln!("[redline] qwen4 capture failed; later forwards fall back to HIP");
+                }
+                match ple.abort() {
+                    Ok(_) => Err(error),
+                    Err(cleanup) => Err(Qwen4GpuForwardError::Ple(format!(
+                        "forward attempt failed: {error}; PLE cleanup failed: {cleanup}"
+                    ))),
+                }
+            }
+        }
+    }
+}
+
+/// Close a recorded Qwen4 body: census, then install the prepared plan, or refuse
+/// it for a measurement-only capture.
+///
+/// Prepare failure after a successful HIP warmup poisons the route (sticky
+/// fallback) rather than failing the request that already produced output.
+fn finish_qwen4_capture(
+    gpu: &mut Gpu,
+    diagnostic_capture: bool,
+    launched_before: u64,
+    effects_before: (u64, u64, u64, u64),
+) {
+    let launched = hip_bridge::launch_counters::launch_kernel::count();
+    let effects = (
+        hip_bridge::launch_counters::memcpy_htod::count().saturating_sub(effects_before.0),
+        hip_bridge::launch_counters::memcpy_dtod::count().saturating_sub(effects_before.1),
+        hip_bridge::launch_counters::memcpy_dtoh::count().saturating_sub(effects_before.2),
+        hip_bridge::launch_counters::memset::count().saturating_sub(effects_before.3),
+    );
+    let summary = gpu.replay.capture_summary();
+    let recorded = summary.launch_count;
+    let computed = launched.saturating_sub(launched_before) as usize;
+    eprintln!(
+        "[redline] qwen4 capture census: computed={computed} recorded={recorded} \
+         unique_kernels={} sequence_hash={:016x}",
+        summary.unique_kernel_count, summary.sequence_hash
+    );
+    eprintln!(
+        "[redline] qwen4 capture census: effects inside window — htod={} dtod={} dtoh={} memset={}",
+        effects.0, effects.1, effects.2, effects.3
+    );
+    if computed != recorded {
+        eprintln!(
+            "[redline] qwen4 capture census: MISMATCH — {computed} launched, {recorded} recorded \
+             (#397-style truncated tape)"
+        );
+    }
+    if effects.1 > 0 || effects.2 > 0 || effects.3 > 0 {
+        eprintln!(
+            "[redline] qwen4 capture census: effect-incomplete — {} device copy(ies), {} readback(s) \
+             and {} memset(s) inside the window are state the tape cannot replay",
+            effects.1, effects.2, effects.3
+        );
+    }
+    if diagnostic_capture {
+        let reason =
+            "diagnostic specialized-MoE capture only; no plan installed (the model runs on \
+                      HIP)";
+        gpu.replay.poison(reason);
+        eprintln!("[redline] qwen4: {reason}");
+        return;
+    }
+    if let Err(reason) = gpu.hip.device_synchronize() {
+        let reason = format!("qwen4 capture sync failed: {reason:?}");
+        gpu.replay.poison(reason.clone());
+        eprintln!("[redline] qwen4 capture could not be closed or prepared: {reason}");
+        return;
+    }
+    if let Err(reason) = gpu.replay.finish_capture() {
+        gpu.replay.poison(reason);
+        eprintln!("[redline] qwen4 capture could not be closed or prepared: {reason}");
+        return;
+    }
+    let launches = gpu.replay.recorded_launches().len();
+    let prepared = if gpu.replay.uses_pm4_transport() {
+        gpu.replay
+            .prepare_pm4_prefix(gpu.device_id as usize, launches)
+            .map(|_| ())
+    } else {
+        gpu.replay
+            .prepare_linear_aql(gpu.device_id as usize)
+            .map(|_| ())
+    };
+    match prepared {
+        Ok(()) => eprintln!(
+            "[redline] qwen4 retained body prepared: transport={} dispatches={launches}",
+            gpu.replay.transport_name()
+        ),
+        Err(reason) => {
+            let reason = format!("Redline prepare after warmup failed: {reason}");
+            gpu.replay.poison(reason.clone());
+            eprintln!("[redline] falling back to HIP: {reason}");
         }
     }
 }
