@@ -195,35 +195,204 @@ declared binding, not a smarter heuristic.
 **Not yet evidenced.** Nothing here has been through PM4 preparation, because a
 Qwen4 tape cannot yet be captured or prepared (G3/G4).
 
-## G3 — open decision: QSA geometry and shared memory
+## G3 — open decision: QSA geometry, shared memory, and position fields
 
-Not started. The decision is *how* to make these replay-stable, not whether:
+**Status: analysis complete, decision not taken.** No code changed. This section
+is the decision record; the weights below are source-derived for the admitted
+geometry and *unmeasured* for cost — the measurement plan is at the end.
 
-- `indexed_attention_pool_rope` is launched only when `complete > 0`, and its grid
-  x is `complete = final_position / compress` — a launch that appears, then grows.
-  REDLINE records a flat order-preserving tape, so a conditionally-present
-  dispatch has no representation; a recorded grid is a hard maximum that may only
-  be narrowed.
-- `indexed_attention_select_*` and `indexed_attention_attention_*` choose kernel
-  symbol *and* dynamic shared memory from position-derived lengths
-  (`block_count`, `max_selected`). REDLINE §4/§7-stage-7 requires a
-  "replay-stable fixed/tiled design" for a changing block/shared-memory shape.
+### The problem, precisely
 
-Candidate directions to evaluate (choose one, record why):
+The Qwen4 QSA step lowers ~13 launches per full-attention layer. Retained replay
+requires a fixed launch sequence (no conditional presence), a fixed symbol, a
+fixed block and shared-memory size, a grid that is fixed or only narrows from a
+recorded maximum, and every position-derived field either absent or declared.
+Four properties of the QSA step violate that, and one of them fails *silently*:
 
-1. Capacity-bounded geometry: launch over the declared capacity, pass live lengths
-   as scalars, keep one symbol and one static shared-memory size. Requires kernel
-   contracts to mask correctly and a non-replay perf measurement.
-2. Always-serial shape: force the `_serial` variant (shared memory 0) whenever
-   replay is enabled. Simplest, likely slowest; must be measured against HIP.
-3. Position-regime tapes: prepare a small set of tapes keyed by the position
-   predicate. Must justify why this is not "capture-time shape replayed at a new
-   context" (REDLINE §10 failure atlas).
+**P1 — the pool launch appears and grows.** `indexed_attention_pool_rope_f32` is
+launched only when `block_count > 0` (`layer_ops.rs`), and its `grid.x` is that
+position-derived count. The kernel itself is mask-safe (`if (block >= block_count
+|| compress <= 0) return;` precedes every read, `kernels/src/tensor_ops.hip`), so
+an oversized grid is legal; the wrapper rejects `block_count == 0`
+(`crates/rdna-compute/src/tensor_ops.rs`). The count is
+`complete = (position + rows) / compress`, monotone non-decreasing, so the
+condition flips exactly once, at `complete == 1`.
 
-Required evidence to close: a tau/tok-s measurement on the ordinary HIP path for
-the chosen shape (no regression claim without ≥3 fresh-process runs, prompt md5,
-binary md5), plus the pool-kernel `block_count == 0` no-op question answered by
-kernel contract or by regime gating.
+**P2 — dynamic shared memory varies with position.** Both remaining QSA shapes
+size their LDS from position-derived lengths: `indexed_attention_select_*` uses
+`block_count * 4` bytes, `indexed_attention_attention_*` uses
+`max_selected * 8` where `max_selected = min(end_position, capacity, budget *
+compress + compress - 1)`. Each wrapper picks between a batched (dynamic LDS) and
+a `_serial` (shared memory 0) symbol when the request exceeds a 64 KiB limit.
+REDLINE §4 makes symbol + grid + block + shared memory one identity contract and
+requires a "replay-stable fixed/tiled design" for a changing shared-memory shape,
+so the *value* must become constant even though the symbol happens not to flip.
+
+**P3 — one position-derived device pointer.** `raw_batch = view(raw_index_keys,
+initial_position * index_kv_width, …)` (`layer_ops.rs`) bakes a position-shifted
+address into the `copy_rows_strided_f32` destination pointer. Pointers are not
+scalars; no binding kind covers an address that moves with position.
+
+**P4 — every position-derived field must be *declared*, because the automatic
+route has no calibration pass.** `synthesize_position_bindings` (which
+differences two recordings and classifies what changed) is called only from the
+manual/speculative path; the automatic MQ4R route goes `Captured → Ready` on a
+single recording (`docs/REDLINE.md` §3). There is therefore no mechanism that
+notices a stale position-derived kernarg field. A tape whose QSA launches carry
+undeclared `position_start` / `block_count` / shifted pointers would replay the
+capture-position values: **wrong output, no error, no fallback**. G2's declared
+bindings are the mechanism that makes this class explicit, and they are mandatory
+here rather than an optimization.
+
+### Admitted geometry (source-derived)
+
+| Quantity | Value | Source |
+|---|---|---|
+| `max_seq` | exactly 2048 (admission requires it) | `crates/hipfire-loader/src/admission.rs` |
+| `compress` / `budget` | 4 / 2048 | `crates/hipfire-arch-qwen4/src/config.rs` |
+| indexer heads / kv heads / index_dim | 4 / 1 / 128 | same |
+| main heads / kv heads / head_dim | 24 / 2 / 256 | same |
+| `qsa_selected_capacity` | `budget + compress - 1 = 2051` | same |
+| `pooled_capacity` | `ceil(max_seq / compress) = 512` | `crates/hipfire-arch-qwen4/src/state.rs` |
+| pool `grid.x` | `complete`, 1…512 | wrapper + config |
+| select LDS | `4 * complete` ≤ 2048 B | wrapper |
+| attention LDS | `8 * max_selected` ≤ 16 408 B | wrapper |
+| attention grid | `[24, 1, 1]` (24 workgroups) | `n_heads=24`, `head_dim=256`, block 256 |
+
+Consequences that shape the decision: **neither 64 KiB switch flips anywhere in
+the admitted range** (attention needs `max_selected > 8192`); for `complete ≥ 1`
+(positions ≥ 3) the symbol set is already constant (batched everywhere); and both
+dynamic-LDS requests are small enough that a capacity-sized reservation fits the
+64 KiB device limit with room to spare. The attention grid is 24 workgroups on a
+40-CU device, so LDS reservation cannot become an occupancy limiter there.
+
+### Options
+
+**P1, pool launch presence and grid**
+
+- **A1 — capacity-fixed grid (recommended).** `grid.x = pooled_capacity` (512),
+  `block_count` passed as a declared `PositionDivU32 { addend: 1, divisor:
+  compress }`. The kernel masks, so active work is unchanged; the cost is one
+  compare-and-return per inactive workgroup (≤512 per layer per token, only until
+  `complete` saturates). Pros: no new mechanism, no env dependency, no kernel
+  change, one tape for every position. Cons: bounded wasted work (~0.5–1 % of a
+  token by workgroup-count arithmetic, unmeasured), and the grid no longer
+  encodes the active count (readability: the binding and the scalar must stay
+  consistent).
+- **A2 — dynamic grid narrowing.** Keep `grid.x = complete` at capture and
+  declare `ReplayGridBinding::PositionCeilDiv { axis: 0, addend: 1, divisor:
+  compress }` (`ceil((p+1)/4) == complete` for `rows == 1`, verified identity),
+  prepared at a declared maximum position (`set_prepared_max_position`, with the
+  existing `position > prepared_max_position` refusal). Pros: exact grid, zero
+  wasted work. Cons: needs `HIPFIRE_REPLAY_PM4_DYNAMIC_GRID` (off by default) to
+  even record the binding, forces single-queue PM4, and the grid binding is
+  PM4-only, so the recorded-HIP oracle launches a different grid than the PM4
+  route (numerically identical because the kernel masks, but it is one more
+  difference to explain in the parity ledger).
+- **A3 — kernel change: capacity tiling.** Rejected: same result as A1, but pays
+  a kernel/ABI re-certification for no functional gain.
+- **A4 — keep the conditional by arming later (orthogonal, recommended).** Require
+  the retained route to arm only once `complete > 0` (position ≥ 3). The
+  condition is monotone, so the tape captured after that point stays valid
+  forever, and the first ≤3 decode steps run on HIP. Removes the presence
+  problem *and* the zero-count select edge case in one move, with no wrapper or
+  kernel change. Alternative D2 below if a uniform-from-position-0 tape is
+  preferred.
+
+**P2, dynamic shared memory**
+
+- **B1 — capacity-pinned LDS (recommended).** Size the reservation from the
+  declaration instead of the active value: select `= pooled_capacity * 4` (2048 B),
+  attention `= qsa_selected_capacity * 8` (16 408 B), with the symbol chosen from
+  the pinned shape and the active lengths left as declared scalars. Both kernels
+  index their dynamic LDS by the active counts, so a larger reservation is not
+  read. Pros: constant symbol/block/shared-memory (the whole P2 contract becomes
+  position-free), arithmetic untouched (LDS size never changes which values are
+  computed, only where they are staged), free at these grid sizes. Cons: it is an
+  *assumption about the kernels* — "reservation ≥ active need is safe" must be
+  pinned by a test per variant, and the capacity arithmetic must stay under 64 KiB
+  if `max_seq` ever grows.
+- **B2 — force the `_serial` variants.** Pros: shared memory 0 everywhere, the
+  simplest possible contract. Cons: disqualifying for select — `_serial` launches
+  with block `[1,1,1]`, i.e. one thread per row scanning every candidate block;
+  for attention `_serial` recomputes the dot per pass (bit-identical, but more
+  work). Only viable for attention, and only if B1's assumption fails.
+- **B3 — patch `shared_mem` at replay.** Rejected: REDLINE §4 forbids a changing
+  shared-memory assumption outright; the PM4 packet field is patchable but the
+  semantics are not admissible.
+- **B4 — kernel change: explicit `lds_capacity` argument.** Fallback if B1's
+  premise is falsified. Pays a kernel re-certification; no benefit over B1 while
+  the premise holds.
+
+**P3/P4, position-derived fields**
+
+- **C1 — declare scalars; replace the shifted pointer with the existing offset
+  parameter (recommended).** `copy_rows_strided_f32` already takes `dst_col_offset`
+  as an `i32` kernarg (offset 32 in its blob). Pass the *base* `raw_index_keys`,
+  `dst_row_stride = index_kv_width`, and `dst_col_offset = position *
+  index_kv_width` — the row mapping `dst[r * index_kv_width + position *
+  index_kv_width + c]` is identical for decode and for a `rows > 1` chunk — and
+  declare that slot with a new sibling `PositionMulU32 { offset, factor }`.
+  Declare the remaining scalars with the vocabulary G2 landed: `position_start`
+  as `PositionPlusU32 { addend: 0 }` on the norm/RoPE, cache-append, select and
+  attention launches, `block_count` as `PositionDivU32 { addend: 1, divisor:
+  compress }` on pool and select. Pros: no kernel change, no new pointer class,
+  uniform for decode and chunked prefill, and it removes the silent-staleness
+  hazard for exactly the fields that carry it. Cons: ~9 declared bindings per QSA
+  layer (host-side 4-byte patches between replays — cheap, but it is per-layer
+  bookkeeping to keep honest), plus `PositionMulU32` is a third arithmetic form in
+  the vocabulary, and the params-shaped funnel needs a bindings-aware entry
+  (or the copy converts to the blob entry).
+- **C2 — keep the shifted view, add a pointer binding.** Rejected: an 8-byte
+  address patch needs the capture position and the base-address relationship
+  inside the tape contract; strictly more machinery than C1 for the same result.
+- **C3 — write raw index keys with the existing cache-append kernel** (pass the
+  same tensor as key and value): no new binding kind, but it writes the same 128
+  values twice and misuses an append contract for a keys-only cache. Viable,
+  less honest than C1.
+- **C4 — move position into a device buffer** (kernels read position from memory;
+  the pattern the other MQ4R models use for the position-buffer H2D). Pros:
+  removes position scalars from the tape entirely. Cons: 4–5 kernel signature
+  changes plus re-certification, and it does not address P1 or P2 at all. Keep as
+  a fallback if the declared-scalar count becomes unwieldy, not as the first move.
+- **C5 — rely on recording differencing (do nothing).** Rejected outright: the
+  automatic route never calls `synthesize_position_bindings` (P4), so this is a
+  silent-wrongness option, not a cheap one.
+
+### Weighing
+
+| | Mechanism cost | Device cost | Kernel/ABI risk | Failure mode if wrong |
+|---|---|---|---|---|
+| A1 + B1 + C1 + A4 | lowering only | ≤512 masked workgroups/layer/token; LDS reservations free at 24-worker grids | none | loud: binding/owner mistakes fail at prepare |
+| A2 + B1 + C1 + A4 | lowering + env flag + prepared max | none | none | clamp at `prepared_max_position` refuses (fail closed) |
+| A1 + B2(attention) + C1 + A4 | lowering only | attention dot recomputed twice | none | loud |
+| A1 + B4 + C1 + A4 | lowering + kernel | unknown | kernel re-certification | kernel change invalidates the base tape |
+
+The recommended package is **A1 + B1 + C1 + A4**: it is the only column with no
+kernel change, no environment dependency, and no silent failure mode. Its total
+device cost is bounded by ~512 masked workgroups per QSA layer per token plus two
+constant LDS reservations, and both are unmeasured — which is what the next step
+must fix.
+
+### Measurement plan (before any code)
+
+1. **Bit-exactness of pinning.** On the ordinary HIP path, A/B the pinned shapes
+   against today's shapes on the same prompt: outputs must be bit-identical
+   (pinning changes only launch geometry, never arithmetic). Any difference means
+   a premise is wrong (most likely B1's LDS-reservation assumption).
+2. **Cost of A1's masked grid and B1's reservations.** Decode tok/s over a fixed
+   prompt at several context lengths, ≥3 fresh processes, prompt md5 + binary
+   md5 recorded. Expectation is within noise; anything above noise makes A2 the
+   pool choice.
+3. **Zero-count behaviour, only if D2 is preferred over A4:** prove the batched
+   select variant at `block_count == 0` bit-identical to the `_serial` variant
+   that the wrapper would pick today, or keep A4 and never launch it.
+4. **Binding census.** With a capture window open, assert every position-derived
+   kernarg in the QSA step is either declared or provably position-free — the
+   concrete form of REDLINE §7 gate 3 for this route.
+
+Nothing above requires G4, but the *end-to-end* form of 1–4 does, because today
+no Qwen4 forward can complete with a replay backend enabled.
 
 ## G4 — open decision: the sealed MoE pointer contract
 
@@ -292,14 +461,23 @@ Append-only. One line per landed change with the commit hash once it exists.
 - 2026-09-20 — Default-path probe re-run after G1/G2: still the sealed-MoE
   preflight refusal, i.e. G4 remains the gate for any capture. Unchanged behavior
   is the expected result here, not a regression.
+- 2026-09-20 — **G3 analyzed, no decision taken** (this section): problem split
+  into P1 pool presence/grid, P2 dynamic shared memory, P3 a position-shifted
+  destination pointer in the index-key write, and P4 the finding that the
+  automatic route has no calibration pass, so an undeclared position-derived field
+  is a *silent* wrong-output hazard rather than a loud failure. Admitted geometry
+  computed (compress 4, budget 2048, pooled_capacity 512, qsa_selected_capacity
+  2051, attention grid 24 workgroups, LDS ≤ 16 408 B); neither 64 KiB switch flips
+  in the 2048-token range. Options A1/A2, B1–B4 and C1–C5 recorded with
+  pro/contra and a measurement plan; recommendation A1 + B1 + C1 + A4.
 
-### Next (do not start without a decision)
+### Next
 
-1. G4 first: until the specialized-route pointer contract exists (or the refusal
-   is narrowed to the exactly-unstable sub-case), no complete Qwen4 tape can be
+1. G3 measurement plan (bit-exactness of pinning, cost of the masked pool grid and
+   the pinned LDS reservations, binding census) — none of it needs G4, but the
+   end-to-end form does.
+2. G4: until the specialized-route pointer contract exists (or the refusal is
+   narrowed to the exactly-unstable sub-case), no complete Qwen4 tape can be
    captured, so no census, parity, or route proof is reachable.
-2. Then G3, with the census in hand: the QSA shapes (conditional pool launch,
-   position-growing grid, symbol/shared-memory switching) are the next blocker to
-   a lowerable tape, and they need a measured decision.
 3. Then the REDLINE §7 ladder, notably the state oracle (QSA full/raw/pooled
    keys, selected indices, GDN recurrent/conv state, PLE history).
