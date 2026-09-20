@@ -5988,6 +5988,19 @@ impl ReplayController {
         self.transport == ReplayTransport::Pm4Ib
     }
 
+    /// Whether the *current forward* is inside the retained body: the controller
+    /// would record this forward into the tape, or route it through a prepared
+    /// plan.
+    ///
+    /// This is the scope a launch-level admission guard must use. A forward that
+    /// merely has a replay backend enabled — prefill, an ineligible call, or an
+    /// already-poisoned route — is not in the retained body and must keep running
+    /// on HIP, so a route that cannot be retained degrades the model to HIP
+    /// instead of making every forward fail.
+    pub fn retained_body_active(&self) -> bool {
+        self.is_recording() || self.should_route_aql() || self.should_route_pm4()
+    }
+
     pub fn poison(&mut self, reason: impl Into<String>) {
         self.fallback_reason = Some(reason.into());
         self.state = ReplayState::Fallback;
@@ -8795,6 +8808,49 @@ mod tests {
             factor: u32::MAX,
         };
         assert!(overflow.apply(&mut kernarg, 2).is_err());
+    }
+
+    #[test]
+    fn retained_body_scope_is_the_eligible_forward_not_the_backend_choice() {
+        // The scope a launch-level guard must use: recording, or routing a
+        // prepared plan. An armed-but-idle controller, a captured-but-unprepared
+        // one, and a poisoned one are NOT in the retained body, so their forwards
+        // must keep running on HIP.
+        let mut controller = ReplayController::new_armed(ReplayBackendRequest::Auto);
+        assert_eq!(controller.state(), ReplayState::Armed);
+        assert!(
+            !controller.retained_body_active(),
+            "an armed-but-idle controller must not make HIP forwards fail"
+        );
+
+        controller.begin_capture().expect("open capture window");
+        assert!(
+            controller.retained_body_active(),
+            "recording is the retained body"
+        );
+
+        // An ineligible forward inside the window (prefill, spec, MTP) is not.
+        controller.set_forward_eligible(false);
+        assert!(
+            !controller.retained_body_active(),
+            "an ineligible forward must not be treated as the retained body"
+        );
+        controller.set_forward_eligible(true);
+
+        let summary = controller.finish_capture().expect("close capture window");
+        assert_eq!(summary.launch_count, 0);
+        assert_eq!(controller.state(), ReplayState::Captured);
+        assert!(
+            !controller.retained_body_active(),
+            "a captured-but-unprepared route still runs HIP"
+        );
+
+        controller.poison("test poison");
+        assert_eq!(controller.state(), ReplayState::Fallback);
+        assert!(
+            !controller.retained_body_active(),
+            "a poisoned route must fall back to HIP, not keep failing forwards"
+        );
     }
 
     #[test]

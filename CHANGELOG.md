@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Retained replay no longer refuses the *whole model* when a family's MoE route has no
+  admitted pointer contract: the specialized sealed-MoE guard is now scoped to the
+  retained body (`is_recording()` or a routed plan), so prefill, ineligible forwards,
+  and an already-poisoned route keep running on HIP. Qwen4 gained the corresponding
+  engine-level retained-body discipline in `hipfire-generate` (prefill ineligible;
+  single-token decode poisons and logs when the route cannot be retained; a body
+  failure inside a capture window poisons instead of failing every later forward; a
+  routed-but-unprepared state fails closed). With the Redline default armed, the
+  `.mq4r` Qwen4 artifact now loads, prefills, and generates on HIP with the refusal
+  reason logged, byte-identical to the explicit HIP baseline; capture stays
+  fail-closed, and `hipfire-arch-qwen4` still carries no replay code. See
+  [the plan record](docs/design/qwen4-program-retained-pm4.md).
 - Qwen4 QSA launches now declare position-independent shapes and position-derived
   fields, so a retained tape cannot bake a capture position into them. The pool
   grid, the select LDS/symbol, and the attention LDS/symbol come from declared

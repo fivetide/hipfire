@@ -2,10 +2,10 @@
 
 ## Status and purpose
 
-**Status: G1–G3 implemented on `feat/qwen38-flash-next` (branch-implemented, not
-certified); G4 analyzed with a recommended package.** G4 — the sealed-MoE pointer
-contract and the refusal's blast radius — is the only blocker left before a Qwen4
-tape can exist; its analysis is in this record and no decision has been taken.
+**Status: G1–G3 implemented and G4's scope fix (A2) landed on
+`feat/qwen38-flash-next` (branch-implemented, not certified).** The remaining
+decision is G4's admission contract (B1, with C2 for the census): until it lands, a
+Qwen4 tape cannot exist, so the census, parity, and route proof stay unreachable.
 
 This record is the tracking document for enabling Redline retained PM4 replay for
 Qwen3.8 Flash-Next (`hipfire-arch-qwen4`) **at the shared engine/dispatch level**,
@@ -106,7 +106,7 @@ formula). That is exactly what G2 makes declarable, and it is declared at the
 | G1 | Half the decode program never reaches the recorder: `tensor_ops.rs` was 31 wrappers, 31 raw `Gpu::launch_kernel_blob`, 0 funnel launches | `crates/rdna-compute` | **done** (branch-implemented) |
 | G2 | Binding vocabulary could not express a quotient/modulo of position, and declared bindings could not be attached to a launch | `crates/rdna-compute`, `hipfire-dispatch` | **done** (branch-implemented) |
 | G3 | Position-switched kernel symbol and dynamic shared memory in QSA (`complete > 0` conditional launch, grid growing with position) | engine (lowering) + a kernel contract decision | **decided + done** (branch-implemented; route arming deferred to the G4 hook) |
-| G4 | Sealed MoE "no retained-replay pointer contract" refusal: `route_policy` is `Some(Qt44Qt53Grouped)` for qwen4 decode | engine (dispatch) | **analyzed**; recommended A2 (scope) + B1 with C2 (contract) — decision pending |
+| G4 | Sealed MoE "no retained-replay pointer contract" refusal: `route_policy` is `Some(Qt44Qt53Grouped)` for qwen4 decode | engine (dispatch) | **A2 landed** (scoped refusal + engine-side retained-body policy); B1 + C2 pending decision |
 
 ## G1 — recorder funnel coverage (done)
 
@@ -627,6 +627,57 @@ must not make a model unservable), then **B1 with C2** for admission, with B4 he
 as the honest fallback if the census shows the launch set or geometry moving with
 position.
 
+### Landing (A2)
+
+**Problem D1 fixed.** The refusal is now scoped to the retained body instead of
+"any replay backend enabled": `ReplayController::retained_body_active()` is
+`is_recording() || should_route_aql() || should_route_pm4()`
+(`crates/rdna-compute/src/replay.rs`), and the guard refuses only then, through the
+single admission point
+`hipfire_dispatch::pipeline::sealed_moe::specialized_sealed_moe_retained_admission()`
+— so the launch guard and the arming hook read one rule and cannot drift.
+
+**Qwen4 gained the retained-body discipline** at the engine level
+(`crates/hipfire-generate`: `ar::retained_body_action` + the Qwen4 AR producer's
+closures), keeping `hipfire-arch-qwen4` free of replay code:
+
+- prefill marks itself ineligible, so it can neither record nor consume a tape;
+- plain single-token decode is the eligible forward; with admission refused it
+  **poisons before running the body** and logs the reason, so this and every later
+  forward runs HIP instead of arming a capture the route would refuse per token;
+- a capture window that fails inside the body poisons rather than failing every
+  following forward;
+- a routed state (`Ready`) fails closed while no plan can be prepared for this
+  family — it never silently runs HIP behind a plan the engine believes is in use.
+
+Deliberate deviation from the earlier sketch: the "arm once `complete > 0`" gate is
+**not** implemented here. Arming is refused wholesale today, so the gate would be
+dead code; it belongs with B1, where capture-completeness (the pool launch being
+present) is knowable. This is recorded rather than half-built.
+
+**Evidence.**
+
+- `replay::tests::retained_body_scope_is_the_eligible_forward_not_the_backend_choice`
+  — armed-but-idle, captured-but-unprepared, ineligible-inside-a-window, and
+  poisoned states are all *not* the retained body.
+- `ar::route_scope_tests::retained_body_action_keeps_hip_for_every_non_eligible_or_refused_forward`
+  — the action matrix across all seven replay states.
+- End-to-end, two fresh processes, `.mq4r` artifact with the Redline default
+  **armed** (the configuration that previously failed at prefill preflight):
+
+  ```text
+  [redline] enabling fail-closed retained default on gfx1151 (model_arch=qwen4, drafter=off, transport=pm4)
+  [redline] qwen4 retained body unavailable: specialized sealed MoE has no retained-replay pointer contract; refusing the retained body (the model runs on HIP)
+  {"content":"2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37","tokens":116,"tok_s":11.4,"finish_reason":"stop"}
+  ```
+
+  The decoded stream and tok/s are identical to the explicit
+  `HIPFIRE_REPLAY_BACKEND=hip` baseline, i.e. the scope fix changes nothing about
+  the HIP path and restores serving. Capture stays fail-closed: `is_recording()`
+  remains part of the refused scope, pinned by the unit test above; no Qwen4 code
+  path arms a window while admission is refused, so the guard is a backstop rather
+  than a reachable refusal today.
+
 ### Acceptance evidence per option
 
 - A2: a `.mq4r` Qwen4 serve with a replay backend armed loads, prefills, and
@@ -655,6 +706,8 @@ baseline (REDLINE gate 1), and it is also the A/B arm for the later census.
 | Real-model shape pin A/B | 5 interleaved fresh-process pairs, greedy 116-token stream bit-identical, tok/s medians equal | **passing** (HIP path only) |
 | Structural: no raw launch left in the program's op owner | `tensor_ops.rs` launch-discipline review (0 raw sites) | **passing** |
 | Ordinary HIP baseline | `HIPFIRE_REPLAY_BACKEND=hip` daemon probe: loads, generates (`PARIS`), commits | **passing** |
+| G4 A2 scope | armed-default `.mq4r` probe: serves on HIP, logs the refusal reason, stream identical to the HIP baseline | **passing** |
+| G4 A2 policy | `replay::tests::retained_body_scope_*`, `ar::route_scope_tests::retained_body_action_*` | **passing** |
 | End-to-end census: recorded launches == compute launches | needs G4 | blocked by design |
 | Multi-position HIP vs recorded-blob vs PM4 parity | needs G3, G4 | blocked by design |
 | Serve health, stationary matched performance | REDLINE §7 gates 6–7 | blocked by design |
@@ -688,6 +741,15 @@ Append-only. One line per landed change with the commit hash once it exists.
 - 2026-09-20 — Default-path probe re-run after G1/G2: still the sealed-MoE
   preflight refusal, i.e. G4 remains the gate for any capture. Unchanged behavior
   is the expected result here, not a regression.
+- 2026-09-20 — **G4 A2 landed** (branch-implemented, uncertified): the refusal is
+  scoped to the retained body (`ReplayController::retained_body_active()` plus one
+  admission point in dispatch), and Qwen4 gained the engine-level retained-body
+  discipline in `hipfire-generate` (prefill ineligible; decode poisons when the
+  route cannot be retained; body failure inside a window poisons; a routed state
+  fails closed). Verified by two policy unit tests and two fresh-process armed
+  probes that now serve on HIP with the refusal reason logged and a stream
+  identical to the HIP baseline. The `complete > 0` arming gate is deferred to B1
+  (arming is refused wholesale today, so it would be dead code).
 - 2026-09-20 — **G4 analyzed** (no decision): split into D1 (the refusal's blast
   radius — it disables prefill, fallback and every forward, making the `.mq4r`
   artifact unservable) and D2 (the unstated pointer contract). The route is already

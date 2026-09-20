@@ -7797,6 +7797,9 @@ pub fn generate_qwen4_ar(
         stop,
         true,
         |model, device, tokens, logits| {
+            // Prefill is never the retained body: the tape holds ordinary
+            // single-token continuation only (docs/REDLINE.md §3).
+            device.replay.set_forward_eligible(false);
             model
                 .qwen4_mut()
                 .ok_or_else(|| "qwen4 AR bundle disappeared before prefill".to_string())
@@ -7807,14 +7810,53 @@ pub fn generate_qwen4_ar(
                 })
         },
         |model, device, token, logits| {
-            model
+            // Plain single-token decode is Qwen4's only eligible forward, so the
+            // retained-body discipline lives here rather than in the family crate.
+            device.replay.set_forward_eligible(true);
+            let admission =
+                hipfire_dispatch::pipeline::sealed_moe::specialized_sealed_moe_retained_admission();
+            match crate::ar::retained_body_action(true, device.replay.state(), admission) {
+                crate::ar::RetainedBodyAction::Ineligible => {}
+                crate::ar::RetainedBodyAction::Arm => {
+                    if let Err(reason) = device.replay.begin_auto_capture_if_armed() {
+                        device.replay.poison(reason);
+                        eprintln!("[redline] qwen4 capture could not start: {reason}");
+                    }
+                }
+                crate::ar::RetainedBodyAction::Refuse { reason } => {
+                    // The route cannot be retained yet: poison before the body so
+                    // this and every later forward runs on HIP, instead of arming
+                    // a capture the route would refuse on each token.
+                    device.replay.poison(reason);
+                    eprintln!("[redline] qwen4 retained body unavailable: {reason}");
+                }
+                crate::ar::RetainedBodyAction::Route => {
+                    // No plan can be prepared while admission is refused, so a
+                    // routed state here would mean running HIP behind a retained
+                    // plan the engine believes is in use. Fail closed instead.
+                    let reason = "qwen4 retained-body routing is not implemented";
+                    device.replay.poison(reason);
+                    eprintln!("[redline] qwen4: {reason}");
+                    return Err(reason.to_string());
+                }
+            }
+            let result = model
                 .qwen4_mut()
                 .ok_or_else(|| "qwen4 AR bundle disappeared during decode".to_string())
                 .and_then(|bundle| {
                     bundle
                         .forward_token(device, token, logits, None)
                         .map_err(|error| error.to_string())
-                })
+                });
+            // A capture window that failed inside the body must not keep failing
+            // every following forward: the failure poisons the route, and later
+            // forwards fall back to HIP.
+            if result.is_err() && device.replay.is_recording() {
+                let reason = "qwen4 capture failed; later forwards fall back to HIP";
+                device.replay.poison(reason);
+                eprintln!("[redline] {reason}");
+            }
+            result
         },
     );
 }

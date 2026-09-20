@@ -5924,12 +5924,64 @@ pub fn reset_core_arch_key(arch_id: u32) -> &'static str {
     }
 }
 
+/// What the engine must do with the retained body on one forward.
+///
+/// The policy lives in one place so the launch-level admission guard and the
+/// family's arming hook cannot disagree. The retained body is the *eligible*
+/// forward only (plain single-token decode); a family whose MoE route has no
+/// admitted pointer contract refuses the body up front instead of arming a
+/// capture the route will refuse, and every other forward — prefill, speculative
+/// or batched calls, an already-poisoned route — keeps running on HIP.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetainedBodyAction {
+    /// Not the eligible forward: never records, never routes, runs on HIP.
+    Ineligible,
+    /// Eligible, and the family's route cannot be retained: poison with this
+    /// reason and run this forward on HIP.
+    Refuse { reason: &'static str },
+    /// Open the capture window for this eligible forward.
+    Arm,
+    /// Submit the prepared plan; the HIP body must not run.
+    Route,
+}
+
+/// Decide the retained-body action for one forward.
+///
+/// `admission` is the engine's single answer for "may this family's route enter a
+/// retained body" (`hipfire_dispatch`), so the guard and the arming hook read the
+/// same rule.
+pub fn retained_body_action(
+    eligible: bool,
+    state: rdna_compute::replay::ReplayState,
+    admission: Result<(), &'static str>,
+) -> RetainedBodyAction {
+    use rdna_compute::replay::ReplayState;
+
+    if !eligible {
+        return RetainedBodyAction::Ineligible;
+    }
+    match state {
+        // Nothing to do: either the backend is off, or the route already fell
+        // back and this forward belongs to HIP.
+        ReplayState::Hip | ReplayState::Fallback => RetainedBodyAction::Ineligible,
+        ReplayState::Ready => RetainedBodyAction::Route,
+        ReplayState::Armed => match admission {
+            Ok(()) => RetainedBodyAction::Arm,
+            Err(reason) => RetainedBodyAction::Refuse { reason },
+        },
+        // A window is already open (the body records itself), and a captured but
+        // unprepared tape routes nothing yet.
+        ReplayState::RecordingWarmup | ReplayState::Captured | ReplayState::ShadowValidated => {
+            RetainedBodyAction::Ineligible
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn generation_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    static LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]
@@ -5938,6 +5990,57 @@ mod route_scope_tests {
     use hipfire_engine::terminal::{
         activate_terminal_control, clear_terminal_control, set_active_attempt_id,
     };
+
+    #[test]
+    fn retained_body_action_keeps_hip_for_every_non_eligible_or_refused_forward() {
+        use rdna_compute::replay::ReplayState;
+
+        // Not the eligible forward: prefill, spec/MTP, batch — whatever the
+        // backend state, these run on HIP and neither record nor route.
+        for state in [
+            ReplayState::Hip,
+            ReplayState::Armed,
+            ReplayState::RecordingWarmup,
+            ReplayState::Captured,
+            ReplayState::ShadowValidated,
+            ReplayState::Ready,
+            ReplayState::Fallback,
+        ] {
+            assert_eq!(
+                retained_body_action(false, state, Ok(())),
+                RetainedBodyAction::Ineligible,
+                "ineligible forward must run on HIP in {state:?}"
+            );
+        }
+
+        // A refused route must never arm a capture: this is what keeps an
+        // unadmitted route from turning every decode into a failing forward.
+        assert_eq!(
+            retained_body_action(true, ReplayState::Armed, Err("no pointer contract")),
+            RetainedBodyAction::Refuse {
+                reason: "no pointer contract"
+            }
+        );
+        // With admission, the eligible forward opens the capture window.
+        assert_eq!(
+            retained_body_action(true, ReplayState::Armed, Ok(())),
+            RetainedBodyAction::Arm
+        );
+        // An already-poisoned route keeps generating on HIP.
+        assert_eq!(
+            retained_body_action(true, ReplayState::Fallback, Err("no pointer contract")),
+            RetainedBodyAction::Ineligible
+        );
+        assert_eq!(
+            retained_body_action(true, ReplayState::Hip, Err("no pointer contract")),
+            RetainedBodyAction::Ineligible
+        );
+        // Only a prepared plan routes, and it must not run the HIP body.
+        assert_eq!(
+            retained_body_action(true, ReplayState::Ready, Ok(())),
+            RetainedBodyAction::Route
+        );
+    }
     fn route_lock() -> std::sync::MutexGuard<'static, ()> {
         super::generation_test_lock()
     }

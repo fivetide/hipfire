@@ -24,6 +24,28 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const DEVICE_POINTER_BYTES: usize = 8;
+
+/// Admission rule for letting a specialized (route-policy) sealed MoE route enter
+/// a retained body.
+///
+/// The route may be recorded only once its pointer contract is stated *and*
+/// enforced: expert pointer-table contents proved against the live expert
+/// tensors, a pointer-mapping identity pinned into the plan, and the lifetime
+/// hazards named (lazily allocated FWHT sign tables, in-route diagnostic
+/// readback, plan-invalidation triggers). Until then this is the single place that
+/// says so — the launch guard refuses the retained body with this reason, and the
+/// engine-side arming hook reads the same answer instead of starting a capture the
+/// route will refuse, so both decisions cannot drift apart.
+///
+/// Evidence and the option analysis live in
+/// `docs/design/qwen4-program-retained-pm4.md` § G4 (options B1/C2).
+pub fn specialized_sealed_moe_retained_admission() -> Result<(), &'static str> {
+    Err(
+        "specialized sealed MoE has no retained-replay pointer contract; refusing the retained body \
+         (the model runs on HIP)",
+    )
+}
+
 /// Grouped-GEMM rows are emitted in fixed-width tiles. Keep this tied to the
 /// dispatch implementation in `pipeline::mod` rather than letting callers
 /// choose a second alignment policy.
@@ -1830,10 +1852,16 @@ impl<'a> SealedMoeCall<'a> {
             SealedParams::Decode(params) => params.route_policy.is_some(),
             SealedParams::Prefill(params) => params.route_policy.is_some(),
         };
-        if specialized_route && gpu.replay.is_enabled() {
-            return Err(invalid(
-                "specialized sealed MoE has no retained-replay pointer contract; refusing before launch",
-            ));
+        // Only the *retained body* is refused: recording this forward into a tape,
+        // or routing it through a prepared plan. A forward that merely has a
+        // replay backend enabled (prefill, an ineligible call, an already-poisoned
+        // route) keeps running on HIP, so an unadmitted route cannot make the
+        // model unservable. `docs/REDLINE.md` §3 keeps prefill out of the tape and
+        // defines the poisoned route as a HIP fallback.
+        if specialized_route && gpu.replay.retained_body_active() {
+            if let Err(reason) = specialized_sealed_moe_retained_admission() {
+                return Err(invalid(reason));
+            }
         }
 
         if self.protocol == MoeProtocol::GroupedPrefill
