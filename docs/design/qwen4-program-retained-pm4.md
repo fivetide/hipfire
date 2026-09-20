@@ -276,19 +276,19 @@ Append-only. One line per landed change with the commit hash once it exists.
 
 - 2026-09-20 — plan written. Baseline refusal reproduced (see above). G1/G2 in
   progress.
-- 2026-09-20 — **G1 landed** (branch-implemented, uncommitted at the time of
-  writing): `Gpu::launch_blob_recorded` + 31 `tensor_ops.rs` migrations + one
-  shared `recorded_launch_artifact` resolver (funnel, scratch, new entry).
+- 2026-09-20 — **G1 landed** (branch-implemented) in `b12185138`:
+  `Gpu::launch_blob_recorded` + 31 `tensor_ops.rs` migrations + one shared
+  `recorded_launch_artifact` resolver (funnel, scratch, new entry).
   Evidence: GPU tape test, `cargo test -p rdna-compute --lib` 260 pass,
   `cargo test -p hipfire-dispatch` 285 pass, HIP end-to-end `PARIS`.
-- 2026-09-20 — **G2 landed** (branch-implemented): `PositionDivU32`/
-  `PositionModU32` bindings, declared-binding carriage on `RecordedHipLaunch`,
-  prepare-time merge with one-owner-per-slot + position-derived-only rules,
-  synthesis skip for declared offsets, binding identity in the sequence hash,
-  `offset()` accessor replacing three duplicated match arms, and the first two
-  declarations (GDN conv ring cursor, batched chunk start cursor) with
-  `GatedDeltaConv::row_index` supplied by `layer_ops`. Evidence: 6 new unit tests
-  (87 `replay::` tests pass).
+- 2026-09-20 — **G2 landed** (branch-implemented) in `b12185138`:
+  `PositionDivU32`/`PositionModU32` bindings, declared-binding carriage on
+  `RecordedHipLaunch`, prepare-time merge with one-owner-per-slot +
+  position-derived-only rules, synthesis skip for declared offsets, binding
+  identity in the sequence hash, `offset()` accessor replacing three duplicated
+  match arms, and the first two declarations (GDN conv ring cursor, batched chunk
+  start cursor) with `GatedDeltaConv::row_index` supplied by `layer_ops`.
+  Evidence: 6 new unit tests (87 `replay::` tests pass).
 - 2026-09-20 — Default-path probe re-run after G1/G2: still the sealed-MoE
   preflight refusal, i.e. G4 remains the gate for any capture. Unchanged behavior
   is the expected result here, not a regression.
