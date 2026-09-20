@@ -122,6 +122,96 @@ DFLASH_EXACT_FIELDS = (
 # recorded-HIP/PM4 routes, not the separate HipGraph route.
 DFLASH_COMPARED_ARMS = ("recorded_hip", "pm4")
 
+# Qwen4 (Qwen3.8 Flash-Next) state surfaces. The retained replay and the
+# exact-kernarg HIP oracle must agree with ordinary HIP on every one of these at
+# every compared position: the decoded token is not the gate, the state is.
+QWEN4_EXACT_FIELDS = (
+    "tokens_equal",
+    "argmax_equal",
+    "position_equal",
+    "lengths_equal",
+    "state_bit_exact",
+    "qsa_full_equal",
+    "gdn_equal",
+    "ple_equal",
+)
+
+
+def qwen4_shadow_failures(shadow):
+    """Every reason this Qwen4 multi-position parity run is not evidence."""
+    failures = []
+    route = shadow.get("route") or {}
+    counters = route.get("counters") or {}
+    if route.get("phase") != "ready":
+        failures.append(f"route phase is {route.get('phase')!r}, not 'ready'")
+    if int(counters.get("replays") or 0) == 0:
+        failures.append("route.counters.replays == 0")
+    for name in ("replay_failures", "poison_count", "contract_failures", "prepare_failures"):
+        if int(counters.get(name) or 0) != 0:
+            failures.append(f"counters.{name} == {counters.get(name)}")
+
+    capture = shadow.get("capture") or {}
+    identity = shadow.get("prepared_identity") or {}
+    if not identity.get("dispatch_equals_launches"):
+        failures.append(
+            f"prepared dispatches {identity.get('dispatch_count')} != "
+            f"captured launches {capture.get('launches')}"
+        )
+    if identity.get("queue_count") != 1 or identity.get("phase_count") != 1:
+        failures.append(f"prepared route is not single-queue/single-phase: {identity!r}")
+
+    if not shadow.get("bit_exact"):
+        failures.append("retained transport != ordinary HIP over the compared state")
+    if not shadow.get("blob_bit_exact"):
+        failures.append("recorded-HIP oracle != ordinary HIP over the compared state")
+
+    parity = shadow.get("parity") or {}
+    windows = parity.get("windows") or []
+    if not windows:
+        failures.append("parity table has no windows")
+    for window in windows:
+        position = window.get("position")
+        row = window.get("pm4") or {}
+        if not row:
+            failures.append(f"position {position}: retained arm missing from parity")
+            continue
+        failures.extend(qwen4_row_failures(row, f"position {position}: pm4"))
+
+    # The recorded-HIP oracle is the captured blob replayed at its own capture
+    # position: its substitution comes from the controller's synthesized-binding
+    # calibration, which Qwen4 replaces with program-declared bindings. It is
+    # therefore compared once, at the capture geometry, while the retained arm
+    # carries the multi-position claim.
+    blob = parity.get("blob") or {}
+    row = blob.get("recorded_hip") or {}
+    if not row:
+        failures.append("parity.blob.recorded_hip missing (capture-position oracle)")
+    elif blob.get("position") != windows[0].get("position"):
+        failures.append(
+            f"parity.blob.position {blob.get('position')} != first window "
+            f"{windows[0].get('position')} ({row})"
+        )
+    else:
+        failures.extend(qwen4_row_failures(row, "blob.recorded_hip"))
+    return failures
+
+
+def qwen4_row_failures(row, label):
+    failures = []
+    for field in QWEN4_EXACT_FIELDS:
+        if field not in row:
+            failures.append(f"{label}.{field} missing")
+        elif not row[field]:
+            failures.append(f"{label}.{field} is false")
+    for field, value in row.items():
+        if isinstance(value, dict) and "max_abs" in value:
+            if (value.get("max_abs") or 0) != 0 or (value.get("max_rel") or 0) != 0:
+                failures.append(
+                    f"{label}.{field} diverged max_abs={value.get('max_abs')} "
+                    f"max_rel={value.get('max_rel')}"
+                )
+    return failures
+
 
 def dflash_shadow_failures(shadow):
     """Every reason this shadow run is not evidence. Empty list == pass.
@@ -225,6 +315,11 @@ def main():
         type=int,
         default=1,
         help="position increment per shadow replay; 0 isolates queue lifetime from context growth",
+    )
+    parser.add_argument(
+        "--qwen4",
+        action="store_true",
+        help="gate the Qwen4 (Qwen3.8 Flash-Next) multi-position state-parity table",
     )
     parser.add_argument(
         "--shadow-replay-only",
@@ -561,6 +656,19 @@ def main():
                     f"position_step={shadow.get('position_step')} "
                     f"queue_id={shadow.get('queue_id')} "
                     f"host_us={shadow.get('aql_host_us'):.1f}",
+                    flush=True,
+                )
+            elif args.qwen4:
+                failures = qwen4_shadow_failures(shadow)
+                report["qwen4_shadow_failures"] = failures
+                shadow_pass = not failures
+                positions = [w.get("position") for w in (shadow.get("parity") or {}).get("windows", [])]
+                print(
+                    f"qwen4-shadow: positions={positions} "
+                    f"bit_exact={shadow.get('bit_exact')} "
+                    f"blob_bit_exact={shadow.get('blob_bit_exact')} "
+                    f"state_bytes={shadow.get('state_bytes_compared_per_position')} "
+                    f"failures={failures}",
                     flush=True,
                 )
             else:
