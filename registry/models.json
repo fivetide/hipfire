@@ -1137,7 +1137,7 @@
     },
     "qwen3.8:flash-next": {
       "repo": "hipfire-models/qwen3.8-flash-next",
-      "file": "qwen3.8-flash-next.hfq",
+      "file": "qwen3.8-flash-next.mq4r",
       "size_gb": 178.0,
       "min_vram_gb": 128,
       "desc": "Qwen3.8-Flash-Next / Qwen4 experimental HFQM (arch 16); tested only on 128 GB-class Strix Halo, so the 128 GB catalog gate is conservative rather than a measured minimum. Streaming SSD-resident PLE and native MTP are embedded in the 178 GB artifact.",
