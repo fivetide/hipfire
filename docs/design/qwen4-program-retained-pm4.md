@@ -741,7 +741,8 @@ Append-only. One line per landed change with the commit hash once it exists.
 - 2026-09-20 — Default-path probe re-run after G1/G2: still the sealed-MoE
   preflight refusal, i.e. G4 remains the gate for any capture. Unchanged behavior
   is the expected result here, not a regression.
-- 2026-09-20 — **G4 A2 landed** (branch-implemented, uncertified): the refusal is
+- 2026-09-20 — **G4 A2 landed** (branch-implemented, uncertified) in
+  `0c758739b`: the refusal is
   scoped to the retained body (`ReplayController::retained_body_active()` plus one
   admission point in dispatch), and Qwen4 gained the engine-level retained-body
   discipline in `hipfire-generate` (prefill ineligible; decode poisons when the
