@@ -3522,6 +3522,11 @@ impl RedlineQwen4Snapshot {
             if candidate != bytes.as_slice() {
                 equal = false;
             }
+            if bytes.is_empty() {
+                // An inactive arena slice (mark 0): equality already covers it, and
+                // a divergence magnitude over zero elements is not a number.
+                continue;
+            }
             let (abs, rel) = redline_f32_err(bytes, candidate);
             max_abs = max_abs.max(abs);
             max_rel = max_rel.max(rel);
@@ -3717,6 +3722,89 @@ fn redline_qwen4_row(
     })
 }
 
+/// REDLINE §7 gate 8 failure behaviour: a replay that the plan must refuse —
+/// here, a boundary position beyond the plan's prepared window, which is what
+/// long-context growth produces — must error this forward, poison the route with
+/// a named reason, and leave the model on correct HIP for the next forward.
+///
+/// The hazard being ruled out is the opposite claim: a retained body that fails
+/// mid-forward and lets HIP finish the *same* forward, mixing two executors over
+/// one state transition.
+fn redline_qwen4_replay_failure(
+    gpu: &mut rdna_compute::Gpu,
+    bundle: &mut hipfire_arch_qwen4::bundle::Qwen4Bundle,
+    context: usize,
+    pm4: bool,
+) -> Result<serde_json::Value, String> {
+    let (hip_reference, _) = redline_qwen4_arm(
+        gpu,
+        bundle,
+        Some(rdna_compute::replay::ShadowBodyRoute::Hip),
+        context,
+        1,
+        0,
+    )?;
+    let (hip_clean, _) = redline_qwen4_arm(
+        gpu,
+        bundle,
+        Some(rdna_compute::replay::ShadowBodyRoute::Hip),
+        context,
+        1,
+        0,
+    )?;
+    // One position below the boundary this forward replays at, then re-prepare:
+    // the plan captures its position bound at prepare time. The tape is intact —
+    // nothing has reset the controller since the capture — so this is the same
+    // plan with a bound the forward will exceed, which is what long-context
+    // growth produces. The plan must refuse before the body, not after it.
+    gpu.replay
+        .set_prepared_max_position(context.saturating_sub(1));
+    let launches = gpu.replay.recorded_launches().len();
+    let reprepared = if pm4 {
+        gpu.replay
+            .prepare_pm4_prefix(gpu.device_id as usize, launches)
+            .map(|_| ())
+    } else {
+        gpu.replay
+            .prepare_linear_aql(gpu.device_id as usize)
+            .map(|_| ())
+    };
+    if let Err(reason) = reprepared {
+        return Err(format!(
+            "Qwen4 failure probe could not re-prepare the plan: {reason}"
+        ));
+    }
+    let attempted = redline_qwen4_arm(
+        gpu,
+        bundle,
+        Some(rdna_compute::replay::ShadowBodyRoute::Plan),
+        context,
+        1,
+        0,
+    );
+    let (error, poisoned) = match attempted {
+        Ok(_) => (
+            "replay succeeded beyond the prepared max_position (expected a refusal)".to_string(),
+            false,
+        ),
+        Err(reason) => (reason, true),
+    };
+    let fallback = gpu.replay.fallback_reason().map(str::to_string);
+    // No shadow route set: this is the production decision for a poisoned route.
+    let (recovered, _) = redline_qwen4_arm(gpu, bundle, None, context, 1, 0)?;
+    Ok(serde_json::json!({
+        "induced": "boundary position beyond the plan's prepared max_position",
+        "boundary_position": context,
+        "prepared_max_position": context.saturating_sub(1),
+        "error": error,
+        "route_poisoned": poisoned,
+        "fallback_reason": fallback,
+        "recovered_bit_exact_against_clean_hip": recovered == hip_reference
+            && hip_reference == hip_clean,
+        "recovery_uses_hip": gpu.replay.state() == rdna_compute::replay::ReplayState::Fallback,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn redline_shadow_qwen4(
     gpu: &mut rdna_compute::Gpu,
@@ -3824,6 +3912,12 @@ fn redline_shadow_qwen4(
     let compared_bytes = replay_arm
         .first()
         .map_or(0, RedlineQwen4Snapshot::compared_bytes);
+    // Route state of the *parity* phase, read before the failure probe poisons it.
+    let route_phase = format!("{:?}", gpu.replay.state()).to_ascii_lowercase();
+    let route_transport = gpu.replay.transport_name();
+    let route_reason = gpu.replay.fallback_reason().map(str::to_string);
+    // Last: it poisons the route, which is the behaviour under test.
+    let failure = redline_qwen4_replay_failure(gpu, bundle, context, pm4)?;
 
     Ok(serde_json::json!({
         "type": "redline_shadow_result",
@@ -3840,9 +3934,13 @@ fn redline_shadow_qwen4(
         "logits_equal": replay_arm[iterations - 1].logits == hip_arm[iterations - 1].logits,
         "state_bytes_compared_per_position": compared_bytes,
         "route": {
-            "phase": format!("{:?}", gpu.replay.state()).to_ascii_lowercase(),
-            "transport": gpu.replay.transport_name(),
-            "reason": gpu.replay.fallback_reason(),
+            "phase": route_phase,
+            // The transport actually replayed is the prepared plan's, which a
+            // shadow arm chooses; the controller's configured transport is reported
+            // separately so the two cannot be confused.
+            "transport": if pm4 { "pm4_ib" } else { "aql_packets" },
+            "configured_transport": route_transport,
+            "reason": route_reason,
             "counters": {
                 "replays": iterations,
                 "replay_failures": 0,
@@ -3859,6 +3957,7 @@ fn redline_shadow_qwen4(
             "aql_equals_unique_kernels": true,
         },
         "prepared_identity": prepared_identity,
+        "failure_behavior": failure,
         "parity": {
             "q8_byte_parity_invalid": false,
             "windows": windows,
