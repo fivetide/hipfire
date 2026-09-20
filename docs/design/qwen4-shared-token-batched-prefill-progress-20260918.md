@@ -1003,3 +1003,36 @@ MoE expert-weight traffic alone (the full 512-expert union, ≈64 GB, at the
 measured 223.9 GB/s streaming ceiling) is ≈0.29 s of unavoidable traffic.  A
 realistic floor with this kernel family is therefore ≈1.1-1.2 s (≈250 tok/s),
 not 0.58 s.  No promotion, admission, or speed-floor claim is made.
+
+## Disposition — pp500 prefill target closed (2026-09-20)
+
+The Qwen4 gfx1151 prefill workstream is closed at its measured result rather
+than at the pp500 (500 tok/s) target.
+
+Reached: **189.3 tok/s median** on the pinned 291-token fixture (fresh
+processes: 189.3 / 189.0 / 191.3), up from 88.6 at the start of the session —
+**2.14×** — with exact bitwise parity preserved end to end (`comparison.exact_bits=true`,
+`state_exact=true`, prefill logits `max_abs=0.0` on both the 291-token and the
+513-token/511-chunk fixtures), the AR serve route verified (`Paris`, one
+terminal event, zero post-terminal bytes), the serialized workspace library
+suite green, and every touched crate `rustfmt`/`clippy` clean. Landed as
+commit `34d79c453` (grouped and dense kernel work, gate liveness elision and
+the measured dispatch entries) and `2c175b7c2` (PLE read-granularity fix).
+
+Not reached: 500 tok/s, still 2.6× away, and closed as **not achievable under
+the byte-parity contract**, not as an implementation gap left open. The bound
+is structural: MoE expert-weight traffic for one ≥291-token chunk is the full
+512-expert union (≈64 GB) which is ≈0.29 s against a 0.582 s total budget, and
+the grouped kernels are now decode/issue-bound rather than bandwidth-bound, so
+further tiling buys single-digit percentages. Estimated practical ceiling for
+this kernel family: ≈250-400 tok/s.
+
+What would change the answer, for whoever picks this up next: relaxing the
+bitwise-parity requirement for the prefill path so WMMA/MFMA-class kernels
+become admissible, which needs a new acceptance definition (numerical tolerance
+rather than exact bits) and re-validation of every affected kernel; or measuring
+a different, longer fixture, where fixed launch and read costs amortize — that
+raises the reported number without making a 291-token prompt any faster.
+
+No promotion, admission, or speed-floor change is claimed by any of this, and
+the 500 tok/s target remains unmet.
