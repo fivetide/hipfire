@@ -175,12 +175,13 @@ pub fn gated_delta_step(gpu: &mut Gpu, p: &GatedDeltaStep<'_>) -> HipResult<()> 
     args.push_i32(value_dim);
     args.push_f32((p.key_dim as f32).sqrt().recip());
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         kernel,
         [value_heads_grid, value_dim_grid, 1],
         [block_x, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 /// Persistent row-batched GDN recurrence for the exact gfx1151 128x128 route.
@@ -258,12 +259,13 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     args.push_i32(value_dim);
     args.push_f32((p.key_dim as f32).sqrt().recip());
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "gated_delta_step_halves_state128_persistent256_gfx1151",
         [value_heads_grid, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 /// Device-side F32 -> BF16 storage -> F32 conversion at a source activation
@@ -298,12 +300,13 @@ pub fn bf16_roundtrip_f32(gpu: &mut Gpu, p: &Bf16Roundtrip<'_>) -> HipResult<()>
     args.push_ptr(p.output.buf.as_ptr());
     args.push_i32(elements_i);
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "bf16_roundtrip_f32",
         [grid, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 /// HC-specific in-place fusion of three source BF16 boundaries, F32 scaling,
@@ -328,12 +331,13 @@ pub fn hc_activation_fused_f32(gpu: &mut Gpu, p: &HcActivationFused<'_>) -> HipR
     args.push_i32(elements_i);
     args.push_f32(p.scale);
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "hc_activation_fused_f32",
         [grid, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 
@@ -367,12 +371,13 @@ pub fn bf16_scaled_add(gpu: &mut Gpu, p: &Bf16ScaledAdd<'_>) -> HipResult<()> {
     args.push_ptr(p.scalar.buf.as_ptr());
     args.push_i32(elements_i);
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "bf16_scaled_add_f32",
         [grid, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 /// Source-exact BF16 product/residual add for a row-batched shared expert.
@@ -409,12 +414,13 @@ pub fn bf16_scaled_add_batched(gpu: &mut Gpu, p: &Bf16ScaledAddBatched<'_>) -> H
     args.push_i32(rows);
     args.push_i32(elements);
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "bf16_scaled_add_batched_f32",
         [grid, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 
@@ -461,12 +467,13 @@ pub fn hyper_read(gpu: &mut Gpu, p: &HyperRead<'_>) -> HipResult<()> {
     args.push_i32(hidden);
     args.push_i32(rank);
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "hyper_read_f32",
         [1, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 
@@ -518,12 +525,13 @@ pub fn hyper_read_projected(gpu: &mut Gpu, p: &HyperReadProjected<'_>) -> HipRes
     args.push_i32(hidden);
     args.push_i32(rows_i);
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "hyper_read_projected_f32",
         [grid_x, grid_y, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 
@@ -574,12 +582,13 @@ pub fn hyper_write(gpu: &mut Gpu, p: &HyperWrite<'_>) -> HipResult<()> {
     args.push_i32(hidden);
     args.push_i32(rows_i);
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "hyper_write_f32",
         [grid_x, grid_y, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 
@@ -612,12 +621,13 @@ pub fn hyper_final(gpu: &mut Gpu, p: &HyperFinal<'_>) -> HipResult<()> {
     args.push_i32(branches);
     args.push_i32(hidden);
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "hyper_final_f32",
         [grid, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 pub struct HyperNorm<'a> {
@@ -658,12 +668,13 @@ pub fn hyper_norm(gpu: &mut Gpu, p: &HyperNorm<'_>) -> HipResult<()> {
     args.push_i32(hidden);
     args.push_i32(rows_i);
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "hyper_norm_f32",
         [branch_grid, row_grid, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 pub struct GatedDeltaConv<'a> {
@@ -676,6 +687,10 @@ pub struct GatedDeltaConv<'a> {
     pub history_rows: usize,
     pub kernel_size: usize,
     pub cursor: usize,
+    /// Index of this row inside the chunk whose start position the tape replays
+    /// at. The caller derives `cursor = (start_position + row_index) %
+    /// history_rows`, so the declared replay binding re-derives exactly that.
+    pub row_index: usize,
 }
 
 pub fn gated_delta_conv(gpu: &mut Gpu, p: &GatedDeltaConv<'_>) -> HipResult<()> {
@@ -718,13 +733,41 @@ pub fn gated_delta_conv(gpu: &mut Gpu, p: &GatedDeltaConv<'_>) -> HipResult<()> 
     args.push_i32(history_rows);
     args.push_i32(kernel_size);
     args.push_i32(cursor);
+    // The offset the scalar actually landed at, not a hand-counted layout
+    // constant: a changed argument list cannot silently move the binding.
+    let cursor_offset = args.len() - 4;
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    // The cursor is `(start_position + row_index) % history_rows` by
+    // construction, so it is a declared dynamic field rather than an unexplained
+    // kernarg difference: replay re-derives it instead of replaying the
+    // capture-position ring slot.
+    //
+    // Kernel width 1 (`history_rows == 0`) has no ring to index: the cursor is
+    // the constant 0, and a modulo binding would be meaningless (and rejected),
+    // so nothing is declared. The placeholder below is never handed to the
+    // recorder in that case.
+    let cursor_binding = [crate::replay::ReplayKernargBinding::PositionModU32 {
+        offset: cursor_offset,
+        addend: u32::try_from(p.row_index)
+            .map_err(|_| HipError::new(0, "GDN convolution row index exceeds u32"))?,
+        modulus: u32::try_from(p.history_rows.max(1))
+            .map_err(|_| HipError::new(0, "GDN convolution history rows exceed u32"))?,
+    }];
+    let declared: &[crate::replay::ReplayKernargBinding] = if p.history_rows > 0 {
+        &cursor_binding
+    } else {
+        &[]
+    };
+    gpu.launch_blob_recorded(
         "gated_delta_conv_bf16_f32",
         [grid, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings {
+            grid: None,
+            kernargs: declared,
+        },
     )
 }
 /// Ordered K=4 causal convolution over row-major `[rows, channels]` input.
@@ -792,13 +835,27 @@ pub fn gated_delta_conv_batched(gpu: &mut Gpu, p: &GatedDeltaConvBatched<'_>) ->
     args.push_i32(history_rows);
     args.push_i32(kernel_size);
     args.push_i32(start_cursor);
+    let start_cursor_offset = args.len() - 4;
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    // `start_cursor` is `start_position % history_rows` for the chunk (the
+    // kernel advances the ring per row from there), so the declared binding
+    // re-derives it at the replay position.
+    let start_cursor_binding = [crate::replay::ReplayKernargBinding::PositionModU32 {
+        offset: start_cursor_offset,
+        addend: 0,
+        modulus: u32::try_from(p.history_rows)
+            .map_err(|_| HipError::new(0, "GDN batched convolution history rows exceed u32"))?,
+    }];
+    gpu.launch_blob_recorded(
         "gated_delta_conv_bf16_f32_batched_k4_gfx1151",
         [grid, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings {
+            grid: None,
+            kernargs: &start_cursor_binding,
+        },
     )
 }
 
@@ -837,12 +894,13 @@ pub fn gated_delta_params(gpu: &mut Gpu, p: &GatedDeltaParams<'_>, heads: usize)
     }
     args.push_i32(heads_i);
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "gated_delta_params_bf16_f32",
         [grid, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 /// Row-batched parameter expansion for the exact Qwen4 prefill route.
@@ -891,12 +949,13 @@ pub fn gated_delta_params_batched(gpu: &mut Gpu, p: &GatedDeltaParamsBatched<'_>
     args.push_i32(rows);
     args.push_i32(heads);
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "gated_delta_params_bf16_f32_batched",
         [grid, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 
@@ -928,12 +987,13 @@ pub fn gated_delta_params_f32(
     }
     args.push_i32(heads_i);
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "gated_delta_params_f32",
         [grid, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 
@@ -974,12 +1034,13 @@ pub fn gated_delta_gate(gpu: &mut Gpu, p: &GatedDeltaGate<'_>) -> HipResult<()> 
     args.push_i32(value_heads);
     args.push_i32(value_dim);
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "gated_delta_gate_bf16_f32",
         [value_heads_grid, value_dim_grid, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 /// Row-batched gated RMSNorm with the exact BF16 recurrent boundary folded
@@ -1029,12 +1090,13 @@ pub fn gated_delta_gate_batched(gpu: &mut Gpu, p: &GatedDeltaGateBatched<'_>) ->
     args.push_i32(value_heads);
     args.push_i32(value_dim);
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "gated_delta_gate_bf16_f32_batched",
         [value_heads_grid, value_dim_grid, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 pub struct IndexedAttentionNormRope<'a> {
@@ -1091,12 +1153,13 @@ pub fn indexed_attention_norm_rope(
     args.push_i32(position);
     args.push_i32(rotary_dim);
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "indexed_attention_norm_rope_f32",
         [head_grid, dim_grid, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 
@@ -1180,12 +1243,13 @@ pub fn indexed_attention_norm_rope_batch(
         args.push_i32(value);
     }
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "indexed_attention_norm_rope_f32_batched",
         [head_grid, dim_grid, row_grid],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 
@@ -1233,12 +1297,13 @@ pub fn indexed_attention_cache_append(
     args.push_i32(position);
     args.push_i32(kv_width);
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "indexed_attention_cache_append_f32",
         [grid, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 
@@ -1294,12 +1359,13 @@ pub fn indexed_attention_cache_append_batch(
         args.push_i32(value);
     }
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "indexed_attention_cache_append_f32_batched",
         [grid, row_grid, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 pub struct IndexedAttentionSelect<'a> {
@@ -1380,12 +1446,13 @@ pub fn indexed_attention_select(gpu: &mut Gpu, p: &IndexedAttentionSelect<'_>) -
         args.push_i32(value);
     }
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         kernel_name,
         [1, 1, 1],
         block,
         shared_mem,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 
@@ -1495,12 +1562,13 @@ pub fn indexed_attention_select_batch(
         args.push_i32(value);
     }
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         kernel_name,
         [row_grid, 1, 1],
         block,
         shared_mem,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 /// Device-side stable reuse of a prior MTP QSA selection row.
@@ -1550,12 +1618,13 @@ pub fn indexed_attention_reuse_selection(
     args.push_i32(position);
     args.push_i32(capacity);
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "indexed_attention_reuse_selection",
         [1, 1, 1],
         [1, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 
@@ -1619,12 +1688,13 @@ pub fn indexed_attention_pool_rope(
     args.push_i32(compress);
     args.push_i32(index_dim);
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "indexed_attention_pool_rope_f32",
         [block_grid, dim_grid, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 
@@ -1709,12 +1779,13 @@ pub fn indexed_attention_attention(
         args.push_i32(value);
     }
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         kernel_name,
         [head_grid, dim_grid, 1],
         [QSA_ATTENTION_PARALLEL_THREADS, 1, 1],
         shared_mem,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 
@@ -1848,12 +1919,13 @@ pub fn indexed_attention_attention_batch(
         args.push_i32(value);
     }
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         kernel_name,
         [head_grid, dim_grid, row_grid],
         block,
         shared_mem,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 
@@ -1887,12 +1959,13 @@ pub fn indexed_attention_pool(gpu: &mut Gpu, p: &IndexedAttentionPool<'_>) -> Hi
     args.push_i32(block_count);
     args.push_i32(head_dim);
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "indexed_attention_pool_f32",
         [block_grid, dim_grid, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 
@@ -1917,12 +1990,13 @@ pub fn scale_f32(gpu: &mut Gpu, p: &ScaleF32<'_>) -> HipResult<()> {
     args.push_i32(elements_i);
     args.push_f32(p.scale);
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "scale_f32",
         [grid, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 
@@ -1958,12 +2032,13 @@ pub fn argmax_f32(gpu: &mut Gpu, p: &ArgmaxF32<'_>) -> HipResult<()> {
     args.push_i32(rows);
     args.push_i32(vocab);
     args.pad_to(16);
-    gpu.launch_kernel_blob(
+    gpu.launch_blob_recorded(
         "argmax_f32",
         [row_grid, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 
@@ -1985,6 +2060,66 @@ mod tests {
         tensor.shape = shape.to_vec();
         tensor.dtype = dtype;
         tensor
+    }
+
+    #[test]
+    fn recorded_blob_launch_enters_the_tape_with_the_bytes_it_launched() {
+        let Some(mut gpu) = try_gfx1151_gpu() else {
+            eprintln!("skip: no gfx1151 GPU");
+            return;
+        };
+        let input = [1.0f32, -2.0, 3.5, 0.25];
+        let values = gpu
+            .upload_f32(&input, &[input.len()])
+            .expect("scale upload");
+
+        // Ordinary path: no recorder armed, so the same launch leaves no tape.
+        scale_f32(
+            &mut gpu,
+            &ScaleF32 {
+                values: &values,
+                scale: 2.0,
+            },
+        )
+        .expect("scale");
+        assert_eq!(gpu.replay.recorded_launches().len(), 0);
+
+        // Open a recording window: the launch must now enter the tape with the
+        // exact bytes it launched, resolve its owning artifact, AND still run.
+        gpu.replay =
+            crate::replay::ReplayController::new_armed(crate::replay::ReplayBackendRequest::Auto);
+        gpu.replay.begin_capture().expect("open recording window");
+        scale_f32(
+            &mut gpu,
+            &ScaleF32 {
+                values: &values,
+                scale: 3.0,
+            },
+        )
+        .expect("scale");
+        let recorded = gpu.replay.recorded_launches();
+        assert_eq!(recorded.len(), 1, "one launch, one tape entry");
+        assert_eq!(recorded[0].kernel, "scale_f32");
+        assert!(
+            recorded[0].artifact.is_some(),
+            "the owning artifact must resolve, or preparation cannot lower the tape"
+        );
+        assert_eq!(recorded[0].grid, [1, 1, 1]);
+        let kernarg = &recorded[0].kernarg;
+        assert_eq!(kernarg.len() % 16, 0, "blob is tail-padded");
+        assert_eq!(
+            u64::from_ne_bytes(kernarg[0..8].try_into().unwrap()),
+            values.buf.as_ptr() as u64
+        );
+        assert_eq!(
+            i32::from_ne_bytes(kernarg[8..12].try_into().unwrap()),
+            input.len() as i32
+        );
+        assert_eq!(f32::from_ne_bytes(kernarg[12..16].try_into().unwrap()), 3.0);
+
+        // The recorded launch executed: (input * 2.0) * 3.0, all exact in f32.
+        let actual = gpu.download_f32(&values).expect("scale download");
+        assert_eq!(actual, vec![6.0, -12.0, 21.0, 1.5]);
     }
 
     #[test]

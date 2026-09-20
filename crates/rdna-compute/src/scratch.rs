@@ -156,42 +156,12 @@ pub(crate) fn launch_maybe_blob(
         let mut blob = blob_builder();
         blob.pad_to(16);
         if record {
-            // Single decision point for how a launch is recorded: same
-            // artifact lookup shape as `Gpu::launch_maybe_blob_bound`.
-            let artifact = compiler.as_ref().and_then(|c| {
-                c.compiled_kernels()
-                    .get(func_name)
-                    .or_else(|| match func_name {
-                        "mq_rotate_x" => c.compiled_kernels().get("gemv_mq4g256"),
-                        "deinterleave_f32_batched" => {
-                            c.compiled_kernels().get("deinterleave_batched")
-                        }
-                        name if name.starts_with("gemv_hfq4g256_residual_sigmoid_scaled_gpu") => {
-                            c.compiled_kernels().get("gemv_hfq4g256_residual_scaled")
-                        }
-                        "gemv_hfq4g256_moe_gate_up_k8_indexed" => c
-                            .compiled_kernels()
-                            .get("gemv_hfq4g256_moe_gate_up_indexed"),
-                        name if name.starts_with("gemv_hfq4g256_multirow_r") => c
-                            .compiled_kernels()
-                            .get("gemv_hfq4g256_multirow_default")
-                            .or_else(|| c.compiled_kernels().get("gemv_hfq4g256_multirow_rdna3")),
-                        name if name.starts_with("gemv_hfq4g256_residual_multirow_r") => c
-                            .compiled_kernels()
-                            .get("gemv_hfq4g256_residual_multirow_default")
-                            .or_else(|| {
-                                c.compiled_kernels()
-                                    .get("gemv_hfq4g256_residual_multirow_rdna3")
-                            }),
-                        _ => None,
-                    })
-                    .or_else(|| {
-                        func_name
-                            .strip_suffix("_f32")
-                            .and_then(|name| c.compiled_kernels().get(name))
-                    })
-                    .cloned()
-            });
+            // Single decision point for how a launch is recorded: the artifact
+            // alias table and the record shape are shared with
+            // `Gpu::launch_maybe_blob_bound`.
+            let artifact = compiler
+                .as_ref()
+                .and_then(|c| crate::dispatch::recorded_launch_artifact(c, func_name));
             replay.as_mut().unwrap().record_hip_launch_typed_bound(
                 hip,
                 func_name,
@@ -201,6 +171,7 @@ pub(crate) fn launch_maybe_blob(
                 shared_mem,
                 blob.as_bytes(),
                 None,
+                &[],
             );
         }
         if capture_mode {

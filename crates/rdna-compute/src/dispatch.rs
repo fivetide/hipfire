@@ -177,6 +177,65 @@ fn pm4_dynamic_grid_enabled() -> bool {
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
 }
 
+/// Dynamic fields a launch declares to the retained-replay recorder.
+///
+/// A declaration is how the lowering *names* a value that changes between
+/// forwards instead of leaving it to be discovered by differencing two
+/// recordings. The recorded bytes always hold the capture-position values; a
+/// grid binding narrows the recorded maximum grid for the replay position, and
+/// each kernarg binding re-derives one 4-byte scalar from that position.
+#[derive(Clone, Copy, Default)]
+pub struct ReplayLaunchBindings<'a> {
+    pub grid: Option<crate::replay::ReplayGridBinding>,
+    pub kernargs: &'a [crate::replay::ReplayKernargBinding],
+}
+
+impl ReplayLaunchBindings<'static> {
+    /// No dynamic fields: replay the launch exactly as captured.
+    pub const NONE: Self = Self {
+        grid: None,
+        kernargs: &[],
+    };
+}
+
+/// Resolve the compiled artifact that owns a launched symbol.
+///
+/// `KernelCompiler::compiled_kernels()` is keyed by module name while the
+/// recorder stores the launched *function* name, so runtime-specialized
+/// variants resolve through this one alias table. `None` means the artifact is
+/// unknown and preparation will reject the tape rather than guess.
+pub(crate) fn recorded_launch_artifact(
+    compiler: &KernelCompiler,
+    func_name: &str,
+) -> Option<std::path::PathBuf> {
+    let compiled = compiler.compiled_kernels();
+    compiled
+        .get(func_name)
+        .or_else(|| match func_name {
+            "mq_rotate_x" => compiled.get("gemv_mq4g256"),
+            "deinterleave_f32_batched" => compiled.get("deinterleave_batched"),
+            name if name.starts_with("gemv_hfq4g256_residual_sigmoid_scaled_gpu") => {
+                compiled.get("gemv_hfq4g256_residual_scaled")
+            }
+            "gemv_hfq4g256_moe_gate_up_k8_indexed" => {
+                compiled.get("gemv_hfq4g256_moe_gate_up_indexed")
+            }
+            name if name.starts_with("gemv_hfq4g256_multirow_r") => compiled
+                .get("gemv_hfq4g256_multirow_default")
+                .or_else(|| compiled.get("gemv_hfq4g256_multirow_rdna3")),
+            name if name.starts_with("gemv_hfq4g256_residual_multirow_r") => compiled
+                .get("gemv_hfq4g256_residual_multirow_default")
+                .or_else(|| compiled.get("gemv_hfq4g256_residual_multirow_rdna3")),
+            _ => None,
+        })
+        .or_else(|| {
+            func_name
+                .strip_suffix("_f32")
+                .and_then(|name| compiled.get(name))
+        })
+        .cloned()
+}
+
 /// Minimum batch size at which the FP8 WMMA prefill path is enabled.
 /// Below this, the FP16 WMMA path wins on gfx1201 (measured 0.71-0.94×
 /// at N ≤ 512, 0.82-1.26× only at N ≥ 2048 with high DPM variance —
@@ -2313,7 +2372,7 @@ impl Gpu {
             block,
             shared_mem,
             params,
-            None,
+            ReplayLaunchBindings::NONE,
             blob_builder,
         )
     }
@@ -2346,7 +2405,10 @@ impl Gpu {
             block,
             shared_mem,
             params,
-            grid_binding,
+            ReplayLaunchBindings {
+                grid: grid_binding,
+                kernargs: &[],
+            },
             blob_builder,
         )
     }
@@ -2359,119 +2421,75 @@ impl Gpu {
         block: [u32; 3],
         shared_mem: u32,
         params: &mut [*mut std::ffi::c_void],
-        grid_binding: Option<crate::replay::ReplayGridBinding>,
+        bindings: ReplayLaunchBindings<'_>,
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
         let record = self.replay.is_recording();
-        let result: HipResult<()> = if record
-            || self.graphs.capture_mode
-            || self.flags.force_blob_path
-        {
-            let mut blob = blob_builder();
-            blob.pad_to(16);
-            if record {
-                let artifact = self
-                    .compiler
-                    .compiled_kernels()
-                    .get(func_name)
-                    .or_else(|| match func_name {
-                        "mq_rotate_x" => self.compiler.compiled_kernels().get("gemv_mq4g256"),
-                        "deinterleave_f32_batched" => {
-                            self.compiler.compiled_kernels().get("deinterleave_batched")
-                        }
-                        name if name.starts_with("gemv_hfq4g256_residual_sigmoid_scaled_gpu") => {
-                            self.compiler
-                                .compiled_kernels()
-                                .get("gemv_hfq4g256_residual_scaled")
-                        }
-                        "gemv_hfq4g256_moe_gate_up_k8_indexed" => self
-                            .compiler
-                            .compiled_kernels()
-                            .get("gemv_hfq4g256_moe_gate_up_indexed"),
-                        name if name.starts_with("gemv_hfq4g256_multirow_r") => self
-                            .compiler
-                            .compiled_kernels()
-                            .get("gemv_hfq4g256_multirow_default")
-                            .or_else(|| {
-                                self.compiler
-                                    .compiled_kernels()
-                                    .get("gemv_hfq4g256_multirow_rdna3")
-                            }),
-                        name if name.starts_with("gemv_hfq4g256_residual_multirow_r") => self
-                            .compiler
-                            .compiled_kernels()
-                            .get("gemv_hfq4g256_residual_multirow_default")
-                            .or_else(|| {
-                                self.compiler
-                                    .compiled_kernels()
-                                    .get("gemv_hfq4g256_residual_multirow_rdna3")
-                            }),
-                        _ => None,
-                    })
-                    .or_else(|| {
-                        func_name
-                            .strip_suffix("_f32")
-                            .and_then(|name| self.compiler.compiled_kernels().get(name))
-                    })
-                    .cloned();
-                self.replay.record_hip_launch_typed_bound(
-                    &self.hip,
-                    func_name,
-                    artifact,
-                    grid,
-                    block,
-                    shared_mem,
-                    blob.as_bytes(),
-                    grid_binding,
-                );
-            }
-            let func = &self.functions[func_name];
-            if self.graphs.capture_mode {
-                self.graphs.capture_blobs.push(blob.into_vec());
-                let buf = self.graphs.capture_blobs.last_mut().unwrap();
-                // SAFETY: every caller's builder encodes the same argument
-                // values supplied by `params`; graph-owned storage stays live
-                // through graph instantiation and replay.
-                unsafe {
-                    self.hip.launch_kernel_blob(
-                        func,
+        let result: HipResult<()> =
+            if record || self.graphs.capture_mode || self.flags.force_blob_path {
+                let mut blob = blob_builder();
+                blob.pad_to(16);
+                if record {
+                    let artifact = recorded_launch_artifact(&self.compiler, func_name);
+                    self.replay.record_hip_launch_typed_bound(
+                        &self.hip,
+                        func_name,
+                        artifact,
                         grid,
                         block,
                         shared_mem,
-                        self.active_stream.as_ref(),
-                        buf.as_mut_slice(),
-                    )
+                        blob.as_bytes(),
+                        bindings.grid,
+                        bindings.kernargs,
+                    );
+                }
+                let func = &self.functions[func_name];
+                if self.graphs.capture_mode {
+                    self.graphs.capture_blobs.push(blob.into_vec());
+                    let buf = self.graphs.capture_blobs.last_mut().unwrap();
+                    // SAFETY: every caller's builder encodes the same argument
+                    // values supplied by `params`; graph-owned storage stays live
+                    // through graph instantiation and replay.
+                    unsafe {
+                        self.hip.launch_kernel_blob(
+                            func,
+                            grid,
+                            block,
+                            shared_mem,
+                            self.active_stream.as_ref(),
+                            buf.as_mut_slice(),
+                        )
+                    }
+                } else {
+                    let mut bytes = blob.into_vec();
+                    // SAFETY: HIP consumes the contiguous argument bytes during
+                    // this one-shot launch; `bytes` remains live across the call.
+                    unsafe {
+                        self.hip.launch_kernel_blob(
+                            func,
+                            grid,
+                            block,
+                            shared_mem,
+                            self.active_stream.as_ref(),
+                            bytes.as_mut_slice(),
+                        )
+                    }
                 }
             } else {
-                let mut bytes = blob.into_vec();
-                // SAFETY: HIP consumes the contiguous argument bytes during
-                // this one-shot launch; `bytes` remains live across the call.
+                let func = &self.functions[func_name];
+                // SAFETY: forwarded from the typed launch wrapper that assembled
+                // `params` for this kernel signature.
                 unsafe {
-                    self.hip.launch_kernel_blob(
+                    self.hip.launch_kernel(
                         func,
                         grid,
                         block,
                         shared_mem,
                         self.active_stream.as_ref(),
-                        bytes.as_mut_slice(),
+                        params,
                     )
                 }
-            }
-        } else {
-            let func = &self.functions[func_name];
-            // SAFETY: forwarded from the typed launch wrapper that assembled
-            // `params` for this kernel signature.
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    grid,
-                    block,
-                    shared_mem,
-                    self.active_stream.as_ref(),
-                    params,
-                )
-            }
-        };
+            };
         if result.is_ok() {
             self.last_kernel = Some(func_name.to_string());
         }
@@ -2623,6 +2641,89 @@ impl Gpu {
                 .launch_kernel_blob(func, grid, block, shared_mem, self.stream_ref(), kernargs)
         }
         .map_err(|e| e.with_kernel(func_name))
+    }
+
+    /// Launch an already-built kernarg blob through the recorder-aware funnel.
+    ///
+    /// Blob-shaped twin of [`Self::launch_maybe_blob`] for callers that assemble
+    /// a `hip_bridge::KernargBlob` directly (the shared tensor/grouped op
+    /// owners). It reaches the same recorder, captures the same exact bytes, and
+    /// keeps the same HipGraph capture-blob accounting as the params-shaped
+    /// funnel, so a launch cannot be captured in one tape and missed in the
+    /// other. [`Self::launch_kernel_blob`] stays the raw entry for the funnel
+    /// itself and for the recorded-HIP oracle, which must never re-record.
+    pub fn launch_blob_recorded(
+        &mut self,
+        func_name: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        kernargs: &mut [u8],
+        bindings: ReplayLaunchBindings<'_>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.replay.is_recording() {
+            let artifact = recorded_launch_artifact(&self.compiler, func_name);
+            self.replay.record_hip_launch_typed_bound(
+                &self.hip,
+                func_name,
+                artifact,
+                grid,
+                block,
+                shared_mem,
+                kernargs,
+                bindings.grid,
+                bindings.kernargs,
+            );
+        }
+        let result = if self.graphs.capture_mode {
+            // Retain the exact bytes for graph instantiation: HIP records the
+            // blob pointer, so graph-owned storage must outlive the capture.
+            self.graphs.capture_blobs.push(kernargs.to_vec());
+            let buf = self.graphs.capture_blobs.last_mut().unwrap();
+            let func = self.functions.get(func_name).ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("launch_blob_recorded: function '{func_name}' not loaded"),
+                )
+            })?;
+            // SAFETY: HIP consumes the contiguous argument bytes during this
+            // one-shot launch; graph-owned storage stays live through
+            // instantiation and replay.
+            unsafe {
+                self.hip.launch_kernel_blob(
+                    func,
+                    grid,
+                    block,
+                    shared_mem,
+                    self.active_stream.as_ref(),
+                    buf.as_mut_slice(),
+                )
+            }
+        } else {
+            let func = self.functions.get(func_name).ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("launch_blob_recorded: function '{func_name}' not loaded"),
+                )
+            })?;
+            // SAFETY: HIP consumes the contiguous argument bytes during this
+            // one-shot launch; `kernargs` remains live across the call.
+            unsafe {
+                self.hip.launch_kernel_blob(
+                    func,
+                    grid,
+                    block,
+                    shared_mem,
+                    self.stream_ref(),
+                    kernargs,
+                )
+            }
+        };
+        if result.is_ok() {
+            self.last_kernel = Some(func_name.to_string());
+        }
+        result.map_err(|e| e.with_kernel(func_name))
     }
 
     /// Compile and load a kernel, caching the result.

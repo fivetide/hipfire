@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Retained-replay funnel coverage for the Qwen4 declarative program: the shared
+  tensor-op owner (`rdna-compute::tensor_ops`) launched every Qwen4 GDN/QSA/HC
+  op through the raw `launch_kernel_blob` entry, so those launches never reached
+  `ReplayController` and a capture would have been a silently truncated tape.
+  A new `Gpu::launch_blob_recorded` entry joins the same recorder, exact-bytes
+  capture, and HipGraph capture-blob accounting as the params-shaped funnel, and
+  all 31 raw sites migrated to it. Dynamic kernarg fields can now be *declared*
+  at the lowering that computes them (`ReplayKernargBinding::PositionDivU32` /
+  `PositionModU32`, carried on the recorded launch and merged at prepare with
+  one owner per slot); the GDN convolution ring cursor declares the first such
+  binding instead of being discovered by recording differencing. No route is
+  admitted, no PM4 preparation is claimed, and the sealed-MoE pointer-contract
+  refusal for specialized routes still fails closed. See [the plan record](docs/design/qwen4-program-retained-pm4.md).
 - Rename Qwen4 CPU/reference modules to `reference_forward` and `reference_mtp`; production `gpu_forward`/`mtp_gpu` paths remain unchanged and the old public module paths are removed.
 - Sealed MoE calls lower to granular computation programs; Qwen root-routed EP decode and batched prefill share a checked collective schedule. Compact EP gathers expert outputs in global top-k slot layout and runs the ordinary single-device slot-order combine once on root before byte-broadcasting the finished partial, avoiding rank-grouped floating-point reassociation. Existing kernels, ownership, other-family reduction order, and diagnostic policies are retained. This does not admit new parallel axes or product replay routes; see [the design and validation boundary](docs/design/sealed-granular-moe.md).
 - Add experimental `qwen3.8:flash-next` registry availability for the uploaded 178 GB HFQ artifact with a conservative 128 GB tested-hardware gate; the runtime minimum is unmeasured, and this does not change product or replay admission.

@@ -638,6 +638,7 @@ pub fn execute_gated_delta_net(
                     history_rows,
                     kernel_size: op.conv_kernel,
                     cursor,
+                    row_index: row,
                 },
             ))?;
             let a_row = view(&a, row * op.value_heads, op.value_heads);
