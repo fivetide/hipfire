@@ -44,6 +44,7 @@ use hipfire_dispatch::pipeline::{
 };
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_runtime::weight_manifest::ExpertSourceLayout;
+use rdna_compute::replay::ShadowBodyRoute;
 use rdna_compute::tensor_ops::{argmax_f32, ArgmaxF32};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use smallvec::SmallVec;
@@ -2230,34 +2231,55 @@ impl Qwen4GpuForward {
             // capture is the speculative-verify shape and must never enter the tape.
             let eligible = n == 1 && wide_hidden_capture.is_none();
             gpu.replay.set_forward_eligible(eligible);
-            match retained_body_action(
-                eligible,
-                gpu.replay.state(),
-                specialized_sealed_moe_retained_admission(),
-            ) {
-                RetainedBodyAction::Ineligible => {}
-                RetainedBodyAction::Refuse { reason } => {
-                    // The route cannot be retained: poison before the body so this
-                    // and every later forward runs on HIP.
-                    gpu.replay.poison(reason);
-                    eprintln!("[redline] qwen4 retained body unavailable: {reason}");
+            // A manual shadow controller states the executor directly: one prepared
+            // tape is compared across the exact-kernarg HIP oracle, the retained
+            // transport, and ordinary HIP. The shadow arms never record, so they do
+            // not run the production lifecycle below.
+            let shadow_route = if eligible {
+                gpu.replay.shadow_body_route()
+            } else {
+                None
+            };
+            if shadow_route.is_none() {
+                match retained_body_action(
+                    eligible,
+                    gpu.replay.state(),
+                    specialized_sealed_moe_retained_admission(),
+                ) {
+                    RetainedBodyAction::Ineligible => {}
+                    RetainedBodyAction::Refuse { reason } => {
+                        // The route cannot be retained: poison before the body so this
+                        // and every later forward runs on HIP.
+                        gpu.replay.poison(reason);
+                        eprintln!("[redline] qwen4 retained body unavailable: {reason}");
+                    }
+                    RetainedBodyAction::Arm { diagnostic } => {
+                        diagnostic_capture = diagnostic;
+                        launched_before = hip_bridge::launch_counters::launch_kernel::count();
+                        effects_before = (
+                            hip_bridge::launch_counters::memcpy_htod::count(),
+                            hip_bridge::launch_counters::memcpy_dtod::count(),
+                            hip_bridge::launch_counters::memcpy_dtoh::count(),
+                            hip_bridge::launch_counters::memset::count(),
+                        );
+                        gpu.replay
+                            .begin_auto_capture_if_armed()
+                            .map_err(|reason| invalid(reason))?;
+                    }
+                    RetainedBodyAction::Route => {}
                 }
-                RetainedBodyAction::Arm { diagnostic } => {
-                    diagnostic_capture = diagnostic;
-                    launched_before = hip_bridge::launch_counters::launch_kernel::count();
-                    effects_before = (
-                        hip_bridge::launch_counters::memcpy_htod::count(),
-                        hip_bridge::launch_counters::memcpy_dtod::count(),
-                        hip_bridge::launch_counters::memcpy_dtoh::count(),
-                        hip_bridge::launch_counters::memset::count(),
-                    );
-                    gpu.replay
-                        .begin_auto_capture_if_armed()
-                        .map_err(|reason| invalid(reason))?;
-                }
-                RetainedBodyAction::Route => {}
             }
-            let routed = if gpu.replay.should_route_pm4() {
+            let pm4_route = match shadow_route {
+                Some(ShadowBodyRoute::Plan) => gpu.replay.prepared_pm4_plan_ready(),
+                Some(_) => false,
+                None => gpu.replay.should_route_pm4(),
+            };
+            let aql_route = match shadow_route {
+                Some(ShadowBodyRoute::Plan) => gpu.replay.prepared_aql_plan_ready(),
+                Some(_) => false,
+                None => gpu.replay.should_route_aql(),
+            };
+            let routed = if pm4_route {
                 // SAFETY: the boundary above staged every host input the tape's
                 // recorded launches read, and every pointer in the tape is owned by
                 // this bundle for the plan's lifetime.
@@ -2268,7 +2290,20 @@ impl Qwen4GpuForward {
                         return Err(invalid(format!("Qwen4 retained replay failed: {reason}")));
                     }
                 }
-            } else if gpu.replay.should_route_aql() {
+            } else if shadow_route == Some(ShadowBodyRoute::HipOracle) {
+                // The exact-kernarg oracle: re-execute the recorded HIP launch
+                // sequence. This is the arm that proves the tape names the dispatches
+                // ordinary HIP issues, not merely that some retained transport runs.
+                let launches = gpu.replay.recorded_launches().len();
+                match gpu.replay_recorded_hip_prefix_at(launches, next_position) {
+                    Ok(_) => true,
+                    Err(reason) => {
+                        return Err(invalid(format!(
+                            "Qwen4 recorded-HIP oracle failed: {reason}"
+                        )));
+                    }
+                }
+            } else if aql_route {
                 // SAFETY: same contract as the PM4 route above.
                 match unsafe { gpu.replay.replay_linear_aql(next_position) } {
                     Ok(_) => true,

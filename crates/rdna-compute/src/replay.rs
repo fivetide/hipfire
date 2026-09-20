@@ -4119,6 +4119,28 @@ pub struct ReplayController {
     prepared_max_position: Option<usize>,
     synthesized_position_bindings: Vec<(usize, ReplayKernargBinding)>,
     position_bindings_calibrated: bool,
+    /// Shadow-only executor override for the next eligible forward.
+    shadow_body_route: Option<ShadowBodyRoute>,
+}
+
+/// Which executor the retained body uses on the next eligible forward.
+///
+/// Production controllers never set this: the executor follows from the
+/// prepared plan and the request backend. A manual shadow controller sets it so
+/// one prepared tape can be compared across the exact-kernarg HIP oracle, the
+/// retained transport, and ordinary HIP without re-capturing between arms —
+/// which is what the multi-position state-parity gate needs. Identity matters as
+/// much as the transport here: the oracle re-executes the *recorded* HIP launch
+/// sequence (kernargs and all), so a divergence it reports is a divergence
+/// between ordinary HIP and the byte-exact captured dispatch stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShadowBodyRoute {
+    /// Submit the prepared plan over its retained transport.
+    Plan,
+    /// Re-execute the recorded HIP launch prefix (`recorded_hip_prefix_at`).
+    HipOracle,
+    /// Run the ordinary HIP body (the comparison baseline).
+    Hip,
 }
 
 impl ReplayController {
@@ -4173,6 +4195,7 @@ impl ReplayController {
             prepared_max_position: None,
             synthesized_position_bindings: Vec::new(),
             position_bindings_calibrated: false,
+            shadow_body_route: None,
         }
     }
 
@@ -4284,6 +4307,7 @@ impl ReplayController {
         self.route_identities.clear();
         self.synthesized_position_bindings.clear();
         self.position_bindings_calibrated = false;
+        self.shadow_body_route = None;
     }
 
     /// Drop a prepared route after a model-owned allocation/geometry bucket
@@ -4296,6 +4320,30 @@ impl ReplayController {
         let transport = self.transport;
         let auto_lifecycle = self.auto_lifecycle;
         self.reset_for_model(request, transport, auto_lifecycle);
+    }
+
+    /// Set the executor the retained body uses on the next eligible forward.
+    ///
+    /// Only a manual shadow controller may use this: production adoption reads
+    /// the executor from the prepared plan. `None` restores that default.
+    pub fn set_shadow_body_route(&mut self, route: Option<ShadowBodyRoute>) {
+        self.shadow_body_route = route;
+    }
+
+    pub fn shadow_body_route(&self) -> Option<ShadowBodyRoute> {
+        self.shadow_body_route
+    }
+
+    /// Which transport the *currently prepared* plan uses, if any.
+    ///
+    /// A shadow arm prepares its plan itself, so the plan that exists — not the
+    /// controller's configured transport — decides which replay entry submits it.
+    pub fn prepared_pm4_plan_ready(&self) -> bool {
+        self.prepared_pm4.is_some()
+    }
+
+    pub fn prepared_aql_plan_ready(&self) -> bool {
+        self.prepared.is_some() && self.prepared_pm4.is_none()
     }
 
     pub fn transport_name(&self) -> &'static str {
@@ -4327,34 +4375,34 @@ impl ReplayController {
             .map(|prepared| (prepared.queue_count(), prepared.phase_count()))
     }
 
+    /// Identity of the installed plan.
+    ///
+    /// The plan that exists decides which transport's identity this is: an
+    /// adapter (or a shadow arm) prepares the transport it chooses, and a
+    /// controller that answered "no identity" while holding an installed plan
+    /// would report an unproven route as an absent one.
     pub fn prepared_route_identity(&self) -> Option<PreparedReplayIdentity> {
-        match self.transport {
-            ReplayTransport::AqlPackets => {
-                self.prepared
-                    .as_ref()
-                    .map(|prepared| PreparedReplayIdentity {
-                        dispatch_count: prepared.dispatch_count(),
-                        packet_count: Some(prepared.packet_count()),
-                        queue_id: prepared.queue_id(),
-                        command_dwords: None,
-                        // Linear AQL is a single-queue, single-phase batch graph.
-                        queue_count: 1,
-                        phase_count: 1,
-                    })
-            }
-            ReplayTransport::Pm4Ib => {
-                self.prepared_pm4
-                    .as_ref()
-                    .map(|prepared| PreparedReplayIdentity {
-                        dispatch_count: prepared.dispatch_count(),
-                        packet_count: pm4_packet_identity(prepared.packet_count()),
-                        queue_id: prepared.queue_id(),
-                        command_dwords: Some(prepared.command_dwords()),
-                        queue_count: prepared.queue_count(),
-                        phase_count: prepared.phase_count(),
-                    })
-            }
+        if let Some(prepared) = self.prepared_pm4.as_ref() {
+            return Some(PreparedReplayIdentity {
+                dispatch_count: prepared.dispatch_count(),
+                packet_count: pm4_packet_identity(prepared.packet_count()),
+                queue_id: prepared.queue_id(),
+                command_dwords: Some(prepared.command_dwords()),
+                queue_count: prepared.queue_count(),
+                phase_count: prepared.phase_count(),
+            });
         }
+        self.prepared
+            .as_ref()
+            .map(|prepared| PreparedReplayIdentity {
+                dispatch_count: prepared.dispatch_count(),
+                packet_count: Some(prepared.packet_count()),
+                queue_id: prepared.queue_id(),
+                command_dwords: None,
+                // Linear AQL is a single-queue, single-phase batch graph.
+                queue_count: 1,
+                phase_count: 1,
+            })
     }
 
     pub fn replay_observation(&self) -> ReplayObservation {
