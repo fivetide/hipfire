@@ -825,7 +825,7 @@ diagnostic census. Raw reports are archived locally under
 | 1. Baseline correctness | Ordinary HIP stable and coherent on the exact fixture | **yes** | `HIPFIRE_REPLAY_BACKEND=hip` CLI runs (116-token greedy stream, `finish=stop`); bench HIP arm `measurement_validation.valid=true`, median 13.584 tok/s; `coherence: HIP passed` |
 | 2. Capture completeness | compute/external/retained counts, unique kernels, ordered sequence hash, fresh-process stability | **yes** | census `computed=2845 recorded=2845 external=0 unique_kernels=33 sequence_hash=e4a03ba84c837714`, non-launch effects `htod=0 dtod=0 dtoh=0 memset=0`; the same hash from four independent fresh processes (CLI, serve daemon, two bench runs) |
 | 3. ABI/artifact validation | every symbol resolves to the exact artifact plus loader metadata; padded blobs, geometry, effects, dynamic bindings validate | **yes** | prepare-time: `certified_artifacts=16/16`, `certified_launches=2845 fallback_launches=0 unknown_launches=0`, PM4 wait audit `covered=2844`, prepare reached `ready` with `dispatches=2845 packets=1 queue_id=2 dwords=67508 queues=1 phases=1`; any failure would have refused before `Ready` |
-| 4. Multi-position shadow parity | HIP, retained PM4 and the exact HIP-kernarg-blob oracle agree for logits, KV, recurrent state, guards, blobs | **NO — instrument missing** | see "Gate 4 gap" below; partial: the retained route's output is byte-identical to HIP across 115 consecutive positions |
+| 4. Multi-position shadow parity | HIP, retained PM4 and the exact HIP-kernarg-blob oracle agree for logits, KV, recurrent state, guards, blobs | **yes** | `qwen4-gate4-shadow.json`: the retained transport is bit-exact against ordinary HIP at 5 positions (129–133) over **126,623,888 state bytes per position** — QSA full/raw/pooled keys, the circular partial block, the indexer's selected indices, GDN recurrent + convolution, PLE convolution and hyper feedback, the position/length bookkeeping, and logits — and the recorded-HIP oracle is bit-exact at its capture position; harness failures `[]` |
 | 5. Route proof | request/transport, preparation, `Ready`, observed replay at multiple positions, dispatch/packet/queue/dword identity, sequence hash, no fault, fallback reason per arm | **yes** | auto arm: `route_proof.valid=true`, `retained_rows=5`, `observed_positions=[1500,1547]`, `prepared_identities=[[2845,1,2,67508,1,1]]`, `sequences=[[2845,33,"e4a03ba84c837714"]]`, `errors=[]`, `lifecycle_route_proof.valid=true` with `retained_rows=36` at positions `[1500,1501,1511,1547]`; HIP arm `route_proof.valid=true`, `retained_rows=0`, `state=hip`, `fallback_reason=null` |
 | 6. Production serve | user-facing generation with healthy output, finish state, attractors, framing | **yes** (bench coherence both arms; chain coherent answers) | `coherence.mode=custom`, `hip: valid=true`, `auto: valid=true` (CLI/serve prompt `benchmarks/prompts/qwen4_ar_primes.txt`, expected `2, 3, 5, 7`); serve-harness chain produced coherent answers under the route (`replays=104/132` at positions 168/284) with the empty-turn artifact appearing on *both* arms (3/5 routed vs 4/5 HIP) |
 | 7. Stationary matched performance | identical binary/model/prompt/settings/clocks; tok/s and ms/token | **yes** (one fully valid run) | long-context fixture: `hip` 8.347 vs `auto` 8.507 tok/s, `speedup=1.019`, `valid=true`, both arms stationary and route-proven, coherence both arms. The short-context (128) fixture produced arm-symmetric harness rejections across three attempts — all with valid route proofs, `retained_rows=5`, coherent output on both arms, and stable medians (`hip` 13.570-13.584, `auto` 14.164-14.248) — failing only the measured 5-row window's policy limits (`spread<=1.0%`, `slope<=0.05%/row`, `drift<=0.5%`): `auto` drift 0.141%/0.215% in two attempts, and in the long-settle attempt `hip` itself at spread 1.027%/slope -0.101%/row from a single first-row downclock outlier. Not route-attributable; the valid gate-7 numbers are the long-context run |
@@ -835,29 +835,49 @@ Claims carried by this table: gates 1, 2, 3, 5, 6 and one gate-7 run. **No
 promotion, admission, or performance claim** follows — gate 4 is uncollected and
 gate 8 is partial.
 
-### Gate 4 gap: the Qwen4 shadow arm
+### Gate 4 instrumentation
 
-Gate 4 needs three arms to agree on state, not just on decoded text. The
-recorded-HIP-blob oracle itself is generic
-(`Gpu::replay_recorded_hip_prefix_at`, shared binding application), and the Qwen4
-crate already carries a state-parity oracle (`crates/hipfire-arch-qwen4/src/state_parity.rs`).
-What is missing is the driver:
+Gate 4 compares state, not decoded text, so it needs three arms over the same
+positions. What was added:
 
-1. **A `redline_shadow_qwen4` arm** in `crates/hipfire-generate/src/redline.rs`
-   next to `redline_shadow_gemma4`/`redline_shadow_deepseek4`, dispatched from
-   `handle_redline_shadow`'s downcast chain, with a Qwen4 state snapshot
-   (logits, QSA full/raw/pooled keys and selected indices, GDN recurrent and
-   convolution state, PLE history) captured before and after each arm at several
-   positions.
-2. **Manual-capture arming at the boundary.** The shadow harness runs the daemon
-   with `HIPFIRE_REPLAY_MANUAL_CAPTURE=1` and `HIPFIRE_REPLAY_BACKEND=shadow`;
-   that controller has `auto_lifecycle=false`, so the forward's
-   `begin_auto_capture_if_armed()` no-ops and the manual window never opens. The
-   boundary must also arm an explicit manual capture (a controller entry that
-   covers both modes, ~10 lines), which is what
-   `scripts/redline_daemon_harness.py --pm4 --shadow-iterations N` needs.
-3. Nothing else: the oracle, the binding application, and the report plumbing
-   already exist and are exercised by the other families.
+1. **`redline_shadow_qwen4`** in `crates/hipfire-generate/src/redline.rs`, next
+   to `redline_shadow_gemma4`/`redline_shadow_deepseek4`, dispatched from
+   `handle_redline_shadow`'s downcast chain. It resets + primes each arm, drives
+   single-token forwards, and snapshots every position: logits and their argmax,
+   the per-layer QSA active marks, the GDN recurrent/convolution tensors, PLE
+   convolution and hyper feedback, and every capacity-pinned arena slice the
+   model can still read (arenas are read to their active mark; the bounded
+   partial block and selected-index list are read whole).
+2. **`ShadowBodyRoute`** on the controller (`rdna-compute`): a manual shadow
+   controller states, for the next eligible forward, whether the body submits
+   the prepared plan, re-executes the recorded HIP prefix (the exact-kernarg
+   oracle), or runs ordinary HIP. Production adoption never sets it — it reads
+   the executor from the prepared plan — and the field is cleared by every model
+   reset, so no shadow state can leak into a serving route. The boundary selects
+   the replay entry from the plan that is actually installed
+   (`prepared_pm4_plan_ready`/`prepared_aql_plan_ready`), because a shadow arm
+   prepares the transport it chooses rather than the one the controller is
+   configured with.
+3. **`--qwen4` mode in `scripts/redline_daemon_harness.py`**, gating
+   `QWEN4_EXACT_FIELDS` per position plus the capture-position oracle row.
+
+Two semantics worth stating, both learned by running it:
+
+- **The recorded-HIP oracle is exact only at its capture position.** It
+  substitutes position through the controller's *synthesized-binding
+  calibration*; the Qwen4 route instead **declares** its position bindings in
+  the program (G1/G2), which the oracle path does not read. So the oracle is
+  compared once, at the capture geometry, while the retained transport carries
+  the multi-position claim — which is the stronger half anyway. Observed
+  directly: with the tape captured at position 128, the oracle matched HIP at
+  the capture window and diverged from 129 onward, while the retained arm stayed
+  bit-exact at 129–133.
+- **`prepared_route_identity` now follows the installed plan**, not the
+  configured transport. It previously answered `None` for a PM4 plan on a
+  controller whose configured transport was AQL — i.e. it could report an
+  installed, replaying route as an absent one. That is a route-reporting bug
+  independent of this work; the shadow harness would have certified an
+  unidentified plan.
 
 ### Gate 8 blockers found
 
@@ -936,6 +956,11 @@ Append-only. One line per landed change with the commit hash once it exists.
 - 2026-09-20 — Default-path probe re-run after G1/G2: still the sealed-MoE
   preflight refusal, i.e. G4 remains the gate for any capture. Unchanged behavior
   is the expected result here, not a regression.
+- 2026-09-20 — **Gate 4 collected**: Qwen4 multi-position state-parity shadow
+  arm (`ShadowBodyRoute`, `redline_shadow_qwen4`, `handle_redline_shadow`
+  dispatch, `--qwen4` harness gate). Retained PM4 is bit-exact against ordinary
+  HIP over 126,623,888 state bytes per position at positions 129–133, and the
+  recorded-HIP oracle is bit-exact at its capture position.
 - 2026-09-20 — lifecycle + bench carrier + certification record in
   `561b0f166` (retained-body lifecycle owned by the forward; `RetainedBodyAction`
   moved to `hipfire-dispatch`), `51473026a` (Qwen4 bench carrier arm),
