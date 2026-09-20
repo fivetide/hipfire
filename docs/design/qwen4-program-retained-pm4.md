@@ -936,6 +936,10 @@ Append-only. One line per landed change with the commit hash once it exists.
 - 2026-09-20 — Default-path probe re-run after G1/G2: still the sealed-MoE
   preflight refusal, i.e. G4 remains the gate for any capture. Unchanged behavior
   is the expected result here, not a regression.
+- 2026-09-20 — lifecycle + bench carrier + certification record in
+  `561b0f166` (retained-body lifecycle owned by the forward; `RetainedBodyAction`
+  moved to `hipfire-dispatch`), `51473026a` (Qwen4 bench carrier arm),
+  `10ed7bfe0` (this section).
 - 2026-09-20 — **Certification evidence collected** (no promotion): gates 1, 2, 3,
   5, 6 and one fully valid gate-7 run are collected through the route-proof
   product harness; gate 4 is blocked on a Qwen4 shadow arm (plus manual-capture
