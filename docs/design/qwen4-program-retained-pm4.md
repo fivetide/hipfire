@@ -2,14 +2,22 @@
 
 ## Status and purpose
 
-**Status: implementation complete on `feat/qwen38-flash-next`; certification not
-claimed (branch-implemented, uncertified).** G1–G3 plus G4's A2 (scope), C2
-(census) and B1 (admission contract) landed: the specialized sealed-MoE route is
-admitted, and a Qwen4 `.mq4r` decode body captures, prepares and *replays* through
-retained PM4 on gfx1151 with byte-identical output. The REDLINE §7 ladder —
-shadow-parity across positions, the `tools.redline` route-proof ledger, serve
-health, long-context/reset — remains the certification step and is **not**
-claimed.
+**Status: implementation complete and REDLINE §7 gates 1–7 collected on
+`feat/qwen38-flash-next`; gate 8 partly collected; no promotion claim.** G1–G3
+plus G4's A2 (scope), C2 (census) and B1 (admission contract) landed: the
+specialized sealed-MoE route is admitted, and a Qwen4 `.mq4r` decode body
+captures, prepares and *replays* through retained PM4 on gfx1151 with
+byte-identical output.
+
+The §7 evidence is recorded in the certification section below: multi-position
+state parity against ordinary HIP and the exact-kernarg HIP oracle (126,623,888
+state bytes per position), the `tools.redline` route-proof ledger on both arms,
+serve coherence, long-context behaviour to position 1547, request reset, and the
+induced replay-failure contract. What is **not** collected: gate 8's model-swap
+row (blocked by a pre-existing loader/VMM teardown guard that reproduces with the
+route disabled) and the §8 author declarations, so nothing here is an admission,
+a promotion, or a performance claim. AQL transport and prefill/speculative
+bodies are out of scope and uncertified.
 
 This record is the tracking document for enabling Redline retained PM4 replay for
 Qwen3.8 Flash-Next (`hipfire-arch-qwen4`) **at the shared engine/dispatch level**,
@@ -973,6 +981,8 @@ Append-only. One line per landed change with the commit hash once it exists.
 - 2026-09-20 — Default-path probe re-run after G1/G2: still the sealed-MoE
   preflight refusal, i.e. G4 remains the gate for any capture. Unchanged behavior
   is the expected result here, not a regression.
+- 2026-09-20 — status paragraph brought in line with the collected §7 evidence
+  (gates 1–7, gate 8 partly); no promotion claim.
 - 2026-09-20 — **Gate 8 replay-failure row collected**: the plan's position bound
   is the induction (no test-only hook), and the observed behaviour is error →
   named poison → correct HIP recovery. Model swap stays blocked on the
