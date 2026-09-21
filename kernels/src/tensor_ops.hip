@@ -1094,6 +1094,13 @@ extern "C" __global__ void indexed_attention_select_f32_batched(
     int row_block_count = visible / compress;
     if (row_block_count > block_count) row_block_count = block_count;
     const float* row_query = query + row * query_row_stride;
+    int* row_selected = selected + row * capacity;
+    // Every slot the caller can read owes a -1: the ones above `chosen`, the
+    // tail a short row never reaches, and the whole row when it has no
+    // complete block. This is the fill the old single-threaded path did.
+    for (int i = (int)threadIdx.x; i < capacity; i += (int)blockDim.x) {
+        row_selected[i] = -1;
+    }
     if (row_block_count > 0) {
         for (int block = (int)threadIdx.x;
              block < row_block_count;
@@ -1103,35 +1110,35 @@ extern "C" __global__ void indexed_attention_select_f32_batched(
         }
     }
     __syncthreads();
-    if (threadIdx.x != 0) return;
-    int* row_selected = selected + row * capacity;
     int chosen = budget_blocks < row_block_count ? budget_blocks : row_block_count;
-    for (int i = 0; i < capacity; ++i) row_selected[i] = -1;
-    for (int slot = 0; slot < chosen; ++slot) {
-        float best = -3.402823466e+38f;
-        int best_block = -1;
-        for (int block = 0; block < row_block_count; ++block) {
-            float score = scores[block];
-            if (score == -3.402823466e+38f) continue;
-            if (score > best) {
-                best = score;
-                best_block = block;
-            }
+    // rank(block) counts the blocks that sort before it under
+    // (score desc, index asc) — the exact order the serial selection sort
+    // produced — so writing block `b` at slot `rank(b)` emits the same bytes.
+    // Live scores are >= 0 (fmaxf against 0, summed per head), so no block can
+    // hold the old sentinel and the order is strict: the ranks are distinct.
+    for (int block = (int)threadIdx.x;
+         block < row_block_count;
+         block += (int)blockDim.x) {
+        float score = scores[block];
+        int rank = 0;
+        for (int other = 0; other < row_block_count; ++other) {
+            float value = scores[other];
+            if (value > score || (value == score && other < block)) ++rank;
         }
-        if (best_block >= 0) {
-            scores[best_block] = -3.402823466e+38f;
-            for (int slot_row = 0;
-                 slot_row < compress && slot * compress + slot_row < capacity;
-                 ++slot_row) {
-                int token = best_block * compress + slot_row;
-                if (token < visible) row_selected[slot * compress + slot_row] = token;
+        if (rank < chosen) {
+            for (int slot = 0; slot < compress; ++slot) {
+                int index = rank * compress + slot;
+                int token = block * compress + slot;
+                if (index < capacity && token < visible) row_selected[index] = token;
             }
         }
     }
     int tail_start = row_block_count * compress;
     int offset = chosen * compress;
-    for (int token = tail_start; token < visible && offset < capacity; ++token) {
-        row_selected[offset++] = token;
+    for (int token = tail_start + (int)threadIdx.x;
+         token < visible && offset + (token - tail_start) < capacity;
+         token += (int)blockDim.x) {
+        row_selected[offset + (token - tail_start)] = token;
     }
 }
 

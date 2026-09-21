@@ -2887,6 +2887,180 @@ mod tests {
         gpu.free_tensor(selected_gpu).expect("free selected");
     }
 
+    struct SelectCase {
+        compress: usize,
+        index_heads: usize,
+        index_dim: usize,
+        rows: usize,
+        block_count: usize,
+        budget_blocks: usize,
+        capacity: usize,
+        position_start: usize,
+    }
+
+    fn run_select_case(
+        gpu: &mut Gpu,
+        case: &SelectCase,
+        pooled: &[f32],
+        query: &[f32],
+        shape_blocks: usize,
+    ) -> Vec<i32> {
+        let pooled_gpu = gpu
+            .upload_f32(pooled, &[pooled.len().max(1)])
+            .expect("pooled upload");
+        let query_gpu = gpu
+            .upload_f32(query, &[query.len().max(1)])
+            .expect("query upload");
+        let selected = gpu
+            .zeros(&[case.rows * case.capacity * 4], DType::Raw)
+            .expect("selected allocation");
+        indexed_attention_select_batch(
+            gpu,
+            &IndexedAttentionSelectBatch {
+                query: &query_gpu,
+                pooled: &pooled_gpu,
+                selected: &selected,
+                rows: case.rows,
+                query_row_stride: case.index_heads * case.index_dim,
+                block_count: case.block_count,
+                index_heads: case.index_heads,
+                index_dim: case.index_dim,
+                budget_blocks: case.budget_blocks,
+                compress: case.compress,
+                position_start: case.position_start,
+                capacity: case.capacity,
+                shape_blocks,
+            },
+        )
+        .expect("QSA select");
+        let mut bytes = vec![0u8; case.rows * case.capacity * 4];
+        gpu.hip
+            .memcpy_dtoh(&mut bytes, &selected.buf)
+            .expect("selected download");
+        gpu.free_tensor(selected).expect("free selected");
+        gpu.free_tensor(pooled_gpu).expect("free pooled");
+        gpu.free_tensor(query_gpu).expect("free query");
+        bytes
+            .chunks_exact(4)
+            .map(|chunk| i32::from_ne_bytes(chunk.try_into().expect("i32 chunk")))
+            .collect()
+    }
+
+    /// Scores that increase with the block index must select blocks in
+    /// descending order, and equal scores must break ties toward the lower
+    /// block index — the order the serial scan's strict `>` comparison
+    /// produced. This pins the semantics rather than mutual agreement.
+    #[test]
+    fn batched_select_orders_blocks_by_score_then_index() {
+        let Some(mut gpu) = try_gfx1151_gpu() else {
+            eprintln!("skip: no gfx1151 GPU");
+            return;
+        };
+        let compress = 4usize;
+        let index_dim = 4usize;
+        // Block b contributes b to the dot product, so score(b) = b / 2.
+        let pooled: Vec<f32> = (0..4 * index_dim)
+            .map(|i| {
+                if i % index_dim == 0 {
+                    (i / index_dim) as f32
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let query = vec![1.0f32; index_dim];
+        let case = SelectCase {
+            compress,
+            index_heads: 1,
+            index_dim,
+            rows: 1,
+            block_count: 4,
+            budget_blocks: 8,
+            capacity: 18,
+            position_start: 4 * compress,
+        };
+        // Slot 16 is the tail: block 4 covers tokens 16..19 but `visible` is 17,
+        // so the partial block still contributes its one visible token.
+        let selected = run_select_case(&mut gpu, &case, &pooled, &query, case.block_count);
+        assert_eq!(
+            selected,
+            vec![12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3, 16, -1],
+            "descending-score selection changed"
+        );
+
+        // All-zero pooled keys tie every block at score 0.
+        let tied = vec![0.0f32; 4 * index_dim];
+        let selected = run_select_case(&mut gpu, &case, &tied, &query, case.block_count);
+        assert_eq!(
+            selected,
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, -1],
+            "tie-break by block index changed"
+        );
+    }
+
+    /// The parallel rank path and the serial selection-sort fallback are two
+    /// symbols for the same logical selection, chosen only by the LDS
+    /// reservation; they must emit identical `selected` bytes. A
+    /// `shape_blocks` above the dynamic-LDS limit selects the serial symbol.
+    #[test]
+    fn batched_select_ranking_matches_the_serial_selection_sort() {
+        let Some(mut gpu) = try_gfx1151_gpu() else {
+            eprintln!("skip: no gfx1151 GPU");
+            return;
+        };
+        const SERIAL_BOUND: usize = QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES / 4 + 1;
+
+        let mut state = 0x9e37_79b9u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / 65_536.0) - 8.0
+        };
+
+        for &compress in &[2usize, 4, 8] {
+            for &index_dim in &[8usize, 128] {
+                for &index_heads in &[1usize, 4] {
+                    for &rows in &[1usize, 5] {
+                        // `(position_start + rows) / compress` must equal the
+                        // wrapper's declared block count.
+                        if rows > compress - 1 {
+                            continue;
+                        }
+                        for &block_count in &[0usize, 1, 3, 17, 72, 128, 500] {
+                            for &budget_blocks in &[1usize, 4, 64, 512] {
+                                let case = SelectCase {
+                                    compress,
+                                    index_heads,
+                                    index_dim,
+                                    rows,
+                                    block_count,
+                                    budget_blocks,
+                                    capacity: budget_blocks * compress + compress - 1,
+                                    position_start: block_count * compress,
+                                };
+                                let pooled: Vec<f32> = (0..block_count * index_dim + index_dim)
+                                    .map(|_| next())
+                                    .collect();
+                                let query: Vec<f32> = (0..rows * index_heads * index_dim)
+                                    .map(|_| next())
+                                    .collect();
+                                let parallel =
+                                    run_select_case(&mut gpu, &case, &pooled, &query, block_count);
+                                let serial =
+                                    run_select_case(&mut gpu, &case, &pooled, &query, SERIAL_BOUND);
+                                assert_eq!(
+                                    parallel, serial,
+                                    "parallel ranking diverged from the serial selection sort: \
+                                     compress={compress} heads={index_heads} dim={index_dim} \
+                                     rows={rows} blocks={block_count} budget={budget_blocks}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn qsa_reuse_selection_preserves_order_and_boundaries() {
         let Some(mut gpu) = try_gfx1151_gpu() else {
