@@ -26,6 +26,44 @@ const QWEN4_QT_BF16: u8 = 16;
 const QWEN4_QT_I64: u8 = 52;
 const QWEN4_QT_MQ4G256V2: u8 = 44;
 const QWEN4_QT_MQ4G128V2: u8 = 53;
+/// MQ6G256V2 (qt=47): aligned-K 256 groups, 200 B/group (6-bit payload).
+const QWEN4_QT_MQ6G256V2: u8 = 47;
+/// Q8F16 (qt=3): f16 scale + 32 int8 per block, 34 bytes per 32 weights.  Not
+/// FWHT-rotated.  The MoE fixed classes (embed, lm_head) ship at this tier.
+const QWEN4_QT_Q8F16: u8 = 3;
+/// MFP4G32E8SOA (qt=35): E8-lattice SoA rows, 4.25 bpw, 32-weight blocks with a
+/// 16-byte-aligned padded scale block.
+const QWEN4_QT_MFP4G32E8SOA: u8 = 35;
+
+/// SoA row geometry, mirroring the producer's `mfp4e8soa_row_geometry`.
+fn mfp4e8soa_extent(
+    shape: &[u32],
+    name: &str,
+) -> Result<(usize, usize), Qwen4ArtifactError> {
+    let k = usize::try_from(*shape.last().expect("shape length checked")).map_err(|_| {
+        Qwen4ArtifactError::new(format!("qwen4: source tensor {name} K overflows usize"))
+    })?;
+    if k == 0 || k % 32 != 0 {
+        return Err(Qwen4ArtifactError::new(format!(
+            "qwen4: MFP4G32E8SOA tensor {name} needs a nonzero K multiple of 32, got {k}"
+        )));
+    }
+    let n_blocks = k / 32;
+    let scale_padded = ((n_blocks + 15) >> 4) << 4;
+    let row_stride = 16 + scale_padded + n_blocks * 16;
+    let rows = shape[..shape.len() - 1]
+        .iter()
+        .try_fold(1usize, |rows, &dimension| {
+            rows.checked_mul(usize::try_from(dimension).unwrap_or(usize::MAX))
+        })
+        .ok_or_else(|| {
+            Qwen4ArtifactError::new(format!("qwen4: source tensor {name} rows overflow"))
+        })?;
+    let extent = rows.checked_mul(row_stride).ok_or_else(|| {
+        Qwen4ArtifactError::new(format!("qwen4: source tensor {name} extent overflows"))
+    })?;
+    Ok((row_stride, extent))
+}
 
 const PLE_MULTIPLIERS_NAME: &str =
     "model.language_model.layers.1.ple.ple_embedding.layer_multipliers";
@@ -77,12 +115,24 @@ impl fmt::Display for Qwen4ArtifactError {
 
 impl std::error::Error for Qwen4ArtifactError {}
 
+/// Escape hatch for deliberately loading an artifact whose manifest target is
+/// quantized while its bytes are BF16 (the unpacked decode path).
+fn unpacked_quantized_target_allowed() -> bool {
+    std::env::var("HIPFIRE_ALLOW_BF16_QUANTIZED_TARGET").is_ok_and(|value| value == "1")
+}
+
 fn source_dtype_name(quant_type: u8) -> Option<&'static str> {
     match quant_type {
         QWEN4_QT_BF16 => Some("BF16"),
         QWEN4_QT_I64 => Some("I64"),
         QWEN4_QT_MQ4G256V2 => Some("MQ4G256V2"),
         QWEN4_QT_MQ4G128V2 => Some("MQ4G128V2"),
+        QWEN4_QT_MQ6G256V2 => Some("MQ6G256V2"),
+        // The effective-source seal is composed by the runtime from the artifact's
+        // own index through `quant_type_to_dtype`, which spells qt=3 "Q8_0". This
+        // table is compared against that seal, so the spelling has to match it.
+        QWEN4_QT_Q8F16 => Some("Q8_0"),
+        QWEN4_QT_MFP4G32E8SOA => Some("MFP4G32E8SOA"),
         _ => None,
     }
 }
@@ -90,6 +140,9 @@ fn source_dtype_name(quant_type: u8) -> Option<&'static str> {
 fn quant_type_for_dtype(dtype: DType) -> Option<u8> {
     match dtype {
         DType::MQ4G256V2 => Some(QWEN4_QT_MQ4G256V2),
+        DType::MQ6G256V2 => Some(QWEN4_QT_MQ6G256V2),
+        DType::Q8_0 => Some(QWEN4_QT_Q8F16),
+        DType::MFP4G32E8SOA => Some(QWEN4_QT_MFP4G32E8SOA),
         DType::MQ4G128V2 => Some(QWEN4_QT_MQ4G128V2),
         DType::BF16 => Some(QWEN4_QT_BF16),
         _ => None,
@@ -224,6 +277,36 @@ fn validate_weight_geometry(
             let (row_stride, extent) = quantized_extent(&info.shape, &entry.name, 256, 136, true)?;
             (Some(DType::MQ4G256V2), extent, row_stride)
         }
+        QWEN4_QT_MQ6G256V2 => {
+            if info.group_size != 256 {
+                return Err(Qwen4ArtifactError::new(format!(
+                    "qwen4: tensor {} qt47 group_size={}, expected 256",
+                    entry.name, info.group_size
+                )));
+            }
+            let (row_stride, extent) = quantized_extent(&info.shape, &entry.name, 256, 200, true)?;
+            (Some(DType::MQ6G256V2), extent, row_stride)
+        }
+        QWEN4_QT_MFP4G32E8SOA => {
+            if info.group_size != 32 {
+                return Err(Qwen4ArtifactError::new(format!(
+                    "qwen4: tensor {} qt35 group_size={}, expected 32",
+                    entry.name, info.group_size
+                )));
+            }
+            let (row_stride, extent) = mfp4e8soa_extent(&info.shape, &entry.name)?;
+            (Some(DType::MFP4G32E8SOA), extent, row_stride)
+        }
+        QWEN4_QT_Q8F16 => {
+            if info.group_size != 32 {
+                return Err(Qwen4ArtifactError::new(format!(
+                    "qwen4: tensor {} qt3 group_size={}, expected 32",
+                    entry.name, info.group_size
+                )));
+            }
+            let (row_stride, extent) = quantized_extent(&info.shape, &entry.name, 32, 34, false)?;
+            (Some(DType::Q8_0), extent, row_stride)
+        }
         QWEN4_QT_MQ4G128V2 => {
             if info.group_size != 128 {
                 return Err(Qwen4ArtifactError::new(format!(
@@ -243,7 +326,24 @@ fn validate_weight_geometry(
     };
 
     match entry.dtype {
-        DType::MQ4G256V2 | DType::MQ4G128V2 => {
+        DType::MQ4G256V2
+        | DType::MQ4G128V2
+        | DType::MQ6G256V2
+        | DType::MFP4G32E8SOA
+        | DType::Q8_0 => {
+            // An artifact whose manifest target is quantized but whose bytes are
+            // BF16 decodes that matrix through the unpacked path.  Supporting
+            // that silently is how a packed trunk regresses to BF16 without
+            // anyone noticing, so it takes an explicit opt-in.
+            if source_dtype == Some(DType::BF16) && !unpacked_quantized_target_allowed() {
+                return Err(Qwen4ArtifactError::new(format!(
+                    "qwen4: tensor {} is declared {:?} by the manifest but the artifact \
+                     carries BF16 bytes; this artifact would decode it unpacked. \
+                     Re-publish with the packed trunk, or set \
+                     HIPFIRE_ALLOW_BF16_QUANTIZED_TARGET=1 to load it anyway",
+                    entry.name, entry.dtype
+                )));
+            }
             // A converted artifact may retain BF16 source bytes for a matrix
             // whose manifest target is quantized.  If it is already quantized,
             // the source tag must agree with the target's exact geometry.

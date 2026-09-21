@@ -25,7 +25,32 @@ use hipfire_runtime::weight_manifest::ShardPolicy;
 use rdna_compute::DType;
 use serde_json::{json, Map, Value};
 
-use crate::quant_fwht::{gen_fwht_signs, quantize_mq4g128v2, quantize_mq4g256v2};
+use crate::quant_fwht::{
+    gen_fwht_signs, quantize_mq4g128v2, quantize_mq4g256v2, quantize_mq6g256v2,
+};
+use crate::quant_e8::quantize_mfp4g32_e8_soa_2d;
+use crate::quant_q4::quantize_q8f16;
+
+/// SoA row geometry: `16 + ((n_blocks + 15) >> 4) << 4 + n_blocks * 16`, with
+/// `n_blocks = k / 32`.  Returned as `(row_stride, extent)`; the padded scale
+/// block is why this cannot go through the uniform `(group, bytes)` model.
+fn mfp4e8soa_row_geometry(rows: u64, k: u64) -> Result<(u64, u64), Qwen4Error> {
+    if k == 0 || k % MFP4G32E8SOA_BLOCK_SIZE != 0 {
+        return Err(Qwen4Error::Invalid(format!(
+            "MFP4G32E8SOA requires a nonzero K multiple of 32, got K={k}"
+        )));
+    }
+    let n_blocks = k / MFP4G32E8SOA_BLOCK_SIZE;
+    let scale_padded = ((n_blocks + 15) >> 4) << 4;
+    let row_stride = 16u64
+        .checked_add(scale_padded)
+        .and_then(|bytes| bytes.checked_add(n_blocks.checked_mul(16)?))
+        .ok_or_else(|| Qwen4Error::Invalid("MFP4G32E8SOA row stride overflows".to_string()))?;
+    let extent = rows
+        .checked_mul(row_stride)
+        .ok_or_else(|| Qwen4Error::Invalid("MFP4G32E8SOA extent overflows".to_string()))?;
+    Ok((row_stride, extent))
+}
 use hipfire_quantize::float16::bf16_to_f32;
 
 /// Native Qwen4 architecture ID reserved by the runtime registry.
@@ -48,6 +73,22 @@ const MQ4G128V2_GROUP_SIZE: u64 = 128;
 const MQ4G128V2_GROUP_BYTES: u64 = 68;
 const MQ4G256V2_QUANT_TYPE: u8 = 44;
 const MQ4G128V2_QUANT_TYPE: u8 = 53;
+/// MQ6G256V2 (qt=47) shares the aligned-K 256 group with MQ4G256V2 but carries
+/// four more bits per weight (200 B/group instead of 136 B/group).
+const MQ6G256V2_GROUP_SIZE: u64 = 256;
+const MQ6G256V2_GROUP_BYTES: u64 = 200;
+const MQ6G256V2_QUANT_TYPE: u8 = 47;
+/// Q8F16 (qt=3): f16 scale + 32 int8 per block, 34 bytes per 32 weights.  Not
+/// FWHT-rotated, and the tier the MoE fixed classes (embed, lm_head, router)
+/// take instead of a four-bit matrix format.
+const Q8F16_BLOCK_SIZE: u64 = 32;
+const Q8F16_BLOCK_BYTES: u64 = 34;
+const Q8F16_QUANT_TYPE: u8 = 3;
+/// MFP4G32E8SOA (qt=35): E8 lattice VQ over 32-weight blocks, 4.25 bpw, FWHT-rotated
+/// with the same 256-wide basis as the MQ4/MQ6 families.  SoA layout is the only
+/// one with both a dense decode GEMV and a dense prefill GEMM on gfx1151.
+const MFP4G32E8SOA_QUANT_TYPE: u8 = 35;
+const MFP4G32E8SOA_BLOCK_SIZE: u64 = 32;
 /// Raw signed-I64 records are a distinct HFQ type.  TidI32 is not a valid
 /// representation for Qwen4's hash metadata.
 const QWEN4_I64_QUANT_TYPE: u8 = 52;
@@ -102,7 +143,10 @@ fn validate_row_chunk(row_chunk: usize) -> Result<(), Qwen4Error> {
 }
 
 fn qwen4_quantized_dtype(dtype: DType) -> bool {
-    matches!(dtype, DType::MQ4G256V2 | DType::MQ4G128V2)
+    matches!(
+        dtype,
+        DType::MQ4G256V2 | DType::MQ4G128V2 | DType::MQ6G256V2 | DType::MFP4G32E8SOA | DType::Q8_0
+    )
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Qwen4Mode {
@@ -2366,8 +2410,19 @@ impl ManifestIndex {
                 ManifestRole::Down
             } else if qwen4_quantized_dtype(entry.dtype) {
                 ManifestRole::Matrix(entry.dtype)
-            } else {
+            } else if entry.dtype == DType::BF16 {
                 ManifestRole::Bf16
+            } else {
+                // Silent demotion to BF16 here is exactly how a packed trunk
+                // once shipped unpacked: the manifest asked for a matrix quant
+                // the predicate did not recognise and the plan quietly carried
+                // source bytes instead.  Fail instead of demoting.
+                return Err(Qwen4Error::Invalid(format!(
+                    "Qwen4 manifest offers {} as {:?}, which no plan role can carry; \
+                     a rank-2 matrix target must be BF16 or one of \
+                     MQ4G256V2/MQ4G128V2/MQ6G256V2",
+                    entry.name, entry.dtype
+                )));
             };
             let ple_index = if role == ManifestRole::Ple {
                 let index = ple_shard_index(&entry.name).ok_or_else(|| {
@@ -2577,10 +2632,35 @@ fn validate_matrix_shape(
     Ok((rows, k))
 }
 
+/// Wire tag and group size for a packed matrix dtype.  A dtype with no tag is
+/// an error rather than an `unreachable!`: the plan's role derivation and this
+/// table drifting apart is how a quantized trunk once shipped unpacked, and a
+/// panic is a poor way to learn that.
+fn matrix_quant_type(dtype: DType) -> Result<(u8, u32), Qwen4Error> {
+    match dtype {
+        DType::MQ4G256V2 => Ok((MQ4G256V2_QUANT_TYPE, MQ4G256V2_GROUP_SIZE as u32)),
+        DType::MQ4G128V2 => Ok((MQ4G128V2_QUANT_TYPE, MQ4G128V2_GROUP_SIZE as u32)),
+        DType::MQ6G256V2 => Ok((MQ6G256V2_QUANT_TYPE, MQ6G256V2_GROUP_SIZE as u32)),
+        DType::Q8_0 => Ok((Q8F16_QUANT_TYPE, Q8F16_BLOCK_SIZE as u32)),
+        DType::MFP4G32E8SOA => Ok((
+            MFP4G32E8SOA_QUANT_TYPE,
+            MFP4G32E8SOA_BLOCK_SIZE as u32,
+        )),
+        other => Err(Qwen4Error::Invalid(format!(
+            "Qwen4 matrix quant dtype {other:?} has no wire tag; add it to matrix_quant_type"
+        ))),
+    }
+}
+
 fn quantized_data_len_for_dtype(dtype: DType, rows: u64, k: u64) -> Result<u64, Qwen4Error> {
+    if dtype == DType::MFP4G32E8SOA {
+        return mfp4e8soa_row_geometry(rows, k).map(|(_, extent)| extent);
+    }
     let (group_size, group_bytes, require_aligned_k) = match dtype {
         DType::MQ4G256V2 => (MQ4G256V2_GROUP_SIZE, MQ4G256V2_GROUP_BYTES, true),
         DType::MQ4G128V2 => (MQ4G128V2_GROUP_SIZE, MQ4G128V2_GROUP_BYTES, false),
+        DType::MQ6G256V2 => (MQ6G256V2_GROUP_SIZE, MQ6G256V2_GROUP_BYTES, true),
+        DType::Q8_0 => (Q8F16_BLOCK_SIZE, Q8F16_BLOCK_BYTES, false),
         _ => {
             return Err(Qwen4Error::Invalid(format!(
                 "unsupported Qwen4 matrix quant dtype {dtype:?}"
@@ -2618,6 +2698,11 @@ fn quantized_data_len(kind: ExpertKind, rows: u64, k: u64) -> Result<u64, Qwen4E
 enum EntryKind {
     Bf16,
     Matrix(DType),
+    /// Block-32 Q8F16 (qt=3): an eight-bit class, published separately from the
+    /// rotated matrix tiers it sits beside.
+    Q8,
+    /// E8-lattice SoA trunk tier (qt=35), the comparison alternative to MQ6.
+    E8Soa,
     GateUp,
     Down,
     Ple,
@@ -2983,19 +3068,15 @@ fn plan_entries(
                     resident.push(PlannedEntry {
                         source: tensor,
                         name: String::new(),
-                        quant_type: match dtype {
-                            DType::MQ4G256V2 => MQ4G256V2_QUANT_TYPE,
-                            DType::MQ4G128V2 => MQ4G128V2_QUANT_TYPE,
-                            _ => unreachable!("manifest matrix role must be a Qwen4 MQ4 dtype"),
-                        },
+                        quant_type: matrix_quant_type(dtype)?.0,
                         shape,
-                        group_size: match dtype {
-                            DType::MQ4G256V2 => MQ4G256V2_GROUP_SIZE as u32,
-                            DType::MQ4G128V2 => MQ4G128V2_GROUP_SIZE as u32,
-                            _ => unreachable!("manifest matrix role must be a Qwen4 MQ4 dtype"),
-                        },
+                        group_size: matrix_quant_type(dtype)?.1,
                         data_len: expected_len,
-                        kind: EntryKind::Matrix(dtype),
+                        kind: match dtype {
+                            DType::Q8_0 => EntryKind::Q8,
+                            DType::MFP4G32E8SOA => EntryKind::E8Soa,
+                            _ => EntryKind::Matrix(dtype),
+                        },
                     });
                 }
                 ManifestRole::Bf16 => {
@@ -3186,6 +3267,22 @@ fn plan_entries(
         sum.checked_add(entry.data_len)
             .ok_or_else(|| Qwen4Error::Invalid("Qwen4 resident byte count overflows".to_string()))
     })?;
+    // A production artifact whose manifest declares no packed rank-2 matrix
+    // would decode every trunk projection through the unpacked BF16 path.  That
+    // is a recipe error rather than a variant, so it cannot be produced silently.
+    if !resident
+        .iter()
+        .any(|entry| matches!(
+        entry.kind,
+        EntryKind::Matrix(_) | EntryKind::E8Soa
+    ))
+    {
+        return Err(Qwen4Error::Invalid(
+            "Qwen4 production plan packs no rank-2 matrix: the arch manifest declares \
+             every trunk matrix BF16, which is the unpacked decode path"
+                .to_string(),
+        ));
+    }
     let resident_entries = resident.len();
     let mut entries = ple_entries;
     entries.extend(resident);
@@ -3200,6 +3297,39 @@ fn plan_entries(
         external_ple_bytes,
         ple_shards: PLE_SHARD_COUNT,
     })
+}
+
+/// The trunk formats this plan actually wrote, read back from the plan rather
+/// than restated: a hardcoded recipe can disagree with the artifact it
+/// describes, and a redline preflight that reads it would then be blind.
+fn plan_matrix_recipe(plan: &EntryPlan) -> Value {
+    let mut formats = BTreeMap::<u8, (String, u64)>::new();
+    for entry in &plan.entries {
+        if !matches!(
+        entry.kind,
+        EntryKind::Matrix(_) | EntryKind::E8Soa
+    ) {
+            continue;
+        }
+        let format = match entry.quant_type {
+            MQ4G256V2_QUANT_TYPE => "MQ4G256V2",
+            MQ4G128V2_QUANT_TYPE => "MQ4G128V2",
+            MQ6G256V2_QUANT_TYPE => "MQ6G256V2",
+            MFP4G32E8SOA_QUANT_TYPE => "MFP4G32E8SOA",
+            _ => "unknown",
+        };
+        formats.insert(
+            entry.quant_type,
+            (format.to_string(), u64::from(entry.group_size)),
+        );
+    }
+    let listed: Vec<Value> = formats
+        .iter()
+        .map(|(quant_type, (format, group_size))| {
+            json!({"quant_type": quant_type, "format": format, "group_size": group_size})
+        })
+        .collect();
+    json!({"trunk": listed})
 }
 
 fn build_metadata(
@@ -3231,16 +3361,23 @@ fn build_metadata(
     root.insert(
         "qwen4_recipe".to_string(),
         json!({
-            "version": 1,
+            "version": 2,
             "stacked_experts": true,
             "routing": {"num_experts": ROUTED_EXPERTS, "top_k": ROUTER_TOP_K},
-            "matrix": {
-                "aligned_k": {"quant_type": MQ4G256V2_QUANT_TYPE, "format": "MQ4G256V2", "group_size": MQ4G256V2_GROUP_SIZE},
-                "unaligned_k": {"quant_type": MQ4G128V2_QUANT_TYPE, "format": "MQ4G128V2", "group_size": MQ4G128V2_GROUP_SIZE}
-            },
+            "matrix": plan_matrix_recipe(plan),
             "gate_up": {"quant_type": MQ4G256V2_QUANT_TYPE, "format": "MQ4G256V2", "group_size": MQ4G256V2_GROUP_SIZE, "k": HIDDEN_WIDTH},
             "down": {"quant_type": MQ4G128V2_QUANT_TYPE, "format": "MQ4G128V2", "group_size": MQ4G128V2_GROUP_SIZE, "k": DOWN_INTERMEDIATE},
-            "nonexpert": {"quant_type": 16, "format": "BF16", "byte_preserving": true},
+            // The eight-bit classes: the token embedding and the language head,
+            // which every MoE recipe in this tree holds at Q8F16 rather than at
+            // a four-bit matrix tier.
+            "eight_bit": ["embed_tokens.weight", "lm_head.weight"],
+            // Parameters that keep source BF16 bytes; they are covered by
+            // neither format above.
+            "source_exact": [
+                "hyper_connection",
+                "mtp.fc_embedding.weight",
+                "mtp.fc_hidden.weight"
+            ],
             "mtp_experts": "same_as_trunk"
         }),
     );
@@ -3460,6 +3597,17 @@ fn stream_quantized_rows(
                 quantize_mq4g128v2(&values, count_usize, k_usize, signs1_128, signs2_128)
                     .map_err(Qwen4Error::Invalid)?
             }
+            DType::MQ6G256V2 => {
+                quantize_mq6g256v2(&values, count_usize, k_usize, signs1_256, signs2_256)
+            }
+            DType::Q8_0 => quantize_q8f16(&values),
+            DType::MFP4G32E8SOA => quantize_mfp4g32_e8_soa_2d(
+                &values,
+                count_usize,
+                k_usize,
+                signs1_256,
+                signs2_256,
+            ),
             _ => {
                 return Err(Qwen4Error::Invalid(format!(
                     "{} has unsupported Qwen4 quant dtype {dtype:?}",
@@ -3515,6 +3663,50 @@ fn stream_entry(
             };
             stream_raw_rows(&entry.source, row_width, 8, row_chunk, scratch, writer)
         }
+        EntryKind::E8Soa => {
+            if entry.source.shape.len() != 2 {
+                return Err(Qwen4Error::Invalid(format!(
+                    "{} E8-SoA stream requires rank-2 source shape, got {:?}",
+                    entry.name, entry.source.shape
+                )));
+            }
+            stream_quantized_rows(
+                &entry.source,
+                DType::MFP4G32E8SOA,
+                entry.source.shape[0],
+                entry.source.shape[1],
+                row_chunk,
+                None,
+                signs1_256,
+                signs2_256,
+                signs1_128,
+                signs2_128,
+                scratch,
+                writer,
+            )
+        }
+        EntryKind::Q8 => {
+            if entry.source.shape.len() != 2 {
+                return Err(Qwen4Error::Invalid(format!(
+                    "{} eight-bit stream requires rank-2 source shape, got {:?}",
+                    entry.name, entry.source.shape
+                )));
+            }
+            stream_quantized_rows(
+                &entry.source,
+                DType::Q8_0,
+                entry.source.shape[0],
+                entry.source.shape[1],
+                row_chunk,
+                None,
+                signs1_256,
+                signs2_256,
+                signs1_128,
+                signs2_128,
+                scratch,
+                writer,
+            )
+        }
         EntryKind::Matrix(dtype) => {
             if entry.source.shape.len() != 2 {
                 return Err(Qwen4Error::Invalid(format!(
@@ -3559,9 +3751,12 @@ fn stream_entry(
                     entry.source.shape[2],
                     entry.source.shape[1],
                 ),
-                EntryKind::Bf16 | EntryKind::Matrix(_) | EntryKind::Ple | EntryKind::I64(_) => {
-                    unreachable!()
-                }
+                EntryKind::Bf16
+                | EntryKind::Matrix(_)
+                | EntryKind::Q8
+                | EntryKind::E8Soa
+                | EntryKind::Ple
+                | EntryKind::I64(_) => unreachable!(),
             };
             stream_quantized_rows(
                 &entry.source,
@@ -3740,7 +3935,12 @@ impl Qwen4ReopenPlan {
             let quant_type = read_u8(&region, &mut pos, "quant type")?;
             if !matches!(
                 quant_type,
-                16 | MQ4G256V2_QUANT_TYPE | MQ4G128V2_QUANT_TYPE | QWEN4_I64_QUANT_TYPE
+                16 | MQ4G256V2_QUANT_TYPE
+                    | MQ4G128V2_QUANT_TYPE
+                    | MQ6G256V2_QUANT_TYPE
+                    | Q8F16_QUANT_TYPE
+                    | MFP4G32E8SOA_QUANT_TYPE
+                    | QWEN4_I64_QUANT_TYPE
             ) {
                 return Err(Qwen4Error::Invalid(format!(
                     "Qwen4 artifact tensor {name} uses unknown quant type {quant_type}"
@@ -3929,10 +4129,14 @@ fn validate_output_entry_len(
         MQ4G128V2_QUANT_TYPE => {
             validate_quantized_output_len(name, shape, data_len, DType::MQ4G128V2)?;
         }
-        3 => {
-            return Err(Qwen4Error::Invalid(format!(
-                "{name} uses obsolete qt=3 Q8F16; Qwen4 matrices require qt=44 or qt=53"
-            )));
+        MQ6G256V2_QUANT_TYPE => {
+            validate_quantized_output_len(name, shape, data_len, DType::MQ6G256V2)?;
+        }
+        Q8F16_QUANT_TYPE => {
+            validate_quantized_output_len(name, shape, data_len, DType::Q8_0)?;
+        }
+        MFP4G32E8SOA_QUANT_TYPE => {
+            validate_quantized_output_len(name, shape, data_len, DType::MFP4G32E8SOA)?;
         }
         other => {
             return Err(Qwen4Error::Invalid(format!(
@@ -5510,17 +5714,9 @@ mod tests {
                         resident.push(PlannedEntry {
                             source: tensor.clone(),
                             name: tensor.name.clone(),
-                            quant_type: match dtype {
-                                DType::MQ4G256V2 => MQ4G256V2_QUANT_TYPE,
-                                DType::MQ4G128V2 => MQ4G128V2_QUANT_TYPE,
-                                _ => unreachable!("Qwen4 matrix dtype"),
-                            },
+                            quant_type: matrix_quant_type(dtype)?.0,
                             shape: shape_u32(&tensor.shape, &tensor.name)?,
-                            group_size: match dtype {
-                                DType::MQ4G256V2 => MQ4G256V2_GROUP_SIZE as u32,
-                                DType::MQ4G128V2 => MQ4G128V2_GROUP_SIZE as u32,
-                                _ => unreachable!("Qwen4 matrix dtype"),
-                            },
+                            group_size: matrix_quant_type(dtype)?.1,
                             data_len,
                             kind: EntryKind::Matrix(dtype),
                         });

@@ -35,24 +35,117 @@ pub const PLE_ROW_WIDTH: usize = 160;
 pub const PLE_SHARD_COUNT: usize = 128;
 
 fn qwen4_quantized_dtype(dtype: DType) -> bool {
-    matches!(dtype, DType::MQ4G256V2 | DType::MQ4G128V2)
+    matches!(
+        dtype,
+        DType::MQ4G256V2 | DType::MQ4G128V2 | DType::MQ6G256V2 | DType::MFP4G32E8SOA
+    )
+}
+
+/// Trunk tier selector, for A/B comparison builds only.
+///
+/// `HIPFIRE_QWEN4_TRUNK_TIER=mfp4e8` puts the wide attention/GDN projections on
+/// the E8 lattice format (qt=35, 4.25 bpw) instead of MQ6G256V2 (6.25 bpw).  The
+/// producer and the loader read it through this one function, so a build and its
+/// load agree; the published recipe carries the resulting tier either way.
+fn qwen4_trunk_tier() -> DType {
+    match std::env::var("HIPFIRE_QWEN4_TRUNK_TIER").as_deref() {
+        Ok("mfp4e8") => DType::MFP4G32E8SOA,
+        _ => DType::MQ6G256V2,
+    }
+}
+
+/// Payloads that stay source-exact BF16 even though they are rank-2 matrices.
+///
+/// The Qwen4 family quantizes every matrix whose consumers read a quantized
+/// weight — the trunk projections, the shared expert, the router, the PLE
+/// key/value projections and the embedding/head — mirroring the canonical
+/// `qwen3.6-35b-a3b` layout.  The MTP connector matrices are the exception:
+/// their owner (`mtp_gpu`) still binds source BF16, so declaring them
+/// quantized here would produce an artifact nothing can read.
+const QWEN4_SOURCE_EXACT_SUFFIXES: &[&str] = &["mtp.fc_embedding.weight", "mtp.fc_hidden.weight"];
+
+/// Payload classes that stay source-exact BF16 despite being rank-2 matrices.
+///
+/// The hyper-connection mixer is four output rows over a `hc_count * hidden`
+/// reduction — the thinnest matrix in the network against the widest activation
+/// — so it keeps source bytes rather than being packed for a rounding error's
+/// worth of traffic.
+const QWEN4_SOURCE_EXACT_MARKERS: &[&str] = &["hyper_connection"];
+
+/// The two classes the repo's MoE recipes hold at eight bits rather than four.
+///
+/// Every family's embedding arm ships Q8 (never MQ4), and the quantizer's MoE
+/// default promotes the whole fixed tier — attention, lm_head, embed, router —
+/// to Q8F16 (qt=3, 34 bytes per 32 weights) because it is quality-critical and
+/// small relative to the routed experts.  `qwen3.6-35b-a3b.mq6` ships its
+/// lm_head, embed and router at qt=3 while its experts carry the six-bit tier;
+/// muse_glimmer's untied 202k-vocab head was forced to Q8 after an MQ4 build
+/// shipped.  For Qwen4's untied 248k-vocab head that is 0.68 GB per token
+/// instead of 1.27, at a tier the repo already trusts for this exact shape.
+const QWEN4_Q8_MARKERS: &[&str] = &["lm_head.weight", "embed_tokens.weight"];
+
+fn qwen4_q8_dtype(name: &str) -> bool {
+    QWEN4_Q8_MARKERS.iter().any(|marker| name.ends_with(marker))
 }
 
 fn qwen4_quantizable_matrix(name: &str, shape: &[usize]) -> bool {
-    shape.len() == 3
-        && (name.ends_with(".experts.down_proj") || name.ends_with(".experts.gate_up_proj"))
+    if shape.len() == 3 {
+        return name.ends_with(".experts.down_proj") || name.ends_with(".experts.gate_up_proj");
+    }
+    if shape.len() != 2
+        || QWEN4_SOURCE_EXACT_SUFFIXES
+            .iter()
+            .any(|s| name.ends_with(s))
+        || QWEN4_SOURCE_EXACT_MARKERS
+            .iter()
+            .any(|marker| name.contains(marker))
+    {
+        return false;
+    }
+    // The packed set is the wide attention/GDN projections, which dominate
+    // decode weight traffic.  The shared expert, the router, and the PLE
+    // projections stay source-exact: the shared expert is as wide as any
+    // trunk matrix but rides the sealed-MoE route, and the router decides
+    // expert selection from 512 logits.
+    if !name.contains(".linear_attn.") && !name.contains(".self_attn.") {
+        return false;
+    }
+    // Aligned K takes MQ4G256V2; everything else that the row-local format can
+    // represent takes MQ4G128V2, whose per-row `ceil(K / 128)` groups exist for
+    // exactly this case.  A K that is not a multiple of 128 stays BF16.
+    shape.last().is_some_and(|k| k % 128 == 0)
 }
 
+/// The packed trunk carries six bits per weight, not four.
+///
+/// A routed expert's 4-bit error is averaged over the ten experts a token
+/// selects, so the routed family tolerates MQ4; a dense trunk projection writes
+/// its error straight into the residual stream, and the measured consequence of
+/// MQ4 on these matrices was a model that opened a reasoning block it could not
+/// close.  MQ6G256V2 keeps the aligned-K 256 group and the same FWHT basis, so
+/// dispatch, artifact layout, and the rotation scratch are unchanged.
 fn qwen4_matrix_dtype(shape: &[usize]) -> DType {
     let k = shape.last().copied().unwrap_or_default();
+    // Routed experts keep the 4-bit family their sealed gate/up and down
+    // kernels read; only the rank-2 trunk matrices take the 6-bit group.
+    if shape.len() == 3 {
+        return if k % 256 == 0 {
+            DType::MQ4G256V2
+        } else {
+            DType::MQ4G128V2
+        };
+    }
     if k % 256 == 0 {
-        DType::MQ4G256V2
+        qwen4_trunk_tier()
     } else {
         DType::MQ4G128V2
     }
 }
 
 fn qwen4_target_dtype(name: &str, shape: &[usize], requested: DType) -> DType {
+    if qwen4_q8_dtype(name) && matches!(requested, DType::BF16 | DType::Q8_0) {
+        return DType::Q8_0;
+    }
     if qwen4_quantizable_matrix(name, shape)
         && (requested == DType::BF16 || qwen4_quantized_dtype(requested))
     {
@@ -62,8 +155,21 @@ fn qwen4_target_dtype(name: &str, shape: &[usize], requested: DType) -> DType {
     }
 }
 
+/// Q8 targets accept a BF16 source (the checkpoint) or an already-converted
+/// Q8 payload, and nothing else: the matrix families above are a different
+/// geometry and would be misread here.
+fn qwen4_q8_source() -> DTypeConstraint {
+    DTypeConstraint::source_from_sources(vec![DType::BF16, DType::Q8_0])
+}
+
 fn qwen4_quant_source() -> DTypeConstraint {
-    DTypeConstraint::source_from_sources(vec![DType::BF16, DType::MQ4G256V2, DType::MQ4G128V2])
+    DTypeConstraint::source_from_sources(vec![
+        DType::BF16,
+        DType::MQ4G256V2,
+        DType::MQ4G128V2,
+        DType::MQ6G256V2,
+        DType::MFP4G32E8SOA,
+    ])
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -255,13 +361,16 @@ impl Qwen4Manifest {
         // Converted HFQM records may already carry either MQ4G256V2 (qt=44)
         // or MQ4G128V2 (qt=53).  The source checkpoint itself remains BF16.
         let quant_matrix = qwen4_quant_source();
+        let quant_q8 = qwen4_q8_source();
         let model = |name: &str,
                      shape: Vec<usize>,
                      requested_dtype: DType,
                      policy: ShardPolicy,
                      source: &DTypeConstraint| {
             let dtype = qwen4_target_dtype(name, &shape, requested_dtype);
-            let source = if qwen4_quantized_dtype(dtype) {
+            let source = if dtype == DType::Q8_0 {
+                &quant_q8
+            } else if qwen4_quantized_dtype(dtype) {
                 &quant_matrix
             } else {
                 source
@@ -275,7 +384,9 @@ impl Qwen4Manifest {
                      policy: ShardPolicy,
                      source: &DTypeConstraint| {
             let dtype = qwen4_target_dtype(name, &shape, requested_dtype);
-            let source = if qwen4_quantized_dtype(dtype) {
+            let source = if dtype == DType::Q8_0 {
+                &quant_q8
+            } else if qwen4_quantized_dtype(dtype) {
                 &quant_matrix
             } else {
                 source
@@ -1989,7 +2100,7 @@ mod tests {
         }
     }
     #[test]
-    fn routed_expert_matrices_quantize_and_all_rank2_nonexperts_stay_bf16() {
+    fn matrices_quantize_by_group_width_and_unrepresentable_k_stays_bf16() {
         let tensor = |name: &str, shape: &[usize]| {
             TensorRef::new(
                 name,
@@ -2025,69 +2136,151 @@ mod tests {
             DType::MQ4G128V2
         );
 
+        // Rank-2 matrices whose logical K the row-local format can carry are
+        // quantized, aligned K taking the 256-wide group.  These are the wide
+        // projections that dominate decode traffic.
+        for name in [
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+        ] {
+            assert_eq!(
+                tensor(name, &[2, 256]).dtype,
+                DType::MQ6G256V2,
+                "rank-2 matrix {name} must quantize at six bits"
+            );
+            assert_eq!(
+                tensor(name, &[2, 384]).dtype,
+                DType::MQ4G128V2,
+                "128-aligned rank-2 matrix {name} must take the row-local format"
+            );
+        }
+
+        // The token embedding and the language head take the eight-bit class
+        // tier, which every MoE recipe in this tree uses for them.
         for name in [
             "model.language_model.embed_tokens.weight",
             "lm_head.weight",
-            "model.language_model.layers.0.mlp.gate.weight",
-            "model.language_model.layers.0.mlp.shared_expert.up_proj.weight",
-            "model.language_model.layers.0.self_attn.q_proj.weight",
-            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+        ] {
+            assert_eq!(
+                tensor(name, &[2, 256]).dtype,
+                DType::Q8_0,
+                "{name} is an eight-bit class"
+            );
+        }
+
+        // The thinnest-over-widest reduction keeps source bytes whatever its K:
+        // the hyper-connection mixer is four rows over a
+        // `hc_count * hidden` reduction.
+        for name in [
             "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight",
-            "model.language_model.layers.1.ple.ple_embedding.key_proj.weight",
+            "model.language_model.layers.0.attn_hyper_connection.block_inject_weight.weight",
+            "model.language_model.layers.0.mlp_hyper_connection.input_mix_weight_down.weight",
         ] {
             assert_eq!(
                 tensor(name, &[2, 256]).dtype,
                 DType::BF16,
-                "rank-2 nonexpert {name} must remain source-exact BF16"
+                "{name} keeps source bytes"
+            );
+        }
+
+        // K = 320 is neither 256- nor 128-aligned (the hyper-connection up
+        // projection), and K = 160 is the PLE row width; both stay source BF16.
+        for (name, k) in [
+            (
+                "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight",
+                320usize,
+            ),
+            (
+                "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
+                160,
+            ),
+        ] {
+            assert_eq!(
+                tensor(name, &[2, k]).dtype,
+                DType::BF16,
+                "{name} K={k} must stay source-exact BF16"
+            );
+        }
+
+        // The MTP connector matrices still have a source-BF16 owner.
+        for name in ["mtp.fc_embedding.weight", "mtp.fc_hidden.weight"] {
+            assert_eq!(
+                tensor(name, &[2, 256]).dtype,
+                DType::BF16,
+                "{name} stays source-exact BF16 until its owner reads quantized weights"
             );
         }
     }
 
+    /// The trunk recipe is a decision, not a default: the wide attention/GDN
+    /// projections ship at six bits because four bits on a dense projection
+    /// (which writes straight into the residual stream) produced a model that
+    /// opened a reasoning block it could not close, and BF16 is the unpacked
+    /// path this packing exists to replace.  Either fallback changes the dtype
+    /// assertion or the count below.
     #[test]
-    fn manifest_admits_quantized_routed_experts_and_bf16_nonexperts() {
+    fn trunk_attention_projections_are_pinned_to_six_bits() {
         let manifest = Qwen4Manifest::build(&pinned_config()).expect("pinned config manifest");
-        for (name, layer, dtype, accepts_quant) in [
+        let mut packed = 0usize;
+        for entry in &manifest.weights {
+            let trunk_attention = entry.name.contains(".linear_attn.")
+                || entry.name.contains(".self_attn.");
+            if !trunk_attention || entry.logical_shape.len() != 2 {
+                continue;
+            }
+            let k = *entry.logical_shape.last().expect("rank checked above");
+            if k % 128 != 0 {
+                continue;
+            }
+            assert_eq!(
+                entry.dtype,
+                DType::MQ6G256V2,
+                "{} is a trunk attention projection and must ship at six bits",
+                entry.name
+            );
+            packed += 1;
+        }
+        // 36 linear-attention layers x (qkv, z, in_proj_a, in_proj_b, out_proj)
+        // + 12 full-attention layers x (q, k, v, o, indexer qk)
+        // + the MTP layer's five full-attention projections.
+        assert_eq!(packed, 245, "trunk packing count");
+    }
+
+    #[test]
+    fn manifest_admits_quantized_matrices_and_keeps_source_exact_payloads_bf16() {
+        let manifest = Qwen4Manifest::build(&pinned_config()).expect("pinned config manifest");
+        for (name, layer, dtype) in [
             (
                 "model.language_model.layers.3.mlp.experts.gate_up_proj",
                 Some(3),
                 DType::MQ4G256V2,
-                true,
             ),
             (
                 "model.language_model.layers.3.mlp.experts.down_proj",
                 Some(3),
                 DType::MQ4G128V2,
-                true,
             ),
             (
                 "mtp.layers.0.mlp.experts.gate_up_proj",
                 None,
                 DType::MQ4G256V2,
-                true,
             ),
-            (
-                "mtp.layers.0.mlp.experts.down_proj",
-                None,
-                DType::MQ4G128V2,
-                true,
-            ),
+            ("mtp.layers.0.mlp.experts.down_proj", None, DType::MQ4G128V2),
         ] {
             let entry = manifest.entry(name, layer).expect("routed expert entry");
             assert_eq!(entry.dtype, dtype, "{name} target dtype");
             assert!(entry.dtype_constraint.accepts(DType::BF16));
-            assert_eq!(
-                entry.dtype_constraint.accepts(dtype),
-                accepts_quant,
-                "{name} source constraint"
-            );
+            assert!(entry.dtype_constraint.accepts(dtype), "{name} source");
         }
 
-        let assert_bf16 = |name: &str, layer: Option<usize>| {
-            let entry = manifest.entry(name, layer).expect("BF16 nonexpert entry");
-            assert_eq!(entry.dtype, DType::BF16, "{name} target dtype");
+        // Dense matrices are quantized targets that still accept BF16 source
+        // bytes, which is what lets an older artifact load against a newer
+        // manifest.
+        let assert_quantized = |name: &str, layer: Option<usize>| {
+            let entry = manifest.entry(name, layer).expect("quantized matrix entry");
+            assert_eq!(entry.dtype, DType::MQ6G256V2, "{name} target dtype");
             assert!(entry.dtype_constraint.accepts(DType::BF16));
-            assert!(!entry.dtype_constraint.accepts(DType::MQ4G256V2));
-            assert!(!entry.dtype_constraint.accepts(DType::MQ4G128V2));
+            assert!(entry.dtype_constraint.accepts(DType::MQ6G256V2));
         };
         for (name, layer) in [
             (
@@ -2098,17 +2291,56 @@ mod tests {
                 "model.language_model.layers.2.linear_attn.in_proj_qkv.weight",
                 Some(2),
             ),
-            ("model.language_model.layers.3.mlp.gate.weight", Some(3)),
-            (
-                "model.language_model.layers.3.mlp.shared_expert.up_proj.weight",
-                Some(3),
-            ),
         ] {
-            assert_bf16(name, layer);
+            assert_quantized(name, layer);
         }
-        for name in ["model.language_model.embed_tokens.weight", "lm_head.weight"] {
+
+        let assert_bf16 = |name: &str, layer: Option<usize>| {
+            let entry = manifest.entry(name, layer).expect("BF16 entry");
+            assert_eq!(entry.dtype, DType::BF16, "{name} target dtype");
+            assert!(entry.dtype_constraint.accepts(DType::BF16));
+            assert!(!entry.dtype_constraint.accepts(DType::MQ4G256V2));
+            assert!(!entry.dtype_constraint.accepts(DType::MQ4G128V2));
+        };
+        for name in ["mtp.fc_embedding.weight", "mtp.fc_hidden.weight"] {
             assert_bf16(name, None);
         }
+        // The eight-bit classes: BF16 in the checkpoint, Q8 in the artifact.
+        for name in [
+            "model.language_model.embed_tokens.weight",
+            "lm_head.weight",
+        ] {
+            let entry = manifest.entry(name, None).expect("eight-bit class entry");
+            assert_eq!(entry.dtype, DType::Q8_0, "{name} target dtype");
+            assert!(entry.dtype_constraint.accepts(DType::BF16));
+            assert!(entry.dtype_constraint.accepts(DType::Q8_0));
+            assert!(!entry.dtype_constraint.accepts(DType::MQ4G256V2));
+        }
+        // The shared expert, the router, and the PLE projections stay
+        // source-exact: they ride the sealed-MoE route or select among 512
+        // experts, and neither is a wide attention projection.
+        assert_bf16("model.language_model.layers.3.mlp.gate.weight", Some(3));
+        assert_bf16(
+            "model.language_model.layers.3.mlp.shared_expert.up_proj.weight",
+            Some(3),
+        );
+        let ple = manifest
+            .weights
+            .iter()
+            .find(|entry| entry.name.contains(".ple.") && entry.name.contains("key"))
+            .map(|entry| (entry.name.clone(), entry.layer))
+            .expect("PLE key projection entry");
+        assert_bf16(&ple.0, ple.1);
+        // The hyper-connection mixer and block-inject matrices are the thin
+        // side of the widest reduction in the network; they keep source bytes.
+        assert_bf16(
+            "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight",
+            None,
+        );
+        assert_bf16(
+            "model.language_model.layers.3.attn_hyper_connection.block_inject_weight.weight",
+            Some(3),
+        );
 
         let ple = manifest
             .entry(

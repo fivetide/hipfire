@@ -296,6 +296,130 @@ def dflash_shadow_failures(shadow):
     return failures
 
 
+# The trunk tier this harness is allowed to certify.  Four bits on a dense
+# trunk projection (which writes straight into the residual stream) produced a
+# model that opened a reasoning block it could not close, and BF16 is the
+# unpacked path this packing exists to replace.  A recipe that drifts to either
+# one is a recipe error, so the gate below refuses to run rather than certify it.
+QWEN4_ADMITTED_TRUNK_TYPES = {47, 35}  # MQ6G256V2, and MFP4G32E8SOA for the E8 A/B
+QWEN4_REQUIRED_SOURCE_EXACT = ("embed_tokens.weight", "lm_head.weight", "hyper_connection")
+
+
+def read_qwen4_index(model):
+    """Return [(name, quant_type)] read from the artifact's own index.
+
+    Ground truth, not the artifact's self-description: a hardcoded recipe can
+    claim a trunk tier the payload does not carry.  Only the metadata/index
+    region is read; the payload is never touched.
+    """
+    with model.open("rb") as handle:
+        header = handle.read(32)
+        if len(header) < 32 or header[:4] != b"HFQM":
+            return None
+        count = int.from_bytes(header[12:16], "little")
+        metadata_offset = int.from_bytes(header[16:24], "little")
+        data_offset = int.from_bytes(header[24:32], "little")
+        if not 32 <= metadata_offset <= data_offset:
+            return None
+        handle.seek(metadata_offset)
+        region = handle.read(min(data_offset - metadata_offset, 64 * 1024 * 1024))
+    depth = 0
+    in_string = False
+    escaped = False
+    cursor = None
+    for index, byte in enumerate(region):
+        char = chr(byte)
+        if escaped:
+            escaped = False
+            continue
+        if in_string:
+            if char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                cursor = index + 1
+                break
+    if cursor is None:
+        return None
+    import struct as _struct
+
+    position = cursor
+    (index_count,) = _struct.unpack_from("<I", region, position)
+    position += 4
+    if index_count != count:
+        return None
+    entries = []
+    for _ in range(index_count):
+        (name_len,) = _struct.unpack_from("<H", region, position)
+        position += 2
+        name = region[position : position + name_len].decode("utf-8")
+        position += name_len
+        quant_type = region[position]
+        position += 1
+        n_dims = region[position]
+        position += 1
+        dims = _struct.unpack_from("<%dI" % n_dims, region, position)
+        position += 4 * n_dims
+        position += 4  # group size
+        position += 8  # data length
+        entries.append((name, quant_type, dims))
+    return entries
+
+
+def qwen4_recipe_failures(model):
+    """Check the artifact's actual trunk tier and source-exact classes."""
+    entries = read_qwen4_index(model)
+    if entries is None:
+        return ["artifact index is unreadable; its trunk tier cannot be certified"]
+    trunk = []
+    sensitive = []
+    for name, quant_type, dims in entries:
+        short = name.replace("model.language_model.", "")
+        if any(
+            marker in short
+            for marker in ("embed_tokens.weight", "lm_head.weight", "hyper_connection")
+        ):
+            sensitive.append((short, quant_type))
+            continue
+        if not any(marker in short for marker in (".linear_attn.", ".self_attn.")):
+            continue
+        if len(dims) != 2 or dims[-1] % 128 != 0:
+            continue
+        trunk.append((short, quant_type))
+    failures = []
+    if not trunk:
+        failures.append("no packed trunk projection found; the trunk decodes unpacked")
+    wrong = sorted({quant_type for _, quant_type in trunk} - QWEN4_ADMITTED_TRUNK_TYPES)
+    if wrong:
+        named = ", ".join(
+            f"{quant_type} ({name})" for name, quant_type in trunk if quant_type in wrong
+        )[:400]
+        failures.append(
+            f"trunk projections carry quant types {wrong}, admitted is "
+            f"{sorted(QWEN4_ADMITTED_TRUNK_TYPES)}; the first offenders: {named}"
+        )
+    # The input/output distributions ship at BF16 (16) or the eight-bit class
+    # tier Q8F16 (3); every MoE recipe in this tree uses one of those two for
+    # them, and anything narrower is the regression this gate exists for.
+    quantized_sensitive = sorted(
+        {name for name, quant_type in sensitive if quant_type not in (16, 3)}
+    )
+    if quantized_sensitive:
+        failures.append(
+            "these classes carry the model's input/output distribution and must stay "
+            f"BF16 (16) or Q8F16 (3): {quantized_sensitive[:6]}"
+        )
+    return failures
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -443,6 +567,13 @@ def main():
                 "DeepSeek4 discovers DSpark only as the sibling "
                 f"{discovered_draft}; --draft resolved to {draft}"
             )
+
+    if args.qwen4:
+        recipe_failures = qwen4_recipe_failures(model)
+        if recipe_failures:
+            for line in recipe_failures:
+                print(f"  FAIL {line}", flush=True)
+            sys.exit(f"qwen4 artifact recipe preflight failed for {model}")
 
     report = {
         "model": str(model),

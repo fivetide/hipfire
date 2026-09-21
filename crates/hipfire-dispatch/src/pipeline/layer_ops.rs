@@ -56,18 +56,42 @@ fn require_tensor(
     Ok(())
 }
 
+/// Payload types the shared stateful-op projections can consume: source BF16,
+/// or a Qwen4 matrix quantization whose FWHT basis the caller rotates into the
+/// op's rotation scratch before the projection runs.
+fn projection_weight_dtype(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::BF16
+            | DType::Q8_0
+            | DType::MQ4G256V2
+            | DType::MQ4G128V2
+            | DType::MQ6G256V2
+            | DType::MFP4G32E8SOA
+    )
+}
+
 fn require_weight(
     weight: &WeightRef<'_>,
     m: usize,
     k: usize,
-    dtype: DType,
     label: &'static str,
 ) -> Result<(), DispatchError> {
-    let elements = checked_mul(m, k, "weight elements")?;
-    if weight.dtype != dtype || weight.m != m || weight.k != k || weight.buf.numel() < elements {
+    if !projection_weight_dtype(weight.dtype) || weight.m != m || weight.k != k {
         return Err(DispatchError::Hip(format!(
             "{label} has incompatible shape or dtype"
         )));
+    }
+    // Packed formats are sized by their own group geometry, which the artifact
+    // boundary validates at admission; only the native layout is an element
+    // count that this layer can check.
+    if weight.dtype == DType::BF16 {
+        let elements = checked_mul(m, k, "weight elements")?;
+        if weight.buf.numel() < elements {
+            return Err(DispatchError::Hip(format!(
+                "{label} has incompatible shape or dtype"
+            )));
+        }
     }
     Ok(())
 }
@@ -77,27 +101,101 @@ fn view(source: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
     source.sub_offset(offset, len)
 }
 
-/// BF16-weight projection used by stateful operations.  Multi-row calls use
-/// the existing batched GEMM launcher; decode uses the existing GEMV launcher.
-pub(crate) fn project_bf16_batch(
+/// Weight projection used by the stateful operations.  Multi-row calls use the
+/// batched GEMM launcher and decode uses the GEMV launcher, for whichever of
+/// the admissible payloads the tensor carries.
+///
+/// The FWHT matrix tiers (MQ4G256V2 / MQ4G128V2 / MQ6G256V2) speak a rotated
+/// basis, not the natural input, so the activation is rotated into `rotation`
+/// (`rows * weight.k` elements) first — the same basis the routed experts and the
+/// MTP head consume.  BF16 and Q8F16 payloads read the input as it stands.
+pub fn project_weight(
     gpu: &mut Gpu,
     weight: &WeightRef<'_>,
     input: &GpuTensor,
     output: &GpuTensor,
     rows: usize,
+    rotation: Option<&GpuTensor>,
 ) -> Result<(), DispatchError> {
-    if weight.dtype != DType::BF16 {
-        return Err(DispatchError::UnsupportedVariant {
-            family: "layer-operations",
-            variant: "non-bf16-stateful-projection",
-            arch: "",
-            quant: "non-BF16",
-        });
-    }
-    let result = if rows > 1 {
-        gpu.gemm_bf16_xf32_multirow(weight.buf, input, output, weight.m, weight.k, rows)
-    } else {
-        gpu.gemv_bf16_xf32(weight.buf, input, output, weight.m, weight.k)
+    let rotated = match weight.dtype {
+        // BF16 and Q8F16 read the natural activation: neither carries an FWHT
+        // basis, so no rotation is owed and the scratch stays untouched.
+        DType::BF16 | DType::Q8_0 => None,
+        // MQ4G256V2 and MQ6G256V2 share the aligned-K 256-wide FWHT basis;
+        // MQ4G128V2 carries the row-local 128-wide one.
+        DType::MQ4G256V2 | DType::MQ4G128V2 | DType::MQ6G256V2 | DType::MFP4G32E8SOA => {
+            let rotation = rotation.ok_or(DispatchError::UnsupportedVariant {
+                family: "layer-operations",
+                variant: "rotation-scratch-absent",
+                arch: "",
+                quant: "quantized",
+            })?;
+            let elements = checked_mul(rows, weight.k, "rotation scratch")?;
+            let scratch = view(rotation, 0, elements);
+            if matches!(
+                weight.dtype,
+                DType::MQ4G256V2 | DType::MQ6G256V2 | DType::MFP4G32E8SOA
+            ) {
+                if rows > 1 {
+                    hip(gpu.rotate_x_mq_batched(input, &scratch, weight.k, rows))?;
+                } else {
+                    hip(gpu.rotate_x_mq(input, &scratch, weight.k))?;
+                }
+            } else {
+                hip(gpu.rotate_x_mq_128_v2(input, &scratch, weight.k, rows))?;
+            }
+            Some(scratch)
+        }
+        _ => {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "layer-operations",
+                variant: "unprojectable-payload",
+                arch: "",
+                quant: "unsupported",
+            })
+        }
+    };
+    let x = rotated.as_ref().unwrap_or(input);
+    let result = match (weight.dtype, rows > 1) {
+        (DType::BF16, false) => gpu.gemv_bf16_xf32(weight.buf, x, output, weight.m, weight.k),
+        (DType::BF16, true) => {
+            gpu.gemm_bf16_xf32_multirow(weight.buf, x, output, weight.m, weight.k, rows)
+        }
+        (DType::MQ4G256V2, false) => gpu.gemv_mq4g256v2(weight.buf, x, output, weight.m, weight.k),
+        (DType::MQ4G256V2, true) => {
+            gpu.gemm_mq4g256v2(weight.buf, x, output, weight.m, weight.k, rows)
+        }
+        (DType::MQ6G256V2, false) => gpu.gemv_mq6g256v2(weight.buf, x, output, weight.m, weight.k),
+        (DType::MQ6G256V2, true) => {
+            gpu.gemm_mq6g256v2(weight.buf, x, output, weight.m, weight.k, rows)
+        }
+        (DType::Q8_0, false) => gpu.gemv_q8_0(weight.buf, x, output, weight.m, weight.k),
+        (DType::Q8_0, true) => {
+            gpu.gemm_q8_0_batched(weight.buf, x, output, weight.m, weight.k, rows)
+        }
+        (DType::MFP4G32E8SOA, false) => gpu.gemv_mfp4g32_e8_soa_prerotated(
+            weight.buf,
+            x,
+            output,
+            weight.m,
+            weight.k,
+        ),
+        (DType::MFP4G32E8SOA, true) => gpu.gemm_mfp4g32_e8_soa_wmma(
+            weight.buf,
+            x,
+            output,
+            weight.m,
+            weight.k,
+            rows,
+        ),
+        (DType::MQ4G128V2, false) => gpu.gemv_mq4g128v2(weight.buf, x, output, weight.m, weight.k),
+        (DType::MQ4G128V2, true) => {
+            gpu.gemm_mq4g128v2_batched(weight.buf, x, output, weight.m, weight.k, rows)
+        }
+        _ => Err(hip_bridge::HipError::new(
+            0,
+            "unsupported projection payload",
+        )),
     };
     hip(result)
 }
@@ -118,6 +216,9 @@ pub struct HyperReadOp<'a> {
     pub branches: usize,
     pub hidden: usize,
     pub low_rank: usize,
+    /// FWHT basis scratch for quantized payloads (`rows * k` elements); the
+    /// BF16 path never reads it.
+    pub rotation: &'a GpuTensor,
 }
 
 impl HyperReadOp<'_> {
@@ -163,20 +264,8 @@ impl HyperReadOp<'_> {
             DType::BF16,
             "hyper read BF16 scratch",
         )?;
-        require_weight(
-            &self.input_mix_down,
-            self.low_rank,
-            wide,
-            DType::BF16,
-            "hyper read down",
-        )?;
-        require_weight(
-            &self.input_mix_up,
-            wide,
-            self.low_rank,
-            DType::BF16,
-            "hyper read up",
-        )?;
+        require_weight(&self.input_mix_down, self.low_rank, wide, "hyper read down")?;
+        require_weight(&self.input_mix_up, wide, self.low_rank, "hyper read up")?;
         Ok(())
     }
 }
@@ -198,7 +287,14 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
             hidden: op.hidden,
         },
     ))?;
-    project_bf16_batch(gpu, &op.input_mix_down, &normalized, &low, op.rows)?;
+    project_weight(
+        gpu,
+        &op.input_mix_down,
+        &normalized,
+        &low,
+        op.rows,
+        Some(op.rotation),
+    )?;
     if gpu.arch_caps.is_gfx1151() {
         hip(hc_activation_fused_f32(
             gpu,
@@ -253,7 +349,7 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
             ))?;
         }
     }
-    project_bf16_batch(gpu, &op.input_mix_up, &low, &up, op.rows)?;
+    project_weight(gpu, &op.input_mix_up, &low, &up, op.rows, Some(op.rotation))?;
     hip(hyper_read_projected(
         gpu,
         &HyperReadProjected {
@@ -280,6 +376,9 @@ pub struct HyperWriteOp<'a> {
     pub rows: usize,
     pub branches: usize,
     pub hidden: usize,
+    /// FWHT basis scratch for quantized payloads (`rows * k` elements); the
+    /// BF16 path never reads it.
+    pub rotation: &'a GpuTensor,
 }
 
 impl HyperWriteOp<'_> {
@@ -323,7 +422,6 @@ impl HyperWriteOp<'_> {
             &self.block_inject,
             self.branches,
             wide,
-            DType::BF16,
             "hyper write projection",
         )?;
         Ok(())
@@ -347,7 +445,14 @@ pub fn execute_hyper_write(gpu: &mut Gpu, op: &HyperWriteOp<'_>) -> Result<(), D
             hidden: op.hidden,
         },
     ))?;
-    project_bf16_batch(gpu, &op.block_inject, &normalized, &gates, op.rows)?;
+    project_weight(
+        gpu,
+        &op.block_inject,
+        &normalized,
+        &gates,
+        op.rows,
+        Some(op.rotation),
+    )?;
     hip(hyper_write(
         gpu,
         &HyperWrite {
@@ -395,6 +500,9 @@ pub struct GatedDeltaNetOp<'a> {
     pub value_dim: usize,
     pub conv_kernel: usize,
     pub input_width: usize,
+    /// FWHT basis scratch for quantized payloads (`rows * k` elements); the
+    /// BF16 path never reads it.
+    pub rotation: &'a GpuTensor,
 }
 
 impl GatedDeltaNetOp<'_> {
@@ -493,39 +601,24 @@ impl GatedDeltaNetOp<'_> {
             DType::F32,
             "gated delta output",
         )?;
-        require_weight(
-            &self.qkv,
-            qkv_width,
-            self.input_width,
-            DType::BF16,
-            "gated delta qkv",
-        )?;
+        require_weight(&self.qkv, qkv_width, self.input_width, "gated delta qkv")?;
         require_weight(
             &self.in_proj_a,
             self.value_heads,
             self.input_width,
-            DType::BF16,
             "gated delta a",
         )?;
         require_weight(
             &self.in_proj_b,
             self.value_heads,
             self.input_width,
-            DType::BF16,
             "gated delta b",
         )?;
-        require_weight(
-            &self.z,
-            value,
-            self.input_width,
-            DType::BF16,
-            "gated delta z",
-        )?;
+        require_weight(&self.z, value, self.input_width, "gated delta z")?;
         require_weight(
             &self.output,
             self.input_width,
             value,
-            DType::BF16,
             "gated delta output projection",
         )?;
         Ok(())
@@ -541,15 +634,22 @@ pub fn execute_gated_delta_net(
     let qkv = 2 * qk + value;
     let projection = view(op.projection, 0, op.rows * qkv);
     let projection2 = view(op.projection2, 0, op.rows * qkv);
-    project_bf16_batch(gpu, &op.qkv, op.input, &projection, op.rows)?;
+    project_weight(
+        gpu,
+        &op.qkv,
+        op.input,
+        &projection,
+        op.rows,
+        Some(op.rotation),
+    )?;
     let a = view(op.a, 0, op.rows * op.value_heads);
     let b = view(op.b, 0, op.rows * op.value_heads);
     let gate = view(op.gate, 0, op.rows * op.value_heads);
     let beta = view(op.beta, 0, op.rows * op.value_heads);
     let z = view(op.z_output, 0, op.rows * value);
-    project_bf16_batch(gpu, &op.in_proj_a, op.input, &a, op.rows)?;
-    project_bf16_batch(gpu, &op.in_proj_b, op.input, &b, op.rows)?;
-    project_bf16_batch(gpu, &op.z, op.input, &z, op.rows)?;
+    project_weight(gpu, &op.in_proj_a, op.input, &a, op.rows, Some(op.rotation))?;
+    project_weight(gpu, &op.in_proj_b, op.input, &b, op.rows, Some(op.rotation))?;
+    project_weight(gpu, &op.z, op.input, &z, op.rows, Some(op.rotation))?;
     let history_rows = op.conv_kernel.saturating_sub(1);
     let persistent_batch = gpu.arch_caps.is_gfx1151()
         && op.rows > 1
@@ -703,12 +803,13 @@ pub fn execute_gated_delta_net(
         }
     }
     let output_batch = view(op.output_tensor, 0, op.rows * op.output.m);
-    project_bf16_batch(
+    project_weight(
         gpu,
         &op.output,
         &op.output_scratch.sub_offset(0, op.rows * value),
         &output_batch,
         op.rows,
+        Some(op.rotation),
     )?;
     let bf16 = view(op.bf16_scratch, 0, op.output.m);
     for row in 0..op.rows {
@@ -777,6 +878,9 @@ pub struct IndexedAttentionOp<'a> {
     pub kv_heads: usize,
     pub head_dim: usize,
     pub input_width: usize,
+    /// FWHT basis scratch for quantized payloads (`rows * k` elements); the
+    /// BF16 path never reads it.
+    pub rotation: &'a GpuTensor,
 }
 
 impl IndexedAttentionOp<'_> {
@@ -986,35 +1090,30 @@ impl IndexedAttentionOp<'_> {
             &self.indexer_qk,
             index_width,
             self.input_width,
-            DType::BF16,
             "indexed attention index projection",
         )?;
         require_weight(
             &self.q,
             qgate_width,
             self.input_width,
-            DType::BF16,
             "indexed attention q projection",
         )?;
         require_weight(
             &self.k,
             kv_width,
             self.input_width,
-            DType::BF16,
             "indexed attention k projection",
         )?;
         require_weight(
             &self.v,
             kv_width,
             self.input_width,
-            DType::BF16,
             "indexed attention v projection",
         )?;
         require_weight(
             &self.output,
             self.input_width,
             q_width,
-            DType::BF16,
             "indexed attention output projection",
         )?;
         Ok(())
@@ -1044,10 +1143,24 @@ pub fn execute_indexed_attention(
         0,
         op.rows * op.state.selected_capacity * std::mem::size_of::<i32>(),
     );
-    project_bf16_batch(gpu, &op.indexer_qk, op.input, &index_batch, op.rows)?;
-    project_bf16_batch(gpu, &op.q, op.input, &qgate_batch, op.rows)?;
-    project_bf16_batch(gpu, &op.k, op.input, &k_batch, op.rows)?;
-    project_bf16_batch(gpu, &op.v, op.input, &v_batch, op.rows)?;
+    project_weight(
+        gpu,
+        &op.indexer_qk,
+        op.input,
+        &index_batch,
+        op.rows,
+        Some(op.rotation),
+    )?;
+    project_weight(
+        gpu,
+        &op.q,
+        op.input,
+        &qgate_batch,
+        op.rows,
+        Some(op.rotation),
+    )?;
+    project_weight(gpu, &op.k, op.input, &k_batch, op.rows, Some(op.rotation))?;
+    project_weight(gpu, &op.v, op.input, &v_batch, op.rows, Some(op.rotation))?;
 
     hip(indexed_attention_norm_rope_batch(
         gpu,
@@ -1192,12 +1305,13 @@ pub fn execute_indexed_attention(
             shape_selected: op.state.selected_capacity,
         },
     ))?;
-    project_bf16_batch(
+    project_weight(
         gpu,
         &op.output,
         &qsa_output_batch,
         &view(op.attention_output, 0, op.rows * op.output.m),
         op.rows,
+        Some(op.rotation),
     )?;
     let selected_len = (budget_blocks.min(complete) * op.compress + final_position
         - complete * op.compress)
@@ -1248,6 +1362,9 @@ pub struct GroupedDepthwiseOp<'a> {
     pub kernel_size: usize,
     pub dilation: usize,
     pub epsilon: f32,
+    /// FWHT basis scratch for quantized payloads (`rows * k` elements); the
+    /// BF16 path never reads it.
+    pub rotation: &'a GpuTensor,
 }
 
 impl GroupedDepthwiseOp<'_> {
@@ -1297,14 +1414,8 @@ impl GroupedDepthwiseOp<'_> {
             "grouped convolution norm",
         )?;
         require_tensor(self.conv, conv_elements, DType::BF16, "grouped convolution")?;
-        require_weight(&self.key, channels, self.hidden, DType::BF16, "grouped key")?;
-        require_weight(
-            &self.value,
-            self.hidden,
-            self.hidden,
-            DType::BF16,
-            "grouped value",
-        )?;
+        require_weight(&self.key, channels, self.hidden, "grouped key")?;
+        require_weight(&self.value, self.hidden, self.hidden, "grouped value")?;
         Ok(())
     }
 }
@@ -1321,8 +1432,22 @@ pub fn execute_grouped_depthwise(
     let gated = view(op.gated, 0, op.rows * channels);
     let normed = view(op.normed, 0, op.rows * channels);
     let output = view(op.output, 0, op.rows * channels);
-    project_bf16_batch(gpu, &op.key, op.rows_tensor, &key, op.rows)?;
-    project_bf16_batch(gpu, &op.value, op.rows_tensor, &value, op.rows)?;
+    project_weight(
+        gpu,
+        &op.key,
+        op.rows_tensor,
+        &key,
+        op.rows,
+        Some(op.rotation),
+    )?;
+    project_weight(
+        gpu,
+        &op.value,
+        op.rows_tensor,
+        &value,
+        op.rows,
+        Some(op.rotation),
+    )?;
     // A recorded launch, not a `copy_d2d`: a retained tape replays dispatches, so
     // a device copy inside the body would be state the replay cannot reproduce.
     hip(gpu.copy_f32_buffer(&query, &streams, op.rows * channels))?;
@@ -1444,7 +1569,7 @@ pub fn execute_lm_head(
     validate_lm_head(weight, hidden_batch, logits, rows, requested_rows)?;
     if requested_rows == rows {
         match weight.dtype {
-            DType::BF16 => project_bf16_batch(gpu, weight, hidden_batch, logits, rows),
+            DType::BF16 => project_weight(gpu, weight, hidden_batch, logits, rows, None),
             DType::F32 => hip(gpu.gemm_f32_batched(
                 weight.buf,
                 hidden_batch,
@@ -1520,6 +1645,7 @@ mod tests {
         beta: GpuTensor,
         recurrent_output: GpuTensor,
         bf16_scratch: GpuTensor,
+        rotation: GpuTensor,
         z_output: GpuTensor,
         output_scratch: GpuTensor,
         input: GpuTensor,
@@ -1548,6 +1674,7 @@ mod tests {
                 beta: tensor(1, DType::F32),
                 recurrent_output: tensor(2, DType::F32),
                 bf16_scratch: tensor(2, DType::BF16),
+                rotation: tensor(2, DType::F32),
                 z_output: tensor(2, DType::F32),
                 output_scratch: tensor(2, DType::F32),
                 input: tensor(2, DType::F32),
@@ -1588,6 +1715,7 @@ mod tests {
                 beta: &self.beta,
                 recurrent_output: &self.recurrent_output,
                 bf16_scratch: &self.bf16_scratch,
+                rotation: &self.rotation,
                 z_output: &self.z_output,
                 output_scratch: &self.output_scratch,
                 input: &self.input,

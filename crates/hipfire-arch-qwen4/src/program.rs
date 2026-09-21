@@ -17,8 +17,8 @@ use hipfire_dispatch::families::moe::{
 };
 use hipfire_dispatch::pipeline::sealed_moe::PrefillRouteMode;
 use hipfire_dispatch::pipeline::{
-    execute_final_hyper as execute_shared_final_hyper, seal_decode, seal_prefill, BoundMoeExperts,
-    ExpertBindingCache, ExpertTable, HyperReadOp,
+    execute_final_hyper as execute_shared_final_hyper, project_weight, seal_decode, seal_prefill,
+    BoundMoeExperts, ExpertBindingCache, ExpertTable, HyperReadOp,
 };
 use hipfire_dispatch::types::DispatchError;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -234,6 +234,7 @@ pub struct Qwen4LayerScratch<'a> {
     pub hc_up: &'a GpuTensor,
     pub hc_mixed: &'a GpuTensor,
     pub hc_gates: &'a GpuTensor,
+    pub rotation: &'a GpuTensor,
     pub projection: &'a GpuTensor,
     pub projection2: &'a GpuTensor,
     pub gdn_a: &'a GpuTensor,
@@ -299,29 +300,6 @@ pub fn grouped_m_total_bound(total_slots: usize, n_exp: usize) -> Result<usize, 
     )
 }
 
-pub(crate) fn project_bf16_batch(
-    gpu: &mut Gpu,
-    weight: &WeightRef<'_>,
-    input: &GpuTensor,
-    output: &GpuTensor,
-    rows: usize,
-) -> Result<(), DispatchError> {
-    if weight.dtype != DType::BF16 {
-        return Err(DispatchError::UnsupportedVariant {
-            family: "qwen4-program",
-            variant: "non-bf16-stateful-projection",
-            arch: "",
-            quant: "non-BF16",
-        });
-    }
-    let result = if rows > 1 {
-        gpu.gemm_bf16_xf32_multirow(weight.buf, input, output, weight.m, weight.k, rows)
-    } else {
-        gpu.gemv_bf16_xf32(weight.buf, input, output, weight.m, weight.k)
-    };
-    hip(result)
-}
-
 pub fn execute_final_hyper(
     gpu: &mut Gpu,
     dims: Qwen4ProgramDims,
@@ -337,6 +315,7 @@ pub fn execute_final_hyper(
     execute_shared_final_hyper(
         gpu,
         &HyperReadOp {
+            rotation: scratch.rotation,
             input: &view(streams, 0, wide),
             norm_weight: weights.norm,
             input_mix_down: weights.input_mix_down,
@@ -374,11 +353,10 @@ pub fn validate_final_hyper(
     let wide_rows = checked_mul(rows, wide, "final hyper input")?;
     let hidden = checked_mul(rows, dims.hidden, "final hyper output")?;
     require_tensor(weights.norm, wide, DType::BF16, "final HC norm")?;
-    require_dense_weight(
+    require_projection_weight(
         &weights.input_mix_down,
         low,
         wide,
-        DType::BF16,
         "final HC input mix down",
     )?;
     require_dense_weight(
@@ -409,15 +387,30 @@ pub fn validate_lm_head(
     if weight.m == 0 || weight.k == 0 {
         return Err(DispatchError::Hip("Qwen4 LM-head geometry is empty".into()));
     }
-    if !matches!(weight.dtype, DType::BF16 | DType::F32) {
-        return Err(DispatchError::UnsupportedVariant {
-            family: "qwen4-program",
-            variant: "lm-head",
-            arch: "",
-            quant: "unsupported",
-        });
+    // The head follows the trunk: a packed payload consumes the FWHT basis and
+    // is validated by its own group geometry at the artifact boundary, while
+    // F32 keeps the widened legacy layout.
+    match weight.dtype {
+        DType::BF16
+        | DType::Q8_0
+        | DType::MQ4G256V2
+        | DType::MQ4G128V2
+        | DType::MQ6G256V2
+        | DType::MFP4G32E8SOA => {
+            require_weight(weight, weight.m, weight.k, "LM-head weight")?
+        }
+        DType::F32 => {
+            require_dense_weight(weight, weight.m, weight.k, DType::F32, "LM-head weight")?
+        }
+        _ => {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "qwen4-program",
+                variant: "lm-head",
+                arch: "",
+                quant: "unsupported",
+            })
+        }
     }
-    require_dense_weight(weight, weight.m, weight.k, weight.dtype, "LM-head weight")?;
     let hidden_elements = checked_mul(rows, weight.k, "LM-head hidden")?;
     require_tensor(hidden_batch, hidden_elements, DType::F32, "LM-head hidden")?;
     let output_elements = checked_mul(requested_rows, weight.m, "LM-head output")?;
@@ -437,44 +430,34 @@ pub fn execute_lm_head(
     logits: &GpuTensor,
     rows: usize,
     requested_rows: usize,
+    rotation: Option<&GpuTensor>,
 ) -> Result<(), DispatchError> {
     validate_lm_head(weight, hidden_batch, logits, rows, requested_rows)?;
     if requested_rows == rows {
-        match weight.dtype {
-            DType::BF16 => project_bf16_batch(gpu, weight, hidden_batch, logits, rows),
-            DType::F32 => hip(gpu.gemm_f32_batched(
+        if weight.dtype == DType::F32 {
+            return hip(gpu.gemm_f32_batched(
                 weight.buf,
                 hidden_batch,
                 logits,
                 weight.m,
                 weight.k,
                 rows,
-            )),
-            _dtype => Err(DispatchError::UnsupportedVariant {
-                family: "qwen4-program",
-                variant: "lm-head",
-                arch: "",
-                quant: "unsupported",
-            }),
+            ));
         }
+        // One projection contract for the head and the trunk: packed payloads
+        // rotate `rows * k` into the caller's basis scratch and decode through
+        // the GEMV or batched GEMM launcher that matches the row count.
+        return project_weight(gpu, weight, hidden_batch, logits, rows, rotation);
     } else if requested_rows == 1 {
         let input = view(
             hidden_batch,
             checked_mul(rows - 1, weight.k, "final LM-head row")?,
             weight.k,
         );
-        match weight.dtype {
-            DType::BF16 => hip(gpu.gemv_bf16_xf32(weight.buf, &input, logits, weight.m, weight.k)),
-            DType::F32 => {
-                hip(gpu.gemm_f32_batched(weight.buf, &input, logits, weight.m, weight.k, 1))
-            }
-            _dtype => Err(DispatchError::UnsupportedVariant {
-                family: "qwen4-program",
-                variant: "lm-head",
-                arch: "",
-                quant: "unsupported",
-            }),
+        if weight.dtype == DType::F32 {
+            return hip(gpu.gemm_f32_batched(weight.buf, &input, logits, weight.m, weight.k, 1));
         }
+        return project_weight(gpu, weight, &input, logits, 1, rotation);
     } else {
         Err(DispatchError::Hip(
             "Qwen4 LM-head supports all rows or final row only".into(),
@@ -551,6 +534,42 @@ fn require_tensor(
         )));
     }
     Ok(())
+}
+
+/// Projection payloads the shared lowering can consume: source BF16, or either
+/// Qwen4 matrix quantization whose FWHT basis the caller rotates in.  Packed
+/// payloads are sized by their own group geometry, which the artifact boundary
+/// validates at admission, so only the native layout carries an extent check.
+fn require_projection_weight(
+    weight: &WeightRef<'_>,
+    m: usize,
+    k: usize,
+    name: &'static str,
+) -> Result<(), DispatchError> {
+    require_weight(weight, m, k, name)?;
+    match weight.dtype {
+        DType::BF16 => {
+            let bytes = m
+                .checked_mul(k)
+                .and_then(|elements| elements.checked_mul(DType::BF16.size()))
+                .ok_or_else(|| DispatchError::Hip(format!("Qwen4 {name} size overflows")))?;
+            if weight.buf.buf.size() < bytes {
+                return Err(DispatchError::Hip(format!(
+                    "Qwen4 {name} capacity too small: need {bytes} bytes, have {}",
+                    weight.buf.buf.size()
+                )));
+            }
+            Ok(())
+        }
+        DType::MQ4G256V2
+        | DType::MQ4G128V2
+        | DType::MQ6G256V2
+        | DType::MFP4G32E8SOA
+        | DType::Q8_0 => Ok(()),
+        dtype => Err(DispatchError::Hip(format!(
+            "Qwen4 {name} dtype mismatch: expected BF16 or a Qwen4 matrix quantization, got {dtype:?}"
+        ))),
+    }
 }
 
 fn require_weight(

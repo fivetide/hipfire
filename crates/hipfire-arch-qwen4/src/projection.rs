@@ -13,10 +13,18 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 
 const QT44_GROUP_BYTES: usize = 136;
 const QT53_GROUP_BYTES: usize = 68;
+const QT47_GROUP_BYTES: usize = 200;
+const QT3_BLOCK_BYTES: usize = 34;
 
 pub(crate) fn row_stride(dtype: DType, k: usize) -> usize {
     match dtype {
         DType::MQ4G256V2 => k.div_ceil(256) * QT44_GROUP_BYTES,
+        DType::MQ6G256V2 => k.div_ceil(256) * QT47_GROUP_BYTES,
+        DType::Q8_0 => k.div_ceil(32) * QT3_BLOCK_BYTES,
+        DType::MFP4G32E8SOA => {
+            let n_blocks = k.div_ceil(32);
+            16 + (((n_blocks + 15) >> 4) << 4) + n_blocks * 16
+        }
         DType::MQ4G128V2 => k.div_ceil(128) * QT53_GROUP_BYTES,
         _ => k * dtype.size(),
     }
@@ -107,15 +115,12 @@ pub(crate) fn dispatch_gemv(
     k: usize,
 ) -> hip_bridge::HipResult<()> {
     match weight.dtype {
-        DType::MQ4G256V2 => {
-            gpu.rotate_x_mq(input, rotation, k)?;
-            gpu.gemv_mq4g256v2(weight, rotation, output, m, k)?;
-        }
-        DType::MQ4G128V2 => {
-            gpu.rotate_x_mq_128_v2(input, rotation, k, 1)?;
-            gpu.gemv_mq4g128v2(weight, rotation, output, m, k)?;
-        }
-        DType::BF16 => gpu.gemv_bf16_xf32(weight, input, output, m, k)?,
+        DType::MQ4G256V2
+        | DType::MQ4G128V2
+        | DType::MQ6G256V2
+        | DType::MFP4G32E8SOA
+        | DType::Q8_0
+        | DType::BF16 => {}
         dtype => {
             return Err(hip_bridge::HipError::new(
                 0,
@@ -123,25 +128,40 @@ pub(crate) fn dispatch_gemv(
             ));
         }
     }
-    Ok(())
+    // One projection contract: the shared lowering owns the FWHT basis
+    // convention, so a packed payload is rotated and decoded exactly as the
+    // trunk's own ops decode it.
+    let reference = WeightRef {
+        buf: weight,
+        dtype: weight.dtype,
+        m,
+        k,
+        row_stride: row_stride(weight.dtype, k),
+        rotation: None,
+        awq_scale: None,
+    };
+    hipfire_dispatch::pipeline::project_weight(gpu, &reference, input, output, 1, Some(rotation))
+        .map_err(|error| hip_bridge::HipError::new(0, &error.to_string()))
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EmbeddingPath {
     Mq4V2,
     Bf16,
+    Q8,
 }
 
 fn embedding_path(dtype: DType) -> Option<EmbeddingPath> {
     match dtype {
         DType::MQ4G256V2 | DType::MQ4G128V2 => Some(EmbeddingPath::Mq4V2),
         DType::BF16 => Some(EmbeddingPath::Bf16),
+        DType::Q8_0 => Some(EmbeddingPath::Q8),
         _ => None,
     }
 }
 
 /// Dispatch one embedding lookup according to the resident table's exact
-/// contract.  BF16 rows are widened directly; only packed MQv2 rows use the
-/// rotated staging buffer and FWHT decode.
+/// contract.  BF16 rows are widened directly; packed MQv2 rows use the rotated
+/// staging buffer and FWHT decode; Q8 rows are block-decoded in place.
 pub(crate) fn dispatch_embedding(
     gpu: &mut Gpu,
     embedding: &GpuTensor,
@@ -167,6 +187,9 @@ pub(crate) fn dispatch_embedding(
         EmbeddingPath::Bf16 => {
             gpu.embedding_lookup_bf16_batched(embedding, output, token_ids, n, dim)
         }
+        EmbeddingPath::Q8 => {
+            gpu.embedding_lookup_q8_batched(embedding, output, token_ids, n, dim)
+        }
     }
 }
 
@@ -179,6 +202,7 @@ mod tests {
         assert_eq!(embedding_path(DType::BF16), Some(EmbeddingPath::Bf16));
         assert_eq!(embedding_path(DType::MQ4G256V2), Some(EmbeddingPath::Mq4V2));
         assert_eq!(embedding_path(DType::MQ4G128V2), Some(EmbeddingPath::Mq4V2));
+        assert_eq!(embedding_path(DType::Q8_0), Some(EmbeddingPath::Q8));
     }
 
     #[test]
