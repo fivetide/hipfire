@@ -2856,8 +2856,14 @@ fn decode_gate_side_stage(
       // shared-expert projections.  The quantized GEMV contract is F32, so
       // restore the source boundary before the downstream nonlinearities.
     if qwen4_top10 {
-        hip!(gpu.bf16_round_trip_f32(p.router_logits))?;
-        hip!(gpu.bf16_round_trip_f32(scalar_buf))?;
+        // The decode step program is single-row (`build_moe_decode` binds
+        // `batch_size: 1`), but every scratch buffer is sized for the prefill
+        // chunk cap (512 rows). Rounding the whole buffer would carry 512x the
+        // traffic of the one live row, so each boundary is bound to the extent
+        // its consumer actually reads: one router row (n_exp), the selector's
+        // single scalar, and the already-live-sized shared gate/up slices.
+        hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(p.router_logits, 0, p.n_exp)))?;
+        hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(scalar_buf, 0, 1)))?;
         hip!(gpu.bf16_round_trip_f32(shared_gate))?;
         hip!(gpu.bf16_round_trip_f32(shared_up))?;
     }
@@ -2917,8 +2923,9 @@ fn decode_route_gpu_stage(
                 p.norm_topk_prob,
             ))?;
             // HF casts selected top-k probabilities back to the hidden
-            // dtype before expert weighting.
-            hip!(gpu.bf16_round_trip_f32(p.topk_weights))?;
+            // dtype before expert weighting. Only the live row's k_top slots
+            // are ever read; the buffer is sized for the prefill chunk cap.
+            hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(p.topk_weights, 0, p.k)))?;
             return Ok(());
         }
         if router_shared_fuse {
@@ -2999,10 +3006,14 @@ fn decode_shared_down_stage(
     if qwen4_top10 && !p.skip_shared {
         #[cfg(feature = "deltanet")]
         {
-            // Linear and sigmoid outputs are BF16 in the source module.
-            hip!(gpu.bf16_round_trip_f32(scalar_buf))?;
-            hip!(gpu.sigmoid_f32(scalar_buf))?;
-            hip!(gpu.bf16_round_trip_f32(scalar_buf))?;
+            // Linear and sigmoid outputs are BF16 in the source module. The
+            // shared-expert selector writes one scalar per row and the only
+            // consumer (`bf16_scaled_add`) reads `scalar[0]`, so this boundary
+            // owes one element, not the full 512-row scratch buffer.
+            let scalar_live = slice_moe_f32_view(scalar_buf, 0, 1);
+            hip!(gpu.bf16_round_trip_f32(&scalar_live))?;
+            hip!(gpu.sigmoid_f32(&scalar_live))?;
+            hip!(gpu.bf16_round_trip_f32(&scalar_live))?;
             let shared_hid = slice_moe_f32_view(p.ffn_hidden, 0, smi);
             hip!(gpu.silu_mul_f32(shared_gate, shared_up, &shared_hid))?;
             hip!(gpu.bf16_round_trip_f32(&shared_hid))?;
@@ -3022,7 +3033,9 @@ fn decode_shared_down_stage(
                     .run_auto(ctx, gpu, shared_down_w, &shared_hid, p.ffn_out)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
             }
-            hip!(gpu.bf16_round_trip_f32(p.ffn_out))?;
+            // One live row of the shared-expert output (the buffer is the
+            // prefill chunk cap wide).
+            hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(p.ffn_out, 0, p.hidden)))?;
             hip!(bf16_scaled_add(
                 gpu,
                 &Bf16ScaledAdd {
@@ -3032,7 +3045,7 @@ fn decode_shared_down_stage(
                     elements: p.hidden,
                 },
             ))?;
-            hip!(gpu.bf16_round_trip_f32(out_target))?;
+            hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(out_target, 0, p.hidden)))?;
             return Ok(());
         }
         #[cfg(not(feature = "deltanet"))]
@@ -4005,7 +4018,9 @@ fn decode_combine_stage(
             p.hidden,
             1,
         ))?;
-        hip!(gpu.bf16_round_trip_f32(target))?;
+        // One live row: the combine writes exactly `p.hidden` elements for a
+        // single-row step, while `target` is the prefill chunk cap wide.
+        hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(target, 0, p.hidden)))?;
         return Ok(());
     }
     hip!(gpu.moe_down_combine_k8_batched(
