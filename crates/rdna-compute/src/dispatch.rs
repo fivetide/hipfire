@@ -454,9 +454,17 @@ pub enum DType {
     // Pure byte-permutation of MFP4G32E8 => dequant result IDENTICAL.
     MFP3G32E8, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 4), 13 B/blk, 104 B/grp, 3.25 bpw. Drop-in for MQ3G256Lloyd.
     MFP2G32E8, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 2),  9 B/blk,  72 B/grp, 2.25 bpw. Drop-in for MQ2G256Lloyd.
-    HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
-    HFQ2G128,  // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
-    TQ2G128,   // ternary Bonsai-27B: 34 bytes per 128 elements (flat 2-bit ternary, group 128)
+    MFP4G32E8G128, // qt=42 mfp4-E8 with a 128-wide FWHT rotation group: the MFP4G32E8
+    // wire layout BYTE-FOR-BYTE (16-B hdr + (K/32) x 17 B blocks, no prefix, no padding),
+    // but the encoder rotates 128-element segments (sign seeds 43/1043) instead of 256.
+    // That is the only thing 256 was doing for this family, and it is what excludes
+    // K=640 = 5x128, so this tier covers qwen4's expert `down_proj` axis. The rotation
+    // width is NOT in the bytes: the row stride is identical to MFP4G32E8, and the
+    // decoder is the same E8-lattice body. Activation side must use the G128 basis
+    // (`rotate_x_mq_128`), the same one MQ4G128V2 consumes.
+    HFQ2G256, // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
+    HFQ2G128, // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
+    TQ2G128,  // ternary Bonsai-27B: 34 bytes per 128 elements (flat 2-bit ternary, group 128)
     // Phase 4: ternary kernels wire GPU decode/dispatch; this Task 7 slice is
     // CPU-foundation only (variant + byte-size + RawCodec load mapping).
     BQ1G128,    // binary Bonsai-27B: 18 bytes per 128 elements (flat 1-bit sign, group 128)
@@ -516,6 +524,7 @@ impl DType {
             | DType::MFP4G32E8SOA
             | DType::MFP3G32E8
             | DType::MFP2G32E8
+            | DType::MFP4G32E8G128
             | DType::ParoQ4G128
             | DType::Raw => 1, // byte-level
         }

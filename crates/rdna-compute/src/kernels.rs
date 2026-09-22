@@ -1500,6 +1500,26 @@ pub const GEMV_MFP4G32_E8_LDSX_GFX1151_SRC: &str =
 /// gfx1151 mfp4-E8 grouped MoE gate_up (k8 indexed) — mq4-parity expert kernel.
 pub const GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched.gfx1151.hip");
+/// qt=42 (MFP4G32E8G128) dense GEMV: mfp4-E8 wire layout with a 128-wide FWHT
+/// rotation group, and remainder-block coverage so ANY K%32==0 reduces exactly.
+/// One kernel for every arch (no ISA-specific intrinsics beyond __shfl_down).
+/// For K%256==0 it runs the shipped group loop with an empty remainder.
+pub const GEMV_MFP4G32_E8G128_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8g128.hip");
+/// qt=42 grouped MoE gate_up (k8 indexed). Same remainder-block coverage rule.
+pub const GEMV_MFP4G32_E8G128_MOE_GATE_UP_K8_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8g128_moe_gate_up_k8_indexed_batched.hip");
+/// qt=42 grouped MoE down (k8 indexed, atomic-free expanded). This is the
+/// kernel qwen4's K=640 expert `down_proj` reduction needs: the shipped 256-group
+/// walk could never reach its last 128 elements.
+pub const GEMV_MFP4G32_E8G128_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str = include_str!(
+    "../../../kernels/src/gemv_mfp4g32_e8g128_moe_down_k8_indexed_batched_expanded.hip"
+);
+/// qt=42 grouped-WMMA MoE prefill (gfx1151). Flat 16-value tile loop instead of
+/// the nested group/tile loop, so it covers any K%32==0; for K%256==0 it visits
+/// the identical (group, tile) sequence in the identical order.
+pub const GEMM_MFP4G32_E8G128_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mfp4g32_e8g128_moe_grouped_wmma.gfx1151.hip");
 /// gfx1151 mfp4-E8 grouped MoE down (k8 indexed, atomic-free expanded).
 pub const GEMV_MFP4G32_E8_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_GFX1151_SRC: &str = include_str!(
     "../../../kernels/src/gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded.gfx1151.hip"

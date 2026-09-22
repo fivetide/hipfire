@@ -15058,6 +15058,92 @@ impl Gpu {
     /// Decodes each 16-row weight tile once per 16-token tile instead of
     /// replaying the decode GEMV for every prompt token. X is converted to
     /// f16 through the existing pointer-keyed scratch cache; Y remains f32.
+    /// qt=42 grouped-WMMA MoE prefill (gfx1151). Same scatter pipeline and
+    /// accumulation order as [`Self::gemm_mfp4g32_e8_moe_grouped_wmma`], with a
+    /// flat 16-value tile loop so any K%32==0 is covered instead of only
+    /// K%256==0. Row/tile arithmetic is unchanged: `safe_row`, the lane -> slot
+    /// gather, `x_row_div` and the masked store depend on M and m_total, and the
+    /// only K-derived values are the row stride and the tile count.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mfp4g32_e8g128_moe_grouped_wmma(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert!(
+            self.arch_caps.is_gfx1151(),
+            "qt=42 grouped E8 WMMA kernel is gfx1151-only"
+        );
+        assert!(
+            k % 128 == 0,
+            "gemm_mfp4g32_e8g128_moe_grouped_wmma requires K%128==0, got K={k}"
+        );
+        const KERNEL: &str = "gemm_mfp4g32_e8g128_moe_grouped_wmma";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::GEMM_MFP4G32_E8G128_MOE_GROUPED_WMMA_GFX1151_SRC,
+            KERNEL,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val = m_total as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+        let row_tiles = m.div_ceil(16) as u32;
+        let slot_tiles = m_total.div_ceil(16) as u32;
+        let bytes = m_total * k * 2 + (m_total * m) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [row_tiles, slot_tiles, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(tp);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(xrd_val);
+                b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     pub fn gemm_mfp4g32_e8_soa_wmma(
         &mut self,
         weight: &GpuTensor,

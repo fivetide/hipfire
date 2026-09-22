@@ -541,6 +541,11 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         K::GemvMfp4G32E8Soa | K::GemvMfp4G32E8SoaPrerotated => {
             hip!(gpu.gemv_mfp4g32_e8_soa(w.buf, x, y, m, k))
         }
+        // qt=42. Same E8 lattice body, G128 activation basis, and a kernel that
+        // covers any K%128==0 instead of only K%256==0.
+        K::GemvMfp4G32E8G128 | K::GemvMfp4G32E8G128Prerotated => {
+            hip!(gpu.gemv_mfp4g32_e8g128(w.buf, x, y, m, k))
+        }
         other => return Err(DispatchError::MissingImpl { key: other }),
     }
 }

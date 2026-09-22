@@ -819,6 +819,7 @@ fn source_dtype(dtype: &str) -> Result<DType, String> {
         "MFP4G32P" => DType::MFP4G32P,
         "MFP4G32E8" => DType::MFP4G32E8,
         "MFP4G32E8SOA" => DType::MFP4G32E8SOA,
+        "MFP4G32E8G128" => DType::MFP4G32E8G128,
         "MFP3G32E8" => DType::MFP3G32E8,
         "MFP2G32E8" => DType::MFP2G32E8,
         "PAROQ4G128" => DType::ParoQ4G128,
@@ -876,7 +877,8 @@ fn quant_block_bytes(dtype: DType) -> usize {
         | DType::MFP4G32Lloyd
         | DType::MFP4G32P
         | DType::MFP4G32E8
-        | DType::MFP4G32E8SOA => 16,
+        | DType::MFP4G32E8SOA
+        | DType::MFP4G32E8G128 => 16,
         DType::MFP3G32E8 => 13,
         DType::MFP2G32E8 => 9,
         DType::HFQ2G128 => 40,

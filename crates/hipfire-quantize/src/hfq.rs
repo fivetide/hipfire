@@ -76,6 +76,7 @@ impl QuantType {
             35 => Some(Self::MFP4G32E8SOA),
             36 => Some(Self::MFP3G32E8),
             37 => Some(Self::MFP2G32E8),
+            42 => Some(Self::MFP4G32E8G128),
             38 => Some(Self::MQ2G256GL),
             39 => Some(Self::MQ3G256GL),
             40 => Some(Self::TQ2G128),
@@ -178,6 +179,13 @@ pub(crate) enum QuantType {
     // Drop-in cold tier for MQ3G256Lloyd (tag 3 → tag 5).
     MFP2G32E8 = 37, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 1), 9 B/blk, 2.25 bpw.
     // Drop-in cold tier for MQ2G256Lloyd (tag 1 → tag 6).
+    MFP4G32E8G128 = 42, // mfp4-E8 with a 128-wide FWHT rotation group. Wire layout
+    // BYTE-FOR-BYTE MFP4G32E8 (16-B hdr + (K/32) x 17 B blocks: 1 B E4M3 scale +
+    // 4 x u32 E8 codewords, QUANT_STEP 0.88). The rotation width is not in the
+    // bytes, so the row stride is identical to qt=34; only the segmentation the
+    // encoder rotated (128 elements, sign seeds 43/1043) and the matching
+    // activation basis differ. Exists because qt=34's 256-wide segmentation
+    // cannot tile qwen4's expert down_proj reduction K = 640 = 5 x 128.
     TQ2G128 = 40, // TQ2G128: PrismML Q2_0-compatible scale-only ternary, g128, 34 B/blk
     // (2.125 bpw). [FP16 d][32B 2-bit codes], code=(w/d)+1 clamped 0..2,
     // dequant w=(code-1)*d. Byte-identical to GGUF ggml_type Q2_0=42.

@@ -418,13 +418,8 @@ impl Gpu {
             .saturating_mul(k.div_ceil(128).saturating_mul(68))
             .saturating_add(m.saturating_mul(k).saturating_mul(4));
         let timer = crate::profile::begin_timer(&self.hip, "gemv", FUNC, bytes);
-        let result = self.launch_maybe_blob(
-            FUNC,
-            [m as u32, 1, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
+        let result =
+            self.launch_maybe_blob(FUNC, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(a_ptr);
                 b.push_ptr(x_ptr);
@@ -432,14 +427,12 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b
-            },
-        );
+            });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
         result
     }
-
 
     /// ParoQuant Givens rotation: apply learned pairwise rotations + channel
     /// scaling to activation vector x in-place. Called before GEMV on
@@ -3515,7 +3508,6 @@ impl Gpu {
         ];
         let bytes = crate::profile::mq_rotate_bytes(k) * batch_size;
 
-
         let timer = crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x_batched", bytes);
         let result = self.launch_maybe_blob(
             kernel,
@@ -3598,7 +3590,6 @@ impl Gpu {
         self.invalidate_x_caches_for(xrp);
         result
     }
-
 
     /// FWHT-128 standalone rotation for MQ4G128 activations.
     ///
@@ -4017,6 +4008,54 @@ impl Gpu {
     }
 
     /// mfp4-E8 prerotated (x already FWHT-rotated by caller).
+    /// mfp4-E8 with a 128-wide FWHT rotation group (qt=42), dense GEMV.
+    ///
+    /// `x` must already be rotated in the G128 basis (`rotate_x_mq_128`, sign
+    /// seeds 43/1043) — the same basis `MQ4G128V2` consumes. The wire layout is
+    /// the AoS E8 layout unchanged, so this row stride is byte-identical to
+    /// `gemv_mfp4g32_e8`'s; only the FWHT segmentation the encoder used differs.
+    ///
+    /// Unlike the 256-wide family this admits any `K % 128 == 0`: the kernel
+    /// walks whole 8-block groups plus a masked remainder, which is what lets a
+    /// K=640 reduction axis (qwen4's expert `down_proj`) run at all.
+    pub fn gemv_mfp4g32_e8g128(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            k % 128 == 0,
+            "gemv_mfp4g32_e8g128 requires K%128==0 (whole 128-wide rotation groups), got K={k}"
+        );
+        const KERNEL: &str = "gemv_mfp4g32_e8g128";
+        self.ensure_kernel(KERNEL, kernels::GEMV_MFP4G32_E8G128_SRC, KERNEL)?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(KERNEL, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        })
+    }
+
     pub fn gemv_mfp4g32_e8_prerotated(
         &mut self,
         a_raw: &GpuTensor,
@@ -10140,6 +10179,102 @@ impl Gpu {
     /// RDNA3 dGPU (gfx1100/1101/1102): dispatches the 4-way-unroll twin when
     /// HIPFIRE_E8_DGPU_TWIN is enabled (default ON).
     #[allow(clippy::too_many_arguments)]
+    /// Single-token (batch=1, k_top=8) entry for the qt=42 grouped gate_up.
+    ///
+    /// Mirrors [`Self::gemv_mfp4g32_e8_moe_gate_up_k8_indexed`]: it runs the same
+    /// batched kernel with `batch_size = 1`, which is how the decode call site
+    /// reaches it. Present so route admission for the new dtype is a one-line
+    /// dtype match at the call site rather than a signature change.
+    pub fn gemv_mfp4g32_e8g128_moe_gate_up_k8_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.gemv_mfp4g32_e8g128_moe_gate_up_k8_indexed_batched(
+            expert_ptrs,
+            topk_indices,
+            x,
+            y_gate,
+            y_up,
+            m,
+            k,
+            8,
+            1,
+        )
+    }
+
+    /// qt=42 grouped MoE gate_up (k8 indexed, batched). See
+    /// [`Self::gemv_mfp4g32_e8g128`] for the coverage contract; this is the same
+    /// remainder-block kernel behind the indexed MoE interface, so a K%256!=0
+    /// gate_up axis is covered exactly rather than truncated.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mfp4g32_e8g128_moe_gate_up_k8_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            k % 128 == 0,
+            "gemv_mfp4g32_e8g128_moe_gate_up_k8_indexed_batched requires K%128==0, got K={k}"
+        );
+        const KERNEL: &str = "gemv_mfp4g32_e8g128_moe_gate_up_k8_indexed_batched";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::GEMV_MFP4G32_E8G128_MOE_GATE_UP_K8_INDEXED_BATCHED_SRC,
+            KERNEL,
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            KERNEL,
+            [m as u32, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        )
+    }
+
     pub fn gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched(
         &mut self,
         expert_ptrs: &GpuTensor,
@@ -10233,6 +10368,68 @@ impl Gpu {
     /// On RDNA3 dGPU (gfx1100/1101/1102) with HIPFIRE_E8_DGPU_TWIN (default ON),
     /// dispatches the 4-way-unroll gfx11_dgpu twin.
     #[allow(clippy::too_many_arguments)]
+    /// qt=42 grouped MoE down (k8 indexed, atomic-free expanded). This is the
+    /// kernel qwen4's K=640 expert `down_proj` reduction needs: the shipped
+    /// 256-group walk could never reach its last 128 elements.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mfp4g32_e8g128_moe_down_k8_indexed_batched_expanded(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        rot_batch: &GpuTensor,
+        expert_outputs: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            k % 128 == 0,
+            "gemv_mfp4g32_e8g128_moe_down_k8_indexed_batched_expanded requires K%128==0, got K={k}"
+        );
+        const KERNEL: &str = "gemv_mfp4g32_e8g128_moe_down_k8_indexed_batched_expanded";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::GEMV_MFP4G32_E8G128_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC,
+            KERNEL,
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let eop = expert_outputs.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &eop as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            KERNEL,
+            [m as u32, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(rbp);
+                b.push_ptr(eop);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        )
+    }
+
     pub fn gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded(
         &mut self,
         expert_ptrs: &GpuTensor,
@@ -11246,7 +11443,6 @@ impl Gpu {
         }
         result
     }
-
 
     /// N-batched indexed MoE gate_up. Grid = (M, K_TOP, N). `x` is
     /// [N × K], `topk_indices` is [N × K_TOP] i32, `y_gate` and `y_up`

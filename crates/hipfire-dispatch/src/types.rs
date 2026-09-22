@@ -128,6 +128,13 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         // uses the qt53 68-byte row format; it must not fall through to the
         // natural-basis default.
         MQ4G128 | MQ4G128V2 => RotationPlan::FwhtG128,
+        // qt=42 mfp4-E8 carries the SAME G128 activation basis as qt=53 —
+        // 128-element FWHT segments, sign seeds 43/1043, rotated by
+        // `rotate_x_mq_128`. Mapping it to FwhtG256 would feed x rotated in
+        // 256-wide segments into weights rotated in 128-wide ones: both are
+        // orthogonal, but they are NOT the same transform, so the result would
+        // be fluent garbage rather than a fault.
+        MFP4G32E8G128 => RotationPlan::FwhtG128,
         MQ8G256 => RotationPlan::Mq8Internal,
         ParoQ4G128 => RotationPlan::Givens,
         // MQ2G256LloydU is the UNROTATED Lloyd sibling: its weights are encoded
@@ -154,7 +161,7 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
         MQ4G256 | MQ4G256V2 | MQ5G256V2 | MQ6G256V2 | MQ3G256V2 | MQ2G256V2 | MQ4CG256
         | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd | MQ3G256Lloyd
         | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA
-        | MFP3G32E8 | MFP2G32E8 | MQ4G128 | MQ4G128V2 => GemvVariant::Prerotated,
+        | MFP3G32E8 | MFP2G32E8 | MQ4G128 | MQ4G128V2 | MFP4G32E8G128 => GemvVariant::Prerotated,
         _ => GemvVariant::Plain,
     }
 }
@@ -272,6 +279,11 @@ pub enum KernelKey {
     GemvMfp4G32PPrerotated,
     GemvMfp4G32E8Prerotated,
     GemvMfp4G32E8SoaPrerotated,
+    /// qt=42 mfp4-E8, 128-wide rotation group. Same E8 lattice body as the
+    /// MFP4G32E8 keys; only the activation basis and the kernel's coverage
+    /// arithmetic (whole 8-block groups + a masked remainder) differ.
+    GemvMfp4G32E8G128,
+    GemvMfp4G32E8G128Prerotated,
     // GEMV residual
     GemvHfq4G256Residual,
     GemvHfq3G256Residual,
@@ -722,6 +734,7 @@ impl KernelKey {
             (MFP4G32P, Plain) => Ok(Self::GemvMfp4G32P),
             (MFP4G32E8, Plain) => Ok(Self::GemvMfp4G32E8),
             (MFP4G32E8SOA, Plain) => Ok(Self::GemvMfp4G32E8Soa),
+            (MFP4G32E8G128, Plain) => Ok(Self::GemvMfp4G32E8G128),
             (HFP4G32, Plain) => Ok(Self::GemvHfp4G32),
             (ParoQ4G128, Plain) => Ok(Self::GemvParoQ4G128),
             (Q4F16G64, Plain) => Ok(Self::GemvQ4F16G64),
@@ -767,6 +780,7 @@ impl KernelKey {
             MFP4G32P => Ok(Self::GemvMfp4G32PPrerotated),
             MFP4G32E8 => Ok(Self::GemvMfp4G32E8Prerotated),
             MFP4G32E8SOA => Ok(Self::GemvMfp4G32E8SoaPrerotated),
+            MFP4G32E8G128 => Ok(Self::GemvMfp4G32E8G128Prerotated),
             // Q8/Paro have no separate "prerotated" kernel: Q8 is not FWHT-rotated
             // (prerotated input == raw input → gemv_q8_0), and Paro's Givens-rotated
             // input feeds the same gemv_hfq4g128 kernel as its Plain path. launch()
@@ -887,7 +901,7 @@ impl KernelKey {
             HFQ4G256 | HFQ4G128 | HFQ2G256 | HFQ2G128
             | MQ4G256 | MQ4G128 | MQ2G256 | MQ8G256
             | HFP4G32 | MFP4G32 | MFP4G32Lloyd | MFP4G32P
-            | MFP4G32E8 | MFP4G32E8SOA
+            | MFP4G32E8 | MFP4G32E8SOA | MFP4G32E8G128
             | MFP3G32E8 | MFP2G32E8  // mfpN-E8: same RDNA3/4 gating as MFP4G32E8 via e8_with_wmma
             | ParoQ4G128
             // TQ2G128: ternary GEMV kernel (gemv_tq2g128, Task 9) is a generic
