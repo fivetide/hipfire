@@ -9,9 +9,9 @@ use crate::llama::{
 };
 use crate::model_load::{load_weights as rt_load_weights, LoadedWeights, WeightSource};
 use crate::model_source::{
-    capture_file_identity, read_file_exact_at, ModelSource, SourceError, SourceFileIdentity,
-    SourceFormat, SourceIdentity, SourceRangeDescriptor, SourceRangeIdentity, SourceReader,
-    SourceReaderImpl,
+    capture_file_identity, read_file_exact_at, verify_path_identity, ModelSource, SourceError,
+    SourceFileIdentity, SourceFormat, SourceIdentity, SourceRangeDescriptor, SourceRangeIdentity,
+    SourceReader, SourceReaderImpl,
 };
 use crate::weight_backend::{
     decode_raw_codec, flat_name_candidates, load_embedding, raw_codec, resolve_lm_head,
@@ -500,13 +500,7 @@ impl SourceReaderImpl for HfqRangeReader {
         // them, not only the selected base/overlay shard, so a changed base
         // cannot be hidden by a still-readable overlay range.
         for expected in &self.identity.files {
-            let actual = capture_file_identity(&expected.canonical_path)?;
-            if &actual != expected {
-                return Err(SourceError::IdentityChanged {
-                    expected: expected.clone(),
-                    actual,
-                });
-            }
+            verify_path_identity(expected)?;
         }
         read_file_exact_at(&self.file, &self.file_identity, offset, dst)
     }
@@ -3423,6 +3417,194 @@ mod compact_qwen4_ple_tests {
                 300_001_275,
             ]
         );
+    }
+
+    /// `(rchar, read_bytes)` from `/proc/self/io`: bytes the process asked for
+    /// and bytes the block layer actually delivered for it.
+    fn read_proc_self_io() -> (u64, u64) {
+        let text = std::fs::read_to_string("/proc/self/io").unwrap_or_default();
+        let field = |name: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(name))
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        (field("rchar: "), field("read_bytes: "))
+    }
+
+    /// Disk-only probe: does the container's `POSIX_FADV_SEQUENTIAL` hint cost
+    /// the row-addressed PLE reader anything?
+    ///
+    ///   HIPFIRE_PROBE_MODEL=<artifact.hfq> cargo test -p hipfire-runtime --lib \
+    ///     ple_window_readahead_probe -- --ignored --nocapture
+    ///
+    /// The container fd is opened with `POSIX_FADV_SEQUENTIAL` for the ordered
+    /// model load, and the PLE reader's descriptor is a dup of it, so PLE rows
+    /// are read on a sequentially-advised description. This reads the PLE's
+    /// real 3,840 B windows (and a 128 KiB window, where read-ahead has
+    /// something to spend) from two independently opened descriptions, one
+    /// advised SEQUENTIAL and one advised RANDOM, dropping each window's pages
+    /// with `POSIX_FADV_DONTNEED` first, and reports bytes the block layer
+    /// delivered per read (`/proc/self/io`: `read_bytes`).
+    ///
+    /// Measured 2026-09-22, ext4, kernel 7.0.9-cachyos-lto, 192 windows per arm,
+    /// arms alternating order over 3 repetitions: 7,851 B/read for BOTH arms at
+    /// 3,840 B (the ~1.92 pages a crossing window needs) and 135,168 B/read for
+    /// both arms at 128 KiB (exactly the window, no read-ahead). The advice is
+    /// therefore inert for this access shape on this kernel/filesystem; the
+    /// earlier 1.93x reading was an arm-ordering artifact and was not
+    /// reproducible with alternation. Keep this probe: it is the evidence for
+    /// not carrying a second descriptor flavour. Run it with no build or model
+    /// write in flight — a saturated queue is a confounded number, not a
+    /// measurement.
+    #[test]
+    #[ignore = "disk-only readahead probe; set HIPFIRE_PROBE_MODEL to an HFQ artifact"]
+    fn ple_window_readahead_probe() {
+        let Ok(model) = std::env::var("HIPFIRE_PROBE_MODEL") else {
+            println!("ple-window-probe: skipped, HIPFIRE_PROBE_MODEL is unset");
+            return;
+        };
+        let reads: usize = std::env::var("HIPFIRE_PROBE_READS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(192);
+        // Row width the reader aligns to: 320 B for today's BF16 shards, 170 B
+        // for a Q8F16 shard. Offsets are multiples of this, exactly like the
+        // reader's page offsets.
+        let align: u64 = std::env::var("HIPFIRE_PROBE_ALIGN")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(320);
+        // 170/340/680/1360/2040 are 1/2/4/8/12 Q8F16 rows; 3840 is today's
+        // BF16 page (12 x 320); 128 KiB is the control where read-ahead would
+        // have room to spend if the kernel did any.
+        let windows: [u64; 7] = [170, 340, 680, 1_360, 2_040, 3_840, 128 * 1024];
+
+        let hfq = HfqFile::open(Path::new(&model)).expect("open probe artifact");
+        let shards: Vec<(u64, u64)> = hfq
+            .tensor_infos()
+            .iter()
+            .filter(|info| info.name.contains(".ngram_embedding.shard_"))
+            .map(|info| (info.data_offset as u64, info.data_size as u64))
+            .take(8)
+            .collect();
+        assert!(
+            !shards.is_empty(),
+            "probe artifact has no external PLE shards to read"
+        );
+        assert!(
+            shards[0].1 > 256 * 1024,
+            "probe shards are too small for the 128 KiB arm"
+        );
+        #[cfg(unix)]
+        let advised = |advice: libc::c_int| -> File {
+            use std::os::unix::io::AsRawFd;
+            let file = File::open(&model).expect("probe fd");
+            unsafe {
+                libc::posix_fadvise(file.as_raw_fd(), 0, 0, advice);
+            }
+            file
+        };
+
+        // Read one arm and return bytes fetched from the block layer per read.
+        #[cfg(unix)]
+        let run_arm = |advice: libc::c_int, window: u64, offsets: &[(usize, u64)]| -> f64 {
+            use std::os::unix::fs::FileExt as _;
+            use std::os::unix::io::AsRawFd;
+            let files: Vec<File> = shards.iter().map(|_| advised(advice)).collect();
+            let dropper = File::open(&model).expect("drop fd");
+            let mut buffer = vec![0u8; window as usize];
+            let before = read_proc_self_io().1;
+            for (shard, offset) in offsets {
+                let drop_from = *offset & !4095;
+                unsafe {
+                    libc::posix_fadvise(
+                        dropper.as_raw_fd(),
+                        drop_from as libc::off_t,
+                        (window + 8192) as libc::off_t,
+                        libc::POSIX_FADV_DONTNEED,
+                    );
+                }
+                files[*shard]
+                    .read_exact_at(&mut buffer, *offset)
+                    .expect("probe read");
+            }
+            read_proc_self_io().1.saturating_sub(before) as f64 / offsets.len() as f64
+        };
+
+        #[cfg(unix)]
+        {
+            let mut report: Vec<(u64, &'static str, f64)> = Vec::new();
+            for window in windows {
+                let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+                let mut next = move || {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    seed
+                };
+                let mut offsets = Vec::with_capacity(reads);
+                for _ in 0..reads {
+                    let shard = (next() as usize) % shards.len();
+                    let (offset, length) = shards[shard];
+                    let span = length.saturating_sub(window).max(1);
+                    // Row-aligned, exactly like the reader's page offsets.
+                    let row = (next() % (span / align).max(1)) * align;
+                    offsets.push((shard, offset + row));
+                }
+                // Alternate arm order per repetition: whichever arm runs second
+                // absorbs any asynchronous read-ahead still in flight.
+                for repetition in 0..3 {
+                    let order = if repetition % 2 == 0 {
+                        [
+                            ("sequential", libc::POSIX_FADV_SEQUENTIAL),
+                            ("random", libc::POSIX_FADV_RANDOM),
+                        ]
+                    } else {
+                        [
+                            ("random", libc::POSIX_FADV_RANDOM),
+                            ("sequential", libc::POSIX_FADV_SEQUENTIAL),
+                        ]
+                    };
+                    for (label, advice) in order {
+                        let bytes_per_read = run_arm(advice, window, &offsets);
+                        println!(
+                            "ple-window-probe window={window}B {label}: rep={repetition} reads={} \
+                             bytes/read={bytes_per_read:.0}",
+                            offsets.len()
+                        );
+                        report.push((window, label, bytes_per_read));
+                    }
+                }
+            }
+
+            let median = |window: u64, label: &str| -> f64 {
+                let mut values: Vec<f64> = report
+                    .iter()
+                    .filter(|(w, l, _)| *w == window && *l == label)
+                    .map(|(_, _, bytes)| *bytes)
+                    .collect();
+                values.sort_by(f64::total_cmp);
+                values[values.len() / 2]
+            };
+            println!(
+                "ple-window-probe page-cost curve (row_aligned={align}B, {reads} reads/arm, \
+                 3 reps, median bytes fetched per read):"
+            );
+            for window in windows {
+                let sequential = median(window, "sequential");
+                let random = median(window, "random");
+                println!(
+                    "ple-window-probe window={window}B sequential={sequential:.0} \
+                     random={random:.0} ratio={:.2}x",
+                    if random > 0.0 {
+                        sequential / random
+                    } else {
+                        0.0
+                    }
+                );
+            }
+        }
     }
 
     #[test]

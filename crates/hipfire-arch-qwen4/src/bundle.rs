@@ -13,7 +13,7 @@ use crate::config::Qwen4Config;
 use crate::gpu_forward::{Qwen4GpuForward, QWEN4_PREFILL_CHUNK_CAP};
 use crate::mtp_gpu::{MtpGpuStateSnapshot, Qwen4MtpGpu};
 use crate::ple::PleHashMetadata;
-use crate::ple_rows::{PleRows, PleRowsError};
+use crate::ple_rows::{PleRowEncoding, PleRows, PleRowsError};
 use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
 use crate::weights::{
     ple_valid_rows_for_shard, ExternalRowsRef, Qwen4Manifest, Qwen4Placement, Qwen4Weights,
@@ -914,7 +914,18 @@ fn ple_descriptors(
                 )))
             }
         };
-        if row_bytes != PLE_ROW_WIDTH * 2 || valid_rows != ple_valid_rows_for_shard(index) {
+        // The manifest's stride is the tier it was declared for; the descriptor
+        // side is validated against the shard's *own* declared dtype by
+        // `ExternalRowsRef::validate_descriptor`. Here the declaration only has
+        // to name a tier this reader decodes, so a sealed BF16-PLE artifact
+        // stays loadable next to a Q8F16 one.
+        if ![
+            PleRowEncoding::Bf16.encoded_row_bytes(),
+            PleRowEncoding::Q8F16.encoded_row_bytes(),
+        ]
+        .contains(&row_bytes)
+            || valid_rows != ple_valid_rows_for_shard(index)
+        {
             return Err(BundleError::Weights(WeightError::DescriptorMismatch(
                 entry.name.clone(),
             )));

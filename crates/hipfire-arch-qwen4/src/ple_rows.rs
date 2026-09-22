@@ -26,28 +26,33 @@ use std::time::{Duration, Instant};
 
 /// Number of n-gram rows needed for every token.
 pub const PLE_ROWS_PER_TOKEN: usize = PLE_HEAD_COUNT;
-/// A physical PLE row is 160 BF16 values.
+/// A physical PLE row as the device consumes it: 160 BF16 values.
+///
+/// This is the *decoded* width. The width on disk is
+/// [`PleRowEncoding::encoded_row_bytes`], which is what the reader pages,
+/// caches and reads; the lease always publishes this decoded form so the
+/// upload and the PLE kernels see one shape regardless of the stored tier.
 pub const PLE_ROW_BYTES: usize = PLE_ROW_WIDTH * 2;
 /// Userspace cache budget.  This is deliberately fixed rather than a public
 /// runtime knob: the model's SSD path must remain bounded on every request.
 pub const PLE_PAGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
-/// Target page size used by the userspace cache.
+/// Physical rows per userspace page.
 ///
-/// A page is both the cache unit and the read unit, so this constant bounds how
-/// many bytes one 320-byte row can cost.  Requested rows are drawn at random
-/// over the whole 102 GB physical table, so a page read almost never serves any
-/// other requested row and the cost of one row is the whole page.  Measured on
-/// gfx1151 with a 2 MiB target: a 291-token chunk requested 4656 rows in 4483
-/// distinct windows and pulled ~9.4 GB for ~1.5 MB of useful bytes — 492 ms of
-/// page-cache copy (1810 ms cold) spent with the GPU idle waiting for the lease.
-/// Matching the OS page (whose cache line the read lands in anyway) keeps the
-/// window within the row's own file page instead of amplifying it ~6500x.
-const PLE_PAGE_TARGET_BYTES: usize = 4 * 1024;
-/// Page size rounded down to a whole number of physical rows.
+/// A page is both the cache unit and the read unit, so the row *count* decides
+/// how much of an OS page one requested row drags in. Requested rows are drawn
+/// at random over the whole 100 GB physical table, so a page read almost never
+/// serves any other requested row and the cost of one row is the whole page.
+/// Measured on gfx1151/ext4 with a 2 MiB page: a 291-token chunk requested 4656
+/// rows in 4483 distinct windows and pulled ~9.4 GB for ~1.5 MB of useful bytes
+/// — 492 ms of page-cache copy (1810 ms cold) spent with the GPU idle.
 ///
-/// Keeping the public geometry row aligned avoids partial-row pages and makes
-/// every positional read a multiple of the source row width.
-pub const PLE_PAGE_BYTES: usize = (PLE_PAGE_TARGET_BYTES / PLE_ROW_BYTES) * PLE_ROW_BYTES;
+/// The device cost of a window is `1 + (window - 1) / 4096` pages, so the row
+/// count is a real lever and it pulls two ways: fewer rows per page means fewer
+/// pages fetched per row (~1.04 at one row, ~1.17 at four, ~1.5 at twelve,
+/// ~2.0 at twenty-four) but more cache entries, and every entry carries index
+/// overhead outside the byte budget. Four rows keeps the page inside a fifth of
+/// an OS page and the index overhead near a quarter of the payload.
+const PLE_ROWS_PER_PAGE: usize = 4;
 /// Maximum of bytes in one coalesced read or one staging buffer, rounded down
 /// to a whole number of rows.
 pub const PLE_STAGING_BYTES: usize = (8 * 1024 * 1024 / PLE_ROW_BYTES) * PLE_ROW_BYTES;
@@ -57,8 +62,115 @@ pub const PLE_MAX_STAGING_BUFFERS: usize = 2;
 /// until its lease is consumed or the request is cancelled.
 pub const PLE_READER_QUEUE_CAPACITY: usize = 64;
 
-const PLE_ROWS_PER_PAGE: usize = PLE_PAGE_BYTES / PLE_ROW_BYTES;
 const PLE_MAX_TOKENS_PER_PREFETCH: usize = PLE_STAGING_BYTES / (PLE_ROWS_PER_TOKEN * PLE_ROW_BYTES);
+
+/// Stored representation of one physical PLE row.
+///
+/// The artifact declares this through the shard dtype, so both tiers can be
+/// read by one reader: an artifact written before the Q8F16 tier is BF16 rows,
+/// and a Q8F16 artifact is five 34-byte blocks per row (`qf16` scale + 32 i8,
+/// [`crate::ple_rows::PLE_Q8_BLOCK_BYTES`]).  Decoding happens on the reader
+/// thread while the requested rows are copied out of a cached page, so the
+/// cache keeps the compact form and the device path is untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PleRowEncoding {
+    /// Raw little-endian BF16: one 320-byte row.
+    Bf16,
+    /// Q8F16: `PLE_ROW_WIDTH / 32` blocks of `[f16 scale][32 x i8]`.
+    Q8F16,
+}
+
+/// Bytes of one Q8F16 block: an f16 scale followed by 32 signed bytes.
+const PLE_Q8_BLOCK_BYTES: usize = 34;
+/// Weights per Q8F16 block.
+const PLE_Q8_BLOCK_WEIGHTS: usize = 32;
+
+impl PleRowEncoding {
+    /// Encoded bytes of one physical row in this representation.
+    pub const fn encoded_row_bytes(self) -> usize {
+        match self {
+            Self::Bf16 => PLE_ROW_BYTES,
+            Self::Q8F16 => (PLE_ROW_WIDTH / PLE_Q8_BLOCK_WEIGHTS) * PLE_Q8_BLOCK_BYTES,
+        }
+    }
+
+    /// Bytes of one userspace page in this representation.
+    pub const fn page_bytes(self) -> usize {
+        PLE_ROWS_PER_PAGE * self.encoded_row_bytes()
+    }
+
+    /// The artifact dtype this encoding is declared as.
+    pub const fn dtype_name(self) -> &'static str {
+        match self {
+            Self::Bf16 => "BF16",
+            Self::Q8F16 => "Q8_0",
+        }
+    }
+
+    /// The encoding a shard dtype declares, or `None` when the reader has no
+    /// decoder for it.
+    ///
+    /// The declared dtype is the contract. Nothing infers the tier from the
+    /// extent, so a mislabelled shard is refused instead of decoded at the
+    /// wrong width.
+    pub fn from_dtype(dtype: &str) -> Option<Self> {
+        match dtype.to_ascii_uppercase().as_str() {
+            "BF16" | "BFLOAT16" => Some(Self::Bf16),
+            "Q8_0" | "Q8F16" | "Q8" | "Q8_F16" => Some(Self::Q8F16),
+            _ => None,
+        }
+    }
+
+    /// Decode one encoded row into `PLE_ROW_BYTES` of little-endian BF16.
+    ///
+    /// `encoded` must be exactly [`Self::encoded_row_bytes`] long and `out`
+    /// exactly [`PLE_ROW_BYTES`]; a short row can never be silently padded.
+    fn decode_row(self, encoded: &[u8], out: &mut [u8]) -> Result<(), PleRowsError> {
+        match self {
+            Self::Bf16 => {
+                if encoded.len() != PLE_ROW_BYTES || out.len() != PLE_ROW_BYTES {
+                    return Err(PleRowsError::InvalidLease {
+                        reason: "BF16 PLE row length mismatch".to_string(),
+                    });
+                }
+                out.copy_from_slice(encoded);
+            }
+            Self::Q8F16 => {
+                if encoded.len() != self.encoded_row_bytes() || out.len() != PLE_ROW_BYTES {
+                    return Err(PleRowsError::InvalidLease {
+                        reason: "Q8F16 PLE row length mismatch".to_string(),
+                    });
+                }
+                for (block, chunk) in encoded.chunks_exact(PLE_Q8_BLOCK_BYTES).enumerate() {
+                    let scale = f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+                    for index in 0..PLE_Q8_BLOCK_WEIGHTS {
+                        let value = scale * (chunk[2 + index] as i8) as f32;
+                        let cell = (block * PLE_Q8_BLOCK_WEIGHTS + index) * 2;
+                        out[cell..cell + 2].copy_from_slice(&f32_to_bf16_bits(value).to_le_bytes());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[inline]
+fn f16_to_f32(bits: u16) -> f32 {
+    // The decoder the runtime uses for f16 payloads (half-backed), not a local
+    // hand-rolled version: f16 scale decode must be exact, including subnormals.
+    hipfire_runtime::llama::f16_to_f32(bits)
+}
+
+/// Round-to-nearest-even f32 -> BF16 bits, the narrowing the parity fixture
+/// uses (`examples/qwen4_parity.rs`), so a decoded row is bit-identical to the
+/// narrowing the reference does.
+#[inline]
+fn f32_to_bf16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let rounding = 0x7fffu32 + ((bits >> 16) & 1);
+    (bits.wrapping_add(rounding) >> 16) as u16
+}
 
 /// A page in the physical shard layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -446,26 +558,28 @@ impl PleRows {
     /// Open production PLE storage from sealed shard descriptors.
     ///
     /// All descriptors must refer to one immutable source identity and have
-    /// shape `[rows_per_shard, 160]`, BF16 dtype, and exactly `rows * 320`
-    /// bytes.  The physical rows must exactly cover `metadata.padded_rows()`;
-    /// requests are still checked against `metadata.valid_rows()` so padding
-    /// can never be returned as an embedding.
+    /// shape `[rows_per_shard, 160]`, either BF16 (320-byte rows) or Q8F16
+    /// (170-byte rows), and exactly `rows * encoded_row_bytes` bytes.  The
+    /// physical rows must exactly cover `metadata.padded_rows()`; requests are
+    /// still checked against `metadata.valid_rows()` so padding can never be
+    /// returned as an embedding.
     pub fn new(
         descriptors: Vec<SourceRangeDescriptor>,
         metadata: PleHashMetadata,
     ) -> Result<Self, PleRowsError> {
         let descriptors: Arc<[SourceRangeDescriptor]> = descriptors.into();
-        validate_descriptors(&descriptors, &metadata)?;
+        let encoding = validate_descriptors(&descriptors, &metadata)?;
         let source: Arc<dyn PositionalRowSource> = Arc::new(DescriptorRowSource {
             descriptors: descriptors.clone(),
         });
-        Self::spawn(source, descriptors, metadata)
+        Self::spawn(source, descriptors, metadata, encoding)
     }
 
     fn spawn(
         source: Arc<dyn PositionalRowSource>,
         descriptors: Arc<[SourceRangeDescriptor]>,
         metadata: PleHashMetadata,
+        encoding: PleRowEncoding,
     ) -> Result<Self, PleRowsError> {
         let rows_per_shard = descriptors
             .first()
@@ -480,6 +594,7 @@ impl PleRows {
             shard_count: descriptors.len(),
             _descriptors: descriptors,
             metadata,
+            encoding,
             rows_per_shard,
             rows_per_page: PLE_ROWS_PER_PAGE,
             current_epoch: AtomicU64::new(0),
@@ -912,6 +1027,8 @@ struct PleRowsInner {
     shard_count: usize,
     _descriptors: Arc<[SourceRangeDescriptor]>,
     metadata: PleHashMetadata,
+    /// Stored row representation, fixed by the sealed shard dtype.
+    encoding: PleRowEncoding,
     rows_per_shard: usize,
     rows_per_page: usize,
     epoch_started: AtomicBool,
@@ -951,12 +1068,11 @@ impl PleRowsInner {
         }
         let page = local_row / self.rows_per_page;
         let row_in_page = local_row % self.rows_per_page;
-        let page_byte_offset =
-            row_in_page
-                .checked_mul(PLE_ROW_BYTES)
-                .ok_or_else(|| PleRowsError::InvalidLease {
-                    reason: "page byte offset overflow".to_string(),
-                })?;
+        let page_byte_offset = row_in_page
+            .checked_mul(self.encoding.encoded_row_bytes())
+            .ok_or_else(|| PleRowsError::InvalidLease {
+                reason: "page byte offset overflow".to_string(),
+            })?;
         Ok(PleRowLocation {
             global_row: row,
             shard,
@@ -1141,6 +1257,7 @@ impl PleRowsInner {
             let mut state = self.state.lock().expect("PLE state mutex poisoned");
             if let Some(cached) = state.cache.pages.get(&page) {
                 copy_requested_rows(
+                    self.encoding,
                     page,
                     &cached.bytes,
                     requested.get(&page).map(Vec::as_slice).unwrap_or(&[]),
@@ -1210,7 +1327,7 @@ impl PleRowsInner {
             });
         }
         let rows = (self.rows_per_shard - first_row).min(self.rows_per_page);
-        rows.checked_mul(PLE_ROW_BYTES)
+        rows.checked_mul(self.encoding.encoded_row_bytes())
             .ok_or_else(|| PleRowsError::InvalidLease {
                 reason: "page byte length overflow".to_string(),
             })
@@ -1229,7 +1346,7 @@ impl PleRowsInner {
         let first_offset = first
             .page
             .checked_mul(self.rows_per_page)
-            .and_then(|row| row.checked_mul(PLE_ROW_BYTES))
+            .and_then(|row| row.checked_mul(self.encoding.encoded_row_bytes()))
             .ok_or_else(|| PleRowsError::InvalidLease {
                 reason: "coalesced offset overflow".to_string(),
             })? as u64;
@@ -1262,7 +1379,7 @@ impl PleRowsInner {
         for (&page, &length) in group.iter().zip(&lengths) {
             let page_bytes = &read_staging[cursor..cursor + length];
             if let Some(rows) = requested.get(&page) {
-                copy_requested_rows(page, page_bytes, rows, output)?;
+                copy_requested_rows(self.encoding, page, page_bytes, rows, output)?;
             }
             state.cache.insert(page, page_bytes.to_vec());
             cursor += length;
@@ -1280,18 +1397,28 @@ struct RowCopy {
     page_offset: usize,
 }
 
+/// Copy the requested rows out of one cached page into the lease staging
+/// buffer, decoding from the stored representation to `PLE_ROW_BYTES` of BF16.
+///
+/// The cache keeps the *encoded* page, so a decode is paid per access instead
+/// of per distinct row; at 160 weights per row that is five Q8 blocks, and the
+/// alternative (caching decoded rows) would cut the cache's row capacity by the
+/// same encoding ratio.
 fn copy_requested_rows(
+    encoding: PleRowEncoding,
     page: PageKey,
     page_bytes: &[u8],
     rows: &[RowCopy],
     output: &mut [u8],
 ) -> Result<(), PleRowsError> {
+    let encoded_row_bytes = encoding.encoded_row_bytes();
     for row in rows {
-        let page_end = row.page_offset.checked_add(PLE_ROW_BYTES).ok_or_else(|| {
-            PleRowsError::InvalidLease {
+        let page_end = row
+            .page_offset
+            .checked_add(encoded_row_bytes)
+            .ok_or_else(|| PleRowsError::InvalidLease {
                 reason: format!("page {page:?} row offset overflow"),
-            }
-        })?;
+            })?;
         let output_end = row
             .output_offset
             .checked_add(PLE_ROW_BYTES)
@@ -1303,8 +1430,10 @@ fn copy_requested_rows(
                 reason: format!("requested row is outside page {page:?} or output"),
             });
         }
-        output[row.output_offset..output_end]
-            .copy_from_slice(&page_bytes[row.page_offset..page_end]);
+        encoding.decode_row(
+            &page_bytes[row.page_offset..page_end],
+            &mut output[row.output_offset..output_end],
+        )?;
     }
     Ok(())
 }
@@ -1617,12 +1746,21 @@ impl PageCache {
 fn validate_descriptors(
     descriptors: &[SourceRangeDescriptor],
     metadata: &PleHashMetadata,
-) -> Result<(), PleRowsError> {
+) -> Result<PleRowEncoding, PleRowsError> {
     let first = descriptors
         .first()
         .ok_or_else(|| PleRowsError::Descriptor {
             index: 0,
             reason: "at least one physical shard is required".to_string(),
+        })?;
+    // The declared dtype is the contract: BF16 shards are 320-byte raw rows and
+    // Q8F16 shards are five 34-byte blocks per row. Nothing infers the tier
+    // from the byte count, so a mislabelled artifact is refused rather than
+    // decoded as the wrong width.
+    let encoding =
+        PleRowEncoding::from_dtype(first.dtype()).ok_or_else(|| PleRowsError::Descriptor {
+            index: 0,
+            reason: format!("PLE rows must be BF16 or Q8_0, got {}", first.dtype()),
         })?;
     let shape = first.logical_shape();
     let rows = *shape.first().ok_or_else(|| PleRowsError::Descriptor {
@@ -1657,7 +1795,7 @@ fn validate_descriptors(
         });
     }
     let expected_length = (rows as u64)
-        .checked_mul(PLE_ROW_BYTES as u64)
+        .checked_mul(encoding.encoded_row_bytes() as u64)
         .ok_or_else(|| PleRowsError::Descriptor {
             index: 0,
             reason: "descriptor length overflow".to_string(),
@@ -1665,13 +1803,11 @@ fn validate_descriptors(
     if first.length != expected_length {
         return Err(PleRowsError::Descriptor {
             index: 0,
-            reason: format!("expected {expected_length} bytes, got {}", first.length),
-        });
-    }
-    if !is_bf16(first.dtype()) {
-        return Err(PleRowsError::Descriptor {
-            index: 0,
-            reason: format!("PLE rows must be BF16, got {}", first.dtype()),
+            reason: format!(
+                "expected {expected_length} bytes for {} rows, got {}",
+                encoding.dtype_name(),
+                first.length
+            ),
         });
     }
     let identity = first.source_identity();
@@ -1698,10 +1834,14 @@ fn validate_descriptors(
                 reason: format!("all shards must have {expected_length} bytes"),
             });
         }
-        if !is_bf16(descriptor.dtype()) {
+        if PleRowEncoding::from_dtype(descriptor.dtype()) != Some(encoding) {
             return Err(PleRowsError::Descriptor {
                 index,
-                reason: format!("PLE rows must be BF16, got {}", descriptor.dtype()),
+                reason: format!(
+                    "all PLE shards must be {}, got {}",
+                    encoding.dtype_name(),
+                    descriptor.dtype()
+                ),
             });
         }
     }
@@ -1720,11 +1860,7 @@ fn validate_descriptors(
             ),
         });
     }
-    Ok(())
-}
-
-fn is_bf16(dtype: &str) -> bool {
-    matches!(dtype.to_ascii_lowercase().as_str(), "bf16" | "bfloat16")
+    Ok(encoding)
 }
 
 #[cfg(test)]
@@ -1826,6 +1962,22 @@ mod tests {
             rows_per_page: usize,
             source: Arc<MemoryRowSource>,
         ) -> Result<Self, PleRowsError> {
+            Self::from_test_source_encoded(
+                metadata,
+                rows_per_shard,
+                rows_per_page,
+                PleRowEncoding::Bf16,
+                source,
+            )
+        }
+
+        fn from_test_source_encoded(
+            metadata: PleHashMetadata,
+            rows_per_shard: usize,
+            rows_per_page: usize,
+            encoding: PleRowEncoding,
+            source: Arc<MemoryRowSource>,
+        ) -> Result<Self, PleRowsError> {
             if rows_per_shard == 0 || rows_per_page == 0 {
                 return Err(PleRowsError::Descriptor {
                     index: 0,
@@ -1854,6 +2006,7 @@ mod tests {
                 shard_count,
                 _descriptors: Vec::new().into(),
                 metadata,
+                encoding,
                 rows_per_shard,
                 rows_per_page,
                 current_epoch: AtomicU64::new(0),
@@ -2099,9 +2252,202 @@ mod tests {
         assert!(rows.unload().unwrap().is_clean());
     }
 
+    /// Q8F16 rows for the same fixture layout: five `[f16 scale][32 x i8]`
+    /// blocks per row, each block a distinct constant so a mis-ordered block or
+    /// a mis-scaled value is visible.
+    fn rows_source_q8(shard_count: usize, rows_per_shard: usize) -> Vec<Vec<u8>> {
+        let blocks = PLE_ROW_WIDTH / PLE_Q8_BLOCK_WEIGHTS;
+        (0..shard_count)
+            .map(|shard| {
+                let mut bytes = vec![0u8; rows_per_shard * blocks * PLE_Q8_BLOCK_BYTES];
+                for row in 0..rows_per_shard {
+                    let global = (shard * rows_per_shard + row) as f32;
+                    for block in 0..blocks {
+                        let offset = (row * blocks + block) * PLE_Q8_BLOCK_BYTES;
+                        // scale = 1.0 for even blocks, 0.5 for odd ones.
+                        let scale: f32 = if block % 2 == 0 { 1.0 } else { 0.5 };
+                        let bits = f32_to_f16(scale);
+                        bytes[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
+                        for index in 0..PLE_Q8_BLOCK_WEIGHTS {
+                            // Distinct, in-range quantized values per row/head.
+                            let value = ((index as f32) - 16.0 + global) as i8;
+                            bytes[offset + 2 + index] = value as u8;
+                        }
+                    }
+                }
+                bytes
+            })
+            .collect()
+    }
+
+    fn expected_q8_row(shard: usize, row: usize, rows_per_shard: usize) -> Vec<u8> {
+        let blocks = PLE_ROW_WIDTH / PLE_Q8_BLOCK_WEIGHTS;
+        let global = (shard * rows_per_shard + row) as f32;
+        let mut out = vec![0u8; PLE_ROW_BYTES];
+        for block in 0..blocks {
+            let scale: f32 = if block % 2 == 0 { 1.0 } else { 0.5 };
+            for index in 0..PLE_Q8_BLOCK_WEIGHTS {
+                let value = scale * (((index as f32) - 16.0 + global) as i8) as f32;
+                let cell = (block * PLE_Q8_BLOCK_WEIGHTS + index) * 2;
+                out[cell..cell + 2].copy_from_slice(&f32_to_bf16_bits(value).to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// f16 encode for the fixture only (the reader decodes f16; this gives the
+    /// fixture exact scales rather than rounded ones).
+    fn f32_to_f16(value: f32) -> u16 {
+        hipfire_runtime::llama::f32_to_f16(value)
+    }
+
+    #[test]
+    fn q8_rows_decode_to_bf16_lease_rows() {
+        let rows_per_shard = 64;
+        let source = Arc::new(MemoryRowSource {
+            shards: rows_source_q8(2, rows_per_shard),
+            reads: AtomicUsize::new(0),
+            fail: None,
+        });
+        let rows = PleRows::from_test_source_encoded(
+            metadata(128),
+            rows_per_shard,
+            PLE_ROWS_PER_PAGE,
+            PleRowEncoding::Q8F16,
+            source.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            PleRowEncoding::Q8F16.encoded_row_bytes() * PLE_ROWS_PER_PAGE,
+            PleRowEncoding::Q8F16.page_bytes()
+        );
+        let ticket = rows.prefetch(0, PleHistory::new(99), &[0, 1]).unwrap();
+        let expected_ids = ticket.row_ids().unwrap();
+        let lease = rows.wait_completed_lease(&ticket).unwrap();
+        for (token, ids) in expected_ids.iter().enumerate() {
+            for (head, &row_id) in ids.iter().enumerate() {
+                let location = rows.locate_row(row_id).unwrap();
+                let want = expected_q8_row(location.shard, location.local_row, rows_per_shard);
+                assert_eq!(
+                    lease.row_bytes(token, head).unwrap(),
+                    want.as_slice(),
+                    "row {row_id} (token {token} head {head}) decoded differently"
+                );
+            }
+        }
+        drop(lease);
+        // Encoded pages: the lease is still the 320-byte BF16 row shape the
+        // device consumes, while the cache and the reads use the 170-byte form.
+        let stats = rows.cache_stats();
+        assert!(stats.read_bytes > 0);
+        for row in expected_ids.iter().flatten() {
+            let location = rows.locate_row(*row).unwrap();
+            assert_eq!(
+                rows.inner.page_len(location.page_key()).unwrap(),
+                PleRowEncoding::Q8F16.page_bytes()
+            );
+        }
+        assert!(rows.unload().unwrap().is_clean());
+    }
+
+    /// CPU cost of the Q8F16 row decode, which now sits on the reader thread.
+    ///
+    ///   cargo test -p hipfire-arch-qwen4 --lib -- q8_decode_cost_probe --ignored --nocapture
+    ///
+    /// Prints ns per row both ways: straight through the decoder, and inside a
+    /// real prefetch over an in-memory shard set (which also carries the page
+    /// copy the decode replaces for BF16).
+    #[test]
+    #[ignore = "CPU timing probe; no GPU or artifact needed"]
+    fn q8_decode_cost_probe() {
+        let encoded = rows_source_q8(1, 1).remove(0);
+        let mut out = vec![0u8; PLE_ROW_BYTES];
+        const DECODES: u32 = 200_000;
+        let started = std::time::Instant::now();
+        for _ in 0..DECODES {
+            PleRowEncoding::Q8F16
+                .decode_row(&encoded, &mut out)
+                .expect("decode");
+            std::hint::black_box(&out);
+        }
+        let ns_per_row = started.elapsed().as_secs_f64() * 1e9 / DECODES as f64;
+
+        let mut arms = Vec::new();
+        for encoding in [PleRowEncoding::Bf16, PleRowEncoding::Q8F16] {
+            let rows_per_shard = 4096;
+            let shards = match encoding {
+                PleRowEncoding::Bf16 => rows_source(2, rows_per_shard),
+                PleRowEncoding::Q8F16 => rows_source_q8(2, rows_per_shard),
+            };
+            let tokens: Vec<u32> = (0..256).collect();
+            let rows = PleRows::from_test_source_encoded(
+                metadata_with_head_size(512, (2 * rows_per_shard) as u64),
+                rows_per_shard,
+                PLE_ROWS_PER_PAGE,
+                encoding,
+                Arc::new(MemoryRowSource {
+                    shards,
+                    reads: AtomicUsize::new(0),
+                    fail: None,
+                }),
+            )
+            .unwrap();
+            // Warm the page cache so the arm measures copy + decode, not reads.
+            let ticket = rows.prefetch(0, PleHistory::new(99), &tokens).unwrap();
+            drop(rows.wait_completed_lease(&ticket).unwrap());
+            let started = std::time::Instant::now();
+            let ticket = rows.prefetch(0, PleHistory::new(99), &tokens).unwrap();
+            drop(rows.wait_completed_lease(&ticket).unwrap());
+            let elapsed = started.elapsed().as_secs_f64();
+            arms.push((
+                encoding,
+                elapsed * 1e6 / tokens.len() as f64,
+                rows.cache_stats(),
+            ));
+            assert!(rows.unload().unwrap().is_clean());
+        }
+        println!(
+            "q8-decode-probe decode_row={ns_per_row:.1}ns/row ({:.1}ns per 16-row token)",
+            ns_per_row * f64::from(PLE_ROWS_PER_TOKEN as u32)
+        );
+        for (encoding, us_per_token, stats) in &arms {
+            println!(
+                "q8-decode-probe {:?} prefetch={us_per_token:.2}us/token (warm pages, {} reads, \
+                 {} read_bytes)",
+                encoding, stats.reads, stats.read_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn row_encoding_is_declared_by_dtype_not_inferred_from_extent() {
+        assert_eq!(
+            PleRowEncoding::from_dtype("BF16"),
+            Some(PleRowEncoding::Bf16)
+        );
+        assert_eq!(
+            PleRowEncoding::from_dtype("Q8_0"),
+            Some(PleRowEncoding::Q8F16)
+        );
+        for foreign in ["F32", "F16", "MQ4G256V2", "MQ6G256V2", "I64", ""] {
+            assert_eq!(PleRowEncoding::from_dtype(foreign), None, "{foreign}");
+        }
+        // The two tiers differ exactly by the row stride the shard must cover:
+        // 320 bytes for a BF16 shard, 5 x 34 for a Q8F16 one.
+        assert_eq!(PleRowEncoding::Bf16.encoded_row_bytes(), PLE_ROW_BYTES);
+        assert_eq!(
+            PleRowEncoding::Q8F16.encoded_row_bytes(),
+            (PLE_ROW_WIDTH / PLE_Q8_BLOCK_WEIGHTS) * PLE_Q8_BLOCK_BYTES
+        );
+        assert_eq!(PleRowEncoding::Q8F16.encoded_row_bytes(), 170);
+        assert_eq!(PleRowEncoding::Q8F16.dtype_name(), "Q8_0");
+    }
+
     #[test]
     fn direct_fill_handles_partial_pages_duplicates_and_cache_pressure() {
-        assert_eq!(PLE_PAGE_BYTES % PLE_ROW_BYTES, 0);
+        for encoding in [PleRowEncoding::Bf16, PleRowEncoding::Q8F16] {
+            assert_eq!(encoding.page_bytes() % encoding.encoded_row_bytes(), 0);
+        }
         assert_eq!(PLE_STAGING_BYTES % PLE_ROW_BYTES, 0);
 
         let source = Arc::new(MemoryRowSource {

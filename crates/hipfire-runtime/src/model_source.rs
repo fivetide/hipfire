@@ -364,13 +364,7 @@ pub(crate) fn read_file_exact_at(
     offset: u64,
     dst: &mut [u8],
 ) -> Result<(), SourceError> {
-    let actual = capture_file_identity(&expected.canonical_path)?;
-    if &actual != expected {
-        return Err(SourceError::IdentityChanged {
-            expected: expected.clone(),
-            actual,
-        });
-    }
+    verify_path_identity(expected)?;
     let length = u64::try_from(dst.len()).map_err(|_| SourceError::Overflow {
         offset,
         length: u64::MAX,
@@ -431,6 +425,14 @@ pub(crate) fn capture_file_identity(path: &Path) -> Result<SourceFileIdentity, S
         std::fs::canonicalize(path).map_err(|source| SourceError::Io { offset: 0, source })?;
     let metadata = std::fs::metadata(&canonical_path)
         .map_err(|source| SourceError::Io { offset: 0, source })?;
+    Ok(identity_from_metadata(canonical_path, &metadata))
+}
+
+/// One file identity from an already-obtained [`std::fs::Metadata`].
+fn identity_from_metadata(
+    canonical_path: PathBuf,
+    metadata: &std::fs::Metadata,
+) -> SourceFileIdentity {
     #[cfg(unix)]
     let (dev, ino) = {
         use std::os::unix::fs::MetadataExt;
@@ -444,13 +446,58 @@ pub(crate) fn capture_file_identity(path: &Path) -> Result<SourceFileIdentity, S
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| (duration.as_secs() as i64, duration.subsec_nanos()))
         .unwrap_or((0, 0));
-    Ok(SourceFileIdentity {
+    SourceFileIdentity {
         canonical_path,
         dev,
         ino,
         len: metadata.len(),
         mtime_secs,
         mtime_nanos,
+    }
+}
+
+/// True when `metadata` still describes exactly the sealed [`SourceFileIdentity`].
+fn identity_matches(expected: &SourceFileIdentity, metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    let (dev, ino) = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.dev(), metadata.ino())
+    };
+    #[cfg(not(unix))]
+    let (dev, ino) = (0, 0);
+    let (mtime_secs, mtime_nanos) = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| (duration.as_secs() as i64, duration.subsec_nanos()))
+        .unwrap_or((0, 0));
+    dev == expected.dev
+        && ino == expected.ino
+        && metadata.len() == expected.len
+        && mtime_secs == expected.mtime_secs
+        && mtime_nanos == expected.mtime_nanos
+}
+
+/// Re-check a sealed identity on the read path in one `stat`, with no path
+/// resolution and no allocation.
+///
+/// The sealed identity already holds the canonical path, so re-resolving it per
+/// read buys nothing: identity is compared by (dev, ino, length, mtime), and a
+/// retargeted symlink or replaced ancestor directory shows up as a different
+/// (dev, ino) on the same name. This is deliberately a `stat` by name rather
+/// than an `fstat` on the open handle: the handle keeps pointing at the inode it
+/// was opened from, so `fstat` alone cannot see a file replaced at the sealed
+/// name — the case `descriptor_rejects_source_identity_change` and
+/// `compact_qwen4_ple_range_rejects_identity_change_and_truncation` pin.
+pub(crate) fn verify_path_identity(expected: &SourceFileIdentity) -> Result<(), SourceError> {
+    let metadata = std::fs::metadata(&expected.canonical_path)
+        .map_err(|source| SourceError::Io { offset: 0, source })?;
+    if identity_matches(expected, &metadata) {
+        return Ok(());
+    }
+    Err(SourceError::IdentityChanged {
+        expected: expected.clone(),
+        actual: identity_from_metadata(expected.canonical_path.clone(), &metadata),
     })
 }
 
@@ -687,5 +734,65 @@ mod range_tests {
             ),
             Err(SourceError::Overflow { .. })
         ));
+    }
+
+    #[test]
+    fn cheap_identity_check_still_refuses_in_place_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.bin");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let descriptor = test_descriptor(&path, 0, 4, false);
+        let sealed = capture_file_identity(&path).unwrap();
+        verify_path_identity(&sealed).expect("sealed identity verifies");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[7])
+            .unwrap();
+        let mut bytes = [0u8; 4];
+        assert!(matches!(
+            descriptor.read_exact(&mut bytes),
+            Err(SourceError::IdentityChanged { .. })
+        ));
+    }
+
+    /// Cost of the read-path identity check. CPU + one `stat`; no GPU.
+    ///
+    ///   HIPFIRE_PROBE_MODEL=<artifact> cargo test -p hipfire-runtime --lib \
+    ///     identity_check_cost_probe -- --ignored --nocapture
+    ///
+    /// Prints ns/op for the open-time capture (`canonicalize` + `stat` +
+    /// allocation) and for the read-path verifier (one `stat`, no allocation).
+    #[test]
+    #[ignore = "timing probe; set HIPFIRE_PROBE_MODEL to a sealed file"]
+    fn identity_check_cost_probe() {
+        let Ok(model) = std::env::var("HIPFIRE_PROBE_MODEL") else {
+            println!("identity-check-probe: skipped, HIPFIRE_PROBE_MODEL is unset");
+            return;
+        };
+        let path = Path::new(&model);
+        let sealed = capture_file_identity(path).expect("capture probe identity");
+        const ITERATIONS: u32 = 20_000;
+
+        let started = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            let identity = capture_file_identity(path).expect("capture");
+            std::hint::black_box(identity.len);
+        }
+        let capture_ns = started.elapsed().as_secs_f64() * 1e9 / ITERATIONS as f64;
+
+        let started = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            verify_path_identity(&sealed).expect("verify");
+        }
+        let verify_ns = started.elapsed().as_secs_f64() * 1e9 / ITERATIONS as f64;
+
+        println!(
+            "identity-check-probe {model}: capture={capture_ns:.0}ns/op verify={verify_ns:.0}ns/op \
+             saving={:.0}ns/op ({:.2}x), one fewer syscall and two fewer allocations per read",
+            capture_ns - verify_ns,
+            capture_ns / verify_ns.max(0.001)
+        );
     }
 }

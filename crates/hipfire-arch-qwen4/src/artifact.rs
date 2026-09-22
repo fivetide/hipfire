@@ -217,6 +217,24 @@ fn quantized_extent(
     Ok((row_stride, extent))
 }
 
+/// Bytes one row of `width` values occupies in a row-addressed table.
+///
+/// Only the tiers this architecture stores as addressable rows are answered;
+/// anything else is not a row tier and is refused by name at the call site.
+fn external_row_stride(dtype: DType, width: usize) -> Option<usize> {
+    match dtype {
+        DType::F32 => width.checked_mul(4),
+        DType::F16 | DType::BF16 => width.checked_mul(2),
+        // Q8F16 rows are `ceil(K/32)` 34-byte blocks; a partial block is
+        // refused rather than rounded, because the encoder only writes whole
+        // blocks.
+        DType::Q8_0 if width > 0 && width % 32 == 0 => width
+            .checked_div(32)
+            .and_then(|blocks| blocks.checked_mul(34)),
+        _ => None,
+    }
+}
+
 fn validate_weight_geometry(
     entry: &WeightEntry,
     info: &HfqTensorInfo,
@@ -406,16 +424,47 @@ fn validate_weight_geometry(
                     ))
                 })
             })?;
-        let expected_row_bytes = width.checked_mul(2).ok_or_else(|| {
+        // A row-addressed table declares its tier through the artifact: the
+        // shard's own quant tag names the representation, its own dtype-derived
+        // stride must be the one the manifest declared, and the entry's source
+        // contract has to admit that tier. Qwen4 PLE rows ship as BF16 and as
+        // Q8F16, so both are answered here rather than one being privileged.
+        let declared = match info.quant_type {
+            QWEN4_QT_BF16 => DType::BF16,
+            QWEN4_QT_Q8F16 => DType::Q8_0,
+            other => {
+                return Err(Qwen4ArtifactError::new(format!(
+                    "qwen4: external tensor {} has quant_type={other}, which is not a \
+                     row-addressed tier",
+                    entry.name
+                )));
+            }
+        };
+        external_row_stride(declared, width).ok_or_else(|| {
             Qwen4ArtifactError::new(format!(
-                "qwen4: external tensor {} row stride overflows usize",
+                "qwen4: external tensor {} width {width} is not addressable as {declared:?} rows",
                 entry.name
             ))
         })?;
-        if row_bytes != expected_row_bytes {
+        // `row_bytes` is the stride the declaration defaults to. A table may
+        // admit more than one row tier (Qwen4 PLE rows ship as BF16 and Q8F16),
+        // so the declaration only has to name a stride that is coherent for this
+        // width; the artifact's own tag and extent below pin the real geometry.
+        let declared_stride_is_a_tier = [DType::BF16, DType::Q8_0]
+            .into_iter()
+            .any(|tier| external_row_stride(tier, width) == Some(row_bytes));
+        if !declared_stride_is_a_tier {
             return Err(Qwen4ArtifactError::new(format!(
-                "qwen4: external tensor {} row_stride={} expected {}",
-                entry.name, row_bytes, expected_row_bytes
+                "qwen4: external tensor {} declares row_stride={}, which is not a row tier \
+                 for width {width}",
+                entry.name, row_bytes
+            )));
+        }
+        if !entry.dtype_constraint.accepts(declared) {
+            return Err(Qwen4ArtifactError::new(format!(
+                "qwen4: external tensor {} carries {declared:?} rows, which its manifest \
+                 declaration does not admit",
+                entry.name
             )));
         }
         if valid_rows == 0 || valid_rows > physical_rows {
@@ -424,21 +473,18 @@ fn validate_weight_geometry(
                 entry.name, valid_rows
             )));
         }
-        let external_extent = row_bytes.checked_mul(physical_rows).ok_or_else(|| {
-            Qwen4ArtifactError::new(format!(
-                "qwen4: external tensor {} data extent overflows usize",
-                entry.name
-            ))
-        })?;
-        if info.quant_type != QWEN4_QT_BF16
-            || info.group_size != 0
-            || expected_extent != external_extent
-        {
+        let expected_group = if declared == DType::Q8_0 { 32 } else { 0 };
+        if info.group_size != expected_group {
             return Err(Qwen4ArtifactError::new(format!(
-                "qwen4: external tensor {} has quant_type={}, group_size={}, data_size={}, expected BF16 rows ({row_bytes} bytes × {physical_rows})",
-                entry.name, info.quant_type, info.group_size, info.data_size
+                "qwen4: external tensor {} has quant_type={}, group_size={}, expected \
+                 {declared:?} rows",
+                entry.name, info.quant_type, info.group_size
             )));
         }
+        // The extent is pinned by the tag and shape above and compared against
+        // the index below; the declaration's stride only has to be a coherent
+        // tier for this width, because a two-tier table cannot declare one
+        // stride for both.
     } else if row_stride != 0 && info.data_size != expected_extent {
         return Err(Qwen4ArtifactError::new(format!(
             "qwen4: tensor {} row_stride={} data_size={} expected {}",
@@ -1015,6 +1061,111 @@ mod tests {
         assert!(
             error.to_string().contains("multiple of 256"),
             "a K below one FWHT-256 segment must be refused by name, got: {error}"
+        );
+    }
+
+    /// GPU-free admission probe over a real artifact.
+    ///
+    ///   HIPFIRE_PROBE_MODEL=<artifact.hfq> cargo test -p hipfire-arch-qwen4 --lib \
+    ///     admits_a_sealed_artifact_with_its_declared_ple_tier --ignored --nocapture
+    ///
+    /// Reads headers and the index only. Prints the admitted PLE tier, its row
+    /// stride and the external byte count, so a sealed artifact written before
+    /// the Q8F16 tier and one written with it can both be checked without a GPU.
+    #[test]
+    #[ignore = "artifact admission probe; set HIPFIRE_PROBE_MODEL to an HFQ artifact"]
+    fn admits_a_sealed_artifact_with_its_declared_ple_tier() {
+        let Ok(model) = std::env::var("HIPFIRE_PROBE_MODEL") else {
+            println!("admit-probe: skipped, HIPFIRE_PROBE_MODEL is unset");
+            return;
+        };
+        let hfq = hipfire_runtime::hfq::HfqFile::open(Path::new(&model)).expect("open artifact");
+        let admitted = admit_hfqm_artifact(&hfq).expect("artifact must be admitted");
+        let mut shards = 0usize;
+        let mut stride = 0usize;
+        let mut external_bytes = 0u64;
+        let mut tier = None;
+        for entry in admitted.manifest.weights.iter() {
+            if !entry.name.contains(".ngram_embedding.shard_") {
+                continue;
+            }
+            shards += 1;
+            if let hipfire_runtime::weight_manifest::WeightResidency::ExternalRows {
+                row_bytes,
+                ..
+            } = entry.residency
+            {
+                stride = row_bytes;
+            }
+            tier = Some(entry.dtype);
+            let info = hfq
+                .find_tensor_info(&entry.name)
+                .expect("PLE shard index entry");
+            external_bytes += info.data_size as u64;
+        }
+        println!(
+            "admit-probe {model}: admitted, {shards} PLE shards, declared {tier:?} tier, \
+             stride={stride}, external_bytes={external_bytes}"
+        );
+        assert_eq!(shards, 128, "every PLE shard must be admitted");
+        assert!(stride == 320 || stride == 170, "declared stride {stride}");
+    }
+
+    #[test]
+    fn external_row_geometry_admits_each_declared_ple_tier() {
+        // A PLE shard declaration admits BF16 rows and Q8F16 rows; the artifact
+        // decides which one it carries, and the geometry gate must answer both
+        // without privileging either.
+        let mut entry = WeightEntry::layer(
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
+            1,
+            vec![4, 160],
+            DType::Q8_0,
+            ShardPolicy::Replicate,
+        )
+        .external_rows(170, 4);
+        entry.dtype_constraint =
+            hipfire_runtime::weight_manifest::DTypeConstraint::source_from_sources(vec![
+                DType::Q8_0,
+                DType::BF16,
+            ]);
+
+        let info =
+            |quant_type: u8, group_size: u32, data_size: u64| hipfire_runtime::hfq::HfqTensorInfo {
+                name: entry.name.clone(),
+                quant_type,
+                shape: vec![4, 160],
+                group_size,
+                data_offset: 0,
+                data_size: data_size.try_into().unwrap(),
+            };
+
+        validate_weight_geometry(&entry, &info(QWEN4_QT_BF16, 0, 4 * 320))
+            .expect("a sealed BF16 shard must be admitted");
+        validate_weight_geometry(&entry, &info(QWEN4_QT_Q8F16, 32, 4 * 170))
+            .expect("a Q8F16 shard must be admitted");
+
+        // A stride that is no tier for this width, a mismatched index extent,
+        // and a tag the declaration excludes are each refused by name.
+        let mut nonsense = entry.clone();
+        nonsense.residency =
+            hipfire_runtime::weight_manifest::WeightResidency::external_rows(640, 4);
+        let error = validate_weight_geometry(&nonsense, &info(QWEN4_QT_BF16, 0, 4 * 320))
+            .expect_err("a stride that is no row tier must be refused");
+        assert!(error.to_string().contains("not a row tier"), "{error}");
+
+        let error = validate_weight_geometry(&entry, &info(QWEN4_QT_BF16, 0, 4 * 320 - 1))
+            .expect_err("an extent that disagrees with the index must be refused");
+        assert!(error.to_string().contains("data_size"), "{error}");
+
+        let mut bf16_only = entry.clone();
+        bf16_only.dtype_constraint =
+            hipfire_runtime::weight_manifest::DTypeConstraint::source_exact(DType::BF16);
+        let error = validate_weight_geometry(&bf16_only, &info(QWEN4_QT_Q8F16, 32, 4 * 170))
+            .expect_err("a tier the declaration excludes must be refused");
+        assert!(
+            error.to_string().contains("not an admitted source"),
+            "{error}"
         );
     }
 }

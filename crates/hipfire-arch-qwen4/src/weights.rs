@@ -14,6 +14,7 @@
 use crate::config::{LayerType, Qwen4Config};
 #[cfg(test)]
 use crate::config::{Qwen4MtpConfig, RecurrentStateDType, SourceDType};
+use crate::ple_rows::PleRowEncoding;
 use hipfire_runtime::model_source::{SourceFormat, SourceRangeDescriptor};
 #[cfg(test)]
 use hipfire_runtime::weight_manifest::WeightResidency;
@@ -293,8 +294,14 @@ impl ExternalRowsRef {
         &self,
         descriptor: &SourceRangeDescriptor,
     ) -> Result<(), WeightError> {
-        let expected_len = self
-            .row_bytes
+        // The row stride comes from the tier the shard *declares*, not from the
+        // manifest's default: a sealed BF16 shard (320-byte rows) and a Q8F16
+        // shard (170-byte rows) are both valid answers to the same declaration,
+        // and the reader decodes whichever one the artifact carries.
+        let encoding = crate::ple_rows::PleRowEncoding::from_dtype(&descriptor.dtype)
+            .ok_or_else(|| WeightError::DescriptorMismatch(self.name.clone()))?;
+        let expected_len = encoding
+            .encoded_row_bytes()
             .checked_mul(self.physical_rows)
             .ok_or_else(|| WeightError::ShapeOverflow(self.name.clone()))?;
         if descriptor.length != expected_len as u64 {
@@ -304,9 +311,7 @@ impl ExternalRowsRef {
                 actual: descriptor.length,
             });
         }
-        if descriptor.logical_shape != [self.physical_rows, PLE_ROW_WIDTH]
-            || !descriptor.dtype.eq_ignore_ascii_case("BF16")
-        {
+        if descriptor.logical_shape != [self.physical_rows, PLE_ROW_WIDTH] {
             return Err(WeightError::DescriptorMismatch(self.name.clone()));
         }
         if self.valid_rows == 0 || self.valid_rows > self.physical_rows {
@@ -1157,6 +1162,11 @@ fn push_ple_entries<F>(
         ShardPolicy::RowShard { axis: 1 },
         bf16,
     ));
+    // The PLE row tier is declared by the artifact, not by this manifest: a
+    // sealed artifact written before the Q8F16 tier carries BF16 rows and must
+    // stay loadable, so both tiers are admitted and the reader derives its page
+    // and read geometry from whichever one the shard declares.
+    let ple_rows = DTypeConstraint::source_from_sources(vec![DType::Q8_0, DType::BF16]);
     for shard in 0..PLE_SHARD_COUNT {
         let name = format!("{ple}.ple_embedding.ngram_embedding.shard_{shard}.weight");
         weights.push(
@@ -1164,11 +1174,19 @@ fn push_ple_entries<F>(
                 &name,
                 layer_idx,
                 vec![PLE_SHARD_ROWS, PLE_ROW_WIDTH],
-                DType::BF16,
+                DType::Q8_0,
                 ShardPolicy::Replicate,
-                bf16,
+                &ple_rows,
             )
-            .external_rows(PLE_ROW_WIDTH * 2, ple_valid_rows_for_shard(shard)),
+            // Q8F16 is the current writer's tier: five `[f16 scale][32 x i8]`
+            // blocks per 160-value row, 170 bytes instead of the 320 a BF16 row
+            // costs. The declared stride here is the default; a sealed BF16
+            // shard is accepted by the same constraint and validated against its
+            // own dtype-derived stride.
+            .external_rows(
+                PleRowEncoding::Q8F16.encoded_row_bytes(),
+                ple_valid_rows_for_shard(shard),
+            ),
         );
     }
 }
@@ -2405,7 +2423,11 @@ mod tests {
                 Some(1),
             )
             .expect("PLE shard");
-        assert_eq!(ple.dtype, DType::BF16);
+        assert_eq!(ple.dtype, DType::Q8_0);
+        assert!(ple.dtype_constraint.accepts(DType::Q8_0));
+        // A sealed artifact written before the Q8F16 tier carries BF16 rows and
+        // must stay loadable: both tiers are admitted by the same declaration.
+        assert!(ple.dtype_constraint.accepts(DType::BF16));
         assert!(!ple.dtype_constraint.accepts(DType::MQ4G128V2));
     }
 }

@@ -25,10 +25,10 @@ use hipfire_runtime::weight_manifest::ShardPolicy;
 use rdna_compute::DType;
 use serde_json::{json, Map, Value};
 
+use crate::quant_e8::quantize_mfp4g32_e8_soa_2d;
 use crate::quant_fwht::{
     gen_fwht_signs, quantize_mq4g128v2, quantize_mq4g256v2, quantize_mq6g256v2,
 };
-use crate::quant_e8::quantize_mfp4g32_e8_soa_2d;
 use crate::quant_q4::quantize_q8f16;
 
 /// SoA row geometry: `16 + ((n_blocks + 15) >> 4) << 4 + n_blocks * 16`, with
@@ -65,6 +65,10 @@ const QWEN4_PLE_VERSION: u32 = 1;
 const PLE_SHARD_COUNT: usize = 128;
 const PLE_ROWS_PER_SHARD: u64 = 2_500_012;
 const PLE_ROW_WIDTH: u64 = 160;
+/// Encoded bytes of one external PLE row.  PLE_ROW_WIDTH is a multiple of the
+/// Q8F16 block, so five blocks cover a row exactly and a chunk-wide quantization
+/// never straddles two rows.
+const PLE_ENCODED_ROW_BYTES: u64 = (PLE_ROW_WIDTH / Q8F16_BLOCK_SIZE) * Q8F16_BLOCK_BYTES;
 const PLE_HEAD_COUNT: usize = 16;
 const PLE_NGRAM_SIZE: u32 = 3;
 const ROUTED_EXPERTS: u64 = 512;
@@ -120,16 +124,23 @@ const PINNED_METADATA_BYTES: u64 = 4_000;
 const PINNED_INDEX_BYTES: u64 = 116_418;
 #[cfg(test)]
 const PINNED_PAYLOAD_BYTES: u64 = 177_986_811_416;
+/// Two tier changes move the pinned checkpoint's stored size away from its
+/// source payload: the Q8 trunk tier (3,759,329,280 B below the previously
+/// pinned matrices) and the PLE row tier (128 x 2,500,012 x (320 - 170) =
+/// 48,000,230,400 B). Both terms are asserted in
+/// `pinned_output_prediction_is_exact_before_payload_reads`, so a drift in
+/// either tier trips the anchor.
 #[cfg(test)]
-const PINNED_PREDICTED_OUTPUT_BYTES: u64 = 177_986_934_296;
+const PINNED_PREDICTED_OUTPUT_BYTES: u64 = 126_227_374_616;
 const PINNED_SHARD_COUNT: usize = 131;
 /// Default bounded source row chunk. Quantized matrices derive a smaller
 /// physical chunk when raw BF16, decoded F32, and encoded output together
 /// approach the 96 MiB aggregate scratch ceiling.
 pub(crate) const DEFAULT_ROW_CHUNK: usize = 4_096;
-/// External PLE rows are raw BF16 and do not need quantization scratch.  A
-/// 65,536-row range is a bounded 20 MiB request while reducing HTTP request
-/// overhead for the 128 large PLE shards.
+/// External PLE shards are quantized to Q8F16 rows on write; the chunk bounds
+/// both the BF16 read and the f32 decode for one bounded pass. A 65,536-row
+/// range is a ~20 MiB source request (plus decode and encode scratch) while
+/// reducing HTTP request overhead for the 128 large PLE shards.
 const EXTERNAL_PLE_ROW_CHUNK: usize = 65_536;
 const MAX_CHUNK_BYTES: u64 = 96 * 1024 * 1024;
 /// Do not let an accidental CLI value turn a row stream into a tensor buffer.
@@ -670,12 +681,17 @@ fn plan_compact_entries(
     let mut ple_entries = Vec::with_capacity(ple_sources.len());
     for (index, source) in ple_sources {
         let _ = index;
+        let rows = source.shape.first().copied().ok_or_else(|| {
+            Qwen4Error::Invalid(format!("{} compact PLE shard has no rows", source.name))
+        })?;
         ple_entries.push(PlannedEntry {
             name: source.name.clone(),
             shape: shape_u32(&source.shape, &source.name)?,
-            quant_type: 16,
-            group_size: 0,
-            data_len: source.data_len(),
+            quant_type: Q8F16_QUANT_TYPE,
+            group_size: Q8F16_BLOCK_SIZE as u32,
+            data_len: rows.checked_mul(PLE_ENCODED_ROW_BYTES).ok_or_else(|| {
+                Qwen4Error::Invalid("compact PLE entry length overflows".to_string())
+            })?,
             kind: EntryKind::Ple,
             source,
         });
@@ -2644,10 +2660,7 @@ fn matrix_quant_type(dtype: DType) -> Result<(u8, u32), Qwen4Error> {
         DType::MQ4G128V2 => Ok((MQ4G128V2_QUANT_TYPE, MQ4G128V2_GROUP_SIZE as u32)),
         DType::MQ6G256V2 => Ok((MQ6G256V2_QUANT_TYPE, MQ6G256V2_GROUP_SIZE as u32)),
         DType::Q8_0 => Ok((Q8F16_QUANT_TYPE, Q8F16_BLOCK_SIZE as u32)),
-        DType::MFP4G32E8SOA => Ok((
-            MFP4G32E8SOA_QUANT_TYPE,
-            MFP4G32E8SOA_BLOCK_SIZE as u32,
-        )),
+        DType::MFP4G32E8SOA => Ok((MFP4G32E8SOA_QUANT_TYPE, MFP4G32E8SOA_BLOCK_SIZE as u32)),
         other => Err(Qwen4Error::Invalid(format!(
             "Qwen4 matrix quant dtype {other:?} has no wire tag; add it to matrix_quant_type"
         ))),
@@ -3177,17 +3190,23 @@ fn plan_entries(
     let physical_rows = (PLE_SHARD_COUNT as u64)
         .checked_mul(PLE_ROWS_PER_SHARD)
         .ok_or_else(|| Qwen4Error::Invalid("Qwen4 PLE physical row count overflows".to_string()))?;
-    let external_ple_bytes = physical_rows
+    // The source shards are BF16 rows; the artifact stores Q8F16 rows. Both
+    // byte counts cover the same physical table, so each is checked against its
+    // own row width rather than against each other.
+    let source_ple_bytes = physical_rows
         .checked_mul(PLE_ROW_WIDTH)
         .and_then(|elements| elements.checked_mul(2))
+        .ok_or_else(|| Qwen4Error::Invalid("Qwen4 PLE source byte count overflows".to_string()))?;
+    let external_ple_bytes = physical_rows
+        .checked_mul(PLE_ENCODED_ROW_BYTES)
         .ok_or_else(|| Qwen4Error::Invalid("Qwen4 PLE payload byte count overflows".to_string()))?;
-    let source_ple_bytes = ple_sources.values().try_fold(0u64, |sum, source| {
+    let mapped_ple_bytes = ple_sources.values().try_fold(0u64, |sum, source| {
         sum.checked_add(source.data_len())
             .ok_or_else(|| Qwen4Error::Invalid("Qwen4 PLE source byte sum overflows".to_string()))
     })?;
-    if external_ple_bytes != source_ple_bytes {
+    if mapped_ple_bytes != source_ple_bytes {
         return Err(Qwen4Error::Invalid(
-            "Qwen4 PLE shard payload lengths do not sum to the physical table".to_string(),
+            "Qwen4 PLE shard payload lengths do not sum to the BF16 physical table".to_string(),
         ));
     }
     if gate_up_count == 0 || down_count == 0 {
@@ -3229,12 +3248,11 @@ fn plan_entries(
         ple_entries.push(PlannedEntry {
             name: source.name.clone(),
             source,
-            quant_type: 16,
+            quant_type: Q8F16_QUANT_TYPE,
             shape,
-            group_size: 0,
+            group_size: Q8F16_BLOCK_SIZE as u32,
             data_len: PLE_ROWS_PER_SHARD
-                .checked_mul(PLE_ROW_WIDTH)
-                .and_then(|elements| elements.checked_mul(2))
+                .checked_mul(PLE_ENCODED_ROW_BYTES)
                 .ok_or_else(|| {
                     Qwen4Error::Invalid("Qwen4 PLE entry length overflows".to_string())
                 })?,
@@ -3251,10 +3269,7 @@ fn plan_entries(
     // is a recipe error rather than a variant, so it cannot be produced silently.
     if !resident
         .iter()
-        .any(|entry| matches!(
-        entry.kind,
-        EntryKind::Quant(_)
-    ))
+        .any(|entry| matches!(entry.kind, EntryKind::Quant(_)))
     {
         return Err(Qwen4Error::Invalid(
             "Qwen4 production plan packs no rank-2 matrix: the arch manifest declares \
@@ -3284,10 +3299,7 @@ fn plan_entries(
 fn plan_matrix_recipe(plan: &EntryPlan) -> Value {
     let mut formats = BTreeMap::<u8, (String, u64)>::new();
     for entry in &plan.entries {
-        if !matches!(
-        entry.kind,
-        EntryKind::Quant(_)
-    ) {
+        if !matches!(entry.kind, EntryKind::Quant(_)) {
             continue;
         }
         let format = match entry.quant_type {
@@ -3580,13 +3592,9 @@ fn stream_quantized_rows(
                 quantize_mq6g256v2(&values, count_usize, k_usize, signs1_256, signs2_256)
             }
             DType::Q8_0 => quantize_q8f16(&values),
-            DType::MFP4G32E8SOA => quantize_mfp4g32_e8_soa_2d(
-                &values,
-                count_usize,
-                k_usize,
-                signs1_256,
-                signs2_256,
-            ),
+            DType::MFP4G32E8SOA => {
+                quantize_mfp4g32_e8_soa_2d(&values, count_usize, k_usize, signs1_256, signs2_256)
+            }
             _ => {
                 return Err(Qwen4Error::Invalid(format!(
                     "{} has unsupported Qwen4 quant dtype {dtype:?}",
@@ -3626,14 +3634,28 @@ fn stream_entry(
             };
             stream_raw_rows(&entry.source, row_width, 2, row_chunk, scratch, writer)
         }
-        EntryKind::Ple => stream_raw_rows(
-            &entry.source,
-            PLE_ROW_WIDTH,
-            2,
-            EXTERNAL_PLE_ROW_CHUNK,
-            scratch,
-            writer,
-        ),
+        EntryKind::Ple => {
+            // External PLE shards are stored as Q8F16 rows: the source rows are
+            // BF16, and `PLE_ROW_WIDTH` is a multiple of the block, so each row
+            // quantizes independently inside a chunk-wide pass.
+            let rows = entry.source.shape.first().copied().ok_or_else(|| {
+                Qwen4Error::Invalid(format!("{} PLE shard has no rows", entry.name))
+            })?;
+            stream_quantized_rows(
+                &entry.source,
+                DType::Q8_0,
+                rows,
+                PLE_ROW_WIDTH,
+                EXTERNAL_PLE_ROW_CHUNK,
+                None,
+                signs1_256,
+                signs2_256,
+                signs1_128,
+                signs2_128,
+                scratch,
+                writer,
+            )
+        }
         EntryKind::I64(_) => {
             let row_width = if entry.source.shape.len() <= 1 {
                 checked_product(&entry.source.shape, &entry.source.name)?
@@ -4990,6 +5012,16 @@ mod tests {
             assert_eq!(entry.data_len, 2 * 256 * 2, "{name} byte count");
         }
 
+        // PLE shards are external rows and are quantized on write: one 160-value
+        // row is five Q8F16 blocks, however many rows the fixture has.
+        let ple =
+            entry("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight");
+        assert_eq!(ple.kind, EntryKind::Ple);
+        assert_eq!(ple.quant_type, Q8F16_QUANT_TYPE);
+        assert_eq!(ple.group_size, Q8F16_BLOCK_SIZE as u32);
+        assert_eq!(ple.data_len, PLE_ENCODED_ROW_BYTES);
+        assert_eq!(PLE_ENCODED_ROW_BYTES, 170);
+
         // Rank-3 experts flatten to four rows of K=256 and carry the tiers the
         // manifest declares for their roles: gate/up takes the aligned-K group
         // (136 B per 256 weights), and a K the aligned group cannot carry falls
@@ -5226,8 +5258,19 @@ mod tests {
         assert_eq!(data_start, 120_450);
         let data_offset = (data_start + 4_095) & !4_095;
         assert_eq!(data_offset, 122_880);
+        // Two tier changes separate the pinned checkpoint's stored size from its
+        // source payload: the Q8 trunk matrices (3,759,329,280 B below the
+        // previously pinned tiers) and the PLE row tier, whose 128 shards of
+        // 2,500,012 rows are written as Q8F16 rows (170 B) instead of BF16 rows
+        // (320 B).
+        let trunk_saved = 3_759_329_280u64;
+        let ple_saved = (PLE_SHARD_COUNT as u64)
+            .checked_mul(PLE_ROWS_PER_SHARD)
+            .and_then(|rows| rows.checked_mul(PLE_ROW_WIDTH * 2 - PLE_ENCODED_ROW_BYTES))
+            .expect("PLE saving");
+        assert_eq!(ple_saved, 48_000_230_400);
         assert_eq!(
-            data_offset + PINNED_PAYLOAD_BYTES,
+            data_offset + PINNED_PAYLOAD_BYTES - trunk_saved - ple_saved,
             PINNED_PREDICTED_OUTPUT_BYTES
         );
     }
@@ -5264,6 +5307,22 @@ mod tests {
         let mut scratch = ScratchTracker::default();
         stream_raw_rows(&tensor, 2, 2, 1, &mut scratch, &mut output).unwrap();
         assert_eq!(output, bytes);
+    }
+
+    /// The production PLE rasterization for a fixture: every source BF16 row
+    /// decoded to f32 and quantized with the production encoder, in row order.
+    /// Tests compare against this so row order and chunk boundaries are what is
+    /// under test, not the encoder internals.
+    fn expected_ple_q8_bytes(bytes: &[u8], rows: u64) -> Vec<u8> {
+        let row_bytes = PLE_ROW_WIDTH as usize * 2;
+        let mut out = Vec::with_capacity(rows as usize * PLE_ENCODED_ROW_BYTES as usize);
+        for row in 0..rows as usize {
+            let mut values = vec![0f32; PLE_ROW_WIDTH as usize];
+            decode_bf16(&bytes[row * row_bytes..(row + 1) * row_bytes], &mut values)
+                .expect("decode fixture PLE row");
+            out.extend_from_slice(&quantize_q8f16(&values));
+        }
+        out
     }
 
     #[test]
@@ -5312,14 +5371,14 @@ mod tests {
         let entry = PlannedEntry {
             source: tensor,
             name: "model.ple.ngram_embedding.shard_0.weight".to_string(),
-            quant_type: 16,
+            quant_type: Q8F16_QUANT_TYPE,
             shape: vec![rows as u32, PLE_ROW_WIDTH as u32],
-            group_size: 0,
-            data_len: total,
+            group_size: Q8F16_BLOCK_SIZE as u32,
+            data_len: rows * PLE_ENCODED_ROW_BYTES,
             kind: EntryKind::Ple,
         };
         let mut scratch = ScratchTracker::default();
-        let mut output = Vec::with_capacity(total as usize);
+        let mut output = Vec::with_capacity(entry.data_len as usize);
         stream_entry(
             &entry,
             DEFAULT_ROW_CHUNK,
@@ -5331,9 +5390,20 @@ mod tests {
             &mut output,
         )
         .expect("external PLE stream");
-        let expected: Vec<u8> = (0..total).map(|offset| (offset % 251) as u8).collect();
-        assert_eq!(output, expected, "larger ranges must preserve source bytes");
-        assert_eq!(scratch.high_water, max_range_bytes);
+        let source: Vec<u8> = (0..total).map(|offset| (offset % 251) as u8).collect();
+        let expected = expected_ple_q8_bytes(&source, rows);
+        assert_eq!(
+            output, expected,
+            "quantized rows must be written in source row order"
+        );
+        assert_eq!(output.len() as u64, entry.data_len);
+        // One bounded pass holds the BF16 read, its f32 decode, and the Q8F16
+        // encode for every row of the chunk.
+        let chunk_rows = rows.min(EXTERNAL_PLE_ROW_CHUNK as u64);
+        assert_eq!(
+            scratch.high_water,
+            chunk_rows * (PLE_ROW_WIDTH * 2 + PLE_ROW_WIDTH * 4 + PLE_ENCODED_ROW_BYTES)
+        );
 
         let ranges = handle.join().expect("range counter");
         assert_eq!(
@@ -5354,27 +5424,17 @@ mod tests {
             .map(|offset| (offset % 251) as u8)
             .collect();
         let (_file, tensor) = source_tensor(&bytes, vec![rows as u64, PLE_ROW_WIDTH], "BF16");
+        let expected = expected_ple_q8_bytes(&bytes, rows as u64);
         let entry = PlannedEntry {
             source: tensor,
             name: "model.ple.ngram_embedding.shard_0.weight".to_string(),
-            quant_type: 16,
+            quant_type: Q8F16_QUANT_TYPE,
             shape: vec![rows, PLE_ROW_WIDTH as u32],
-            group_size: 0,
-            data_len: bytes.len() as u64,
+            group_size: Q8F16_BLOCK_SIZE as u32,
+            data_len: expected.len() as u64,
             kind: EntryKind::Ple,
         };
 
-        let mut baseline = Vec::new();
-        let mut baseline_scratch = ScratchTracker::default();
-        stream_raw_rows(
-            &entry.source,
-            PLE_ROW_WIDTH,
-            2,
-            DEFAULT_ROW_CHUNK,
-            &mut baseline_scratch,
-            &mut baseline,
-        )
-        .expect("baseline PLE stream");
         let mut optimized = Vec::new();
         let mut optimized_scratch = ScratchTracker::default();
         stream_entry(
@@ -5388,8 +5448,10 @@ mod tests {
             &mut optimized,
         )
         .expect("optimized PLE stream");
-        assert_eq!(optimized, baseline, "PLE payload bytes must be identical");
-        assert_eq!(optimized, bytes, "PLE row order must be unchanged");
+        assert_eq!(
+            optimized, expected,
+            "PLE payload must be the quantized rows in source order"
+        );
 
         let ple = PleMetadata {
             multipliers: vec![3, 5, 7],
@@ -5405,7 +5467,7 @@ mod tests {
             resident_entries: 0,
             expert_entries: 0,
             resident_bytes: 0,
-            external_ple_bytes: bytes.len() as u64,
+            external_ple_bytes: expected.len() as u64,
             ple_shards: 1,
         };
         let metadata_json = build_metadata(None, &plan, plan.ple_metadata.as_ref().unwrap(), None)
@@ -5449,10 +5511,13 @@ mod tests {
             Some(DEFAULT_ROW_CHUNK as u64)
         );
         let file = std::fs::File::open(artifact.path()).expect("open artifact payload");
-        let mut payload = vec![0u8; bytes.len()];
+        let mut payload = vec![0u8; expected.len()];
         read_exact_at(&file, reopened.entries[0].data_offset, &mut payload)
             .expect("read artifact payload");
-        assert_eq!(payload, bytes, "artifact payload bytes must be unchanged");
+        assert_eq!(
+            payload, expected,
+            "artifact payload must carry the quantized PLE rows"
+        );
     }
 
     #[test]
@@ -5968,7 +6033,11 @@ mod tests {
         // lattice granularity.  Reported, never asserted: the tier's quality is
         // measured on a real artifact, not on probe data.
         let element_error = e8_probe_rel_l2(&decoded, &rotated_weights);
-        let norm_ratio = decoded.iter().map(|value| value * value).sum::<f32>().sqrt()
+        let norm_ratio = decoded
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt()
             / rotated_weights
                 .iter()
                 .map(|value| value * value)
@@ -6067,15 +6136,8 @@ mod tests {
             .expect("poison batch y");
         gpu.rotate_x_mq_batched(&batch_x_gpu, &batch_rot_gpu, K, BATCH)
             .expect("rotate_x_mq_batched");
-        gpu.gemm_mfp4g32_e8_soa_wmma(
-            &weight_gpu,
-            &batch_rot_gpu,
-            &batch_y_gpu,
-            M,
-            K,
-            BATCH,
-        )
-        .expect("gemm_mfp4g32_e8_soa_wmma");
+        gpu.gemm_mfp4g32_e8_soa_wmma(&weight_gpu, &batch_rot_gpu, &batch_y_gpu, M, K, BATCH)
+            .expect("gemm_mfp4g32_e8_soa_wmma");
         gpu.hip.device_synchronize().expect("sync");
 
         let batch_host = download(&gpu, &batch_y_gpu, BATCH * M);

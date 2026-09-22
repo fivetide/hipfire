@@ -830,6 +830,24 @@ fn source_dtype(dtype: &str) -> Result<DType, String> {
     Ok(parsed)
 }
 
+/// Bytes one row of `row_elements` occupies when stored as `dtype`.
+///
+/// A row-addressed table may admit more than one tier — a Qwen4 PLE shard is
+/// BF16 (320-byte rows) or Q8F16 (170-byte rows) — so the *declared* dtype picks
+/// the stride and the manifest's `row_bytes` is only the default for dtypes
+/// whose row layout is not derived here.
+fn external_row_stride(dtype: DType, row_elements: usize) -> Option<usize> {
+    match dtype {
+        DType::F32 | DType::F16 | DType::BF16 => row_elements.checked_mul(dtype.size()),
+        // Q8_0 rows are `ceil(K/32)` 34-byte blocks. A partial block is refused
+        // rather than rounded: the encoder only ever writes whole blocks.
+        DType::Q8_0 if row_elements > 0 && row_elements % 32 == 0 => row_elements
+            .checked_div(32)
+            .and_then(|blocks| blocks.checked_mul(quant_block_bytes(dtype))),
+        _ => None,
+    }
+}
+
 fn quant_block_bytes(dtype: DType) -> usize {
     match dtype {
         DType::Q4K => 144,
@@ -1307,23 +1325,18 @@ fn validate_external_range(
             "external valid_rows={valid_rows} is outside physical rows 1..={physical_rows}"
         ));
     }
-    if let Some(width) =
-        matches!(dtype, DType::F32 | DType::F16 | DType::BF16).then_some(dtype.size())
-    {
-        let row_elements = entry.logical_shape[1..]
-            .iter()
-            .try_fold(1usize, |product, &dim| product.checked_mul(dim))
-            .ok_or_else(|| "external row shape overflows usize".to_string())?;
-        let expected_row_bytes = row_elements
-            .checked_mul(width)
-            .ok_or_else(|| "external row byte count overflows usize".to_string())?;
-        if row_bytes != expected_row_bytes {
-            return Err(format!(
-                "external row_bytes={row_bytes}, expected {expected_row_bytes} for {dtype:?}"
-            ));
-        }
+    if !entry.dtype_constraint.accepts(dtype) {
+        return Err(format!(
+            "external rows dtype {dtype:?} is excluded by constraint {:?}",
+            entry.dtype_constraint
+        ));
     }
-    let expected_length = row_bytes
+    let row_elements = entry.logical_shape[1..]
+        .iter()
+        .try_fold(1usize, |product, &dim| product.checked_mul(dim))
+        .ok_or_else(|| "external row shape overflows usize".to_string())?;
+    let expected_row_bytes = external_row_stride(dtype, row_elements).unwrap_or(row_bytes);
+    let expected_length = expected_row_bytes
         .checked_mul(physical_rows)
         .ok_or_else(|| "external range length overflows usize".to_string())?;
     let actual_length = usize::try_from(descriptor.length)
@@ -1331,7 +1344,7 @@ fn validate_external_range(
     if actual_length != expected_length {
         return Err(format!(
             "external range has {actual_length} bytes, expected {expected_length} \
-             for {physical_rows} physical rows"
+             for {physical_rows} physical rows of {dtype:?}"
         ));
     }
     Ok(())
@@ -2433,6 +2446,49 @@ mod tests {
             "the earlier resident must be released after the failed range"
         );
         test_support::reset();
+    }
+
+    #[test]
+    fn external_rows_admit_each_declared_ple_tier() {
+        // Qwen4 PLE rows are 160 values wide and ship in two tiers. One
+        // declaration must validate against either, because a sealed artifact
+        // carries whichever tier it was written with; the stride comes from the
+        // shard's own dtype.
+        assert_eq!(external_row_stride(DType::BF16, 160), Some(320));
+        assert_eq!(external_row_stride(DType::Q8_0, 160), Some(170));
+        // A partial Q8 block is refused rather than rounded.
+        assert_eq!(external_row_stride(DType::Q8_0, 129), None);
+        assert_eq!(external_row_stride(DType::MQ6G256V2, 160), None);
+
+        let mut entry = WeightEntry::layer(
+            "model.ple.ngram_embedding.shard_0.weight",
+            1,
+            vec![4, 160],
+            DType::Q8_0,
+            ShardPolicy::Replicate,
+        )
+        .external_rows(170, 4);
+        entry.dtype_constraint =
+            DTypeConstraint::source_from_sources(vec![DType::Q8_0, DType::BF16]);
+
+        for (dtype, name, stride) in [(DType::BF16, "BF16", 320u64), (DType::Q8_0, "Q8_0", 170u64)]
+        {
+            let descriptor = test_descriptor_with_length(vec![0], 4 * stride, name, vec![4, 160]);
+            validate_external_range(&entry, dtype, &descriptor)
+                .unwrap_or_else(|error| panic!("{dtype:?} shard must validate: {error}"));
+            let short = test_descriptor_with_length(vec![0], 4 * stride - 1, name, vec![4, 160]);
+            assert!(
+                validate_external_range(&entry, dtype, &short).is_err(),
+                "an extent that does not match {dtype:?} rows must be refused"
+            );
+        }
+
+        // A tier the declaration excludes is refused even when its own extent
+        // is self-consistent.
+        let foreign = test_descriptor_with_length(vec![0], 4 * 200, "MQ6G256V2", vec![4, 160]);
+        let error = validate_external_range(&entry, DType::MQ6G256V2, &foreign)
+            .expect_err("an excluded tier must be refused");
+        assert!(error.contains("excluded by constraint"), "{error}");
     }
 
     #[test]

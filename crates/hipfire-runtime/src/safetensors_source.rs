@@ -6,9 +6,9 @@
 //! API maps a shard lazily only when explicitly requested.
 
 use crate::model_source::{
-    capture_file_identity, read_file_exact_at, ModelSource, QuantConfig, SourceError,
-    SourceFileIdentity, SourceFormat, SourceIdentity, SourceRangeDescriptor, SourceRangeIdentity,
-    SourceReader, SourceReaderImpl, TensorInfo,
+    capture_file_identity, read_file_exact_at, verify_path_identity, ModelSource, QuantConfig,
+    SourceError, SourceFileIdentity, SourceFormat, SourceIdentity, SourceRangeDescriptor,
+    SourceRangeIdentity, SourceReader, SourceReaderImpl, TensorInfo,
 };
 use half::bf16;
 use memmap2::Mmap;
@@ -314,13 +314,7 @@ impl SourceReaderImpl for SafetensorsRangeReader {
         // shard still invalidates descriptors because the source is one
         // immutable inventory, not an unbound collection of files.
         for expected in &self.identity.files {
-            let actual = capture_file_identity(&expected.canonical_path)?;
-            if &actual != expected {
-                return Err(SourceError::IdentityChanged {
-                    expected: expected.clone(),
-                    actual,
-                });
-            }
+            verify_path_identity(expected)?;
         }
         read_file_exact_at(&self.file, &self.file_identity, offset, dst)
     }
