@@ -197,6 +197,23 @@ pub(crate) fn dispatch_embedding(
 mod tests {
     use super::*;
 
+    /// The stride the arch hands the dispatcher is a second implementation of
+    /// the artifact boundary's row geometry.  These are the expert K and the
+    /// trunk K values, spelled as the producer's formula so the three copies
+    /// (producer, artifact boundary, here) cannot drift apart silently.
+    #[test]
+    fn packed_row_strides_follow_the_producer_geometry() {
+        // E8 SoA: 16-byte header + ceil-to-16 scale bytes + 16 B per block.
+        assert_eq!(row_stride(DType::MFP4G32E8SOA, 2560), 16 + 80 + 80 * 16);
+        // K = 768 pads its 24 scale bytes to 32 — the padding case, at a K the
+        // format actually admits (the routed down reduction is not 256-aligned
+        // and the artifact boundary refuses it by name).
+        assert_eq!(row_stride(DType::MFP4G32E8SOA, 768), 16 + 32 + 24 * 16);
+        // Q8F16: 34-byte blocks of 32 weights.
+        assert_eq!(row_stride(DType::Q8_0, 2560), 80 * QT3_BLOCK_BYTES);
+        assert_eq!(row_stride(DType::Q8_0, 6144), 192 * QT3_BLOCK_BYTES);
+    }
+
     #[test]
     fn embedding_dispatch_preserves_bf16_and_routed_mqv2_contracts() {
         assert_eq!(embedding_path(DType::BF16), Some(EmbeddingPath::Bf16));

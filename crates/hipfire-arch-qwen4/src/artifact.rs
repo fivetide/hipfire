@@ -34,6 +34,11 @@ const QWEN4_QT_Q8F16: u8 = 3;
 /// MFP4G32E8SOA (qt=35): E8-lattice SoA rows, 4.25 bpw, 32-weight blocks with a
 /// 16-byte-aligned padded scale block.
 const QWEN4_QT_MFP4G32E8SOA: u8 = 35;
+/// One FWHT-256 segment: the unit the encoder rotates and the decode GEMV/GEMM
+/// assert (`assert!(k % 256 == 0)`).  A payload that only satisfied the
+/// 32-weight block size would pass every byte count here and then either panic
+/// or read unrotated activations.
+const QWEN4_MFP4G32E8SOA_K_ALIGNMENT: usize = 256;
 
 /// SoA row geometry, mirroring the producer's `mfp4e8soa_row_geometry`.
 fn mfp4e8soa_extent(
@@ -43,9 +48,10 @@ fn mfp4e8soa_extent(
     let k = usize::try_from(*shape.last().expect("shape length checked")).map_err(|_| {
         Qwen4ArtifactError::new(format!("qwen4: source tensor {name} K overflows usize"))
     })?;
-    if k == 0 || k % 32 != 0 {
+    if k == 0 || k % QWEN4_MFP4G32E8SOA_K_ALIGNMENT != 0 {
         return Err(Qwen4ArtifactError::new(format!(
-            "qwen4: MFP4G32E8SOA tensor {name} needs a nonzero K multiple of 32, got {k}"
+            "qwen4: MFP4G32E8SOA tensor {name} needs a nonzero K multiple of \
+             {QWEN4_MFP4G32E8SOA_K_ALIGNMENT}, got {k}"
         )));
     }
     let n_blocks = k / 32;
@@ -986,5 +992,35 @@ mod tests {
         validate_ple_records(&hfq, &PleHashMetadata::qwen4()).unwrap();
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(path.parent().unwrap());
+    }
+
+    /// A routed expert block is rank-3 on disk and rows-by-K in the format, so
+    /// the loader's extent must flatten the leading dimensions exactly as the
+    /// producer's row count does — and refuse a K the decode kernels assert on.
+    #[test]
+    fn mfp4e8soa_extent_flattens_expert_blocks_and_requires_fwht_alignment() {
+        let (stride, extent) = mfp4e8soa_extent(&[512, 1280, 2560], "gate_up").unwrap();
+        assert_eq!(stride, 16 + 80 + 80 * 16);
+        assert_eq!(extent, 512 * 1280 * stride);
+
+        // The same rows as a flat rank-2 matrix describe the same payload: the
+        // flattening is exactly the leading-dimension product.
+        let (_flat_stride, flat) = mfp4e8soa_extent(&[512 * 1280, 2560], "gate_up_flat").unwrap();
+        assert_eq!(flat, extent);
+
+        // `moe_intermediate_size = 640` is not one FWHT-256 segment, so the
+        // routed down projection cannot be carried by this format at all: the
+        // boundary must say so by name instead of admitting a payload whose
+        // decode would drop the unaligned tail.
+        let error = mfp4e8soa_extent(&[512, 2560, 640], "down").unwrap_err();
+        assert!(
+            error.to_string().contains("multiple of 256"),
+            "a K below one FWHT-256 segment must be refused by name, got: {error}"
+        );
+        let error = mfp4e8soa_extent(&[512, 1280, 128], "gate_up").unwrap_err();
+        assert!(
+            error.to_string().contains("multiple of 256"),
+            "a K below one FWHT-256 segment must be refused by name, got: {error}"
+        );
     }
 }

@@ -26,32 +26,32 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::BTreeSet;
 use std::fmt;
 
-/// MQ4-G256V2 is the aligned logical-K matrix representation.
+/// The routed experts' declared targets: gate/up at the aligned-K group width
+/// and down at the row-local one.
+///
+/// The E8 lattice format is deliberately *not* used here.  It rotates and
+/// encodes in 256-wide FWHT segments, so `K % 256 == 0` is a precondition of
+/// both the encoder and the decode kernels (`groups_per_row = K / 256`), and
+/// `experts.down_proj` reduces over `moe_intermediate_size = 640` — three
+/// quarters of a segment short.  The row-local MQ4G128V2 group exists for
+/// exactly this case, and both tiers cost the same 4.25 bits per weight, so the
+/// expert family keeps the pair the qwen4 typed route's kernels are built on.
 pub const ROUTED_GATE_UP_DTYPE: DType = DType::MQ4G256V2;
-/// MQ4-G128V2 is the row-local fallback for non-256-aligned logical K.
 pub const ROUTED_DOWN_DTYPE: DType = DType::MQ4G128V2;
 pub const PLE_SHARD_ROWS: usize = 2_500_012;
 pub const PLE_ROW_WIDTH: usize = 160;
 pub const PLE_SHARD_COUNT: usize = 128;
 
+/// Packed formats this family's planner recognises.
+///
+/// A declaration outside this set is refused by name rather than demoted to
+/// BF16, so the predicate is a recognition list, not the tier policy: the
+/// policy lives in [`qwen4_matrix_dtype`].
 fn qwen4_quantized_dtype(dtype: DType) -> bool {
     matches!(
         dtype,
-        DType::MQ4G256V2 | DType::MQ4G128V2 | DType::MQ6G256V2 | DType::MFP4G32E8SOA
+        DType::MQ4G256V2 | DType::MQ4G128V2 | DType::MQ6G256V2 | DType::MFP4G32E8SOA | DType::Q8_0
     )
-}
-
-/// Trunk tier selector, for A/B comparison builds only.
-///
-/// `HIPFIRE_QWEN4_TRUNK_TIER=mfp4e8` puts the wide attention/GDN projections on
-/// the E8 lattice format (qt=35, 4.25 bpw) instead of MQ6G256V2 (6.25 bpw).  The
-/// producer and the loader read it through this one function, so a build and its
-/// load agree; the published recipe carries the resulting tier either way.
-fn qwen4_trunk_tier() -> DType {
-    match std::env::var("HIPFIRE_QWEN4_TRUNK_TIER").as_deref() {
-        Ok("mfp4e8") => DType::MFP4G32E8SOA,
-        _ => DType::MQ6G256V2,
-    }
 }
 
 /// Payloads that stay source-exact BF16 even though they are rank-2 matrices.
@@ -110,35 +110,36 @@ fn qwen4_quantizable_matrix(name: &str, shape: &[usize]) -> bool {
     if !name.contains(".linear_attn.") && !name.contains(".self_attn.") {
         return false;
     }
-    // Aligned K takes MQ4G256V2; everything else that the row-local format can
-    // represent takes MQ4G128V2, whose per-row `ceil(K / 128)` groups exist for
-    // exactly this case.  A K that is not a multiple of 128 stays BF16.
+    // The eight-bit block format carries any K that is a multiple of its
+    // 32-weight block, so alignment beyond the admission boundary above is not
+    // a packing precondition.  A K that is not a multiple of 128 stays BF16.
     shape.last().is_some_and(|k| k % 128 == 0)
 }
 
-/// The packed trunk carries six bits per weight, not four.
+/// The tier each packed class ships at.
 ///
-/// A routed expert's 4-bit error is averaged over the ten experts a token
-/// selects, so the routed family tolerates MQ4; a dense trunk projection writes
-/// its error straight into the residual stream, and the measured consequence of
-/// MQ4 on these matrices was a model that opened a reasoning block it could not
-/// close.  MQ6G256V2 keeps the aligned-K 256 group and the same FWHT basis, so
-/// dispatch, artifact layout, and the rotation scratch are unchanged.
+/// Routed experts keep the four-bit MQ4 family: their error is averaged over the
+/// ten experts a token selects, they are where nearly all of the weight traffic
+/// is (512 experts x two matrices per layer), and the qwen4 typed route's
+/// grouped kernels are built on this exact qt44/qt53 pair.  The rank-2 trunk
+/// carries eight bits instead — a dense projection writes its error straight
+/// into the residual stream, and this family has already measured what a
+/// lossier tier does there: a four-bit trunk opened a reasoning block the model
+/// could not close.  Q8F16 costs 8.5 bpw but needs no rotation basis at all, and
+/// the trunk is a rounding error next to the experts.
 fn qwen4_matrix_dtype(shape: &[usize]) -> DType {
     let k = shape.last().copied().unwrap_or_default();
-    // Routed experts keep the 4-bit family their sealed gate/up and down
-    // kernels read; only the rank-2 trunk matrices take the 6-bit group.
     if shape.len() == 3 {
-        return if k % 256 == 0 {
-            DType::MQ4G256V2
+        // gate/up reduces over `hidden` (256-aligned) and takes the aligned-K
+        // group; down reduces over `moe_intermediate_size` and takes the
+        // row-local one.
+        if k % 256 == 0 {
+            ROUTED_GATE_UP_DTYPE
         } else {
-            DType::MQ4G128V2
-        };
-    }
-    if k % 256 == 0 {
-        qwen4_trunk_tier()
+            ROUTED_DOWN_DTYPE
+        }
     } else {
-        DType::MQ4G128V2
+        DType::Q8_0
     }
 }
 
@@ -156,19 +157,24 @@ fn qwen4_target_dtype(name: &str, shape: &[usize], requested: DType) -> DType {
 }
 
 /// Q8 targets accept a BF16 source (the checkpoint) or an already-converted
-/// Q8 payload, and nothing else: the matrix families above are a different
+/// Q8 payload, and nothing else: any other packed family is a different
 /// geometry and would be misread here.
 fn qwen4_q8_source() -> DTypeConstraint {
     DTypeConstraint::source_from_sources(vec![DType::BF16, DType::Q8_0])
 }
 
+/// Expert targets accept a BF16 source (the checkpoint) or an already-converted
+/// four-bit payload at the exact geometry this family declares.
+///
+/// The set is deliberately closed: every member is a representation some
+/// declared target actually carries.  Admitting a family no target uses would
+/// only let an artifact past the source check and into a geometry mismatch at
+/// the artifact boundary, one validation layer later.
 fn qwen4_quant_source() -> DTypeConstraint {
     DTypeConstraint::source_from_sources(vec![
         DType::BF16,
-        DType::MQ4G256V2,
-        DType::MQ4G128V2,
-        DType::MQ6G256V2,
-        DType::MFP4G32E8SOA,
+        ROUTED_GATE_UP_DTYPE,
+        ROUTED_DOWN_DTYPE,
     ])
 }
 
@@ -2117,7 +2123,7 @@ mod tests {
                 &[2, 4, 256],
             )
             .dtype,
-            DType::MQ4G256V2
+            ROUTED_GATE_UP_DTYPE
         );
         assert_eq!(
             tensor(
@@ -2125,38 +2131,36 @@ mod tests {
                 &[2, 4, 128],
             )
             .dtype,
-            DType::MQ4G128V2
+            ROUTED_DOWN_DTYPE,
+            "a K the aligned group cannot carry falls to the row-local one"
         );
         assert_eq!(
             tensor("mtp.layers.0.mlp.experts.gate_up_proj", &[2, 4, 256]).dtype,
-            DType::MQ4G256V2
+            ROUTED_GATE_UP_DTYPE
         );
         assert_eq!(
             tensor("mtp.layers.0.mlp.experts.down_proj", &[2, 4, 128]).dtype,
-            DType::MQ4G128V2
+            ROUTED_DOWN_DTYPE
         );
 
-        // Rank-2 matrices whose logical K the row-local format can carry are
-        // quantized, aligned K taking the 256-wide group.  These are the wide
-        // projections that dominate decode traffic.
+        // Rank-2 matrices the packed set admits all take the eight-bit class,
+        // whatever their alignment above the 128-weight admission boundary:
+        // the block format carries any K, so there is no fallback tier.
         for name in [
             "model.language_model.layers.0.self_attn.q_proj.weight",
             "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
         ] {
-            assert_eq!(
-                tensor(name, &[2, 256]).dtype,
-                DType::MQ6G256V2,
-                "rank-2 matrix {name} must quantize at six bits"
-            );
-            assert_eq!(
-                tensor(name, &[2, 384]).dtype,
-                DType::MQ4G128V2,
-                "128-aligned rank-2 matrix {name} must take the row-local format"
-            );
+            for k in [256usize, 384] {
+                assert_eq!(
+                    tensor(name, &[2, k]).dtype,
+                    DType::Q8_0,
+                    "rank-2 matrix {name} K={k} must ship eight-bit"
+                );
+            }
         }
 
-        // The token embedding and the language head take the eight-bit class
-        // tier, which every MoE recipe in this tree uses for them.
+        // The token embedding and the language head take the same eight-bit
+        // class tier, which every MoE recipe in this tree uses for them.
         for name in [
             "model.language_model.embed_tokens.weight",
             "lm_head.weight",
@@ -2213,13 +2217,13 @@ mod tests {
     }
 
     /// The trunk recipe is a decision, not a default: the wide attention/GDN
-    /// projections ship at six bits because four bits on a dense projection
-    /// (which writes straight into the residual stream) produced a model that
-    /// opened a reasoning block it could not close, and BF16 is the unpacked
-    /// path this packing exists to replace.  Either fallback changes the dtype
-    /// assertion or the count below.
+    /// projections ship eight-bit because the paired candidate tiers are worse
+    /// here — four bits on a dense projection (which writes straight into the
+    /// residual stream) produced a model that opened a reasoning block it could
+    /// not close, and BF16 is the unpacked path this packing exists to replace.
+    /// Either fallback changes the dtype assertion or the count below.
     #[test]
-    fn trunk_attention_projections_are_pinned_to_six_bits() {
+    fn trunk_attention_projections_are_pinned_to_eight_bits() {
         let manifest = Qwen4Manifest::build(&pinned_config()).expect("pinned config manifest");
         let mut packed = 0usize;
         for entry in &manifest.weights {
@@ -2234,8 +2238,8 @@ mod tests {
             }
             assert_eq!(
                 entry.dtype,
-                DType::MQ6G256V2,
-                "{} is a trunk attention projection and must ship at six bits",
+                DType::Q8_0,
+                "{} is a trunk attention projection and must ship at eight bits",
                 entry.name
             );
             packed += 1;
@@ -2253,24 +2257,32 @@ mod tests {
             (
                 "model.language_model.layers.3.mlp.experts.gate_up_proj",
                 Some(3),
-                DType::MQ4G256V2,
+                ROUTED_GATE_UP_DTYPE,
             ),
             (
                 "model.language_model.layers.3.mlp.experts.down_proj",
                 Some(3),
-                DType::MQ4G128V2,
+                ROUTED_DOWN_DTYPE,
             ),
             (
                 "mtp.layers.0.mlp.experts.gate_up_proj",
                 None,
-                DType::MQ4G256V2,
+                ROUTED_GATE_UP_DTYPE,
             ),
-            ("mtp.layers.0.mlp.experts.down_proj", None, DType::MQ4G128V2),
+            (
+                "mtp.layers.0.mlp.experts.down_proj",
+                None,
+                ROUTED_DOWN_DTYPE,
+            ),
         ] {
             let entry = manifest.entry(name, layer).expect("routed expert entry");
             assert_eq!(entry.dtype, dtype, "{name} target dtype");
             assert!(entry.dtype_constraint.accepts(DType::BF16));
             assert!(entry.dtype_constraint.accepts(dtype), "{name} source");
+            assert!(
+                !entry.dtype_constraint.accepts(DType::MQ6G256V2),
+                "{name} must not accept an aligned-K family its geometry is not"
+            );
         }
 
         // Dense matrices are quantized targets that still accept BF16 source
@@ -2278,9 +2290,9 @@ mod tests {
         // manifest.
         let assert_quantized = |name: &str, layer: Option<usize>| {
             let entry = manifest.entry(name, layer).expect("quantized matrix entry");
-            assert_eq!(entry.dtype, DType::MQ6G256V2, "{name} target dtype");
+            assert_eq!(entry.dtype, DType::Q8_0, "{name} target dtype");
             assert!(entry.dtype_constraint.accepts(DType::BF16));
-            assert!(entry.dtype_constraint.accepts(DType::MQ6G256V2));
+            assert!(entry.dtype_constraint.accepts(DType::Q8_0));
         };
         for (name, layer) in [
             (

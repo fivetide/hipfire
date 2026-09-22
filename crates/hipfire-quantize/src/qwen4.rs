@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hipfire_arch_qwen4::config::Qwen4Config;
-use hipfire_arch_qwen4::weights::Qwen4Manifest;
+use hipfire_arch_qwen4::weights::{Qwen4Manifest, ROUTED_DOWN_DTYPE, ROUTED_GATE_UP_DTYPE};
 use hipfire_runtime::weight_manifest::ShardPolicy;
 use rdna_compute::DType;
 use serde_json::{json, Map, Value};
@@ -34,10 +34,15 @@ use crate::quant_q4::quantize_q8f16;
 /// SoA row geometry: `16 + ((n_blocks + 15) >> 4) << 4 + n_blocks * 16`, with
 /// `n_blocks = k / 32`.  Returned as `(row_stride, extent)`; the padded scale
 /// block is why this cannot go through the uniform `(group, bytes)` model.
+///
+/// The `K % 256` precondition is the encoder's own, not a cosmetic tightening:
+/// rows are rotated in 256-wide FWHT segments and the decode GEMV/GEMM assert
+/// the same alignment, so an E8 payload whose K only satisfied the 32-weight
+/// block size would pass every byte count here and then panic at encode time.
 fn mfp4e8soa_row_geometry(rows: u64, k: u64) -> Result<(u64, u64), Qwen4Error> {
-    if k == 0 || k % MFP4G32E8SOA_BLOCK_SIZE != 0 {
+    if k == 0 || k % MFP4G32E8SOA_K_ALIGNMENT != 0 {
         return Err(Qwen4Error::Invalid(format!(
-            "MFP4G32E8SOA requires a nonzero K multiple of 32, got K={k}"
+            "MFP4G32E8SOA requires a nonzero K multiple of {MFP4G32E8SOA_K_ALIGNMENT}, got K={k}"
         )));
     }
     let n_blocks = k / MFP4G32E8SOA_BLOCK_SIZE;
@@ -89,6 +94,9 @@ const Q8F16_QUANT_TYPE: u8 = 3;
 /// one with both a dense decode GEMV and a dense prefill GEMM on gfx1151.
 const MFP4G32E8SOA_QUANT_TYPE: u8 = 35;
 const MFP4G32E8SOA_BLOCK_SIZE: u64 = 32;
+/// One FWHT-256 rotation segment: the unit the encoder rotates and the decode
+/// kernels assert (`assert!(k % 256 == 0)`).
+const MFP4G32E8SOA_K_ALIGNMENT: u64 = 256;
 /// Raw signed-I64 records are a distinct HFQ type.  TidI32 is not a valid
 /// representation for Qwen4's hash metadata.
 const QWEN4_I64_QUANT_TYPE: u8 = 52;
@@ -568,15 +576,13 @@ fn plan_compact_entries(
                 .checked_mul(tensor.shape[1])
                 .ok_or_else(|| Qwen4Error::Invalid(format!("{} rows overflow", tensor.name)))?;
             let k = tensor.shape[2];
-            let kind = if is_gate_up {
-                EntryKind::GateUp
-            } else {
-                EntryKind::Down
-            };
+            // A compact fixture is read back through the same manifest and the
+            // same loader as a production artifact, so it must carry the tier
+            // the family declares for that role rather than a tier of its own.
             let dtype = if is_gate_up {
-                DType::MQ4G256V2
+                ROUTED_GATE_UP_DTYPE
             } else {
-                DType::MQ4G128V2
+                ROUTED_DOWN_DTYPE
             };
             let source_len = checked_bf16_bytes(&tensor.shape, &tensor.name)?;
             if tensor.data_len() != source_len {
@@ -586,19 +592,12 @@ fn plan_compact_entries(
                     tensor.data_len()
                 )));
             }
+            let (quant_type, group_size) = matrix_quant_type(dtype)?;
             (
-                match dtype {
-                    DType::MQ4G256V2 => MQ4G256V2_QUANT_TYPE,
-                    DType::MQ4G128V2 => MQ4G128V2_QUANT_TYPE,
-                    _ => unreachable!(),
-                },
-                match dtype {
-                    DType::MQ4G256V2 => MQ4G256V2_GROUP_SIZE as u32,
-                    DType::MQ4G128V2 => MQ4G128V2_GROUP_SIZE as u32,
-                    _ => unreachable!(),
-                },
+                quant_type,
+                group_size,
                 quantized_data_len_for_dtype(dtype, rows, k)?,
-                kind,
+                EntryKind::Quant(dtype),
             )
         } else {
             (
@@ -608,7 +607,7 @@ fn plan_compact_entries(
                 EntryKind::Bf16,
             )
         };
-        if matches!(kind, EntryKind::GateUp | EntryKind::Down) {
+        if matches!(kind, EntryKind::Quant(_)) {
             expert_entries += 1;
         }
         resident.push(PlannedEntry {
@@ -2355,8 +2354,12 @@ fn is_vision_tensor(name: &str) -> bool {
 enum ManifestRole {
     Bf16,
     Matrix(DType),
-    GateUp,
-    Down,
+    /// Rank-3 routed expert block (`[experts, rows, K]`).  The role carries the
+    /// manifest's declared target so the plan packs exactly what the loader
+    /// expects; a role that only knew "expert" would have to guess, and a guess
+    /// that drifts from the manifest is a mis-decoded weight, not an error.
+    GateUp(DType),
+    Down(DType),
     Ple,
 }
 
@@ -2405,9 +2408,9 @@ impl ManifestIndex {
             let role = if entry.residency.is_external() {
                 ManifestRole::Ple
             } else if entry.name.ends_with(".experts.gate_up_proj") && shape.len() == 3 {
-                ManifestRole::GateUp
+                ManifestRole::GateUp(entry.dtype)
             } else if entry.name.ends_with(".experts.down_proj") && shape.len() == 3 {
-                ManifestRole::Down
+                ManifestRole::Down(entry.dtype)
             } else if qwen4_quantized_dtype(entry.dtype) {
                 ManifestRole::Matrix(entry.dtype)
             } else if entry.dtype == DType::BF16 {
@@ -2419,8 +2422,7 @@ impl ManifestIndex {
                 // source bytes instead.  Fail instead of demoting.
                 return Err(Qwen4Error::Invalid(format!(
                     "Qwen4 manifest offers {} as {:?}, which no plan role can carry; \
-                     a rank-2 matrix target must be BF16 or one of \
-                     MQ4G256V2/MQ4G128V2/MQ6G256V2",
+                     a matrix target must be BF16, Q8_0 or MFP4G32E8SOA",
                     entry.name, entry.dtype
                 )));
             };
@@ -2686,25 +2688,14 @@ fn quantized_data_len_for_dtype(dtype: DType, rows: u64, k: u64) -> Result<u64, 
         .ok_or_else(|| Qwen4Error::Invalid("quantized matrix byte length overflows".to_string()))
 }
 
-fn quantized_data_len(kind: ExpertKind, rows: u64, k: u64) -> Result<u64, Qwen4Error> {
-    let dtype = match kind {
-        ExpertKind::GateUp => DType::MQ4G256V2,
-        ExpertKind::Down => DType::MQ4G128V2,
-    };
-    quantized_data_len_for_dtype(dtype, rows, k)
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EntryKind {
     Bf16,
-    Matrix(DType),
-    /// Block-32 Q8F16 (qt=3): an eight-bit class, published separately from the
-    /// rotated matrix tiers it sits beside.
-    Q8,
-    /// E8-lattice SoA trunk tier (qt=35), the comparison alternative to MQ6.
-    E8Soa,
-    GateUp,
-    Down,
+    /// A packed matrix: rank-2, or rank-3 for a routed expert block, whose
+    /// leading dimensions flatten into the row count the format streams.  The
+    /// dtype is the manifest's declaration, never re-derived here — a planner
+    /// that second-guessed it would pack a geometry the loader cannot decode.
+    Quant(DType),
     Ple,
     I64(I64Role),
 }
@@ -3020,16 +3011,17 @@ fn plan_entries(
                         )));
                     }
                 }
-                ManifestRole::GateUp | ManifestRole::Down => {
+                ManifestRole::GateUp(dtype) | ManifestRole::Down(dtype) => {
                     let kind = match expected.role {
-                        ManifestRole::GateUp => ExpertKind::GateUp,
-                        ManifestRole::Down => ExpertKind::Down,
+                        ManifestRole::GateUp(_) => ExpertKind::GateUp,
+                        ManifestRole::Down(_) => ExpertKind::Down,
                         ManifestRole::Bf16 | ManifestRole::Matrix(_) | ManifestRole::Ple => {
                             unreachable!("matched expert manifest role")
                         }
                     };
                     let (rows, k) = validate_expert_shape(&tensor, kind, &expected.shape)?;
-                    let expected_len = quantized_data_len(kind, rows, k)?;
+                    let (quant_type, group_size) = matrix_quant_type(dtype)?;
+                    let data_len = quantized_data_len_for_dtype(dtype, rows, k)?;
                     match kind {
                         ExpertKind::GateUp => {
                             gate_up_count += 1;
@@ -3045,20 +3037,11 @@ fn plan_entries(
                     resident.push(PlannedEntry {
                         source: tensor,
                         name: String::new(),
-                        quant_type: match kind {
-                            ExpertKind::GateUp => MQ4G256V2_QUANT_TYPE,
-                            ExpertKind::Down => MQ4G128V2_QUANT_TYPE,
-                        },
+                        quant_type,
                         shape,
-                        group_size: match kind {
-                            ExpertKind::GateUp => MQ4G256V2_GROUP_SIZE as u32,
-                            ExpertKind::Down => MQ4G128V2_GROUP_SIZE as u32,
-                        },
-                        data_len: expected_len,
-                        kind: match kind {
-                            ExpertKind::GateUp => EntryKind::GateUp,
-                            ExpertKind::Down => EntryKind::Down,
-                        },
+                        group_size,
+                        data_len,
+                        kind: EntryKind::Quant(dtype),
                     });
                 }
                 ManifestRole::Matrix(dtype) => {
@@ -3072,11 +3055,7 @@ fn plan_entries(
                         shape,
                         group_size: matrix_quant_type(dtype)?.1,
                         data_len: expected_len,
-                        kind: match dtype {
-                            DType::Q8_0 => EntryKind::Q8,
-                            DType::MFP4G32E8SOA => EntryKind::E8Soa,
-                            _ => EntryKind::Matrix(dtype),
-                        },
+                        kind: EntryKind::Quant(dtype),
                     });
                 }
                 ManifestRole::Bf16 => {
@@ -3274,7 +3253,7 @@ fn plan_entries(
         .iter()
         .any(|entry| matches!(
         entry.kind,
-        EntryKind::Matrix(_) | EntryKind::E8Soa
+        EntryKind::Quant(_)
     ))
     {
         return Err(Qwen4Error::Invalid(
@@ -3307,7 +3286,7 @@ fn plan_matrix_recipe(plan: &EntryPlan) -> Value {
     for entry in &plan.entries {
         if !matches!(
         entry.kind,
-        EntryKind::Matrix(_) | EntryKind::E8Soa
+        EntryKind::Quant(_)
     ) {
             continue;
         }
@@ -3663,108 +3642,28 @@ fn stream_entry(
             };
             stream_raw_rows(&entry.source, row_width, 8, row_chunk, scratch, writer)
         }
-        EntryKind::E8Soa => {
-            if entry.source.shape.len() != 2 {
+        EntryKind::Quant(dtype) => {
+            // Rank-2 is a plain matrix; rank-3 is a routed expert block that the
+            // format flattens into rows-by-K, keeping each expert's rows
+            // contiguous — exactly the slicing the loader performs when it hands
+            // each expert a byte view of the stacked tensor.
+            let rank = entry.source.shape.len();
+            if rank < 2 {
                 return Err(Qwen4Error::Invalid(format!(
-                    "{} E8-SoA stream requires rank-2 source shape, got {:?}",
+                    "{} {dtype:?} stream requires a matrix source shape, got {:?}",
                     entry.name, entry.source.shape
                 )));
             }
-            stream_quantized_rows(
-                &entry.source,
-                DType::MFP4G32E8SOA,
-                entry.source.shape[0],
-                entry.source.shape[1],
-                row_chunk,
-                None,
-                signs1_256,
-                signs2_256,
-                signs1_128,
-                signs2_128,
-                scratch,
-                writer,
-            )
-        }
-        EntryKind::Q8 => {
-            if entry.source.shape.len() != 2 {
-                return Err(Qwen4Error::Invalid(format!(
-                    "{} eight-bit stream requires rank-2 source shape, got {:?}",
-                    entry.name, entry.source.shape
-                )));
-            }
-            stream_quantized_rows(
-                &entry.source,
-                DType::Q8_0,
-                entry.source.shape[0],
-                entry.source.shape[1],
-                row_chunk,
-                None,
-                signs1_256,
-                signs2_256,
-                signs1_128,
-                signs2_128,
-                scratch,
-                writer,
-            )
-        }
-        EntryKind::Matrix(dtype) => {
-            if entry.source.shape.len() != 2 {
-                return Err(Qwen4Error::Invalid(format!(
-                    "{} matrix stream requires rank-2 source shape, got {:?}",
-                    entry.name, entry.source.shape
-                )));
-            }
-            stream_quantized_rows(
-                &entry.source,
-                dtype,
-                entry.source.shape[0],
-                entry.source.shape[1],
-                row_chunk,
-                None,
-                signs1_256,
-                signs2_256,
-                signs1_128,
-                signs2_128,
-                scratch,
-                writer,
-            )
-        }
-        EntryKind::GateUp | EntryKind::Down => {
-            let (dtype, rows, k, expert_rows) = match entry.kind {
-                EntryKind::GateUp => (
-                    DType::MQ4G256V2,
-                    entry.source.shape[0]
-                        .checked_mul(entry.source.shape[1])
-                        .ok_or_else(|| {
-                            Qwen4Error::Invalid(format!("{} rows overflow", entry.name))
-                        })?,
-                    entry.source.shape[2],
-                    entry.source.shape[1],
-                ),
-                EntryKind::Down => (
-                    DType::MQ4G128V2,
-                    entry.source.shape[0]
-                        .checked_mul(entry.source.shape[1])
-                        .ok_or_else(|| {
-                            Qwen4Error::Invalid(format!("{} rows overflow", entry.name))
-                        })?,
-                    entry.source.shape[2],
-                    entry.source.shape[1],
-                ),
-                EntryKind::Bf16
-                | EntryKind::Matrix(_)
-                | EntryKind::Q8
-                | EntryKind::E8Soa
-                | EntryKind::Ple
-                | EntryKind::I64(_) => unreachable!(),
-            };
+            let rows = checked_product(&entry.source.shape[..rank - 1], &entry.name)?;
+            let k = entry.source.shape[rank - 1];
+            let expert_rows = (rank == 3).then(|| entry.source.shape[1]);
             stream_quantized_rows(
                 &entry.source,
                 dtype,
                 rows,
                 k,
                 row_chunk,
-                Some(expert_rows),
+                expert_rows,
                 signs1_256,
                 signs2_256,
                 signs1_128,
@@ -4305,6 +4204,9 @@ fn read_exact_at(file: &File, offset: u64, dst: &mut [u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quant_e8::dequant_mfp4g32_e8_soa;
+    use crate::quant_fwht::cpu_fwht_256;
+    use rdna_compute::Gpu;
     use std::env;
     use std::net::TcpListener;
     #[cfg(unix)]
@@ -4984,7 +4886,7 @@ mod tests {
     fn manifest_source_dtype_is_bf16_even_when_output_role_is_quantized() {
         let expected = ManifestExpectation {
             shape: vec![2, 2, 2],
-            role: ManifestRole::GateUp,
+            role: ManifestRole::GateUp(DType::MFP4G32E8SOA),
             is_mtp: false,
             ple_index: None,
         };
@@ -4996,20 +4898,43 @@ mod tests {
     }
 
     #[test]
-    fn qwen4_recipe_geometry_uses_row_aware_formats() {
+    fn qwen4_expert_and_trunk_geometry_follow_the_declared_tiers() {
+        // Routed experts: rank-3 blocks flattened to rows-by-K at the group
+        // geometry their declared tier uses.
+        let gate_up_rows = ROUTED_EXPERTS * GATE_UP_INTERMEDIATE;
         assert_eq!(
-            quantized_data_len(ExpertKind::GateUp, 512 * 1280, 2560).unwrap(),
-            891_289_600
+            quantized_data_len_for_dtype(DType::MQ4G256V2, gate_up_rows, HIDDEN_WIDTH).unwrap(),
+            gate_up_rows * (HIDDEN_WIDTH / 256) * MQ4G256V2_GROUP_BYTES
         );
+        let down_rows = ROUTED_EXPERTS * HIDDEN_WIDTH;
         assert_eq!(
-            quantized_data_len(ExpertKind::Down, 512 * 2560, 640).unwrap(),
-            445_644_800
+            quantized_data_len_for_dtype(DType::MQ4G128V2, down_rows, DOWN_INTERMEDIATE).unwrap(),
+            down_rows * (DOWN_INTERMEDIATE / 128) * MQ4G128V2_GROUP_BYTES
         );
+
+        // The E8 lattice format remains a producer capability, and its geometry
+        // is `16 + pad16(K/32) + (K/32) * 16` bytes per row.  It is a capability
+        // the routed down projection cannot use: the codec rotates and encodes
+        // in 256-wide FWHT segments (`groups_per_row = K / 256` in the kernels),
+        // and `moe_intermediate_size = 640` is not a multiple of 256.  That is a
+        // refusal with a message, not a panic inside the encoder.
         assert_eq!(
-            quantized_data_len_for_dtype(DType::MQ4G128V2, 2, 129).unwrap(),
-            2 * 2 * MQ4G128V2_GROUP_BYTES
+            quantized_data_len_for_dtype(DType::MFP4G32E8SOA, 4, HIDDEN_WIDTH).unwrap(),
+            4 * (16 + 80 + 80 * 16)
         );
-        assert!(quantized_data_len(ExpertKind::GateUp, 1, 640).is_err());
+        let refused = quantized_data_len_for_dtype(DType::MFP4G32E8SOA, 4, DOWN_INTERMEDIATE)
+            .expect_err("K = 640 is not one FWHT-256 segment");
+        assert!(
+            refused.to_string().contains("multiple of 256"),
+            "the refusal must name the alignment it needs: {refused}"
+        );
+        assert!(quantized_data_len_for_dtype(DType::MFP4G32E8SOA, 1, 128).is_err());
+
+        // Rank-2 trunk matrices are eight-bit blocks and carry any K.
+        assert_eq!(
+            quantized_data_len_for_dtype(DType::Q8_0, 2, 129).unwrap(),
+            2 * 5 * Q8F16_BLOCK_BYTES
+        );
         assert!(validate_expert_shape_stub(&[512, 1280, 2559], ExpertKind::GateUp).is_err());
     }
     #[test]
@@ -5065,14 +4990,18 @@ mod tests {
             assert_eq!(entry.data_len, 2 * 256 * 2, "{name} byte count");
         }
 
+        // Rank-3 experts flatten to four rows of K=256 and carry the tiers the
+        // manifest declares for their roles: gate/up takes the aligned-K group
+        // (136 B per 256 weights), and a K the aligned group cannot carry falls
+        // to the row-local 68 B per 128.
         let gate_up = entry("model.language_model.layers.0.mlp.experts.gate_up_proj");
-        assert_eq!(gate_up.kind, EntryKind::GateUp);
+        assert_eq!(gate_up.kind, EntryKind::Quant(DType::MQ4G256V2));
         assert_eq!(gate_up.quant_type, MQ4G256V2_QUANT_TYPE);
         assert_eq!(gate_up.group_size, MQ4G256V2_GROUP_SIZE as u32);
         assert_eq!(gate_up.data_len, 4 * MQ4G256V2_GROUP_BYTES);
 
         let down = entry("mtp.layers.0.mlp.experts.down_proj");
-        assert_eq!(down.kind, EntryKind::Down);
+        assert_eq!(down.kind, EntryKind::Quant(DType::MQ4G128V2));
         assert_eq!(down.quant_type, MQ4G128V2_QUANT_TYPE);
         assert_eq!(down.group_size, MQ4G128V2_GROUP_SIZE as u32);
         assert_eq!(down.data_len, 4 * MQ4G128V2_GROUP_BYTES);
@@ -5088,7 +5017,7 @@ mod tests {
             .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>() as u64))
             .unwrap();
         let encoded_bytes =
-            quantized_data_len_for_dtype(DType::MQ4G256V2, rows, HIDDEN_WIDTH).unwrap();
+            quantized_data_len_for_dtype(DType::MFP4G32E8SOA, rows, HIDDEN_WIDTH).unwrap();
         let worst = raw_bytes
             .checked_add(value_bytes)
             .and_then(|bytes| bytes.checked_add(encoded_bytes))
@@ -5097,8 +5026,10 @@ mod tests {
         assert_eq!(MAX_CHUNK_BYTES, 96 * 1024 * 1024);
         assert_eq!(raw_bytes, 20_971_520);
         assert_eq!(value_bytes, 41_943_040);
-        assert_eq!(encoded_bytes, 5_570_560);
-        assert_eq!(worst, 68_485_120);
+        // E8 SoA at K = 2560: 16 B header + 80 scale bytes + 80 * 16 B codewords.
+        assert_eq!(encoded_bytes, rows * (16 + 80 + 80 * 16));
+        assert_eq!(encoded_bytes, 5_636_096);
+        assert_eq!(worst, 68_550_656);
         assert!(worst < MAX_CHUNK_BYTES);
 
         let mut tracker = ScratchTracker::default();
@@ -5126,15 +5057,15 @@ mod tests {
         // chunk exceeded the aggregate raw+F32+encoded scratch bound.
         let rows = HIDDEN_WIDTH;
         let k = 24 * 256;
-        let dtype = DType::MQ4G256V2;
+        let dtype = DType::Q8_0;
         let unsplit = chunk_scratch_bytes(dtype, rows, k).unwrap();
-        assert_eq!(unsplit, 102_727_680);
+        assert_eq!(unsplit, 111_083_520);
         assert!(unsplit > MAX_CHUNK_BYTES);
 
         let bounded_rows = bounded_rows_for_scratch(dtype, k, rows).unwrap();
-        assert_eq!(bounded_rows, 2_508);
+        assert_eq!(bounded_rows, 2_319);
         let bounded = chunk_scratch_bytes(dtype, bounded_rows, k).unwrap();
-        assert_eq!(bounded, 100_641_024);
+        assert_eq!(bounded, 100_626_048);
         assert!(bounded <= MAX_CHUNK_BYTES);
         assert!(chunk_scratch_bytes(dtype, bounded_rows + 1, k).unwrap() > MAX_CHUNK_BYTES);
 
@@ -5664,37 +5595,23 @@ mod tests {
                             kind: EntryKind::Ple,
                         });
                     }
-                    ManifestRole::GateUp | ManifestRole::Down => {
+                    ManifestRole::GateUp(dtype) | ManifestRole::Down(dtype) => {
                         let kind = match expected.role {
-                            ManifestRole::GateUp => ExpertKind::GateUp,
-                            ManifestRole::Down => ExpertKind::Down,
+                            ManifestRole::GateUp(_) => ExpertKind::GateUp,
+                            ManifestRole::Down(_) => ExpertKind::Down,
                             _ => unreachable!("matched expert role"),
                         };
                         let (rows, k) = validate_expert_shape(tensor, kind, &expected.shape)?;
-                        let dtype = match kind {
-                            ExpertKind::GateUp => DType::MQ4G256V2,
-                            ExpertKind::Down => DType::MQ4G128V2,
-                        };
+                        let (quant_type, group_size) = matrix_quant_type(dtype)?;
                         let data_len = quantized_data_len_for_dtype(dtype, rows, k)?;
                         resident.push(PlannedEntry {
                             source: tensor.clone(),
                             name: tensor.name.clone(),
-                            quant_type: match dtype {
-                                DType::MQ4G256V2 => MQ4G256V2_QUANT_TYPE,
-                                DType::MQ4G128V2 => MQ4G128V2_QUANT_TYPE,
-                                _ => unreachable!("Qwen4 expert dtype"),
-                            },
+                            quant_type,
                             shape: shape_u32(&tensor.shape, &tensor.name)?,
-                            group_size: match dtype {
-                                DType::MQ4G256V2 => MQ4G256V2_GROUP_SIZE as u32,
-                                DType::MQ4G128V2 => MQ4G128V2_GROUP_SIZE as u32,
-                                _ => unreachable!("Qwen4 expert dtype"),
-                            },
+                            group_size,
                             data_len,
-                            kind: match kind {
-                                ExpertKind::GateUp => EntryKind::GateUp,
-                                ExpertKind::Down => EntryKind::Down,
-                            },
+                            kind: EntryKind::Quant(dtype),
                         });
                         expert_entries += 1;
                         match kind {
@@ -5718,7 +5635,7 @@ mod tests {
                             shape: shape_u32(&tensor.shape, &tensor.name)?,
                             group_size: matrix_quant_type(dtype)?.1,
                             data_len,
-                            kind: EntryKind::Matrix(dtype),
+                            kind: EntryKind::Quant(dtype),
                         });
                     }
                     ManifestRole::Bf16 => {
@@ -5918,6 +5835,273 @@ mod tests {
             PINNED_I64_TENSOR_COUNT,
             metadata_json.len(),
             predicted
+        );
+    }
+
+    // ── E8-SoA numerics probe ──────────────────────────────────────────────
+    //
+    // The E8 tier is only trustworthy if the producer's encoder, the decode
+    // path's rotation helper, and both kernel arms agree with a plain f32
+    // reference.  The kernels are shared with other families; the wiring
+    // (sign tables, rotation basis, SoA row stride, batch argument) is ours,
+    // and every one of those has produced silent garbage in this tree before.
+
+    fn e8_probe_bytes(values: &[f32]) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values))
+        }
+    }
+
+    fn e8_probe_bytes_mut(values: &mut [f32]) -> &mut [u8] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                values.as_mut_ptr() as *mut u8,
+                std::mem::size_of_val(values),
+            )
+        }
+    }
+
+    /// Deterministic small-magnitude weights: real weight rows, not lattice
+    /// friendly constants.
+    fn e8_probe_weights(m: usize, k: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..m * k)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let unit = ((state >> 33) & 0xffff) as f32 / 65536.0;
+                (unit - 0.5) * 0.04
+            })
+            .collect()
+    }
+
+    /// Activations are multiples of 1/128, so every value is exact in f16: the
+    /// batched WMMA arm stages its input through f16 internally and that
+    /// rounding must not be part of the wiring error being measured.
+    fn e8_probe_activations(rows: usize, k: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..rows * k)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let value = ((state >> 40) % 257) as i32 - 128;
+                value as f32 / 128.0
+            })
+            .collect()
+    }
+
+    fn e8_probe_fwht(values: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+        let mut rotated = values.to_vec();
+        for segment in rotated.chunks_mut(256) {
+            cpu_fwht_256(segment, signs1, signs2);
+        }
+        rotated
+    }
+
+    fn e8_probe_rel_l2(actual: &[f32], expected: &[f32]) -> f32 {
+        assert_eq!(actual.len(), expected.len(), "probe length mismatch");
+        let numerator: f32 = actual
+            .iter()
+            .zip(expected)
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum::<f32>()
+            .sqrt();
+        let denominator: f32 = expected.iter().map(|b| b * b).sum::<f32>().sqrt();
+        numerator / denominator.max(f32::MIN_POSITIVE)
+    }
+
+    #[test]
+    #[ignore = "device-backed: run `cargo test --release -p hipfire-quantize --bin hipfire-quantize -- --ignored e8_soa_projection --nocapture`"]
+    fn e8_soa_projection_matches_f32_reference_on_device() {
+        // 32 rows x 512 K keeps the two expert geometries honest (K % 256 == 0)
+        // while the batch of 24 crosses the 16-token tile the batched arm
+        // writes per block.
+        const M: usize = 32;
+        const K: usize = 512;
+        const BATCH: usize = 24;
+        const POISON: f32 = 12345.625;
+
+        // The producer's own sign tables (see `Qwen4Plan`/`stream_entry`).
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+
+        let weights = e8_probe_weights(M, K, 0x5eed_1234_abcd_0001);
+        let packed = quantize_mfp4g32_e8_soa_2d(&weights, M, K, &signs1, &signs2);
+        let (row_stride, extent) = mfp4e8soa_row_geometry(M as u64, K as u64).unwrap();
+        assert_eq!(row_stride, 16 + 16 + 16 * 16);
+        assert_eq!(packed.len() as u64, extent);
+
+        let decoded = dequant_mfp4g32_e8_soa(&packed, M, K);
+        let project = |rotated: &[f32]| -> Vec<f32> {
+            (0..M)
+                .map(|row| {
+                    decoded[row * K..(row + 1) * K]
+                        .iter()
+                        .zip(rotated)
+                        .map(|(weight, activation)| weight * activation)
+                        .sum::<f32>()
+                })
+                .collect()
+        };
+
+        let x = e8_probe_activations(1, K, 0x0abc_def0_0000_0002);
+        let x_rotated_cpu = e8_probe_fwht(&x, &signs1, &signs2);
+        let gemv_reference = project(&x_rotated_cpu);
+        // The FWHT is orthonormal, so `dot(rotated_weight, rotated_x)` is the
+        // same scalar as the natural-basis dot product: this is the true output
+        // the f32 weights would produce, and the gap to `gemv_reference` is the
+        // tier's own contribution.
+        let rotated_weights = e8_probe_fwht(&weights, &signs1, &signs2);
+        let exact_reference: Vec<f32> = (0..M)
+            .map(|row| {
+                rotated_weights[row * K..(row + 1) * K]
+                    .iter()
+                    .zip(&x_rotated_cpu)
+                    .map(|(weight, activation)| weight * activation)
+                    .sum::<f32>()
+            })
+            .collect();
+
+        // Encoder floor: element-wise, so no dot-product cancellation masks the
+        // lattice granularity.  Reported, never asserted: the tier's quality is
+        // measured on a real artifact, not on probe data.
+        let element_error = e8_probe_rel_l2(&decoded, &rotated_weights);
+        let norm_ratio = decoded.iter().map(|value| value * value).sum::<f32>().sqrt()
+            / rotated_weights
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                .sqrt();
+        println!(
+            "E8-SoA probe encoder M={M} K={K}: element rel_l2={element_error:.4} \
+             decoded/rotated norm ratio={norm_ratio:.4}"
+        );
+
+        let mut gpu = Gpu::init().expect("device init");
+        let arch = gpu.arch.clone();
+
+        let download = |gpu: &Gpu, tensor: &rdna_compute::GpuTensor, len: usize| -> Vec<f32> {
+            let mut host = vec![0f32; len];
+            gpu.hip
+                .memcpy_dtoh(e8_probe_bytes_mut(&mut host), &tensor.buf)
+                .expect("download");
+            host
+        };
+
+        let weight_gpu = gpu
+            .upload_raw(&packed, &[packed.len()])
+            .expect("upload E8 SoA weights");
+        let x_gpu = gpu.alloc_tensor(&[K], DType::F32).expect("alloc x");
+        gpu.hip
+            .memcpy_htod(&x_gpu.buf, e8_probe_bytes(&x))
+            .expect("upload x");
+        let rotated_gpu = gpu.alloc_tensor(&[K], DType::F32).expect("alloc x_rot");
+        let y_gpu = gpu.alloc_tensor(&[M], DType::F32).expect("alloc y");
+        gpu.rotate_x_mq(&x_gpu, &rotated_gpu, K)
+            .expect("rotate_x_mq");
+        gpu.gemv_mfp4g32_e8_soa_prerotated(&weight_gpu, &rotated_gpu, &y_gpu, M, K)
+            .expect("gemv_mfp4g32_e8_soa_prerotated");
+        gpu.hip.device_synchronize().expect("sync");
+
+        let rotated_gpu_host = download(&gpu, &rotated_gpu, K);
+        let gemv_host = download(&gpu, &y_gpu, M);
+        let rotation_error = e8_probe_rel_l2(&rotated_gpu_host, &x_rotated_cpu);
+        let gemv_wiring_error = e8_probe_rel_l2(&gemv_host, &gemv_reference);
+        let format_error = e8_probe_rel_l2(&gemv_reference, &exact_reference);
+        println!(
+            "E8-SoA probe arch={arch} single row M={M} K={K}: rotation rel_l2={rotation_error:.3e} \
+             gemv rel_l2={gemv_wiring_error:.3e} format rel_l2={format_error:.3e}"
+        );
+        assert!(
+            rotation_error < 1e-5,
+            "the decode rotation basis must equal the producer's FWHT-256 basis"
+        );
+        assert!(
+            gemv_wiring_error < 5e-4,
+            "single-row E8 GEMV disagrees with the encoded weight's own dequant"
+        );
+        assert!(
+            element_error < 0.5,
+            "the encoder must reproduce its own row to within the lattice's granularity"
+        );
+        assert!(
+            (0.9..=1.1).contains(&norm_ratio),
+            "the encoder must preserve row energy: a scale factor outside this band \
+             means the QUANT_STEP was folded twice (or not at all)"
+        );
+
+        // Batched arm (the prefill shape).  `_wmma` is gfx1151-only; other
+        // archs would JIT a kernel built for the wrong target, so they stop
+        // here with the single-row numbers already reported.
+        if arch != "gfx1151" {
+            println!("E8-SoA batched arm skipped: gemm_mfp4g32_e8_soa_wmma is gfx1151-only");
+            return;
+        }
+
+        let batch_x = e8_probe_activations(BATCH, K, 0x0abc_def0_0000_0003);
+        let mut batch_reference = Vec::with_capacity(BATCH * M);
+        for row in 0..BATCH {
+            let rotated = e8_probe_fwht(&batch_x[row * K..(row + 1) * K], &signs1, &signs2);
+            batch_reference.extend(project(&rotated));
+        }
+
+        let batch_x_gpu = gpu
+            .alloc_tensor(&[BATCH * K], DType::F32)
+            .expect("alloc batch x");
+        gpu.hip
+            .memcpy_htod(&batch_x_gpu.buf, e8_probe_bytes(&batch_x))
+            .expect("upload batch x");
+        let batch_rot_gpu = gpu
+            .alloc_tensor(&[BATCH * K], DType::F32)
+            .expect("alloc batch x_rot");
+        // Poison the destination: an unwritten output row keeps the sentinel and
+        // is reported as such instead of passing as a plausible number.
+        let mut poisoned = vec![POISON; BATCH * M];
+        let batch_y_gpu = gpu
+            .alloc_tensor(&[BATCH * M], DType::F32)
+            .expect("alloc batch y");
+        gpu.hip
+            .memcpy_htod(&batch_y_gpu.buf, e8_probe_bytes(&poisoned))
+            .expect("poison batch y");
+        gpu.rotate_x_mq_batched(&batch_x_gpu, &batch_rot_gpu, K, BATCH)
+            .expect("rotate_x_mq_batched");
+        gpu.gemm_mfp4g32_e8_soa_wmma(
+            &weight_gpu,
+            &batch_rot_gpu,
+            &batch_y_gpu,
+            M,
+            K,
+            BATCH,
+        )
+        .expect("gemm_mfp4g32_e8_soa_wmma");
+        gpu.hip.device_synchronize().expect("sync");
+
+        let batch_host = download(&gpu, &batch_y_gpu, BATCH * M);
+        poisoned = batch_host.clone();
+        let unwritten = poisoned.iter().filter(|value| **value == POISON).count();
+        let batch_wiring_error = e8_probe_rel_l2(&batch_host, &batch_reference);
+        let per_row_errors: Vec<f32> = (0..BATCH)
+            .map(|row| {
+                e8_probe_rel_l2(
+                    &batch_host[row * M..(row + 1) * M],
+                    &batch_reference[row * M..(row + 1) * M],
+                )
+            })
+            .collect();
+        println!(
+            "E8-SoA probe batched M={M} K={K} B={BATCH}: rel_l2={batch_wiring_error:.3e} \
+             unwritten_outputs={unwritten} worst_row rel_l2={:.3e}",
+            per_row_errors.iter().cloned().fold(0f32, f32::max)
+        );
+        assert_eq!(
+            unwritten, 0,
+            "every batched output column must be written: the kernel covers 16 tokens per block"
+        );
+        assert!(
+            batch_wiring_error < 5e-4,
+            "batched E8 WMMA disagrees with the encoded weight's own dequant"
         );
     }
 }
