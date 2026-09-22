@@ -631,6 +631,8 @@ Caveats that are part of the fixture, not trivia:
   near-tie flips seen earlier were an artifact of the four-row batched verify's
   numerics, which single-row rows remove. Report ratios, not absolute tok/s:
   the run-to-run spread is machine load.
+  (both fixes were flag-gated before they became the default path: the clean
+  batch came first, and only then was the fixed route made the default.)
 - Acceptance is route-invariant and still below the reference: 0.412/0.203/0.071
   per draft step on prose and 0.735/0.611/0.295 on code, against 83–92% at the
   first draft for a same-family reference implementation on this hardware. The
@@ -639,7 +641,11 @@ Caveats that are part of the fixture, not trivia:
   documents a tier-related acceptance cost, and testing it needs a scratch
   artifact with the MTP namespace at training precision. Cost model from the row
   probe: a marginal verify row costs ~45% of a single-row forward, so MTP wins
-  when `tokens_per_cycle > 1 + 0.45K`. Full investigation under
+  when `tokens_per_cycle > 1 + 0.45K`. That means the batched route needs mean
+  per-step acceptance above ~45% at K=3 (code is already at 45%, prose at 19%),
+  which is what per-row GDN recurrent-state capture would buy; fusing the draft
+  `lm_head` with the target row's `lm_head` over the same table is worth about
+  5 ms/token on top. Full investigation under
   `mtp_investigation` in `.codeinsight+research/qwen4/canonical-flash-next.json`.
 - `hipfire bench` cannot measure this model at all: the qwen4 contract pins
   `max_seq` to 2048 while bench asks for the configured 32768 (still 5120 with
