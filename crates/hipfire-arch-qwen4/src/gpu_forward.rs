@@ -1250,6 +1250,7 @@ fn layer_scratch<'a>(
 ) -> Qwen4LayerScratch<'a> {
     Qwen4LayerScratch {
         streams: &scratch.streams,
+        rotation: &scratch.rotation,
         hc_normalized: &scratch.hc_normalized,
         hc_low: &scratch.hc_low,
         hc_up: &scratch.hc_up,
@@ -1892,6 +1893,7 @@ impl Qwen4GpuForward {
                 }
                 let ple = ple_desc(&bundle.weights, ple_weights)?;
                 steps.push(Step::GroupedDepthwise(GroupedDepthwiseOp {
+                    rotation: &self.scratch.rotation,
                     key: ple.key,
                     value: ple.value,
                     norm_key: ple.norm_key,
@@ -1924,6 +1926,7 @@ impl Qwen4GpuForward {
                 ));
             }
             steps.push(Step::HyperRead(HyperReadOp {
+                rotation: &self.scratch.rotation,
                 input: &self.scratch.streams,
                 norm_weight: attn_read.norm,
                 input_mix_down: attn_read.input_mix_down,
@@ -1952,6 +1955,7 @@ impl Qwen4GpuForward {
                         _ => return Err(invalid("GDN descriptor kind mismatch")),
                     };
                     steps.push(Step::GatedDeltaNet(GatedDeltaNetOp {
+                        rotation: &self.scratch.rotation,
                         qkv: weights.qkv,
                         conv: weights.conv,
                         in_proj_a: weights.in_proj_a,
@@ -1997,6 +2001,7 @@ impl Qwen4GpuForward {
                         _ => return Err(invalid("QSA descriptor kind mismatch")),
                     };
                     steps.push(Step::IndexedAttention(IndexedAttentionOp {
+                        rotation: &self.scratch.rotation,
                         indexer_qk: weights.indexer_qk,
                         indexer_q_norm: weights.indexer_q_norm,
                         indexer_k_norm: weights.indexer_k_norm,
@@ -2048,6 +2053,7 @@ impl Qwen4GpuForward {
 
             let attn_write = &description.attn_hyper.write;
             steps.push(Step::HyperWrite(HyperWriteOp {
+                rotation: &self.scratch.rotation,
                 input: &self.scratch.streams,
                 norm_weight: attn_write.norm,
                 block_inject: attn_write.block_inject,
@@ -2062,6 +2068,7 @@ impl Qwen4GpuForward {
 
             let mlp_read = &description.mlp_hyper.read;
             steps.push(Step::HyperRead(HyperReadOp {
+                rotation: &self.scratch.rotation,
                 input: &self.scratch.streams,
                 norm_weight: mlp_read.norm,
                 input_mix_down: mlp_read.input_mix_down,
@@ -2090,6 +2097,7 @@ impl Qwen4GpuForward {
 
             let mlp_write = &description.mlp_hyper.write;
             steps.push(Step::HyperWrite(HyperWriteOp {
+                rotation: &self.scratch.rotation,
                 input: &self.scratch.streams,
                 norm_weight: mlp_write.norm,
                 block_inject: mlp_write.block_inject,
@@ -2417,7 +2425,20 @@ impl Qwen4GpuForward {
                     Qwen4GpuForwardError::Dispatch(format!("execute Qwen4 final hyper: {error:?}"))
                 })?;
                 let final_hidden = view(&self.scratch.hc_mixed, 0, n * config.hidden_size);
-                execute_lm_head(gpu, lm_head, &final_hidden, logits, n, requested_rows).map_err(
+                // The head shares the trunk's basis scratch: each projection
+                // consumes its rotated rows before the next one writes.
+                let head_rotation =
+                    view(&self.scratch.rotation, 0, n * config.hidden_size);
+                execute_lm_head(
+                    gpu,
+                    lm_head,
+                    &final_hidden,
+                    logits,
+                    n,
+                    requested_rows,
+                    Some(&head_rotation),
+                )
+                .map_err(
                     |error| {
                         Qwen4GpuForwardError::Dispatch(format!("execute Qwen4 LM head: {error:?}"))
                     },
