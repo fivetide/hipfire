@@ -14,7 +14,7 @@ use crate::config::Qwen4Config;
 use crate::gpu_forward::{
     execute_moe, Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
 };
-use crate::projection::dispatch_gemv;
+use crate::projection::{dispatch_embedding, dispatch_gemv};
 use crate::weights::{HyperConnectionWeights, Qwen4Weights, WeightError};
 use hipfire_runtime::spec::SpecGrammar;
 use rdna_compute::tensor_ops::{
@@ -166,6 +166,13 @@ fn hc_write(
     Ok(())
 }
 
+/// Embed the pending MTP token from the trunk-owned tied table.
+///
+/// The resident-dtype→lookup decision belongs to
+/// [`crate::projection::dispatch_embedding`] alone.  This module used to carry
+/// its own dtype table, which silently admitted fewer tiers than the trunk did;
+/// sharing one dispatch is what keeps the draft head and the target from
+/// disagreeing about the embedding tier an artifact may use.
 fn embed_token(
     gpu: &mut Gpu,
     weights: &Qwen4Weights,
@@ -173,33 +180,16 @@ fn embed_token(
     scratch: &MtpGpuScratch,
 ) -> Result<(), MtpGpuError> {
     let embedding = weights.resident(&weights.root.embedding)?;
-    match embedding.dtype {
-        DType::MQ4G256V2 | DType::MQ4G128V2 => {
-            gpu.embedding_lookup_mq4v2_batched(
-                embedding,
-                &scratch.embedding_rot,
-                &scratch.token_embedding,
-                &scratch.token_ids,
-                1,
-                config.hidden_size,
-            )?;
-        }
-        DType::BF16 => {
-            gpu.embedding_lookup_bf16_batched(
-                embedding,
-                &scratch.token_embedding,
-                &scratch.token_ids,
-                1,
-                config.hidden_size,
-            )?;
-        }
-        dtype => {
-            return Err(invalid(format!(
-                "Qwen4 MTP embedding dtype {dtype:?} is unsupported"
-            )));
-        }
-    }
-    Ok(())
+    dispatch_embedding(
+        gpu,
+        embedding,
+        &scratch.embedding_rot,
+        &scratch.token_embedding,
+        &scratch.token_ids,
+        1,
+        config.hidden_size,
+    )
+    .map_err(MtpGpuError::Hip)
 }
 
 /// Errors from native GPU MTP execution and resource management.
