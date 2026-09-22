@@ -19,7 +19,99 @@ use hipfire_runtime::spec::{
     accept_greedy_prefix, MtpDrafter, MtpSpeculator, MtpWindow, SpecAdvance, SpecGrammar,
     SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
 };
+use rdna_compute::profile::{begin_deferred, resolve_deferred, PendingTimer};
 use rdna_compute::{Gpu, GpuTensor};
+use std::time::Instant;
+
+/// Device-side phase timing for one native MTP window.
+///
+/// Enabled by `HIPFIRE_MTP_PHASE_TIMING=1`.  Each phase is one `hipEvent` pair
+/// recorded on the null stream and resolved once at window end, so the
+/// instrument never synchronizes mid-window and never changes launch order:
+/// the number it prints is the GPU time the phase actually occupies.
+/// `HIPFIRE_MTP_ROWPROBE=1` additionally times one `k+1`-row target forward
+/// against one single-row forward at the same position, with no drafting, and
+/// prints that as its own line.
+struct MtpPhaseTimers {
+    enabled: bool,
+    open: Option<(&'static str, PendingTimer)>,
+    open_started_us: u64,
+    done: Vec<(&'static str, u64, u64, PendingTimer)>,
+}
+
+fn unix_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_micros() as u64)
+        .unwrap_or(0)
+}
+
+impl MtpPhaseTimers {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var("HIPFIRE_MTP_PHASE_TIMING").is_ok_and(|value| value == "1"),
+            open: None,
+            open_started_us: 0,
+            done: Vec::new(),
+        }
+    }
+
+    /// Close the open phase and open `label`.
+    fn mark(&mut self, gpu: &Gpu, label: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        self.close(gpu);
+        self.open_started_us = unix_micros();
+        if let Ok(timer) = begin_deferred(&gpu.hip, None) {
+            self.open = Some((label, timer));
+        }
+    }
+
+    fn close(&mut self, gpu: &Gpu) {
+        if let Some((label, timer)) = self.open.take() {
+            if timer.mark_stop(&gpu.hip, None).is_ok() {
+                self.done.push((label, self.open_started_us, unix_micros(), timer));
+            }
+        }
+    }
+
+    /// Resolve every recorded pair and print one line.  `fields` carries the
+    /// per-window scalars (position, k, accepted drafts).  Repeated labels are
+    /// summed, so a per-row phase reads as its total across the window.
+    fn finish(mut self, gpu: &Gpu, tag: &str, fields: &str) {
+        self.close(gpu);
+        if self.done.is_empty() {
+            return;
+        }
+        let mut stamps: Vec<(&'static str, u64, u64)> = Vec::new();
+        let mut pairs = Vec::with_capacity(self.done.len());
+        for (label, started, ended, timer) in self.done.drain(..) {
+            stamps.push((label, started, ended));
+            pairs.push((label, timer));
+        }
+        let resolved = resolve_deferred(&gpu.hip, None, pairs);
+        let mut totals: Vec<(&'static str, f64, u64, u64)> = Vec::new();
+        for ((label, micros), (_, started, ended)) in resolved.iter().zip(stamps.iter()) {
+            match totals.iter_mut().find(|entry| entry.0 == *label) {
+                Some(entry) => {
+                    entry.1 += micros;
+                    entry.2 = entry.2.min(*started);
+                    entry.3 = entry.3.max(*ended);
+                }
+                None => totals.push((label, *micros, *started, *ended)),
+            }
+        }
+        let phases = totals
+            .iter()
+            .map(|(label, micros, started, ended)| {
+                format!("\"{label}\":{{\"us\":{micros:.1},\"t0\":{started},\"t1\":{ended}}}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        eprintln!("{tag} {{\"event\":\"mtp_phase\",{fields},\"phases_us\":{{{phases}}}}}");
+    }
+}
 
 /// Result of one native greedy MTP target comparison.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -527,6 +619,14 @@ impl SpecTarget for Qwen4Bundle {
     }
 }
 
+/// Draft-step hidden conditioning mode; see [`Qwen4MtpDrafter::draft_pairing`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DraftPairing {
+    HeadState,
+    AlignedHead,
+    AlignedTarget,
+}
+
 /// Native GPU MTP drafter.  The MTP operator/state stay model-owned by the
 /// target bundle; this adapter owns only the reusable verifier scratch and one
 /// pending target-hidden row needed to seed each MTP window.
@@ -536,6 +636,8 @@ pub struct Qwen4MtpDrafter {
     request: SpecRequestConfig,
     scratch: Option<Box<dyn SpecScratch>>,
     pending_hidden: Option<GpuTensor>,
+    row_hidden: Option<GpuTensor>,
+    row_probe_done: bool,
 }
 
 impl Qwen4MtpDrafter {
@@ -546,6 +648,8 @@ impl Qwen4MtpDrafter {
             request: SpecRequestConfig::default(),
             scratch: None,
             pending_hidden: None,
+            row_hidden: None,
+            row_probe_done: false,
         }
     }
 
@@ -580,13 +684,231 @@ impl Qwen4MtpDrafter {
                     .map_err(|error| format!("Qwen4 MTP pending hidden allocation: {error}"))?,
             );
         }
+        if self.row_hidden.is_none() {
+            self.row_hidden = Some(
+                gpu.zeros(&[width], rdna_compute::DType::F32)
+                    .map_err(|error| format!("Qwen4 MTP row hidden allocation: {error}"))?,
+            );
+        }
         Ok(())
+    }
+
+    fn row_hidden(&self) -> Result<&GpuTensor, String> {
+        self.row_hidden
+            .as_ref()
+            .ok_or_else(|| "Qwen4 MTP row hidden is not allocated".to_string())
+    }
+
+    /// Native MTP draft-step conditioning.  `HeadState` is the historical
+    /// chain: row 0 is fed the window's pending hidden and every later row is
+    /// fed the head's own previous-step hidden (`forward_token_from_state`).
+    /// `AlignedHead` feeds the target's hidden of the token being processed at
+    /// row 0 and the head's own hidden afterwards; `AlignedTarget` feeds the
+    /// target's same-row hidden at every row.  Selectable so the pairing can be
+    /// measured rather than argued: `HIPFIRE_MTP_PAIRING=aligned-head|aligned`.
+    fn draft_pairing() -> DraftPairing {
+        match std::env::var("HIPFIRE_MTP_PAIRING").as_deref() {
+            Ok("aligned-head") => DraftPairing::AlignedHead,
+            Ok("aligned") => DraftPairing::AlignedTarget,
+            _ => DraftPairing::HeadState,
+        }
+    }
+
+    /// Incremental verify: interleave one target row with one draft step and
+    /// stop at the first rejection.
+    ///
+    /// Every row is committed as it is produced, so the target state advances
+    /// by exactly the rows that were verified and the head state advances with
+    /// it: no snapshot, no restore, no re-forward of the accepted prefix.  A
+    /// cycle costs `accepted + 1` single-row forwards instead of a `k+1`-row
+    /// batch plus a replay of the same prefix, and no draft step is wasted past
+    /// the rejection point.  Selection: `HIPFIRE_MTP_INCREMENTAL=1`.
+    fn mtp_step_incremental(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        k: usize,
+        eos: u32,
+        trace: bool,
+    ) -> Result<MtpWindow, String> {
+        let pairing = Self::draft_pairing();
+        let mut timers = MtpPhaseTimers::new();
+        let mut committed: Vec<u32> = Vec::with_capacity(k + 1);
+        let mut drafts: Vec<u32> = Vec::with_capacity(k);
+        let mut picks: Vec<u32> = Vec::with_capacity(k + 1);
+        let mut token = seed;
+        let mut accepted = 0usize;
+        let mut row = 0usize;
+        loop {
+            let token_position = position
+                .checked_add(row)
+                .ok_or_else(|| "Qwen4 MTP incremental position overflow".to_string())?;
+            timers.mark(gpu, "target_row");
+            let pick = {
+                let bundle = Self::bundle(target)?;
+                bundle
+                    .spec_capture_token(gpu, token)
+                    .map_err(|error| error.to_string())?
+            };
+            picks.push(pick);
+            let row_hidden = self.row_hidden()?;
+            {
+                let bundle = Self::bundle(target)?;
+                bundle
+                    .copy_spec_hidden_row_to(gpu, 0, row_hidden)
+                    .map_err(|error| error.to_string())?;
+            }
+            if row == k {
+                // Every draft matched: this row's pick is the bonus.  The head
+                // must still consume the row's token so its own position lands on
+                // the committed end, exactly as the batched path's full-accept
+                // branch does with one extra `mtp_forward_token`.
+                timers.mark(gpu, "draft_step");
+                let hidden = match pairing {
+                    DraftPairing::HeadState => None,
+                    DraftPairing::AlignedHead | DraftPairing::AlignedTarget => Some(row_hidden),
+                };
+                {
+                    let bundle = Self::bundle(target)?;
+                    bundle
+                        .mtp_forward_token(gpu, token, hidden, token_position)
+                        .map_err(|error| error.to_string())?;
+                }
+                committed.push(pick);
+                break;
+            }
+            timers.mark(gpu, "draft_step");
+            let hidden = match pairing {
+                DraftPairing::HeadState if row > 0 => None,
+                DraftPairing::AlignedHead if row > 0 => None,
+                DraftPairing::HeadState => Some(self.pending_hidden()?),
+                DraftPairing::AlignedHead | DraftPairing::AlignedTarget => Some(row_hidden),
+            };
+            let draft = {
+                let bundle = Self::bundle(target)?;
+                bundle
+                    .mtp_forward_token(gpu, token, hidden, token_position)
+                    .map_err(|error| error.to_string())?
+            };
+            drafts.push(draft);
+            if draft == pick {
+                accepted += 1;
+                committed.push(draft);
+                if draft == eos {
+                    break;
+                }
+                token = draft;
+                row += 1;
+            } else {
+                committed.push(pick);
+                break;
+            }
+        }
+        if committed.is_empty() {
+            return Err("Qwen4 MTP incremental window committed no token".to_string());
+        }
+        // The next window's step-0 conditioning hidden is the hidden of the last
+        // committed token, which is the row just captured: the baseline path
+        // copies `pending_hidden_row()` (= the last processed row) of its verify
+        // capture, and this is the same row of the same forward shape.
+        {
+            let row_hidden = self.row_hidden()?;
+            let pending = self.pending_hidden()?;
+            gpu.copy_d2d(row_hidden, pending, pending.byte_size())
+                .map_err(|error| format!("Qwen4 MTP incremental pending hidden copy: {error}"))?;
+        }
+        let committed_end = position
+            .checked_add(committed.len())
+            .ok_or_else(|| "Qwen4 MTP incremental commit overflow".to_string())?;
+        let mtp_end = Self::bundle(target)?
+            .mtp_position()
+            .map_err(|error| error.to_string())?;
+        if mtp_end != committed_end {
+            return Err(format!(
+                "Qwen4 MTP incremental transaction ended at mtp={mtp_end}, expected {committed_end}"
+            ));
+        }
+        if trace || timers.enabled {
+            let rows = drafts
+                .iter()
+                .zip(picks.iter())
+                .map(|(draft, pick)| {
+                    format!(
+                        "{{\"draft\":{draft},\"pick\":{pick},\"match\":{}}}",
+                        draft == pick
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            eprintln!(
+                "QWEN4_MTP_TRACE {{\"event\":\"window\",\"position\":{position},\"k\":{k},\"accepted\":{accepted},\"rows\":[{rows}],\"committed\":{committed:?}}}"
+            );
+        }
+        if timers.enabled {
+            let fields = format!(
+                "\"position\":{position},\"k\":{k},\"accepted\":{accepted},\"pairing\":\"{}\",\"t_end\":{}",
+                match pairing {
+                    DraftPairing::HeadState => "head-state",
+                    DraftPairing::AlignedHead => "aligned-head",
+                    DraftPairing::AlignedTarget => "aligned-target",
+                },
+                unix_micros()
+            );
+            timers.finish(gpu, "QWEN4_MTP_PHASE", &fields);
+        }
+        Ok(MtpWindow {
+            committed,
+            accepted,
+            drafts_generated: drafts.len(),
+        })
     }
 
     fn pending_hidden(&self) -> Result<&GpuTensor, String> {
         self.pending_hidden
             .as_ref()
             .ok_or_else(|| "Qwen4 MTP pending hidden is not allocated".to_string())
+    }
+
+    /// Time one `k+1`-row target forward against one single-row forward at the
+    /// same position, with no drafting, by snapshotting the target around each.
+    /// `HIPFIRE_MTP_ROWPROBE=1`; runs once per process.  This is the
+    /// amortization measurement: a weight-read-bound forward should cost about
+    /// the same for both row counts.
+    fn row_probe(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        block: &[u32],
+        position: usize,
+    ) -> Result<(), String> {
+        if std::env::var("HIPFIRE_MTP_ROWPROBE").is_err() {
+            return Ok(());
+        }
+        let rows = block.len();
+        let mut timers = MtpPhaseTimers {
+            enabled: true,
+            open: None,
+            open_started_us: 0,
+            done: Vec::new(),
+        };
+        let bundle = Self::bundle(target)?;
+        let snapshot = bundle.snapshot(gpu).map_err(|error| error.to_string())?;
+        timers.mark(gpu, "forward_1row");
+        bundle
+            .spec_forward_rows(gpu, &block[..1], true)
+            .map_err(|error| error.to_string())?;
+        bundle.restore(gpu, snapshot).map_err(|error| error.to_string())?;
+        let snapshot = bundle.snapshot(gpu).map_err(|error| error.to_string())?;
+        timers.mark(gpu, "forward_nrow");
+        bundle
+            .spec_forward_rows(gpu, block, true)
+            .map_err(|error| error.to_string())?;
+        bundle.restore(gpu, snapshot).map_err(|error| error.to_string())?;
+        let fields = format!("\"position\":{position},\"rows\":{rows}");
+        timers.finish(gpu, "QWEN4_MTP_ROWPROBE", &fields);
+        Ok(())
     }
 }
 
@@ -663,6 +985,10 @@ impl MtpDrafter for Qwen4MtpDrafter {
             ));
         }
         self.ensure_resources(gpu, target)?;
+        let trace = std::env::var("HIPFIRE_MTP_TRACE").is_ok_and(|value| value == "1");
+        if std::env::var("HIPFIRE_MTP_INCREMENTAL").is_ok_and(|value| value == "1") {
+            return self.mtp_step_incremental(gpu, target, position, seed, k, eos, trace);
+        }
         {
             let bundle = Self::bundle(target)?;
             let target_position = bundle.state.position;
@@ -682,6 +1008,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     .map_err(|error| error.to_string())?,
             )
         };
+        let mut timers = MtpPhaseTimers::new();
+        let mut accepted_drafts = 0usize;
+        let window_start = Instant::now();
         let result = (|| -> Result<MtpWindow, String> {
             let mut drafts = Vec::with_capacity(k);
             let mut input = seed;
@@ -702,6 +1031,11 @@ impl MtpDrafter for Qwen4MtpDrafter {
             let mut block = Vec::with_capacity(k + 1);
             block.push(seed);
             block.extend_from_slice(&drafts);
+            if !self.row_probe_done {
+                self.row_probe_done = true;
+                self.row_probe(gpu, target, &block, position)?;
+            }
+            timers.mark(gpu, "verify");
             let picks = Self::bundle(target)?;
             let pending_hidden = self
                 .pending_hidden
@@ -715,6 +1049,24 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 .verify_block(gpu, &block, position, scratch.as_mut(), None)
                 .map_err(|error| error.to_string())?;
             let acceptance = accept_native_greedy(&drafts, &target_picks, Some(eos))?;
+            accepted_drafts = acceptance.accepted_drafts;
+            if trace {
+                let rows = drafts
+                    .iter()
+                    .zip(target_picks.iter())
+                    .map(|(draft, pick)| {
+                        format!(
+                            "{{\"draft\":{draft},\"pick\":{pick},\"match\":{}}}",
+                            draft == pick
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                eprintln!(
+                    "QWEN4_MTP_TRACE {{\"event\":\"window\",\"position\":{position},\"k\":{k},\"accepted\":{accepted_drafts},\"rows\":[{rows}],\"committed\":{:?},\"baseline\":true}}",
+                    acceptance.committed
+                );
+            }
             let target_accept_len = acceptance.target_commit_accept_len();
             let full_accept = target_accept_len == k;
             let target_scratch = scratch
@@ -729,6 +1081,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
             // copy succeeds. A retained restore lets the outer rollback repair
             // both owners if either side's GPU work fails.
             if !full_accept {
+                timers.mark(gpu, "target_replay");
                 picks
                     .restore_retain(gpu, target_snapshot)
                     .map_err(|error| error.to_string())?;
@@ -737,6 +1090,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     .map(|_| ())
                     .map_err(|error| error.to_string())?;
             }
+            timers.mark(gpu, "mtp_replay");
             let mtp_ticket = snapshot
                 .as_ref()
                 .copied()
@@ -769,6 +1123,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                         .map_err(|error| error.to_string())?;
                 }
             }
+            timers.mark(gpu, "commit");
             let committed_end = position
                 .checked_add(target_accept_len + 1)
                 .ok_or_else(|| "Qwen4 MTP commit position overflow".to_string())?;
@@ -801,6 +1156,14 @@ impl MtpDrafter for Qwen4MtpDrafter {
             snapshot = None;
             Ok(window)
         })();
+        if timers.enabled {
+            let fields = format!(
+                "\"position\":{position},\"k\":{k},\"accepted\":{accepted_drafts},\"window_us\":{:.1},\"t_end\":{}",
+                window_start.elapsed().as_secs_f64() * 1e6,
+                unix_micros()
+            );
+            timers.finish(gpu, "QWEN4_MTP_PHASE", &fields);
+        }
         if let Err(error) = &result {
             let mut rollback_errors = Vec::new();
             let target_ticket = match self.scratch.as_mut() {
