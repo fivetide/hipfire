@@ -601,6 +601,46 @@ The only permitted prompt fixtures for this A3B MoE DFlash thread are:
 Runs using any other prompt are exploratory only and must not be compared
 against the A3B MoE DFlash perfmaxx line.
 
+### Pinned Flash-Next bench fixture
+
+The canonical Flash-Next trunk is whichever local artifact byte-matches
+`qwen3.8-flash-next.mq6q8-pleq8` from HF repo `hipfire-models/qwen3.8-flash-next`
+(registry tag `qwen3.8:flash-next`):
+
+- HF repo: `hipfire-models/qwen3.8-flash-next`
+- HF / local file: `qwen3.8-flash-next.mq6q8-pleq8`
+- File size: `125467331096`
+- SHA-256: `58fb4f586403000b3394413c38f58b0ec0d8845675f81c3d3c0b5de2cdaa4aed`
+- MD5: `d6173f38055aefa7b0065b2a44ee9cda`
+- Recipe: MQ6G256V2 trunk (240 tensors), MQ4G256V2/MQ4G128V2 experts,
+  Q8F16 head/embed/MTP-attention and PLE n-gram rows (128 shards,
+  external-resident, 54,400,261,120 B).
+
+Before reporting Flash-Next results, verify the candidate trunk with
+`sha256sum` and require the digest above.
+
+Caveats that are part of the fixture, not trivia:
+
+- Loading it needs a build whose qwen4 trunk source contract admits **both**
+  packed trunk tiers and whose external-PLE admission accepts both PLE tiers.
+  Older builds refuse at load; that refusal is correct, not a corrupt file.
+- **Do not enable MTP on this recipe.** The route loads and engages (it needs
+  a build carrying `96600e15e`, which routes the MTP embedding lookup through
+  the shared embedding dispatch), but the draft head is weak — 1.5–2.4 bits
+  lower entropy than the target, argmax agreement 43.8/21.3/12.5% by draft
+  step, 56% of prose cycles accepting nothing — so it is 2.8–3.4× slower than
+  AR on prose and 2.9× on code, and its output is not token-identical to AR
+  at near-ties (a batched-verify vs single-row numerics flip, deterministic
+  and fixed-index, not corruption). Use AR.
+- `hipfire bench` cannot measure this model at all: the qwen4 contract pins
+  `max_seq` to 2048 while bench asks for the configured 32768 (still 5120 with
+  `memory.max_seq` forced to 2048), so it fails closed at load and never
+  reaches a measurement. Use the serve or probe path. The fix, if wanted, is a
+  bench-side `max_seq` knob — not an MTP change.
+- Decode numbers are not comparable across instruments: the raw decode probe
+  measured 22.74 tok/s (ctx128, graph off, kv q8), the serve path ~19.9 tok/s.
+  Same model, different measurement; never average or compare them across.
+
 ---
 
 ## 6 · Common pitfalls (history of what bit us)
