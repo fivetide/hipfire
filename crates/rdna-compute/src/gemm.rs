@@ -15086,7 +15086,14 @@ impl Gpu {
             &b_val as *const _ as *mut c_void,
         ];
         let row_tiles = m.div_ceil(16) as u32;
-        let batch_tiles = batch_size.div_ceil(64) as u32;
+        // The kernel advances `16 * E8_PREFILL_BATCH_TILES` tokens per
+        // `blockIdx.y`, and this source is compiled with the macro default of 1,
+        // so one block covers 16 tokens.  Dividing by 64 here (copy-pasted from
+        // the four-tile launcher) left every output column past the first 16
+        // unwritten for any batch > 16: no fault, no error, just stale scratch
+        // read back as weights-times-activation.
+        const BATCH_ROWS_PER_BLOCK: usize = 16;
+        let batch_tiles = batch_size.div_ceil(BATCH_ROWS_PER_BLOCK) as u32;
         let bytes = weight.byte_size() + batch_size * (k * 2 + m * 4);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
         let result = self.launch_maybe_blob(
@@ -15153,7 +15160,11 @@ impl Gpu {
             &b_val as *const _ as *mut c_void,
         ];
         let row_tiles = m.div_ceil(16) as u32;
-        let batch_tiles = batch_size.div_ceil(64) as u32;
+        // Two 16-token tiles per `blockIdx.y`: dividing by the four-tile
+        // launcher's 64 under-covers every batch past 32 the same way the
+        // single-tile launcher does past 16.
+        const BATCH_ROWS_PER_BLOCK: usize = 32;
+        let batch_tiles = batch_size.div_ceil(BATCH_ROWS_PER_BLOCK) as u32;
         let bytes = weight.byte_size() + batch_size * (k * 2 + m * 4);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
         let result = self.launch_maybe_blob(
