@@ -624,27 +624,23 @@ Caveats that are part of the fixture, not trivia:
 - Loading it needs a build whose qwen4 trunk source contract admits **both**
   packed trunk tiers and whose external-PLE admission accepts both PLE tiers.
   Older builds refuse at load; that refusal is correct, not a corrupt file.
-- **Do not enable MTP on this recipe yet.** The route loads and engages (it
-  needs a build carrying `96600e15e`, which routes the MTP embedding lookup
-  through the shared embedding dispatch), but it is measurably wrong in this
-  runtime: 2.8–3.4× slower than AR on prose and 2.9× on code, with per-step
-  draft agreement of 43.8/21.3/12.5% against 83–92% at the first draft step
-  for a same-family reference implementation on this exact hardware. Treat
-  that as a defect in our lowering rather than a weak draft head: the input
-  chain, verification layer, per-stream combiner, norms and accepted-count
-  convention have each been read and verified correct, so the remaining
-  suspects are measurable rather than readable.
-- The cost model behind that, from the artifact census: ~92% of resident
-  weight is per-row-routed experts (65.5 GB of 71 GB), and expert reads do
-  not amortize across verify rows, so MTP beats AR only if
-  `sum(p_i) > 0.92K - 0.08` — near-90% average per-step acceptance at K=3.
-  Use AR meanwhile. The full investigation is recorded under
-  `mtp_investigation` in
-  `.codeinsight+research/qwen4/canonical-flash-next.json`.
-- Its near-tie divergence from AR (deterministic, fixed output index, three
-  candidates inside 0.16 logits) is backend-normal on HIP, not a correctness
-  defect of ours: the reference thread documents the same behaviour with
-  acceptance unaffected.
+- **MTP is enabled by default on this recipe as of `6b9db7774`.** Decode runs at
+  95–106% of AR and 92–95% end-to-end at the committed fixtures (it was 33–48%
+  before `121646d6c`/`6b9db7774` landed), and the interleaved route emits AR's
+  exact tokens — no divergence across 256 prose and 227 code tokens. The
+  near-tie flips seen earlier were an artifact of the four-row batched verify's
+  numerics, which single-row rows remove. Report ratios, not absolute tok/s:
+  the run-to-run spread is machine load.
+- Acceptance is route-invariant and still below the reference: 0.412/0.203/0.071
+  per draft step on prose and 0.735/0.611/0.295 on code, against 83–92% at the
+  first draft for a same-family reference implementation on this hardware. The
+  named remaining lever is the MTP layer's five attention projections at Q8F16
+  (qt=3) against the trunk's MQ6 (qt=47) — this project's own DeepSeek V4 recipe
+  documents a tier-related acceptance cost, and testing it needs a scratch
+  artifact with the MTP namespace at training precision. Cost model from the row
+  probe: a marginal verify row costs ~45% of a single-row forward, so MTP wins
+  when `tokens_per_cycle > 1 + 0.45K`. Full investigation under
+  `mtp_investigation` in `.codeinsight+research/qwen4/canonical-flash-next.json`.
 - `hipfire bench` cannot measure this model at all: the qwen4 contract pins
   `max_seq` to 2048 while bench asks for the configured 32768 (still 5120 with
   `memory.max_seq` forced to 2048), so it fails closed at load and never
