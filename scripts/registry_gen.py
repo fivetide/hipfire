@@ -71,6 +71,11 @@ KNOWN_QUANTS = {
     "mq4r",
     "mq5",
     "mq6",
+    # Qwen3.8-Flash-Next's packed trunk rung: MQ6G256V2 (qt47) on the wide
+    # attention/GDN projections, Q8F16 (qt3) embedding and language head,
+    # MQ4G256V2/MQ4G128V2 routed experts. The suffix is that artifact's
+    # published SKU name; quant_for() reads it verbatim from the file name.
+    "mq6q8",
     "mfp4",
     # PrismML Bonsai low-bit: TQ2G128 ternary / BQ1G128 binary. Added with the
     # filename rename in the same commit -- quant_for() reads the extension and

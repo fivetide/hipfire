@@ -1138,9 +1138,22 @@
     "qwen3.8:flash-next": {
       "repo": "hipfire-models/qwen3.8-flash-next",
       "file": "qwen3.8-flash-next.mq4r",
-      "size_gb": 178.0,
+      "size_gb": 174.6,
       "min_vram_gb": 128,
-      "desc": "Qwen3.8-Flash-Next / Qwen4 experimental HFQM (arch 16); tested only on 128 GB-class Strix Halo, so the 128 GB catalog gate is conservative rather than a measured minimum. Streaming SSD-resident PLE and native MTP are embedded in the 178 GB artifact.",
+      "desc": "Qwen3.8-Flash-Next / Qwen4 experimental HFQM (arch 16). Trunk attention/GDN projections ship MQ6G256V2 (245 tensors), routed experts MQ4, and the embedding, language head, hyper-connection matrices, MoE router, shared expert and PLE projections stay BF16; 72.2 GB resident with 102.4 GB of PLE n-gram rows leased from the mapped artifact. Tested only on 128 GB-class Strix Halo, so the 128 GB catalog gate is conservative rather than a measured minimum. Native MTP is embedded.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20
+      }
+    },
+
+    "qwen3.8:flash-next-mq6q8": {
+      "repo": "hipfire-models/qwen3.8-flash-next",
+      "file": "qwen3.8-flash-next.mq6q8",
+      "size_gb": 173.5,
+      "min_vram_gb": 128,
+      "desc": "Qwen3.8-Flash-Next / Qwen4 experimental HFQM (arch 16) packed rung. MQ6G256V2 (qt47) on the 245 trunk attention/GDN projections, MQ4G256V2/MQ4G128V2 routed experts, Q8F16 (qt3) embedding and language head; hyper-connection, router, shared expert and PLE projections stay BF16. 71.0 GB resident with 102.4 GB of PLE n-gram rows leased from the mapped artifact. 22.6-22.9 tok/s decode at ctx128 (gfx1151, graph off, kv q8) against 13.6 for the BF16-trunk build. Needs a hipfire build whose qwen4 trunk source contract admits both packed trunk tiers. Tested only on 128 GB-class Strix Halo, so the 128 GB catalog gate is conservative rather than a measured minimum. Native MTP is embedded.",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
