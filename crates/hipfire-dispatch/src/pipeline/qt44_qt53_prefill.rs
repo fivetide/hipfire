@@ -25,29 +25,6 @@ fn f32_view(source: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
     source.sub_offset(offset, len)
 }
 
-pub(crate) fn project_bf16_batch(
-    gpu: &mut Gpu,
-    weight: &WeightRef<'_>,
-    input: &GpuTensor,
-    output: &GpuTensor,
-    rows: usize,
-) -> Result<(), DispatchError> {
-    if weight.dtype != DType::BF16 {
-        return Err(DispatchError::UnsupportedVariant {
-            family: "grouped-prefill",
-            variant: "non-bf16-projection",
-            arch: "",
-            quant: "non-BF16",
-        });
-    }
-    let result = if rows > 1 {
-        gpu.gemm_bf16_xf32_multirow(weight.buf, input, output, weight.m, weight.k, rows)
-    } else {
-        gpu.gemv_bf16_xf32(weight.buf, input, output, weight.m, weight.k)
-    };
-    hip(result)
-}
-
 #[inline]
 fn grouped_geometry(p: &MoePrefillParams<'_>) -> bool {
     let Some(policy) = p.route_policy else {
@@ -97,7 +74,9 @@ fn batch_projection(
     batch_size: usize,
 ) -> Result<(), DispatchError> {
     match weight.dtype {
-        DType::BF16 => project_bf16_batch(gpu, weight, x, y, batch_size),
+        // BF16 rows read the natural activation; this route materializes the
+        // packed basis once per layer, so no per-projection rotation is owed.
+        DType::BF16 => super::project_weight(gpu, weight, x, y, batch_size, None),
         DType::F32 => hip(gpu.gemm_f32_batched(weight.buf, x, y, weight.m, weight.k, batch_size)),
         DType::MQ4G256V2 => {
             hip(gpu.gemm_mq4g256v2(weight.buf, x, y, weight.m, weight.k, batch_size))
