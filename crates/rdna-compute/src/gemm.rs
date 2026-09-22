@@ -14974,6 +14974,15 @@ impl Gpu {
             "gemm_mfp4g32_e8_moe_grouped_wmma needs RDNA3 wave32-WMMA or RDNA4 (current arch = {})",
             self.arch
         );
+        // The kernel walks `groups_per_row = K / 256` AoS groups of 16 WMMA
+        // K-tiles. A K that is not a multiple of 256 leaves the tail group
+        // unprocessed with no fault and no bounds check on x — the same silent
+        // under-coverage class as the E8-SoA prefill grid.y bug (0e0ad47b4).
+        assert!(
+            k % 256 == 0,
+            "gemm_mfp4g32_e8_moe_grouped_wmma requires K%256==0 \
+             (groups_per_row = K/256), got K={k}"
+        );
         // gfx12 (RDNA4) uses the _gfx12 WMMA intrinsic sister; gfx1151 (and the
         // rest of RDNA3) use the original gfx1151 kernel — both carry the same
         // kernarg layout and grid formula so nothing else changes.

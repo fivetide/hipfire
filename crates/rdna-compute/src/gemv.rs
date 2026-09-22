@@ -10063,6 +10063,19 @@ impl Gpu {
             self.arch_caps.has_wmma_w32() || self.arch_caps.is_rdna4(),
             "gemv_mfp4g32_e8_moe_gate_up_k8_indexed needs RDNA3 or RDNA4"
         );
+        // The kernel walks `groups_per_row = K / 256` groups and multiplies the
+        // x range `[g*256, g*256+256)` for each. A K that is not a multiple of
+        // 256 therefore covers `floor(K/256)` groups and silently drops the
+        // tail — no fault, no bounds check on x, just a short reduction.
+        // Hardening, not a live-bug fix: the only producer of qt=34 expert
+        // tensors (hipfire-quantize `handle_moe_expert_3d`) gates every E8 arm
+        // on `supports_g256 = inner_k % 256 == 0`, so no in-tree quantize path
+        // or registry manifest can emit such a tensor today.
+        assert!(
+            k % 256 == 0,
+            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed requires K%256==0 \
+             (groups_per_row = K/256), got K={k}"
+        );
         // SoA path (decode): when experts were transposed AoS->SoA at load. Same
         // batched kernel interface (this launcher runs it with batch=1).
         let use_soa = self.arch_caps.is_rdna3_dgpu() && e8_soa_experts_enabled();
@@ -10143,6 +10156,13 @@ impl Gpu {
         debug_assert!(
             self.arch_caps.has_wmma_w32() || self.arch_caps.is_rdna4(),
             "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched needs RDNA3 or RDNA4"
+        );
+        // See `gemv_mfp4g32_e8_moe_gate_up_k8_indexed`: `groups_per_row = K/256`
+        // truncates a non-multiple-of-256 K without faulting.
+        assert!(
+            k % 256 == 0,
+            "gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched requires K%256==0 \
+             (groups_per_row = K/256), got K={k}"
         );
         // SoA-coalesced path takes priority when experts were transposed AoS->SoA at
         // load (RDNA3 dGPU + HIPFIRE_E8_SOA_EXPERTS=1). Same params/grid as the AoS
@@ -10228,6 +10248,15 @@ impl Gpu {
         debug_assert!(
             self.arch_caps.has_wmma_w32() || self.arch_caps.is_rdna4(),
             "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded needs RDNA3 or RDNA4"
+        );
+        // See `gemv_mfp4g32_e8_moe_gate_up_k8_indexed`: `groups_per_row = K/256`
+        // truncates a non-multiple-of-256 K without faulting. This is the
+        // projection that carries qwen4's K=640 expert reduction, the geometry
+        // a 128-wide E8 tier exists to serve.
+        assert!(
+            k % 256 == 0,
+            "gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded requires K%256==0 \
+             (groups_per_row = K/256), got K={k}"
         );
         let use_dgpu_twin = self.arch_caps.is_rdna3_dgpu() && e8_dgpu_twin_enabled();
         let (kname, ksrc, kfn) = if use_dgpu_twin {
