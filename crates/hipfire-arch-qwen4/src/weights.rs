@@ -199,6 +199,41 @@ fn qwen4_trunk_matrix(name: &str, shape: &[usize]) -> bool {
     shape.len() == 2 && qwen4_quantizable_matrix(name, shape)
 }
 
+/// The packed tier the rank-2 trunk matrices ship at.
+///
+/// `HIPFIRE_QWEN4_TRUNK_TIER=mq6` puts the wide attention/GDN projections on
+/// the aligned-K six-bit group (MQ6G256V2, qt=47, 6.25 bpw) instead of the
+/// eight-bit recipe this build declares by default (Q8F16, qt=3, 8.5 bpw).
+/// Any other value — an unset variable included — selects that default, so the
+/// knob only ever adds the six-bit rung and every recipe and artifact written
+/// so far keeps its meaning.
+///
+/// The producer and the loader reach the declaration through the same
+/// [`Qwen4Manifest::build`], and the trunk's source contract
+/// ([`qwen4_trunk_matrix_source`]) admits both rungs, so each build loads the
+/// other's artifact.  The MTP namespace declares its own targets through
+/// [`qwen4_target_dtype`] and never reads this.
+fn qwen4_trunk_tier(value: Option<&str>) -> DType {
+    match value {
+        Some("mq6") => DType::MQ6G256V2,
+        _ => DType::Q8_0,
+    }
+}
+
+/// The declared target of one entry, with the selected trunk tier applied.
+///
+/// Only the rank-2 trunk attention/GDN class moves, and only when the request
+/// was packed in the first place: a request that [`qwen4_target_dtype`] leaves
+/// unpacked (F32, or a class this family keeps source-exact) keeps its dtype.
+fn qwen4_trunk_target(name: &str, shape: &[usize], requested: DType, trunk_tier: DType) -> DType {
+    let dtype = qwen4_target_dtype(name, shape, requested);
+    if dtype == DType::Q8_0 && qwen4_trunk_matrix(name, shape) {
+        trunk_tier
+    } else {
+        dtype
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub enum TensorRole {
     TokenEmbedding,
@@ -386,7 +421,20 @@ pub struct Qwen4Manifest {
 }
 
 impl Qwen4Manifest {
+    /// The declaration both the producer and the loader read.
+    ///
+    /// The trunk's packed tier comes from `HIPFIRE_QWEN4_TRUNK_TIER` through
+    /// [`qwen4_trunk_tier`]; everything else is this build's own recipe.
     pub fn build(config: &Qwen4Config) -> Result<Self, WeightError> {
+        Self::build_with_trunk_tier(
+            config,
+            qwen4_trunk_tier(std::env::var("HIPFIRE_QWEN4_TRUNK_TIER").ok().as_deref()),
+        )
+    }
+
+    /// [`Self::build`] against an explicit trunk tier, so the selector's effect
+    /// on the declaration is testable without a process-global environment.
+    fn build_with_trunk_tier(config: &Qwen4Config, trunk_tier: DType) -> Result<Self, WeightError> {
         config.validate().map_err(WeightError::Config)?;
         let bf16 = DTypeConstraint::source_exact(DType::BF16);
         // Converted HFQM records may already carry either MQ4G256V2 (qt=44)
@@ -399,7 +447,7 @@ impl Qwen4Manifest {
                      requested_dtype: DType,
                      policy: ShardPolicy,
                      source: &DTypeConstraint| {
-            let dtype = qwen4_target_dtype(name, &shape, requested_dtype);
+            let dtype = qwen4_trunk_target(name, &shape, requested_dtype, trunk_tier);
             let source = if qwen4_trunk_matrix(name, &shape) {
                 &quant_trunk
             } else if dtype == DType::Q8_0 {
@@ -417,7 +465,7 @@ impl Qwen4Manifest {
                      requested_dtype: DType,
                      policy: ShardPolicy,
                      source: &DTypeConstraint| {
-            let dtype = qwen4_target_dtype(name, &shape, requested_dtype);
+            let dtype = qwen4_trunk_target(name, &shape, requested_dtype, trunk_tier);
             let source = if qwen4_trunk_matrix(name, &shape) {
                 &quant_trunk
             } else if dtype == DType::Q8_0 {
@@ -2272,7 +2320,9 @@ mod tests {
     /// here — four bits on a dense projection (which writes straight into the
     /// residual stream) produced a model that opened a reasoning block it could
     /// not close, and BF16 is the unpacked path this packing exists to replace.
-    /// Either fallback changes the dtype assertion or the count below.
+    /// Either fallback changes the dtype assertion or the count below.  The
+    /// eight-bit tier is what an unset `HIPFIRE_QWEN4_TRUNK_TIER` declares; the
+    /// six-bit rung is the selector's, and is asserted below.
     #[test]
     fn trunk_attention_projections_are_pinned_to_eight_bits() {
         let manifest = Qwen4Manifest::build(&pinned_config()).expect("pinned config manifest");
@@ -2299,6 +2349,92 @@ mod tests {
         // + 12 full-attention layers x (q, k, v, o, indexer qk)
         // + the MTP layer's five full-attention projections.
         assert_eq!(packed, 245, "trunk packing count");
+    }
+
+    /// The trunk's declared tier follows `HIPFIRE_QWEN4_TRUNK_TIER`, and only
+    /// the trunk's does.
+    ///
+    /// The default the line above pins is the eight-bit recipe; `mq6` is the
+    /// only value that selects the six-bit rung, and it moves the two hundred
+    /// and forty rank-2 trunk attention/GDN matrices — not the MTP namespace,
+    /// which reaches the manifest through its own constructor and keeps its own
+    /// targets.
+    #[test]
+    fn trunk_tier_selector_moves_the_declared_trunk_target() {
+        assert_eq!(qwen4_trunk_tier(None), DType::Q8_0, "unset knob default");
+        assert_eq!(qwen4_trunk_tier(Some("mq6")), DType::MQ6G256V2);
+        assert_eq!(
+            qwen4_trunk_tier(Some("mfp4e8")),
+            DType::Q8_0,
+            "a retired value must not resurrect a third tier"
+        );
+
+        let config = pinned_config();
+        let six = Qwen4Manifest::build_with_trunk_tier(&config, qwen4_trunk_tier(Some("mq6")))
+            .expect("six-bit trunk manifest");
+        let eight = Qwen4Manifest::build_with_trunk_tier(&config, qwen4_trunk_tier(None))
+            .expect("eight-bit trunk manifest");
+        assert_eq!(
+            six.weights.len(),
+            eight.weights.len(),
+            "tier, not the entry set"
+        );
+
+        let mut moved = 0usize;
+        let mut held = 0usize;
+        for (six_entry, eight_entry) in six.weights.iter().zip(&eight.weights) {
+            assert_eq!(six_entry.name, eight_entry.name, "entries must not move");
+            let trunk_matrix = qwen4_trunk_matrix(&six_entry.name, &six_entry.logical_shape)
+                && six_entry.layer.is_some();
+            // The layer index is what separates the trunk declaration from the
+            // MTP namespace's: MTP names are layerless by construction.
+            if trunk_matrix {
+                assert_eq!(
+                    six_entry.dtype,
+                    DType::MQ6G256V2,
+                    "{} trunk target under HIPFIRE_QWEN4_TRUNK_TIER=mq6",
+                    six_entry.name
+                );
+                assert_eq!(
+                    eight_entry.dtype,
+                    DType::Q8_0,
+                    "{} trunk target with the knob unset",
+                    eight_entry.name
+                );
+                moved += 1;
+            } else {
+                assert_eq!(
+                    six_entry.dtype, eight_entry.dtype,
+                    "{} must not follow the trunk selector",
+                    six_entry.name
+                );
+            }
+            // Under either declaration the trunk keeps admitting both rungs,
+            // which is what keeps a published artifact of the other tier
+            // loadable by this build.
+            if trunk_matrix {
+                for tier in [DType::BF16, DType::Q8_0, DType::MQ6G256V2] {
+                    assert!(
+                        six_entry.dtype_constraint.accepts(tier),
+                        "{} must keep admitting {tier:?}",
+                        six_entry.name
+                    );
+                }
+            }
+        }
+        assert_eq!(moved, 240, "trunk matrices the selector moves");
+
+        // The MTP namespace's five attention projections are the same class
+        // under a separate declaration: Q8F16 under the six-bit build too.
+        for entry in &six.weights {
+            if entry.name.starts_with("mtp.")
+                && qwen4_trunk_matrix(&entry.name, &entry.logical_shape)
+            {
+                assert_eq!(entry.dtype, DType::Q8_0, "{} MTP tier", entry.name);
+                held += 1;
+            }
+        }
+        assert_eq!(held, 5, "MTP attention projections left alone");
     }
 
     #[test]
