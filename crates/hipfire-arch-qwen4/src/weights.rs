@@ -171,11 +171,31 @@ fn qwen4_q8_source() -> DTypeConstraint {
 /// only let an artifact past the source check and into a geometry mismatch at
 /// the artifact boundary, one validation layer later.
 fn qwen4_quant_source() -> DTypeConstraint {
-    DTypeConstraint::source_from_sources(vec![
-        DType::BF16,
-        ROUTED_GATE_UP_DTYPE,
-        ROUTED_DOWN_DTYPE,
-    ])
+    DTypeConstraint::source_from_sources(vec![DType::BF16, ROUTED_GATE_UP_DTYPE, ROUTED_DOWN_DTYPE])
+}
+
+/// The trunk's wide attention/GDN projections are the one packed class whose
+/// tier the *artifact* chooses rather than this build.
+///
+/// Both rungs describe the same logical matrix and load as the same resident
+/// handle: the six-bit rung carries MQ6G256V2 (qt=47) and the eight-bit rung
+/// carries Q8F16 (qt=3), which is the tier this build declares.  The loader
+/// reads the tier the artifact actually ships and derives every row geometry
+/// from that tag, so the source contract admits either payload.  Naming only
+/// the tier this build happens to write would make a published rung of the
+/// other tier unloadable by the very tree that produced it.
+///
+/// The set stays closed beyond that pair: four-bit families are a group width
+/// the trunk's decode kernels do not read, and their admission would only move
+/// the failure to the artifact boundary.
+fn qwen4_trunk_matrix_source() -> DTypeConstraint {
+    DTypeConstraint::source_from_sources(vec![DType::BF16, DType::Q8_0, DType::MQ6G256V2])
+}
+
+/// True for the rank-2 trunk attention/GDN matrices — the class
+/// [`qwen4_trunk_matrix_source`] governs.
+fn qwen4_trunk_matrix(name: &str, shape: &[usize]) -> bool {
+    shape.len() == 2 && qwen4_quantizable_matrix(name, shape)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -368,13 +388,16 @@ impl Qwen4Manifest {
         // or MQ4G128V2 (qt=53).  The source checkpoint itself remains BF16.
         let quant_matrix = qwen4_quant_source();
         let quant_q8 = qwen4_q8_source();
+        let quant_trunk = qwen4_trunk_matrix_source();
         let model = |name: &str,
                      shape: Vec<usize>,
                      requested_dtype: DType,
                      policy: ShardPolicy,
                      source: &DTypeConstraint| {
             let dtype = qwen4_target_dtype(name, &shape, requested_dtype);
-            let source = if dtype == DType::Q8_0 {
+            let source = if qwen4_trunk_matrix(name, &shape) {
+                &quant_trunk
+            } else if dtype == DType::Q8_0 {
                 &quant_q8
             } else if qwen4_quantized_dtype(dtype) {
                 &quant_matrix
@@ -390,7 +413,9 @@ impl Qwen4Manifest {
                      policy: ShardPolicy,
                      source: &DTypeConstraint| {
             let dtype = qwen4_target_dtype(name, &shape, requested_dtype);
-            let source = if dtype == DType::Q8_0 {
+            let source = if qwen4_trunk_matrix(name, &shape) {
+                &quant_trunk
+            } else if dtype == DType::Q8_0 {
                 &quant_q8
             } else if qwen4_quantized_dtype(dtype) {
                 &quant_matrix
@@ -809,7 +834,18 @@ fn mtp_model(
     source: &DTypeConstraint,
 ) -> WeightEntry {
     let dtype = qwen4_target_dtype(name, &shape, requested_dtype);
-    let source = if qwen4_quantized_dtype(dtype) {
+    // Mirror the trunk's `model` closure: the wide attention/GDN projections
+    // ship at whichever tier the artifact declares (MQ6G256V2 or Q8), and a Q8
+    // target otherwise takes the Q8 source set (BF16 checkpoint or an
+    // already-converted Q8 payload).  `qwen4_quantized_dtype` is true for Q8_0
+    // as well, so testing it first would hand every eight-bit MTP projection
+    // the expert constraint (BF16 | MQ4G256V2 | MQ4G128V2) — families that are
+    // a different geometry and would be misread there.
+    let source = if qwen4_trunk_matrix(name, &shape) {
+        qwen4_trunk_matrix_source()
+    } else if dtype == DType::Q8_0 {
+        qwen4_q8_source()
+    } else if qwen4_quantized_dtype(dtype) {
         qwen4_quant_source()
     } else {
         source.clone()
@@ -2161,10 +2197,7 @@ mod tests {
 
         // The token embedding and the language head take the same eight-bit
         // class tier, which every MoE recipe in this tree uses for them.
-        for name in [
-            "model.language_model.embed_tokens.weight",
-            "lm_head.weight",
-        ] {
+        for name in ["model.language_model.embed_tokens.weight", "lm_head.weight"] {
             assert_eq!(
                 tensor(name, &[2, 256]).dtype,
                 DType::Q8_0,
@@ -2227,8 +2260,8 @@ mod tests {
         let manifest = Qwen4Manifest::build(&pinned_config()).expect("pinned config manifest");
         let mut packed = 0usize;
         for entry in &manifest.weights {
-            let trunk_attention = entry.name.contains(".linear_attn.")
-                || entry.name.contains(".self_attn.");
+            let trunk_attention =
+                entry.name.contains(".linear_attn.") || entry.name.contains(".self_attn.");
             if !trunk_attention || entry.logical_shape.len() != 2 {
                 continue;
             }
@@ -2287,12 +2320,20 @@ mod tests {
 
         // Dense matrices are quantized targets that still accept BF16 source
         // bytes, which is what lets an older artifact load against a newer
-        // manifest.
+        // manifest.  The trunk's wide attention/GDN projections are also the
+        // class whose packed tier the artifact chooses: the six-bit rung
+        // carries MQ6G256V2 (qt47) there and the eight-bit rung Q8F16 (qt3).
+        // Both must satisfy the entry's source contract, or a published rung
+        // of one tier cannot be loaded by the tree that produced it.
         let assert_quantized = |name: &str, layer: Option<usize>| {
             let entry = manifest.entry(name, layer).expect("quantized matrix entry");
             assert_eq!(entry.dtype, DType::Q8_0, "{name} target dtype");
             assert!(entry.dtype_constraint.accepts(DType::BF16));
             assert!(entry.dtype_constraint.accepts(DType::Q8_0));
+            assert!(
+                entry.dtype_constraint.accepts(DType::MQ6G256V2),
+                "{name} must admit the six-bit trunk rung"
+            );
         };
         for (name, layer) in [
             (
@@ -2303,6 +2344,10 @@ mod tests {
                 "model.language_model.layers.2.linear_attn.in_proj_qkv.weight",
                 Some(2),
             ),
+            // The MTP layer's attention projections are the same class under
+            // the model namespace, and reach the manifest through their own
+            // constructor.
+            ("mtp.layers.0.self_attn.q_proj.weight", None),
         ] {
             assert_quantized(name, layer);
         }
@@ -2318,15 +2363,15 @@ mod tests {
             assert_bf16(name, None);
         }
         // The eight-bit classes: BF16 in the checkpoint, Q8 in the artifact.
-        for name in [
-            "model.language_model.embed_tokens.weight",
-            "lm_head.weight",
-        ] {
+        for name in ["model.language_model.embed_tokens.weight", "lm_head.weight"] {
             let entry = manifest.entry(name, None).expect("eight-bit class entry");
             assert_eq!(entry.dtype, DType::Q8_0, "{name} target dtype");
             assert!(entry.dtype_constraint.accepts(DType::BF16));
             assert!(entry.dtype_constraint.accepts(DType::Q8_0));
             assert!(!entry.dtype_constraint.accepts(DType::MQ4G256V2));
+            // The head and the embedding are eight-bit by recipe; a six-bit
+            // payload there is the same class of mistake as four bits.
+            assert!(!entry.dtype_constraint.accepts(DType::MQ6G256V2));
         }
         // The shared expert, the router, and the PLE projections stay
         // source-exact: they ride the sealed-MoE route or select among 512

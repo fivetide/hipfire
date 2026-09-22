@@ -41,10 +41,7 @@ const QWEN4_QT_MFP4G32E8SOA: u8 = 35;
 const QWEN4_MFP4G32E8SOA_K_ALIGNMENT: usize = 256;
 
 /// SoA row geometry, mirroring the producer's `mfp4e8soa_row_geometry`.
-fn mfp4e8soa_extent(
-    shape: &[u32],
-    name: &str,
-) -> Result<(usize, usize), Qwen4ArtifactError> {
+fn mfp4e8soa_extent(shape: &[u32], name: &str) -> Result<(usize, usize), Qwen4ArtifactError> {
     let k = usize::try_from(*shape.last().expect("shape length checked")).map_err(|_| {
         Qwen4ArtifactError::new(format!("qwen4: source tensor {name} K overflows usize"))
     })?;
@@ -139,18 +136,6 @@ fn source_dtype_name(quant_type: u8) -> Option<&'static str> {
         // table is compared against that seal, so the spelling has to match it.
         QWEN4_QT_Q8F16 => Some("Q8_0"),
         QWEN4_QT_MFP4G32E8SOA => Some("MFP4G32E8SOA"),
-        _ => None,
-    }
-}
-
-fn quant_type_for_dtype(dtype: DType) -> Option<u8> {
-    match dtype {
-        DType::MQ4G256V2 => Some(QWEN4_QT_MQ4G256V2),
-        DType::MQ6G256V2 => Some(QWEN4_QT_MQ6G256V2),
-        DType::Q8_0 => Some(QWEN4_QT_Q8F16),
-        DType::MFP4G32E8SOA => Some(QWEN4_QT_MFP4G32E8SOA),
-        DType::MQ4G128V2 => Some(QWEN4_QT_MQ4G128V2),
-        DType::BF16 => Some(QWEN4_QT_BF16),
         _ => None,
     }
 }
@@ -340,8 +325,14 @@ fn validate_weight_geometry(
             // An artifact whose manifest target is quantized but whose bytes are
             // BF16 decodes that matrix through the unpacked path.  Supporting
             // that silently is how a packed trunk regresses to BF16 without
-            // anyone noticing, so it takes an explicit opt-in.
-            if source_dtype == Some(DType::BF16) && !unpacked_quantized_target_allowed() {
+            // anyone noticing, so it takes an explicit opt-in — *unless* the
+            // entry's own source contract admits BF16, which is the case for a
+            // table that ships in two tiers and whose artifact declares which
+            // one it carries (Qwen4 PLE rows: Q8F16 or BF16).
+            if source_dtype == Some(DType::BF16)
+                && !entry.dtype_constraint.accepts(DType::BF16)
+                && !unpacked_quantized_target_allowed()
+            {
                 return Err(Qwen4ArtifactError::new(format!(
                     "qwen4: tensor {} is declared {:?} by the manifest but the artifact \
                      carries BF16 bytes; this artifact would decode it unpacked. \
@@ -351,19 +342,22 @@ fn validate_weight_geometry(
                 )));
             }
             // A converted artifact may retain BF16 source bytes for a matrix
-            // whose manifest target is quantized.  If it is already quantized,
-            // the source tag must agree with the target's exact geometry.
-            if source_dtype != Some(DType::BF16) && source_dtype != Some(entry.dtype) {
-                return Err(Qwen4ArtifactError::new(format!(
-                    "qwen4: tensor {} source quant tag {} does not match manifest dtype {:?}",
-                    entry.name, info.quant_type, entry.dtype
-                )));
-            }
-            if source_dtype == Some(entry.dtype)
-                && quant_type_for_dtype(entry.dtype) != Some(info.quant_type)
+            // whose manifest target is quantized.  When it is already packed,
+            // the tag must name a representation the entry's *own* source
+            // contract admits — not the target this build happens to declare.
+            // The trunk is the class where those differ: its contract names
+            // both MQ6G256V2 (qt=47) and Q8F16 (qt=3) because the artifact
+            // chooses the tier, and every extent above was computed from the
+            // tag the artifact actually carries.  This is the same question the
+            // runtime's weight store asks at fulfillment, so the two layers
+            // admit the same artifacts.
+            if source_dtype != Some(DType::BF16)
+                && !entry
+                    .dtype_constraint
+                    .accepts(source_dtype.expect("every admitted tag names a dtype"))
             {
                 return Err(Qwen4ArtifactError::new(format!(
-                    "qwen4: tensor {} source quant tag {} does not match manifest geometry {:?}",
+                    "qwen4: tensor {} source quant tag {} is not an admitted source for manifest dtype {:?}",
                     entry.name, info.quant_type, entry.dtype
                 )));
             }
