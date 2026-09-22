@@ -220,6 +220,22 @@ fn qwen4_trunk_tier(value: Option<&str>) -> DType {
     }
 }
 
+/// `HIPFIRE_QWEN4_MTP_TIER=source` declares the whole MTP namespace at the
+/// source's own BF16 instead of the eight-bit recipe the shared matrix
+/// classifier otherwise picks for it.
+///
+/// This exists to measure, not to ship: the published rung keeps its MTP
+/// attention projections at Q8F16 (qt=3) while the trunk carries the six-bit
+/// rung, and the open question is whether that tier costs acceptance.  The knob
+/// is the only input - unset, every existing artifact and recipe keeps its exact
+/// meaning - and it applies to the MTP names alone, so the trunk's tier is
+/// untouched by construction.  The producer and the loader reach the
+/// declaration through the same manifest, so a scratch artifact written with the
+/// knob set loads on an unmodified build.
+fn qwen4_mtp_source_tier(value: Option<&str>) -> bool {
+    matches!(value, Some("source"))
+}
+
 /// The declared target of one entry, with the selected trunk tier applied.
 ///
 /// Only the rank-2 trunk attention/GDN class moves, and only when the request
@@ -886,6 +902,19 @@ fn mtp_model(
     policy: ShardPolicy,
     source: &DTypeConstraint,
 ) -> WeightEntry {
+    // Training-precision MTP experiment (`HIPFIRE_QWEN4_MTP_TIER=source`): every
+    // entry in the MTP namespace declares BF16 against a BF16 source, so a
+    // scratch artifact carries the head at the checkpoint's own precision while
+    // the trunk keeps whatever tier it declared.  Off by default.
+    if qwen4_mtp_source_tier(std::env::var("HIPFIRE_QWEN4_MTP_TIER").ok().as_deref()) {
+        return WeightEntry::model_with_dtype_constraint(
+            name,
+            shape,
+            DType::BF16,
+            DTypeConstraint::source_exact(DType::BF16),
+            policy,
+        );
+    }
     let dtype = qwen4_target_dtype(name, &shape, requested_dtype);
     // Mirror the trunk's `model` closure: the wide attention/GDN projections
     // ship at whichever tier the artifact declares (MQ6G256V2 or Q8), and a Q8
@@ -2323,6 +2352,13 @@ mod tests {
     /// Either fallback changes the dtype assertion or the count below.  The
     /// eight-bit tier is what an unset `HIPFIRE_QWEN4_TRUNK_TIER` declares; the
     /// six-bit rung is the selector's, and is asserted below.
+    #[test]
+    fn mtp_source_tier_knob_only_answers_to_its_own_value() {
+        assert!(!qwen4_mtp_source_tier(None), "unset keeps the shipped tier");
+        assert!(!qwen4_mtp_source_tier(Some("mq6")));
+        assert!(qwen4_mtp_source_tier(Some("source")));
+    }
+
     #[test]
     fn trunk_attention_projections_are_pinned_to_eight_bits() {
         let manifest = Qwen4Manifest::build(&pinned_config()).expect("pinned config manifest");
