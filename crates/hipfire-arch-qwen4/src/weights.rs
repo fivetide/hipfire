@@ -236,6 +236,21 @@ fn qwen4_mtp_source_tier(value: Option<&str>) -> bool {
     matches!(value, Some("source"))
 }
 
+thread_local! {
+    /// Test-only override so a manifest assertion can exercise the knob without
+    /// a process-global environment write.  Production always reads the env.
+    static MTP_SOURCE_TIER_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The predicate the manifest actually consults, so a test can prove the knob
+/// *reaches* the five rank-2 MTP attention matrices rather than only parsing.
+fn mtp_source_tier_active() -> bool {
+    MTP_SOURCE_TIER_OVERRIDE.with(|value| value.get()).unwrap_or_else(|| {
+        qwen4_mtp_source_tier(std::env::var("HIPFIRE_QWEN4_MTP_TIER").ok().as_deref())
+    })
+}
+
 /// The declared target of one entry, with the selected trunk tier applied.
 ///
 /// Only the rank-2 trunk attention/GDN class moves, and only when the request
@@ -906,7 +921,7 @@ fn mtp_model(
     // entry in the MTP namespace declares BF16 against a BF16 source, so a
     // scratch artifact carries the head at the checkpoint's own precision while
     // the trunk keeps whatever tier it declared.  Off by default.
-    if qwen4_mtp_source_tier(std::env::var("HIPFIRE_QWEN4_MTP_TIER").ok().as_deref()) {
+    if mtp_source_tier_active() {
         return WeightEntry::model_with_dtype_constraint(
             name,
             shape,
@@ -2352,6 +2367,43 @@ mod tests {
     /// Either fallback changes the dtype assertion or the count below.  The
     /// eight-bit tier is what an unset `HIPFIRE_QWEN4_TRUNK_TIER` declares; the
     /// six-bit rung is the selector's, and is asserted below.
+    #[test]
+    fn mtp_tier_knob_reaches_the_five_attention_matrices() {
+        let config = pinned_config();
+        // Measured on the published rung: these five ship qt=3 (Q8F16) while the
+        // trunk carries the mq6 rung, and the knob must move exactly these.
+        let mtp_attention = [
+            "mtp.layers.0.self_attn.q_proj.weight",
+            "mtp.layers.0.self_attn.k_proj.weight",
+            "mtp.layers.0.self_attn.v_proj.weight",
+            "mtp.layers.0.self_attn.o_proj.weight",
+            "mtp.layers.0.self_attn.indexer.index_qk_proj.weight",
+        ];
+        let trunk_attention = "model.language_model.layers.2.linear_attn.in_proj_qkv.weight";
+        MTP_SOURCE_TIER_OVERRIDE.with(|value| value.set(Some(false)));
+        let shipped = Qwen4Manifest::build(&config).expect("default manifest");
+        MTP_SOURCE_TIER_OVERRIDE.with(|value| value.set(Some(true)));
+        let source = Qwen4Manifest::build(&config).expect("source-tier manifest");
+        MTP_SOURCE_TIER_OVERRIDE.with(|value| value.set(None));
+        for name in mtp_attention {
+            let default_entry = shipped.entry(name, None).expect("default MTP attention entry");
+            let source_entry = source.entry(name, None).expect("source-tier MTP attention entry");
+            assert_ne!(default_entry.dtype, DType::BF16, "{name} ships quantized");
+            assert_eq!(
+                source_entry.dtype,
+                DType::BF16,
+                "{name} must follow HIPFIRE_QWEN4_MTP_TIER=source"
+            );
+        }
+        let default_trunk = shipped.entry(trunk_attention, Some(2)).expect("trunk entry");
+        let source_trunk = source.entry(trunk_attention, Some(2)).expect("trunk entry");
+        assert_eq!(default_trunk.dtype, source_trunk.dtype, "trunk tier must not move");
+        let norm = source
+            .entry("mtp.layers.0.self_attn.q_norm.weight", None)
+            .expect("MTP norm entry");
+        assert_eq!(norm.dtype, DType::BF16, "MTP norms are already source-exact");
+    }
+
     #[test]
     fn mtp_source_tier_knob_only_answers_to_its_own_value() {
         assert!(!qwen4_mtp_source_tier(None), "unset keeps the shipped tier");
