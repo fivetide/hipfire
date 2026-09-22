@@ -1137,10 +1137,10 @@
     },
     "qwen3.8:flash-next": {
       "repo": "hipfire-models/qwen3.8-flash-next",
-      "file": "qwen3.8-flash-next.mq4r",
-      "size_gb": 174.6,
+      "file": "qwen3.8-flash-next.mq6q8-pleq8",
+      "size_gb": 125.5,
       "min_vram_gb": 128,
-      "desc": "Qwen3.8-Flash-Next / Qwen4 experimental HFQM (arch 16). Trunk attention/GDN projections ship MQ6G256V2 (245 tensors), routed experts MQ4, and the embedding, language head, hyper-connection matrices, MoE router, shared expert and PLE projections stay BF16; 72.2 GB resident with 102.4 GB of PLE n-gram rows leased from the mapped artifact. Tested only on 128 GB-class Strix Halo, so the 128 GB catalog gate is conservative rather than a measured minimum. Native MTP is embedded.",
+      "desc": "Qwen3.8-Flash-Next / Qwen4 experimental HFQM (arch 16), canonical rung. MQ6G256V2 (qt47) on the 240 trunk attention/GDN projections, MQ4G256V2/MQ4G128V2 routed experts, Q8F16 (qt3) embedding, language head, the MTP layer's five attention projections and the PLE n-gram rows; hyper-connection matrices, MoE router, shared expert, PLE projections and norms stay BF16. 125.5 GB on disk against 173.5 GB for the same recipe with BF16 PLE rows, and 75,776 device bytes per decoded token against 124,928. 22.7 tok/s decode at ctx128 (gfx1151, graph off, kv q8), the mq6q8 class. Needs a hipfire build whose qwen4 trunk source contract admits both packed trunk tiers and whose PLE admission accepts both row tiers. Native MTP is embedded and works on a build carrying 96600e15e, but it is not recommended on this recipe: about 2.8-2.9x slower than AR (prose 18.7 vs 6.7 tok/s, code 17.3 vs 6.0; greedy, kv q8, max_seq 2048) and not token-identical to AR. The draft head is weak rather than broken (argmax agreement with the target 43.8/21.3/12.5% at draft steps 1/2/3), so use AR. `hipfire bench` cannot measure this model - it fails closed at load on the max_seq contract - so MTP figures come from the serve path. Tested only on 128 GB-class Strix Halo, so the 128 GB catalog gate is conservative rather than a measured minimum.",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -1148,12 +1148,12 @@
       }
     },
 
-    "qwen3.8:flash-next-mq6q8": {
+    "qwen3.8:flash-next-mq6q8-pleq8": {
       "repo": "hipfire-models/qwen3.8-flash-next",
-      "file": "qwen3.8-flash-next.mq6q8",
-      "size_gb": 173.5,
+      "file": "qwen3.8-flash-next.mq6q8-pleq8",
+      "size_gb": 125.5,
       "min_vram_gb": 128,
-      "desc": "Qwen3.8-Flash-Next / Qwen4 experimental HFQM (arch 16) packed rung. MQ6G256V2 (qt47) on the 245 trunk attention/GDN projections, MQ4G256V2/MQ4G128V2 routed experts, Q8F16 (qt3) embedding and language head; hyper-connection, router, shared expert and PLE projections stay BF16. 71.0 GB resident with 102.4 GB of PLE n-gram rows leased from the mapped artifact. 22.6-22.9 tok/s decode at ctx128 (gfx1151, graph off, kv q8) against 13.6 for the BF16-trunk build. Needs a hipfire build whose qwen4 trunk source contract admits both packed trunk tiers. Tested only on 128 GB-class Strix Halo, so the 128 GB catalog gate is conservative rather than a measured minimum. Native MTP is embedded.",
+      "desc": "Qwen3.8-Flash-Next / Qwen4 experimental HFQM (arch 16), canonical rung. MQ6G256V2 (qt47) on the 240 trunk attention/GDN projections, MQ4G256V2/MQ4G128V2 routed experts, Q8F16 (qt3) embedding, language head, the MTP layer's five attention projections and the PLE n-gram rows; hyper-connection matrices, MoE router, shared expert, PLE projections and norms stay BF16. 125.5 GB on disk against 173.5 GB for the same recipe with BF16 PLE rows, and 75,776 device bytes per decoded token against 124,928. 22.7 tok/s decode at ctx128 (gfx1151, graph off, kv q8), the mq6q8 class. Needs a hipfire build whose qwen4 trunk source contract admits both packed trunk tiers and whose PLE admission accepts both row tiers. Native MTP is embedded and works on a build carrying 96600e15e, but it is not recommended on this recipe: about 2.8-2.9x slower than AR (prose 18.7 vs 6.7 tok/s, code 17.3 vs 6.0; greedy, kv q8, max_seq 2048) and not token-identical to AR. The draft head is weak rather than broken (argmax agreement with the target 43.8/21.3/12.5% at draft steps 1/2/3), so use AR. `hipfire bench` cannot measure this model - it fails closed at load on the max_seq contract - so MTP figures come from the serve path. Tested only on 128 GB-class Strix Halo, so the 128 GB catalog gate is conservative rather than a measured minimum.",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,

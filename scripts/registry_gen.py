@@ -76,6 +76,10 @@ KNOWN_QUANTS = {
     # MQ4G256V2/MQ4G128V2 routed experts. The suffix is that artifact's
     # published SKU name; quant_for() reads it verbatim from the file name.
     "mq6q8",
+    # The same rung with the PLE n-gram rows packed to Q8F16 as well, which is
+    # the canonical Flash-Next artifact today. quant_for() reads the suffix
+    # verbatim from the published file name.
+    "mq6q8-pleq8",
     "mfp4",
     # PrismML Bonsai low-bit: TQ2G128 ternary / BQ1G128 binary. Added with the
     # filename rename in the same commit -- quant_for() reads the extension and
