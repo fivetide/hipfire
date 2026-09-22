@@ -330,6 +330,13 @@ impl Qwen4Bundle {
         Ok(())
     }
 
+    /// Rows the attached forward can process in one chunked call.  The MTP
+    /// prefill uses this to batch a whole prompt chunk through the shared
+    /// forward instead of one single-row forward per prompt token.
+    pub(crate) fn spec_chunk_rows(&self) -> Option<usize> {
+        self.execution.as_ref().map(|forward| forward.scratch.max_chunk)
+    }
+
     pub(crate) fn spec_forward_rows(
         &mut self,
         gpu: &mut Gpu,

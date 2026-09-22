@@ -637,6 +637,9 @@ pub struct Qwen4MtpDrafter {
     scratch: Option<Box<dyn SpecScratch>>,
     pending_hidden: Option<GpuTensor>,
     row_hidden: Option<GpuTensor>,
+    /// Prompt rows one chunked prefill call may capture; mirrors the attached
+    /// forward's chunk capacity and sizes the spec hidden capture buffer.
+    prefill_rows: usize,
     row_probe_done: bool,
 }
 
@@ -649,6 +652,7 @@ impl Qwen4MtpDrafter {
             scratch: None,
             pending_hidden: None,
             row_hidden: None,
+            prefill_rows: 0,
             row_probe_done: false,
         }
     }
@@ -674,10 +678,15 @@ impl Qwen4MtpDrafter {
                 .checked_mul(bundle.config.hidden_size)
                 .ok_or_else(|| "Qwen4 MTP hidden width overflow".to_string())?
         };
+        let prefill_rows = {
+            let bundle = Self::bundle(target)?;
+            bundle.spec_chunk_rows().unwrap_or(1).max(1)
+        };
         if self.scratch.is_none() {
-            let scratch = target.new_spec_scratch(gpu, self.max_k + 1)?;
+            let scratch = target.new_spec_scratch(gpu, (self.max_k + 1).max(prefill_rows))?;
             self.scratch = Some(scratch);
         }
+        self.prefill_rows = prefill_rows;
         if self.pending_hidden.is_none() {
             self.pending_hidden = Some(
                 gpu.zeros(&[width], rdna_compute::DType::F32)
@@ -943,25 +952,42 @@ impl MtpDrafter for Qwen4MtpDrafter {
         }
         let pending = self.pending_hidden()?;
         let mut first_token = None;
-        for (index, &token) in fill_tokens.iter().enumerate() {
+        // One chunked target forward per chunk instead of one single-row forward
+        // per prompt token: the shared forward already captures the whole
+        // chunk's wide hidden, and the head then consumes each row in order.
+        // Cost goes from ~1 single-row forward per prompt token to the ordinary
+        // chunked prefill rate plus one head step per token.
+        let chunk_rows = self.prefill_rows.max(1);
+        for (chunk_index, chunk) in fill_tokens.chunks(chunk_rows).enumerate() {
             if abort() {
                 target.reset_recurrent(gpu)?;
                 return Err("Qwen4 native MTP prefill aborted".to_string());
             }
-            let position = start_pos
-                .checked_add(index)
-                .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
-            let bundle = Self::bundle(target)?;
-            let argmax = bundle
-                .spec_capture_token(gpu, token)
-                .map_err(|error| error.to_string())?;
-            bundle
-                .copy_spec_hidden_row_to(gpu, 0, pending)
-                .map_err(|error| error.to_string())?;
-            bundle
-                .mtp_forward_token(gpu, token, Some(pending), position)
-                .map_err(|error| error.to_string())?;
-            first_token = Some(argmax);
+            let base = chunk_index * chunk_rows;
+            let picks = {
+                let bundle = Self::bundle(target)?;
+                bundle
+                    .spec_forward_rows(gpu, chunk, true)
+                    .map_err(|error| error.to_string())?
+            };
+            for (index, &token) in chunk.iter().enumerate() {
+                if abort() {
+                    target.reset_recurrent(gpu)?;
+                    return Err("Qwen4 native MTP prefill aborted".to_string());
+                }
+                let position = start_pos
+                    .checked_add(base)
+                    .and_then(|value| value.checked_add(index))
+                    .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
+                let bundle = Self::bundle(target)?;
+                bundle
+                    .copy_spec_hidden_row_to(gpu, index, pending)
+                    .map_err(|error| error.to_string())?;
+                bundle
+                    .mtp_forward_token(gpu, token, Some(pending), position)
+                    .map_err(|error| error.to_string())?;
+            }
+            first_token = picks.last().copied();
         }
         Ok(first_token.expect("non-empty MTP prefill produced no seed"))
     }
@@ -986,7 +1012,15 @@ impl MtpDrafter for Qwen4MtpDrafter {
         }
         self.ensure_resources(gpu, target)?;
         let trace = std::env::var("HIPFIRE_MTP_TRACE").is_ok_and(|value| value == "1");
-        if std::env::var("HIPFIRE_MTP_INCREMENTAL").is_ok_and(|value| value == "1") {
+        // Interleaved verify is the production route.  With the batched verify a
+        // cycle also paid a replay of the accepted prefix (47-94 ms, measured),
+        // which was 27-40% of the window; `HIPFIRE_MTP_INCREMENTAL=0` keeps the
+        // batched path reachable as the measured control.
+        let incremental = !matches!(
+            std::env::var("HIPFIRE_MTP_INCREMENTAL").as_deref(),
+            Ok("0")
+        );
+        if incremental {
             return self.mtp_step_incremental(gpu, target, position, seed, k, eos, trace);
         }
         {
