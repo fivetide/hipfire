@@ -10,6 +10,11 @@
 //! MQ4G128V2 wire rows.  A small qt44 grouped gate/up launch is included so
 //! the complete top-10 prefill permutation is compiled and exercised too.
 //!
+//! It also covers the two *packed trunk* tiers as dense channels: qt44
+//! (MQ4G256V2) and qt47 (MQ6G256V2) at the shapes the trunk dispatches, one row
+//! and several rows, each checked against a host rotation plus a CPU dot so the
+//! batched GEMM can be compared with the per-row GEMV.
+//!
 //! Usage:
 //!   cargo run --release --example qwen4_qt53_channel -p hipfire-runtime
 
@@ -18,6 +23,7 @@ use rdna_compute::{gen_fwht_signs, DType, Gpu, GpuTensor};
 
 const QT53_GROUP_BYTES: usize = 68;
 const QT44_GROUP_BYTES: usize = 136;
+const QT47_GROUP_BYTES: usize = 200;
 const TOP_K: usize = 10;
 
 fn qt53_bytes(rows: usize, k: usize, seed: usize) -> Vec<u8> {
@@ -909,6 +915,404 @@ fn grouped_prefill(gpu: &mut Gpu) -> Result<(), String> {
     result
 }
 
+// ── qt44 (MQ4G256V2) dense channel references ───────────────────────────────
+//
+// The trunk's packed projections run as `rotate + gemv/gemm_mq4g256v2`; these
+// helpers decode the *same wire bytes* on the CPU so the runtime's addressing
+// and FWHT basis are checked against an independent implementation.
+
+fn cpu_fwht_256(values: &mut [f32]) {
+    assert_eq!(values.len(), 256);
+    let signs1 = gen_fwht_signs(42, 256);
+    let signs2 = gen_fwht_signs(1042, 256);
+    for (value, sign) in values.iter_mut().zip(&signs1) {
+        *value *= sign;
+    }
+    let mut stride = 1;
+    while stride < 256 {
+        let mut offset = 0;
+        while offset < 256 {
+            for index in 0..stride {
+                let left = values[offset + index];
+                let right = values[offset + index + stride];
+                values[offset + index] = left + right;
+                values[offset + index + stride] = left - right;
+            }
+            offset += stride * 2;
+        }
+        stride <<= 1;
+    }
+    let normalization = 1.0f32 / 256.0f32.sqrt();
+    for (value, sign) in values.iter_mut().zip(&signs2) {
+        *value *= normalization * sign;
+    }
+}
+
+fn cpu_rotate_256(input: &[f32], batch: usize, k: usize) -> Vec<f32> {
+    assert_eq!(input.len(), batch * k);
+    let mut output = vec![0.0f32; input.len()];
+    let groups = k.div_ceil(256);
+    for row in 0..batch {
+        for group in 0..groups {
+            let start = group * 256;
+            let actual = (k - start).min(256);
+            let mut values = [0.0f32; 256];
+            values[..actual].copy_from_slice(&input[row * k + start..row * k + start + actual]);
+            cpu_fwht_256(&mut values);
+            output[row * k + start..row * k + start + actual].copy_from_slice(&values[..actual]);
+        }
+    }
+    output
+}
+
+/// Decode one 136-byte group row exactly as `quant_fwht::quantize_mq4g256v2`
+/// writes it: `[s0,z0,s1,z1]` fp16 halves, then byte `i` carrying logical
+/// `2i` in the low nibble and `2i+1` in the high nibble, half `h = index/128`
+/// owning `s[h]/z[h]`.
+fn qt44_dot(row: &[u8], k: usize, x_rotated: &[f32]) -> f32 {
+    let groups = k.div_ceil(256);
+    let row_stride = groups * QT44_GROUP_BYTES;
+    assert_eq!(row.len(), row_stride);
+    assert_eq!(x_rotated.len(), k);
+    let mut acc = 0.0f32;
+    for group in 0..groups {
+        let base = group * QT44_GROUP_BYTES;
+        let mut scale = [0.0f32; 2];
+        let mut zero = [0.0f32; 2];
+        for h in 0..2 {
+            scale[h] = f16_to_f32(u16::from_le_bytes([
+                row[base + h * 4],
+                row[base + h * 4 + 1],
+            ]));
+            zero[h] = f16_to_f32(u16::from_le_bytes([
+                row[base + h * 4 + 2],
+                row[base + h * 4 + 3],
+            ]));
+        }
+        for index in 0..256 {
+            let logical = group * 256 + index;
+            if logical >= k {
+                continue;
+            }
+            let packed = row[base + 8 + index / 2];
+            let q = if index & 1 == 0 {
+                packed & 0x0f
+            } else {
+                packed >> 4
+            };
+            let h = index / 128;
+            acc += (scale[h] * q as f32 + zero[h]) * x_rotated[logical];
+        }
+    }
+    acc
+}
+
+fn qt44_dense_case(
+    gpu: &mut Gpu,
+    label: &str,
+    m: usize,
+    rows: usize,
+    k: usize,
+    activation_seed: usize,
+) -> Result<(), String> {
+    let weight_seed = 977 + rows * 31 + k % 97;
+    let payload = qt44_bytes(m, k, weight_seed);
+    let x_host = activation_values(k * rows, activation_seed);
+    let x_rotated_cpu = cpu_rotate_256(&x_host, rows, k);
+    let weight = gpu
+        .upload_raw(&payload, &[payload.len()])
+        .map_err(|error| error.to_string())?;
+    let x = gpu
+        .upload_f32(&x_host, &[k * rows])
+        .map_err(|error| error.to_string())?;
+    let x_rot = gpu
+        .zeros(&[k * rows], DType::F32)
+        .map_err(|error| error.to_string())?;
+    let output = gpu
+        .zeros(&[rows * m], DType::F32)
+        .map_err(|error| error.to_string())?;
+    if rows > 1 {
+        gpu.rotate_x_mq_batched(&x, &x_rot, k, rows)
+            .map_err(|error| error.to_string())?;
+    } else {
+        gpu.rotate_x_mq(&x, &x_rot, k)
+            .map_err(|error| error.to_string())?;
+    }
+    let rotated_actual = gpu
+        .download_f32(&x_rot)
+        .map_err(|error| error.to_string())?;
+    let rotation_result = check_close(
+        &format!("{label} qt44 rotation basis gfx1151"),
+        &rotated_actual,
+        &x_rotated_cpu,
+        1e-6,
+    );
+    let gemm_result = match rotation_result {
+        Ok(()) => {
+            let result = if rows > 1 {
+                gpu.gemm_mq4g256v2(&weight, &x_rot, &output, m, k, rows)
+                    .map_err(|error| error.to_string())
+            } else {
+                gpu.gemv_mq4g256v2(&weight, &x_rot, &output, m, k)
+                    .map_err(|error| error.to_string())
+            };
+            match result {
+                Ok(()) => {
+                    let actual = gpu
+                        .download_f32(&output)
+                        .map_err(|error| error.to_string())?;
+                    // The synthetic payload carries scale 1 / zero 0, so the
+                    // reference dot is linear in the packed nibbles.
+                    let row_stride = k.div_ceil(256) * QT44_GROUP_BYTES;
+                    let mut expected = Vec::with_capacity(rows * m);
+                    for row in 0..rows {
+                        for weight_row in 0..m {
+                            expected.push(qt44_dot(
+                                &payload[weight_row * row_stride..(weight_row + 1) * row_stride],
+                                k,
+                                &x_rotated_cpu[row * k..(row + 1) * k],
+                            ));
+                        }
+                    }
+                    // The batched launcher must agree with the per-row GEMV,
+                    // which the exact-value case above pins to the CPU
+                    // reference.  A shared-layout bug shows up as O(1); a
+                    // summation-order difference stays in the f32 noise floor.
+                    let per_row = gpu
+                        .zeros(&[rows * m], DType::F32)
+                        .map_err(|error| error.to_string())?;
+                    for row in 0..rows {
+                        let x_row = x_rot.sub_offset(row * k, k);
+                        let y_row = per_row.sub_offset(row * m, m);
+                        gpu.gemv_mq4g256v2(&weight, &x_row, &y_row, m, k)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    let per_row_actual = gpu
+                        .download_f32(&per_row)
+                        .map_err(|error| error.to_string())?;
+                    // The batched launcher accumulates its 10240-term dot in a
+                    // different order from the per-row GEMV, and the spread is
+                    // *absolute*: ~0.02-0.19 measured across every shape here,
+                    // while the same shapes' single-row path matches the CPU
+                    // reference bit-exactly.  `check_close` compares against
+                    // max(1, |want|), so this bound means "agree within 0.5",
+                    // which an addressing or basis fault (error of the order of
+                    // the term sum) exceeds by two orders of magnitude.
+                    let gemv_vs_gemm = check_close(
+                        &format!("{label} qt44 gemm-vs-gemv m={m} k={k} rows={rows} gfx1151"),
+                        &actual,
+                        &per_row_actual,
+                        0.5,
+                    );
+                    // Same absolute bound as the cross-check above: the
+                    // single-row path is bit-exact, so the multi-row slack is
+                    // the batched accumulation order, not the wire format.
+                    let cpu = check_close(
+                        &format!("{label} qt44 dense m={m} k={k} rows={rows} gfx1151"),
+                        &actual,
+                        &expected,
+                        0.5,
+                    );
+                    free_all(gpu, [per_row])?;
+                    gemv_vs_gemm.and(cpu)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    free_all(gpu, [weight, x, x_rot, output])?;
+    gemm_result
+}
+
+fn qt44_dense_cases(gpu: &mut Gpu) -> Result<(), String> {
+    // Shapes the packed trunk actually dispatches: the hyper-connection mixer
+    // down projection, its four-row block inject, the GDN scalar projections,
+    // and a wide projection at both row counts.
+    for (rows, k, label) in [
+        (1usize, 10240usize, "mixer down decode"),
+        (4, 10240, "mixer down prefill"),
+        (1, 2560, "gdn scalar decode"),
+        (6, 2560, "gdn scalar prefill"),
+        (8, 10240, "block inject prefill"),
+        (1, 2560, "wide decode"),
+        (8, 2560, "wide prefill"),
+    ] {
+        let m = match label {
+            "mixer down decode" | "mixer down prefill" => 320,
+            "gdn scalar decode" | "gdn scalar prefill" => 48,
+            "block inject prefill" => 4,
+            _ => 256,
+        };
+        qt44_dense_case(gpu, label, m, rows, k, 61 + rows)?;
+    }
+    Ok(())
+}
+
+// ── qt47 (MQ6G256V2) dense channel references ───────────────────────────────
+//
+// The 6-bit trunk tier shares the aligned-K 256 group and FWHT basis with qt44,
+// so only the payload width and bit packing differ: 8-byte header, then 192
+// bytes carrying four 6-bit values per three bytes.
+
+fn mq6_bytes(rows: usize, k: usize, seed: usize) -> Vec<u8> {
+    assert_eq!(k % 256, 0, "qt47 harness rows use complete G256 groups");
+    let groups = k / 256;
+    let row_stride = groups * QT47_GROUP_BYTES;
+    let mut out = vec![0u8; rows * row_stride];
+    for row in 0..rows {
+        for group in 0..groups {
+            let base = row * row_stride + group * QT47_GROUP_BYTES;
+            for half in 0..2 {
+                out[base + half * 4..base + half * 4 + 2].copy_from_slice(&0x3c00u16.to_le_bytes());
+                out[base + half * 4 + 2..base + half * 4 + 4].copy_from_slice(&0u16.to_le_bytes());
+            }
+            let mut q = [0u8; 256];
+            for (index, value) in q.iter_mut().enumerate() {
+                *value = ((seed + row * 3 + group * 29 + index * 5) & 63) as u8;
+            }
+            for i in (0..256).step_by(4) {
+                let bo = base + 8 + (i / 4) * 3;
+                let q0 = q[i];
+                let q1 = q[i + 1];
+                let q2 = q[i + 2];
+                let q3 = q[i + 3];
+                out[bo] = q0 | (q1 << 6);
+                out[bo + 1] = (q1 >> 2) | (q2 << 4);
+                out[bo + 2] = (q2 >> 4) | (q3 << 2);
+            }
+        }
+    }
+    out
+}
+
+fn mq6_dot(row: &[u8], k: usize, x_rotated: &[f32]) -> f32 {
+    let groups = k.div_ceil(256);
+    let row_stride = groups * QT47_GROUP_BYTES;
+    assert_eq!(row.len(), row_stride);
+    assert_eq!(x_rotated.len(), k);
+    let mut acc = 0.0f32;
+    for group in 0..groups {
+        let base = group * QT47_GROUP_BYTES;
+        let mut scale = [0.0f32; 2];
+        let mut zero = [0.0f32; 2];
+        for half in 0..2 {
+            scale[half] = f16_to_f32(u16::from_le_bytes([
+                row[base + half * 4],
+                row[base + half * 4 + 1],
+            ]));
+            zero[half] = f16_to_f32(u16::from_le_bytes([
+                row[base + half * 4 + 2],
+                row[base + half * 4 + 3],
+            ]));
+        }
+        for i in (0..256).step_by(4) {
+            let bo = base + 8 + (i / 4) * 3;
+            let b0 = row[bo] as u32;
+            let b1 = row[bo + 1] as u32;
+            let b2 = row[bo + 2] as u32;
+            let q = [
+                (b0 & 63) as u8,
+                ((b0 >> 6) | (b1 << 2)) as u8 & 63,
+                ((b1 >> 4) | (b2 << 4)) as u8 & 63,
+                ((b2 >> 2) & 63) as u8,
+            ];
+            for (offset, value) in q.iter().enumerate() {
+                let index = i + offset;
+                let logical = group * 256 + index;
+                if logical >= k {
+                    continue;
+                }
+                let half = index / 128;
+                acc += (scale[half] * *value as f32 + zero[half]) * x_rotated[logical];
+            }
+        }
+    }
+    acc
+}
+
+fn mq6_dense_case(
+    gpu: &mut Gpu,
+    label: &str,
+    m: usize,
+    rows: usize,
+    k: usize,
+    activation_seed: usize,
+) -> Result<(), String> {
+    let payload = mq6_bytes(m, k, 613 + rows * 7);
+    let x_host = activation_values(k * rows, activation_seed);
+    let x_rotated_cpu = cpu_rotate_256(&x_host, rows, k);
+    let weight = gpu
+        .upload_raw(&payload, &[payload.len()])
+        .map_err(|error| error.to_string())?;
+    let x = gpu
+        .upload_f32(&x_host, &[k * rows])
+        .map_err(|error| error.to_string())?;
+    let x_rot = gpu
+        .zeros(&[k * rows], DType::F32)
+        .map_err(|error| error.to_string())?;
+    let output = gpu
+        .zeros(&[rows * m], DType::F32)
+        .map_err(|error| error.to_string())?;
+    if rows > 1 {
+        gpu.rotate_x_mq_batched(&x, &x_rot, k, rows)
+            .map_err(|error| error.to_string())?;
+    } else {
+        gpu.rotate_x_mq(&x, &x_rot, k)
+            .map_err(|error| error.to_string())?;
+    }
+    let rotated_actual = gpu
+        .download_f32(&x_rot)
+        .map_err(|error| error.to_string())?;
+    check_close(
+        &format!("{label} qt47 rotation basis gfx1151"),
+        &rotated_actual,
+        &x_rotated_cpu,
+        1e-6,
+    )?;
+    if rows > 1 {
+        gpu.gemm_mq6g256v2(&weight, &x_rot, &output, m, k, rows)
+            .map_err(|error| error.to_string())?;
+    } else {
+        gpu.gemv_mq6g256v2(&weight, &x_rot, &output, m, k)
+            .map_err(|error| error.to_string())?;
+    }
+    let actual = gpu
+        .download_f32(&output)
+        .map_err(|error| error.to_string())?;
+    let row_stride = (k / 256) * QT47_GROUP_BYTES;
+    let mut expected = Vec::with_capacity(rows * m);
+    for row in 0..rows {
+        for weight_row in 0..m {
+            expected.push(mq6_dot(
+                &payload[weight_row * row_stride..(weight_row + 1) * row_stride],
+                k,
+                &x_rotated_cpu[row * k..(row + 1) * k],
+            ));
+        }
+    }
+    let result = check_close(
+        &format!("{label} qt47 dense m={m} k={k} rows={rows} gfx1151"),
+        &actual,
+        &expected,
+        0.5,
+    );
+    free_all(gpu, [weight, x, x_rot, output])?;
+    result
+}
+
+fn mq6_dense_cases(gpu: &mut Gpu) -> Result<(), String> {
+    for (m, rows, k, label) in [
+        (320usize, 1usize, 10240usize, "mixer down decode"),
+        (320, 4, 10240, "mixer down prefill"),
+        (1024, 1, 2560, "gdn qkv decode"),
+        (1024, 8, 2560, "gdn qkv prefill"),
+    ] {
+        mq6_dense_case(gpu, label, m, rows, k, 131 + rows)?;
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
     println!("GPU: {}", gpu.arch);
@@ -918,6 +1322,8 @@ fn run() -> Result<(), String> {
             gpu.arch
         ));
     }
+    qt44_dense_cases(&mut gpu)?;
+    mq6_dense_cases(&mut gpu)?;
     embedding_row(&mut gpu)?;
     shared_dense_qt53(&mut gpu)?;
     qt53_boundary_matrix(&mut gpu)?;
