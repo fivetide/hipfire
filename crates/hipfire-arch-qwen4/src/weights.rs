@@ -921,7 +921,11 @@ fn mtp_model(
     // entry in the MTP namespace declares BF16 against a BF16 source, so a
     // scratch artifact carries the head at the checkpoint's own precision while
     // the trunk keeps whatever tier it declared.  Off by default.
-    if mtp_source_tier_active() {
+    // Rank-2 only: the MTP routed experts are rank-3 and their writer carries
+    // packed tiers exclusively (`matrix_quant_type` has no BF16 arm), so the
+    // training-precision knob covers the attention/GDN-shaped matrices the
+    // published rung stores at qt=3 and leaves the expert tiers alone.
+    if mtp_source_tier_active() && shape.len() == 2 {
         return WeightEntry::model_with_dtype_constraint(
             name,
             shape,
@@ -2393,6 +2397,19 @@ mod tests {
                 source_entry.dtype,
                 DType::BF16,
                 "{name} must follow HIPFIRE_QWEN4_MTP_TIER=source"
+            );
+        }
+        // The rank-3 routed experts keep their packed tier: the expert writer
+        // carries no BF16 arm, and the knob is scoped to rank-2 matrices.
+        for name in [
+            "mtp.layers.0.mlp.experts.gate_up_proj",
+            "mtp.layers.0.mlp.experts.down_proj",
+        ] {
+            let default_entry = shipped.entry(name, None).expect("default expert entry");
+            let source_entry = source.entry(name, None).expect("source-tier expert entry");
+            assert_eq!(
+                default_entry.dtype, source_entry.dtype,
+                "{name} must not move with the matrix knob"
             );
         }
         let default_trunk = shipped.entry(trunk_attention, Some(2)).expect("trunk entry");
