@@ -150,7 +150,11 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_FLASH_PREFILL` | Developer override for Q8 WMMA flash prefill: `0` forces off, `1` forces on; unset uses the architecture/workload envelope. |
 | `HIPFIRE_FLASH_PREFILL_FIXED_HD` | Developer ablation: fixed-head-dimension specialization is on unless `0`. |
 | `HIPFIRE_FLASH_PREFILL_PREFETCH_V` | Developer ablation: gfx12 V prefetch is on unless `0`. |
+| `HIPFIRE_GFX11_FA2_PREFILL` | GQA-fused FA2 prefill on gfx1100/gfx1151 (Qwen NH24/NKV4/HD256, N 64..512 step 16, ctx 64..32768) — default ON (`kernel.gfx11_fa2_prefill`); `=0` opts out toward the byte-identical incumbent |
+| `HIPFIRE_GFX12_FA2_PREFILL` | GQA-fused FA2 prefill on exact gfx1201 (same Qwen NH24/NKV4/HD256 envelope) — default ON (`kernel.gfx12_fa2_prefill`); `=0` opts out toward the byte-identical incumbent |
 | `HIPFIRE_CALIB_BF16` | Calibration-only: keep native-BF16 teachers in BF16 (`kernel.calib_force_bf16`, default off; shipped inference unaffected) |
+| `HIPFIRE_GFX12_MQ4V2_FP8_GATEUP` / `_RESID` / `_QKVZA` / `_QKV` | gfx1201 FP8-WMMA MQ4v2 prefill route — default ON on exact gfx1201 (prefill chunk 512); `=0` on any one opts out toward the F16 path (chunk 384). `=1` forces on; launchers stay exact-gfx1201-only, so other arches are unchanged |
+| `HIPFIRE_GFX12_MQ4V2_FP8_SLABS` | Two-slab S2BT8 FP8 symbols by default; `=1` selects the single-slab symbols |
 
 ### LFM (arch 11) — branch-scoped optimized prefill
 
@@ -622,6 +626,9 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_GFX1100_DENSE_GATE_UP_SETPRIO` | crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_GFX1100_DENSE_GATE_UP_STAGE_X32` | crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_GFX1100_ROUTER_W64` | crates/hipfire-dispatch/src/pipeline/mod.rs |
+| `HIPFIRE_GFX11_FA2_PREFILL` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/attention.rs, crates/hipfire-dispatch/src/families/attention.rs, crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_GFX11_MMQ_X128` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs |
+| `HIPFIRE_GFX11_MQ4V2_IU4` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/scratch.rs, crates/rdna-compute/src/dispatch.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_GFX1151_ATTENTION_TILE_DPP` | crates/rdna-compute/src/attention.rs |
 | `HIPFIRE_GFX1151_ATTENTION_TILE_DPP_REDUCE` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_GFX1151_CUMODE_MODULES` | crates/rdna-compute/src/compiler.rs |
@@ -691,6 +698,12 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_GFX11_WEIGHT_GLOBAL_LOADS` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GFX11_WEIGHT_LOAD_POLICY` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GFX1201_ROUTER_W64` | crates/hipfire-dispatch/src/pipeline/mod.rs |
+| `HIPFIRE_GFX12_FA2_PREFILL` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/attention.rs, crates/hipfire-dispatch/src/families/attention.rs, crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_GFX12_MQ4V2_FP8_GATEUP` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs, crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_GFX12_MQ4V2_FP8_QKV` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs, crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_GFX12_MQ4V2_FP8_QKVZA` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs, crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_GFX12_MQ4V2_FP8_RESID` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs, crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_GFX12_MQ4V2_FP8_SLABS` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_GFX12_WEIGHT_CPOL_AUX` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS` | crates/rdna-compute/src/feature_flags.rs |

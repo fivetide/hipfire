@@ -20,6 +20,7 @@ use super::weights::LayerWeights;
 use super::weights::MoeFfnWeights;
 use super::weights::Qwen35Weights;
 use super::weights::StateQuant;
+use crate::speculative::GdnTape;
 use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
@@ -4306,6 +4307,31 @@ fn dense_tp_add_residual(gpus: &mut Gpus, scratches: &[Qwen35Scratch]) -> HipRes
     Ok(())
 }
 
+/// Kill switch for the symmetric direct-peer-read TP allreduce:
+/// `HIPFIRE_TP_PEER_DIRECT=0` restores the rooted gather/fold/broadcast.
+/// Default ON for the n == 2 peer-access fast path.
+fn tp_peer_direct_enabled() -> bool {
+    hipfire_config::developer_var("HIPFIRE_TP_PEER_DIRECT")
+        .ok()
+        .as_deref()
+        != Some("0")
+}
+
+/// Dense TP allreduce routing: symmetric direct peer-read when exactly two
+/// ranks share peer access (and the kill switch is off), else the rooted path.
+fn dense_tp_allreduce_add_route(
+    gpus: &mut Gpus,
+    partials: &[&hip_bridge::DeviceBuffer],
+    residuals: &[&hip_bridge::DeviceBuffer],
+    count: usize,
+) -> HipResult<()> {
+    if gpus.devices.len() == 2 && gpus.peer_access_enabled && tp_peer_direct_enabled() {
+        gpus.all_reduce_sum_f32_peer_direct_add(partials, residuals, count)
+    } else {
+        gpus.all_reduce_sum_f32_peer_rooted_add(partials, residuals, count)
+    }
+}
+
 fn dense_tp_allreduce_add(
     gpus: &mut Gpus,
     scratches: &[Qwen35Scratch],
@@ -4314,7 +4340,7 @@ fn dense_tp_allreduce_add(
     if gpus.peer_access_enabled {
         let partials: Vec<_> = scratches.iter().map(|scratch| &scratch.o.buf).collect();
         let residuals: Vec<_> = scratches.iter().map(|scratch| &scratch.x.buf).collect();
-        gpus.all_reduce_sum_f32_peer_rooted_add(&partials, &residuals, count)
+        dense_tp_allreduce_add_route(gpus, &partials, &residuals, count)
     } else {
         dense_tp_allreduce(gpus, scratches, count)?;
         dense_tp_add_residual(gpus, scratches)
@@ -4323,8 +4349,8 @@ fn dense_tp_allreduce_add(
 
 fn dense_tp_allreduce_batched(
     gpus: &mut Gpus,
-    pbs_vec: &[PrefillBatchScratch],
-    partials: &[GpuTensor],
+    pbs_vec: &[&PrefillBatchScratch],
+    partials: &[&GpuTensor],
     n: usize,
     dim: usize,
 ) -> HipResult<()> {
@@ -4338,7 +4364,7 @@ fn dense_tp_allreduce_batched(
             .map(|pbs| pbs.x_batch.sub_offset(0, count))
             .collect();
         let residual_refs: Vec<_> = residuals.iter().map(|tensor| &tensor.buf).collect();
-        return gpus.all_reduce_sum_f32_peer_rooted_add(&partial_refs, &residual_refs, count);
+        return dense_tp_allreduce_add_route(gpus, &partial_refs, &residual_refs, count);
     }
     dense_tp_all_reduce_sum_f32(gpus, &partial_refs, count)?;
     for (rank, (pbs, partial)) in pbs_vec.iter().zip(partials.iter()).enumerate() {
@@ -4871,12 +4897,26 @@ pub fn forward_scratch_dense_tp(
     Ok(())
 }
 
-/// Layer-granular batched dense-TP prefill. Chunks with the existing
-/// gfx1201 bounded prefill batch size, uses one `PrefillBatchScratch`
-/// per rank (no per-token allocation) and exactly two deterministic
-/// reductions per layer per chunk. Only rank 0 produces final logits.
+/// Per-rank DFlash capture handles for dense-TP verification prefill.
+///
+/// `hidden` stages each configured target layer's post-second-reduction full
+/// residual (written from that rank's own `x_batch`, which the rooted
+/// allreduce leaves bit-identical on every rank). `tape` records the
+/// rank-local DeltaNet `(q, k, v, α, β)` innovations for exact replay.
+pub(crate) struct DenseTpDflashCapture<'a> {
+    pub hidden: &'a mut HiddenStateRingBuffer,
+    pub tape: &'a mut GdnTape,
+}
+
+/// Dense-TP verify/prefill with persistent caller-owned scratch and DFlash
+/// capture. Runs one chunked pass over `tokens` (requires
+/// `tokens.len() <= every pbs.max_batch` and `partials[r] >= n*dim` floats),
+/// capturing GdnTape through the existing DeltaNet batch call and
+/// selected-layer hidden only after each layer's second allreduce, then
+/// copies the final `[n,H]` full residual into `rank0_final_hidden`. Runs no
+/// final LM head; the caller (rank-0 verify) owns norm + head.
 #[allow(clippy::too_many_arguments)]
-pub fn forward_prefill_dense_tp(
+pub(crate) fn forward_prefill_dense_tp_with_pbs_capture(
     gpus: &mut Gpus,
     shard: &ShardConfig,
     weights: &[Qwen35Weights],
@@ -4886,6 +4926,10 @@ pub fn forward_prefill_dense_tp(
     kv_caches: &mut [llama::KvCache],
     dn_states: &mut [DeltaNetState],
     scratches: &[Qwen35Scratch],
+    pbs: &[&PrefillBatchScratch],
+    partials: &[&GpuTensor],
+    captures: &mut [DenseTpDflashCapture<'_>],
+    rank0_final_hidden: &GpuTensor,
 ) -> HipResult<()> {
     if tokens.is_empty() {
         return Ok(());
@@ -4898,6 +4942,95 @@ pub fn forward_prefill_dense_tp(
         || dn_states.len() != tp
         || scratches.len() != tp
         || gpus.devices.len() != tp
+        || pbs.len() != tp
+        || partials.len() != tp
+        || captures.len() != tp
+    {
+        return Err(HipError::new(
+            0,
+            "dense TP capture requires 2..=5 devices and complete rank states",
+        ));
+    }
+    let dim = configs[0].dim;
+    let n = tokens.len();
+    for (rank, pb) in pbs.iter().enumerate() {
+        if n > pb.max_batch {
+            return Err(HipError::new(
+                0,
+                "dense TP capture tokens exceed rank PBS max_batch",
+            ));
+        }
+        let need_bytes = n
+            .checked_mul(dim)
+            .and_then(|v| v.checked_mul(4))
+            .ok_or_else(|| HipError::new(0, "dense_tp capture count overflow"))?;
+        if partials[rank].buf.size() < need_bytes {
+            return Err(HipError::new(
+                0,
+                "dense TP capture partial undersized for n*dim",
+            ));
+        }
+    }
+    let need_bytes = n
+        .checked_mul(dim)
+        .and_then(|v| v.checked_mul(4))
+        .ok_or_else(|| HipError::new(0, "dense_tp capture count overflow"))?;
+    if rank0_final_hidden.buf.size() < need_bytes {
+        return Err(HipError::new(
+            0,
+            "dense TP capture rank0_final_hidden undersized for n*dim",
+        ));
+    }
+    let last_n = forward_prefill_dense_tp_batched(
+        gpus, shard, weights, configs, tokens, start_pos, kv_caches, dn_states, scratches, pbs,
+        partials, Some(captures),
+    )?;
+    debug_assert_eq!(last_n, n);
+    gpus.devices[0].bind_thread()?;
+    gpus.devices[0].hip.memcpy_dtod_at(
+        &rank0_final_hidden.buf,
+        0,
+        &pbs[0].x_batch.buf,
+        0,
+        need_bytes,
+    )?;
+    Ok(())
+}
+
+/// Shared chunked dense-TP prefill core. Runs the layer loop over `tokens` in
+/// chunks of the smallest rank PBS capacity using caller-owned `pbs_vec` /
+/// `partials` (no allocation here). With `captures`, records per-rank GdnTape
+/// through the DeltaNet batch call and stages selected-layer hidden only
+/// after each layer's second allreduce, committing staging to each rank's
+/// ring per chunk. Returns the last chunk length for the logits epilogue.
+#[allow(clippy::too_many_arguments)]
+fn forward_prefill_dense_tp_batched(
+    gpus: &mut Gpus,
+    shard: &ShardConfig,
+    weights: &[Qwen35Weights],
+    configs: &[Qwen35Config],
+    tokens: &[u32],
+    start_pos: usize,
+    kv_caches: &mut [llama::KvCache],
+    dn_states: &mut [DeltaNetState],
+    scratches: &[Qwen35Scratch],
+    pbs_vec: &[&PrefillBatchScratch],
+    partials: &[&GpuTensor],
+    mut captures: Option<&mut [DenseTpDflashCapture<'_>]>,
+) -> HipResult<usize> {
+    if tokens.is_empty() {
+        return Ok(0);
+    }
+    let tp = shard.tp_size;
+    if !(2..=5).contains(&tp)
+        || weights.len() != tp
+        || configs.len() != tp
+        || kv_caches.len() != tp
+        || dn_states.len() != tp
+        || scratches.len() != tp
+        || gpus.devices.len() != tp
+        || pbs_vec.len() != tp
+        || partials.len() != tp
     {
         return Err(HipError::new(
             0,
@@ -4917,45 +5050,20 @@ pub fn forward_prefill_dense_tp(
             _ => return Err(HipError::new(0, "dense TP received a MoE/mismatched layer")),
         }
     }
-    // Size the scratch to the call, not to the arch ceiling: an 8-token verify
-    // would otherwise allocate and free a 512-row PBS per rank on every cycle.
-    let cap =
-        crate::qwen35::prefill::prefill_max_batch_tp(&gpus.devices[0], tp).min(tokens.len().max(1));
+    if let Some(caps) = captures.as_ref() {
+        if caps.len() != tp {
+            return Err(HipError::new(
+                0,
+                "dense TP capture requires one entry per rank",
+            ));
+        }
+    }
+    // Chunk at the smallest rank PBS capacity. The DFlash capture entry point
+    // validates tokens.len() <= every max_batch up front, so capture calls
+    // always run a single chunk (the GDN tape_offset stays 0).
+    let cap = pbs_vec.iter().map(|pbs| pbs.max_batch).min().unwrap_or(0);
     if cap == 0 {
         return Err(HipError::new(0, "prefill_max_batch is zero"));
-    }
-    // ── Allocate per-rank PBS + N*dim partial (transactional, cap_gdn_tape=false) ──
-    let mut pbs_vec: Vec<PrefillBatchScratch> = Vec::with_capacity(tp);
-    let mut partials: Vec<GpuTensor> = Vec::with_capacity(tp);
-    for rank in 0..tp {
-        let pbs =
-            match PrefillBatchScratch::new_opt(&mut gpus.devices[rank], &configs[rank], cap, false)
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    for (i, prev) in pbs_vec.drain(..).enumerate() {
-                        let _ = prev.free_gpu(&mut gpus.devices[i]);
-                    }
-                    for (i, prev) in partials.drain(..).enumerate() {
-                        let _ = gpus.devices[i].free_tensor(prev);
-                    }
-                    return Err(e);
-                }
-            };
-        pbs_vec.push(pbs);
-        let partial = match gpus.devices[rank].alloc_tensor(&[cap * dim], DType::F32) {
-            Ok(t) => t,
-            Err(e) => {
-                for (i, prev) in pbs_vec.drain(..).enumerate() {
-                    let _ = prev.free_gpu(&mut gpus.devices[i]);
-                }
-                for (i, prev) in partials.drain(..).enumerate() {
-                    let _ = gpus.devices[i].free_tensor(prev);
-                }
-                return Err(e);
-            }
-        };
-        partials.push(partial);
     }
     // ── Chunked layer-granular prefill ──
     let mut process_res: HipResult<()> = Ok(());
@@ -4995,7 +5103,7 @@ pub fn forward_prefill_dense_tp(
                         &weights[rank],
                         chunk,
                         &scratches[rank],
-                        &pbs_vec[rank],
+                        pbs_vec[rank],
                         n,
                         dim,
                         dim * 4,
@@ -5007,7 +5115,7 @@ pub fn forward_prefill_dense_tp(
                     )?;
                     crate::qwen35::prefill::batch_chunk_upload_positions(
                         &mut gpus.devices[rank],
-                        &pbs_vec[rank],
+                        pbs_vec[rank],
                         BatchSemantics::Sequential,
                         chunk_start,
                         n,
@@ -5051,7 +5159,7 @@ pub fn forward_prefill_dense_tp(
                                 &mut gpus.devices[rank],
                                 layer,
                                 cfg,
-                                &pbs_vec[rank],
+                                pbs_vec[rank],
                                 &mut dn_states[rank],
                                 n,
                                 dim,
@@ -5061,12 +5169,12 @@ pub fn forward_prefill_dense_tp(
                                 hd,
                                 BatchSemantics::Sequential,
                                 None,
-                                None,
+                                captures.as_ref().map(|caps| &*caps[rank].tape),
                                 0,
                                 delta_layer_idx,
                                 q8_flags[rank],
                                 q8_flags[rank],
-                                BatchEpilogue::Partial(&partials[rank]),
+                                BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
                             ) {
                                 process_res = Err(e);
@@ -5077,10 +5185,39 @@ pub fn forward_prefill_dense_tp(
                             break;
                         }
                         if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, &pbs_vec, &partials, n, dim)
+                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
+                        }
+                        // DFlash capture: post-second-reduction full residual.
+                        if captures.is_some() {
+                            for rank in 0..tp {
+                                let res = (|| -> HipResult<()> {
+                                    let caps = captures.as_ref().ok_or_else(|| {
+                                        HipError::new(0, "dense TP capture missing")
+                                    })?;
+                                    if let Some(slot) =
+                                        caps[rank].hidden.extract_slot(layer_idx)
+                                    {
+                                        gpus.devices[rank].bind_thread()?;
+                                        caps[rank].hidden.write_rows_to_staging(
+                                            &mut gpus.devices[rank],
+                                            slot,
+                                            &pbs_vec[rank].x_batch,
+                                            n,
+                                        )?;
+                                    }
+                                    Ok(())
+                                })();
+                                if let Err(e) = res {
+                                    process_res = Err(e);
+                                    break;
+                                }
+                            }
+                            if process_res.is_err() {
+                                break;
+                            }
                         }
                         for rank in 0..tp {
                             let LayerWeights::DeltaNet(layer) = &weights[rank].layers[layer_idx]
@@ -5091,13 +5228,13 @@ pub fn forward_prefill_dense_tp(
                                 &mut gpus.devices[rank],
                                 layer,
                                 &configs[rank],
-                                &pbs_vec[rank],
+                                pbs_vec[rank],
                                 n,
                                 dim,
                                 configs[rank].hidden_dim,
                                 q8_flags[rank],
                                 q8_flags[rank],
-                                BatchEpilogue::Partial(&partials[rank]),
+                                BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
                             ) {
                                 process_res = Err(e);
@@ -5108,10 +5245,39 @@ pub fn forward_prefill_dense_tp(
                             break;
                         }
                         if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, &pbs_vec, &partials, n, dim)
+                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
+                        }
+                        // DFlash capture: post-second-reduction full residual.
+                        if captures.is_some() {
+                            for rank in 0..tp {
+                                let res = (|| -> HipResult<()> {
+                                    let caps = captures.as_ref().ok_or_else(|| {
+                                        HipError::new(0, "dense TP capture missing")
+                                    })?;
+                                    if let Some(slot) =
+                                        caps[rank].hidden.extract_slot(layer_idx)
+                                    {
+                                        gpus.devices[rank].bind_thread()?;
+                                        caps[rank].hidden.write_rows_to_staging(
+                                            &mut gpus.devices[rank],
+                                            slot,
+                                            &pbs_vec[rank].x_batch,
+                                            n,
+                                        )?;
+                                    }
+                                    Ok(())
+                                })();
+                                if let Err(e) = res {
+                                    process_res = Err(e);
+                                    break;
+                                }
+                            }
+                            if process_res.is_err() {
+                                break;
+                            }
                         }
                         delta_layer_idx += 1;
                     }
@@ -5132,7 +5298,7 @@ pub fn forward_prefill_dense_tp(
                                 false,
                                 layer,
                                 &configs[rank],
-                                &pbs_vec[rank],
+                                pbs_vec[rank],
                                 &scratches[rank],
                                 &mut kv_caches[rank],
                                 n,
@@ -5146,7 +5312,7 @@ pub fn forward_prefill_dense_tp(
                                 q8_flags[rank],
                                 kv_layer_idx,
                                 layer_idx,
-                                BatchEpilogue::Partial(&partials[rank]),
+                                BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
                             ) {
                                 process_res = Err(e);
@@ -5157,10 +5323,39 @@ pub fn forward_prefill_dense_tp(
                             break;
                         }
                         if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, &pbs_vec, &partials, n, dim)
+                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
+                        }
+                        // DFlash capture: post-second-reduction full residual.
+                        if captures.is_some() {
+                            for rank in 0..tp {
+                                let res = (|| -> HipResult<()> {
+                                    let caps = captures.as_ref().ok_or_else(|| {
+                                        HipError::new(0, "dense TP capture missing")
+                                    })?;
+                                    if let Some(slot) =
+                                        caps[rank].hidden.extract_slot(layer_idx)
+                                    {
+                                        gpus.devices[rank].bind_thread()?;
+                                        caps[rank].hidden.write_rows_to_staging(
+                                            &mut gpus.devices[rank],
+                                            slot,
+                                            &pbs_vec[rank].x_batch,
+                                            n,
+                                        )?;
+                                    }
+                                    Ok(())
+                                })();
+                                if let Err(e) = res {
+                                    process_res = Err(e);
+                                    break;
+                                }
+                            }
+                            if process_res.is_err() {
+                                break;
+                            }
                         }
                         for rank in 0..tp {
                             let LayerWeights::FullAttn(layer) = &weights[rank].layers[layer_idx]
@@ -5171,13 +5366,13 @@ pub fn forward_prefill_dense_tp(
                                 &mut gpus.devices[rank],
                                 layer,
                                 &configs[rank],
-                                &pbs_vec[rank],
+                                pbs_vec[rank],
                                 n,
                                 dim,
                                 configs[rank].hidden_dim,
                                 q8_flags[rank],
                                 q8_flags[rank],
-                                BatchEpilogue::Partial(&partials[rank]),
+                                BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
                             ) {
                                 process_res = Err(e);
@@ -5188,10 +5383,39 @@ pub fn forward_prefill_dense_tp(
                             break;
                         }
                         if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, &pbs_vec, &partials, n, dim)
+                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
+                        }
+                        // DFlash capture: post-second-reduction full residual.
+                        if captures.is_some() {
+                            for rank in 0..tp {
+                                let res = (|| -> HipResult<()> {
+                                    let caps = captures.as_ref().ok_or_else(|| {
+                                        HipError::new(0, "dense TP capture missing")
+                                    })?;
+                                    if let Some(slot) =
+                                        caps[rank].hidden.extract_slot(layer_idx)
+                                    {
+                                        gpus.devices[rank].bind_thread()?;
+                                        caps[rank].hidden.write_rows_to_staging(
+                                            &mut gpus.devices[rank],
+                                            slot,
+                                            &pbs_vec[rank].x_batch,
+                                            n,
+                                        )?;
+                                    }
+                                    Ok(())
+                                })();
+                                if let Err(e) = res {
+                                    process_res = Err(e);
+                                    break;
+                                }
+                            }
+                            if process_res.is_err() {
+                                break;
+                            }
                         }
                         kv_layer_idx += 1;
                     }
@@ -5200,37 +5424,149 @@ pub fn forward_prefill_dense_tp(
             if process_res.is_err() {
                 break;
             }
+            // Commit per-rank hidden staging to each rank's ring (outside any
+            // captured region, same ordering as the single-GPU verify path).
+            if let Some(caps) = captures.as_mut() {
+                for (rank, cap) in caps.iter_mut().enumerate() {
+                    let res = (|| -> HipResult<()> {
+                        gpus.devices[rank].bind_thread()?;
+                        cap.hidden
+                            .commit_staging_to_ring(&mut gpus.devices[rank], n)?;
+                        Ok(())
+                    })();
+                    if let Err(e) = res {
+                        process_res = Err(e);
+                        break;
+                    }
+                }
+            }
             offset += n;
         }
-        // Final logits only on rank 0, last token of overall prompt.
-        if process_res.is_ok() {
-            let last_row_offset = (last_chunk_n - 1) * dim;
-            let x_last = pbs_vec[0].x_batch.sub_offset(last_row_offset, dim);
-            let res = (|| -> HipResult<()> {
-                gpus.devices[0].bind_thread()?;
-                gpus.devices[0].rmsnorm_f32(
-                    &x_last,
-                    &weights[0].output_norm,
-                    &scratches[0].tmp,
-                    configs[0].norm_eps,
-                )?;
-                let ctx = DispatchCtx::new(&gpus.devices[0]);
-                let wr = weights[0].output.dispatch_ref();
-                execute_steps(
-                    &mut gpus.devices[0],
-                    &ctx,
-                    &[Step::Gemv {
-                        w: &wr,
-                        input: GemvInput::Raw(&scratches[0].tmp),
-                        out: &scratches[0].logits,
-                    }],
-                )
-                .map_err(|e| HipError::new(0, &e.to_string()))?;
-                Ok(())
-            })();
-            if let Err(e) = res {
-                process_res = Err(e);
+    Ok(last_chunk_n)
+}
+}
+
+/// Layer-granular batched dense-TP prefill. Chunks with the existing
+/// gfx1201 bounded prefill batch size, uses one `PrefillBatchScratch`
+/// per rank (no per-token allocation) and exactly two deterministic
+/// reductions per layer per chunk. Only rank 0 produces final logits.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_dense_tp(
+    gpus: &mut Gpus,
+    shard: &ShardConfig,
+    weights: &[Qwen35Weights],
+    configs: &[Qwen35Config],
+    tokens: &[u32],
+    start_pos: usize,
+    kv_caches: &mut [llama::KvCache],
+    dn_states: &mut [DeltaNetState],
+    scratches: &[Qwen35Scratch],
+) -> HipResult<()> {
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    let tp = shard.tp_size;
+    if !(2..=5).contains(&tp)
+        || weights.len() != tp
+        || configs.len() != tp
+        || kv_caches.len() != tp
+        || dn_states.len() != tp
+        || scratches.len() != tp
+        || gpus.devices.len() != tp
+    {
+        return Err(HipError::new(
+            0,
+            "dense TP requires 2..=5 devices and complete rank states",
+        ));
+    }
+    let dim = configs[0].dim;
+    // Size the scratch to the call, not to the arch ceiling: an 8-token verify
+    // would otherwise allocate and free a 512-row PBS per rank on every cycle.
+    let cap =
+        crate::qwen35::prefill::prefill_max_batch_tp(&gpus.devices[0], tp).min(tokens.len().max(1));
+    if cap == 0 {
+        return Err(HipError::new(0, "prefill_max_batch is zero"));
+    }
+    // ── Allocate per-rank PBS + N*dim partial (transactional, cap_gdn_tape=false) ──
+    let mut pbs_vec: Vec<PrefillBatchScratch> = Vec::with_capacity(tp);
+    let mut partials: Vec<GpuTensor> = Vec::with_capacity(tp);
+    for rank in 0..tp {
+        let pbs =
+            match PrefillBatchScratch::new_opt(&mut gpus.devices[rank], &configs[rank], cap, false)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    for (i, prev) in pbs_vec.drain(..).enumerate() {
+                        let _ = prev.free_gpu(&mut gpus.devices[i]);
+                    }
+                    for (i, prev) in partials.drain(..).enumerate() {
+                        let _ = gpus.devices[i].free_tensor(prev);
+                    }
+                    return Err(e);
+                }
+            };
+        pbs_vec.push(pbs);
+        let partial = match gpus.devices[rank].alloc_tensor(&[cap * dim], DType::F32) {
+            Ok(t) => t,
+            Err(e) => {
+                for (i, prev) in pbs_vec.drain(..).enumerate() {
+                    let _ = prev.free_gpu(&mut gpus.devices[i]);
+                }
+                for (i, prev) in partials.drain(..).enumerate() {
+                    let _ = gpus.devices[i].free_tensor(prev);
+                }
+                return Err(e);
             }
+        };
+        partials.push(partial);
+    }
+    // ── Shared chunked layer loop (no capture) ──
+    let pbs_refs: Vec<&PrefillBatchScratch> = pbs_vec.iter().collect();
+    let partial_refs: Vec<&GpuTensor> = partials.iter().collect();
+    let last_chunk_n = match forward_prefill_dense_tp_batched(
+        gpus, shard, weights, configs, tokens, start_pos, kv_caches, dn_states, scratches, &pbs_refs,
+        &partial_refs, None,
+    ) {
+        Ok(n) => n,
+        Err(e) => {
+            for (rank, pbs) in pbs_vec.into_iter().enumerate() {
+                let _ = pbs.free_gpu(&mut gpus.devices[rank]);
+            }
+            for (rank, partial) in partials.into_iter().enumerate() {
+                let _ = gpus.devices[rank].free_tensor(partial);
+            }
+            return Err(e);
+        }
+    };
+    // ── Final logits only on rank 0, last token of overall prompt ──
+    let mut process_res: HipResult<()> = Ok(());
+    {
+        let last_row_offset = (last_chunk_n - 1) * dim;
+        let x_last = pbs_vec[0].x_batch.sub_offset(last_row_offset, dim);
+        let res = (|| -> HipResult<()> {
+            gpus.devices[0].bind_thread()?;
+            gpus.devices[0].rmsnorm_f32(
+                &x_last,
+                &weights[0].output_norm,
+                &scratches[0].tmp,
+                configs[0].norm_eps,
+            )?;
+            let ctx = DispatchCtx::new(&gpus.devices[0]);
+            let wr = weights[0].output.dispatch_ref();
+            execute_steps(
+                &mut gpus.devices[0],
+                &ctx,
+                &[Step::Gemv {
+                    w: &wr,
+                    input: GemvInput::Raw(&scratches[0].tmp),
+                    out: &scratches[0].logits,
+                }],
+            )
+            .map_err(|e| HipError::new(0, &e.to_string()))?;
+            Ok(())
+        })();
+        if let Err(e) = res {
+            process_res = Err(e);
         }
     }
     // ── Transactional free on success and every error path ──

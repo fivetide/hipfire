@@ -388,6 +388,9 @@ struct RunArgs {
     #[arg(long, value_parser = ["contiguous", "vmm"])]
     /// One-shot KV storage backend override for this model load.
     kv_backend: Option<String>,
+    /// Tensor/expert-parallel degree for this model load (same admission as `serve --tp` / `bench --tp`).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
+    tp: Option<u64>,
     /// Select one speculative mechanism: off, auto, ngram, dflash, mtp, or dspark.
     #[arg(long = "spec", alias = "speculation")]
     speculation: Option<String>,
@@ -485,6 +488,9 @@ pub(crate) struct BenchArgs {
     model: String,
     #[arg(long, default_value_t = 5)]
     runs: usize,
+    /// Tensor/expert-parallel degree for the benchmark daemon (same admission as `serve --tp`).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
+    tp: Option<u64>,
     #[arg(short = 'j', long)]
     json: bool,
     /// Compare the five RDNA2 kernel variants in isolated daemon processes.
@@ -2197,6 +2203,11 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         .speculation
         .clone()
         .unwrap_or(config_string(&resolved, "speculation.mode")?);
+    // Tensor-parallel load: forward `tp` like `bench --tp` / `serve --tp` so the
+    // daemon takes the EP/dense-TP route instead of the single-GPU one.
+    if let Some(tp) = args.tp.filter(|&tp| tp > 1) {
+        params["tp"] = serde_json::json!(tp);
+    }
     apply_speculation_selector(&mut params, &selector)?;
     // Final effective selector wins: re-project inherited draft only when DFlash
     // remains enabled (config-off + `run --spec dflash` must still carry draft).
@@ -2558,6 +2569,7 @@ pub(crate) fn run_should_force_local(args: &RunArgs) -> bool {
         || args.image.is_some()
         || args.kv_mode.is_some()
         || args.kv_backend.is_some()
+        || args.tp.is_some_and(|tp| tp > 1)
         || args.head.is_some()
         || args.speculation.is_some()
         || args.model_draft.is_some()
@@ -4817,6 +4829,9 @@ fn open_bench_engine(
             params["continuous_batch_size"] = serde_json::json!(n);
         }
     }
+    if let Some(tp) = args.tp.filter(|&tp| tp > 1) {
+        params["tp"] = serde_json::json!(tp);
+    }
     let loaded = engine.load(&path, params)?;
     let post_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
     Ok((engine, loaded, pre_diag, post_diag))
@@ -5070,6 +5085,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
         let bench = BenchArgs {
             model: model.to_owned(),
             runs: 1,
+            tp: None,
             json: false,
             exp: false,
             matrix: false,
@@ -10965,6 +10981,7 @@ mod tests {
         BenchArgs {
             model: "qwen:test".to_owned(),
             runs: 1,
+            tp: None,
             json: true,
             exp: false,
             matrix: false,
@@ -11734,6 +11751,7 @@ mod tests {
             kv_mode: None,
             head: Some("q4k".into()),
             kv_backend: None,
+            tp: None,
             speculation: None,
             model_draft: None,
             vision: None,

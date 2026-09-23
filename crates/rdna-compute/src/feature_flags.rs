@@ -35,6 +35,15 @@ pub struct FeatureFlags {
     /// the accepted DeepSeek4 MQ2R route default while retaining portable
     /// behavior for other models and architectures.
     pub gfx1151_e8_buffer: Option<bool>,
+    /// gfx11 MMQ per-128 (X128) activation path (`HIPFIRE_GFX11_MMQ_X128`).
+    /// Default on gfx1100/gfx1151 (WT2 KLD +0.000186 <= +0.0005 gate passed);
+    /// `=0` restores the per-32 MMQ route. Other arches stay per-32.
+    pub gfx11_mmq_x128: Option<bool>,
+    /// gfx11 iu4-direct MMQ prefill (W4A4, `HIPFIRE_GFX11_MQ4V2_IU4`,
+    /// `kernel.gfx11_mq4v2_iu4`). Opt-in on gfx1100/gfx1151 only (default
+    /// off everywhere); unset/`=0` keeps the incumbent Q8_1 MMQ route.
+    /// Expected quality cost ~+0.014 WT2 KLD for the MQ4-XT speed rung.
+    pub gfx11_mmq_iu4: Option<bool>,
 
     // ── Quant / format toggles ────────────────────────────────────
     pub hfq3_dp4a: Option<bool>,
@@ -197,6 +206,29 @@ pub struct FeatureFlags {
     /// exact-gfx1100-only. Capture/replay keep the historical base. Set
     /// `HIPFIRE_GATEUP_LDSSTAGE=0` to restore the historical base symbol/block32.
     pub gate_up_ldsstage: bool,
+    /// `HIPFIRE_GFX12_MQ4V2_FP8_GATEUP=0` opts out of the gfx1201 FP8-WMMA MQ4v2
+    /// gate_up prefill candidate (N=384, eager HIP only). Default ON on exact
+    /// gfx1201; `=1` forces it on other arches (launchers stay gfx1201-only).
+    pub gfx12_mq4v2_fp8_gateup: bool,
+    /// FP8-WMMA MQ4v2 residual (down/out-proj) prefill candidate. Default ON on
+    /// exact gfx1201; `=0` opts out.
+    pub gfx12_mq4v2_fp8_resid: bool,
+    /// FP8-WMMA MQ4v2 4-way QKVZA prefill candidate. Default ON on exact
+    /// gfx1201; `=0` opts out.
+    pub gfx12_mq4v2_fp8_qkvza: bool,
+    /// FP8-WMMA MQ4v2 3-way QKV (full-attention) prefill candidate. Default ON
+    /// on exact gfx1201; `=0` opts out.
+    pub gfx12_mq4v2_fp8_qkv: bool,
+    /// `HIPFIRE_GFX12_FA2_PREFILL=0` opts out of the gfx1201 GQA-fused FA2
+    /// prefill attention candidate (Qwen NH24/NKV4/HD256, eager HIP only).
+    /// Default ON on exact gfx1201; `=1` forces it on other arches
+    /// (launchers stay gfx1201-only).
+    pub gfx12_fa2_prefill: bool,
+    /// `HIPFIRE_GFX11_FA2_PREFILL=0` opts out of the gfx11 GQA-fused FA2
+    /// prefill attention candidate (Qwen NH24/NKV4/HD256, eager HIP only).
+    /// Default ON on gfx1100/gfx1151; `=1` forces it on other arches
+    /// (launchers stay on the gfx11 allowlist).
+    pub gfx11_fa2_prefill: bool,
     pub gemm_dump: bool,
     pub deterministic: bool,
     pub mw16: bool,
@@ -429,6 +461,8 @@ impl FeatureFlags {
             gemv_dp4a_default_on: is_gfx906,
             gemv_dp4a: parse_bool("HIPFIRE_GEMV_DP4A"),
             gfx1151_e8_buffer: parse_bool("HIPFIRE_GFX1151_E8_BUFFER"),
+            gfx11_mmq_x128: parse_bool("HIPFIRE_GFX11_MMQ_X128"),
+            gfx11_mmq_iu4: parse_bool("HIPFIRE_GFX11_MQ4V2_IU4"),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -548,6 +582,18 @@ impl FeatureFlags {
             residual_ksplit_off: value("HIPFIRE_RESIDUAL_KSPLIT_OFF").ok().as_deref() == Some("1"),
             residual_ldsstage: parse_bool("HIPFIRE_RESIDUAL_LDSSTAGE").unwrap_or(arch == "gfx1100"),
             gate_up_ldsstage: parse_bool("HIPFIRE_GATEUP_LDSSTAGE").unwrap_or(arch == "gfx1100"),
+            gfx12_mq4v2_fp8_gateup: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_GATEUP")
+                .unwrap_or(arch == "gfx1201"),
+            gfx12_mq4v2_fp8_resid: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_RESID")
+                .unwrap_or(arch == "gfx1201"),
+            gfx12_mq4v2_fp8_qkvza: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_QKVZA")
+                .unwrap_or(arch == "gfx1201"),
+            gfx12_mq4v2_fp8_qkv: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_QKV")
+                .unwrap_or(arch == "gfx1201"),
+            gfx12_fa2_prefill: parse_bool("HIPFIRE_GFX12_FA2_PREFILL")
+                .unwrap_or(arch == "gfx1201"),
+            gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
+                .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
             deterministic: value("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
             mw16: value("HIPFIRE_MW16").map_or(false, |v| v == "1"),
@@ -675,6 +721,20 @@ impl FeatureFlags {
             .unwrap_or(self.gfx942_lds_gemv_default_on)
     }
 
+    /// Resolved gfx11 MMQ X128 route: env override, else default on
+    /// gfx1100/gfx1151, per-32 elsewhere.
+    pub fn gfx11_mmq_x128_enabled(&self) -> bool {
+        self.gfx11_mmq_x128
+            .unwrap_or(matches!(self.arch.as_str(), "gfx1100" | "gfx1151"))
+    }
+
+    /// Resolved gfx11 iu4-direct MMQ route: explicit opt-in only, and only
+    /// on gfx1100/gfx1151. Unset/`=0`/other arches keep the incumbent.
+    pub fn gfx11_mmq_iu4_enabled(&self) -> bool {
+        self.gfx11_mmq_iu4.unwrap_or(false)
+            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+    }
+
     pub fn hfq3_mmq_layer_gate_pass(&self) -> bool {
         let lo = self.hfq3_mmq_layer_min;
         let hi = self.hfq3_mmq_layer_max;
@@ -734,6 +794,8 @@ impl FeatureFlags {
             gemv_dp4a_default_on: is_gfx906,
             gemv_dp4a: None,
             gfx1151_e8_buffer: None,
+            gfx11_mmq_x128: None,
+            gfx11_mmq_iu4: None,
             gemv_prefetch: None,
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: None,
@@ -810,6 +872,12 @@ impl FeatureFlags {
             residual_ksplit_off: false,
             residual_ldsstage: false,
             gate_up_ldsstage: false,
+            gfx12_mq4v2_fp8_gateup: false,
+            gfx12_mq4v2_fp8_resid: false,
+            gfx12_mq4v2_fp8_qkvza: false,
+            gfx12_mq4v2_fp8_qkv: false,
+            gfx12_fa2_prefill: false,
+            gfx11_fa2_prefill: false,
             gemm_dump: false,
             deterministic: false,
             mw16: false,
@@ -874,6 +942,132 @@ mod tests {
     fn fuse_qkv_bias_defaults_on_in_test_ctor() {
         let f = FeatureFlags::for_test("gfx1151");
         assert!(f.fuse_qkv_bias);
+    }
+
+    #[test]
+    fn gfx12_mq4v2_fp8_defaults_on_gfx1201_with_opt_out() {
+        // Default process policy: all four FP8 prefill flags admit on exact
+        // gfx1201 (chunk-512 path); explicit `=0` restores the F16 route.
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let gfx1201 = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(gfx1201.gfx12_mq4v2_fp8_gateup);
+        assert!(gfx1201.gfx12_mq4v2_fp8_resid);
+        assert!(gfx1201.gfx12_mq4v2_fp8_qkvza);
+        assert!(gfx1201.gfx12_mq4v2_fp8_qkv);
+
+        let mut layer = ConfigLayer::default();
+        for key in [
+            "kernel.gfx12_mq4v2_fp8_gateup",
+            "kernel.gfx12_mq4v2_fp8_resid",
+            "kernel.gfx12_mq4v2_fp8_qkvza",
+            "kernel.gfx12_mq4v2_fp8_qkv",
+        ] {
+            layer.set_cli(key, "false").unwrap();
+        }
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let opted_out = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(!opted_out.gfx12_mq4v2_fp8_gateup);
+        assert!(!opted_out.gfx12_mq4v2_fp8_resid);
+        assert!(!opted_out.gfx12_mq4v2_fp8_qkvza);
+        assert!(!opted_out.gfx12_mq4v2_fp8_qkv);
+
+        // The unit-test constructor stays fully off (deterministic baseline).
+        let test_flags = FeatureFlags::for_test("gfx1201");
+        assert!(!test_flags.gfx12_mq4v2_fp8_gateup);
+        assert!(!test_flags.gfx12_mq4v2_fp8_resid);
+        assert!(!test_flags.gfx12_mq4v2_fp8_qkvza);
+        assert!(!test_flags.gfx12_mq4v2_fp8_qkv);
+    }
+
+    #[test]
+    fn fa2_prefill_defaults_on_certified_arches_with_opt_out() {
+        // Default process policy: gfx12 FA2 admits on exact gfx1201, gfx11
+        // FA2 on gfx1100/gfx1151; explicit `=0` restores the incumbent.
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let gfx1201 = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(gfx1201.gfx12_fa2_prefill);
+        assert!(!gfx1201.gfx11_fa2_prefill);
+        for arch in ["gfx1100", "gfx1151"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gfx12_fa2_prefill, "arch={arch}");
+            assert!(flags.gfx11_fa2_prefill, "arch={arch}");
+        }
+        for arch in ["gfx1101", "gfx1102", "gfx1150", "gfx1200", "gfx942"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gfx12_fa2_prefill, "arch={arch}");
+            assert!(!flags.gfx11_fa2_prefill, "arch={arch}");
+        }
+
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.gfx12_fa2_prefill", "false").unwrap();
+        layer.set_cli("kernel.gfx11_fa2_prefill", "false").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let opted_out_12 = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(!opted_out_12.gfx12_fa2_prefill);
+        let opted_out_11 = FeatureFlags::from_process_config("gfx1100", &process);
+        assert!(!opted_out_11.gfx11_fa2_prefill);
+
+        // The unit-test constructor stays fully off (deterministic baseline).
+        for arch in ["gfx1201", "gfx1100", "gfx1151"] {
+            let test_flags = FeatureFlags::for_test(arch);
+            assert!(!test_flags.gfx12_fa2_prefill, "arch={arch}");
+            assert!(!test_flags.gfx11_fa2_prefill, "arch={arch}");
+        }
+    }
+
+    #[test]
+    fn gfx11_mmq_iu4_opt_in_on_gfx11_only() {
+        // Default process policy: the iu4-direct MMQ prefill route stays off
+        // everywhere until `kernel.gfx11_mq4v2_iu4=true` (or
+        // `HIPFIRE_GFX11_MQ4V2_IU4=1`); the opt-in admits only exact
+        // gfx1100/gfx1151.
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx942"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gfx11_mmq_iu4_enabled(), "arch={arch}");
+        }
+
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.gfx11_mq4v2_iu4", "true").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        for arch in ["gfx1100", "gfx1151"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(flags.gfx11_mmq_iu4_enabled(), "arch={arch}");
+        }
+        for arch in ["gfx1101", "gfx1150", "gfx1201", "gfx942"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gfx11_mmq_iu4_enabled(), "arch={arch}");
+        }
+
+        // The unit-test constructor stays off (deterministic baseline).
+        for arch in ["gfx1100", "gfx1151"] {
+            let test_flags = FeatureFlags::for_test(arch);
+            assert!(!test_flags.gfx11_mmq_iu4_enabled(), "arch={arch}");
+        }
     }
 
     #[test]

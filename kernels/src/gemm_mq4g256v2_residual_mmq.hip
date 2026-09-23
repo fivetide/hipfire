@@ -38,6 +38,10 @@
 #define MMQ_TILE_X_K 76
 
 struct block_q8_1_mmq {
+    // ds4 layout: per-32-lane (d, sum) in the default (per-32) path. The
+    // V2 (per-128, x128) path replicates ONE half-wide (d_half, s_half) to
+    // ALL FOUR slots, so any legacy y_dm slot read stays valid while the
+    // x128 consumer reads slot 0 only.
     half2 ds4[4];
     int8_t qs[4 * QK8_1];
 };
@@ -91,6 +95,59 @@ extern "C" __global__ void quantize_q8_1_mmq_ds4(
 
     if ((iqs & 31) == 0) {
         out->ds4[iqs / 32] = make_half2((_Float16)d, (_Float16)sum);
+    }
+}
+
+// Q8_1 activation quantize at per-128 granularity for the V2 (X128)
+// MMQ path: same (X, Y, K, N) signature and block_q8_1_mmq layout as
+// quantize_q8_1_mmq_ds4, but amax+sum span the full 128-element K block
+// (all 32 lanes of the wave segment, offsets 16..1) instead of one
+// 32-element sub-block per 8 lanes (offsets 4..1). qs bytes use the
+// half-wide id_half; ALL FOUR ds4 slots replicate (d_half, s_half).
+// Coarser X quant than the default path by construction: expect relL2
+// ~1e-2 vs the per-32 path, <=1e-5 vs a per-128 CPU oracle on the same X.
+extern "C" __global__ void quantize_q8_1_mmq_ds4_x128(
+    const float* __restrict__ X,
+    block_q8_1_mmq* __restrict__ Y,
+    int K,
+    int N
+) {
+    const int token = blockIdx.y;
+    const int i0 = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (token >= N || i0 >= K) return;
+
+    const float4 xi = (i0 + 3 < K)
+        ? *(const float4*)(X + (long long)token * K + i0)
+        : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    float amax = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w)));
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, offset, WARP_SIZE));
+    }
+
+    float sum = xi.x + xi.y + xi.z + xi.w;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_xor(sum, offset, WARP_SIZE);
+    }
+
+    const float d = amax > 1.0e-20f ? amax / 127.0f : 0.0f;
+    const float id = d > 0.0f ? 1.0f / d : 0.0f;
+    char4 q;
+    q.x = (char)lrintf(fmaxf(-127.0f, fminf(127.0f, xi.x * id)));
+    q.y = (char)lrintf(fmaxf(-127.0f, fminf(127.0f, xi.y * id)));
+    q.z = (char)lrintf(fmaxf(-127.0f, fminf(127.0f, xi.z * id)));
+    q.w = (char)lrintf(fmaxf(-127.0f, fminf(127.0f, xi.w * id)));
+
+    const int kblock = i0 / 128;
+    const int iqs = i0 & 127;
+    block_q8_1_mmq* out = Y + (long long)kblock * N + token;
+    ((char4*)out->qs)[iqs / 4] = q;
+
+    if ((iqs & 127) == 0) {
+        const half2 ds = make_half2((_Float16)d, (_Float16)sum);
+        #pragma unroll
+        for (int l = 0; l < 4; ++l)
+            out->ds4[l] = ds;
     }
 }
 
@@ -346,8 +403,67 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
     }
 }
 
-extern "C" __global__ __launch_bounds__(MMQ_NWARPS * WARP_SIZE, 2)
-void gemm_mq4g256v2_residual_mmq(
+// V2 (X128) dot: the x128 prelude stores ONE (d, s) per 128-K half
+// (replicated to all ds4 slots), so the 8 i8-WMMA dots of the half
+// accumulate in ONE i32 C_frag and the float correction applies once:
+//
+//   C_l   = sum_{b<4} dot_b(l)            (i32 over the 128-K half)
+//   sum_l += dmA.x * d * C_l + dmA.y * s  (one correction per half)
+//
+// Numerics differ from the default per-32 path by construction (coarser X
+// quant); the oracle is per-128 quantization (expect <=1e-5 vs that
+// oracle, ~1e-2 vs the per-32 path). Opt-in via HIPFIRE_GFX11_MMQ_X128;
+// promotion to default only if WT2 KLD <= current+0.0005.
+static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma_x128(
+    const int* __restrict__ x,
+    const int* __restrict__ y,
+    float* __restrict__ sum,
+    int k00
+) {
+    using tile_A = tile<16, 8, int, DATA_LAYOUT_I_MAJOR_MIRRORED>;
+    using tile_B = tile<16, 8, int, DATA_LAYOUT_I_MAJOR_MIRRORED>;
+    using tile_C = tile<16, 16, int, DATA_LAYOUT_J_MAJOR>;
+
+    constexpr int rows_per_warp = 32;
+    constexpr int ntx = rows_per_warp / tile_C::I;
+
+    y += (threadIdx.y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
+
+    const int* x_qs = x;
+    const half2* x_dm = (const half2*)(x_qs + 2 * MMQ_TILE_NE_K);
+    const int* y_qs = y + 4;
+    const half2* y_dm = (const half2*)y;
+
+    const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+    const int j_lane = tile_C::get_j(0);
+
+    for (int j0 = 0; j0 < MMQ_X; j0 += ntx * tile_C::J) {
+        #pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            tile_C C_frag;
+            #pragma nounroll
+            for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
+                const int k0 = k00 + k01;
+                tile_A A_frag;
+                load_ldmatrix_16x8(A_frag, x_qs + (i0 + n * tile_A::I) * MMQ_TILE_X_K + k0, MMQ_TILE_X_K);
+                tile_B B_frag;
+                load_ldmatrix_16x8(B_frag, y_qs + j0 * MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+                mma_i8(C_frag, A_frag, B_frag);
+            }
+            const float2 ds = __half22float2(y_dm[(j0 + j_lane) * MMQ_TILE_Y_K + 0]);
+            #pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int i = i0 + n * tile_A::I + tile_C::get_i(l);
+                const float2 dmA = __half22float2(x_dm[i * MMQ_TILE_X_K + k00 / QI8_1]);
+                sum[(j0 / tile_C::J + n) * tile_C::ne + l] +=
+                    dmA.x * ds.x * (float)C_frag.x[l] + dmA.y * ds.y;
+            }
+        }
+    }
+}
+
+template <bool X128>
+static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_base_body(
     const char* __restrict__ A,
     const block_q8_1_mmq* __restrict__ Xq,
     float* __restrict__ Y,
@@ -379,7 +495,8 @@ void gemm_mq4g256v2_residual_mmq(
             tile_y[l] = (col0 + j < N) ? by0[l] : 0;
         }
         __syncthreads();
-        vec_dot_q8_1_q8_1_mma(tile_x, tile_y, sum, 0);
+        if constexpr (X128) vec_dot_q8_1_q8_1_mma_x128(tile_x, tile_y, sum, 0);
+        else vec_dot_q8_1_q8_1_mma(tile_x, tile_y, sum, 0);
         __syncthreads();
 
         if (2 * kb + 1 < blocks128) {
@@ -390,7 +507,8 @@ void gemm_mq4g256v2_residual_mmq(
                 tile_y[l] = (col0 + j < N) ? by1[l] : 0;
             }
             __syncthreads();
-            vec_dot_q8_1_q8_1_mma(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+            if constexpr (X128) vec_dot_q8_1_q8_1_mma_x128(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+            else vec_dot_q8_1_q8_1_mma(tile_x, tile_y, sum, MMQ_TILE_NE_K);
             __syncthreads();
         }
     }
@@ -422,7 +540,33 @@ void gemm_mq4g256v2_residual_mmq(
     }
 }
 
-template <bool ADD>
+extern "C" __global__ __launch_bounds__(MMQ_NWARPS * WARP_SIZE, 2)
+void gemm_mq4g256v2_residual_mmq(
+    const char* __restrict__ A,
+    const block_q8_1_mmq* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int add
+) {
+    gemm_mq4g256v2_residual_mmq_base_body<false>(A, Xq, Y, M, K, N, add);
+}
+
+extern "C" __global__ __launch_bounds__(MMQ_NWARPS * WARP_SIZE, 2)
+void gemm_mq4g256v2_residual_mmq_x128(
+    const char* __restrict__ A,
+    const block_q8_1_mmq* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int add
+) {
+    gemm_mq4g256v2_residual_mmq_base_body<true>(A, Xq, Y, M, K, N, add);
+}
+
+template <bool ADD, bool X128>
 static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_full_body(
     const char* __restrict__ A,
     const block_q8_1_mmq* __restrict__ Xq,
@@ -452,7 +596,8 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_full_body(
             tile_y[l] = by0[l];
         }
         __syncthreads();
-        vec_dot_q8_1_q8_1_mma(tile_x, tile_y, sum, 0);
+        if constexpr (X128) vec_dot_q8_1_q8_1_mma_x128(tile_x, tile_y, sum, 0);
+        else vec_dot_q8_1_q8_1_mma(tile_x, tile_y, sum, 0);
         __syncthreads();
 
         if (2 * kb + 1 < blocks128) {
@@ -462,7 +607,8 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_full_body(
                 tile_y[l] = by1[l];
             }
             __syncthreads();
-            vec_dot_q8_1_q8_1_mma(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+            if constexpr (X128) vec_dot_q8_1_q8_1_mma_x128(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+            else vec_dot_q8_1_q8_1_mma(tile_x, tile_y, sum, MMQ_TILE_NE_K);
             __syncthreads();
         }
     }
@@ -502,7 +648,7 @@ void gemm_mq4g256v2_residual_mmq_full_add(
     int N,
     int
 ) {
-    gemm_mq4g256v2_residual_mmq_full_body<true>(A, Xq, Y, M, K, N);
+    gemm_mq4g256v2_residual_mmq_full_body<true, false>(A, Xq, Y, M, K, N);
 }
 
 extern "C" __global__ __launch_bounds__(MMQ_NWARPS * WARP_SIZE, 2)
@@ -515,7 +661,33 @@ void gemm_mq4g256v2_residual_mmq_full_set(
     int N,
     int
 ) {
-    gemm_mq4g256v2_residual_mmq_full_body<false>(A, Xq, Y, M, K, N);
+    gemm_mq4g256v2_residual_mmq_full_body<false, false>(A, Xq, Y, M, K, N);
+}
+
+extern "C" __global__ __launch_bounds__(MMQ_NWARPS * WARP_SIZE, 2)
+void gemm_mq4g256v2_residual_mmq_full_add_x128(
+    const char* __restrict__ A,
+    const block_q8_1_mmq* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int
+) {
+    gemm_mq4g256v2_residual_mmq_full_body<true, true>(A, Xq, Y, M, K, N);
+}
+
+extern "C" __global__ __launch_bounds__(MMQ_NWARPS * WARP_SIZE, 2)
+void gemm_mq4g256v2_residual_mmq_full_set_x128(
+    const char* __restrict__ A,
+    const block_q8_1_mmq* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int
+) {
+    gemm_mq4g256v2_residual_mmq_full_body<false, true>(A, Xq, Y, M, K, N);
 }
 
 #endif

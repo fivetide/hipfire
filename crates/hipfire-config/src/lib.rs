@@ -2085,6 +2085,69 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the experimental FP8 WMMA route."
     ),
     process_bool_field!(
+        "kernel.gfx12_mq4v2_fp8_gateup",
+        "gfx12_mq4v2_fp8_gateup",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_MQ4V2_FP8_GATEUP",
+        "Enable the gfx1201 MQ4v2 FP8 WMMA gate/up prefill route (default on exact gfx1201; set to false or HIPFIRE_GFX12_MQ4V2_FP8_GATEUP=0 to opt out)."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_mq4v2_fp8_resid",
+        "gfx12_mq4v2_fp8_resid",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_MQ4V2_FP8_RESID",
+        "Enable the gfx1201 MQ4v2 FP8 WMMA residual prefill route (default on exact gfx1201; set to false or HIPFIRE_GFX12_MQ4V2_FP8_RESID=0 to opt out)."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_mq4v2_fp8_qkvza",
+        "gfx12_mq4v2_fp8_qkvza",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_MQ4V2_FP8_QKVZA",
+        "Enable the gfx1201 MQ4v2 FP8 WMMA 4-way QKVZA prefill route (default on exact gfx1201; set to false or HIPFIRE_GFX12_MQ4V2_FP8_QKVZA=0 to opt out)."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_mq4v2_fp8_qkv",
+        "gfx12_mq4v2_fp8_qkv",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_MQ4V2_FP8_QKV",
+        "Enable the gfx1201 MQ4v2 FP8 WMMA 3-way QKV prefill route (default on exact gfx1201; set to false or HIPFIRE_GFX12_MQ4V2_FP8_QKV=0 to opt out)."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_fa2_prefill",
+        "gfx12_fa2_prefill",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_FA2_PREFILL",
+        "Enable the gfx1201 GQA-fused FA2 prefill attention route (default on exact gfx1201; set to false or HIPFIRE_GFX12_FA2_PREFILL=0 to opt out)."
+    ),
+    process_bool_field!(
+        "kernel.gfx11_fa2_prefill",
+        "gfx11_fa2_prefill",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX11_FA2_PREFILL",
+        "Enable the gfx11 GQA-fused FA2 prefill attention route (default on gfx1100/gfx1151; set to false or HIPFIRE_GFX11_FA2_PREFILL=0 to opt out)."
+    ),
+    process_bool_field!(
+        "kernel.gfx11_mq4v2_iu4",
+        "gfx11_mq4v2_iu4",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_GFX11_MQ4V2_IU4",
+        "Enable the gfx11 iu4-direct MMQ prefill route (opt-in on gfx1100/gfx1151; set to true or HIPFIRE_GFX11_MQ4V2_IU4=1 to opt in)."
+    ),
+    process_bool_field!(
         "kernel.dot2_gemv",
         "dot2_gemv",
         Kernel,
