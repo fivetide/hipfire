@@ -1180,7 +1180,7 @@ fn forward_step_after_x(
         execute_steps(
             gpu,
             &ctx,
-            &mut [
+            &[
                 Step::RmsnormAutomatic {
                     x: &state.x,
                     norm_weight: &layer.attn_norm,
@@ -1316,7 +1316,7 @@ fn forward_step_after_x(
         execute_steps(
             gpu,
             &ctx,
-            &mut [Step::GemvResidual {
+            &[Step::GemvResidual {
                 w: &wro,
                 input: GemvInput::Raw(&state.attn_out),
                 residual: &state.x,
@@ -1333,7 +1333,7 @@ fn forward_step_after_x(
         execute_steps(
             gpu,
             &ctx,
-            &mut [
+            &[
                 Step::RmsnormAutomatic {
                     x: &state.x,
                     norm_weight: &layer.ffn_norm,
@@ -1364,7 +1364,7 @@ fn forward_step_after_x(
         execute_steps(
             gpu,
             &ctx,
-            &mut [Step::GemvResidual {
+            &[Step::GemvResidual {
                 w: &wrd,
                 input: GemvInput::Raw(&state.ffn_hidden),
                 residual: &state.x,
@@ -1380,7 +1380,7 @@ fn forward_step_after_x(
     execute_steps(
         gpu,
         &ctx,
-        &mut [Step::Gemv {
+        &[Step::Gemv {
             w: &wr_out,
             input: GemvInput::Raw(&state.tmp),
             out: &state.logits,
@@ -1962,7 +1962,7 @@ fn forward_step_after_x_lowered(
     execute_steps(
         gpu,
         &ctx,
-        &mut [Step::Gemv {
+        &[Step::Gemv {
             w: &wr_out,
             input: GemvInput::Raw(&state.tmp),
             out: &state.logits,

@@ -744,7 +744,7 @@ impl KernelKey {
             // generic family resolution remains an explicit refusal.
             (MQ4G128V2, _) => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
-                variant: "mq4g128v2_qwen4_typed_only",
+                variant: "mq4g128v2_specialized_route_only",
                 arch: "",
                 quant: "MQ4G128V2",
             }),
@@ -796,7 +796,7 @@ impl KernelKey {
             // plain path would re-rotate already-rotated input — so they stay an Err.
             MQ4G128V2 => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
-                variant: "mq4g128v2_qwen4_typed_only",
+                variant: "mq4g128v2_specialized_route_only",
                 arch: "",
                 quant: "MQ4G128V2",
             }),
@@ -835,7 +835,7 @@ impl KernelKey {
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydResidual),
             MQ4G128V2 => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
-                variant: "mq4g128v2_qwen4_typed_only",
+                variant: "mq4g128v2_specialized_route_only",
                 arch: "",
                 quant: "MQ4G128V2",
             }),
@@ -868,7 +868,7 @@ impl KernelKey {
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydSwiGLUResidual),
             MQ4G128V2 => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
-                variant: "mq4g128v2_qwen4_typed_only",
+                variant: "mq4g128v2_specialized_route_only",
                 arch: "",
                 quant: "MQ4G128V2",
             }),

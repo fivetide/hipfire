@@ -44,33 +44,57 @@ pub enum MoeRecipe {
     SigmoidRoutedNoShared,
 }
 
-/// Architecture-owned geometry and format contract for a specialized grouped
-/// route.  The shared executor only consumes this declaration; it never
-/// invents model-specific expert counts, top-k widths, or QT formats.
+/// Architecture declaration, checked against both live operands and the
+/// immutable specialized-kernel contract before any route is selected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MoeRoutePolicy {
-    /// Architecture-selected shared kernel capability. Geometry and formats
-    /// are immutable shared-kernel constraints, not caller-supplied authority.
     pub capability: MoeRouteCapability,
+    pub geometry: MoeRouteGeometry,
+    pub formats: MoeRouteFormats,
 }
 
-/// Concrete grouped kernel capability implemented by shared dispatch.
-///
-/// Architecture admission may select this capability only after validating a
-/// model's source layout; the shared executor still checks the full fixed
-/// geometry below and never treats caller-supplied dimensions as proof that a
-/// new kernel exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoeRouteGeometry {
+    pub experts: usize,
+    pub top_k: usize,
+    pub hidden: usize,
+    pub routed_intermediate: usize,
+    pub shared_intermediate: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoeRouteFormats {
+    pub router: DType,
+    pub shared_selector: DType,
+    pub shared_gate: DType,
+    pub shared_up: DType,
+    pub shared_down: DType,
+    pub routed_gate_up: DType,
+    pub routed_down: DType,
+}
+
+/// QT44 gate/up plus QT53 down, with exactly 512 experts, top-10,
+/// hidden=2560, routed/shared intermediate=640, and BF16 router/shared
+/// projections (shared down may also be QT53). Arbitrary QT44/QT53
+/// pairs are not admitted by this fixed-width router and combine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoeRouteCapability {
     Qt44Qt53Grouped,
 }
-pub(crate) fn grouped_route_kernel_capable(policy: &MoeRoutePolicy) -> bool {
-    matches!(policy.capability, MoeRouteCapability::Qt44Qt53Grouped)
+
+impl MoeRouteCapability {
+    /// The complete source-bound QT44/QT53 route is currently admitted only
+    /// on gfx1151; availability of an individual portable helper does not
+    /// certify the other projections or grouped path on another device.
+    pub(crate) fn admitted_on(self, arch: &rdna_compute::arch_caps::ArchCaps) -> bool {
+        match self {
+            Self::Qt44Qt53Grouped => arch.is_gfx1151() && cfg!(feature = "deltanet"),
+        }
+    }
 }
 
-/// Immutable geometry and wire-format contract for the implemented grouped
-/// QT44/QT53 kernels. Model dimensions are checked against this capability
-/// before any route producer, grouped launch, or combine can run.
+/// Exact geometry and wire-format contract of the available grouped kernels.
+/// This does not by itself admit a GPU; call `admitted_on` as well.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn grouped_route_geometry_supported(
     policy: &MoeRoutePolicy,
@@ -84,16 +108,28 @@ pub(crate) fn grouped_route_geometry_supported(
     gate_up: DType,
     down: DType,
 ) -> bool {
-    grouped_route_kernel_capable(policy)
-        && experts == 512
-        && top_k == 10
-        && hidden == 2560
-        && intermediate == 640
-        && gate_up_k == 2560
-        && down_m == 2560
-        && down_k == 640
-        && gate_up == DType::MQ4G256V2
-        && down == DType::MQ4G128V2
+    let geometry = policy.geometry;
+    let formats = policy.formats;
+    let fixed_geometry = MoeRouteGeometry {
+        experts: 512,
+        top_k: 10,
+        hidden: 2560,
+        routed_intermediate: 640,
+        shared_intermediate: 640,
+    };
+    matches!(policy.capability, MoeRouteCapability::Qt44Qt53Grouped)
+        && geometry == fixed_geometry
+        && experts == geometry.experts
+        && top_k == geometry.top_k
+        && hidden == geometry.hidden
+        && intermediate == geometry.routed_intermediate
+        && gate_up_k == geometry.hidden
+        && down_m == geometry.hidden
+        && down_k == geometry.routed_intermediate
+        && formats.routed_gate_up == DType::MQ4G256V2
+        && formats.routed_down == DType::MQ4G128V2
+        && gate_up == formats.routed_gate_up
+        && down == formats.routed_down
 }
 
 /// Source of the activation consumed by a MoE recipe.

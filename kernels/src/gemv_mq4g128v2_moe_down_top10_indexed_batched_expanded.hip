@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026
-// hipfire — Qwen4 MQ4G128V2 (qt=53) top-10 indexed down projection.
+// hipfire — QT53 top-10 indexed down projection with expanded output.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>

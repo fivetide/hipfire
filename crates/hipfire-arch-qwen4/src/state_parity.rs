@@ -1659,7 +1659,7 @@ fn run_profile_inner(
             .map_err(|error| format!("qwen4 profile pending hidden copy: {error}"))?;
         dirty_profile_mtp_moe_reuse(&mut gpu, &bundle)?;
         let mtp_token = bundle
-            .mtp_forward_token(&mut gpu, input_token, Some(&pending), mtp_position)
+            .mtp_forward_token(&mut gpu, input_token, Some(&pending), mtp_position, true)
             .map_err(|error| format!("qwen4 profile native MTP token: {error}"))?;
         let mtp_ns = profile_duration_ns(mtp_started);
         let mtp_hip = hip_counter_snapshot();
@@ -1937,7 +1937,8 @@ fn real_model_probe(
             return Err(format!("read native MTP position: {error}"));
         }
     };
-    if let Err(error) = bundle.mtp_forward_token_logits(gpu, probe_token, mtp_position, &mtp_buffer)
+    if let Err(error) =
+        bundle.mtp_forward_token_logits(gpu, probe_token, mtp_position, true, &mtp_buffer)
     {
         MtpDrafter::mtp_free(Box::new(drafter), gpu);
         let _ = gpu.free_tensor(mtp_buffer);

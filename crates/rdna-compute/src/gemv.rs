@@ -15806,6 +15806,82 @@ impl Gpu {
         }
         result
     }
+
+    /// Shared-weight F32 MQ6G256V2 for 2–4 pre-rotated activation rows.
+    /// `x` is contiguous [rows, k]; `y` is contiguous [rows, m].
+    /// Each warp owns one weight row and computes every activation row in
+    /// the scalar GEMV's four-accumulator and shuffle reduction order.
+    pub fn gemm_mq6g256v2_f32_rows(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        let name = match rows {
+            2 => "gemm_mq6g256v2_f32_rows_r2",
+            3 => "gemm_mq6g256v2_f32_rows_r3",
+            4 => "gemm_mq6g256v2_f32_rows_r4",
+            _ => return Err(hip_bridge::HipError::new(1, "MQ6 F32 rows must be 2..=4")),
+        };
+        if m == 0 || k == 0 || k % 256 != 0 || m > i32::MAX as usize || k > i32::MAX as usize {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "MQ6 F32 rows requires positive M and K, K divisible by 256, both within i32",
+            ));
+        }
+        if x.dtype != DType::F32 || y.dtype != DType::F32 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "MQ6 F32 rows requires F32 activations and output",
+            ));
+        }
+        let weight_bytes = m * (k / 256) * 200;
+        let x_bytes = rows * k * 4;
+        let y_bytes = rows * m * 4;
+        if a_raw.buf.size() < weight_bytes || x.buf.size() < x_bytes || y.buf.size() < y_bytes {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "MQ6 F32 rows tensor view too small",
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_mq6g256v2_f32_rows",
+            kernels::GEMM_MQ6G256V2_F32_ROWS_SRC,
+            name,
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: [*mut c_void; 5] = [
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let bytes = weight_bytes.saturating_add(x_bytes).saturating_add(y_bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", name, bytes);
+        let result =
+            self.launch_maybe_blob(name, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     pub fn gemv_mq6g256v2_multirow(
         &mut self,
         a_raw: &GpuTensor,

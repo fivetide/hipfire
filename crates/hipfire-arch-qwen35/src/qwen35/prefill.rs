@@ -2821,7 +2821,7 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
         )
         .map_err(|e| hip_bridge::HipError::new(0, &e))?;
 
-        execute_steps(gpu, ctx, &mut [Step::Moe(sealed)])
+        execute_steps(gpu, ctx, &[Step::Moe(sealed)])
             .map_err(|e| HipError::new(0, &e.to_string()))?;
 
         #[cfg(feature = "moe-oracle")]
@@ -5329,7 +5329,7 @@ fn batch_chunk_fa_attend(
         output_gate: None,
         output: &pbs.fa_attn_out_batch,
     };
-    execute_steps(gpu, ctx, &mut [Step::Attend { plan, io }])
+    execute_steps(gpu, ctx, &[Step::Attend { plan, io }])
         .map_err(|e| HipError::new(0, &e.to_string()))
 }
 
@@ -7090,7 +7090,7 @@ fn batch_chunk_final_logits(
                         input: GemvInput::Raw(&last_view),
                         out: &s.logits,
                     };
-                    execute_steps(gpu, &ctx, &mut [step])
+                    execute_steps(gpu, &ctx, &[step])
                         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
                 }
             }
@@ -7115,7 +7115,7 @@ fn batch_chunk_final_logits(
                     input: GemvInput::Raw(&s.tmp),
                     out: &s.logits,
                 };
-                execute_steps(gpu, &ctx, &mut [step])
+                execute_steps(gpu, &ctx, &[step])
                     .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
             }
         }
@@ -7778,7 +7778,7 @@ fn run_fa_layer_body(
         execute_steps(
             gpu,
             &ctx,
-            &mut [Step::GemvResidual {
+            &[Step::GemvResidual {
                 w: &wr,
                 input,
                 residual: &s.x,

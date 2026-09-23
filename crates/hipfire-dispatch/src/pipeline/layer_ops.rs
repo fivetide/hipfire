@@ -30,7 +30,7 @@ use rdna_compute::tensor_ops::{
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 #[inline]
-fn hip<T>(result: Result<T, hip_bridge::HipError>) -> Result<T, DispatchError> {
+pub(super) fn hip<T>(result: Result<T, hip_bridge::HipError>) -> Result<T, DispatchError> {
     result.map_err(|error| DispatchError::Hip(error.to_string()))
 }
 
@@ -156,6 +156,9 @@ pub fn project_weight(
         }
     };
     let x = rotated.as_ref().unwrap_or(input);
+    if weight.dtype == DType::MQ6G256V2 && (2..=4).contains(&rows) && gpu.arch_caps.is_gfx1151() {
+        return hip(gpu.gemm_mq6g256v2_f32_rows(weight.buf, x, output, weight.m, weight.k, rows));
+    }
     let result = match (weight.dtype, rows > 1) {
         (DType::BF16, false) => gpu.gemv_bf16_xf32(weight.buf, x, output, weight.m, weight.k),
         (DType::BF16, true) => {
@@ -1121,11 +1124,38 @@ impl IndexedAttentionOp<'_> {
         )?;
         Ok(())
     }
+
+    /// Host bookkeeping for a successful QSA step, shared by HIP and retained
+    /// replay. The architecture commits it only after the forward succeeds.
+    pub fn next_lengths(&self) -> Result<(usize, usize, usize, usize, usize), DispatchError> {
+        let final_position = self
+            .state
+            .position
+            .checked_add(self.rows)
+            .ok_or_else(|| DispatchError::Hip("indexed attention position overflows".into()))?;
+        if self.compress == 0 {
+            return Err(DispatchError::Hip(
+                "indexed attention compress is zero".into(),
+            ));
+        }
+        let complete = final_position / self.compress;
+        let budget_blocks = self.budget / self.compress;
+        let selected_len = (budget_blocks.min(complete) * self.compress + final_position
+            - complete * self.compress)
+            .min(self.state.selected_capacity);
+        Ok((
+            final_position,
+            final_position,
+            complete,
+            selected_len,
+            final_position,
+        ))
+    }
 }
 
 pub fn execute_indexed_attention(
     gpu: &mut Gpu,
-    op: &mut IndexedAttentionOp<'_>,
+    op: &IndexedAttentionOp<'_>,
 ) -> Result<(), DispatchError> {
     let index_width = (op.index_heads + op.index_kv_heads) * op.index_dim;
     let index_q_width = op.index_heads * op.index_dim;
@@ -1133,9 +1163,7 @@ pub fn execute_indexed_attention(
     let q_width = op.heads * op.head_dim;
     let kv_width = op.kv_heads * op.head_dim;
     let initial_position = op.state.position;
-    let final_position = initial_position
-        .checked_add(op.rows)
-        .ok_or_else(|| DispatchError::Hip("indexed attention position overflows".into()))?;
+    let (_, _, complete, _, _) = op.next_lengths()?;
     let index_batch = view(op.index_scratch, 0, op.rows * index_width);
     let qgate_batch = view(op.qgate_scratch, 0, op.rows * 2 * q_width);
     let k_batch = view(op.k_scratch, 0, op.rows * kv_width);
@@ -1246,7 +1274,6 @@ pub fn execute_indexed_attention(
         },
     ))?;
 
-    let complete = final_position / op.compress;
     // Every QSA launch declares a position-independent shape: the pool grid and
     // both dynamic-LDS reservations come from the declared capacities while the
     // active lengths stay scalars. Measured bit-identical to the position-derived
@@ -1316,9 +1343,6 @@ pub fn execute_indexed_attention(
         op.rows,
         Some(op.rotation),
     )?;
-    let selected_len = (budget_blocks.min(complete) * op.compress + final_position
-        - complete * op.compress)
-        .min(op.state.selected_capacity);
     let final_selected = view(
         &selected_batch,
         (op.rows - 1) * op.state.selected_capacity * std::mem::size_of::<i32>(),
@@ -1332,11 +1356,6 @@ pub fn execute_indexed_attention(
         &final_selected,
         op.state.selected_capacity,
     ))?;
-    op.state.full_len = final_position;
-    op.state.raw_len = final_position;
-    op.state.pooled_len = complete;
-    op.state.selected_len = selected_len;
-    op.state.position = final_position;
     Ok(())
 }
 

@@ -217,39 +217,22 @@ fn qwen4_use_range_payload(
     is_uma || residency.is_external()
 }
 
-pub struct Qwen4Carrier;
-impl Qwen4Carrier {
-    fn admit_request(
-        draft_path: Option<&str>,
-        gemma4_drafter_path: Option<&str>,
-        kv_adaptive_override: Option<&str>,
-        spec: SpecLoadCfg,
-        cask_active: bool,
-        state_quant_override: Option<&str>,
-        deepseek4_compute_placement: hipfire_config::Deepseek4ComputePlacement,
-    ) -> Result<(), String> {
-        if draft_path.is_some()
-            || gemma4_drafter_path.is_some()
-            || crate::admission::qwen4_kv_adaptive_requested(kv_adaptive_override)
-            || spec.dflash.is_some_and(|enabled| enabled)
-            || spec.dspark.is_some_and(|enabled| enabled)
-            || spec.ngram_draft.is_some_and(|enabled| enabled)
-            || crate::admission::qwen4_ddtree_requested(spec)
-            || cask_active
-            || state_quant_override.is_some()
-            || !matches!(
-                deepseek4_compute_placement,
-                hipfire_config::Deepseek4ComputePlacement::Single
-            )
-        {
-            return Err(
-                "qwen4: DFlash, DSpark, n-gram, DDTree, adaptive-KV, EAGLE, CASK, state-quant, and non-Single placement are unsupported"
-                    .into(),
-            );
-        }
-        Ok(())
+const QWEN4_DDTREE_DEFAULT_BUDGET: usize = 0;
+const QWEN4_DDTREE_DEFAULT_TOPK: usize = 4;
+
+/// Return whether a Qwen4 load carries an active or non-default DDTree
+/// request. The CLI resolves schema defaults before serializing load params,
+/// so an ordinary AR load arrives as `Some(0)`/`Some(4)` rather than `None`.
+/// A non-default top-K remains unsupported even when the budget is zero.
+const fn qwen4_ddtree_requested(spec: SpecLoadCfg) -> bool {
+    match (spec.ddtree_budget, spec.ddtree_topk) {
+        (Some(budget), _) if budget != QWEN4_DDTREE_DEFAULT_BUDGET => true,
+        (_, Some(topk)) if topk != QWEN4_DDTREE_DEFAULT_TOPK => true,
+        _ => false,
     }
 }
+
+pub struct Qwen4Carrier;
 
 impl Carrier for Qwen4Carrier {
     fn name(&self) -> &'static str {
@@ -297,6 +280,32 @@ impl Carrier for Qwen4Carrier {
         }
         Ok(())
     }
+    fn admit_options(
+        &self,
+        draft_path: Option<&str>,
+        options: crate::admission::SourceAdmissionOptions,
+    ) -> Result<(), String> {
+        let spec = options.spec;
+        if draft_path.is_some()
+            || options.gemma4_drafter
+            || options.kv_adaptive
+            || spec.dflash.is_some_and(|enabled| enabled)
+            || spec.dspark.is_some_and(|enabled| enabled)
+            || spec.ngram_draft.is_some_and(|enabled| enabled)
+            || qwen4_ddtree_requested(spec)
+            || options.cask
+            || options.state_quant
+            || options.non_single_compute
+            || options.deepseek4_experts
+            || options.pflash
+        {
+            return Err(
+                "qwen4: requested DFlash, DSpark, n-gram, DDTree, adaptive-KV, EAGLE, CASK, state-quant, PFlash, or DeepSeek4/non-Single option is unsupported"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
 
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
@@ -339,14 +348,23 @@ impl Carrier for Qwen4Carrier {
         // tensors for capability discovery, but only `Some(true)` may attach
         // the GPU head and publish a speculative drafter.
         let native_mtp = crate::admission::qwen4_native_mtp_requested(ctx.spec);
-        Self::admit_request(
+        self.admit_options(
             ctx.draft_path,
-            ctx.gemma4_drafter_path,
-            ctx.kv_adaptive_override,
-            ctx.spec,
-            ctx.cask.sidecar.is_some(),
-            ctx.state_quant_override,
-            ctx.deepseek4_compute_placement.clone(),
+            crate::admission::SourceAdmissionOptions {
+                spec: ctx.spec,
+                kv_adaptive: crate::admission::qwen4_kv_adaptive_requested(
+                    ctx.kv_adaptive_override,
+                ),
+                gemma4_drafter: ctx.gemma4_drafter_path.is_some(),
+                cask: ctx.cask.sidecar.is_some(),
+                state_quant: ctx.state_quant_override.is_some(),
+                non_single_compute: !matches!(
+                    &ctx.deepseek4_compute_placement,
+                    hipfire_config::Deepseek4ComputePlacement::Single
+                ),
+                deepseek4_experts: ctx.deepseek4_experts_per_token.is_some(),
+                pflash: false,
+            },
         )?;
         if native_mtp
             && hipfire_runtime::config::retained_redline_default(
@@ -3208,6 +3226,7 @@ mod qwen4_source_policy_tests {
 #[cfg(test)]
 mod qwen4_admission_tests {
     use super::Qwen4Carrier;
+    use crate::{admission::SourceAdmissionOptions, Carrier};
     use hipfire_runtime::loader_api::SpecLoadCfg;
 
     fn resolved_ar_spec() -> SpecLoadCfg {
@@ -3223,32 +3242,54 @@ mod qwen4_admission_tests {
     }
 
     #[test]
-    fn schema_defaults_pass_carrier_gate_but_active_adaptive_refuses() {
-        let defaults = resolved_ar_spec();
-        assert!(
-            Qwen4Carrier::admit_request(
-                None,
-                None,
-                Some("off"),
-                defaults,
-                false,
-                None,
-                hipfire_config::Deepseek4ComputePlacement::Single,
-            )
-            .is_ok(),
-            "CLI-resolved AR defaults must not trigger Qwen4 carrier refusal"
-        );
-
-        let err = Qwen4Carrier::admit_request(
-            None,
-            None,
-            Some("balanced"),
-            defaults,
-            false,
-            None,
-            hipfire_config::Deepseek4ComputePlacement::Single,
-        )
-        .expect_err("active adaptive KV must remain unsupported for Qwen4");
-        assert!(err.contains("adaptive-KV"), "refusal: {err}");
+    fn schema_defaults_pass_carrier_gate_but_unsupported_options_refuse() {
+        let defaults = SourceAdmissionOptions {
+            spec: resolved_ar_spec(),
+            ..Default::default()
+        };
+        assert!(Qwen4Carrier.admit_options(None, defaults).is_ok());
+        for (option, options) in [
+            (
+                "adaptive KV",
+                SourceAdmissionOptions {
+                    kv_adaptive: true,
+                    ..defaults
+                },
+            ),
+            (
+                "EAGLE",
+                SourceAdmissionOptions {
+                    gemma4_drafter: true,
+                    ..defaults
+                },
+            ),
+            (
+                "PFlash",
+                SourceAdmissionOptions {
+                    pflash: true,
+                    ..defaults
+                },
+            ),
+            (
+                "DeepSeek4 experts",
+                SourceAdmissionOptions {
+                    deepseek4_experts: true,
+                    ..defaults
+                },
+            ),
+            (
+                "DeepSeek4 placement",
+                SourceAdmissionOptions {
+                    non_single_compute: true,
+                    ..defaults
+                },
+            ),
+        ] {
+            let error = Qwen4Carrier.admit_options(None, options).expect_err(option);
+            assert!(error.contains("unsupported"), "{option}: {error}");
+        }
+        assert!(Qwen4Carrier
+            .admit_options(Some("draft.hfq"), defaults)
+            .is_err());
     }
 }

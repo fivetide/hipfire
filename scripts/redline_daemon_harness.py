@@ -383,6 +383,8 @@ def qwen4_recipe_failures(model):
     sensitive = []
     for name, quant_type, dims in entries:
         short = name.replace("model.language_model.", "")
+        if short.startswith("mtp."):
+            continue  # the drafter's Q8 projections are not trunk projections
         if any(
             marker in short
             for marker in ("embed_tokens.weight", "lm_head.weight", "hyper_connection")

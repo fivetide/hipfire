@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026
-// hipfire — Qwen4 fixed top-10 grouped-down combine.
+// hipfire — fixed top-10 BF16 grouped-down combine.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
 
 using __hip_bfloat16 = hip_bfloat16;
 
-static __device__ __forceinline__ __hip_bfloat16 qwen4_bf16_round(float value) {
+static __device__ __forceinline__ __hip_bfloat16 moe_top10_bf16_round(float value) {
     return static_cast<__hip_bfloat16>(value);
 }
 
-static __device__ __forceinline__ float qwen4_bf16_to_f32(__hip_bfloat16 value) {
+static __device__ __forceinline__ float moe_top10_bf16_to_f32(__hip_bfloat16 value) {
     return static_cast<float>(value);
 }
 
@@ -36,7 +36,7 @@ extern "C" __global__ void moe_down_combine_grouped_top10(
     if (token >= tokens || column >= hidden) return;
 
     const size_t route_base = (size_t)token * 10;
-    __hip_bfloat16 accumulated = qwen4_bf16_round(
+    __hip_bfloat16 accumulated = moe_top10_bf16_round(
         residual[(size_t)token * hidden + column]);
     int used_ranks = 0;
     for (int count = 0; count < 10; ++count) {
@@ -54,18 +54,18 @@ extern "C" __global__ void moe_down_combine_grouped_top10(
         used_ranks |= 1 << selected_rank;
 
         const __hip_bfloat16 weight =
-            qwen4_bf16_round(topk_weights[route_base + selected_rank]);
+            moe_top10_bf16_round(topk_weights[route_base + selected_rank]);
         const int grouped_row = inverse_perm[route_base + selected_rank];
         const float raw_output =
             (grouped_row >= 0 && grouped_row < grouped_rows)
                 ? grouped_down[(size_t)grouped_row * hidden + column]
                 : 0.0f;
-        const __hip_bfloat16 output = qwen4_bf16_round(raw_output);
-        const __hip_bfloat16 weighted = qwen4_bf16_round(
-            qwen4_bf16_to_f32(output) * qwen4_bf16_to_f32(weight));
-        accumulated = qwen4_bf16_round(
-            qwen4_bf16_to_f32(accumulated) + qwen4_bf16_to_f32(weighted));
+        const __hip_bfloat16 output = moe_top10_bf16_round(raw_output);
+        const __hip_bfloat16 weighted = moe_top10_bf16_round(
+            moe_top10_bf16_to_f32(output) * moe_top10_bf16_to_f32(weight));
+        accumulated = moe_top10_bf16_round(
+            moe_top10_bf16_to_f32(accumulated) + moe_top10_bf16_to_f32(weighted));
     }
     residual[(size_t)token * hidden + column] =
-        qwen4_bf16_to_f32(accumulated);
+        moe_top10_bf16_to_f32(accumulated);
 }

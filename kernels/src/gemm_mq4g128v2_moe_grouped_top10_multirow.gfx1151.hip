@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
-// hipfire — Qwen4 qt53 grouped down with same-expert slot weight reuse.
+// hipfire — gfx1151 QT53 grouped top-10 down with same-expert slot weight reuse.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>

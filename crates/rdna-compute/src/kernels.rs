@@ -1601,6 +1601,9 @@ pub const GEMV_MQ3G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq3
 pub const GEMV_MQ2G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq2g256v2.hip");
 /// MQ6G256V2: dual-scale 6-bit (qt=47).
 pub const GEMV_MQ6G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g256v2.hip");
+/// Shared-weight F32 MQ6G256V2 GEMV over 2–4 pre-rotated activation rows.
+pub const GEMM_MQ6G256V2_F32_ROWS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq6g256v2_f32_rows.hip");
 /// gfx1151 LM-head one-row candidate. Keep wave-uniform HFQ headers on scalar
 /// loads, lower lane-divergent packed weights to temporal VMEM, and specialize
 /// the hot 248320x2048 shape so the compiler removes dynamic tail control.

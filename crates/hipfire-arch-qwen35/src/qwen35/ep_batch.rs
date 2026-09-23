@@ -3265,7 +3265,7 @@ pub fn forward_ep(
             input: GemvInput::Raw(&s.tmp),
             out: &s.logits,
         };
-        execute_steps(gpu, &ctx, &mut [step]).map_err(|e| HipError::new(0, &e.to_string()))?;
+        execute_steps(gpu, &ctx, &[step]).map_err(|e| HipError::new(0, &e.to_string()))?;
     }
 
     // 4. Sync every rank — work ran on each device's active_stream, so a host
@@ -3667,7 +3667,7 @@ pub fn forward_prefill_batch_ep(
             input: GemvInput::Raw(&s.tmp),
             out: &s.logits,
         };
-        execute_steps(gpu, &ctx, &mut [step]).map_err(|e| HipError::new(0, &e.to_string()))?;
+        execute_steps(gpu, &ctx, &[step]).map_err(|e| HipError::new(0, &e.to_string()))?;
     }
 
     // Sync every rank — work ran on active_streams; the host logits read on rank
@@ -3940,7 +3940,7 @@ fn forward_scratch_layers_multi(
                         execute_steps(
                             gpu,
                             &ctx,
-                            &mut [Step::GemvResidual {
+                            &[Step::GemvResidual {
                                 w: &wr,
                                 input: GemvInput::Raw(&s.dn_normed),
                                 residual: &s.x,
@@ -4427,7 +4427,7 @@ fn forward_scratch_layers_multi(
                         execute_steps(
                             gpu,
                             &ctx,
-                            &mut [Step::GemvResidual {
+                            &[Step::GemvResidual {
                                 w: &wr,
                                 input: GemvInput::Raw(&s.fa_attn_out),
                                 residual: &s.x,
@@ -4715,7 +4715,7 @@ fn forward_scratch_layers_multi(
                         execute_steps(
                             gpu,
                             &ctx,
-                            &mut [Step::GemvResidual {
+                            &[Step::GemvResidual {
                                 w: &wr,
                                 input: GemvInput::Raw(&s.dn_normed),
                                 residual: &s.x,
@@ -5133,7 +5133,7 @@ fn forward_scratch_layers_multi(
                         execute_steps(
                             gpu,
                             &ctx,
-                            &mut [Step::GemvResidual {
+                            &[Step::GemvResidual {
                                 w: &wr,
                                 input: GemvInput::Raw(&s.fa_attn_out),
                                 residual: &s.x,
@@ -5184,7 +5184,7 @@ fn forward_scratch_layers_multi(
             input: GemvInput::Raw(&s_last.tmp),
             out: &s_last.logits,
         };
-        execute_steps(gpu_last, &ctx, &mut [step])
+        execute_steps(gpu_last, &ctx, &[step])
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     }
 

@@ -2313,7 +2313,7 @@ fn final_logits_per_slot(
                 input: GemvInput::Raw(&s.tmp),
                 out: &logits_view,
             };
-            execute_steps(gpu, &ctx, &mut [step]).map_err(|e| HipError::new(0, &e.to_string()))?;
+            execute_steps(gpu, &ctx, &[step]).map_err(|e| HipError::new(0, &e.to_string()))?;
         }
         row_off += m;
     }

@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Review follow-up: Qwen4's grouped QT44/QT53 route now carries an
+  architecture-declared geometry/format contract and remains limited to its
+  proven gfx1151 kernel shape. Shared tensor ops use portable HIP fallbacks
+  outside gfx1151; pipeline steps are immutable, with QSA bookkeeping owned by
+  the caller and granular MoE stages sharing one step variant. Qwen4 admission
+  is carrier-owned, its HIP source lives under `kernels/src/`, and reference
+  MTP/parity code requires the `reference-parity` feature outside tests.
+
+- Qwen4 Flash-Next MTP now preserves the trained head's final HC mixer and
+  QSA cadence, and keeps routed MoE output separate from shared-expert scratch.
+  On gfx1151 a shared-weight F32 MQ6 verifier matches scalar target rows
+  exactly; recent acceptance selects it for high-agreement windows.
+  Teacher-forced MTP steps omit unused logits, and target prefill computes only
+  its final logit row. The canonical greedy fixtures emit AR-identical tokens;
+  three fresh-process runs per mode reached decode parity on code and prose,
+  not the 80% speculative speedup seen elsewhere.
+
 - Qwen4 decode now runs on the retained PM4 route end to end on gfx1151. The
   specialized sealed-MoE route is admitted on evidence rather than argument: the
   capture census reconciles against an independent launch count (2845 recorded plus
@@ -11,8 +28,8 @@
   `copy_f32_buffer`). At launch the retained body also proves the expert pointer
   tables name the live expert tensors and that each table's pointer mapping is the
   one the tape latched. The eligible-forward boundary moved into the Qwen4 forward
-  so the tape covers only the body, and a replayed forward derives its per-layer QSA
-  bookkeeping with a cross-check against the HIP readback. Measured: a 116-token
+  so the tape covers only the body, and replay and HIP derive the same per-layer
+  QSA bookkeeping before executing it. Measured: a 116-token
   greedy prompt decoded through 115 retained PM4 replays produces the byte-identical
   stream. REDLINE §7 certification (shadow parity, route-proof ledger, serve,
   long-context, reset) is not claimed by this change; see
@@ -68,7 +85,7 @@
   binding instead of being discovered by recording differencing. No route is
   admitted, no PM4 preparation is claimed, and the sealed-MoE pointer-contract
   refusal for specialized routes still fails closed. See [the plan record](docs/design/qwen4-program-retained-pm4.md).
-- Rename Qwen4 CPU/reference modules to `reference_forward` and `reference_mtp`; production `gpu_forward`/`mtp_gpu` paths remain unchanged and the old public module paths are removed.
+- Rename Qwen4 CPU/reference modules to `reference_forward` and `reference_mtp`; production `gpu_forward`/`mtp_gpu` paths remain unchanged, the old public module paths are removed, and the reference modules are test/feature-gated.
 - Sealed MoE calls lower to granular computation programs; Qwen root-routed EP decode and batched prefill share a checked collective schedule. Compact EP gathers expert outputs in global top-k slot layout and runs the ordinary single-device slot-order combine once on root before byte-broadcasting the finished partial, avoiding rank-grouped floating-point reassociation. Existing kernels, ownership, other-family reduction order, and diagnostic policies are retained. This does not admit new parallel axes or product replay routes; see [the design and validation boundary](docs/design/sealed-granular-moe.md).
 - Add experimental `qwen3.8:flash-next` registry availability for the uploaded 178 GB HFQ artifact with a conservative 128 GB tested-hardware gate; the runtime minimum is unmeasured, and this does not change product or replay admission.
 - Qwen4's production layer path now binds architecture-owned typed

@@ -50,6 +50,7 @@ pub struct SourceAdmissionOptions {
     pub cask: bool,
     pub state_quant: bool,
     pub non_single_compute: bool,
+    pub deepseek4_experts: bool,
     pub pflash: bool,
 }
 
@@ -64,21 +65,6 @@ pub fn qwen4_kv_adaptive_requested(value: Option<&str>) -> bool {
 /// explicit disable both keep the carrier on its ordinary AR-only shape.
 pub(crate) const fn qwen4_native_mtp_requested(spec: SpecLoadCfg) -> bool {
     matches!(spec.mtp, Some(true))
-}
-
-const QWEN4_DDTREE_DEFAULT_BUDGET: usize = 0;
-const QWEN4_DDTREE_DEFAULT_TOPK: usize = 4;
-
-/// Return whether a Qwen4 load carries an active or non-default DDTree
-/// request. The CLI resolves schema defaults before serializing load params,
-/// so an ordinary AR load arrives as `Some(0)`/`Some(4)` rather than `None`.
-/// A non-default top-K remains unsupported even when the budget is zero.
-pub(crate) const fn qwen4_ddtree_requested(spec: SpecLoadCfg) -> bool {
-    match (spec.ddtree_budget, spec.ddtree_topk) {
-        (Some(budget), _) if budget != QWEN4_DDTREE_DEFAULT_BUDGET => true,
-        (_, Some(topk)) if topk != QWEN4_DDTREE_DEFAULT_TOPK => true,
-        _ => false,
-    }
 }
 
 /// The source-only portion of Qwen4 admission. The validated config and
@@ -663,23 +649,9 @@ pub fn admit_source_with_options(
         // MTP head. Native execution is opt-in: only `Some(true)` expresses
         // the request to attach it; `None` and `Some(false)` remain AR-only.
         let native_mtp = qwen4_native_mtp_requested(options.spec);
-        if draft_path.is_some()
-            || options.kv_adaptive
-            || options.gemma4_drafter
-            || options.cask
-            || options.state_quant
-            || options.non_single_compute
-            || options.pflash
-            || options.spec.dflash.is_some_and(|enabled| enabled)
-            || options.spec.dspark.is_some_and(|enabled| enabled)
-            || options.spec.ngram_draft.is_some_and(|enabled| enabled)
-            || qwen4_ddtree_requested(options.spec)
-        {
-            return Err(
-                "qwen4: requested DFlash, DSpark, n-gram, DDTree, adaptive-KV, EAGLE, CASK, state-quant, PFlash, or non-Single option is unsupported"
-                    .into(),
-            );
-        }
+        crate::carrier_for(arch_id)
+            .ok_or_else(|| "no carrier for qwen4".to_string())?
+            .admit_options(draft_path, options)?;
         if native_mtp
             && hipfire_runtime::config::retained_redline_default(
                 gpu_arch, "qwen4", path, pp, tp, true,
@@ -987,6 +959,51 @@ mod tests {
                 err.contains("requested DFlash, DSpark, n-gram, DDTree, adaptive-KV"),
                 "active adaptive KV must be refused at source admission: {err}"
             );
+            for (option, options) in [
+                (
+                    "PFlash",
+                    SourceAdmissionOptions {
+                        spec: defaults,
+                        pflash: true,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "EAGLE",
+                    SourceAdmissionOptions {
+                        spec: defaults,
+                        gemma4_drafter: true,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "DeepSeek4 experts",
+                    SourceAdmissionOptions {
+                        spec: defaults,
+                        deepseek4_experts: true,
+                        ..Default::default()
+                    },
+                ),
+            ] {
+                let err = admit_source_with_options(
+                    path.to_str().unwrap(),
+                    1,
+                    1,
+                    None,
+                    None,
+                    "gfx1151",
+                    None,
+                    None,
+                    2048,
+                    options,
+                )
+                .map(|_| ())
+                .expect_err(option);
+                assert!(
+                    err.contains("unsupported"),
+                    "{option} must refuse before config: {err}"
+                );
+            }
             cleanup(&path);
         }
     }

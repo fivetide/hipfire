@@ -675,7 +675,7 @@ fn moe_ffn_decode_impl<'a>(
     hipfire_dispatch::pipeline::execute_steps(
         gpu,
         &ctx,
-        &mut [hipfire_dispatch::pipeline::Step::Moe(sealed)],
+        &[hipfire_dispatch::pipeline::Step::Moe(sealed)],
     )
     .map_err(HipError::from)?;
     #[cfg(feature = "moe-oracle")]
@@ -2069,7 +2069,7 @@ fn forward_scratch_layers(
                     execute_steps(
                         gpu,
                         &ctx,
-                        &mut [Step::GemvResidual {
+                        &[Step::GemvResidual {
                             w: &wr,
                             input: GemvInput::Raw(&s.dn_normed),
                             residual: &s.x,
@@ -2226,7 +2226,7 @@ fn forward_scratch_layers(
                     execute_steps(
                         gpu,
                         &ctx,
-                        &mut [Step::GemvResidual {
+                        &[Step::GemvResidual {
                             w: &wr,
                             input,
                             residual: &s.x,
@@ -2414,7 +2414,7 @@ fn forward_scratch_layers(
                     execute_steps(
                         gpu,
                         &ctx,
-                        &mut [Step::GemvResidual {
+                        &[Step::GemvResidual {
                             w: &wr,
                             input: GemvInput::Raw(&s.dn_normed),
                             residual: &s.x,
@@ -2551,7 +2551,7 @@ fn forward_scratch_layers(
                     execute_steps(
                         gpu,
                         &ctx,
-                        &mut [Step::GemvResidual {
+                        &[Step::GemvResidual {
                             w: &wr,
                             input,
                             residual: &s.x,
@@ -2590,7 +2590,7 @@ fn forward_scratch_layers(
             input: GemvInput::Raw(&s.tmp),
             out: &s.logits,
         };
-        execute_steps(gpu, &ctx, &mut [step])
+        execute_steps(gpu, &ctx, &[step])
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     }
 
@@ -2671,7 +2671,7 @@ fn qkvza_via_execute_steps(
             rotation: w_alpha.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
         };
-        let mut steps = [
+        let steps = [
             Step::RmsnormAutomatic {
                 x,
                 norm_weight: attn_norm,
@@ -2703,7 +2703,7 @@ fn qkvza_via_execute_steps(
                 out: dn_alpha,
             },
         ];
-        execute_steps(gpu, ctx, &mut steps).map_err(|e| HipError::new(0, &e.to_string()))
+        execute_steps(gpu, ctx, &steps).map_err(|e| HipError::new(0, &e.to_string()))
     } else {
         // FWHT-rotated (MQ family) or non-rotated (HFQ, Q8, etc.) dtypes.
         // RmsnormAutomatic handles FWHT when rotation != None;
@@ -2744,7 +2744,7 @@ fn qkvza_via_execute_steps(
             rotation: None,
             awq_scale: None,
         };
-        let mut steps = [
+        let steps = [
             Step::RmsnormAutomatic {
                 x,
                 norm_weight: attn_norm,
@@ -2776,7 +2776,7 @@ fn qkvza_via_execute_steps(
                 out: dn_alpha,
             },
         ];
-        execute_steps(gpu, ctx, &mut steps).map_err(|e| HipError::new(0, &e.to_string()))
+        execute_steps(gpu, ctx, &steps).map_err(|e| HipError::new(0, &e.to_string()))
     }
 }
 
@@ -2829,7 +2829,7 @@ fn qkv_via_execute_steps(
             rotation: wv.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
         };
-        let mut steps = [
+        let steps = [
             Step::RmsnormAutomatic {
                 x,
                 norm_weight: attn_norm,
@@ -2856,7 +2856,7 @@ fn qkv_via_execute_steps(
                 out: fa_v,
             },
         ];
-        execute_steps(gpu, ctx, &mut steps).map_err(|e| HipError::new(0, &e.to_string()))
+        execute_steps(gpu, ctx, &steps).map_err(|e| HipError::new(0, &e.to_string()))
     } else {
         let wrq = WeightRef {
             buf: &wq.buf,
@@ -2885,7 +2885,7 @@ fn qkv_via_execute_steps(
             rotation: None,
             awq_scale: None,
         };
-        let mut steps = [
+        let steps = [
             Step::RmsnormAutomatic {
                 x,
                 norm_weight: attn_norm,
@@ -2912,7 +2912,7 @@ fn qkv_via_execute_steps(
                 out: fa_v,
             },
         ];
-        execute_steps(gpu, ctx, &mut steps).map_err(|e| HipError::new(0, &e.to_string()))
+        execute_steps(gpu, ctx, &steps).map_err(|e| HipError::new(0, &e.to_string()))
     }
 }
 
@@ -2952,7 +2952,7 @@ fn gate_up_via_execute_steps(
             rotation: w_up.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
         };
-        let mut steps = [
+        let steps = [
             Step::RmsnormAutomatic {
                 x,
                 norm_weight: ffn_norm,
@@ -2974,7 +2974,7 @@ fn gate_up_via_execute_steps(
                 out: up_out,
             },
         ];
-        execute_steps(gpu, ctx, &mut steps).map_err(|e| HipError::new(0, &e.to_string()))
+        execute_steps(gpu, ctx, &steps).map_err(|e| HipError::new(0, &e.to_string()))
     } else {
         let wrg = WeightRef {
             buf: &w_gate.buf,
@@ -2994,7 +2994,7 @@ fn gate_up_via_execute_steps(
             rotation: None,
             awq_scale: None,
         };
-        let mut steps = [
+        let steps = [
             Step::RmsnormAutomatic {
                 x,
                 norm_weight: ffn_norm,
@@ -3016,7 +3016,7 @@ fn gate_up_via_execute_steps(
                 out: up_out,
             },
         ];
-        execute_steps(gpu, ctx, &mut steps).map_err(|e| HipError::new(0, &e.to_string()))
+        execute_steps(gpu, ctx, &steps).map_err(|e| HipError::new(0, &e.to_string()))
     }
 }
 
@@ -3236,7 +3236,7 @@ fn moe_ffn_dispatch_root_ep(
     hipfire_dispatch::pipeline::execute_steps(
         gpu,
         ctx,
-        &mut [hipfire_dispatch::pipeline::Step::Moe(sealed)],
+        &[hipfire_dispatch::pipeline::Step::Moe(sealed)],
     )
     .map_err(HipError::from)?;
     let refs = MoeScratchRef::from_scratch(s);
@@ -3294,7 +3294,7 @@ fn moe_ffn_dispatch_contrib_ep(
     hipfire_dispatch::pipeline::execute_steps(
         gpu,
         ctx,
-        &mut [hipfire_dispatch::pipeline::Step::Moe(sealed)],
+        &[hipfire_dispatch::pipeline::Step::Moe(sealed)],
     )
     .map_err(HipError::from)?;
     trace_finite_if_enabled(gpu, "moe_ffn", x)?;
@@ -3989,7 +3989,7 @@ pub(crate) fn kv_cache_attention_dispatch(
         output_gate: fused_epilogue.then_some(&s.fa_gate),
         output: &s.fa_attn_out,
     };
-    execute_steps(gpu, ctx, &mut [Step::Attend { plan, io }])
+    execute_steps(gpu, ctx, &[Step::Attend { plan, io }])
         .map_err(|e| HipError::new(0, &e.to_string()))?;
     Ok(fused_epilogue)
 }
@@ -4022,7 +4022,7 @@ fn dense_tp_ffn_partial(
     execute_steps(
         gpu,
         ctx,
-        &mut [Step::Gemv {
+        &[Step::Gemv {
             w: &wr,
             input: GemvInput::Raw(&s.ffn_hidden),
             out: &s.o,
@@ -4185,7 +4185,7 @@ fn dense_tp_deltanet_partial(
     execute_steps(
         gpu,
         &ctx,
-        &mut [Step::Gemv {
+        &[Step::Gemv {
             w: &wr,
             input: GemvInput::Raw(&s.dn_normed),
             out: &s.o,
@@ -4263,7 +4263,7 @@ fn dense_tp_attention_partial(
     execute_steps(
         gpu,
         &ctx,
-        &mut [Step::Gemv {
+        &[Step::Gemv {
             w: &wr,
             input: if fused_epilogue {
                 GemvInput::Prerotated(&s.fa_attn_out)
@@ -4433,7 +4433,7 @@ fn dense_tp_output(
     execute_steps(
         &mut gpus.devices[0],
         &ctx,
-        &mut [Step::Gemv {
+        &[Step::Gemv {
             w: &output,
             input: GemvInput::Raw(&scratches[0].tmp),
             out: &scratches[0].logits,
@@ -5216,7 +5216,7 @@ pub fn forward_prefill_dense_tp(
                 execute_steps(
                     &mut gpus.devices[0],
                     &ctx,
-                    &mut [Step::Gemv {
+                    &[Step::Gemv {
                         w: &wr,
                         input: GemvInput::Raw(&scratches[0].tmp),
                         out: &scratches[0].logits,
@@ -5691,7 +5691,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                 execute_steps(
                     gpu,
                     ctx,
-                    &mut [Step::GemvResidual {
+                    &[Step::GemvResidual {
                         w: &wr,
                         input,
                         residual: &s.x,
@@ -6755,7 +6755,7 @@ fn forward_scratch_layers_lowered(
             input: GemvInput::Raw(&s.tmp),
             out: &s.logits,
         };
-        execute_steps(gpu, &ctx, &mut [step]).map_err(|e| HipError::new(0, &e.to_string()))?;
+        execute_steps(gpu, &ctx, &[step]).map_err(|e| HipError::new(0, &e.to_string()))?;
     }
     Ok(())
 }

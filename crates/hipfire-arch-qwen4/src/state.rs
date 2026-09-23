@@ -2,12 +2,10 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! GPU-owned Qwen4 request state and a small CPU reference state for contracts.
+//! Qwen4 GPU request state and CPU parity state.
 //!
-//! `Qwen4State` is the production owner: every recurrent, convolution, QSA,
-//! full-KV, PLE-convolution, and HC-feedback buffer is a `GpuTensor` and is
-//! released through `free_gpu`.  The reference structs are explicitly named
-//! `Reference*` and are only used by CPU equation tests/parity probes.
+//! `Qwen4State` owns the GPU buffers and releases them through `free_gpu`.
+//! `Reference*` structs are used only by CPU equation tests and parity probes.
 
 use crate::config::{LayerType, Qwen4Config};
 use crate::ple::{PleHashMetadata, PleHistory, PLE_HEAD_COUNT};

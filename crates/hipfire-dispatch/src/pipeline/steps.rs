@@ -95,25 +95,13 @@ pub enum Step<'a> {
     GroupedDepthwise(crate::pipeline::layer_ops::GroupedDepthwiseOp<'a>),
     /// Launch-free clear of a preallocated scratch prefix.
     Clear(crate::pipeline::layer_ops::ClearOp<'a>),
-    /// Complete validated MoE program. The sealed call remains the public
-    /// authority; granular operands are only produced by its shared lowerer.
+    /// Complete validated MoE program; granular operands come from its shared lowerer.
     Moe(sealed_moe::SealedMoeCall<'a>),
-    MoeNormalize(crate::pipeline::moe_program::SealedMoeOp<'a>),
-    MoeInputBasis(crate::pipeline::moe_program::SealedMoeOp<'a>),
-    MoeGateSide(crate::pipeline::moe_program::SealedMoeOp<'a>),
-    MoeRouterProjection(crate::pipeline::moe_program::SealedMoeOp<'a>),
-    MoeRoute(crate::pipeline::moe_program::SealedMoeOp<'a>),
-    MoeSharedGateUp(crate::pipeline::moe_program::SealedMoeOp<'a>),
-    MoeSharedActivation(crate::pipeline::moe_program::SealedMoeOp<'a>),
-    MoeSharedDown(crate::pipeline::moe_program::SealedMoeOp<'a>),
-    MoeScatter(crate::pipeline::moe_program::SealedMoeOp<'a>),
-    MoeGateUp(crate::pipeline::moe_program::SealedMoeOp<'a>),
-    MoeUnscatter(crate::pipeline::moe_program::SealedMoeOp<'a>),
-    MoeActivation(crate::pipeline::moe_program::SealedMoeOp<'a>),
-    MoeDown(crate::pipeline::moe_program::SealedMoeOp<'a>),
-    MoeCombine(crate::pipeline::moe_program::SealedMoeOp<'a>),
-    MoeHostExperts(crate::pipeline::moe_program::SealedMoeOp<'a>),
-    MoeMutationFence(crate::pipeline::moe_program::SealedMoeOp<'a>),
+    /// Validated granular MoE stage; the sealed call is still the public authority.
+    MoeStage(
+        crate::pipeline::moe_program::SealedMoeOp<'a>,
+        crate::pipeline::moe_program::MoeStage,
+    ),
 }
 
 /// Op-kind for fusion matching. Composite and opaque MoE operations are
@@ -125,31 +113,16 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         Step::RmsnormAutomatic { .. } => Some(PipelineOp::RmsnormAutomatic),
         Step::Attend { .. } => Some(PipelineOp::Attend),
         Step::Rope { .. } => Some(PipelineOp::Rope),
+        Step::QkNorm { .. } => Some(PipelineOp::QkNorm),
+        Step::BiasAdd { .. } => Some(PipelineOp::BiasAdd),
         Step::HyperRead(_)
         | Step::GatedDeltaNet(_)
         | Step::IndexedAttention(_)
         | Step::HyperWrite(_)
         | Step::GroupedDepthwise(_)
         | Step::Clear(_)
-        | Step::QkNorm { .. } => Some(PipelineOp::QkNorm),
-        Step::BiasAdd { .. } => Some(PipelineOp::BiasAdd),
-        Step::Moe(_)
-        | Step::MoeNormalize(_)
-        | Step::MoeInputBasis(_)
-        | Step::MoeGateSide(_)
-        | Step::MoeRouterProjection(_)
-        | Step::MoeRoute(_)
-        | Step::MoeSharedGateUp(_)
-        | Step::MoeSharedActivation(_)
-        | Step::MoeSharedDown(_)
-        | Step::MoeScatter(_)
-        | Step::MoeGateUp(_)
-        | Step::MoeUnscatter(_)
-        | Step::MoeActivation(_)
-        | Step::MoeDown(_)
-        | Step::MoeCombine(_)
-        | Step::MoeHostExperts(_)
-        | Step::MoeMutationFence(_) => None,
+        | Step::Moe(_)
+        | Step::MoeStage(..) => None,
     }
 }
 
@@ -728,7 +701,7 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
 pub fn execute_steps<'a>(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
-    steps: &mut [Step<'a>],
+    steps: &[Step<'a>],
 ) -> Result<(), DispatchError> {
     validate_steps(gpu, steps)?;
     execute_validated_steps(gpu, ctx, steps)
@@ -740,7 +713,7 @@ pub fn execute_steps<'a>(
 pub fn execute_validated_steps<'a>(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
-    steps: &mut [Step<'a>],
+    steps: &[Step<'a>],
 ) -> Result<(), DispatchError> {
     let mut i = 0;
     while i < steps.len() {
@@ -761,7 +734,7 @@ pub fn execute_validated_steps<'a>(
             launch_fused(gpu, ctx, key, &steps[i..i + len])?;
             i += len;
         } else {
-            launch_op_mut(gpu, ctx, &mut steps[i])?;
+            launch_op(gpu, ctx, &steps[i])?;
             i += 1;
         }
     }
@@ -870,26 +843,6 @@ fn launch_fused_qkv_with_bias<'a>(
             bias,
         },
     )
-}
-
-fn launch_op_mut(
-    gpu: &mut Gpu,
-    ctx: &DispatchCtx,
-    step: &mut Step<'_>,
-) -> Result<(), DispatchError> {
-    match step {
-        Step::HyperRead(op) => crate::pipeline::layer_ops::execute_hyper_read(gpu, op),
-        Step::GatedDeltaNet(op) => crate::pipeline::layer_ops::execute_gated_delta_net(gpu, op),
-        Step::IndexedAttention(op) => {
-            crate::pipeline::layer_ops::execute_indexed_attention(gpu, op)
-        }
-        Step::HyperWrite(op) => crate::pipeline::layer_ops::execute_hyper_write(gpu, op),
-        Step::GroupedDepthwise(op) => {
-            crate::pipeline::layer_ops::execute_grouped_depthwise(gpu, op)
-        }
-        Step::Clear(op) => crate::pipeline::layer_ops::execute_clear(gpu, op),
-        _ => launch_op(gpu, ctx, step),
-    }
 }
 
 /// Per-op fallback. FULL enum match (no catch-all) so the compiler forces every
@@ -1114,34 +1067,18 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         Step::BiasAdd { x, bias, dim } => gpu
             .bias_add_f32(x, bias, 1, *dim)
             .map_err(|e| DispatchError::Hip(e.to_string())),
-        Step::HyperRead(_)
-        | Step::GatedDeltaNet(_)
-        | Step::IndexedAttention(_)
-        | Step::HyperWrite(_)
-        | Step::GroupedDepthwise(_)
-        | Step::Clear(_) => Err(DispatchError::UnsupportedVariant {
-            family: "pipeline",
-            variant: "stateful-operation-requires-mutable-executor",
-            arch: "",
-            quant: "stateful",
-        }),
+        Step::HyperRead(op) => crate::pipeline::layer_ops::execute_hyper_read(gpu, op),
+        Step::GatedDeltaNet(op) => crate::pipeline::layer_ops::execute_gated_delta_net(gpu, op),
+        Step::IndexedAttention(op) => {
+            crate::pipeline::layer_ops::execute_indexed_attention(gpu, op)
+        }
+        Step::HyperWrite(op) => crate::pipeline::layer_ops::execute_hyper_write(gpu, op),
+        Step::GroupedDepthwise(op) => {
+            crate::pipeline::layer_ops::execute_grouped_depthwise(gpu, op)
+        }
+        Step::Clear(op) => crate::pipeline::layer_ops::execute_clear(gpu, op),
         Step::Moe(call) => sealed_moe::execute_sealed(gpu, call),
-        Step::MoeNormalize(op) => op.normalize(gpu),
-        Step::MoeInputBasis(op) => op.input_basis(gpu),
-        Step::MoeGateSide(op) => op.gate_side(gpu),
-        Step::MoeRouterProjection(op) => op.router_projection(gpu),
-        Step::MoeRoute(op) => op.route(gpu),
-        Step::MoeSharedGateUp(op) => op.shared_gate_up(gpu),
-        Step::MoeSharedActivation(op) => op.shared_activation(gpu),
-        Step::MoeSharedDown(op) => op.shared_down(gpu),
-        Step::MoeScatter(op) => op.scatter(gpu),
-        Step::MoeGateUp(op) => op.gate_up(gpu),
-        Step::MoeUnscatter(op) => op.unscatter(gpu),
-        Step::MoeActivation(op) => op.activation(gpu),
-        Step::MoeDown(op) => op.down(gpu),
-        Step::MoeCombine(op) => op.combine(gpu),
-        Step::MoeHostExperts(op) => op.host_experts(gpu),
-        Step::MoeMutationFence(op) => op.mutation_fence(gpu),
+        Step::MoeStage(op, stage) => op.execute_stage(gpu, *stage),
     }
 }
 fn rmsnorm_out<'a>(step: &Step<'a>) -> &'a rdna_compute::GpuTensor {

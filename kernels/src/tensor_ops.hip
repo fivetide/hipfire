@@ -205,13 +205,13 @@ extern "C" __global__ void gated_delta_step_shared_norm128_gfx1151(
     }
     output[value_head * 128 + value_index] = out;
 }
-// gfx1151-only persistent row-batched path for the exact 128x128 geometry.
+// Wave-size-independent persistent row-batched path for exact 128x128 geometry.
 // A block owns one value head and 256 threads.  tid%128 is the output channel
 // and tid/128 selects the half; each thread retains 64 state values in
 // registers.  Shared handoffs serialize the kd=0..127 kv and output chains:
 // half 1 continues half 0's accumulator rather than combining partial sums.
 __launch_bounds__(256)
-extern "C" __global__ void gated_delta_step_halves_state128_persistent256_gfx1151(
+extern "C" __global__ void gated_delta_step_halves_state128_persistent256_f32(
     const float* projection,
     const float* gate,
     const float* beta,
@@ -551,19 +551,6 @@ extern "C" __global__ void hyper_write_f32(
     output[row_offset + column] = bf16_to_f32(bf16_round(value));
 }
 
-extern "C" __global__ void hyper_final_f32(
-    const float* normalized,
-    float* output,
-    int branches,
-    int hidden) {
-    int column = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    if (column >= hidden) return;
-    float sum = 0.0f;
-    for (int branch = 0; branch < branches; ++branch) {
-        sum += normalized[branch * hidden + column];
-    }
-    output[column] = sum / (float)branches;
-}
 extern "C" __global__ void hyper_norm_f32(
     const float* input,
     const __hip_bfloat16* norm_weight,
@@ -632,7 +619,7 @@ extern "C" __global__ void gated_delta_conv_bf16_f32(
 }
 // K=4 ordered causal convolution. Each channel owns a local BF16 ring and
 // advances it through all rows, preserving the rowwise source boundaries.
-extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4_gfx1151(
+extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
     const float* input,
     const __hip_bfloat16* kernel,
     const float* history,
@@ -1014,9 +1001,8 @@ static __device__ __forceinline__ float indexed_attention_select_score_f32(
     return score;
 }
 
-// Serial fallback for non-gfx1151 callers or shapes whose score array would
-// exceed the device LDS limit. This is the previous one-thread implementation,
-// including stable ascending-block tie selection and the causal tail.
+// Serial fallback off gfx1151 or when the score array exceeds its LDS limit.
+// Keep stable ascending-block tie selection and the causal tail unchanged.
 // Batched selection keeps one independent workgroup per query row. The row's
 // visible prefix derives from position_start, so complete blocks that belong
 // only to later rows can never enter an earlier row's candidate set.
@@ -1271,9 +1257,8 @@ extern "C" __global__ void indexed_attention_reuse_selection(
 }
 
 
-// Serial fallback for non-gfx1151 callers or shapes whose score/token rows
-// exceed the device LDS limit. Keep this body identical to the original
-// per-channel implementation so oversized shapes retain the old contract.
+// Serial fallback off gfx1151 or when score/token rows exceed its LDS limit.
+// Keep the body identical to the original per-channel implementation.
 extern "C" __global__ void indexed_attention_attention_f32_batched_serial(
     const float* q_with_gate,
     const float* full_keys,

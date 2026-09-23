@@ -4254,7 +4254,7 @@ fn forward_scratch_layers_lowered(
     execute_steps(
         gpu,
         &ctx,
-        &mut [Step::Gemv {
+        &[Step::Gemv {
             w: &wr_out,
             input: GemvInput::Raw(&scratch.tmp),
             out: &scratch.logits,

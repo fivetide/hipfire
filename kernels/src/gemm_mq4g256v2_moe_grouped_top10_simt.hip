@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
-// hipfire — Qwen4 qt44 grouped top-10 gate/up with F32 scalar parity.
+// hipfire — QT44 grouped top-10 gate/up with F32 scalar parity.
 //
 // This is the parity path for gfx1151.  It keeps the indexed decode kernel's
 // F32 input, MQ4G256V2 dequantization, four-accumulator lane traversal, and

@@ -9,16 +9,12 @@
 //! Generic MoE prefill continues to own the k=8 path; no QT53 format is
 //! admitted by this module through a representative-dtype fallback.
 
+use super::layer_ops::hip;
 use crate::families::gemv::WeightRef;
 use crate::families::moe::MoePrefillParams;
 use crate::types::DispatchError;
 use rdna_compute::tensor_ops::{bf16_scaled_add_batched, Bf16ScaledAddBatched};
 use rdna_compute::{DType, Gpu, GpuTensor};
-
-#[inline]
-fn hip<T>(result: Result<T, hip_bridge::HipError>) -> Result<T, DispatchError> {
-    result.map_err(|error| DispatchError::Hip(error.to_string()))
-}
 
 #[inline]
 fn f32_view(source: &GpuTensor, offset: usize, len: usize) -> GpuTensor {

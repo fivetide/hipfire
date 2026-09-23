@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026
-// hipfire — Qwen4's fixed 512-way top-10 router.
+// hipfire — fixed E512/top-10 softmax router.
 
 #include <hip/hip_runtime.h>
 #include <math.h>
@@ -41,9 +41,9 @@ extern "C" __global__ void moe_router_softmax_top10_f32(
     const int wave = thread >> 5;
     const int token = blockIdx.x;
 
-    // The typed Qwen4 route seals this exact geometry.  Keep the guard uniform
+    // The sealed E512/top-10 route checks this geometry before launch. Keep the guard uniform
     // across the workgroup so no lane can return across the block barrier.
-    if (n_exp != 512 || top_k <= 0 || top_k > 10) return;
+    if (n_exp != 512 || top_k != 10) return;
 
     const size_t token_base = (size_t)token * 512;
     float first_value = logits[token_base + thread];

@@ -2,17 +2,12 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! CPU/reference Qwen4 / Qwen3.8-Flash-Next MTP state and equations.
+//! CPU/reference Qwen4 / Qwen3.8-Flash-Next MTP equations and fixtures.
 //!
-//! This module contains the CPU/reference MTP state and equation-level
-//! implementation.  Production MTP execution lives in [`crate::mtp_gpu`].
-//!
-//! Production MTP tensor references live in [`crate::weights::Qwen4MtpWeights`].
-//! This module owns the bounded request-side QSA state and the
-//! [`ReferenceMtpWeights`] equation fixture; neither creates a second
-//! vocabulary allocation.  The MTP input embedding remains the tied
-//! `model.language_model.embed_tokens.weight` source and the distinct
-//! `lm_head.weight` source remains owned by [`crate::weights::Qwen4Weights`].
+//! Production MTP execution and request state live in [`crate::mtp_gpu`].
+//! This module holds deterministic CPU transaction state and equation-level
+//! fixtures. The input embedding uses the tied trunk table, and
+//! [`crate::weights::Qwen4Weights`] owns the distinct lm_head.
 //!
 //! [`ReferenceMtpWeights`] and [`mtp_forward_step`] are deliberately small,
 //! deterministic equation-level helpers.  They are useful for layerwise
@@ -28,7 +23,14 @@ use std::fmt;
 pub const MTP_LAYER_COUNT: usize = 1;
 /// The checkpoint's Hyper-Connection branch count.
 pub const MTP_BRANCHES: usize = 4;
-/// CPU/reference QSA geometry.
+/// Reference selection capacity for the native QSA geometry.
+pub const MTP_SELECTED_CAPACITY: usize = MTP_INDEX_BUDGET + MTP_COMPRESS_RATIO - 1;
+pub const MTP_TOP_K: usize = 10;
+/// The reference model uses the config's RMS epsilon.  The pinned checkpoint
+/// resolves this to 1e-6; keeping it local avoids inventing a new config field.
+pub const MTP_RMS_EPS: f32 = 1.0e-6;
+
+/// Native MTP QSA geometry shared with the equation-level parity fixtures.
 pub const MTP_Q_HEADS: usize = 24;
 pub const MTP_KV_HEADS: usize = 2;
 pub const MTP_HEAD_DIM: usize = 256;
@@ -36,190 +38,8 @@ pub const MTP_INDEX_HEADS: usize = 4;
 pub const MTP_INDEX_DIM: usize = 128;
 pub const MTP_INDEX_BUDGET: usize = 2048;
 pub const MTP_COMPRESS_RATIO: usize = 4;
-pub const MTP_SELECTED_CAPACITY: usize = MTP_INDEX_BUDGET + MTP_COMPRESS_RATIO - 1;
 pub const MTP_ROTARY_DIM: usize = 64;
 pub const MTP_ROPE_THETA: f32 = 10_000_000.0;
-pub const MTP_TOP_K: usize = 10;
-/// The reference model uses the config's RMS epsilon.  The pinned checkpoint
-/// resolves this to 1e-6; keeping it local avoids inventing a new config field.
-pub const MTP_RMS_EPS: f32 = 1.0e-6;
-
-/// Matrix used by the equation-level MTP implementation.  Production GPU
-/// lowering resolves the same logical shape from `TensorRef`/`WeightHandle`;
-/// this owned form is only for deterministic CPU fixtures.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MtpMatrix {
-    pub rows: usize,
-    pub cols: usize,
-    pub values: Vec<f32>,
-}
-
-impl MtpMatrix {
-    pub fn new(rows: usize, cols: usize, values: Vec<f32>) -> Result<Self, MtpError> {
-        let expected = rows
-            .checked_mul(cols)
-            .ok_or(MtpError::Shape("matrix dimensions overflow"))?;
-        if rows == 0 || cols == 0 || values.len() != expected {
-            return Err(MtpError::Length {
-                what: "MTP matrix",
-                expected,
-                actual: values.len(),
-            });
-        }
-        Ok(Self { rows, cols, values })
-    }
-
-    pub fn mul_vec(&self, input: &[f32]) -> Result<Vec<f32>, MtpError> {
-        if input.len() != self.cols {
-            return Err(MtpError::Length {
-                what: "matrix input",
-                expected: self.cols,
-                actual: input.len(),
-            });
-        }
-        Ok(self
-            .values
-            .chunks_exact(self.cols)
-            .map(|row| row.iter().zip(input).map(|(&w, &x)| w * x).sum())
-            .collect())
-    }
-}
-
-/// Attention projection weights for one CPU/reference MTP QSA block.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MtpAttentionWeights {
-    pub q_proj: MtpMatrix,
-    pub k_proj: MtpMatrix,
-    pub v_proj: MtpMatrix,
-    pub o_proj: MtpMatrix,
-    pub q_norm: Vec<f32>,
-    pub k_norm: Vec<f32>,
-    pub index_qk_proj: MtpMatrix,
-    pub index_q_norm: Vec<f32>,
-    pub index_k_norm: Vec<f32>,
-}
-
-/// Hyper-Connection projection set.  `block_inject` has shape
-/// `[branches, branches * hidden]`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MtpHyperWeights {
-    pub norm: Vec<f32>,
-    pub down: MtpMatrix,
-    pub up: MtpMatrix,
-    pub block_inject: MtpMatrix,
-}
-
-/// Final mixer has only the branch norm; it intentionally has no final write
-/// projection and no extra RMSNorm after the mix.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MtpFinalHyperWeights {
-    pub norm: Vec<f32>,
-}
-
-/// Routed and shared MTP expert weights.  Routed outputs are weighted exactly
-/// once in `mtp_forward_step`; shared output is gated once and then added.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MtpMoeWeights {
-    pub router: MtpMatrix,
-    pub routed_gate_up: Vec<MtpMatrix>,
-    pub routed_down: Vec<MtpMatrix>,
-    pub shared_gate_scalar: Vec<f32>,
-    pub shared_gate: MtpMatrix,
-    pub shared_up: MtpMatrix,
-    pub shared_down: MtpMatrix,
-}
-
-/// CPU-only MTP tensor fixture.  Production tensor references remain in
-/// [`crate::weights::Qwen4MtpWeights`]; this owned form is for deterministic
-/// equation probes and never aliases or allocates a GPU vocabulary table.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ReferenceMtpWeights {
-    pub pre_fc_norm_embedding: Vec<f32>,
-    pub pre_fc_norm_hidden: Vec<f32>,
-    pub fc_embedding: MtpMatrix,
-    pub fc_hidden: MtpMatrix,
-    pub attention: MtpAttentionWeights,
-    pub attention_hyper: MtpHyperWeights,
-    pub moe: MtpMoeWeights,
-    pub mlp_hyper: MtpHyperWeights,
-    pub final_hyper: MtpFinalHyperWeights,
-    pub qsa_geometry: MtpQsaGeometry,
-}
-
-impl ReferenceMtpWeights {
-    /// Validate the fixed CPU/reference dimensions and all expert tensor counts.
-    pub fn validate(&self) -> Result<(), MtpError> {
-        let hidden = self.fc_embedding.cols;
-        if self.fc_embedding.rows != hidden
-            || self.pre_fc_norm_embedding.len() != hidden
-            || self.pre_fc_norm_hidden.len() % MTP_BRANCHES != 0
-            || self.fc_hidden.rows != hidden
-            || self.fc_hidden.cols != hidden
-        {
-            return Err(MtpError::Shape("MTP fc/norm dimensions"));
-        }
-        let branches = self.pre_fc_norm_hidden.len() / hidden;
-        if branches == 0 || self.pre_fc_norm_hidden.len() != branches * hidden {
-            return Err(MtpError::Shape("MTP hidden branch dimensions"));
-        }
-        if self.attention_hyper.norm.len() != branches * hidden
-            || self.mlp_hyper.norm.len() != branches * hidden
-            || self.final_hyper.norm.len() != branches * hidden
-        {
-            return Err(MtpError::Shape("MTP HC norm dimensions"));
-        }
-        if self.attention.o_proj.cols != self.qsa_geometry.q_heads * self.qsa_geometry.head_dim
-            || self.attention.o_proj.rows != hidden
-            || self.attention.q_proj.cols != hidden
-            || self.attention.q_proj.rows
-                != self.qsa_geometry.q_heads * self.qsa_geometry.head_dim * 2
-            || self.attention.k_proj.cols != hidden
-            || self.attention.k_proj.rows != self.qsa_geometry.kv_heads * self.qsa_geometry.head_dim
-            || self.attention.v_proj.cols != hidden
-            || self.attention.v_proj.rows != self.qsa_geometry.kv_heads * self.qsa_geometry.head_dim
-            || self.attention.q_norm.len() != self.qsa_geometry.head_dim
-            || self.attention.k_norm.len() != self.qsa_geometry.head_dim
-        {
-            return Err(MtpError::Shape("MTP QSA projection dimensions"));
-        }
-        if self.attention.index_qk_proj.cols != hidden
-            || self.attention.index_qk_proj.rows
-                != (self.qsa_geometry.index_heads + 1) * self.qsa_geometry.index_dim
-            || self.attention.index_q_norm.len() != self.qsa_geometry.index_dim
-            || self.attention.index_k_norm.len() != self.qsa_geometry.index_dim
-        {
-            return Err(MtpError::Shape("MTP indexer dimensions"));
-        }
-        if self.moe.router.cols != hidden
-            || self.moe.routed_gate_up.len() != self.moe.router.rows
-            || self.moe.routed_down.len() != self.moe.router.rows
-            || self.moe.router.rows < MTP_TOP_K
-            || self.moe.shared_gate_scalar.len() != hidden
-            || self.moe.shared_gate.cols != hidden
-            || self.moe.shared_up.cols != hidden
-            || self.moe.shared_down.rows != hidden
-        {
-            return Err(MtpError::Shape("MTP MoE dimensions"));
-        }
-        for (gate_up, down) in self.moe.routed_gate_up.iter().zip(&self.moe.routed_down) {
-            if gate_up.cols != hidden
-                || gate_up.rows % 2 != 0
-                || down.rows != hidden
-                || down.cols != gate_up.rows / 2
-            {
-                return Err(MtpError::Shape("MTP routed expert dimensions"));
-            }
-        }
-        if self.qsa_geometry.q_heads % self.qsa_geometry.kv_heads != 0
-            || self.qsa_geometry.compress_ratio == 0
-            || self.qsa_geometry.index_heads == 0
-            || self.qsa_geometry.index_dim == 0
-        {
-            return Err(MtpError::Shape("MTP QSA geometry"));
-        }
-        Ok(())
-    }
-}
 
 /// QSA geometry is explicit so test fixtures can use small dimensions while
 /// the native constructor retains the checkpoint's 24/2/256 and 4/128 shape.
@@ -249,7 +69,7 @@ impl MtpQsaGeometry {
             budget: MTP_INDEX_BUDGET,
             max_seq_len,
             rotary_dim: MTP_ROTARY_DIM,
-            rope_theta: 10_000_000,
+            rope_theta: MTP_ROPE_THETA as u32,
         }
     }
 
@@ -647,30 +467,8 @@ pub struct MtpQsaSnapshot {
     pub position: usize,
 }
 
-/// Complete MTP forward input.  The token embedding row is looked up through
-/// the aliased trunk embedding by the carrier; no token table is owned here.
-pub struct MtpForwardInput<'a> {
-    pub token_embedding: &'a [f32],
-    pub backbone_hidden: &'a [f32],
-    pub position: usize,
-    pub step_index: usize,
-}
-
-/// One CPU/reference MTP output: collapsed H for the distinct lm_head and wide
-/// 4H for the following draft step.  `qsa_indices` records the step-0 selection
-/// or later-step reuse for parity diagnostics.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MtpForwardOutput {
-    pub collapsed_hidden: Vec<f32>,
-    pub wide_hidden: Vec<f32>,
-    pub qsa_indices: Vec<usize>,
-    pub selected_experts: [usize; MTP_TOP_K],
-    pub routing_weights: [f32; MTP_TOP_K],
-}
-
-/// CPU/reference MTP mutable state.  The target's Qwen4State is snapshotted by
-/// the SpecTarget adapter; this object independently snapshots MTP QSA side
-/// state and wide hidden so partial acceptance cannot leave a stale draft cache.
+/// CPU/reference MTP request state. QSA and wide-hidden snapshots let parity
+/// fixtures exercise partial-acceptance rollback without GPU allocation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Qwen4MtpState {
     pub qsa: MtpQsaState,
@@ -679,8 +477,8 @@ pub struct Qwen4MtpState {
     pub step_index: usize,
     pub request_epoch: u64,
     pub cancelled: bool,
-    in_flight: bool,
-    quiesced: bool,
+    pub(crate) in_flight: bool,
+    pub(crate) quiesced: bool,
 }
 
 impl Qwen4MtpState {
@@ -790,8 +588,8 @@ impl Qwen4MtpState {
     }
 }
 
-/// Architecture-owned bounded MTP snapshot.  It clones only the wide hidden
-/// row and bounded indexer ring; main KV remains append-marked in `qsa`.
+/// Bounded CPU/reference MTP snapshot. It clones the wide hidden row and
+/// indexer side state; main KV remains append-marked in `qsa`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Qwen4MtpSnapshot {
     pub qsa: MtpQsaSnapshot,
@@ -799,6 +597,288 @@ pub struct Qwen4MtpSnapshot {
     pub position: usize,
     pub step_index: usize,
     pub request_epoch: u64,
+}
+
+/// Error type for CPU/reference MTP state and equations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MtpError {
+    Length {
+        what: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    Shape(&'static str),
+    Position {
+        expected: usize,
+        actual: usize,
+    },
+    PositionOverflow,
+    Capacity(usize),
+    SelectionCapacity {
+        capacity: usize,
+        actual: usize,
+    },
+    SelectionUnavailable,
+    SnapshotLength {
+        what: &'static str,
+        requested: usize,
+        actual: usize,
+    },
+    SnapshotEpoch {
+        expected: u64,
+        actual: u64,
+    },
+    Cancelled,
+    InFlight,
+}
+
+impl fmt::Display for MtpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Length {
+                what,
+                expected,
+                actual,
+            } => {
+                write!(f, "{what}: expected {expected}, got {actual}")
+            }
+            Self::Shape(what) => write!(f, "invalid {what}"),
+            Self::Position { expected, actual } => {
+                write!(f, "MTP position expected {expected}, got {actual}")
+            }
+            Self::PositionOverflow => write!(f, "MTP position overflow"),
+            Self::Capacity(capacity) => write!(f, "MTP capacity {capacity} exceeded"),
+            Self::SelectionCapacity { capacity, actual } => {
+                write!(f, "MTP selection has {actual} rows, capacity {capacity}")
+            }
+            Self::SelectionUnavailable => write!(f, "MTP QSA selection is not primed"),
+            Self::SnapshotLength {
+                what,
+                requested,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "{what}: snapshot mark {requested} exceeds active {actual}"
+                )
+            }
+            Self::SnapshotEpoch { expected, actual } => {
+                write!(f, "MTP snapshot epoch expected {expected}, got {actual}")
+            }
+            Self::Cancelled => write!(f, "MTP request is cancelled"),
+            Self::InFlight => write!(f, "MTP transaction is still in flight"),
+        }
+    }
+}
+
+impl std::error::Error for MtpError {}
+
+/// Matrix used by the equation-level MTP implementation.  Production GPU
+/// lowering resolves the same logical shape from `TensorRef`/`WeightHandle`;
+/// this owned form is only for deterministic CPU fixtures.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MtpMatrix {
+    pub rows: usize,
+    pub cols: usize,
+    pub values: Vec<f32>,
+}
+
+impl MtpMatrix {
+    pub fn new(rows: usize, cols: usize, values: Vec<f32>) -> Result<Self, MtpError> {
+        let expected = rows
+            .checked_mul(cols)
+            .ok_or(MtpError::Shape("matrix dimensions overflow"))?;
+        if rows == 0 || cols == 0 || values.len() != expected {
+            return Err(MtpError::Length {
+                what: "MTP matrix",
+                expected,
+                actual: values.len(),
+            });
+        }
+        Ok(Self { rows, cols, values })
+    }
+
+    pub fn mul_vec(&self, input: &[f32]) -> Result<Vec<f32>, MtpError> {
+        if input.len() != self.cols {
+            return Err(MtpError::Length {
+                what: "matrix input",
+                expected: self.cols,
+                actual: input.len(),
+            });
+        }
+        Ok(self
+            .values
+            .chunks_exact(self.cols)
+            .map(|row| row.iter().zip(input).map(|(&w, &x)| w * x).sum())
+            .collect())
+    }
+}
+
+/// Attention projection weights for one CPU/reference MTP QSA block.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MtpAttentionWeights {
+    pub q_proj: MtpMatrix,
+    pub k_proj: MtpMatrix,
+    pub v_proj: MtpMatrix,
+    pub o_proj: MtpMatrix,
+    pub q_norm: Vec<f32>,
+    pub k_norm: Vec<f32>,
+    pub index_qk_proj: MtpMatrix,
+    pub index_q_norm: Vec<f32>,
+    pub index_k_norm: Vec<f32>,
+}
+
+/// Hyper-Connection projection set.  `block_inject` has shape
+/// `[branches, branches * hidden]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MtpHyperWeights {
+    pub norm: Vec<f32>,
+    pub down: MtpMatrix,
+    pub up: MtpMatrix,
+    pub block_inject: MtpMatrix,
+}
+
+/// Final learned branch mixer.  There is no final write projection or extra
+/// RMSNorm after the mix.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MtpFinalHyperWeights {
+    pub norm: Vec<f32>,
+    pub down: MtpMatrix,
+    pub up: MtpMatrix,
+}
+
+/// Routed and shared MTP expert weights.  Routed outputs are weighted exactly
+/// once in `mtp_forward_step`; shared output is gated once and then added.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MtpMoeWeights {
+    pub router: MtpMatrix,
+    pub routed_gate_up: Vec<MtpMatrix>,
+    pub routed_down: Vec<MtpMatrix>,
+    pub shared_gate_scalar: Vec<f32>,
+    pub shared_gate: MtpMatrix,
+    pub shared_up: MtpMatrix,
+    pub shared_down: MtpMatrix,
+}
+
+/// CPU-only MTP tensor fixture.  Production tensor references remain in
+/// [`crate::weights::Qwen4MtpWeights`]; this owned form is for deterministic
+/// equation probes and never aliases or allocates a GPU vocabulary table.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReferenceMtpWeights {
+    pub pre_fc_norm_embedding: Vec<f32>,
+    pub pre_fc_norm_hidden: Vec<f32>,
+    pub fc_embedding: MtpMatrix,
+    pub fc_hidden: MtpMatrix,
+    pub attention: MtpAttentionWeights,
+    pub attention_hyper: MtpHyperWeights,
+    pub moe: MtpMoeWeights,
+    pub mlp_hyper: MtpHyperWeights,
+    pub final_hyper: MtpFinalHyperWeights,
+    pub qsa_geometry: MtpQsaGeometry,
+}
+
+impl ReferenceMtpWeights {
+    /// Validate the fixed CPU/reference dimensions and all expert tensor counts.
+    pub fn validate(&self) -> Result<(), MtpError> {
+        let hidden = self.fc_embedding.cols;
+        if self.fc_embedding.rows != hidden
+            || self.pre_fc_norm_embedding.len() != hidden
+            || self.pre_fc_norm_hidden.len() % MTP_BRANCHES != 0
+            || self.fc_hidden.rows != hidden
+            || self.fc_hidden.cols != hidden
+        {
+            return Err(MtpError::Shape("MTP fc/norm dimensions"));
+        }
+        let branches = self.pre_fc_norm_hidden.len() / hidden;
+        if branches == 0 || self.pre_fc_norm_hidden.len() != branches * hidden {
+            return Err(MtpError::Shape("MTP hidden branch dimensions"));
+        }
+        if self.attention_hyper.norm.len() != branches * hidden
+            || self.mlp_hyper.norm.len() != branches * hidden
+            || self.final_hyper.norm.len() != branches * hidden
+        {
+            return Err(MtpError::Shape("MTP HC norm dimensions"));
+        }
+        let wide = branches * hidden;
+        if self.final_hyper.down.rows == 0
+            || self.final_hyper.down.cols != wide
+            || self.final_hyper.up.rows != wide
+            || self.final_hyper.up.cols != self.final_hyper.down.rows
+        {
+            return Err(MtpError::Shape("MTP final HC mix dimensions"));
+        }
+        if self.attention.o_proj.cols != self.qsa_geometry.q_heads * self.qsa_geometry.head_dim
+            || self.attention.o_proj.rows != hidden
+            || self.attention.q_proj.cols != hidden
+            || self.attention.q_proj.rows
+                != self.qsa_geometry.q_heads * self.qsa_geometry.head_dim * 2
+            || self.attention.k_proj.cols != hidden
+            || self.attention.k_proj.rows != self.qsa_geometry.kv_heads * self.qsa_geometry.head_dim
+            || self.attention.v_proj.cols != hidden
+            || self.attention.v_proj.rows != self.qsa_geometry.kv_heads * self.qsa_geometry.head_dim
+            || self.attention.q_norm.len() != self.qsa_geometry.head_dim
+            || self.attention.k_norm.len() != self.qsa_geometry.head_dim
+        {
+            return Err(MtpError::Shape("MTP QSA projection dimensions"));
+        }
+        if self.attention.index_qk_proj.cols != hidden
+            || self.attention.index_qk_proj.rows
+                != (self.qsa_geometry.index_heads + 1) * self.qsa_geometry.index_dim
+            || self.attention.index_q_norm.len() != self.qsa_geometry.index_dim
+            || self.attention.index_k_norm.len() != self.qsa_geometry.index_dim
+        {
+            return Err(MtpError::Shape("MTP indexer dimensions"));
+        }
+        if self.moe.router.cols != hidden
+            || self.moe.routed_gate_up.len() != self.moe.router.rows
+            || self.moe.routed_down.len() != self.moe.router.rows
+            || self.moe.router.rows < MTP_TOP_K
+            || self.moe.shared_gate_scalar.len() != hidden
+            || self.moe.shared_gate.cols != hidden
+            || self.moe.shared_up.cols != hidden
+            || self.moe.shared_down.rows != hidden
+        {
+            return Err(MtpError::Shape("MTP MoE dimensions"));
+        }
+        for (gate_up, down) in self.moe.routed_gate_up.iter().zip(&self.moe.routed_down) {
+            if gate_up.cols != hidden
+                || gate_up.rows % 2 != 0
+                || down.rows != hidden
+                || down.cols != gate_up.rows / 2
+            {
+                return Err(MtpError::Shape("MTP routed expert dimensions"));
+            }
+        }
+        if self.qsa_geometry.q_heads % self.qsa_geometry.kv_heads != 0
+            || self.qsa_geometry.compress_ratio == 0
+            || self.qsa_geometry.index_heads == 0
+            || self.qsa_geometry.index_dim == 0
+        {
+            return Err(MtpError::Shape("MTP QSA geometry"));
+        }
+        Ok(())
+    }
+}
+
+/// Complete MTP forward input.  The token embedding row is looked up through
+/// the aliased trunk embedding by the carrier; no token table is owned here.
+pub struct MtpForwardInput<'a> {
+    pub token_embedding: &'a [f32],
+    pub backbone_hidden: &'a [f32],
+    pub position: usize,
+    pub step_index: usize,
+}
+
+/// One CPU/reference MTP output: collapsed H for the distinct lm_head and wide
+/// 4H for the following draft step.  `qsa_indices` records the step-0 selection
+/// or later-step reuse for parity diagnostics.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MtpForwardOutput {
+    pub collapsed_hidden: Vec<f32>,
+    pub wide_hidden: Vec<f32>,
+    pub qsa_indices: Vec<usize>,
+    pub selected_experts: [usize; MTP_TOP_K],
+    pub routing_weights: [f32; MTP_TOP_K],
 }
 
 /// Execute one full-attention QSA/MoE/HC MTP step on CPU reference tensors.
@@ -858,8 +938,15 @@ pub fn mtp_forward_step(
     }
 
     // 2. Read the HC branches for attention.  This is the vLLM native order:
-    // branch norm → low-rank SiLU → sigmoid mix → branch mean.
-    let (_attn_normed, attn_input) = hc_read(&weights.attention_hyper, &wide, branches, hidden)?;
+    // per-branch norm → low-rank SiLU → sigmoid mix → branch mean.
+    let attn_input = hc_read(
+        &weights.attention_hyper.norm,
+        &weights.attention_hyper.down,
+        &weights.attention_hyper.up,
+        &wide,
+        branches,
+        hidden,
+    )?;
 
     // 3. Full-attention QSA.  q_proj contains Q followed by its gate half;
     // k/v use two KV heads.  The indexer has four query heads plus one key.
@@ -960,7 +1047,7 @@ pub fn mtp_forward_step(
 
     // 4. Inject attention output into each HC branch, then route the collapsed
     // branch view through normalized top-10 MoE.  The MLP HC stage repeats the
-    // same ordered inject operation and the final mixer only collapses.
+    // same ordered inject operation; the final mixer performs a learned read.
     hc_inject_output(
         &mut wide,
         &weights.attention_hyper,
@@ -1024,14 +1111,19 @@ pub fn mtp_forward_step(
         *dst += shared_scale * value;
     }
     hc_inject_output(&mut wide, &weights.mlp_hyper, &moe_output, branches, hidden)?;
-    let (final_normed, collapsed_hidden) =
-        hc_final_read(&weights.final_hyper, &wide, branches, hidden)?;
+    let collapsed_hidden = hc_read(
+        &weights.final_hyper.norm,
+        &weights.final_hyper.down,
+        &weights.final_hyper.up,
+        &wide,
+        branches,
+        hidden,
+    )?;
     state.wide_hidden = wide.clone();
     state.position = input.position + 1;
     state.step_index = input.step_index.wrapping_add(1);
     state.quiesced = true;
     state.in_flight = false;
-    let _ = final_normed;
     Ok(MtpForwardOutput {
         collapsed_hidden,
         wide_hidden: wide,
@@ -1042,34 +1134,43 @@ pub fn mtp_forward_step(
 }
 
 fn hc_read(
-    weights: &MtpHyperWeights,
+    norm: &[f32],
+    down: &MtpMatrix,
+    up: &MtpMatrix,
     input: &[f32],
     branches: usize,
     hidden: usize,
-) -> Result<(Vec<f32>, Vec<f32>), MtpError> {
-    if input.len() != branches * hidden || weights.norm.len() != input.len() {
-        return Err(MtpError::Shape("MTP HC read input"));
+) -> Result<Vec<f32>, MtpError> {
+    let wide = branches
+        .checked_mul(hidden)
+        .ok_or(MtpError::Shape("MTP HC read dimensions"))?;
+    if branches == 0
+        || hidden == 0
+        || input.len() != wide
+        || norm.len() != wide
+        || down.rows == 0
+        || down.cols != wide
+        || up.rows != wide
+        || up.cols != down.rows
+    {
+        return Err(MtpError::Shape("MTP HC read dimensions"));
     }
-    let mut normed = vec![0.0f32; input.len()];
-    ops::zero_centered_rms_norm(input, &weights.norm, MTP_RMS_EPS, &mut normed)
-        .map_err(|_| MtpError::Shape("MTP HC read norm"))?;
-    let low = weights.down.mul_vec(&normed)?;
-    let low = low
-        .into_iter()
-        .map(|value| ops::silu(value / branches as f32))
-        .collect::<Vec<_>>();
-    let gate = weights.up.mul_vec(&low)?;
-    if gate.len() != input.len() {
-        return Err(MtpError::Shape("MTP HC read gate"));
-    }
+    let mut normalized = vec![0.0f32; wide];
     let mut mixed = vec![0.0f32; hidden];
-    for branch in 0..branches {
-        for j in 0..hidden {
-            mixed[j] += ops::sigmoid(gate[branch * hidden + j]) * normed[branch * hidden + j]
-                / branches as f32;
-        }
-    }
-    Ok((normed, mixed))
+    ops::hc_read(
+        input,
+        &down.values,
+        &up.values,
+        norm,
+        branches,
+        hidden,
+        down.rows,
+        MTP_RMS_EPS,
+        &mut normalized,
+        &mut mixed,
+    )
+    .map_err(|_| MtpError::Shape("MTP HC read"))?;
+    Ok(mixed)
 }
 
 fn hc_inject_output(
@@ -1099,104 +1200,47 @@ fn hc_inject_output(
     Ok(())
 }
 
-fn hc_final_read(
-    weights: &MtpFinalHyperWeights,
-    input: &[f32],
-    branches: usize,
-    hidden: usize,
-) -> Result<(Vec<f32>, Vec<f32>), MtpError> {
-    if input.len() != branches * hidden || weights.norm.len() != input.len() {
-        return Err(MtpError::Shape("MTP final HC dimensions"));
-    }
-    let mut normed = vec![0.0f32; input.len()];
-    ops::zero_centered_rms_norm(input, &weights.norm, MTP_RMS_EPS, &mut normed)
-        .map_err(|_| MtpError::Shape("MTP final HC norm"))?;
-    let mut mixed = vec![0.0f32; hidden];
-    for branch in 0..branches {
-        for j in 0..hidden {
-            mixed[j] += normed[branch * hidden + j] / branches as f32;
-        }
-    }
-    Ok((normed, mixed))
-}
-
-/// Error type shared by the CPU/reference MTP resource/state and equation path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MtpError {
-    Length {
-        what: &'static str,
-        expected: usize,
-        actual: usize,
-    },
-    Shape(&'static str),
-    Position {
-        expected: usize,
-        actual: usize,
-    },
-    PositionOverflow,
-    Capacity(usize),
-    SelectionCapacity {
-        capacity: usize,
-        actual: usize,
-    },
-    SelectionUnavailable,
-    SnapshotLength {
-        what: &'static str,
-        requested: usize,
-        actual: usize,
-    },
-    SnapshotEpoch {
-        expected: u64,
-        actual: u64,
-    },
-    Cancelled,
-    InFlight,
-}
-
-impl fmt::Display for MtpError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Length {
-                what,
-                expected,
-                actual,
-            } => {
-                write!(f, "{what}: expected {expected}, got {actual}")
-            }
-            Self::Shape(what) => write!(f, "invalid {what}"),
-            Self::Position { expected, actual } => {
-                write!(f, "MTP position expected {expected}, got {actual}")
-            }
-            Self::PositionOverflow => write!(f, "MTP position overflow"),
-            Self::Capacity(capacity) => write!(f, "MTP capacity {capacity} exceeded"),
-            Self::SelectionCapacity { capacity, actual } => {
-                write!(f, "MTP selection has {actual} rows, capacity {capacity}")
-            }
-            Self::SelectionUnavailable => write!(f, "MTP QSA selection is not primed"),
-            Self::SnapshotLength {
-                what,
-                requested,
-                actual,
-            } => {
-                write!(
-                    f,
-                    "{what}: snapshot mark {requested} exceeds active {actual}"
-                )
-            }
-            Self::SnapshotEpoch { expected, actual } => {
-                write!(f, "MTP snapshot epoch expected {expected}, got {actual}")
-            }
-            Self::Cancelled => write!(f, "MTP request is cancelled"),
-            Self::InFlight => write!(f, "MTP transaction is still in flight"),
-        }
-    }
-}
-
-impl std::error::Error for MtpError {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_hc_read_uses_learned_branch_mix() {
+        let weights = MtpFinalHyperWeights {
+            norm: vec![0.0; 4],
+            down: MtpMatrix::new(1, 4, vec![1.0, 0.0, 0.0, 0.0]).unwrap(),
+            up: MtpMatrix::new(4, 1, vec![4.0, 0.0, 0.0, -4.0]).unwrap(),
+        };
+        let input = [3.0, 0.0, 0.0, 1.0];
+        let mixed = hc_read(&weights.norm, &weights.down, &weights.up, &input, 2, 2).unwrap();
+        let first = 3.0f32 / (4.5 + MTP_RMS_EPS).sqrt();
+        let second = 1.0f32 / (0.5 + MTP_RMS_EPS).sqrt();
+        let gate = 4.0 * ops::silu(first / 2.0);
+        assert!((mixed[0] - first * ops::sigmoid(gate) / 2.0).abs() < 1.0e-6);
+        assert!((mixed[1] - second * ops::sigmoid(-gate) / 2.0).abs() < 1.0e-6);
+        assert!((mixed[1] - second / 2.0).abs() > 0.1);
+
+        let mut changed = weights.clone();
+        changed.down.values.fill(0.0);
+        let down_mix = hc_read(&changed.norm, &changed.down, &changed.up, &input, 2, 2).unwrap();
+        assert!((down_mix[0] - mixed[0]).abs() > 0.1);
+        changed = weights.clone();
+        changed.up.values.fill(0.0);
+        let up_mix = hc_read(&changed.norm, &changed.down, &changed.up, &input, 2, 2).unwrap();
+        assert!((up_mix[1] - mixed[1]).abs() > 0.1);
+
+        changed.down = MtpMatrix::new(1, 2, vec![0.0; 2]).unwrap();
+        assert!(matches!(
+            hc_read(&changed.norm, &changed.down, &changed.up, &input, 2, 2),
+            Err(MtpError::Shape("MTP HC read dimensions"))
+        ));
+        changed = weights;
+        changed.up = MtpMatrix::new(2, 1, vec![0.0; 2]).unwrap();
+        assert!(matches!(
+            hc_read(&changed.norm, &changed.down, &changed.up, &input, 2, 2),
+            Err(MtpError::Shape("MTP HC read dimensions"))
+        ));
+    }
 
     #[test]
     fn qsa_step_reuses_and_compacts_indices() {

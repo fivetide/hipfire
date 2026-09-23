@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
-// hipfire — Qwen4 QT44 grouped top-10 gate/up gfx1151 O2×R8.
+// hipfire — gfx1151 QT44 grouped top-10 gate/up O2×R8.
 //
 // This exact-shape gfx1151 path keeps the static production kernel's F32 input,
 // MQ4G256V2 decoding, four static accumulator chains, and full wave32

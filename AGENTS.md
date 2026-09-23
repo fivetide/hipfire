@@ -624,29 +624,33 @@ Caveats that are part of the fixture, not trivia:
 - Loading it needs a build whose qwen4 trunk source contract admits **both**
   packed trunk tiers and whose external-PLE admission accepts both PLE tiers.
   Older builds refuse at load; that refusal is correct, not a corrupt file.
-- **MTP is enabled by default on this recipe as of `6b9db7774`.** Decode runs at
-  95–106% of AR and 92–95% end-to-end at the committed fixtures (it was 33–48%
-  before `121646d6c`/`6b9db7774` landed), and the interleaved route emits AR's
-  exact tokens — no divergence across 256 prose and 227 code tokens. The
-  near-tie flips seen earlier were an artifact of the four-row batched verify's
-  numerics, which single-row rows remove. Report ratios, not absolute tok/s:
-  the run-to-run spread is machine load.
-  (both fixes were flag-gated before they became the default path: the clean
-  batch came first, and only then was the fixed route made the default.)
-- Acceptance is route-invariant and still below the reference: 0.412/0.203/0.071
-  per draft step on prose and 0.735/0.611/0.295 on code, against 83–92% at the
-  first draft for a same-family reference implementation on this hardware. The
-  named remaining lever is the MTP layer's five attention projections at Q8F16
-  (qt=3) against the trunk's MQ6 (qt=47) — this project's own DeepSeek V4 recipe
-  documents a tier-related acceptance cost, and testing it needs a scratch
-  artifact with the MTP namespace at training precision. Cost model from the row
-  probe: a marginal verify row costs ~45% of a single-row forward, so MTP wins
-  when `tokens_per_cycle > 1 + 0.45K`. That means the batched route needs mean
-  per-step acceptance above ~45% at K=3 (code is already at 45%, prose at 19%),
-  which is what per-row GDN recurrent-state capture would buy; fusing the draft
-  `lm_head` with the target row's `lm_head` over the same table is worth about
-  5 ms/token on top. Full investigation under
-  `mtp_investigation` in `.codeinsight+research/qwen4/canonical-flash-next.json`.
+- **MTP is enabled by default on this recipe as of `6b9db7774`.** On gfx1151,
+  verification starts interleaved and switches to a four-row target when at
+  least 16 drafts matched across the last eight K=3 windows; sustained
+  low-acceptance streams remain interleaved. `HIPFIRE_MTP_INCREMENTAL=1`
+  forces interleaving, `0` forces batching. The batched MQ6 trunk uses
+  shared-weight F32 GEMV:
+  the prior F16 WMMA route changed target logits and recurrent state.
+  Teacher-forced prompt and replay steps advance MTP state without computing
+  an unused language-head prediction; prompt target chunks emit only their
+  final logit row while retaining every wide hidden row.
+- **Measured, not an 80% claim:** on 2026-09-23, gfx1151, HIP 7.2, greedy,
+  KV q8, `max_seq=2048`, graph off, three fresh daemon processes per mode and
+  byte-identical committed prompts, median code decode was AR 19.4 versus
+  MTP 20.1 tok/s (end-to-end 17.1 versus 17.2); prose decode was AR 17.9
+  versus MTP 18.0 (end-to-end 15.6 versus 17.1, with large run-to-run
+  spread). Daemon md5 `d09ff1d3220b818c4f4d06a3c60cc85b`; prompt md5s:
+  code `df5dedc8040ce70ba55080c4548e6024`, prose
+  `07a7880965142971dbb3cc7493f8fb94`. All three MTP runs emitted AR's
+  exact 227 code and 256 prose token IDs. Local raw reports:
+  `.codeinsight+research/qwen4/mtp-parity/runs/moe-buffer-fix/perf-v2/`.
+- After fixing routed/shared MoE scratch aliasing, restoring the learned final
+  HC mixer, and reselecting QSA at source-correct boundaries, conditional
+  draft agreement was 0.708/0.532/0.476 for prose and
+  0.922/0.932/0.889 for code at steps 1/2/3. The remaining throughput gap
+  to a claimed 80% gain is verifier/replay cost, not evidence that the
+  trained drafter is defective. Do not extrapolate these fixture-bound
+  measurements to other architectures or prompts.
 - `hipfire bench` cannot measure this model at all: the qwen4 contract pins
   `max_seq` to 2048 while bench asks for the configured 32768 (still 5120 with
   `memory.max_seq` forced to 2048), so it fails closed at load and never
@@ -729,7 +733,7 @@ If you want to actively contribute findings, these are open:
 
 ---
 
-*Last updated: 2026-09-13 (v0.3.1 cut; fixture pin: Qwen3.8-27B MQ4XT). When this
+*Last updated: 2026-09-23 (v0.3.1 cut; fixture pin: Qwen3.8-27B MQ4XT). When this
 doc gets stale (more than 1-2 releases behind HEAD), update it as part of the release PR.*
 
 

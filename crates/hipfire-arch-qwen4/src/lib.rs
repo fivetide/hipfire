@@ -6,9 +6,8 @@
 //!
 //! Product registration remains fail-closed until the model's lifecycle
 //! milestones are accepted. This crate owns strict configuration and
-//! admission, typed weights and GPU state, bounded PLE storage, reference
-//! equations, and native MTP transaction semantics without a compatibility
-//! alias to another Qwen-family architecture.
+//! admission, typed weights and GPU state, bounded PLE storage, and native MTP
+//! transactions. CPU reference equations are opt-in parity fixtures.
 #![recursion_limit = "256"]
 
 pub mod admission;
@@ -25,9 +24,12 @@ pub mod ple_ops;
 pub mod ple_rows;
 pub mod program;
 pub(crate) mod projection;
+#[cfg(any(test, feature = "reference-parity"))]
 pub mod reference_forward;
+#[cfg(any(test, feature = "reference-parity"))]
 pub mod reference_mtp;
 pub mod state;
+#[cfg(any(test, feature = "reference-parity"))]
 pub mod state_parity;
 pub mod weights;
 

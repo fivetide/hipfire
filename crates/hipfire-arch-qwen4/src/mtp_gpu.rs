@@ -6,24 +6,23 @@
 //!
 //! This module is the only production MTP implementation for Qwen4.  It owns
 //! one bound MTP MoE table, one reusable operator scratch set, and one bounded
-//! device-side QSA state.  The CPU/reference equations in
-//! [`crate::reference_mtp`] remain fixtures; they are never called from this
-//! path.
+//! device-side QSA state. The opt-in CPU/reference equations in
+//! `reference_mtp` are parity fixtures, never called from this path.
 
 use crate::config::Qwen4Config;
 use crate::gpu_forward::{
     execute_moe, Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
 };
 use crate::projection::{dispatch_embedding, dispatch_gemv};
-use crate::weights::{HyperConnectionWeights, Qwen4Weights, WeightError};
+use crate::weights::{HyperConnectionWeights, Qwen4Weights, TensorRef, WeightError};
 use hipfire_runtime::spec::SpecGrammar;
 use rdna_compute::tensor_ops::{
-    argmax_f32, hyper_final, hyper_norm, hyper_read_projected, hyper_write,
+    argmax_f32, hc_activation_fused_f32, hyper_norm, hyper_read_projected, hyper_write,
     indexed_attention_attention, indexed_attention_cache_append, indexed_attention_norm_rope,
     indexed_attention_pool_rope, indexed_attention_reuse_selection, indexed_attention_select,
-    scale_f32, ArgmaxF32, HyperFinal, HyperNorm, HyperReadProjected, HyperWrite,
+    ArgmaxF32, HcActivationFused, HyperNorm, HyperReadProjected, HyperWrite,
     IndexedAttentionAttention, IndexedAttentionCacheAppend, IndexedAttentionNormRope,
-    IndexedAttentionPoolRope, IndexedAttentionReuseSelection, IndexedAttentionSelect, ScaleF32,
+    IndexedAttentionPoolRope, IndexedAttentionReuseSelection, IndexedAttentionSelect,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::fmt;
@@ -55,7 +54,9 @@ fn hc_read(
     gpu: &mut Gpu,
     config: &Qwen4Config,
     weights: &Qwen4Weights,
-    hyper: &HyperConnectionWeights,
+    norm_ref: &TensorRef,
+    down_ref: &TensorRef,
+    up_ref: &TensorRef,
     input: &GpuTensor,
     normalized: &GpuTensor,
     low: &GpuTensor,
@@ -63,9 +64,9 @@ fn hc_read(
     mixed: &GpuTensor,
     rotation: &GpuTensor,
 ) -> Result<(), MtpGpuError> {
-    let norm = weights.resident(&hyper.hc_norm)?;
-    let down = weights.resident(&hyper.input_mix_down)?;
-    let up_weight = weights.resident(&hyper.input_mix_up)?;
+    let norm = weights.resident(norm_ref)?;
+    let down = weights.resident(down_ref)?;
+    let up_weight = weights.resident(up_ref)?;
     hyper_norm(
         gpu,
         &HyperNorm {
@@ -85,14 +86,13 @@ fn hc_read(
         config.hc_lowrank,
         config.hc_count * config.hidden_size,
     )?;
-    scale_f32(
+    hc_activation_fused_f32(
         gpu,
-        &ScaleF32 {
+        &HcActivationFused {
             values: low,
             scale: 1.0 / config.hc_count as f32,
         },
     )?;
-    gpu.silu_f32(low, low)?;
     dispatch_gemv(
         gpu,
         up_weight,
@@ -567,12 +567,10 @@ impl MtpGpuStateSnapshotArena {
     }
 
     fn validate_layout(&self, state: &MtpGpuState) -> Result<(), MtpGpuError> {
+        // Allocation capacities can differ for equal-shaped tensors.
         if self.selected_indices.numel() != state.selected_indices.numel()
-            || self.selected_indices.buf.size() != state.selected_indices.buf.size()
             || self.selected_len_out.numel() != state.selected_len_out.numel()
-            || self.selected_len_out.buf.size() != state.selected_len_out.buf.size()
             || self.wide_hidden.numel() != state.wide_hidden.numel()
-            || self.wide_hidden.buf.size() != state.wide_hidden.buf.size()
         {
             return Err(invalid("MTP snapshot arena shape mismatch"));
         }
@@ -1153,29 +1151,6 @@ impl Qwen4MtpGpu {
         &self.state
     }
 
-    pub(crate) fn forward_token(
-        &mut self,
-        gpu: &mut Gpu,
-        weights: &Qwen4Weights,
-        config: &Qwen4Config,
-        token: u32,
-        backbone_hidden: &GpuTensor,
-        position: usize,
-    ) -> Result<u32, MtpGpuError> {
-        self.forward_token_inner(gpu, weights, config, token, Some(backbone_hidden), position)
-    }
-
-    pub(crate) fn forward_token_from_state(
-        &mut self,
-        gpu: &mut Gpu,
-        weights: &Qwen4Weights,
-        config: &Qwen4Config,
-        token: u32,
-        position: usize,
-    ) -> Result<u32, MtpGpuError> {
-        self.forward_token_inner(gpu, weights, config, token, None, position)
-    }
-
     pub(crate) fn forward_token_with_logits(
         &mut self,
         gpu: &mut Gpu,
@@ -1183,17 +1158,29 @@ impl Qwen4MtpGpu {
         config: &Qwen4Config,
         token: u32,
         position: usize,
+        fresh_qsa_selection: bool,
         logits: &GpuTensor,
     ) -> Result<u32, MtpGpuError> {
         if logits.dtype != DType::F32 || logits.numel() != self.scratch.logits.numel() {
             return Err(invalid("MTP logits destination shape mismatch"));
         }
-        let next = self.forward_token_from_state(gpu, weights, config, token, position)?;
+        let next = self
+            .forward_token(
+                gpu,
+                weights,
+                config,
+                token,
+                None,
+                position,
+                fresh_qsa_selection,
+                true,
+            )?
+            .ok_or_else(|| invalid("MTP prediction requested but no token produced"))?;
         gpu.copy_d2d(&self.scratch.logits, logits, logits.byte_size())?;
         Ok(next)
     }
 
-    fn forward_token_inner(
+    pub(crate) fn forward_token(
         &mut self,
         gpu: &mut Gpu,
         weights: &Qwen4Weights,
@@ -1201,26 +1188,25 @@ impl Qwen4MtpGpu {
         token: u32,
         backbone_hidden: Option<&GpuTensor>,
         position: usize,
-    ) -> Result<u32, MtpGpuError> {
+        fresh_qsa_selection: bool,
+        predict: bool,
+    ) -> Result<Option<u32>, MtpGpuError> {
         let wide = MTP_BRANCHES
             .checked_mul(config.hidden_size)
             .ok_or_else(|| invalid("MTP wide dimension overflow"))?;
-        let use_state_hidden = backbone_hidden.is_none();
-        if use_state_hidden {
+        if let Some(hidden) = backbone_hidden {
+            if hidden.dtype != DType::F32 || hidden.numel() != wide {
+                return Err(invalid(format!(
+                    "MTP backbone hidden must be F32 with {wide} elements"
+                )));
+            }
+        } else {
             gpu.copy_d2d(
                 &self.state.wide_hidden,
                 &self.scratch.backbone_hidden,
                 self.state.wide_hidden.byte_size(),
             )?;
         }
-        let backbone_hidden_is_valid = backbone_hidden
-            .is_none_or(|hidden| hidden.dtype == DType::F32 && hidden.numel() == wide);
-        if !backbone_hidden_is_valid {
-            return Err(invalid(format!(
-                "MTP backbone hidden must be F32 with {wide} elements"
-            )));
-        }
-        let backbone_hidden_is_state = use_state_hidden;
         if position != self.state.position {
             return Err(invalid(format!(
                 "MTP position mismatch: expected {}, got {position}",
@@ -1235,11 +1221,7 @@ impl Qwen4MtpGpu {
             .ok_or_else(|| invalid("MTP position overflow"))?;
         let scratch = &mut self.scratch;
         let state = &mut self.state;
-        let backbone_hidden = if backbone_hidden_is_state {
-            &scratch.backbone_hidden
-        } else {
-            backbone_hidden.expect("validated external MTP backbone hidden")
-        };
+        let backbone_hidden = backbone_hidden.unwrap_or(&scratch.backbone_hidden);
         scratch
             .host_token_bytes
             .copy_from_slice(&(token as i32).to_ne_bytes());
@@ -1312,7 +1294,9 @@ impl Qwen4MtpGpu {
             gpu,
             config,
             weights,
-            &weights.mtp.attn_hyper,
+            &weights.mtp.attn_hyper.hc_norm,
+            &weights.mtp.attn_hyper.input_mix_down,
+            &weights.mtp.attn_hyper.input_mix_up,
             &scratch.wide,
             &scratch.hc_normalized,
             &scratch.hc_low,
@@ -1469,7 +1453,9 @@ impl Qwen4MtpGpu {
             )?;
         }
         let budget_blocks = config.indexer_budget / config.indexer_compress_ratio;
-        if state.step_index == 0 {
+        // Reselect for the first step of each proposal (and every prefill token);
+        // the request cursor still tracks state, not the selection's lifetime.
+        if fresh_qsa_selection {
             indexed_attention_select(
                 gpu,
                 &IndexedAttentionSelect {
@@ -1562,7 +1548,9 @@ impl Qwen4MtpGpu {
             gpu,
             config,
             weights,
-            &weights.mtp.mlp_hyper,
+            &weights.mtp.mlp_hyper.hc_norm,
+            &weights.mtp.mlp_hyper.input_mix_down,
+            &weights.mtp.mlp_hyper.input_mix_up,
             &scratch.wide,
             &scratch.hc_normalized,
             &scratch.hc_low,
@@ -1585,7 +1573,8 @@ impl Qwen4MtpGpu {
                 gate_buf: &scratch.moe_gate,
                 up_buf: &scratch.moe_up,
                 ffn_hidden: &scratch.moe_hidden,
-                ffn_out: &scratch.moe_output,
+                // The shared down projection must not overwrite the routed accumulator.
+                ffn_out: &scratch.projected_embedding,
                 gate_batch: &scratch.moe_gate_batch,
                 up_batch: &scratch.moe_up_batch,
                 rot_batch: &scratch.moe_rot_batch,
@@ -1606,54 +1595,53 @@ impl Qwen4MtpGpu {
             &scratch.wide,
             &scratch.rotation,
         )?;
-        let final_norm = weights.resident(&weights.mtp.final_hyper.hc_norm)?;
-        hyper_norm(
-            gpu,
-            &HyperNorm {
-                input: &scratch.wide,
-                norm_weight: final_norm,
-                normalized: &scratch.hc_normalized,
-                branches: MTP_BRANCHES,
-                hidden: config.hidden_size,
-            },
-        )?;
-        hyper_final(
-            gpu,
-            &HyperFinal {
-                normalized: &scratch.hc_normalized,
-                output: &scratch.hc_mixed,
-                branches: MTP_BRANCHES,
-                hidden: config.hidden_size,
-            },
-        )?;
-        let lm_head = weights.resident(&weights.root.lm_head)?;
-        dispatch_gemv(
-            gpu,
-            lm_head,
-            &scratch.hc_mixed,
-            &scratch.rotation,
-            &scratch.logits,
-            config.vocab_size,
-            config.hidden_size,
-        )?;
-        argmax_f32(
-            gpu,
-            &ArgmaxF32 {
-                logits: &scratch.logits,
-                indices: &scratch.top1,
-                rows: 1,
-                vocab: config.vocab_size,
-            },
-        )?;
-        let mut token_bytes = [0u8; 4];
-        gpu.hip.memcpy_dtoh(&mut token_bytes, &scratch.top1.buf)?;
-        let next_token = u32::from_ne_bytes(token_bytes);
-        if next_token as usize >= config.vocab_size {
-            return Err(invalid(format!(
-                "MTP argmax token {next_token} is outside vocab {}",
-                config.vocab_size
-            )));
-        }
+        let next_token = if predict {
+            hc_read(
+                gpu,
+                config,
+                weights,
+                &weights.mtp.final_hyper.hc_norm,
+                &weights.mtp.final_hyper.input_mix_down,
+                &weights.mtp.final_hyper.input_mix_up,
+                &scratch.wide,
+                &scratch.hc_normalized,
+                &scratch.hc_low,
+                &scratch.hc_up,
+                &scratch.hc_mixed,
+                &scratch.rotation,
+            )?;
+            let lm_head = weights.resident(&weights.root.lm_head)?;
+            dispatch_gemv(
+                gpu,
+                lm_head,
+                &scratch.hc_mixed,
+                &scratch.rotation,
+                &scratch.logits,
+                config.vocab_size,
+                config.hidden_size,
+            )?;
+            argmax_f32(
+                gpu,
+                &ArgmaxF32 {
+                    logits: &scratch.logits,
+                    indices: &scratch.top1,
+                    rows: 1,
+                    vocab: config.vocab_size,
+                },
+            )?;
+            let mut token_bytes = [0u8; 4];
+            gpu.hip.memcpy_dtoh(&mut token_bytes, &scratch.top1.buf)?;
+            let next_token = u32::from_ne_bytes(token_bytes);
+            if next_token as usize >= config.vocab_size {
+                return Err(invalid(format!(
+                    "MTP argmax token {next_token} is outside vocab {}",
+                    config.vocab_size
+                )));
+            }
+            Some(next_token)
+        } else {
+            None
+        };
         gpu.copy_d2d(&scratch.wide, &state.wide_hidden, scratch.wide.byte_size())?;
         state.position = next_position;
         state.full_len = visible;

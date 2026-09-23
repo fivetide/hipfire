@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
-// hipfire — Qwen4 QT53 grouped down O4×R16 kernel for gfx1151.
+// hipfire — gfx1151 QT53 grouped top-10 down O4×R16.
 //
 // The previous production sibling assigned one wave to two adjacent output
 // rows and sixteen grouped route slots. This kernel keeps that exact R16

@@ -11,7 +11,8 @@
 use hip_bridge::{HipError, HipResult, KernargBlob};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-const QWEN4_SPECIFIC_SRC: &str = include_str!("qwen4_specific.hip");
+pub const QWEN4_SPECIFIC_SRC: &str =
+    include_str!("../../../kernels/src/qwen4_specific.gfx1151.hip");
 
 fn shape_error() -> HipError {
     HipError::new(0, &"tensor shape mismatch".to_string())

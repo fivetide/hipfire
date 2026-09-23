@@ -4267,7 +4267,7 @@ fn forward_scratch_inner(
     execute_steps(
         gpu,
         &ctx,
-        &mut [Step::Gemv {
+        &[Step::Gemv {
             w: &wr_lm,
             input: GemvInput::Raw(&scratch.tmp),
             out: &scratch.logits,
@@ -4419,7 +4419,7 @@ fn sliding_layer_decode_impl(
     execute_steps(
         gpu,
         &ctx,
-        &mut [
+        &[
             Step::Gemv {
                 w: &wr_q,
                 input: GemvInput::Raw(&scratch.tmp),
@@ -4571,7 +4571,7 @@ fn sliding_layer_decode_impl(
             output_gate: None,
             output: &scratch.attn_out,
         };
-        execute_steps(gpu, &ctx, &mut [Step::Attend { plan, io }])
+        execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     }
     // Dump attention output regardless of KV cache branch.
@@ -4604,7 +4604,7 @@ fn sliding_layer_decode_impl(
     execute_steps(
         gpu,
         &ctx,
-        &mut [Step::Gemv {
+        &[Step::Gemv {
             w: &wr_o,
             input: GemvInput::Raw(&scratch.attn_out),
             out: &scratch.tmp,
@@ -4665,7 +4665,7 @@ fn sliding_layer_decode_impl(
     execute_steps(
         gpu,
         &ctx,
-        &mut [
+        &[
             Step::Gemv {
                 w: &wr_gate,
                 input: GemvInput::Raw(&scratch.tmp),
@@ -4707,7 +4707,7 @@ fn sliding_layer_decode_impl(
     execute_steps(
         gpu,
         &ctx,
-        &mut [Step::Gemv {
+        &[Step::Gemv {
             w: &wr_down,
             input: GemvInput::Raw(&scratch.ffn_hidden),
             out: &scratch.ffn_out,
@@ -4989,7 +4989,7 @@ fn full_layer_decode_impl(
             output_gate: None,
             output: &scratch.attn_out,
         };
-        execute_steps(gpu, &ctx, &mut [Step::Attend { plan, io }])
+        execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     }
 
@@ -5789,7 +5789,7 @@ fn forward_prefill_batch_v2(
                         output: &scratch.attn_out,
                     };
                     let ctx = DispatchCtx::new(gpu);
-                    execute_steps(gpu, &ctx, &mut [Step::Attend { plan, io }])
+                    execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
                         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
                     // Copy attention output back to batched buffer.
                     if let Some(_s) = gpu.active_stream.as_ref() {
@@ -6122,7 +6122,7 @@ fn forward_prefill_batch_v2(
                     output: &scratch.pb_attn_q,
                 };
                 let ctx = DispatchCtx::new(gpu);
-                execute_steps(gpu, &ctx, &mut [Step::Attend { plan, io }])
+                execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
                     .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
                 if hipfire_config::developer_var("HIPFIRE_GEMMA4_ATTN_VERIFY")
                     .ok()
@@ -6206,7 +6206,7 @@ fn forward_prefill_batch_v2(
                             output: &scratch.attn_out,
                         };
                         let c1 = DispatchCtx::new(gpu);
-                        execute_steps(gpu, &c1, &mut [Step::Attend { plan: p1, io: io1 }])
+                        execute_steps(gpu, &c1, &[Step::Attend { plan: p1, io: io1 }])
                             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
                         let single = gpu.download_f32(&scratch.attn_out)?;
                         let row = &batched_out[i * q_dim..(i + 1) * q_dim];
@@ -6540,7 +6540,7 @@ fn forward_prefill_batch_v2(
     execute_steps(
         gpu,
         &ctx,
-        &mut [Step::Gemv {
+        &[Step::Gemv {
             w: &wr_lm,
             input: GemvInput::Raw(&scratch.tmp),
             out: &scratch.logits,
@@ -6743,7 +6743,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     execute_steps(
                         gpu,
                         ctx,
-                        &mut [
+                        &[
                             Step::Gemv {
                                 w: &wr_q,
                                 input: GemvInput::Raw(&s.tmp),
@@ -6769,7 +6769,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     execute_steps(
                         gpu,
                         ctx,
-                        &mut [Step::Gemv {
+                        &[Step::Gemv {
                             w: &wr,
                             input: GemvInput::Raw(&s.tmp),
                             out: &s.v,
@@ -6788,7 +6788,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     execute_steps(
                         gpu,
                         ctx,
-                        &mut [Step::Gemv {
+                        &[Step::Gemv {
                             w: &wr,
                             input: GemvInput::Raw(&s.tmp),
                             out: &s.q,
@@ -6807,7 +6807,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     execute_steps(
                         gpu,
                         ctx,
-                        &mut [Step::Gemv {
+                        &[Step::Gemv {
                             w: &wr,
                             input: GemvInput::Raw(&s.tmp),
                             out: &s.k,
@@ -6826,7 +6826,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     execute_steps(
                         gpu,
                         ctx,
-                        &mut [Step::Gemv {
+                        &[Step::Gemv {
                             w: &wr,
                             input: GemvInput::Raw(&s.attn_out),
                             out: &s.tmp,
@@ -6839,7 +6839,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     execute_steps(
                         gpu,
                         ctx,
-                        &mut [Step::Gemv {
+                        &[Step::Gemv {
                             w: &wr,
                             input: GemvInput::Raw(&s.attn_out),
                             out: &s.tmp,
@@ -6855,7 +6855,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     execute_steps(
                         gpu,
                         ctx,
-                        &mut [
+                        &[
                             Step::Gemv {
                                 w: &wr_gate,
                                 input: GemvInput::Raw(&s.tmp),
@@ -6876,7 +6876,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     execute_steps(
                         gpu,
                         ctx,
-                        &mut [
+                        &[
                             Step::Gemv {
                                 w: &wr_gate,
                                 input: GemvInput::Raw(&s.tmp),
@@ -6905,7 +6905,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                         execute_steps(
                             gpu,
                             ctx,
-                            &mut [Step::Gemv {
+                            &[Step::Gemv {
                                 w: &wr,
                                 input: GemvInput::Raw(&s.ffn_hidden),
                                 out: &s.ffn_out,
@@ -6918,7 +6918,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                         execute_steps(
                             gpu,
                             ctx,
-                            &mut [Step::Gemv {
+                            &[Step::Gemv {
                                 w: &wr,
                                 input: GemvInput::Raw(&s.ffn_hidden),
                                 out: &s.ffn_out,
@@ -7155,7 +7155,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     output_gate: None,
                     output: &s.attn_out,
                 };
-                execute_steps(gpu, &ctx, &mut [Step::Attend { plan, io }])
+                execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
                     .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
             }
             g4_op::ATTEND_FULL => {
@@ -7264,7 +7264,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     output_gate: None,
                     output: &s.attn_out,
                 };
-                execute_steps(gpu, &ctx, &mut [Step::Attend { plan, io }])
+                execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
                     .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
             }
             other => Err(hip_bridge::HipError::new(
@@ -7408,7 +7408,7 @@ fn forward_scratch_inner_lowered(
         execute_steps(
             gpu,
             &ctx,
-            &mut [Step::Gemv {
+            &[Step::Gemv {
                 w: &wr,
                 input: GemvInput::Raw(&scratch.tmp),
                 out: &scratch.logits,

@@ -164,13 +164,8 @@ fn qwen4_q8_source() -> DTypeConstraint {
     DTypeConstraint::source_from_sources(vec![DType::BF16, DType::Q8_0])
 }
 
-/// Expert targets accept a BF16 source (the checkpoint) or an already-converted
-/// four-bit payload at the exact geometry this family declares.
-///
-/// The set is deliberately closed: every member is a representation some
-/// declared target actually carries.  Admitting a family no target uses would
-/// only let an artifact past the source check and into a geometry mismatch at
-/// the artifact boundary, one validation layer later.
+/// Routed experts accept the checkpoint's BF16 or the published four-bit
+/// payload at either declared geometry.
 fn qwen4_quant_source() -> DTypeConstraint {
     DTypeConstraint::source_from_sources(vec![DType::BF16, ROUTED_GATE_UP_DTYPE, ROUTED_DOWN_DTYPE])
 }
@@ -220,18 +215,14 @@ fn qwen4_trunk_tier(value: Option<&str>) -> DType {
     }
 }
 
-/// `HIPFIRE_QWEN4_MTP_TIER=source` declares the whole MTP namespace at the
+/// `HIPFIRE_QWEN4_MTP_TIER=source` declares the rank-2 MTP matrices at their
 /// source's own BF16 instead of the eight-bit recipe the shared matrix
-/// classifier otherwise picks for it.
+/// classifier otherwise picks for them.
 ///
-/// This exists to measure, not to ship: the published rung keeps its MTP
-/// attention projections at Q8F16 (qt=3) while the trunk carries the six-bit
-/// rung, and the open question is whether that tier costs acceptance.  The knob
-/// is the only input - unset, every existing artifact and recipe keeps its exact
-/// meaning - and it applies to the MTP names alone, so the trunk's tier is
-/// untouched by construction.  The producer and the loader reach the
-/// declaration through the same manifest, so a scratch artifact written with the
-/// knob set loads on an unmodified build.
+/// Scratch measurements found no acceptance lift from this tier alone; it
+/// remains an opt-in comparison against the published Q8F16 MTP projections.
+/// Unset, the existing recipe is unchanged, and the producer and loader use
+/// the same manifest declaration.
 fn qwen4_mtp_source_tier(value: Option<&str>) -> bool {
     matches!(value, Some("source"))
 }
@@ -246,9 +237,11 @@ thread_local! {
 /// The predicate the manifest actually consults, so a test can prove the knob
 /// *reaches* the five rank-2 MTP attention matrices rather than only parsing.
 fn mtp_source_tier_active() -> bool {
-    MTP_SOURCE_TIER_OVERRIDE.with(|value| value.get()).unwrap_or_else(|| {
-        qwen4_mtp_source_tier(std::env::var("HIPFIRE_QWEN4_MTP_TIER").ok().as_deref())
-    })
+    MTP_SOURCE_TIER_OVERRIDE
+        .with(|value| value.get())
+        .unwrap_or_else(|| {
+            qwen4_mtp_source_tier(std::env::var("HIPFIRE_QWEN4_MTP_TIER").ok().as_deref())
+        })
 }
 
 /// The declared target of one entry, with the selected trunk tier applied.
@@ -454,8 +447,8 @@ pub struct Qwen4Manifest {
 impl Qwen4Manifest {
     /// The declaration both the producer and the loader read.
     ///
-    /// The trunk's packed tier comes from `HIPFIRE_QWEN4_TRUNK_TIER` through
-    /// [`qwen4_trunk_tier`]; everything else is this build's own recipe.
+    /// The trunk's packed tier comes from `HIPFIRE_QWEN4_TRUNK_TIER`; the
+    /// source-tier experiment affects only rank-2 MTP records.
     pub fn build(config: &Qwen4Config) -> Result<Self, WeightError> {
         Self::build_with_trunk_tier(
             config,
@@ -917,14 +910,8 @@ fn mtp_model(
     policy: ShardPolicy,
     source: &DTypeConstraint,
 ) -> WeightEntry {
-    // Training-precision MTP experiment (`HIPFIRE_QWEN4_MTP_TIER=source`): every
-    // entry in the MTP namespace declares BF16 against a BF16 source, so a
-    // scratch artifact carries the head at the checkpoint's own precision while
-    // the trunk keeps whatever tier it declared.  Off by default.
-    // Rank-2 only: the MTP routed experts are rank-3 and their writer carries
-    // packed tiers exclusively (`matrix_quant_type` has no BF16 arm), so the
-    // training-precision knob covers the attention/GDN-shaped matrices the
-    // published rung stores at qt=3 and leaves the expert tiers alone.
+    // The existing source-tier experiment changes only rank-2 MTP entries;
+    // the routed experts are rank-3, and their writer has no BF16 arm.
     if mtp_source_tier_active() && shape.len() == 2 {
         return WeightEntry::model_with_dtype_constraint(
             name,
@@ -2390,8 +2377,12 @@ mod tests {
         let source = Qwen4Manifest::build(&config).expect("source-tier manifest");
         MTP_SOURCE_TIER_OVERRIDE.with(|value| value.set(None));
         for name in mtp_attention {
-            let default_entry = shipped.entry(name, None).expect("default MTP attention entry");
-            let source_entry = source.entry(name, None).expect("source-tier MTP attention entry");
+            let default_entry = shipped
+                .entry(name, None)
+                .expect("default MTP attention entry");
+            let source_entry = source
+                .entry(name, None)
+                .expect("source-tier MTP attention entry");
             assert_ne!(default_entry.dtype, DType::BF16, "{name} ships quantized");
             assert_eq!(
                 source_entry.dtype,
@@ -2412,13 +2403,22 @@ mod tests {
                 "{name} must not move with the matrix knob"
             );
         }
-        let default_trunk = shipped.entry(trunk_attention, Some(2)).expect("trunk entry");
+        let default_trunk = shipped
+            .entry(trunk_attention, Some(2))
+            .expect("trunk entry");
         let source_trunk = source.entry(trunk_attention, Some(2)).expect("trunk entry");
-        assert_eq!(default_trunk.dtype, source_trunk.dtype, "trunk tier must not move");
+        assert_eq!(
+            default_trunk.dtype, source_trunk.dtype,
+            "trunk tier must not move"
+        );
         let norm = source
             .entry("mtp.layers.0.self_attn.q_norm.weight", None)
             .expect("MTP norm entry");
-        assert_eq!(norm.dtype, DType::BF16, "MTP norms are already source-exact");
+        assert_eq!(
+            norm.dtype,
+            DType::BF16,
+            "MTP norms are already source-exact"
+        );
     }
 
     #[test]

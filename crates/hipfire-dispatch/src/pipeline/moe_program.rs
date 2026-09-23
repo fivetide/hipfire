@@ -14,7 +14,7 @@ use super::steps::Step;
 use crate::context::DispatchCtx;
 use crate::families::moe::{
     MoeNormalization, MoeParams, MoePrefillParams, MoePrefillResolution, MoeQ8RouterPolicy,
-    MoeRecipe, MoeResolution,
+    MoeRecipe, MoeResolution, MoeRouteCapability,
 };
 use crate::pipeline::sealed_moe::{MoeProtocol, MoeRouterInput, SealedMoeCall};
 use crate::types::DispatchError;
@@ -24,6 +24,28 @@ use std::cell::{Cell, OnceCell};
 use std::sync::OnceLock;
 
 const INLINE_STEP_CAPACITY: usize = 32;
+
+/// One operation in a sealed MoE program. The lowerer alone chooses and orders
+/// stages; external callers cannot create the matching sealed operand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeStage {
+    Normalize,
+    InputBasis,
+    GateSide,
+    RouterProjection,
+    Route,
+    SharedGateUp,
+    SharedActivation,
+    SharedDown,
+    Scatter,
+    GateUp,
+    Unscatter,
+    Activation,
+    Down,
+    MutationFence,
+    Combine,
+    HostExperts,
+}
 
 fn router_shared_fuse_allowed(
     skip_routing: bool,
@@ -57,7 +79,7 @@ pub(super) struct MoeDecodeSelection {
     pub(super) exact_wave64_router: bool,
     pub(super) wave64_router: bool,
     pub(super) down_last_combine: bool,
-    pub(super) qwen4_top10: bool,
+    pub(super) route: Option<crate::families::moe::MoeRouteCapability>,
     pub(super) ninepath_d3: bool,
     pub(super) ninepath_d4: bool,
     pub(super) ninepath_mq3l: bool,
@@ -71,10 +93,8 @@ pub(super) struct MoePrefillSelection {
     pub(super) resolution: MoePrefillResolution,
     pub(super) path2_m_total: usize,
     pub(super) force_mq4_grouped_fp16: bool,
-    /// Exact Qwen4 replicated top-10/QT44/QT53 route.  This is kept beside
-    /// the generic resolution so QT53 never enters a representative-dtype
-    /// fallback.
-    pub(super) qwen4_top10: bool,
+    /// Exact architecture-selected route, or the generic grouped path.
+    pub(super) route: Option<crate::families::moe::MoeRouteCapability>,
 }
 
 /// The call's static kernel selection. Neither variant stores a step list or
@@ -326,6 +346,31 @@ impl<'a> SealedMoeOp<'a> {
         Self { state }
     }
 
+    pub(super) fn execute_stage(
+        &self,
+        gpu: &mut Gpu,
+        stage: MoeStage,
+    ) -> Result<(), DispatchError> {
+        match stage {
+            MoeStage::Normalize => self.normalize(gpu),
+            MoeStage::InputBasis => self.input_basis(gpu),
+            MoeStage::GateSide => self.gate_side(gpu),
+            MoeStage::RouterProjection => self.router_projection(gpu),
+            MoeStage::Route => self.route(gpu),
+            MoeStage::SharedGateUp => self.shared_gate_up(gpu),
+            MoeStage::SharedActivation => self.shared_activation(gpu),
+            MoeStage::SharedDown => self.shared_down(gpu),
+            MoeStage::Scatter => self.scatter(gpu),
+            MoeStage::GateUp => self.gate_up(gpu),
+            MoeStage::Unscatter => self.unscatter(gpu),
+            MoeStage::Activation => self.activation(gpu),
+            MoeStage::Down => self.down(gpu),
+            MoeStage::MutationFence => self.mutation_fence(gpu),
+            MoeStage::Combine => self.combine(gpu),
+            MoeStage::HostExperts => self.host_experts(gpu),
+        }
+    }
+
     pub(super) fn normalize(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         match self.state.call.protocol() {
             MoeProtocol::IndexedDecode => {
@@ -378,7 +423,7 @@ impl<'a> SealedMoeOp<'a> {
             return super::decode_input_basis_stage(gpu, params, selection.resolution);
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if selection.qwen4_top10 {
+        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
             return super::qt44_qt53_prefill::input_basis(gpu, params);
         }
         let input_weight = params
@@ -437,7 +482,7 @@ impl<'a> SealedMoeOp<'a> {
                 .then_some(params.x_rot_local),
             shared_gate,
             shared_up,
-            selection.qwen4_top10,
+            selection.route,
         )
     }
 
@@ -462,7 +507,7 @@ impl<'a> SealedMoeOp<'a> {
             }
             MoeProtocol::GroupedPrefill => {
                 let (params, selection) = self.state.prefill_parts()?;
-                if selection.qwen4_top10 {
+                if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
                     return super::qt44_qt53_prefill::router_projection(gpu, params);
                 }
                 let prelude = &params.prelude;
@@ -623,7 +668,7 @@ impl<'a> SealedMoeOp<'a> {
                             selection.router_shared_fuse,
                             selection.exact_wave64_router,
                             selection.wave64_router,
-                            selection.qwen4_top10,
+                            selection.route,
                         )?;
                     }
                 } else {
@@ -659,11 +704,11 @@ impl<'a> SealedMoeOp<'a> {
                     .then_some(params.x_rot_local),
                 shared_gate,
                 shared_up,
-                selection.qwen4_top10,
+                selection.route,
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if selection.qwen4_top10 {
+        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
             return super::qt44_qt53_prefill::shared_gate_up(gpu, params);
         }
         super::prefill_shared_gate_up_stage(self.state.dispatch_ctx(), gpu, params)
@@ -685,11 +730,11 @@ impl<'a> SealedMoeOp<'a> {
                 shared_up,
                 target,
                 selection.router_shared_fuse,
-                selection.qwen4_top10,
+                selection.route,
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if selection.qwen4_top10 {
+        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
             return super::qt44_qt53_prefill::shared_activation(gpu, params);
         }
         super::prefill_shared_activation_stage(gpu, params)
@@ -711,11 +756,11 @@ impl<'a> SealedMoeOp<'a> {
                 shared_up,
                 target,
                 selection.router_shared_fuse,
-                selection.qwen4_top10,
+                selection.route,
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if selection.qwen4_top10 {
+        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
             return super::qt44_qt53_prefill::shared_down(gpu, params);
         }
         super::prefill_shared_down_stage(self.state.dispatch_ctx(), gpu, params)
@@ -729,7 +774,7 @@ impl<'a> SealedMoeOp<'a> {
                 "sealed moe: scatter is only valid for grouped prefill path 2".into(),
             ));
         }
-        if selection.qwen4_top10 {
+        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
             return super::qt44_qt53_prefill::scatter(gpu, params, selection.path2_m_total);
         }
         super::prefill_scatter_stage(gpu, params, selection.path2_m_total)
@@ -748,11 +793,11 @@ impl<'a> SealedMoeOp<'a> {
                     .then_some(params.x_rot_local)
                     .unwrap_or(params.x_norm),
                 selection.ninepath_d3,
-                selection.qwen4_top10,
+                selection.route,
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if selection.qwen4_top10 {
+        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
             return super::qt44_qt53_prefill::gate_up(
                 gpu,
                 params,
@@ -784,7 +829,7 @@ impl<'a> SealedMoeOp<'a> {
                 "sealed moe: unscatter is only valid for grouped prefill path 2".into(),
             ));
         }
-        if selection.qwen4_top10 {
+        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
             return super::qt44_qt53_prefill::unscatter(gpu, params, selection.path2_m_total);
         }
         super::prefill_gate_up_unscatter_stage(gpu, params, selection.path2_m_total)
@@ -796,11 +841,11 @@ impl<'a> SealedMoeOp<'a> {
                 gpu,
                 params,
                 selection.resolution,
-                selection.qwen4_top10,
+                selection.route,
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if selection.qwen4_top10 {
+        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
             return super::qt44_qt53_prefill::activation(gpu, params);
         }
         let total_slots = params
@@ -823,11 +868,11 @@ impl<'a> SealedMoeOp<'a> {
                 selection.ninepath_mq4v2,
                 selection.ninepath_mq6v2,
                 selection.down_last_combine,
-                selection.qwen4_top10,
+                selection.route,
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if selection.qwen4_top10 {
+        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
             return super::qt44_qt53_prefill::down(
                 gpu,
                 params,
@@ -864,11 +909,11 @@ impl<'a> SealedMoeOp<'a> {
                 gpu,
                 params,
                 params.routed_out.unwrap_or(params.x_residual),
-                selection.qwen4_top10,
+                selection.route,
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if selection.qwen4_top10 {
+        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
             return super::qt44_qt53_prefill::combine(
                 gpu,
                 params,
@@ -932,7 +977,7 @@ fn lower_decode<'a>(
     let (params, selection) = state.decode_parts()?;
     let mut steps = SmallVec::new();
     let op = |state: &'a MoeStepState<'a>| SealedMoeOp::new(state);
-    append_step(&mut steps, Step::MoeNormalize(op(state)))?;
+    append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Normalize))?;
     let adopted = matches!(
         state.call.router_input(),
         MoeRouterInput::PrecomputedSoftmaxTopK | MoeRouterInput::PrecomputedSigmoidTopK
@@ -940,36 +985,44 @@ fn lower_decode<'a>(
     match params.recipe {
         MoeRecipe::SoftmaxGatedShared => {
             if selection.resolution.needs_x_rot_local {
-                append_step(&mut steps, Step::MoeInputBasis(op(state)))?;
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
             }
             if !adopted {
                 // Qwen's gate-side operation preserves the existing fused
                 // router/selector/gate/up launch when its static quartet is
                 // admitted; the route operation then owns top-k production.
-                append_step(&mut steps, Step::MoeGateSide(op(state)))?;
-                append_step(&mut steps, Step::MoeRoute(op(state)))?;
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateSide))?;
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Route))?;
             }
-            if !selection.qwen4_top10 && !params.skip_shared {
-                append_step(&mut steps, Step::MoeSharedDown(op(state)))?;
+            if !matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped))
+                && !params.skip_shared
+            {
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
             }
         }
         MoeRecipe::SigmoidRoutedNoShared => {
             if !adopted {
-                append_step(&mut steps, Step::MoeRouterProjection(op(state)))?;
-                append_step(&mut steps, Step::MoeRoute(op(state)))?;
+                append_step(
+                    &mut steps,
+                    Step::MoeStage(op(state), MoeStage::RouterProjection),
+                )?;
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Route))?;
             }
             // Cohere's sigmoid route consumes the normalized natural input
             // first and transforms it only after top-eight selection.
             if selection.resolution.needs_x_rot_local {
-                append_step(&mut steps, Step::MoeInputBasis(op(state)))?;
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
             }
         }
     }
     if selection.resolution.use_gpu_topk {
-        append_step(&mut steps, Step::MoeGateUp(op(state)))?;
-        append_step(&mut steps, Step::MoeActivation(op(state)))?;
-        append_step(&mut steps, Step::MoeDown(op(state)))?;
-        append_step(&mut steps, Step::MoeMutationFence(op(state)))?;
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateUp))?;
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Activation))?;
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Down))?;
+        append_step(
+            &mut steps,
+            Step::MoeStage(op(state), MoeStage::MutationFence),
+        )?;
         let down_self_combines = selection.down_last_combine
             || !crate::families::moe::moe_down_writes_expanded(
                 params.dtypes.routed_down,
@@ -978,25 +1031,28 @@ fn lower_decode<'a>(
         let combine_after_down = params.ep_mode
             != crate::families::moe::MoeEpMode::RootRoutedPartial
             && !selection.ninepath_d4
-            && (selection.qwen4_top10 || !down_self_combines)
+            && (matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped))
+                || !down_self_combines)
             && !params.defer_routed_combine;
         if combine_after_down {
-            append_step(&mut steps, Step::MoeCombine(op(state)))?;
-            if selection.qwen4_top10 && !params.skip_shared {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
+            if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped))
+                && !params.skip_shared
+            {
                 // Qwen4's source module performs routed index_add first and
                 // only then adds the shared expert output in BF16.
-                append_step(&mut steps, Step::MoeSharedDown(op(state)))?;
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
             }
-        } else if selection.qwen4_top10
+        } else if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped))
             && !params.skip_shared
             && params.ep_mode == crate::families::moe::MoeEpMode::RootRoutedPartial
         {
             // Root-routed EP folds the gathered slots outside this local
             // program; preserve the existing shared partial contract there.
-            append_step(&mut steps, Step::MoeSharedDown(op(state)))?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
         }
     } else {
-        append_step(&mut steps, Step::MoeHostExperts(op(state)))?;
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::HostExperts))?;
     }
     Ok(steps)
 }
@@ -1007,25 +1063,37 @@ fn lower_prefill<'a>(
     let (params, selection) = state.prefill_parts()?;
     let mut steps = SmallVec::new();
     let op = |state: &'a MoeStepState<'a>| SealedMoeOp::new(state);
-    if selection.qwen4_top10 {
-        append_step(&mut steps, Step::MoeNormalize(op(state)))?;
-        append_step(&mut steps, Step::MoeInputBasis(op(state)))?;
-        append_step(&mut steps, Step::MoeRouterProjection(op(state)))?;
-        append_step(&mut steps, Step::MoeSharedGateUp(op(state)))?;
-        append_step(&mut steps, Step::MoeSharedActivation(op(state)))?;
-        append_step(&mut steps, Step::MoeRoute(op(state)))?;
+    if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Normalize))?;
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
+        append_step(
+            &mut steps,
+            Step::MoeStage(op(state), MoeStage::RouterProjection),
+        )?;
+        append_step(
+            &mut steps,
+            Step::MoeStage(op(state), MoeStage::SharedGateUp),
+        )?;
+        append_step(
+            &mut steps,
+            Step::MoeStage(op(state), MoeStage::SharedActivation),
+        )?;
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Route))?;
         if selection.resolution.use_path2 {
-            append_step(&mut steps, Step::MoeScatter(op(state)))?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Scatter))?;
         }
-        append_step(&mut steps, Step::MoeGateUp(op(state)))?;
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateUp))?;
         if selection.resolution.use_path2 {
-            append_step(&mut steps, Step::MoeUnscatter(op(state)))?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Unscatter))?;
         }
-        append_step(&mut steps, Step::MoeActivation(op(state)))?;
-        append_step(&mut steps, Step::MoeDown(op(state)))?;
-        append_step(&mut steps, Step::MoeMutationFence(op(state)))?;
-        append_step(&mut steps, Step::MoeCombine(op(state)))?;
-        append_step(&mut steps, Step::MoeSharedDown(op(state)))?;
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Activation))?;
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Down))?;
+        append_step(
+            &mut steps,
+            Step::MoeStage(op(state), MoeStage::MutationFence),
+        )?;
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
         return Ok(steps);
     }
     let adopted = matches!(
@@ -1034,40 +1102,55 @@ fn lower_prefill<'a>(
     );
     match params.recipe {
         MoeRecipe::SoftmaxGatedShared => {
-            append_step(&mut steps, Step::MoeInputBasis(op(state)))?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
             if !adopted {
-                append_step(&mut steps, Step::MoeRouterProjection(op(state)))?;
+                append_step(
+                    &mut steps,
+                    Step::MoeStage(op(state), MoeStage::RouterProjection),
+                )?;
             }
-            append_step(&mut steps, Step::MoeSharedGateUp(op(state)))?;
-            append_step(&mut steps, Step::MoeSharedActivation(op(state)))?;
-            append_step(&mut steps, Step::MoeSharedDown(op(state)))?;
-            append_step(&mut steps, Step::MoeRoute(op(state)))?;
+            append_step(
+                &mut steps,
+                Step::MoeStage(op(state), MoeStage::SharedGateUp),
+            )?;
+            append_step(
+                &mut steps,
+                Step::MoeStage(op(state), MoeStage::SharedActivation),
+            )?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Route))?;
         }
         MoeRecipe::SigmoidRoutedNoShared => {
             if !adopted {
-                append_step(&mut steps, Step::MoeRouterProjection(op(state)))?;
-                append_step(&mut steps, Step::MoeRoute(op(state)))?;
+                append_step(
+                    &mut steps,
+                    Step::MoeStage(op(state), MoeStage::RouterProjection),
+                )?;
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Route))?;
             }
-            append_step(&mut steps, Step::MoeInputBasis(op(state)))?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
         }
     }
     if selection.resolution.use_path2 {
-        append_step(&mut steps, Step::MoeScatter(op(state)))?;
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Scatter))?;
     }
-    append_step(&mut steps, Step::MoeGateUp(op(state)))?;
+    append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateUp))?;
     if selection.resolution.use_path2 {
-        append_step(&mut steps, Step::MoeUnscatter(op(state)))?;
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Unscatter))?;
     }
-    append_step(&mut steps, Step::MoeActivation(op(state)))?;
-    append_step(&mut steps, Step::MoeDown(op(state)))?;
-    append_step(&mut steps, Step::MoeMutationFence(op(state)))?;
+    append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Activation))?;
+    append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Down))?;
+    append_step(
+        &mut steps,
+        Step::MoeStage(op(state), MoeStage::MutationFence),
+    )?;
     let compact_ep = matches!(
         params.prelude.route,
         super::sealed_moe::PrefillRouteMode::ProduceRoot { .. }
             | super::sealed_moe::PrefillRouteMode::AdoptRoot { .. }
     );
     if !compact_ep && (selection.resolution.use_path2 || !selection.resolution.down_path0) {
-        append_step(&mut steps, Step::MoeCombine(op(state)))?;
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
     }
     Ok(steps)
 }
@@ -1077,11 +1160,11 @@ pub(super) fn execute(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<(), Dis
     // Reborrow the call at the execution lifetime. The state and every Step
     // borrow only this invocation and are dropped before the call returns.
     let state = MoeStepState::new(call);
-    let mut steps = match call.protocol() {
+    let steps = match call.protocol() {
         MoeProtocol::IndexedDecode => lower_decode(&state)?,
         MoeProtocol::GroupedPrefill => lower_prefill(&state)?,
     };
-    super::steps::execute_validated_steps(gpu, call.dispatch_ctx(), &mut steps)
+    super::steps::execute_validated_steps(gpu, call.dispatch_ctx(), &steps)
 }
 
 /// Execute only the canonical slot-order combine for a validated EP call.
@@ -1091,6 +1174,22 @@ pub(super) fn execute_ep_slot_combine(
 ) -> Result<(), DispatchError> {
     let state = MoeStepState::new(call);
     SealedMoeOp::new(&state).combine(gpu)
+}
+
+/// The specialized wire path does not apply per-projection transformations.
+fn projection_has_sidecars(
+    router: &crate::families::gemv::WeightRef<'_>,
+    shared: &crate::families::moe::MoeSharedWeights<'_>,
+) -> bool {
+    [
+        router,
+        &shared.selector,
+        &shared.gate,
+        &shared.up,
+        &shared.down,
+    ]
+    .into_iter()
+    .any(|weight| weight.rotation.is_some() || weight.awq_scale.is_some())
 }
 
 /// Resolve all decode choices without a GPU. Dynamic GPU capture state remains
@@ -1112,23 +1211,47 @@ pub(super) fn select_decode(
         ));
     }
     let mut resolution = MoeResolution::resolve_arch(&params.dtypes, params.k, ctx.arch.has_wmma());
-    let qwen4_top10 = params.recipe == MoeRecipe::SoftmaxGatedShared
+    let route = (params.recipe == MoeRecipe::SoftmaxGatedShared
         && params.batch_size == 1
         && params.ep_mode == crate::families::moe::MoeEpMode::None
-        && !params.defer_routed_combine
-        && super::is_qwen4_route(
-            &params.dtypes,
-            params.n_exp,
-            params.k,
-            params.hidden,
-            params.mi,
-            params.routed_gate_up_k,
-            params.routed_down_m,
-            params.routed_down_k,
-            params.expert_dtype_tags,
-            params.route_policy,
-        );
-    if qwen4_top10 {
+        && params.routed_gate_up_paro.is_none()
+        && params.routed_down_paro.is_none()
+        && !params.defer_routed_combine)
+        .then(|| {
+            super::select_grouped_route(
+                ctx,
+                &params.dtypes,
+                params.n_exp,
+                params.k,
+                params.hidden,
+                params.mi,
+                params
+                    .shared
+                    .as_ref()
+                    .map_or(0, |shared| shared.intermediate),
+                params.routed_gate_up_k,
+                params.routed_down_m,
+                params.routed_down_k,
+                params.expert_dtype_tags,
+                params.expert_down_awq_ptrs.is_some()
+                    || params.shared.as_ref().is_some_and(|shared| {
+                        projection_has_sidecars(&params.router, &shared.weights)
+                    }),
+                params.route_policy,
+            )
+        })
+        .flatten();
+    if params.route_policy.is_some() && route.is_none() {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "specialized-decode-route-unsupported",
+            arch: "",
+            quant: "QT44/QT53",
+        });
+    }
+    if route.is_none() {
+        super::reject_mq4g128v2_moe(&params.dtypes)?;
+    } else {
         resolution.use_gpu_topk = true;
         resolution.needs_x_rot_local = true;
     }
@@ -1283,7 +1406,7 @@ pub(super) fn select_decode(
         exact_wave64_router,
         wave64_router,
         down_last_combine,
-        qwen4_top10,
+        route,
         ninepath_d3: ninepath_hfq4 && matches!(ninepath_mode, "1" | "d3" | "on"),
         ninepath_d4: ninepath_eligible && !matches!(ninepath_mode, "0" | "off" | "d3"),
         ninepath_mq3l,
@@ -1297,24 +1420,51 @@ pub(super) fn select_prefill(
     ctx: &DispatchCtx,
     params: &MoePrefillParams<'_>,
 ) -> Result<MoePrefillSelection, DispatchError> {
-    let qwen4_top10 = params.recipe == MoeRecipe::SoftmaxGatedShared
+    let route = (params.recipe == MoeRecipe::SoftmaxGatedShared
         && params.routed_out.is_none()
+        && params.paro_gate_up.is_none()
+        && params.paro_down.is_none()
         && matches!(
             params.prelude.route,
             super::sealed_moe::PrefillRouteMode::Replicated
-        )
-        && super::is_qwen4_route(
+        ))
+    .then(|| {
+        super::select_grouped_route(
+            ctx,
             &params.dtypes,
             params.n_exp,
             params.k_top,
             params.gate_up_k,
             params.mi,
+            params
+                .prelude
+                .shared
+                .as_ref()
+                .map_or(0, |shared| shared.intermediate),
             params.gate_up_k,
             params.down_m,
             params.down_k,
             params.expert_dtype_tags,
+            params.expert_down_awq_ptrs.is_some()
+                || params.down_awq_scale.is_some()
+                || params.prelude.shared.as_ref().is_some_and(|shared| {
+                    projection_has_sidecars(&params.prelude.router, &shared.weights)
+                }),
             params.route_policy,
-        );
+        )
+    })
+    .flatten();
+    if params.route_policy.is_some() && route.is_none() {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "specialized-prefill-route-unsupported",
+            arch: "",
+            quant: "QT44/QT53",
+        });
+    }
+    if route.is_none() {
+        super::reject_mq4g128v2_moe(&params.dtypes)?;
+    }
     let resolution = MoePrefillResolution::resolve(&params.dtypes, &ctx.arch, &ctx.flags);
     let _total_slots = params
         .batch_size
@@ -1340,7 +1490,7 @@ pub(super) fn select_prefill(
         resolution,
         path2_m_total,
         force_mq4_grouped_fp16,
-        qwen4_top10,
+        route,
     })
 }
 

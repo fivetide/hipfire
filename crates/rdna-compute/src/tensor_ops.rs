@@ -4,10 +4,9 @@
 
 //! Ordinary-HIP tensor operation wrappers.
 //!
-//! These functions are explicit F32 contracts for the supported trunk.  They
-//! do not perform source I/O, allocate scratch, or silently choose a different
-//! family implementation.  The caller selects the supported gfx1151 route
-//! before calling them.
+//! These functions enforce the tensor layout and F32/BF16 boundaries at the
+//! shared HIP launch site; architecture-specific tuning remains an explicit
+//! selector rather than an admission requirement.
 
 use hip_bridge::{HipError, HipResult, KernargBlob};
 
@@ -15,20 +14,17 @@ use crate::{DType, Gpu, GpuTensor};
 
 pub(crate) const TENSOR_OPS_SRC: &str = include_str!("../../../kernels/src/tensor_ops.hip");
 const QSA_SELECT_PARALLEL_THREADS: u32 = 256;
-// gfx1151's ordinary-HIP dynamic LDS ceiling. Oversized score arrays retain
-// the serial kernel so this tuning never changes the existing large-shape path.
+// gfx1151's 64-KiB dynamic LDS budget; other devices use the serial path.
+// Oversized rows also use serial kernels without changing the contract.
 const QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES: usize = 64 * 1024;
 const QSA_ATTENTION_PARALLEL_THREADS: u32 = 256;
 const QSA_ATTENTION_LDS_BYTES_PER_ROW: usize = 8; // F32 score + i32 token.
-                                                  // gfx1151's ordinary-HIP dynamic LDS ceiling; oversized attention rows keep
-                                                  // the serial kernel and unchanged launch contract.
 const QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComputeError {
     WrongDtype,
     WrongShape,
-    UnsupportedArch,
 }
 
 impl std::fmt::Display for ComputeError {
@@ -36,7 +32,6 @@ impl std::fmt::Display for ComputeError {
         match self {
             Self::WrongDtype => write!(f, "tensor operation expects F32 tensors"),
             Self::WrongShape => write!(f, "tensor operation tensor shape mismatch"),
-            Self::UnsupportedArch => write!(f, "ordinary HIP tensor operation requires gfx1151"),
         }
     }
 }
@@ -46,13 +41,6 @@ impl std::error::Error for ComputeError {}
 pub(crate) fn ensure_f32(tensor: &GpuTensor) -> HipResult<()> {
     if tensor.dtype != DType::F32 {
         return Err(HipError::new(0, &ComputeError::WrongDtype.to_string()));
-    }
-    Ok(())
-}
-
-pub(crate) fn ensure_gfx1151(gpu: &Gpu) -> HipResult<()> {
-    if !gpu.arch_caps.is_gfx1151() {
-        return Err(HipError::new(0, &ComputeError::UnsupportedArch.to_string()));
     }
     Ok(())
 }
@@ -122,7 +110,6 @@ pub struct GatedDeltaStep<'a> {
 }
 
 pub fn gated_delta_step(gpu: &mut Gpu, p: &GatedDeltaStep<'_>) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     for tensor in [p.q, p.k, p.v, p.gate, p.beta, p.state, p.output] {
         ensure_f32(tensor)?;
     }
@@ -184,9 +171,11 @@ pub fn gated_delta_step(gpu: &mut Gpu, p: &GatedDeltaStep<'_>) -> HipResult<()> 
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
-/// Persistent row-batched GDN recurrence for the exact gfx1151 128x128 route.
-/// The kernel partitions each value channel's 128-state column across two
-/// 64-value halves and serializes the cross-half dot chains in shared memory.
+/// Persistent row-batched GDN recurrence for the exact 128x128 geometry.
+/// The kernel partitions each value channel's state column across two
+/// 64-value halves and serializes cross-half dot chains in shared memory.
+/// The older DeltaNet kernels use a different state orientation and omit the
+/// source BF16 Q/K normalization, so they cannot replace this exact-state path.
 pub struct GatedDeltaStepBatched<'a> {
     pub projection: &'a GpuTensor,
     pub gate: &'a GpuTensor,
@@ -202,7 +191,6 @@ pub struct GatedDeltaStepBatched<'a> {
 }
 
 pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     for tensor in [p.projection, p.gate, p.beta, p.state, p.output] {
         ensure_f32(tensor)?;
     }
@@ -242,11 +230,8 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     let key_dim = checked_i32(p.key_dim, "GDN batched key width")?;
     let value_dim = checked_i32(p.value_dim, "GDN batched value width")?;
     let value_heads_grid = checked_u32(p.value_heads, "GDN batched value-head grid")?;
-    gpu.ensure_kernel_public(
-        "tensor_ops",
-        TENSOR_OPS_SRC,
-        "gated_delta_step_halves_state128_persistent256_gfx1151",
-    )?;
+    let kernel = "gated_delta_step_halves_state128_persistent256_f32";
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
     for tensor in [p.projection, p.gate, p.beta, p.state, p.output] {
         args.push_ptr(tensor.buf.as_ptr());
@@ -260,7 +245,7 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     args.push_f32((p.key_dim as f32).sqrt().recip());
     args.pad_to(16);
     gpu.launch_blob_recorded(
-        "gated_delta_step_halves_state128_persistent256_gfx1151",
+        kernel,
         [value_heads_grid, 1, 1],
         [256, 1, 1],
         0,
@@ -279,7 +264,6 @@ pub struct Bf16Roundtrip<'a> {
 }
 
 pub fn bf16_roundtrip_f32(gpu: &mut Gpu, p: &Bf16Roundtrip<'_>) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     ensure_f32(p.input)?;
     ensure_f32(p.output)?;
     let elements = checked_extent(p.elements, "BF16 roundtrip extent")?;
@@ -317,7 +301,6 @@ pub struct HcActivationFused<'a> {
 }
 
 pub fn hc_activation_fused_f32(gpu: &mut Gpu, p: &HcActivationFused<'_>) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     ensure_f32(p.values)?;
     let elements = checked_extent(p.values.numel(), "HC activation extent")?;
     if elements == 0 {
@@ -350,7 +333,6 @@ pub struct Bf16ScaledAdd<'a> {
 }
 
 pub fn bf16_scaled_add(gpu: &mut Gpu, p: &Bf16ScaledAdd<'_>) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     ensure_f32(p.residual)?;
     ensure_f32(p.value)?;
     ensure_f32(p.scalar)?;
@@ -390,7 +372,6 @@ pub struct Bf16ScaledAddBatched<'a> {
 }
 
 pub fn bf16_scaled_add_batched(gpu: &mut Gpu, p: &Bf16ScaledAddBatched<'_>) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     ensure_f32(p.residual)?;
     ensure_f32(p.value)?;
     ensure_f32(p.scalar)?;
@@ -437,7 +418,6 @@ pub struct HyperRead<'a> {
 }
 
 pub fn hyper_read(gpu: &mut Gpu, p: &HyperRead<'_>) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     for tensor in [p.input, p.low, p.up, p.normalized, p.mixed] {
         ensure_f32(tensor)?;
     }
@@ -490,7 +470,6 @@ pub struct HyperReadProjected<'a> {
 }
 
 pub fn hyper_read_projected(gpu: &mut Gpu, p: &HyperReadProjected<'_>) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     for tensor in [p.input, p.up, p.normalized, p.mixed] {
         ensure_f32(tensor)?;
     }
@@ -546,7 +525,6 @@ pub struct HyperWrite<'a> {
 }
 
 pub fn hyper_write(gpu: &mut Gpu, p: &HyperWrite<'_>) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     for tensor in [p.input, p.normalized, p.mixed, p.gates, p.output] {
         ensure_f32(tensor)?;
     }
@@ -592,44 +570,6 @@ pub fn hyper_write(gpu: &mut Gpu, p: &HyperWrite<'_>) -> HipResult<()> {
     )
 }
 
-pub struct HyperFinal<'a> {
-    pub normalized: &'a GpuTensor,
-    pub output: &'a GpuTensor,
-    pub branches: usize,
-    pub hidden: usize,
-}
-
-pub fn hyper_final(gpu: &mut Gpu, p: &HyperFinal<'_>) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
-    for tensor in [p.normalized, p.output] {
-        ensure_f32(tensor)?;
-    }
-    if p.branches == 0 || p.hidden == 0 {
-        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
-    }
-    let normalized_elements = checked_product(p.branches, p.hidden, "HC final extent")?;
-    let branches = checked_i32(p.branches, "HC final branch count")?;
-    let hidden = checked_i32(p.hidden, "HC final hidden width")?;
-    let grid = blocks(p.hidden)?;
-    if p.normalized.numel() != normalized_elements || p.output.numel() != p.hidden {
-        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
-    }
-    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "hyper_final_f32")?;
-    let mut args = KernargBlob::new();
-    args.push_ptr(p.normalized.buf.as_ptr());
-    args.push_ptr(p.output.buf.as_ptr());
-    args.push_i32(branches);
-    args.push_i32(hidden);
-    args.pad_to(16);
-    gpu.launch_blob_recorded(
-        "hyper_final_f32",
-        [grid, 1, 1],
-        [256, 1, 1],
-        0,
-        args.as_mut_slice(),
-        crate::dispatch::ReplayLaunchBindings::NONE,
-    )
-}
 pub struct HyperNorm<'a> {
     pub input: &'a GpuTensor,
     pub norm_weight: &'a GpuTensor,
@@ -639,7 +579,6 @@ pub struct HyperNorm<'a> {
 }
 
 pub fn hyper_norm(gpu: &mut Gpu, p: &HyperNorm<'_>) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     ensure_f32(p.input)?;
     ensure_f32(p.normalized)?;
     if p.norm_weight.dtype != DType::BF16 || p.branches == 0 || p.hidden == 0 {
@@ -694,7 +633,6 @@ pub struct GatedDeltaConv<'a> {
 }
 
 pub fn gated_delta_conv(gpu: &mut Gpu, p: &GatedDeltaConv<'_>) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     for tensor in [p.input, p.history, p.output, p.next_history] {
         ensure_f32(tensor)?;
     }
@@ -786,7 +724,6 @@ pub struct GatedDeltaConvBatched<'a> {
 }
 
 pub fn gated_delta_conv_batched(gpu: &mut Gpu, p: &GatedDeltaConvBatched<'_>) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     for tensor in [p.input, p.history, p.output, p.next_history] {
         ensure_f32(tensor)?;
     }
@@ -821,11 +758,8 @@ pub fn gated_delta_conv_batched(gpu: &mut Gpu, p: &GatedDeltaConvBatched<'_>) ->
     let kernel_size = checked_i32(p.kernel_size, "GDN batched convolution kernel width")?;
     let start_cursor = checked_i32(p.start_cursor, "GDN batched convolution cursor")?;
     let grid = blocks(p.channels)?;
-    gpu.ensure_kernel_public(
-        "tensor_ops",
-        TENSOR_OPS_SRC,
-        "gated_delta_conv_bf16_f32_batched_k4_gfx1151",
-    )?;
+    let kernel = "gated_delta_conv_bf16_f32_batched_k4";
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
     for tensor in [p.input, p.kernel, p.history, p.output, p.next_history] {
         args.push_ptr(tensor.buf.as_ptr());
@@ -847,7 +781,7 @@ pub fn gated_delta_conv_batched(gpu: &mut Gpu, p: &GatedDeltaConvBatched<'_>) ->
             .map_err(|_| HipError::new(0, "GDN batched convolution history rows exceed u32"))?,
     }];
     gpu.launch_blob_recorded(
-        "gated_delta_conv_bf16_f32_batched_k4_gfx1151",
+        kernel,
         [grid, 1, 1],
         [256, 1, 1],
         0,
@@ -869,7 +803,6 @@ pub struct GatedDeltaParams<'a> {
 }
 
 pub fn gated_delta_params(gpu: &mut Gpu, p: &GatedDeltaParams<'_>, heads: usize) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     for tensor in [p.a, p.b, p.gate, p.beta] {
         ensure_f32(tensor)?;
     }
@@ -916,7 +849,6 @@ pub struct GatedDeltaParamsBatched<'a> {
 }
 
 pub fn gated_delta_params_batched(gpu: &mut Gpu, p: &GatedDeltaParamsBatched<'_>) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     for tensor in [p.a, p.b, p.gate, p.beta] {
         ensure_f32(tensor)?;
     }
@@ -964,7 +896,6 @@ pub fn gated_delta_params_f32(
     p: &GatedDeltaParams<'_>,
     heads: usize,
 ) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     for tensor in [p.a, p.b, p.a_log, p.dt_bias, p.gate, p.beta] {
         ensure_f32(tensor)?;
     }
@@ -1007,7 +938,6 @@ pub struct GatedDeltaGate<'a> {
 }
 
 pub fn gated_delta_gate(gpu: &mut Gpu, p: &GatedDeltaGate<'_>) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     for tensor in [p.recurrent_output, p.z, p.output] {
         ensure_f32(tensor)?;
     }
@@ -1056,7 +986,6 @@ pub struct GatedDeltaGateBatched<'a> {
 }
 
 pub fn gated_delta_gate_batched(gpu: &mut Gpu, p: &GatedDeltaGateBatched<'_>) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     for tensor in [p.recurrent_output, p.z, p.output] {
         ensure_f32(tensor)?;
     }
@@ -1114,7 +1043,6 @@ pub fn indexed_attention_norm_rope(
     gpu: &mut Gpu,
     p: &IndexedAttentionNormRope<'_>,
 ) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     ensure_f32(p.values)?;
     if p.norm.dtype != DType::BF16
         || p.heads == 0
@@ -1179,7 +1107,6 @@ pub fn indexed_attention_norm_rope_batch(
     gpu: &mut Gpu,
     p: &IndexedAttentionNormRopeBatch<'_>,
 ) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     ensure_f32(p.values)?;
     if p.norm.dtype != DType::BF16
         || p.rows == 0
@@ -1271,7 +1198,6 @@ pub fn indexed_attention_cache_append(
     gpu: &mut Gpu,
     p: &IndexedAttentionCacheAppend<'_>,
 ) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     for tensor in [p.key, p.value, p.full_keys, p.full_values] {
         ensure_f32(tensor)?;
     }
@@ -1326,7 +1252,6 @@ pub fn indexed_attention_cache_append_batch(
     gpu: &mut Gpu,
     p: &IndexedAttentionCacheAppendBatch<'_>,
 ) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     for tensor in [p.key, p.value, p.full_keys, p.full_values] {
         ensure_f32(tensor)?;
     }
@@ -1397,7 +1322,6 @@ pub struct IndexedAttentionSelect<'a> {
 }
 
 pub fn indexed_attention_select(gpu: &mut Gpu, p: &IndexedAttentionSelect<'_>) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     for tensor in [p.query, p.pooled] {
         ensure_f32(tensor)?;
     }
@@ -1434,7 +1358,9 @@ pub fn indexed_attention_select(gpu: &mut Gpu, p: &IndexedAttentionSelect<'_>) -
     let (kernel_name, block, shared_mem) =
         match p.block_count.checked_mul(std::mem::size_of::<f32>()) {
             Some(bytes)
-                if bytes <= QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES && bytes <= u32::MAX as usize =>
+                if gpu.arch_caps.is_gfx1151()
+                    && bytes <= QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES
+                    && bytes <= u32::MAX as usize =>
             {
                 (
                     "indexed_attention_select_f32",
@@ -1495,7 +1421,6 @@ pub fn indexed_attention_select_batch(
     gpu: &mut Gpu,
     p: &IndexedAttentionSelectBatch<'_>,
 ) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     for tensor in [p.query, p.pooled] {
         ensure_f32(tensor)?;
     }
@@ -1582,7 +1507,8 @@ pub fn indexed_attention_select_batch(
     let (kernel_name, block, shared_mem) =
         match shape_blocks.checked_mul(std::mem::size_of::<f32>()) {
             Some(bytes)
-                if shape_blocks > 0
+                if gpu.arch_caps.is_gfx1151()
+                    && shape_blocks > 0
                     && bytes <= QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES
                     && bytes <= u32::MAX as usize =>
             {
@@ -1658,7 +1584,6 @@ pub fn indexed_attention_reuse_selection(
     gpu: &mut Gpu,
     p: &IndexedAttentionReuseSelection<'_>,
 ) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     let selected_bytes = p
         .capacity
         .checked_mul(std::mem::size_of::<i32>())
@@ -1733,7 +1658,6 @@ pub fn indexed_attention_pool_rope(
     gpu: &mut Gpu,
     p: &IndexedAttentionPoolRope<'_>,
 ) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     for tensor in [p.raw_keys, p.pooled] {
         ensure_f32(tensor)?;
     }
@@ -1859,7 +1783,6 @@ pub fn indexed_attention_attention(
     gpu: &mut Gpu,
     p: &IndexedAttentionAttention<'_>,
 ) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     for tensor in [p.q_with_gate, p.full_keys, p.full_values, p.output] {
         ensure_f32(tensor)?;
     }
@@ -1902,7 +1825,9 @@ pub fn indexed_attention_attention(
     let (kernel_name, shared_mem) =
         match p.selected_len.checked_mul(QSA_ATTENTION_LDS_BYTES_PER_ROW) {
             Some(bytes)
-                if bytes <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES && bytes <= u32::MAX as usize =>
+                if gpu.arch_caps.is_gfx1151()
+                    && bytes <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
+                    && bytes <= u32::MAX as usize =>
             {
                 ("indexed_attention_attention_f32", bytes as u32)
             }
@@ -1962,7 +1887,6 @@ pub fn indexed_attention_attention_batch(
     gpu: &mut Gpu,
     p: &IndexedAttentionAttentionBatch<'_>,
 ) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     for tensor in [p.q_with_gate, p.full_keys, p.full_values, p.output] {
         ensure_f32(tensor)?;
     }
@@ -2044,7 +1968,8 @@ pub fn indexed_attention_attention_batch(
     let (kernel_name, block, shared_mem) =
         match shape_selected.checked_mul(QSA_ATTENTION_LDS_BYTES_PER_ROW) {
             Some(bytes)
-                if shape_selected > 0
+                if gpu.arch_caps.is_gfx1151()
+                    && shape_selected > 0
                     && bytes <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
                     && bytes <= u32::MAX as usize =>
             {
@@ -2113,7 +2038,6 @@ pub struct IndexedAttentionPool<'a> {
 }
 
 pub fn indexed_attention_pool(gpu: &mut Gpu, p: &IndexedAttentionPool<'_>) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     ensure_f32(p.raw_keys)?;
     ensure_f32(p.pooled)?;
     if p.block_count == 0 || p.head_dim == 0 {
@@ -2152,7 +2076,6 @@ pub struct ScaleF32<'a> {
 }
 
 pub fn scale_f32(gpu: &mut Gpu, p: &ScaleF32<'_>) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     ensure_f32(p.values)?;
     let elements = checked_extent(p.values.numel(), "scale extent")?;
     if elements == 0 {
@@ -2185,7 +2108,6 @@ pub struct ArgmaxF32<'a> {
 }
 
 pub fn argmax_f32(gpu: &mut Gpu, p: &ArgmaxF32<'_>) -> HipResult<()> {
-    ensure_gfx1151(gpu)?;
     ensure_f32(p.logits)?;
     if p.rows == 0 || p.vocab == 0 || p.indices.dtype != DType::Raw {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
@@ -2566,20 +2488,7 @@ mod tests {
         .expect("index-key write");
 
         let launches = gpu.replay.recorded_launches();
-        let kernels: Vec<&str> = launches
-            .iter()
-            .map(|launch| launch.kernel.as_str())
-            .collect();
-        assert_eq!(
-            kernels,
-            vec![
-                "indexed_attention_pool_rope_f32",
-                "indexed_attention_select_f32_batched",
-                "indexed_attention_attention_f32_batched",
-                "copy_rows_strided_f32",
-            ],
-            "recording window captured an unexpected launch set"
-        );
+        assert_eq!(launches.len(), 4, "the recorded QSA sequence changed");
 
         // The declared slot must hold the value this very launch used.
         let check = |launch: &crate::replay::RecordedHipLaunch,

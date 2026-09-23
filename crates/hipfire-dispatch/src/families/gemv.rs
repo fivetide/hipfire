@@ -21,7 +21,7 @@ use crate::types::*;
 fn reject_mq4g128v2() -> Result<(), DispatchError> {
     Err(DispatchError::UnsupportedVariant {
         family: "gemv",
-        variant: "mq4g128v2_qwen4_typed_only",
+        variant: "mq4g128v2_specialized_route_only",
         arch: "",
         quant: "MQ4G128V2",
     })

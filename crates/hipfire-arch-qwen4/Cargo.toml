@@ -15,3 +15,10 @@ rdna-compute = { path = "../rdna-compute", features = ["deltanet"] }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["deltanet"] }
 smallvec = { version = "1.15.2", features = ["const_generics"] }
 sha2.workspace = true
+
+[features]
+reference-parity = []
+
+[[example]]
+name = "qwen4_parity"
+required-features = ["reference-parity"]

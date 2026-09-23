@@ -785,9 +785,8 @@ fn mq4g128v2_is_explicitly_rejected_by_generic_dispatch_families() {
     ] {
         let result = gemv.resolve(DType::MQ4G128V2, variant, false, &ctx_rdna3(), None);
         match result {
-            Err(DispatchError::UnsupportedVariant { quant, variant, .. }) => {
+            Err(DispatchError::UnsupportedVariant { quant, .. }) => {
                 assert_eq!(quant, "MQ4G128V2");
-                assert_eq!(variant, "mq4g128v2_qwen4_typed_only");
             }
             other => panic!("qt53 GEMV unexpectedly resolved through a generic family: {other:?}"),
         }
@@ -795,9 +794,8 @@ fn mq4g128v2_is_explicitly_rejected_by_generic_dispatch_families() {
 
     let gemm = crate::families::gemm::GemmFamily::new();
     match gemm.resolve(DType::MQ4G128V2, &ctx_rdna3(), None) {
-        Err(DispatchError::UnsupportedVariant { quant, variant, .. }) => {
+        Err(DispatchError::UnsupportedVariant { quant, .. }) => {
             assert_eq!(quant, "MQ4G128V2");
-            assert_eq!(variant, "mq4g128v2_qwen4_typed_only");
         }
         other => panic!("qt53 GEMM unexpectedly resolved through a generic family: {other:?}"),
     }

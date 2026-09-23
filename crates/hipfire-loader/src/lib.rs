@@ -78,6 +78,16 @@ pub trait Carrier: Send + Sync {
         Ok(())
     }
 
+    /// Read-only, per-carrier request-option refusal before GPU allocation.
+    /// The default leaves other architectures' option behavior unchanged.
+    fn admit_options(
+        &self,
+        _draft_path: Option<&str>,
+        _options: admission::SourceAdmissionOptions,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Declared capabilities for this arch. Default is the conservative
     /// “no capability” set — carriers override to declare what they support.
     fn caps(&self) -> saddle_core::caps::ArchCaps {
@@ -2352,26 +2362,25 @@ pub fn load_model_with_kv_backend(
         {
             return Err("qwen4: only contiguous KV backend is admitted".into());
         }
-        let native_mtp = crate::admission::qwen4_native_mtp_requested(spec);
-        if draft_path.is_some()
-            || deepseek4_experts_per_token.is_some()
-            || !matches!(
-                deepseek4_compute_placement,
-                hipfire_config::Deepseek4ComputePlacement::Single
-            )
-            || crate::admission::qwen4_kv_adaptive_requested(kv_adaptive_override)
-            || state_quant_override.is_some()
-            || cask.sidecar.is_some()
-            || spec.dflash.is_some_and(|enabled| enabled)
-            || spec.dspark.is_some_and(|enabled| enabled)
-            || spec.ngram_draft.is_some_and(|enabled| enabled)
-            || crate::admission::qwen4_ddtree_requested(spec)
-        {
-            return Err(
-                "qwen4: requested DFlash, DSpark, n-gram, DDTree, adaptive-KV, CASK, state-quant, or non-Single option is unsupported"
-                    .into(),
-            );
-        }
+        carrier_for(hipfire_arch_qwen4::ARCH_ID)
+            .ok_or_else(|| "no carrier for qwen4".to_string())?
+            .admit_options(
+                draft_path,
+                admission::SourceAdmissionOptions {
+                    spec,
+                    kv_adaptive: admission::qwen4_kv_adaptive_requested(kv_adaptive_override),
+                    gemma4_drafter: false,
+                    cask: cask.sidecar.is_some(),
+                    state_quant: state_quant_override.is_some(),
+                    non_single_compute: !matches!(
+                        deepseek4_compute_placement,
+                        hipfire_config::Deepseek4ComputePlacement::Single
+                    ),
+                    deepseek4_experts: deepseek4_experts_per_token.is_some(),
+                    pflash: false,
+                },
+            )?;
+        let native_mtp = admission::qwen4_native_mtp_requested(spec);
         if native_mtp
             && hipfire_runtime::config::retained_redline_default(
                 &gpu.arch, "qwen4", path, 1, 1, true,
@@ -2591,6 +2600,7 @@ pub fn load_model_with_gemma4_drafter(
                 deepseek4_compute_placement,
                 hipfire_config::Deepseek4ComputePlacement::Single
             ),
+            deepseek4_experts: deepseek4_experts_per_token.is_some(),
             pflash: false,
         },
     )?;

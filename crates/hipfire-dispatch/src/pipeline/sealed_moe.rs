@@ -16,7 +16,7 @@ use crate::context::DispatchCtx;
 use crate::families::gemv::WeightRef;
 use crate::families::moe::{
     MoeEpMode, MoeNormalization, MoeParams, MoePointerEntries, MoePrefillParams, MoeQ8RouterPolicy,
-    MoeRecipe, MoeResolution, MoeRouteCapability, MoeRoutePolicy, RoutedExpertWeights,
+    MoeRecipe, MoeResolution, MoeRouteCapability, RoutedExpertWeights,
 };
 use crate::types::{dtype_rotation_plan, DispatchError, RotationPlan};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -2021,21 +2021,12 @@ pub(super) fn produce_prefill_route<'a>(
         .checked_mul(params.n_exp)
         .ok_or_else(|| invalid("prefill router score capacity overflows"))?;
     require_elements(scores, score_elements, "prefill router scores")?;
-    let qwen4_top10 = params.recipe == MoeRecipe::SoftmaxGatedShared
-        && params.routed_out.is_none()
-        && matches!(params.prelude.route, PrefillRouteMode::Replicated)
-        && super::is_qwen4_route(
-            &params.dtypes,
-            params.n_exp,
-            params.k_top,
-            params.gate_up_k,
-            params.mi,
-            params.gate_up_k,
-            params.down_m,
-            params.down_k,
-            params.expert_dtype_tags,
-            params.route_policy,
-        );
+    let route = match call.kernel_selection() {
+        MoeKernelSelection::Prefill(selection) => selection.route,
+        MoeKernelSelection::Decode(_) => {
+            return Err(invalid("prefill producer has decode selection"))
+        }
+    };
 
     match call.router {
         MoeRouterInput::SoftmaxTopK | MoeRouterInput::PrecomputedSoftmaxTopK => {
@@ -2047,7 +2038,7 @@ pub(super) fn produce_prefill_route<'a>(
                     "prefill softmax producer requires a 2-D [batch,n_experts] score view",
                 ));
             }
-            if qwen4_top10 {
+            if matches!(route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
                 gpu.bf16_round_trip_f32(scores)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
                 gpu.moe_router_softmax_top10_f32(
@@ -2654,55 +2645,6 @@ pub fn preflight_prefill<'a>(
     Ok(())
 }
 
-fn validate_qwen4_route_width(
-    n_experts: usize,
-    k: usize,
-    hidden: usize,
-    intermediate: usize,
-    gate_up_k: usize,
-    down_m: usize,
-    down_k: usize,
-    gate_up: DType,
-    down: DType,
-    protocol: &str,
-    route_policy: Option<MoeRoutePolicy>,
-) -> Result<(), DispatchError> {
-    let Some(policy) = route_policy else {
-        if down == DType::MQ4G128V2 {
-            return Err(invalid(format!(
-                "{protocol} qt53 down requires an architecture-declared projection pair"
-            )));
-        }
-        return Ok(());
-    };
-    if down == DType::MQ4G128V2
-        && !crate::families::moe::grouped_route_geometry_supported(
-            &policy,
-            n_experts,
-            k,
-            hidden,
-            intermediate,
-            gate_up_k,
-            down_m,
-            down_k,
-            gate_up,
-            down,
-        )
-    {
-        return Err(invalid(format!(
-            "{protocol} QT44/QT53 grouped route geometry or wire format is unsupported"
-        )));
-    }
-    if down != DType::MQ4G128V2 {
-        return Ok(());
-    }
-    if gate_up != DType::MQ4G256V2 {
-        return Err(invalid(format!(
-            "{protocol} QT53 down requires the canonical QT44 gate/up format"
-        )));
-    }
-    Ok(())
-}
 /// Seal a compact EP grouped-prefill call. Root-routed EP is a softmax-only
 /// protocol; sigmoid/no-shared recipes are rejected before publication.
 pub fn seal_prefill_ep<'a>(
@@ -3040,19 +2982,6 @@ fn validate_decode(
     if params.hidden == 0 || params.mi == 0 {
         return Err(invalid("decode dimensions must be nonzero"));
     }
-    validate_qwen4_route_width(
-        params.n_exp,
-        params.k,
-        params.hidden,
-        params.mi,
-        params.routed_gate_up_k,
-        params.routed_down_m,
-        params.routed_down_k,
-        params.dtypes.routed_gate_up,
-        params.dtypes.routed_down,
-        "decode",
-        params.route_policy,
-    )?;
 
     if params.n_exp == 0 || params.k == 0 || params.k > params.n_exp {
         return Err(invalid(format!(
@@ -3175,36 +3104,6 @@ fn validate_prefill(
     }
     if params.mi == 0 || params.down_m == 0 || params.down_k == 0 || params.gate_up_k == 0 {
         return Err(invalid("prefill dimensions must be nonzero"));
-    }
-    validate_qwen4_route_width(
-        params.n_exp,
-        params.k_top,
-        params.down_m,
-        params.mi,
-        params.gate_up_k,
-        params.down_m,
-        params.down_k,
-        params.dtypes.routed_gate_up,
-        params.dtypes.routed_down,
-        "prefill",
-        params.route_policy,
-    )?;
-    if super::is_qwen4_route(
-        &params.dtypes,
-        params.n_exp,
-        params.k_top,
-        params.gate_up_k,
-        params.mi,
-        params.gate_up_k,
-        params.down_m,
-        params.down_k,
-        params.expert_dtype_tags,
-        params.route_policy,
-    ) && !matches!(params.prelude.route, PrefillRouteMode::Replicated)
-    {
-        return Err(invalid(
-            "Qwen4 top-10 prefill requires replicated route authority; EP is not admitted",
-        ));
     }
     require_recipe_feature(params.recipe)?;
     if params.n_exp == 0 || params.k_top == 0 || params.k_top > params.n_exp {
@@ -4925,72 +4824,6 @@ mod tests {
         assert!(table.prepare_binding(0, 0, 0).is_err());
         assert!(table.prepare_binding(1, 1, 0).is_err());
         assert!(table.prepare_binding(0, 1, -1).is_err());
-    }
-
-    fn qwen4_route_policy() -> MoeRoutePolicy {
-        MoeRoutePolicy {
-            capability: MoeRouteCapability::Qt44Qt53Grouped,
-        }
-    }
-
-    #[test]
-    fn qwen4_topk_width_and_projection_pair_are_sealed_before_gpu_work() {
-        assert!(validate_qwen4_route_width(
-            512,
-            10,
-            2560,
-            640,
-            2560,
-            2560,
-            640,
-            DType::MQ4G256V2,
-            DType::MQ4G128V2,
-            "test",
-            Some(qwen4_route_policy()),
-        )
-        .is_ok());
-        assert!(validate_qwen4_route_width(
-            512,
-            8,
-            2560,
-            640,
-            2560,
-            2560,
-            640,
-            DType::MQ4G256V2,
-            DType::MQ4G128V2,
-            "test",
-            Some(qwen4_route_policy()),
-        )
-        .is_err());
-        assert!(validate_qwen4_route_width(
-            512,
-            10,
-            2560,
-            640,
-            2560,
-            2560,
-            640,
-            DType::MQ4G256,
-            DType::MQ4G128V2,
-            "test",
-            Some(qwen4_route_policy()),
-        )
-        .is_err());
-        assert!(validate_qwen4_route_width(
-            512,
-            10,
-            2560,
-            640,
-            123,
-            1,
-            999,
-            DType::MQ4G256V2,
-            DType::MQ4G128V2,
-            "test",
-            Some(qwen4_route_policy()),
-        )
-        .is_err());
     }
 
     #[test]

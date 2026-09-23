@@ -10,7 +10,7 @@
 //! local may outlive publication as a second owner.
 
 use crate::config::Qwen4Config;
-use crate::gpu_forward::{Qwen4GpuForward, QWEN4_PREFILL_CHUNK_CAP};
+use crate::gpu_forward::{Qwen4GpuForward, Qwen4OutputRows, QWEN4_PREFILL_CHUNK_CAP};
 use crate::mtp_gpu::{MtpGpuStateSnapshot, Qwen4MtpGpu};
 use crate::ple::PleHashMetadata;
 use crate::ple_rows::{PleRowEncoding, PleRows, PleRowsError};
@@ -334,7 +334,9 @@ impl Qwen4Bundle {
     /// prefill uses this to batch a whole prompt chunk through the shared
     /// forward instead of one single-row forward per prompt token.
     pub(crate) fn spec_chunk_rows(&self) -> Option<usize> {
-        self.execution.as_ref().map(|forward| forward.scratch.max_chunk)
+        self.execution
+            .as_ref()
+            .map(|forward| forward.scratch.max_chunk)
     }
 
     pub(crate) fn spec_forward_rows(
@@ -342,6 +344,27 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         tokens: &[u32],
         capture_hidden: bool,
+    ) -> Result<Vec<u32>, BundleError> {
+        self.spec_forward_rows_with_output(gpu, tokens, capture_hidden, Qwen4OutputRows::All)
+    }
+
+    pub(crate) fn spec_prefill_rows(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+    ) -> Result<u32, BundleError> {
+        self.spec_forward_rows_with_output(gpu, tokens, true, Qwen4OutputRows::Final)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| BundleError::Forward("Qwen4 prefill produced no argmax".into()))
+    }
+
+    fn spec_forward_rows_with_output(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        capture_hidden: bool,
+        output_rows: Qwen4OutputRows,
     ) -> Result<Vec<u32>, BundleError> {
         if tokens.is_empty() {
             return Err(BundleError::Forward(
@@ -363,8 +386,8 @@ impl Qwen4Bundle {
             )));
         }
         let vocab = self.config.vocab_size;
-        let logits_len = tokens
-            .len()
+        let output_count = output_rows.count(tokens.len());
+        let logits_len = output_count
             .checked_mul(vocab)
             .ok_or_else(|| BundleError::Forward("Qwen4 spec logits overflow".to_string()))?;
         let logits = self
@@ -372,8 +395,7 @@ impl Qwen4Bundle {
             .as_ref()
             .ok_or_else(|| BundleError::Forward("Qwen4 spec logits are not attached".to_string()))?
             .sub_offset(0, logits_len);
-        let top1_len = tokens
-            .len()
+        let top1_len = output_count
             .checked_mul(std::mem::size_of::<i32>())
             .ok_or_else(|| BundleError::Forward("Qwen4 spec argmax overflow".to_string()))?;
         let top1 = self
@@ -405,17 +427,20 @@ impl Qwen4Bundle {
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
-        let result = match hidden.as_ref() {
-            Some(hidden) => forward
-                .forward_chunk_with_wide_hidden(self, gpu, tokens, &logits, Some(&top1), hidden)
-                .map_err(|error| BundleError::Forward(error.to_string())),
-            None => forward
-                .forward_chunk(self, gpu, tokens, &logits, Some(&top1))
-                .map_err(|error| BundleError::Forward(error.to_string())),
-        };
+        let result = forward
+            .forward_chunk(
+                self,
+                gpu,
+                tokens,
+                &logits,
+                Some(&top1),
+                hidden.as_ref(),
+                output_rows,
+            )
+            .map_err(|error| BundleError::Forward(error.to_string()));
         self.execution = Some(forward);
         result?;
-        let bytes_len = tokens.len() * std::mem::size_of::<i32>();
+        let bytes_len = output_count * std::mem::size_of::<i32>();
         if self.spec_host_top1.len() < bytes_len {
             return Err(BundleError::Forward(
                 "Qwen4 spec host argmax capacity is too small".to_string(),
@@ -424,7 +449,7 @@ impl Qwen4Bundle {
         gpu.hip
             .memcpy_dtoh(&mut self.spec_host_top1[..bytes_len], &top1.buf)
             .map_err(BundleError::Hip)?;
-        let mut picks = Vec::with_capacity(tokens.len());
+        let mut picks = Vec::with_capacity(output_count);
         for bytes in self.spec_host_top1[..bytes_len].chunks_exact(4) {
             picks.push(u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
         }
@@ -485,17 +510,50 @@ impl Qwen4Bundle {
         token: u32,
         backbone_hidden: Option<&GpuTensor>,
         position: usize,
+        fresh_qsa_selection: bool,
     ) -> Result<u32, BundleError> {
         let mtp = self.mtp.as_mut().ok_or_else(|| {
             BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
         })?;
-        let result = match backbone_hidden {
-            Some(hidden) => {
-                mtp.forward_token(gpu, &self.weights, &self.config, token, hidden, position)
-            }
-            None => mtp.forward_token_from_state(gpu, &self.weights, &self.config, token, position),
-        };
-        result.map_err(|error| BundleError::Forward(error.to_string()))
+        mtp.forward_token(
+            gpu,
+            &self.weights,
+            &self.config,
+            token,
+            backbone_hidden,
+            position,
+            fresh_qsa_selection,
+            true,
+        )
+        .map_err(|error| BundleError::Forward(error.to_string()))?
+        .ok_or_else(|| {
+            BundleError::Forward("MTP prediction requested but no token produced".into())
+        })
+    }
+
+    pub(crate) fn mtp_advance_token(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        backbone_hidden: Option<&GpuTensor>,
+        position: usize,
+        fresh_qsa_selection: bool,
+    ) -> Result<(), BundleError> {
+        self.mtp
+            .as_mut()
+            .ok_or_else(|| BundleError::Forward("Qwen4 MTP resources are not attached".into()))?
+            .forward_token(
+                gpu,
+                &self.weights,
+                &self.config,
+                token,
+                backbone_hidden,
+                position,
+                fresh_qsa_selection,
+                false,
+            )
+            .map(|_| ())
+            .map_err(|error| BundleError::Forward(error.to_string()))
     }
 
     /// Run one native MTP token from its committed state and copy the
@@ -505,13 +563,22 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         token: u32,
         position: usize,
+        fresh_qsa_selection: bool,
         logits: &GpuTensor,
     ) -> Result<u32, BundleError> {
         let mtp = self.mtp.as_mut().ok_or_else(|| {
             BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
         })?;
-        mtp.forward_token_with_logits(gpu, &self.weights, &self.config, token, position, logits)
-            .map_err(|error| BundleError::Forward(error.to_string()))
+        mtp.forward_token_with_logits(
+            gpu,
+            &self.weights,
+            &self.config,
+            token,
+            position,
+            fresh_qsa_selection,
+            logits,
+        )
+        .map_err(|error| BundleError::Forward(error.to_string()))
     }
 
     pub(crate) fn mtp_snapshot(
@@ -613,7 +680,7 @@ impl Qwen4Bundle {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
         let result = forward
-            .forward_chunk(self, gpu, tokens, logits, top1)
+            .forward_chunk(self, gpu, tokens, logits, top1, None, Qwen4OutputRows::All)
             .map_err(|error| BundleError::Forward(error.to_string()));
         self.execution = Some(forward);
         result
@@ -635,7 +702,15 @@ impl Qwen4Bundle {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
         let result = forward
-            .forward_chunk_final(self, gpu, tokens, logits, top1)
+            .forward_chunk(
+                self,
+                gpu,
+                tokens,
+                logits,
+                top1,
+                None,
+                Qwen4OutputRows::Final,
+            )
             .map_err(|error| BundleError::Forward(error.to_string()));
         self.execution = Some(forward);
         result

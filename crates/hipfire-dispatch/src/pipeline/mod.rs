@@ -5,7 +5,7 @@ use crate::context::DispatchCtx;
 use crate::families::fused_qkv::{fused_gate_up_key_for, FusedQkvFamily, FusedQkvParams};
 use crate::families::gemm::{GemmFamily, GemmParams};
 use crate::families::gemv::{GemvFamily, WeightRef};
-use crate::families::moe::MOE_GROUPED_BLOCK_M;
+use crate::families::moe::{MoeRouteCapability, MOE_GROUPED_BLOCK_M};
 use crate::tables::KernelRegistry;
 use crate::types::*;
 #[allow(unused_imports)]
@@ -25,7 +25,7 @@ pub use sealed_moe::{
 };
 pub(crate) mod moe_program;
 pub(crate) mod qt44_qt53_prefill;
-pub use moe_program::SealedMoeOp;
+pub use moe_program::{MoeStage, SealedMoeOp};
 pub(crate) mod layer_ops;
 pub(crate) mod steps;
 pub use layer_ops::{
@@ -46,7 +46,7 @@ fn reject_mq4g128v2(dtype: DType, family: &'static str) -> Result<(), DispatchEr
     if dtype == DType::MQ4G128V2 {
         return Err(DispatchError::UnsupportedVariant {
             family,
-            variant: "mq4g128v2_qwen4_typed_only",
+            variant: "mq4g128v2_specialized_route_only",
             arch: "",
             quant: "MQ4G128V2",
         });
@@ -72,61 +72,95 @@ fn reject_mq4g128v2_moe(dtypes: &crate::families::moe::MoeDtypes<'_>) -> Result<
     }
     Ok(())
 }
-/// Exact architecture-declared routed-expert contract.
-///
-/// The architecture supplies the geometry and formats; shared dispatch only
-/// checks that declaration before selecting the specialized route.
-fn is_qwen4_route(
+/// Select only a route whose architecture-declared kernel contract matches
+/// the bound geometry, formats, sidecars, and actual device. A mismatched QT53
+/// route is rejected by the sealer rather than delegated to generic kernels.
+#[allow(clippy::too_many_arguments)]
+fn select_grouped_route(
+    ctx: &DispatchCtx,
     dtypes: &crate::families::moe::MoeDtypes<'_>,
     n_exp: usize,
     k_top: usize,
     hidden: usize,
     intermediate: usize,
+    shared_intermediate: usize,
     gate_up_k: usize,
     down_m: usize,
     down_k: usize,
     dtype_tags: Option<&GpuTensor>,
+    has_sidecars: bool,
     route_policy: Option<crate::families::moe::MoeRoutePolicy>,
-) -> bool {
-    let Some(policy) = route_policy else {
-        return false;
-    };
-    let Some(shared) = dtypes.shared else {
-        return false;
-    };
+) -> Option<crate::families::moe::MoeRouteCapability> {
+    let policy = route_policy?;
+    let shared = dtypes.shared?;
+    let formats = policy.formats;
     let uniform = |table: Option<&[DType]>, expected: DType| {
         table.map_or(true, |values| values.iter().all(|dtype| *dtype == expected))
     };
-    crate::families::moe::grouped_route_geometry_supported(
-        &policy,
-        n_exp,
-        k_top,
-        hidden,
-        intermediate,
-        gate_up_k,
-        down_m,
-        down_k,
-        dtypes.routed_gate_up,
-        dtypes.routed_down,
-    ) && !dtypes.routed_has_mixed_experts
-        && !dtypes.has_paro_shared
-        && uniform(dtypes.per_expert_gate_up, DType::MQ4G256V2)
-        && uniform(dtypes.per_expert_down, DType::MQ4G128V2)
-        && dtype_tags.is_none()
-        && ![dtypes.router, shared.selector, shared.gate, shared.up].contains(&DType::MQ4G128V2)
-        && matches!(shared.down, DType::BF16 | DType::MQ4G128V2)
+    match policy.capability {
+        MoeRouteCapability::Qt44Qt53Grouped
+            if policy.capability.admitted_on(&ctx.arch)
+                && crate::families::moe::grouped_route_geometry_supported(
+                    &policy,
+                    n_exp,
+                    k_top,
+                    hidden,
+                    intermediate,
+                    gate_up_k,
+                    down_m,
+                    down_k,
+                    dtypes.routed_gate_up,
+                    dtypes.routed_down,
+                )
+                && shared_intermediate == policy.geometry.shared_intermediate
+                && !dtypes.routed_has_mixed_experts
+                && !dtypes.has_paro_shared
+                && !has_sidecars
+                && dtype_tags.is_none()
+                && formats.router == DType::BF16
+                && [
+                    formats.shared_selector,
+                    formats.shared_gate,
+                    formats.shared_up,
+                ]
+                .into_iter()
+                .all(|dtype| dtype == DType::BF16)
+                && matches!(formats.shared_down, DType::BF16 | DType::MQ4G128V2)
+                && [
+                    dtypes.router,
+                    shared.selector,
+                    shared.gate,
+                    shared.up,
+                    shared.down,
+                ] == [
+                    formats.router,
+                    formats.shared_selector,
+                    formats.shared_gate,
+                    formats.shared_up,
+                    formats.shared_down,
+                ]
+                && uniform(dtypes.per_expert_gate_up, formats.routed_gate_up)
+                && uniform(dtypes.per_expert_down, formats.routed_down) =>
+        {
+            Some(policy.capability)
+        }
+        _ => None,
+    }
 }
 #[cfg(test)]
 mod qwen4_route_tests {
     use super::*;
-    use crate::families::moe::{MoeDtypes, MoeRouteCapability, MoeRoutePolicy, MoeSharedDtypes};
+    use crate::families::moe::{
+        MoeDtypes, MoeRouteCapability, MoeRouteFormats, MoeRouteGeometry, MoeRoutePolicy,
+        MoeSharedDtypes,
+    };
     fn canonical_dtypes() -> MoeDtypes<'static> {
         MoeDtypes {
-            router: DType::MQ4G256V2,
+            router: DType::BF16,
             shared: Some(MoeSharedDtypes {
                 selector: DType::BF16,
-                gate: DType::MQ4G256V2,
-                up: DType::MQ4G256V2,
+                gate: DType::BF16,
+                up: DType::BF16,
                 down: DType::MQ4G128V2,
             }),
             experts_all_gate_up_mq4: true,
@@ -136,6 +170,28 @@ mod qwen4_route_tests {
             has_paro_shared: false,
             per_expert_gate_up: None,
             per_expert_down: None,
+        }
+    }
+
+    fn policy(shared_down: DType) -> MoeRoutePolicy {
+        MoeRoutePolicy {
+            capability: MoeRouteCapability::Qt44Qt53Grouped,
+            geometry: MoeRouteGeometry {
+                experts: 512,
+                top_k: 10,
+                hidden: 2560,
+                routed_intermediate: 640,
+                shared_intermediate: 640,
+            },
+            formats: MoeRouteFormats {
+                router: DType::BF16,
+                shared_selector: DType::BF16,
+                shared_gate: DType::BF16,
+                shared_up: DType::BF16,
+                shared_down,
+                routed_gate_up: DType::MQ4G256V2,
+                routed_down: DType::MQ4G128V2,
+            },
         }
     }
 
@@ -149,20 +205,24 @@ mod qwen4_route_tests {
         down_m: usize,
         down_k: usize,
     ) -> bool {
-        is_qwen4_route(
+        select_grouped_route(
+            &DispatchCtx::for_test("gfx1151"),
             dtypes,
             n_exp,
             k_top,
             hidden,
             intermediate,
+            640,
             gate_up_k,
             down_m,
             down_k,
             None,
-            Some(MoeRoutePolicy {
-                capability: MoeRouteCapability::Qt44Qt53Grouped,
-            }),
+            false,
+            Some(policy(
+                dtypes.shared.map_or(DType::MQ4G128V2, |shared| shared.down),
+            )),
         )
+        .is_some()
     }
 
     fn is_canonical_qwen4(dtypes: &MoeDtypes<'_>) -> bool {
@@ -183,19 +243,27 @@ mod qwen4_route_tests {
         let mut dtypes = canonical_dtypes();
         dtypes.routed_gate_up = DType::BF16;
         assert!(!is_canonical_qwen4(&dtypes));
+
+        let mut dtypes = canonical_dtypes();
+        dtypes.router = DType::MQ4G256V2;
+        assert!(!is_canonical_qwen4(&dtypes));
+
+        let mut dtypes = canonical_dtypes();
+        dtypes.shared.as_mut().unwrap().gate = DType::MQ4G256V2;
+        assert!(!is_canonical_qwen4(&dtypes));
     }
 
     #[test]
     fn qwen4_route_accepts_canonical_shared_down_q53() {
         let dtypes = canonical_dtypes();
-        assert!(is_canonical_qwen4(&dtypes));
+        assert_eq!(is_canonical_qwen4(&dtypes), cfg!(feature = "deltanet"));
         // The generic MoE gate remains a hard rejection; only the canonical
         // typed route may consume this shared-down q53 operand.
         assert!(matches!(
             reject_mq4g128v2_moe(&dtypes),
             Err(DispatchError::UnsupportedVariant {
                 family: "moe",
-                variant: "mq4g128v2_qwen4_typed_only",
+                variant: _,
                 quant: "MQ4G128V2",
                 ..
             })
@@ -206,7 +274,105 @@ mod qwen4_route_tests {
     fn qwen4_route_accepts_canonical_shared_down_bf16() {
         let mut dtypes = canonical_dtypes();
         dtypes.shared.as_mut().unwrap().down = DType::BF16;
-        assert!(is_canonical_qwen4(&dtypes));
+        assert_eq!(is_canonical_qwen4(&dtypes), cfg!(feature = "deltanet"));
+    }
+
+    #[test]
+    fn route_rejects_unadmitted_device_or_routed_awq() {
+        let dtypes = canonical_dtypes();
+        for arch in ["gfx1100", "gfx1201"] {
+            assert_eq!(
+                select_grouped_route(
+                    &DispatchCtx::for_test(arch),
+                    &dtypes,
+                    512,
+                    10,
+                    2560,
+                    640,
+                    640,
+                    2560,
+                    2560,
+                    640,
+                    None,
+                    false,
+                    Some(policy(DType::MQ4G128V2)),
+                ),
+                None,
+            );
+        }
+        assert_eq!(
+            select_grouped_route(
+                &DispatchCtx::for_test("gfx1151"),
+                &dtypes,
+                512,
+                10,
+                2560,
+                640,
+                640,
+                2560,
+                2560,
+                640,
+                None,
+                true,
+                Some(policy(DType::MQ4G128V2)),
+            ),
+            None,
+        );
+        assert_eq!(
+            select_grouped_route(
+                &DispatchCtx::for_test("gfx1151"),
+                &dtypes,
+                512,
+                10,
+                2560,
+                640,
+                1024,
+                2560,
+                2560,
+                640,
+                None,
+                false,
+                Some(policy(DType::MQ4G128V2)),
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn route_rejects_false_or_unsupported_declaration() {
+        let dtypes = canonical_dtypes();
+        let accepts = |declared: MoeRoutePolicy, experts| {
+            select_grouped_route(
+                &DispatchCtx::for_test("gfx1151"),
+                &dtypes,
+                experts,
+                10,
+                2560,
+                640,
+                640,
+                2560,
+                2560,
+                640,
+                None,
+                false,
+                Some(declared),
+            )
+            .is_some()
+        };
+        let declared = policy(DType::MQ4G128V2);
+        assert_eq!(accepts(declared, 512), cfg!(feature = "deltanet"));
+
+        let mut unsupported_geometry = declared;
+        unsupported_geometry.geometry.experts = 513;
+        assert!(!accepts(unsupported_geometry, 512)); // Declaration disagrees with bound operands.
+        assert!(!accepts(unsupported_geometry, 513)); // Agreement cannot widen a fixed kernel.
+
+        let mut wrong_format = declared;
+        wrong_format.formats.shared_down = DType::BF16;
+        assert!(!accepts(wrong_format, 512)); // Both formats are legal, but the binding disagrees.
+        let mut wrong_format = declared;
+        wrong_format.formats.router = DType::MQ4G256V2;
+        assert!(!accepts(wrong_format, 512));
     }
 
     #[test]
@@ -227,7 +393,7 @@ mod qwen4_route_tests {
                 reject_mq4g128v2_moe(dtypes),
                 Err(DispatchError::UnsupportedVariant {
                     family: "moe",
-                    variant: "mq4g128v2_qwen4_typed_only",
+                    variant: _,
                     quant: "MQ4G128V2",
                     ..
                 })
@@ -2660,7 +2826,7 @@ fn decode_gate_side_stage(
     x_rot_local: Option<&GpuTensor>,
     shared_gate: &GpuTensor,
     shared_up: &GpuTensor,
-    qwen4_top10: bool,
+    route: Option<MoeRouteCapability>,
 ) -> Result<(), DispatchError> {
     let shared = p.shared.as_ref().ok_or_else(|| {
         DispatchError::Hip("shared gate-side stage requires shared weights".into())
@@ -2668,7 +2834,6 @@ fn decode_gate_side_stage(
     let shared_expert_gate = &shared.weights.selector;
     let shared_gate_w = &shared.weights.gate;
     let shared_up_w = &shared.weights.up;
-    let smi = shared.intermediate;
     let scalar_buf = shared.scalar;
     // ── Gate-side GEMV ───────────────────────────────────────────────────────
     // Views are borrowed from the executor so this stage does not allocate
@@ -2855,7 +3020,7 @@ fn decode_gate_side_stage(
       // Qwen4's source model is BF16 end-to-end through the router and
       // shared-expert projections.  The quantized GEMV contract is F32, so
       // restore the source boundary before the downstream nonlinearities.
-    if qwen4_top10 {
+    if route == Some(MoeRouteCapability::Qt44Qt53Grouped) {
         // The decode step program is single-row (`build_moe_decode` binds
         // `batch_size: 1`), but every scratch buffer is sized for the prefill
         // chunk cap (512 rows). Rounding the whole buffer would carry 512x the
@@ -2878,7 +3043,7 @@ fn decode_route_gpu_stage(
     router_shared_fuse: bool,
     exact_wave64_router: bool,
     wave64_router: bool,
-    qwen4_top10: bool,
+    route: Option<MoeRouteCapability>,
 ) -> Result<(), DispatchError> {
     let smi = p
         .shared
@@ -2914,7 +3079,7 @@ fn decode_route_gpu_stage(
       // the root-authoritative IDs (a per-rank re-ranking is exactly the
       // divergence this removes).
     if !skip_routing {
-        if qwen4_top10 {
+        if route == Some(MoeRouteCapability::Qt44Qt53Grouped) {
             hip!(gpu.moe_router_softmax_top10_f32(
                 p.router_logits,
                 p.topk_indices,
@@ -2987,7 +3152,7 @@ fn decode_shared_down_stage(
     shared_up: &GpuTensor,
     target: &GpuTensor,
     router_shared_fuse: bool,
-    qwen4_top10: bool,
+    route: Option<MoeRouteCapability>,
 ) -> Result<(), DispatchError> {
     let shared = p
         .shared
@@ -3003,7 +3168,7 @@ fn decode_shared_down_stage(
     // still ran above (fused with the router GEMV) — only the down/accumulate
     // is skipped here. Accumulates into `out_target` (= the EP partial when
     // `routed_out` is set, else `x_residual`).
-    if qwen4_top10 && !p.skip_shared {
+    if route == Some(MoeRouteCapability::Qt44Qt53Grouped) && !p.skip_shared {
         #[cfg(feature = "deltanet")]
         {
             // Linear and sigmoid outputs are BF16 in the source module. The
@@ -3017,7 +3182,8 @@ fn decode_shared_down_stage(
             let shared_hid = slice_moe_f32_view(p.ffn_hidden, 0, smi);
             hip!(gpu.silu_mul_f32(shared_gate, shared_up, &shared_hid))?;
             hip!(gpu.bf16_round_trip_f32(&shared_hid))?;
-            static GEMV_QWEN4_SHARED_DOWN: LazyLock<GemvFamily> = LazyLock::new(GemvFamily::new);
+            static GEMV_QT44_QT53_SHARED_DOWN: LazyLock<GemvFamily> =
+                LazyLock::new(GemvFamily::new);
             if shared_down_w.dtype == DType::MQ4G128V2 {
                 let shared_down_rot = slice_moe_f32_view(p.rot_batch, 0, shared_down_w.k);
                 hip!(gpu.rotate_x_mq_128_v2(&shared_hid, &shared_down_rot, shared_down_w.k, 1,))?;
@@ -3029,7 +3195,7 @@ fn decode_shared_down_stage(
                     shared_down_w.k,
                 ))?;
             } else {
-                GEMV_QWEN4_SHARED_DOWN
+                GEMV_QT44_QT53_SHARED_DOWN
                     .run_auto(ctx, gpu, shared_down_w, &shared_hid, p.ffn_out)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
             }
@@ -3051,7 +3217,7 @@ fn decode_shared_down_stage(
         #[cfg(not(feature = "deltanet"))]
         return Err(DispatchError::UnsupportedVariant {
             family: "moe",
-            variant: "qwen4-shared-down-requires-deltanet",
+            variant: "qt44-qt53-shared-down-requires-deltanet",
             arch: "",
             quant: "",
         });
@@ -3197,7 +3363,7 @@ fn decode_gate_up_stage(
     res: crate::families::moe::MoeResolution,
     activation_input: &GpuTensor,
     ninepath_d3: bool,
-    qwen4_top10: bool,
+    route: Option<MoeRouteCapability>,
 ) -> Result<(), DispatchError> {
     let xr = activation_input;
     let gate_up_k = p.routed_gate_up_k;
@@ -3216,10 +3382,10 @@ fn decode_gate_up_stage(
     // before representative MQ4V2/MQ6V2/V1 arms. Uniform shortcut only
     // when gate_up exact DType equality (per_expert_gate_up uniform).
     let gate_up_varies = gate_up_varies(p.dtypes.per_expert_gate_up.as_deref());
-    if qwen4_top10 {
+    if route == Some(MoeRouteCapability::Qt44Qt53Grouped) {
         let routed_slots = 10usize
             .checked_mul(p.mi)
-            .ok_or_else(|| DispatchError::Hip("Qwen4 routed slot width overflow".into()))?;
+            .ok_or_else(|| DispatchError::Hip("QT44/QT53 routed slot width overflow".into()))?;
         let gate_batch = slice_moe_f32_view(p.gate_batch, 0, routed_slots);
         let up_batch = slice_moe_f32_view(p.up_batch, 0, routed_slots);
         hip!(gpu.gemv_mq4g256v2_moe_gate_up_top10_indexed_batched(
@@ -3421,12 +3587,12 @@ fn decode_activation_stage(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoeParams<'_>,
     res: crate::families::moe::MoeResolution,
-    qwen4_top10: bool,
+    route: Option<MoeRouteCapability>,
 ) -> Result<(), DispatchError> {
-    if qwen4_top10 {
+    if route == Some(MoeRouteCapability::Qt44Qt53Grouped) {
         let routed_slots = 10usize
             .checked_mul(p.mi)
-            .ok_or_else(|| DispatchError::Hip("Qwen4 routed slot width overflow".into()))?;
+            .ok_or_else(|| DispatchError::Hip("QT44/QT53 routed slot width overflow".into()))?;
         let gate_batch = slice_moe_f32_view(p.gate_batch, 0, routed_slots);
         let up_batch = slice_moe_f32_view(p.up_batch, 0, routed_slots);
         let rot_batch = slice_moe_f32_view(p.rot_batch, 0, routed_slots);
@@ -3502,15 +3668,15 @@ fn decode_down_stage(
     ninepath_mq4v2: bool,
     ninepath_mq6v2: bool,
     down_last_combine: bool,
-    qwen4_top10: bool,
+    route: Option<MoeRouteCapability>,
 ) -> Result<(), DispatchError> {
     let out_target = target;
     let down_m = p.routed_down_m;
     let down_k = p.routed_down_k;
-    if qwen4_top10 {
+    if route == Some(MoeRouteCapability::Qt44Qt53Grouped) {
         let routed_slots = 10usize
             .checked_mul(p.mi)
-            .ok_or_else(|| DispatchError::Hip("Qwen4 routed slot width overflow".into()))?;
+            .ok_or_else(|| DispatchError::Hip("QT44/QT53 routed slot width overflow".into()))?;
         let rot_batch = slice_moe_f32_view(p.rot_batch, 0, routed_slots);
         let down_expanded = slice_moe_f32_view(p.down_expanded, 0, 10 * p.hidden);
         hip!(gpu.gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded(
@@ -4006,9 +4172,9 @@ fn decode_combine_stage(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoeParams<'_>,
     target: &GpuTensor,
-    qwen4_top10: bool,
+    route: Option<MoeRouteCapability>,
 ) -> Result<(), DispatchError> {
-    if qwen4_top10 {
+    if route == Some(MoeRouteCapability::Qt44Qt53Grouped) {
         let down_expanded = slice_moe_f32_view(p.down_expanded, 0, 10 * p.hidden);
         hip!(gpu.moe_down_combine_top10_batched(
             &down_expanded,

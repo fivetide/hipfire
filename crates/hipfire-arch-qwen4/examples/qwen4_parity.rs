@@ -7,16 +7,16 @@
 //! exercise real-model state/MTP rollback plus compact arena fault scenarios.
 //!
 //! Fixture usage:
-//!   cargo run --release -p hipfire-arch-qwen4 --example qwen4_parity -- \
+//!   cargo run --release -p hipfire-arch-qwen4 --features reference-parity --example qwen4_parity -- \
 //!       --fixtures /path/to/reference-fixtures --out /tmp/qwen4-parity.json
 //!
 //! Candidate quality usage:
-//!   cargo run --release -p hipfire-arch-qwen4 --example qwen4_parity -- \
+//!   cargo run --release -p hipfire-arch-qwen4 --features reference-parity --example qwen4_parity -- \
 //!       --model /path/to/model.hfq --tokens benchmarks/prompts/qwen4-teacher-forced.tokens.json \
 //!       --out /tmp/qwen4-candidate.json
 //!
 //! State parity usage:
-//!   cargo run --release -p hipfire-arch-qwen4 --example qwen4_parity -- \
+//!   cargo run --release -p hipfire-arch-qwen4 --features reference-parity --example qwen4_parity -- \
 //!       --mode state --model /path/to/model.hfq \
 //!       --tokens benchmarks/prompts/qwen4-teacher-forced.tokens.json \
 //!       --out /tmp/qwen4-state-parity.json
