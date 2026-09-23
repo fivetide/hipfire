@@ -12,7 +12,7 @@
 use crate::config::compact_test_config;
 use crate::gpu_forward::{
     qwen4_profile_enable, qwen4_profile_reset, qwen4_profile_snapshot, Qwen4GpuForwardScratch,
-    Qwen4ProfileStats,
+    Qwen4ProfilePhase, Qwen4ProfileStats,
 };
 use crate::mtp_gpu::{MtpGpuState, MtpStateParityMetadata};
 use crate::mtp_spec::validate_native_mtp_prefill_request;
@@ -1241,28 +1241,18 @@ fn hip_counter_snapshot() -> Value {
 }
 
 fn qwen4_profile_stats_json(stats: Qwen4ProfileStats) -> Value {
-    json!({
-        "moe_seal": {
-            "calls": stats.moe_seal_calls,
-            "host_ns": stats.moe_seal_ns,
-        },
-        "ple_wait": {
-            "calls": stats.ple_wait_calls,
-            "host_ns": stats.ple_wait_ns,
-        },
-        "ple_stage": {
-            "calls": stats.ple_stage_calls,
-            "host_ns": stats.ple_stage_ns,
-        },
-        "ple_upload": {
-            "calls": stats.ple_upload_calls,
-            "host_ns": stats.ple_upload_ns,
-        },
-        "ple_apply": {
-            "calls": stats.ple_apply_calls,
-            "host_ns": stats.ple_apply_ns,
-        },
-    })
+    Value::Object(
+        Qwen4ProfilePhase::ALL
+            .into_iter()
+            .map(|phase| {
+                let slot = phase as usize;
+                (
+                    phase.name().to_string(),
+                    json!({ "calls": stats.calls[slot], "host_ns": stats.ns[slot] }),
+                )
+            })
+            .collect(),
+    )
 }
 const PROFILE_DIRTY_BYTE: i32 = 0x3f;
 

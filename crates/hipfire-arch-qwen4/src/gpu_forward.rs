@@ -96,27 +96,41 @@ impl Qwen4OutputPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Qwen4ProfileStats {
-    pub(crate) moe_seal_calls: u64,
-    pub(crate) moe_seal_ns: u64,
-    pub(crate) ple_wait_calls: u64,
-    pub(crate) ple_wait_ns: u64,
-    pub(crate) ple_stage_calls: u64,
-    pub(crate) ple_stage_ns: u64,
-    pub(crate) ple_upload_calls: u64,
-    pub(crate) ple_upload_ns: u64,
-    pub(crate) ple_apply_calls: u64,
-    pub(crate) ple_apply_ns: u64,
-}
-
+/// Host-side forward phases timed when profiling is enabled.
 #[derive(Clone, Copy)]
-enum Qwen4ProfilePhase {
+pub(crate) enum Qwen4ProfilePhase {
     MoeSeal,
     PleWait,
     PleStage,
     PleUpload,
     PleApply,
+}
+
+impl Qwen4ProfilePhase {
+    pub(crate) const ALL: [Self; 5] = [
+        Self::MoeSeal,
+        Self::PleWait,
+        Self::PleStage,
+        Self::PleUpload,
+        Self::PleApply,
+    ];
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::MoeSeal => "moe_seal",
+            Self::PleWait => "ple_wait",
+            Self::PleStage => "ple_stage",
+            Self::PleUpload => "ple_upload",
+            Self::PleApply => "ple_apply",
+        }
+    }
+}
+
+/// Calls and host nanoseconds per [`Qwen4ProfilePhase`], indexed by phase.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Qwen4ProfileStats {
+    pub(crate) calls: [u64; Qwen4ProfilePhase::ALL.len()],
+    pub(crate) ns: [u64; Qwen4ProfilePhase::ALL.len()],
 }
 
 thread_local! {
@@ -159,28 +173,9 @@ fn qwen4_profile_record(phase: Qwen4ProfilePhase, started: Option<Instant>) {
     let elapsed = started.elapsed().as_nanos() as u64;
     QWEN4_PROFILE_STATS.with(|stats| {
         let mut stats = stats.borrow_mut();
-        match phase {
-            Qwen4ProfilePhase::MoeSeal => {
-                stats.moe_seal_calls = stats.moe_seal_calls.saturating_add(1);
-                stats.moe_seal_ns = stats.moe_seal_ns.saturating_add(elapsed);
-            }
-            Qwen4ProfilePhase::PleWait => {
-                stats.ple_wait_calls = stats.ple_wait_calls.saturating_add(1);
-                stats.ple_wait_ns = stats.ple_wait_ns.saturating_add(elapsed);
-            }
-            Qwen4ProfilePhase::PleStage => {
-                stats.ple_stage_calls = stats.ple_stage_calls.saturating_add(1);
-                stats.ple_stage_ns = stats.ple_stage_ns.saturating_add(elapsed);
-            }
-            Qwen4ProfilePhase::PleUpload => {
-                stats.ple_upload_calls = stats.ple_upload_calls.saturating_add(1);
-                stats.ple_upload_ns = stats.ple_upload_ns.saturating_add(elapsed);
-            }
-            Qwen4ProfilePhase::PleApply => {
-                stats.ple_apply_calls = stats.ple_apply_calls.saturating_add(1);
-                stats.ple_apply_ns = stats.ple_apply_ns.saturating_add(elapsed);
-            }
-        }
+        let slot = phase as usize;
+        stats.calls[slot] = stats.calls[slot].saturating_add(1);
+        stats.ns[slot] = stats.ns[slot].saturating_add(elapsed);
     });
 }
 
