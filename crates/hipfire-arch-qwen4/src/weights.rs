@@ -15,7 +15,7 @@ use crate::config::{LayerType, Qwen4Config};
 #[cfg(test)]
 use crate::config::{Qwen4MtpConfig, RecurrentStateDType, SourceDType};
 use hipfire_runtime::external_rows::RowEncoding;
-use hipfire_runtime::model_source::{SourceFormat, SourceRangeDescriptor};
+use hipfire_runtime::model_source::SourceRangeDescriptor;
 #[cfg(test)]
 use hipfire_runtime::weight_manifest::WeightResidency;
 use hipfire_runtime::weight_manifest::{
@@ -337,84 +337,6 @@ impl TensorRef {
     }
 }
 
-/// One external PLE descriptor, borrowed from the canonical fulfilled
-/// transaction.  It has no resident handle by design.
-#[derive(Clone, Debug)]
-pub struct ExternalRowsRef {
-    pub name: String,
-    pub layer: usize,
-    pub row_bytes: usize,
-    pub physical_rows: usize,
-    pub valid_rows: usize,
-}
-
-impl ExternalRowsRef {
-    pub fn validate_descriptor(
-        &self,
-        descriptor: &SourceRangeDescriptor,
-    ) -> Result<(), WeightError> {
-        // The row stride comes from the tier the shard *declares*, not from the
-        // manifest's default: a sealed BF16 shard (320-byte rows) and a Q8F16
-        // shard (170-byte rows) are both valid answers to the same declaration,
-        // and the reader decodes whichever one the artifact carries.
-        let encoding = RowEncoding::from_dtype(&descriptor.dtype)
-            .ok_or_else(|| WeightError::DescriptorMismatch(self.name.clone()))?;
-        let expected_len = encoding
-            .encoded_row_bytes(PLE_ROW_WIDTH)
-            .checked_mul(self.physical_rows)
-            .ok_or_else(|| WeightError::ShapeOverflow(self.name.clone()))?;
-        if descriptor.length != expected_len as u64 {
-            return Err(WeightError::RangeLength {
-                name: self.name.clone(),
-                expected: expected_len as u64,
-                actual: descriptor.length,
-            });
-        }
-        if descriptor.logical_shape != [self.physical_rows, PLE_ROW_WIDTH] {
-            return Err(WeightError::DescriptorMismatch(self.name.clone()));
-        }
-        if self.valid_rows == 0 || self.valid_rows > self.physical_rows {
-            return Err(WeightError::InvalidValidRows {
-                name: self.name.clone(),
-                valid_rows: self.valid_rows,
-                physical_rows: self.physical_rows,
-            });
-        }
-        if descriptor.source_identity().format != SourceFormat::Hfq {
-            return Err(WeightError::DescriptorMismatch(self.name.clone()));
-        }
-        let Some(indexed) = descriptor
-            .source_identity()
-            .manifest
-            .iter()
-            .find(|range| range.name == self.name)
-        else {
-            return Err(WeightError::DescriptorMismatch(self.name.clone()));
-        };
-        if indexed.offset != descriptor.offset
-            || indexed.length != descriptor.length
-            || !indexed.dtype.eq_ignore_ascii_case(descriptor.dtype())
-            || indexed.logical_shape != descriptor.logical_shape
-        {
-            return Err(WeightError::DescriptorMismatch(self.name.clone()));
-        }
-        let Some(file) = descriptor.source_identity().files.get(indexed.file_index) else {
-            return Err(WeightError::DescriptorMismatch(self.name.clone()));
-        };
-        let end = descriptor
-            .offset
-            .checked_add(descriptor.length)
-            .ok_or_else(|| WeightError::ShapeOverflow(self.name.clone()))?;
-        if end > file.len {
-            return Err(WeightError::RangeLength {
-                name: self.name.clone(),
-                expected: file.len.saturating_sub(descriptor.offset),
-                actual: descriptor.length,
-            });
-        }
-        Ok(())
-    }
-}
 /// I64 metadata is retained as an exact source declaration rather than being
 /// coerced into a floating-point `WeightEntry`.  The HFQM writer serializes
 /// these arrays under its versioned `qwen4_ple` object; they never become GPU
@@ -1937,16 +1859,6 @@ pub enum WeightError {
     },
     ShapeOverflow(String),
     DescriptorMismatch(String),
-    RangeLength {
-        name: String,
-        expected: u64,
-        actual: u64,
-    },
-    InvalidValidRows {
-        name: String,
-        valid_rows: usize,
-        physical_rows: usize,
-    },
     PlacementSetMismatch {
         expected: usize,
         actual: usize,
@@ -1981,16 +1893,6 @@ impl fmt::Display for WeightError {
             Self::DescriptorMismatch(name) => {
                 write!(f, "{name}: external descriptor mismatch")
             }
-            Self::RangeLength {
-                name,
-                expected,
-                actual,
-            } => write!(f, "{name}: range length expected {expected}, got {actual}"),
-            Self::InvalidValidRows {
-                name,
-                valid_rows,
-                physical_rows,
-            } => write!(f, "{name}: valid_rows={valid_rows} outside {physical_rows}"),
             Self::PlacementSetMismatch { expected, actual } => {
                 write!(f, "Qwen4 placement set expected {expected}, got {actual}")
             }

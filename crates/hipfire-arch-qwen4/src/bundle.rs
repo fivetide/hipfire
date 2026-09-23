@@ -15,11 +15,11 @@ use crate::mtp_gpu::{MtpGpuStateSnapshot, Qwen4MtpGpu};
 use crate::ple::PleHashMetadata;
 use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
 use crate::weights::{
-    ple_valid_rows_for_shard, ExternalRowsRef, Qwen4Manifest, Qwen4Placement, Qwen4Weights,
-    WeightError, PLE_ROW_WIDTH, PLE_SHARD_COUNT, PLE_SHARD_ROWS,
+    ple_valid_rows_for_shard, Qwen4Manifest, Qwen4Placement, Qwen4Weights, WeightError,
+    PLE_ROW_WIDTH, PLE_SHARD_COUNT, PLE_SHARD_ROWS,
 };
 use hipfire_runtime::external_rows::{RowEncoding, RowStore, RowStoreError};
-use hipfire_runtime::model_source::SourceRangeDescriptor;
+use hipfire_runtime::model_source::{SourceFormat, SourceRangeDescriptor};
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
 use hipfire_runtime::weight_store::{WeightLoadTransaction, WeightStoreError};
 use rdna_compute::{Gpu, GpuTensor};
@@ -997,10 +997,11 @@ fn ple_descriptors(
             }
         };
         // The manifest's stride is the tier it was declared for; the descriptor
-        // side is validated against the shard's *own* declared dtype by
-        // `ExternalRowsRef::validate_descriptor`. Here the declaration only has
-        // to name a tier this reader decodes, so a sealed BF16-PLE artifact
-        // stays loadable next to a Q8F16 one.
+        // side (length for its own declared dtype, shape, valid rows, HFQ index
+        // seal, file bounds) was already checked when the transaction was
+        // fulfilled. Here the declaration only has to name a tier the reader
+        // decodes, so a sealed BF16-PLE artifact stays loadable next to a
+        // Q8F16 one.
         if ![
             RowEncoding::Bf16.encoded_row_bytes(PLE_ROW_WIDTH),
             RowEncoding::Q8F16.encoded_row_bytes(PLE_ROW_WIDTH),
@@ -1026,15 +1027,13 @@ fn ple_descriptors(
                 )));
             }
         }
-        ExternalRowsRef {
-            name: entry.name.clone(),
-            layer: 1,
-            row_bytes,
-            physical_rows: PLE_SHARD_ROWS,
-            valid_rows,
+        // Fulfillment only enforces the index seal for HFQ sources; PLE rows
+        // must come from one.
+        if descriptor.source_identity().format != SourceFormat::Hfq {
+            return Err(BundleError::Weights(WeightError::DescriptorMismatch(
+                entry.name.clone(),
+            )));
         }
-        .validate_descriptor(&descriptor)
-        .map_err(BundleError::Weights)?;
         descriptors.push(descriptor);
     }
     if valid_rows_total != metadata.valid_rows() {
