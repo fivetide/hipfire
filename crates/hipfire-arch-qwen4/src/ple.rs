@@ -531,8 +531,6 @@ impl PleHistory {
         self.previous = [self.previous[1], token];
     }
 }
-/// Compatibility names used by the model-owned row reader.
-pub type PleTokenHistory = PleHistory;
 pub type PleRowId = u64;
 
 #[cfg(test)]

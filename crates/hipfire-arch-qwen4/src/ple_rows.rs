@@ -853,22 +853,6 @@ impl PleRows {
     pub fn cancel(&self, ticket: &PlePrefetch) -> Result<(), PleRowsError> {
         ticket.cancel()
     }
-    /// Alias that documents the required scheduling boundary in the caller.
-    pub fn prefetch_before_layer0(
-        &self,
-        epoch: u64,
-        history: PleHistory,
-        tokens: &[u32],
-    ) -> Result<PlePrefetch, PleRowsError> {
-        self.prefetch(epoch, history, tokens)
-    }
-
-    /// Alias for the layer-1 completion boundary.  No GPU operation is
-    /// performed here; the caller owns the single contiguous upload.
-    pub fn consume_at_layer1(&self, ticket: &PlePrefetch) -> Result<PleRowLease, PleRowsError> {
-        self.wait_completed_lease(ticket)
-    }
-
     /// Stop accepting tickets, invalidate pending work, and wait for readers
     /// and leases to drain.  A timeout returns an unload proof showing exactly
     /// which owner is still live; it never pretends quiescence succeeded.

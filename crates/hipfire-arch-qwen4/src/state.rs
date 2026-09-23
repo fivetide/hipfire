@@ -8,7 +8,7 @@
 //! `Reference*` structs are used only by CPU equation tests and parity probes.
 
 use crate::config::{LayerType, Qwen4Config};
-use crate::ple::{PleHashMetadata, PleHistory, PLE_HEAD_COUNT};
+use crate::ple::PleHistory;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -89,68 +89,6 @@ impl ReferenceGdnLayerState {
         let start = self.conv_cursor * self.conv_channels;
         self.conv_history[start..start + self.conv_channels].copy_from_slice(row);
         self.conv_cursor = (self.conv_cursor + 1) % rows;
-        Ok(())
-    }
-}
-
-/// Reference-only PLE convolution state.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ReferencePleState {
-    pub history: PleHistory,
-    pub conv_history: Vec<f32>,
-    pub conv_cursor: usize,
-    pub channels: usize,
-    pub kernel: usize,
-    pub dilation: usize,
-}
-
-impl ReferencePleState {
-    pub fn new(config: &Qwen4Config, eos_token_id: u32) -> Result<Self, StateError> {
-        let rows = config
-            .ple_conv_kernel_size
-            .checked_sub(1)
-            .ok_or(StateError::DimensionOverflow)?
-            .checked_mul(3)
-            .ok_or(StateError::DimensionOverflow)?;
-        let channels = config
-            .ple_embed_dim
-            .checked_mul(config.hc_count)
-            .ok_or(StateError::DimensionOverflow)?;
-        let len = rows
-            .checked_mul(channels)
-            .ok_or(StateError::DimensionOverflow)?;
-        Ok(Self {
-            history: PleHistory::new(eos_token_id),
-            conv_history: vec![0.0; len],
-            conv_cursor: 0,
-            channels,
-            kernel: config.ple_conv_kernel_size,
-            dilation: 3,
-        })
-    }
-
-    pub fn reset(&mut self) {
-        self.history.reset();
-        self.conv_history.fill(0.0);
-        self.conv_cursor = 0;
-    }
-
-    pub fn hash_token(&mut self, metadata: &PleHashMetadata, token: u32) -> [u64; PLE_HEAD_COUNT] {
-        self.history.hash_token(metadata, token)
-    }
-
-    pub fn push_conv_row(&mut self, row: &[f32]) -> Result<(), StateError> {
-        if row.len() != self.channels {
-            return Err(StateError::Length {
-                what: "reference PLE convolution row",
-                expected: self.channels,
-                actual: row.len(),
-            });
-        }
-        let rows = self.conv_history.len() / self.channels;
-        let offset = self.conv_cursor * self.channels;
-        self.conv_history[offset..offset + self.channels].copy_from_slice(row);
-        self.conv_cursor = (self.conv_cursor + 1) % rows.max(1);
         Ok(())
     }
 }
@@ -1198,77 +1136,6 @@ impl std::error::Error for StateError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn reference_state_has_nine_ple_history_rows() {
-        let layers: Vec<_> = (0..48)
-            .map(|layer| {
-                if layer % 4 == 3 {
-                    "full_attention"
-                } else {
-                    "linear_attention"
-                }
-            })
-            .collect();
-        let value = serde_json::json!({
-            "model_type": "qwen4_exp",
-            "text_config": {
-                "model_type": "qwen4_exp_text",
-                "dtype": "bfloat16",
-                "hidden_size": 2560,
-                "vocab_size": 248320,
-                "num_hidden_layers": 48,
-                "max_position_embeddings": 262144,
-                "num_attention_heads": 24,
-                "num_key_value_heads": 2,
-                "head_dim": 256,
-                "partial_rotary_factor": 0.25,
-                "rope_parameters": {"rope_theta": 10000000.0},
-                "attention_bias": false,
-                "layer_types": layers,
-                "full_attention_interval": 4,
-                "linear_num_key_heads": 16,
-                "linear_num_value_heads": 48,
-                "linear_key_head_dim": 128,
-                "linear_value_head_dim": 128,
-                "linear_conv_kernel_dim": 4,
-                "mamba_ssm_dtype": "float32",
-                "indexer_n_heads": 4,
-                "indexer_kv_heads": 1,
-                "indexer_head_dim": 128,
-                "indexer_budget": 2048,
-                "indexer_compress_ratio": 4,
-                "num_experts": 512,
-                "num_experts_per_tok": 10,
-                "moe_intermediate_size": 640,
-                "shared_expert_intermediate_size": 640,
-                "hc_count": 4,
-                "hc_lowrank": 320,
-                "ple_layer_ids": [2],
-                "ple_conv_kernel_size": 4,
-                "ple_embed_dim": 2560,
-                "split_ngram_parts": 128,
-                "heads_per_ngram": 8,
-                "ngram_size": 3,
-                "ngram_vocab_size_base": 20000000,
-                "make_ngram_vocab_size_divisible_by": 128,
-                "eos_token_id": 248044,
-                "tie_word_embeddings": false,
-                "mtp_num_hidden_layers": 1,
-                "mtp_use_dedicated_embeddings": false,
-                "output_gate_type": "sigmoid",
-                "mtp": {
-                    "hybrid": true,
-                    "layer_types": ["full_attention"],
-                    "num_hidden_layers": 1,
-                    "rope_theta": 10000000.0
-                }
-            }
-        });
-        let config = Qwen4Config::from_value(&value).expect("reference config");
-        let state = ReferencePleState::new(&config, config.eos_token_id).expect("PLE state");
-        assert_eq!(state.conv_history.len() / state.channels, 9);
-    }
 
     fn try_gfx1151_gpu() -> Option<Gpu> {
         let gpu = Gpu::init().ok()?;

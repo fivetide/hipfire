@@ -9,7 +9,7 @@
 //! policy.  GPU lowering consumes the same shape/ordering contracts through the
 //! Qwen4-specific dispatch and compute modules.
 
-use crate::state::{ReferenceGdnLayerState, ReferencePleState, StateError};
+use crate::state::{ReferenceGdnLayerState, StateError};
 use std::cmp::Ordering;
 use std::fmt;
 
@@ -381,71 +381,6 @@ pub fn hc_final_mix(branches: &[&[f32]], output: &mut [f32]) -> Result<(), OpErr
             *dst += value * scale;
         }
     }
-    Ok(())
-}
-
-/// Add projected PLE rows to one residual branch.  Rows are contiguous and
-/// already converted from BF16; source-row lookup is performed by the PLE
-/// owner before this operation.
-pub fn ple_add_rows(
-    rows: &[&[f32]],
-    projection: &[f32],
-    gate_query: &[f32],
-    residual: &mut [f32],
-) -> Result<(), OpError> {
-    if rows.is_empty() {
-        return Err(OpError::Empty);
-    }
-    if projection.len() != residual.len() * rows.len() || gate_query.len() != rows.len() {
-        return Err(OpError::Shape(
-            "PLE projection dimensions do not match rows",
-        ));
-    }
-    for (row_index, row) in rows.iter().enumerate() {
-        if row.len() * residual.len() != projection.len() {
-            return Err(OpError::Shape("PLE row width is inconsistent"));
-        }
-        let gate = sigmoid(gate_query[row_index]);
-        let hidden = residual.len();
-        for (out, chunk) in residual.iter_mut().zip(projection.chunks_exact(hidden)) {
-            *out += gate * chunk[row_index] * row[row_index % row.len()];
-        }
-    }
-    Ok(())
-}
-
-/// Depthwise causal convolution for PLE: kernel=4, dilation=3, nine history
-/// rows.  The history row is written only after the output is computed.
-pub fn ple_depthwise_conv(
-    state: &mut ReferencePleState,
-    input: &[f32],
-    kernel: &[f32],
-    output: &mut [f32],
-) -> Result<(), OpError> {
-    if input.len() != state.channels || output.len() != state.channels {
-        return Err(OpError::Length {
-            what: "PLE convolution input",
-            expected: state.channels,
-            actual: input.len().max(output.len()),
-        });
-    }
-    if kernel.len() != state.kernel * state.channels {
-        return Err(OpError::Shape(
-            "PLE convolution kernel must be [kernel, channels]",
-        ));
-    }
-    let rows = state.conv_history.len() / state.channels;
-    for channel in 0..state.channels {
-        let mut value = kernel[channel] * input[channel];
-        for tap in 1..state.kernel {
-            let delay = tap * state.dilation;
-            let row = (state.conv_cursor + rows - (delay % rows.max(1))) % rows.max(1);
-            value += kernel[tap * state.channels + channel]
-                * state.conv_history[row * state.channels + channel];
-        }
-        output[channel] = value;
-    }
-    state.push_conv_row(input)?;
     Ok(())
 }
 

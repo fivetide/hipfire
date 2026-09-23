@@ -19,7 +19,6 @@ pub mod mtp_gpu;
 pub mod mtp_spec;
 pub mod ops;
 pub mod ple;
-pub mod ple_ops;
 pub mod ple_rows;
 pub mod program;
 pub(crate) mod projection;
@@ -44,7 +43,7 @@ pub use config::{
     ARCH_ID, MODEL_TYPE, TEXT_MODEL_TYPE,
 };
 pub use ple::{
-    PleHashMetadata, PleHistory, PleMetadataError, PleRowId, PleTokenHistory, PLE_HEAD_COUNT,
-    PLE_HEAD_OFFSETS, PLE_HEAD_VOCAB_SIZES, PLE_MULTIPLIERS, PLE_MULTIPLIER_COUNT, PLE_PADDED_ROWS,
+    PleHashMetadata, PleHistory, PleMetadataError, PleRowId, PLE_HEAD_COUNT, PLE_HEAD_OFFSETS,
+    PLE_HEAD_VOCAB_SIZES, PLE_MULTIPLIERS, PLE_MULTIPLIER_COUNT, PLE_PADDED_ROWS,
     PLE_PADDING_MULTIPLE, PLE_ROW_WIDTH, PLE_VALID_ROWS,
 };

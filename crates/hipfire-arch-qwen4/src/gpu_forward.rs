@@ -1322,7 +1322,7 @@ impl<'a> PleEpochGuard<'a> {
     }
 
     fn install_lease(&mut self, lease: PleRowLease) {
-        // `consume_at_layer1` marks the ticket consumed.  Drop that handle
+        // `wait_completed_lease` marks the ticket consumed.  Drop that handle
         // before retaining the lease so the only live PLE owner is explicit.
         self.ticket.take();
         self.lease = Some(lease);
@@ -1337,7 +1337,7 @@ impl<'a> PleEpochGuard<'a> {
         let mut errors = Vec::new();
         if let Some(ticket) = self.ticket.take() {
             if let Err(error) = self.rows.cancel(&ticket) {
-                // consume_at_layer1 marks a ticket consumed before waiting;
+                // wait_completed_lease marks a ticket consumed before waiting;
                 // source-read and cancellation errors therefore legitimately
                 // report AlreadyConsumed during abort.
                 if !matches!(
@@ -2095,7 +2095,7 @@ impl Qwen4GpuForward {
         > {
             let ticket = ple
                 .rows
-                .prefetch_before_layer0(ple_epoch, next_history, tokens)
+                .prefetch(ple_epoch, next_history, tokens)
                 .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
             ple.install_ticket(ticket);
             let ple_rows = view(&self.scratch.ple_rows, 0, n * config.hidden_size);
@@ -2124,7 +2124,7 @@ impl Qwen4GpuForward {
                     .as_ref()
                     .ok_or_else(|| invalid("PLE layer reached without a prefetch ticket"))?;
                 let wait_started = qwen4_profile_start();
-                let lease_result = ple.rows.consume_at_layer1(ticket);
+                let lease_result = ple.rows.wait_completed_lease(ticket);
                 qwen4_profile_record(Qwen4ProfilePhase::PleWait, wait_started);
                 let lease =
                     lease_result.map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;

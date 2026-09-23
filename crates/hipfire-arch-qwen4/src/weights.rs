@@ -40,7 +40,7 @@ use std::fmt;
 pub const ROUTED_GATE_UP_DTYPE: DType = DType::MQ4G256V2;
 pub const ROUTED_DOWN_DTYPE: DType = DType::MQ4G128V2;
 pub const PLE_SHARD_ROWS: usize = 2_500_012;
-pub const PLE_ROW_WIDTH: usize = 160;
+pub use crate::ple::{PLE_HEAD_COUNT, PLE_ROW_WIDTH};
 pub const PLE_SHARD_COUNT: usize = 128;
 
 /// Packed formats this family's planner recognises.
@@ -1927,8 +1927,6 @@ pub fn ple_valid_rows_for_shard(shard: usize) -> usize {
         .saturating_sub((shard as u64).saturating_mul(PLE_SHARD_ROWS as u64))
         .min(PLE_SHARD_ROWS as u64) as usize
 }
-
-pub const PLE_HEAD_COUNT: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WeightError {
