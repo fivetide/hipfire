@@ -585,6 +585,17 @@ impl Qwen4Config {
         self.ple_embed_dim / (2 * self.heads_per_ngram)
     }
 
+    /// Dilation of the PLE short convolution: upstream spaces its taps one
+    /// n-gram apart.
+    pub fn ple_conv_dilation(&self) -> usize {
+        self.ngram_size
+    }
+
+    /// Rows of PLE short-convolution history, `(kernel - 1) * dilation`.
+    pub fn ple_conv_history_rows(&self) -> usize {
+        (self.ple_conv_kernel_size - 1) * self.ple_conv_dilation()
+    }
+
     /// The capacity selected by QSA: indexer budget plus the incomplete tail.
     pub fn qsa_selected_capacity(&self) -> usize {
         self.indexer_budget + self.indexer_compress_ratio.saturating_sub(1)
@@ -872,6 +883,8 @@ mod tests {
         assert_eq!(cfg.layer_types[2], LayerType::LinearAttention);
         assert_eq!(cfg.layer_types[3], LayerType::FullAttention);
         assert_eq!(cfg.ple_row_width(), 160);
+        assert_eq!(cfg.ple_conv_dilation(), 3);
+        assert_eq!(cfg.ple_conv_history_rows(), 9);
         assert_eq!(cfg.qsa_selected_capacity(), 2051);
     }
 

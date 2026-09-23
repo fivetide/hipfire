@@ -595,7 +595,8 @@ impl Qwen4State {
                 .ple_embed_dim
                 .checked_mul(config.hc_count)
                 .ok_or(StateError::DimensionOverflow)?;
-            let ple_elements = 9usize
+            let ple_elements = config
+                .ple_conv_history_rows()
                 .checked_mul(ple_channels)
                 .ok_or(StateError::DimensionOverflow)?;
             allocated.push(

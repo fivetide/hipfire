@@ -1728,7 +1728,7 @@ impl Qwen4GpuForward {
                     branches: dims.hc_count,
                     hidden: config.hidden_size,
                     kernel_size: dims.ple_conv_kernel_dim,
-                    dilation: 3,
+                    dilation: config.ple_conv_dilation(),
                     epsilon: EPSILON,
                 }));
             }
