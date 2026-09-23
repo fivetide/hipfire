@@ -8,17 +8,16 @@
 //! module only records the native MTP count convention and lowers an already
 //! verified greedy result onto the canonical runtime types.  In particular,
 //! the seed is never copied into `MtpWindow::committed` or `SpecStep::emit`.
-//! The target's rollback count is explicit: native `num_accepted_tokens`
-//! includes the seed, so `accept_len = num_accepted_tokens - 1` counts only
-//! accepted drafts.
+//! Target rollback counts accepted drafts only; the position helpers take the
+//! consumed-row count, which adds the seed.
 
 use crate::bundle::Qwen4Bundle;
 #[cfg(any(test, feature = "reference-parity"))]
 use crate::reference_mtp::{MtpError, Qwen4MtpState};
 use crate::state::Qwen4StateSnapshot;
 use hipfire_runtime::spec::{
-    accept_greedy_prefix, MtpDrafter, MtpSpeculator, MtpWindow, SpecAdvance, SpecGrammar,
-    SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
+    accept_greedy_prefix, GreedyAccept, MtpDrafter, MtpSpeculator, MtpWindow, SpecAdvance,
+    SpecGrammar, SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
 };
 use rdna_compute::profile::{begin_deferred, resolve_deferred, PendingTimer};
 use rdna_compute::{Gpu, GpuTensor};
@@ -112,50 +111,15 @@ impl MtpPhaseTimers {
     }
 }
 
-/// Result of one native greedy MTP target comparison.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NativeMtpAcceptance {
-    /// Accepted drafts followed by the target bonus, excluding the seed.
-    /// When an accepted draft is EOS, the runtime's shared rule stops there
-    /// and no bonus is appended.
-    pub committed: Vec<u32>,
-    /// Number of draft candidates that matched the target.
-    pub accepted_drafts: usize,
-    /// Number of candidates offered to the verifier.
-    pub drafts_generated: usize,
-    /// Native count including the seed and accepted drafts, but excluding the
-    /// bonus.  This is the count whose `- 1` value is passed to rollback.
-    pub num_accepted_tokens: usize,
-    /// Runtime target rollback count: accepted drafts only.
-    pub rollback_accept_len: usize,
-    /// Last committed token, which is the next window's pending seed.
-    pub next_seed: u32,
-    /// Whether EOS terminated this window.
-    pub hit_eos: bool,
-}
-impl NativeMtpAcceptance {
-    /// Whether EOS was an accepted draft rather than the verifier's bonus.
-    /// Accepted EOS remains a pending seed, so neither target nor MTP state
-    /// consumes that final token until the terminal flush.
-    pub fn accepted_eos(&self) -> bool {
-        self.hit_eos && self.committed.len() == self.accepted_drafts
-    }
-
-    /// Number of accepted drafts the target should commit before the pending
-    /// EOS seed. A bonus EOS is already predicted after this prefix and uses
-    /// the ordinary accepted-draft count.
-    pub fn target_commit_accept_len(&self) -> usize {
-        if self.accepted_eos() {
-            self.rollback_accept_len.saturating_sub(1)
-        } else {
-            self.rollback_accept_len
-        }
-    }
-
-    /// Captured target-hidden row that produced the next pending seed.
-    pub fn pending_hidden_row(&self) -> usize {
-        self.target_commit_accept_len()
-    }
+/// Accepted drafts the target commits before the pending seed.
+///
+/// An accepted EOS draft (no bonus follows it) stays the pending seed, so
+/// neither target nor MTP state consumes it until the terminal flush; a bonus
+/// EOS is already predicted after the accepted prefix. This is also the
+/// captured target-hidden row that produced the next pending seed.
+pub fn target_commit_accept_len(accepted: &GreedyAccept) -> usize {
+    let accepted_eos = accepted.hit_eos && accepted.committed.len() == accepted.accepted;
+    accepted.accepted - usize::from(accepted_eos)
 }
 
 /// Native MTP uses greedy target picks only.  A sampled request must fail
@@ -197,15 +161,6 @@ pub fn validate_native_mtp_prefill_request(
         return Err("Qwen4 native MTP prefill requires a complete prompt fill".to_string());
     }
     Ok(())
-}
-
-/// Convert the native count (which includes the seed) into the runtime's
-/// accepted-draft count.  Zero is invalid because the seed itself is always
-/// present in a verified block.
-pub fn native_rollback_accept_len(num_accepted_tokens: usize) -> Result<usize, String> {
-    num_accepted_tokens
-        .checked_sub(1)
-        .ok_or_else(|| "Qwen4 native MTP accepted-token count cannot be zero".to_string())
 }
 
 /// Absolute target positions occupied by the committed verify prefix.
@@ -268,19 +223,15 @@ pub fn native_commit_position(
         .ok_or_else(|| "Qwen4 native MTP commit position overflow".to_string())
 }
 
-/// Apply the runtime's one shared greedy acceptance rule to native MTP picks.
-///
-/// `target_picks` has one extra slot for the bonus.  The returned
-/// `num_accepted_tokens` deliberately includes the seed, making the
-/// `num_accepted_tokens - 1` rollback offset observable and testable rather
-/// than inferred from draft count.  The seed itself is intentionally not an
-/// argument: it is already represented by the target block and is excluded
-/// from the emitted vector by construction.
+/// Apply the runtime's one shared greedy acceptance rule to native MTP picks,
+/// refusing (rather than debug-asserting) a verifier that returned no bonus
+/// slot.  The seed is not an argument: it is already represented by the
+/// target block and is excluded from `committed` by construction.
 pub fn accept_native_greedy(
     drafts: &[u32],
     target_picks: &[u32],
     eos: Option<u32>,
-) -> Result<NativeMtpAcceptance, String> {
+) -> Result<GreedyAccept, String> {
     if target_picks.len() < drafts.len().saturating_add(1) {
         return Err(format!(
             "Qwen4 native MTP verifier returned {} picks for {} drafts; one bonus pick is required",
@@ -288,49 +239,7 @@ pub fn accept_native_greedy(
             drafts.len()
         ));
     }
-    let accepted = accept_greedy_prefix(drafts, target_picks, eos);
-    let next_seed = *accepted
-        .committed
-        .last()
-        .ok_or_else(|| "Qwen4 native MTP verifier committed no token".to_string())?;
-    let num_accepted_tokens = accepted
-        .accepted
-        .checked_add(1)
-        .ok_or_else(|| "Qwen4 native MTP accepted-token count overflow".to_string())?;
-    let rollback_accept_len = native_rollback_accept_len(num_accepted_tokens)?;
-    debug_assert_eq!(rollback_accept_len, accepted.accepted);
-    Ok(NativeMtpAcceptance {
-        committed: accepted.committed,
-        accepted_drafts: accepted.accepted,
-        drafts_generated: drafts.len(),
-        num_accepted_tokens,
-        rollback_accept_len,
-        next_seed,
-        hit_eos: accepted.hit_eos,
-    })
-}
-
-/// Lower native acceptance onto the runtime's canonical MTP window.
-pub fn acceptance_to_window(acceptance: NativeMtpAcceptance) -> Result<MtpWindow, String> {
-    if acceptance.committed.is_empty() {
-        return Err("Qwen4 native MTP cannot lower an empty committed window".to_string());
-    }
-    if acceptance.accepted_drafts > acceptance.drafts_generated {
-        return Err(format!(
-            "Qwen4 native MTP accepted {} drafts out of {}",
-            acceptance.accepted_drafts, acceptance.drafts_generated
-        ));
-    }
-    if acceptance.rollback_accept_len != acceptance.accepted_drafts
-        || acceptance.num_accepted_tokens != acceptance.accepted_drafts + 1
-    {
-        return Err("Qwen4 native MTP accepted-count convention is inconsistent".to_string());
-    }
-    Ok(MtpWindow {
-        committed: acceptance.committed,
-        accepted: acceptance.accepted_drafts,
-        drafts_generated: acceptance.drafts_generated,
-    })
+    Ok(accept_greedy_prefix(drafts, target_picks, eos))
 }
 
 /// Lower an MTP window directly to the runtime's pending-seed result.
@@ -825,7 +734,7 @@ impl Qwen4MtpDrafter {
         }
         // The next window's step-0 conditioning hidden is the hidden of the last
         // committed token, which is the row just captured: the baseline path
-        // copies `pending_hidden_row()` (= the last processed row) of its verify
+        // copies row `target_commit_accept_len` (= the last processed row) of its verify
         // capture, and this is the same row of the same forward shape.
         {
             let row_hidden = self.row_hidden()?;
@@ -1065,7 +974,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 .verify_block(gpu, &block, position, scratch.as_mut(), None)
                 .map_err(|error| error.to_string())?;
             let acceptance = accept_native_greedy(&drafts, &target_picks, Some(eos))?;
-            accepted_drafts = acceptance.accepted_drafts;
+            accepted_drafts = acceptance.accepted;
             if trace {
                 let rows = drafts
                     .iter()
@@ -1083,7 +992,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     acceptance.committed
                 );
             }
-            let target_accept_len = acceptance.target_commit_accept_len();
+            let target_accept_len = target_commit_accept_len(&acceptance);
             let full_accept = target_accept_len == k;
             let target_scratch = scratch
                 .as_any_mut()
@@ -1155,10 +1064,14 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 ));
             }
             picks
-                .copy_spec_hidden_row_to(gpu, acceptance.pending_hidden_row(), pending_hidden)
+                .copy_spec_hidden_row_to(gpu, target_accept_len, pending_hidden)
                 .map_err(|error| error.to_string())?;
 
-            let window = acceptance_to_window(acceptance)?;
+            let window = MtpWindow {
+                committed: acceptance.committed,
+                accepted: acceptance.accepted,
+                drafts_generated: drafts.len(),
+            };
             // All fallible GPU operations are complete. Validate both tickets
             // before invalidating either arena, then perform the no-copy commit
             // boundary and clear the target scratch ticket.
@@ -1337,21 +1250,19 @@ mod tests {
     use crate::reference_mtp::MtpQsaGeometry;
 
     #[test]
-    fn native_count_includes_seed_and_rollback_excludes_it() {
+    fn native_acceptance_lowers_to_the_runtime_window_and_step() {
         let result = accept_native_greedy(&[10, 11], &[10, 99, 100], None).unwrap();
         assert_eq!(result.committed, vec![10, 99]);
-        assert_eq!(result.accepted_drafts, 1);
-        assert_eq!(result.drafts_generated, 2);
-        assert_eq!(result.num_accepted_tokens, 2);
-        assert_eq!(result.rollback_accept_len, 1);
-        assert_eq!(result.next_seed, 99);
+        assert_eq!(result.accepted, 1);
         assert!(!result.hit_eos);
+        assert_eq!(target_commit_accept_len(&result), 1);
 
-        let window = acceptance_to_window(result).unwrap();
-        assert_eq!(window.committed, vec![10, 99]);
-        assert_eq!(window.accepted, 1);
-        assert_eq!(window.drafts_generated, 2);
-        let step = window_to_spec_step(window).unwrap();
+        let step = window_to_spec_step(MtpWindow {
+            committed: result.committed,
+            accepted: result.accepted,
+            drafts_generated: 2,
+        })
+        .unwrap();
         assert_eq!(step.emit.as_slice(), &[10, 99]);
         assert_eq!(step.next_seed, 99);
         assert_eq!(step.proposed, 2);
@@ -1362,26 +1273,20 @@ mod tests {
     fn native_zero_partial_full_and_eos_counts_are_explicit() {
         let zero = accept_native_greedy(&[], &[42], None).unwrap();
         assert_eq!(zero.committed, vec![42]);
-        assert_eq!(zero.num_accepted_tokens, 1);
-        assert_eq!(zero.rollback_accept_len, 0);
+        assert_eq!(target_commit_accept_len(&zero), 0);
 
         let partial = accept_native_greedy(&[10, 11], &[10, 12, 100], None).unwrap();
-        assert_eq!(partial.num_accepted_tokens, 2);
-        assert_eq!(partial.rollback_accept_len, 1);
+        assert_eq!(target_commit_accept_len(&partial), 1);
 
         let full = accept_native_greedy(&[10, 11], &[10, 11, 12], None).unwrap();
         assert_eq!(full.committed, vec![10, 11, 12]);
-        assert_eq!(full.num_accepted_tokens, 3);
-        assert_eq!(full.rollback_accept_len, 2);
+        assert_eq!(target_commit_accept_len(&full), 2);
 
         let eos = accept_native_greedy(&[10, 99], &[10, 99, 12], Some(99)).unwrap();
         assert_eq!(eos.committed, vec![10, 99]);
-        assert_eq!(eos.accepted_drafts, 2);
-        assert_eq!(eos.num_accepted_tokens, 3);
-        assert_eq!(eos.rollback_accept_len, 2);
+        assert_eq!(eos.accepted, 2);
         assert!(eos.hit_eos);
 
-        assert!(native_rollback_accept_len(0).is_err());
         assert!(require_native_greedy(-0.0).is_ok());
         assert!(require_native_greedy(1.0e-6).is_ok());
         assert!(require_native_greedy(1.0e-5).is_err());
@@ -1393,35 +1298,31 @@ mod tests {
     #[test]
     fn accepted_eos_stays_pending_for_terminal_flush() {
         let accepted = accept_native_greedy(&[10, 99], &[10, 99, 12], Some(99)).unwrap();
-        assert!(accepted.accepted_eos());
-        assert_eq!(accepted.target_commit_accept_len(), 1);
-        assert_eq!(accepted.pending_hidden_row(), 1);
+        assert_eq!(target_commit_accept_len(&accepted), 1);
         assert_eq!(
-            committed_target_positions(7, accepted.target_commit_accept_len()).unwrap(),
+            committed_target_positions(7, target_commit_accept_len(&accepted)).unwrap(),
             vec![7]
         );
         assert_eq!(
-            native_commit_position(7, accepted.target_commit_accept_len()).unwrap(),
+            native_commit_position(7, target_commit_accept_len(&accepted)).unwrap(),
             8
         );
 
         let bonus = accept_native_greedy(&[10, 11], &[10, 99, 12], Some(99)).unwrap();
-        assert!(!bonus.accepted_eos());
-        assert_eq!(bonus.target_commit_accept_len(), 1);
-        assert_eq!(bonus.pending_hidden_row(), 1);
+        assert!(bonus.hit_eos);
+        assert_eq!(target_commit_accept_len(&bonus), 1);
     }
 
     #[test]
     fn zero_draft_replays_seed_before_terminal_flush() {
         let zero = accept_native_greedy(&[], &[42], Some(99)).unwrap();
-        assert_eq!(zero.target_commit_accept_len(), 0);
-        assert_eq!(zero.pending_hidden_row(), 0);
+        assert_eq!(target_commit_accept_len(&zero), 0);
         assert_eq!(
-            committed_target_positions(7, zero.target_commit_accept_len() + 1).unwrap(),
+            committed_target_positions(7, target_commit_accept_len(&zero) + 1).unwrap(),
             vec![7]
         );
         assert_eq!(
-            native_commit_position(7, zero.target_commit_accept_len() + 1).unwrap(),
+            native_commit_position(7, target_commit_accept_len(&zero) + 1).unwrap(),
             8
         );
     }
@@ -1435,8 +1336,8 @@ mod tests {
         ];
         for (drafts, target_picks, expected_accept_len) in cases {
             let acceptance = accept_native_greedy(&drafts, &target_picks, None).unwrap();
-            assert_eq!(acceptance.target_commit_accept_len(), expected_accept_len);
-            let consumed = acceptance.target_commit_accept_len() + 1;
+            assert_eq!(target_commit_accept_len(&acceptance), expected_accept_len);
+            let consumed = target_commit_accept_len(&acceptance) + 1;
             let expected_position = native_commit_position(7, consumed).unwrap();
             let mut state = Qwen4MtpState::new(MtpQsaGeometry {
                 q_heads: 2,
@@ -1489,15 +1390,5 @@ mod tests {
     fn malformed_target_picks_are_rejected_before_acceptance() {
         assert!(accept_native_greedy(&[2], &[], None).is_err());
         assert!(accept_native_greedy(&[2, 3], &[2, 3], None).is_err());
-        assert!(acceptance_to_window(NativeMtpAcceptance {
-            committed: vec![4],
-            accepted_drafts: 2,
-            drafts_generated: 1,
-            num_accepted_tokens: 3,
-            rollback_accept_len: 2,
-            next_seed: 4,
-            hit_eos: false,
-        })
-        .is_err());
     }
 }
