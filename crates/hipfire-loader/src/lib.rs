@@ -259,6 +259,33 @@ pub fn bench_decode_route(arch_id: u32) -> BenchDecodeRoute {
     }
 }
 
+/// The daemon's stable per-arch label: the retained-Redline config key and
+/// the status `model_arch` field. Unlisted ids read as dense `qwen3`.
+pub fn arch_label(arch_id: u32) -> &'static str {
+    match arch_id {
+        5 => "qwen3_5",
+        6 => "qwen3_5_moe",
+        7 => "qwen2",
+        8 => "dots-ocr",
+        9 => "deepseek4",
+        10 => "minimax_m2",
+        11 => "lfm2moe",
+        12 => "north_mini_code",
+        13 => "gemma4",
+        14 => "muse_glimmer",
+        16 => "qwen4",
+        40 => "flux_mmdit",
+        45 => "flux2_mmdit",
+        _ => "qwen3",
+    }
+}
+
+/// Whether this arch, like every tp>1 load, is fully staged before the prior
+/// model is retired, so a failed load leaves the prior model usable.
+pub fn defers_prior_unload(arch_id: u32) -> bool {
+    arch_id == hipfire_arch_qwen4::ARCH_ID
+}
+
 /// Vision route. `None` = no vision encoder (text-only). The daemon still
 /// gates on `has_image`/`has_vl`; this route only selects the per-arch
 /// vision implementation.

@@ -41,7 +41,6 @@ hipfire-engine = { path = "../hipfire-engine" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-pflash = { path = "../hipfire-pflash" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
-hipfire-arch-qwen4 = { path = "../hipfire-arch-qwen4" }
 
 # Arches via loader/generate; qwen35 direct for slots.
 

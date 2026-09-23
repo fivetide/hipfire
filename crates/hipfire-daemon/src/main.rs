@@ -1790,9 +1790,8 @@ fn main() {
                         continue;
                     }
                 };
-                let admitted_arch_id = admission.arch_id;
                 let defer_prior_unload =
-                    load_tp > 1 || admitted_arch_id == hipfire_arch_qwen4::ARCH_ID;
+                    load_tp > 1 || hipfire_loader::defers_prior_unload(admission.arch_id);
 
                 // Unload previous if any. PFlash drafter goes first so
                 // its tensors join the pool before unload_model drains
@@ -1892,22 +1891,7 @@ fn main() {
                         // its PFlash drafter) must survive every fallible
                         // stage of the new model so a staging failure rolls
                         // back only `m` and keeps the prior usable.
-                        let arch = match m.arch_id {
-                            5 => "qwen3_5",
-                            6 => "qwen3_5_moe",
-                            16 => "qwen4",
-                            7 => "qwen2",
-                            8 => "dots-ocr",
-                            9 => "deepseek4",
-                            10 => "minimax_m2",
-                            11 => "lfm2moe",
-                            12 => "north_mini_code",
-                            13 => "gemma4",
-                            14 => "muse_glimmer",
-                            40 => "flux_mmdit",
-                            45 => "flux2_mmdit",
-                            _ => "qwen3",
-                        };
+                        let arch = hipfire_loader::arch_label(m.arch_id);
                         let drafter = m.speculator.as_ref().map(|speculator| speculator.name());
                         let redline_default = hipfire_runtime::config::retained_redline_default(
                             &gpu.arch,
@@ -3980,21 +3964,7 @@ fn main() {
                 let has_model = model.is_some();
                 let model_arch = model
                     .as_ref()
-                    .map(|m| match m.arch_id {
-                        5 => "qwen3_5",
-                        6 => "qwen3_5_moe",
-                        16 => "qwen4",
-                        7 => "qwen2",
-                        9 => "deepseek4",
-                        10 => "minimax_m2",
-                        11 => "lfm2moe",
-                        12 => "north_mini_code",
-                        13 => "gemma4",
-                        14 => "muse_glimmer",
-                        40 => "flux_mmdit",
-                        45 => "flux2_mmdit",
-                        _ => "qwen3",
-                    })
+                    .map(|m| hipfire_loader::arch_label(m.arch_id))
                     .unwrap_or("none");
                 // Count pre-compiled kernels
                 let kernel_dir = std::env::current_exe()

@@ -16,7 +16,7 @@
 //! batched GEMM can be compared with the per-row GEMV.
 //!
 //! Usage:
-//!   cargo run --release --example qwen4_qt53_channel -p hipfire-runtime
+//!   cargo run --release --features lab --example qwen4_qt53_channel -p hipfire-runtime
 
 use half::f16;
 use rdna_compute::{gen_fwht_signs, DType, Gpu, GpuTensor};

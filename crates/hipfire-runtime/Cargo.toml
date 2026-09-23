@@ -613,6 +613,10 @@ name = "tp4_cross_device_graph_barrier"
 required-features = ["lab"]
 
 [[example]]
+name = "qwen4_qt53_channel"
+required-features = ["lab"]
+
+[[example]]
 name = "tp_allreduce_smoke"
 required-features = ["lab"]
 
