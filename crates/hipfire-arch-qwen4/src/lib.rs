@@ -19,7 +19,6 @@ pub mod mtp_gpu;
 pub mod mtp_spec;
 pub mod ops;
 pub mod ple;
-pub mod ple_rows;
 pub mod program;
 pub(crate) mod projection;
 #[cfg(any(test, feature = "reference-parity"))]

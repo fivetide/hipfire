@@ -530,6 +530,17 @@ impl PleHistory {
     pub fn push(&mut self, token: u32) {
         self.previous = [self.previous[1], token];
     }
+
+    /// The token-major, head-minor row ids of `tokens`, hashed from this
+    /// history without advancing it: callers commit history only after the
+    /// surrounding request commits.
+    pub fn row_ids(self, metadata: &PleHashMetadata, tokens: &[u32]) -> Vec<u64> {
+        let mut history = self;
+        tokens
+            .iter()
+            .flat_map(|&token| history.hash_token(metadata, token))
+            .collect()
+    }
 }
 pub type PleRowId = u64;
 

@@ -13,9 +13,7 @@
 
 use crate::bundle::Qwen4Bundle;
 use crate::config::{LayerType, Qwen4Config};
-use crate::ple_rows::{
-    PlePrefetch, PleRowLease, PleRows, PleRowsError, PLE_ROWS_PER_TOKEN, PLE_ROW_BYTES,
-};
+use crate::ple::{PLE_HEAD_COUNT, PLE_ROW_WIDTH};
 use crate::program::{
     execute_final_hyper, execute_lm_head, validate_final_hyper, validate_lm_head,
     Qwen4AttentionWeights, Qwen4GdnWeights, Qwen4HyperReadWeights, Qwen4HyperWeights,
@@ -44,6 +42,7 @@ use hipfire_dispatch::pipeline::{
     IndexedAttentionState, Step,
 };
 use hipfire_dispatch::types::dtype_rotation_plan;
+use hipfire_runtime::external_rows::RowFetch;
 use hipfire_runtime::weight_manifest::ExpertSourceLayout;
 use rdna_compute::replay::ShadowBodyRoute;
 use rdna_compute::tensor_ops::{argmax_f32, ArgmaxF32};
@@ -51,10 +50,9 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use smallvec::SmallVec;
 use std::cell::{Cell, RefCell};
 use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const EPSILON: f32 = 1.0e-6;
-const PLE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum number of rows resident in the reusable Qwen4 forward scratch.
 ///
 /// Public serving calls may receive longer prompts; the forward owner tiles
@@ -961,8 +959,8 @@ impl Qwen4GpuForwardScratch {
         let max_rotation = wide.max(hidden).max(config.moe_intermediate_size);
         let ple_channels = config.ple_embed_dim * config.hc_count;
         let max_ple_bytes = max_chunk
-            .checked_mul(PLE_ROWS_PER_TOKEN)
-            .and_then(|bytes| bytes.checked_mul(PLE_ROW_BYTES))
+            .checked_mul(PLE_HEAD_COUNT)
+            .and_then(|bytes| bytes.checked_mul(PLE_ROW_WIDTH * 2))
             .ok_or_else(|| invalid("PLE staging size overflow"))?;
         let i32_bytes = std::mem::size_of::<i32>();
         let qsa_selected_bytes = max_chunk
@@ -1030,10 +1028,7 @@ impl Qwen4GpuForwardScratch {
             alloc(&[max_chunk * q_width], DType::F32)?;
             alloc(&[qsa_selected_bytes], DType::Raw)?;
             alloc(&[max_chunk * hidden], DType::F32)?;
-            alloc(
-                &[max_chunk * PLE_ROWS_PER_TOKEN * (PLE_ROW_BYTES / 2)],
-                DType::BF16,
-            )?;
+            alloc(&[max_chunk * PLE_HEAD_COUNT * PLE_ROW_WIDTH], DType::BF16)?;
             alloc(&[max_chunk * hidden], DType::F32)?;
             alloc(&[max_chunk * ple_channels], DType::F32)?;
             alloc(&[max_chunk * hidden], DType::F32)?;
@@ -1290,96 +1285,6 @@ fn layer_scratch<'a>(
         moe_inverse_perm: &scratch.moe_inverse_perm,
         moe_y_gate_up_grouped: &scratch.moe_y_gate_up_grouped,
         moe_y_down_grouped: &scratch.moe_y_down_grouped,
-    }
-}
-
-/// Owns request-local PLE work until the forward attempt either commits or
-/// aborts.  Immutable page-cache entries belong to [`PleRows`] and survive
-/// `reset_epoch`; this guard only owns the exact ticket and completed lease for
-/// the current epoch.
-struct PleEpochGuard<'a> {
-    rows: &'a PleRows,
-    epoch: u64,
-    ticket: Option<PlePrefetch>,
-    lease: Option<PleRowLease>,
-    armed: bool,
-}
-
-impl<'a> PleEpochGuard<'a> {
-    fn new(rows: &'a PleRows, epoch: u64) -> Self {
-        Self {
-            rows,
-            epoch,
-            ticket: None,
-            lease: None,
-            armed: true,
-        }
-    }
-
-    fn install_ticket(&mut self, ticket: PlePrefetch) {
-        debug_assert!(self.ticket.is_none());
-        self.ticket = Some(ticket);
-    }
-
-    fn install_lease(&mut self, lease: PleRowLease) {
-        // `wait_completed_lease` marks the ticket consumed.  Drop that handle
-        // before retaining the lease so the only live PLE owner is explicit.
-        self.ticket.take();
-        self.lease = Some(lease);
-    }
-    fn abort(&mut self) -> Result<u64, String> {
-        if !self.armed {
-            return Ok(self.rows.current_epoch());
-        }
-        // Disarm first: if cleanup itself reports an error, Drop must not
-        // issue a second reset against a later epoch.
-        self.armed = false;
-        let mut errors = Vec::new();
-        if let Some(ticket) = self.ticket.take() {
-            if let Err(error) = self.rows.cancel(&ticket) {
-                // wait_completed_lease marks a ticket consumed before waiting;
-                // source-read and cancellation errors therefore legitimately
-                // report AlreadyConsumed during abort.
-                if !matches!(
-                    error,
-                    PleRowsError::AlreadyConsumed(_)
-                        | PleRowsError::Canceled
-                        | PleRowsError::UnknownTicket(_)
-                ) {
-                    errors.push(format!("cancel epoch {} ticket: {error}", self.epoch));
-                }
-            }
-            drop(ticket);
-        }
-        // A lease holds one of the bounded staging buffers.  It must be
-        // returned before reset_epoch waits for readers/leases to drain.
-        drop(self.lease.take());
-        let next_epoch = match self.rows.reset_epoch(PLE_CLEANUP_TIMEOUT) {
-            Ok(next) => Some(next),
-            Err(error) => {
-                errors.push(format!("drain epoch {}: {error}", self.epoch));
-                None
-            }
-        };
-        if errors.is_empty() {
-            Ok(next_epoch.expect("successful PLE reset returns its next epoch"))
-        } else {
-            Err(errors.join("; "))
-        }
-    }
-
-    fn complete(&mut self) {
-        self.armed = false;
-        drop(self.ticket.take());
-        drop(self.lease.take());
-    }
-}
-
-impl Drop for PleEpochGuard<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = self.abort();
-        }
     }
 }
 
@@ -2069,18 +1974,8 @@ impl Qwen4GpuForward {
             config.hidden_size,
         )?;
 
-        let ple_epoch = bundle
-            .ple_rows
-            .current_epoch()
-            .checked_add(1)
-            .ok_or_else(|| {
-                Qwen4GpuForwardError::Ple("PLE epoch exhausted at u64::MAX".to_string())
-            })?;
-        bundle
-            .begin_ple_epoch(ple_epoch)
+        let mut ple = RowFetch::begin(&bundle.ple_rows)
             .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
-        let ple_rows_resource = &bundle.ple_rows;
-        let mut ple = PleEpochGuard::new(ple_rows_resource, ple_epoch);
         let next_history = bundle.state.ple_history;
         let next_position = bundle.state.position;
         // Boundary samples, hoisted so the post-body finalize outside this closure
@@ -2093,16 +1988,13 @@ impl Qwen4GpuForward {
             SmallVec<[(usize, usize, usize, usize, usize, usize); QWEN4_QSA_INLINE_CAPACITY]>,
             Qwen4GpuForwardError,
         > {
-            let ticket = ple
-                .rows
-                .prefetch(ple_epoch, next_history, tokens)
+            ple.prefetch(next_history.row_ids(&bundle.ple_metadata, tokens))
                 .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
-            ple.install_ticket(ticket);
             let ple_rows = view(&self.scratch.ple_rows, 0, n * config.hidden_size);
             let staged = view(
                 &self.scratch.ple_staged,
                 0,
-                n * PLE_ROWS_PER_TOKEN * (PLE_ROW_BYTES / 2),
+                n * PLE_HEAD_COUNT * PLE_ROW_WIDTH,
             );
 
             // Expand the embedding batch into the row-major stream basis with
@@ -2118,21 +2010,12 @@ impl Qwen4GpuForward {
                 n as i32,
             )?;
 
-            if ple.lease.is_none() {
-                let ticket = ple
-                    .ticket
-                    .as_ref()
-                    .ok_or_else(|| invalid("PLE layer reached without a prefetch ticket"))?;
+            if ple.lease().is_none() {
                 let wait_started = qwen4_profile_start();
-                let lease_result = ple.rows.wait_completed_lease(ticket);
+                let lease_result = ple.wait();
                 qwen4_profile_record(Qwen4ProfilePhase::PleWait, wait_started);
                 let lease =
                     lease_result.map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
-                ple.install_lease(lease);
-                let lease = ple
-                    .lease
-                    .as_ref()
-                    .ok_or_else(|| invalid("PLE lease disappeared after consumption"))?;
                 let upload_len = lease
                     .as_bytes()
                     .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?
@@ -2154,8 +2037,8 @@ impl Qwen4GpuForward {
                     &staged,
                     &ple_rows,
                     n,
-                    PLE_ROWS_PER_TOKEN,
-                    PLE_ROW_BYTES / 2,
+                    PLE_HEAD_COUNT,
+                    PLE_ROW_WIDTH,
                 )?;
                 qwen4_profile_record(Qwen4ProfilePhase::PleApply, apply_started);
             }

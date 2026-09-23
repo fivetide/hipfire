@@ -13,12 +13,12 @@ use crate::config::Qwen4Config;
 use crate::gpu_forward::{Qwen4GpuForward, Qwen4OutputRows, QWEN4_PREFILL_CHUNK_CAP};
 use crate::mtp_gpu::{MtpGpuStateSnapshot, Qwen4MtpGpu};
 use crate::ple::PleHashMetadata;
-use crate::ple_rows::{PleRowEncoding, PleRows, PleRowsError};
 use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
 use crate::weights::{
     ple_valid_rows_for_shard, ExternalRowsRef, Qwen4Manifest, Qwen4Placement, Qwen4Weights,
     WeightError, PLE_ROW_WIDTH, PLE_SHARD_COUNT, PLE_SHARD_ROWS,
 };
+use hipfire_runtime::external_rows::{RowEncoding, RowStore, RowStoreError};
 use hipfire_runtime::model_source::SourceRangeDescriptor;
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
 use hipfire_runtime::weight_store::{WeightLoadTransaction, WeightStoreError};
@@ -76,7 +76,7 @@ pub struct Qwen4Bundle {
     pub state: Qwen4State,
     /// Bounded model-owned PLE reader/cache.  It must quiesce before source
     /// descriptors and the attached transaction are dropped.
-    pub(crate) ple_rows: PleRows,
+    pub(crate) ple_rows: RowStore,
     pub(crate) ple_metadata: PleHashMetadata,
     /// Canonical load census and external descriptors.  This is deliberately
     /// not left in the loader or carrier after publication.
@@ -145,7 +145,7 @@ impl Qwen4Bundle {
                 return Err(cleanup_bundle_failure(error, weight_result, cleanup));
             }
         };
-        let ple_rows = match PleRows::new(descriptors, metadata.clone()) {
+        let ple_rows = match RowStore::new("qwen4-ple-reader", descriptors, metadata.valid_rows()) {
             Ok(rows) => rows,
             Err(error) => {
                 let weight_result = weights.free_gpu(gpu);
@@ -214,18 +214,12 @@ impl Qwen4Bundle {
         )
     }
 
-    pub fn ple_rows(&self) -> &PleRows {
+    pub fn ple_rows(&self) -> &RowStore {
         &self.ple_rows
     }
 
-    pub fn ple_rows_mut(&mut self) -> &mut PleRows {
+    pub fn ple_rows_mut(&mut self) -> &mut RowStore {
         &mut self.ple_rows
-    }
-
-    pub fn begin_ple_epoch(&self, epoch: u64) -> Result<(), BundleError> {
-        self.ple_rows
-            .begin_epoch(epoch)
-            .map_err(BundleError::PleRows)
     }
 
     pub fn attached_origin(&self) -> Option<hipfire_runtime::weight_store::WeightOrigin> {
@@ -1008,8 +1002,8 @@ fn ple_descriptors(
         // to name a tier this reader decodes, so a sealed BF16-PLE artifact
         // stays loadable next to a Q8F16 one.
         if ![
-            PleRowEncoding::Bf16.encoded_row_bytes(),
-            PleRowEncoding::Q8F16.encoded_row_bytes(),
+            RowEncoding::Bf16.encoded_row_bytes(PLE_ROW_WIDTH),
+            RowEncoding::Q8F16.encoded_row_bytes(PLE_ROW_WIDTH),
         ]
         .contains(&row_bytes)
             || valid_rows != ple_valid_rows_for_shard(index)
@@ -1103,7 +1097,7 @@ pub enum BundleError {
     Config(String),
     Weights(WeightError),
     State(StateError),
-    PleRows(PleRowsError),
+    PleRows(RowStoreError),
     Forward(String),
     Hip(hip_bridge::HipError),
     Rollback {

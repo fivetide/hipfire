@@ -23,7 +23,7 @@ The following describes the code inspected when this plan was written. Symbol na
 - `crates/hipfire-arch-qwen4/src/gpu_forward.rs`: `Qwen4GpuForward::forward_chunk_inner` embeds a chunk, then loops over tokens and layers. Most execution scratch is single-token. `execute_moe` binds `MoeParams` with `batch_size: 1`, seals decode, and executes `Step::Moe`.
 - The same file owns direct HC/GDN/QSA/PLE execution. These operations do not yet constitute a shared layer program.
 - `crates/hipfire-arch-qwen4/src/state.rs`: GDN owns recurrent and convolution state; QSA owns cache/pooling/selection state. QSA selection scratch currently holds one query's selection.
-- `crates/hipfire-arch-qwen4/src/ple_rows.rs`: PLE uses bounded staging, history-dependent lookup, and lease/epoch lifetimes. Multi-token PLE kernels exist, but surrounding execution remains scalar.
+- `crates/hipfire-runtime/src/external_rows.rs` (reader) + `crates/hipfire-arch-qwen4/src/ple.rs` (row ids): PLE uses bounded staging, history-dependent lookup, and lease/epoch lifetimes. Multi-token PLE kernels exist, but surrounding execution remains scalar.
 - `crates/hipfire-arch-qwen4/src/mtp_gpu.rs` and `mtp_spec.rs`: native MTP has separate state and token-at-a-time execution. Batching the target does not automatically batch MTP.
 - `crates/hipfire-dispatch/src/pipeline/moe_program.rs`: shared decode/prefill stage lowering exists. Architecture consumers bind typed calls; they do not construct an expert-kernel interpreter.
 - Qwen35 and Cohere already consume `MoePrefillParams` → `seal_prefill` → `Step::Moe` for token batches. Qwen35's `PrefillBatchScratch` is a useful existing layout reference.

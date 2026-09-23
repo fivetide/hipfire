@@ -16,9 +16,9 @@ use crate::gpu_forward::{
 };
 use crate::mtp_gpu::{MtpGpuState, MtpStateParityMetadata};
 use crate::mtp_spec::validate_native_mtp_prefill_request;
-use crate::ple_rows::PleCacheStats;
 use crate::state::Qwen4State;
 use hip_bridge::launch_counters;
+use hipfire_runtime::external_rows::RowCacheStats;
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
 use rdna_compute::tensor_ops::{
     indexed_attention_cache_append, indexed_attention_pool_rope, indexed_attention_reuse_selection,
@@ -1333,7 +1333,7 @@ fn sealed_moe_profile_evidence(stats: &Value, dirty_reuse: bool) -> Result<Value
     }))
 }
 
-fn ple_cache_stats_json(stats: PleCacheStats) -> Value {
+fn ple_cache_stats_json(stats: RowCacheStats) -> Value {
     json!({
         "capacity_bytes": stats.capacity_bytes,
         "resident_bytes": stats.resident_bytes,
@@ -1352,7 +1352,7 @@ fn ple_cache_stats_json(stats: PleCacheStats) -> Value {
     })
 }
 
-fn ple_cache_delta(before: PleCacheStats, after: PleCacheStats) -> Value {
+fn ple_cache_delta(before: RowCacheStats, after: RowCacheStats) -> Value {
     json!({
         "cache_hits": after.cache_hits.saturating_sub(before.cache_hits),
         "cache_misses": after.cache_misses.saturating_sub(before.cache_misses),

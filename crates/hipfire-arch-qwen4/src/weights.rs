@@ -14,7 +14,7 @@
 use crate::config::{LayerType, Qwen4Config};
 #[cfg(test)]
 use crate::config::{Qwen4MtpConfig, RecurrentStateDType, SourceDType};
-use crate::ple_rows::PleRowEncoding;
+use hipfire_runtime::external_rows::RowEncoding;
 use hipfire_runtime::model_source::{SourceFormat, SourceRangeDescriptor};
 #[cfg(test)]
 use hipfire_runtime::weight_manifest::WeightResidency;
@@ -357,10 +357,10 @@ impl ExternalRowsRef {
         // manifest's default: a sealed BF16 shard (320-byte rows) and a Q8F16
         // shard (170-byte rows) are both valid answers to the same declaration,
         // and the reader decodes whichever one the artifact carries.
-        let encoding = crate::ple_rows::PleRowEncoding::from_dtype(&descriptor.dtype)
+        let encoding = RowEncoding::from_dtype(&descriptor.dtype)
             .ok_or_else(|| WeightError::DescriptorMismatch(self.name.clone()))?;
         let expected_len = encoding
-            .encoded_row_bytes()
+            .encoded_row_bytes(PLE_ROW_WIDTH)
             .checked_mul(self.physical_rows)
             .ok_or_else(|| WeightError::ShapeOverflow(self.name.clone()))?;
         if descriptor.length != expected_len as u64 {
@@ -1267,7 +1267,7 @@ fn push_ple_entries<F>(
             // shard is accepted by the same constraint and validated against its
             // own dtype-derived stride.
             .external_rows(
-                PleRowEncoding::Q8F16.encoded_row_bytes(),
+                RowEncoding::Q8F16.encoded_row_bytes(PLE_ROW_WIDTH),
                 ple_valid_rows_for_shard(shard),
             ),
         );
