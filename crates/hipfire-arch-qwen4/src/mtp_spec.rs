@@ -19,7 +19,7 @@ use hipfire_runtime::spec::{
     accept_greedy_prefix, GreedyAccept, MtpDrafter, MtpSpeculator, MtpWindow, SpecAdvance,
     SpecGrammar, SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
 };
-use rdna_compute::profile::{begin_deferred, resolve_deferred, PendingTimer};
+use rdna_compute::profile::{unix_micros, Span, SpanProfiler};
 use rdna_compute::{Gpu, GpuTensor};
 use std::time::Instant;
 
@@ -30,80 +30,46 @@ use std::time::Instant;
 /// instrument never synchronizes mid-window and never changes launch order:
 /// the number it prints is the GPU time the phase actually occupies.
 struct MtpPhaseTimers {
-    enabled: bool,
-    open: Option<(&'static str, PendingTimer)>,
-    open_started_us: u64,
-    done: Vec<(&'static str, u64, u64, PendingTimer)>,
-}
-
-fn unix_micros() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_micros() as u64)
-        .unwrap_or(0)
+    spans: SpanProfiler,
+    open: Option<Span>,
 }
 
 impl MtpPhaseTimers {
     fn new() -> Self {
         Self {
-            enabled: std::env::var("HIPFIRE_MTP_PHASE_TIMING").is_ok_and(|value| value == "1"),
+            spans: SpanProfiler::new(
+                std::env::var("HIPFIRE_MTP_PHASE_TIMING").is_ok_and(|value| value == "1"),
+            ),
             open: None,
-            open_started_us: 0,
-            done: Vec::new(),
         }
+    }
+
+    fn enabled(&self) -> bool {
+        self.spans.enabled()
     }
 
     /// Close the open phase and open `label`.
     fn mark(&mut self, gpu: &Gpu, label: &'static str) {
-        if !self.enabled {
-            return;
-        }
-        self.close(gpu);
-        self.open_started_us = unix_micros();
-        if let Ok(timer) = begin_deferred(&gpu.hip, None) {
-            self.open = Some((label, timer));
-        }
-    }
-
-    fn close(&mut self, gpu: &Gpu) {
-        if let Some((label, timer)) = self.open.take() {
-            if timer.mark_stop(&gpu.hip, None).is_ok() {
-                self.done
-                    .push((label, self.open_started_us, unix_micros(), timer));
-            }
-        }
+        self.spans.end(&gpu.hip, None, self.open.take());
+        self.open = self.spans.begin(&gpu.hip, None, label);
     }
 
     /// Resolve every recorded pair and print one line.  `fields` carries the
     /// per-window scalars (position, k, accepted drafts).  Repeated labels are
     /// summed, so a per-row phase reads as its total across the window.
     fn finish(mut self, gpu: &Gpu, tag: &str, fields: &str) {
-        self.close(gpu);
-        if self.done.is_empty() {
+        self.spans.end(&gpu.hip, None, self.open.take());
+        let totals = self.spans.resolve(&gpu.hip, None);
+        if totals.is_empty() {
             return;
-        }
-        let mut stamps: Vec<(&'static str, u64, u64)> = Vec::new();
-        let mut pairs = Vec::with_capacity(self.done.len());
-        for (label, started, ended, timer) in self.done.drain(..) {
-            stamps.push((label, started, ended));
-            pairs.push((label, timer));
-        }
-        let resolved = resolve_deferred(&gpu.hip, None, pairs);
-        let mut totals: Vec<(&'static str, f64, u64, u64)> = Vec::new();
-        for ((label, micros), (_, started, ended)) in resolved.iter().zip(stamps.iter()) {
-            match totals.iter_mut().find(|entry| entry.0 == *label) {
-                Some(entry) => {
-                    entry.1 += micros;
-                    entry.2 = entry.2.min(*started);
-                    entry.3 = entry.3.max(*ended);
-                }
-                None => totals.push((label, *micros, *started, *ended)),
-            }
         }
         let phases = totals
             .iter()
-            .map(|(label, micros, started, ended)| {
-                format!("\"{label}\":{{\"us\":{micros:.1},\"t0\":{started},\"t1\":{ended}}}")
+            .map(|total| {
+                format!(
+                    "\"{}\":{{\"us\":{:.1},\"t0\":{},\"t1\":{}}}",
+                    total.label, total.us, total.first_start_unix_us, total.last_end_unix_us
+                )
             })
             .collect::<Vec<_>>()
             .join(",");
@@ -753,7 +719,7 @@ impl Qwen4MtpDrafter {
                 "Qwen4 MTP incremental transaction ended at mtp={mtp_end}, expected {committed_end}"
             ));
         }
-        if trace || timers.enabled {
+        if trace || timers.enabled() {
             let rows = drafts
                 .iter()
                 .zip(picks.iter())
@@ -769,7 +735,7 @@ impl Qwen4MtpDrafter {
                 "QWEN4_MTP_TRACE {{\"event\":\"window\",\"position\":{position},\"k\":{k},\"accepted\":{accepted},\"rows\":[{rows}],\"committed\":{committed:?}}}"
             );
         }
-        if timers.enabled {
+        if timers.enabled() {
             let fields = format!(
                 "\"position\":{position},\"k\":{k},\"accepted\":{accepted},\"pairing\":\"{}\",\"t_end\":{}",
                 match pairing {
@@ -1087,7 +1053,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
             snapshot = None;
             Ok(window)
         })();
-        if timers.enabled {
+        if timers.enabled() {
             let fields = format!(
                 "\"position\":{position},\"k\":{k},\"accepted\":{accepted_drafts},\"window_us\":{:.1},\"t_end\":{}",
                 window_start.elapsed().as_secs_f64() * 1e6,
