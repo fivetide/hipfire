@@ -584,7 +584,10 @@ fn moe_params_for_decode<'a>(
     });
     hipfire_dispatch::families::moe::MoeParams {
         dtypes: moe_dtypes,
-        recipe: hipfire_dispatch::families::moe::MoeRecipe::SoftmaxGatedShared,
+        recipe: hipfire_dispatch::families::moe::MoeRecipe::SoftmaxGatedShared {
+            bf16_round_trip: false,
+            shared_after_combine: false,
+        },
         route_policy: None,
         normalization,
         batch_size: 1,

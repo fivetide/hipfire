@@ -1042,9 +1042,6 @@ impl Qwen4MtpGpu {
         config: &Qwen4Config,
         max_seq: usize,
     ) -> Result<Self, MtpGpuError> {
-        if !gpu.arch_caps.is_gfx1151() {
-            return Err(invalid("native Qwen4 MTP requires gfx1151"));
-        }
         config.mtp.validate().map_err(MtpGpuError::Invalid)?;
         if max_seq == 0 || max_seq > config.max_position_embeddings {
             return Err(invalid("MTP max_seq is outside model capacity"));

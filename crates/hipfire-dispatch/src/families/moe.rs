@@ -40,8 +40,35 @@ pub struct MoePointerEntries<'a> {
 /// The complete semantic recipe selected by an architecture binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoeRecipe {
-    SoftmaxGatedShared,
+    SoftmaxGatedShared {
+        /// Keep the model's BF16 storage boundaries even when projections use F32 buffers.
+        bf16_round_trip: bool,
+        /// Accumulate routed experts before the shared residual.
+        shared_after_combine: bool,
+    },
     SigmoidRoutedNoShared,
+}
+
+impl MoeRecipe {
+    pub(crate) fn bf16_round_trip(self) -> bool {
+        matches!(
+            self,
+            Self::SoftmaxGatedShared {
+                bf16_round_trip: true,
+                ..
+            }
+        )
+    }
+
+    pub(crate) fn shared_after_combine(self) -> bool {
+        matches!(
+            self,
+            Self::SoftmaxGatedShared {
+                shared_after_combine: true,
+                ..
+            }
+        )
+    }
 }
 
 /// Architecture declaration, checked against both live operands and the

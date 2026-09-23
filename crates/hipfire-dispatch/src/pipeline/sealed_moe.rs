@@ -2038,9 +2038,11 @@ pub(super) fn produce_prefill_route<'a>(
                     "prefill softmax producer requires a 2-D [batch,n_experts] score view",
                 ));
             }
-            if matches!(route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+            if params.recipe.bf16_round_trip() {
                 gpu.bf16_round_trip_f32(scores)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            }
+            if matches!(route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
                 gpu.moe_router_softmax_top10_f32(
                     scores,
                     params.topk_indices,
@@ -2049,8 +2051,6 @@ pub(super) fn produce_prefill_route<'a>(
                     normalize,
                 )
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
-                gpu.bf16_round_trip_f32(params.topk_weights)
-                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
             } else {
                 gpu.softmax_f32(scores)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
@@ -2074,6 +2074,10 @@ pub(super) fn produce_prefill_route<'a>(
                     )
                 };
                 result.map_err(|e| DispatchError::Hip(e.to_string()))?;
+            }
+            if params.recipe.bf16_round_trip() {
+                gpu.bf16_round_trip_f32(params.topk_weights)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
             }
         }
         MoeRouterInput::SigmoidTopK | MoeRouterInput::PrecomputedSigmoidTopK => {
@@ -2289,7 +2293,7 @@ pub fn seal_decode<'a>(
     params: MoeParams<'a>,
 ) -> Result<SealedMoeCall<'a>, DispatchError> {
     let router = match params.recipe {
-        crate::families::moe::MoeRecipe::SoftmaxGatedShared => MoeRouterInput::SoftmaxTopK,
+        crate::families::moe::MoeRecipe::SoftmaxGatedShared { .. } => MoeRouterInput::SoftmaxTopK,
         crate::families::moe::MoeRecipe::SigmoidRoutedNoShared => MoeRouterInput::SigmoidTopK,
     };
     seal_decode_with_router(experts, ctx, params, router)
@@ -2303,7 +2307,7 @@ fn seal_decode_with_router<'a>(
     router: MoeRouterInput,
 ) -> Result<SealedMoeCall<'a>, DispatchError> {
     let expected = match params.recipe {
-        crate::families::moe::MoeRecipe::SoftmaxGatedShared => MoeRouterInput::SoftmaxTopK,
+        crate::families::moe::MoeRecipe::SoftmaxGatedShared { .. } => MoeRouterInput::SoftmaxTopK,
         crate::families::moe::MoeRecipe::SigmoidRoutedNoShared => MoeRouterInput::SigmoidTopK,
     };
     if router != expected {
@@ -2335,7 +2339,7 @@ fn resolve_decode_normalization(
     let MoeNormalization::RmsNorm { plain_out, .. } = &params.normalization else {
         return Ok(());
     };
-    if params.recipe != MoeRecipe::SoftmaxGatedShared {
+    if !matches!(params.recipe, MoeRecipe::SoftmaxGatedShared { .. }) {
         params.x_norm = plain_out;
         params.x_rot_prerotated = false;
         return Ok(());
@@ -2469,7 +2473,7 @@ pub fn preflight_decode<'a>(
     params: MoeParams<'a>,
 ) -> Result<(), DispatchError> {
     let router = match params.recipe {
-        MoeRecipe::SoftmaxGatedShared => MoeRouterInput::SoftmaxTopK,
+        MoeRecipe::SoftmaxGatedShared { .. } => MoeRouterInput::SoftmaxTopK,
         MoeRecipe::SigmoidRoutedNoShared => MoeRouterInput::SigmoidTopK,
     };
     let (params, router) = prepare_decode(&experts, ctx, params, router)?;
@@ -2546,7 +2550,7 @@ pub fn seal_prefill<'a>(
     params: MoePrefillParams<'a>,
 ) -> Result<SealedMoeCall<'a>, DispatchError> {
     let router = match params.recipe {
-        crate::families::moe::MoeRecipe::SoftmaxGatedShared => match params.prelude.route {
+        crate::families::moe::MoeRecipe::SoftmaxGatedShared { .. } => match params.prelude.route {
             PrefillRouteMode::AdoptRoot { .. } => MoeRouterInput::PrecomputedSoftmaxTopK,
             _ => MoeRouterInput::SoftmaxTopK,
         },
@@ -2566,7 +2570,7 @@ fn prepare_prefill<'a>(
     require_context_device(ctx, experts)?;
     require_single_binding(experts)?;
     let expected = match params.recipe {
-        crate::families::moe::MoeRecipe::SoftmaxGatedShared => match params.prelude.route {
+        crate::families::moe::MoeRecipe::SoftmaxGatedShared { .. } => match params.prelude.route {
             PrefillRouteMode::AdoptRoot { .. } => MoeRouterInput::PrecomputedSoftmaxTopK,
             _ => MoeRouterInput::SoftmaxTopK,
         },
@@ -2633,7 +2637,7 @@ pub fn preflight_prefill<'a>(
     params: MoePrefillParams<'a>,
 ) -> Result<(), DispatchError> {
     let router = match params.recipe {
-        crate::families::moe::MoeRecipe::SoftmaxGatedShared => match params.prelude.route {
+        crate::families::moe::MoeRecipe::SoftmaxGatedShared { .. } => match params.prelude.route {
             PrefillRouteMode::AdoptRoot { .. } => MoeRouterInput::PrecomputedSoftmaxTopK,
             _ => MoeRouterInput::SoftmaxTopK,
         },
@@ -2652,7 +2656,7 @@ pub fn seal_prefill_ep<'a>(
     ctx: &'a DispatchCtx,
     params: MoePrefillParams<'a>,
 ) -> Result<SealedMoeCall<'a>, DispatchError> {
-    if params.recipe != crate::families::moe::MoeRecipe::SoftmaxGatedShared {
+    if !matches!(params.recipe, MoeRecipe::SoftmaxGatedShared { .. }) {
         return Err(invalid(
             "compact EP prefill supports only SoftmaxGatedShared",
         ));
@@ -2834,7 +2838,7 @@ fn validate_normalization(
 
 fn validate_shared_decode(params: &MoeParams<'_>, hidden: usize) -> Result<(), DispatchError> {
     match (params.recipe, params.shared.as_ref(), params.dtypes.shared) {
-        (MoeRecipe::SoftmaxGatedShared, Some(shared), Some(dtypes)) => {
+        (MoeRecipe::SoftmaxGatedShared { .. }, Some(shared), Some(dtypes)) => {
             if shared.intermediate == 0 {
                 return Err(invalid("shared decode intermediate dimension is zero"));
             }
@@ -2878,10 +2882,10 @@ fn validate_shared_decode(params: &MoeParams<'_>, hidden: usize) -> Result<(), D
             require_elements(shared.up_out, shared.intermediate, "shared decode up")?;
             Ok(())
         }
-        (MoeRecipe::SoftmaxGatedShared, None, _) => {
+        (MoeRecipe::SoftmaxGatedShared { .. }, None, _) => {
             Err(invalid("SoftmaxGatedShared decode requires shared weights"))
         }
-        (MoeRecipe::SoftmaxGatedShared, Some(_), None) => Err(invalid(
+        (MoeRecipe::SoftmaxGatedShared { .. }, Some(_), None) => Err(invalid(
             "shared decode weights require shared dtype metadata",
         )),
         (MoeRecipe::SigmoidRoutedNoShared, None, None) => Ok(()),
@@ -2903,7 +2907,7 @@ fn validate_shared_prefill(
         params.prelude.shared.as_ref(),
         params.dtypes.shared,
     ) {
-        (MoeRecipe::SoftmaxGatedShared, Some(shared), Some(dtypes)) => {
+        (MoeRecipe::SoftmaxGatedShared { .. }, Some(shared), Some(dtypes)) => {
             if shared.intermediate == 0 {
                 return Err(invalid("shared prefill intermediate dimension is zero"));
             }
@@ -2952,10 +2956,10 @@ fn validate_shared_prefill(
             require_elements(shared.rotated, intermediate, "shared prefill activation")?;
             Ok(())
         }
-        (MoeRecipe::SoftmaxGatedShared, None, _) => Err(invalid(
+        (MoeRecipe::SoftmaxGatedShared { .. }, None, _) => Err(invalid(
             "SoftmaxGatedShared prefill requires shared weights",
         )),
-        (MoeRecipe::SoftmaxGatedShared, Some(_), None) => Err(invalid(
+        (MoeRecipe::SoftmaxGatedShared { .. }, Some(_), None) => Err(invalid(
             "shared prefill weights require shared dtype metadata",
         )),
         (MoeRecipe::SigmoidRoutedNoShared, None, None) => Ok(()),
@@ -5648,7 +5652,10 @@ mod tests {
                 per_expert_gate_up: None,
                 per_expert_down: None,
             },
-            recipe: crate::families::moe::MoeRecipe::SoftmaxGatedShared,
+            recipe: MoeRecipe::SoftmaxGatedShared {
+                bf16_round_trip: false,
+                shared_after_combine: false,
+            },
             route_policy: None,
             normalization: crate::families::moe::MoeNormalization::Provided,
             batch_size: 1,
@@ -5848,7 +5855,10 @@ mod tests {
                 per_expert_gate_up: None,
                 per_expert_down: None,
             },
-            recipe: crate::families::moe::MoeRecipe::SoftmaxGatedShared,
+            recipe: MoeRecipe::SoftmaxGatedShared {
+                bf16_round_trip: false,
+                shared_after_combine: false,
+            },
             route_policy: None,
             normalization: crate::families::moe::MoeNormalization::Provided,
             batch_size: 1,
@@ -6359,7 +6369,10 @@ mod tests {
                 per_expert_gate_up: None,
                 per_expert_down: None,
             },
-            recipe: crate::families::moe::MoeRecipe::SoftmaxGatedShared,
+            recipe: MoeRecipe::SoftmaxGatedShared {
+                bf16_round_trip: false,
+                shared_after_combine: false,
+            },
             route_policy: None,
             prelude: crate::families::moe::MoePrefillPrelude {
                 normalization: crate::families::moe::MoeNormalization::RmsNorm {

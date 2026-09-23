@@ -287,7 +287,7 @@ impl Carrier for Qwen4Carrier {
     ) -> Result<(), String> {
         let spec = options.spec;
         if draft_path.is_some()
-            || options.gemma4_drafter
+            || options.eagle_drafter
             || options.kv_adaptive
             || spec.dflash.is_some_and(|enabled| enabled)
             || spec.dspark.is_some_and(|enabled| enabled)
@@ -296,7 +296,7 @@ impl Carrier for Qwen4Carrier {
             || options.cask
             || options.state_quant
             || options.non_single_compute
-            || options.deepseek4_experts
+            || options.expert_count_override
             || options.pflash
         {
             return Err(
@@ -355,14 +355,14 @@ impl Carrier for Qwen4Carrier {
                 kv_adaptive: crate::admission::qwen4_kv_adaptive_requested(
                     ctx.kv_adaptive_override,
                 ),
-                gemma4_drafter: ctx.gemma4_drafter_path.is_some(),
+                eagle_drafter: ctx.gemma4_drafter_path.is_some(),
                 cask: ctx.cask.sidecar.is_some(),
                 state_quant: ctx.state_quant_override.is_some(),
                 non_single_compute: !matches!(
                     &ctx.deepseek4_compute_placement,
                     hipfire_config::Deepseek4ComputePlacement::Single
                 ),
-                deepseek4_experts: ctx.deepseek4_experts_per_token.is_some(),
+                expert_count_override: ctx.deepseek4_experts_per_token.is_some(),
                 pflash: false,
             },
         )?;
@@ -3259,7 +3259,7 @@ mod qwen4_admission_tests {
             (
                 "EAGLE",
                 SourceAdmissionOptions {
-                    gemma4_drafter: true,
+                    eagle_drafter: true,
                     ..defaults
                 },
             ),
@@ -3271,9 +3271,9 @@ mod qwen4_admission_tests {
                 },
             ),
             (
-                "DeepSeek4 experts",
+                "expert-count override",
                 SourceAdmissionOptions {
-                    deepseek4_experts: true,
+                    expert_count_override: true,
                     ..defaults
                 },
             ),

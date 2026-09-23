@@ -743,19 +743,6 @@ fn main() {
                 }
             }
         }
-        if gpu.arch_caps.is_gfx1151() {
-            let spec = (
-                "qwen4_specific",
-                hipfire_arch_qwen4::gpu_ops::QWEN4_SPECIFIC_SRC,
-                "qwen4_hc_prepare_f32",
-            );
-            if let Err(e) = gpu.precompile_kernels(&[spec]) {
-                eprintln!("  qwen4/gfx1151: {e}");
-                failed += 1;
-            } else {
-                ok += 1;
-            }
-        }
         eprintln!("precompile: {ok} ok, {failed} optional failed");
         return;
     }
@@ -1771,14 +1758,14 @@ fn main() {
                     kv_adaptive: hipfire_loader::admission::qwen4_kv_adaptive_requested(
                         kv_adaptive_override.as_deref(),
                     ),
-                    gemma4_drafter: gemma4_drafter.is_some(),
+                    eagle_drafter: gemma4_drafter.is_some(),
                     cask: cask.sidecar.is_some(),
                     state_quant: state_quant_override.is_some(),
                     non_single_compute: !matches!(
                         deepseek4_compute_placement,
                         hipfire_config::Deepseek4ComputePlacement::Single
                     ),
-                    deepseek4_experts: deepseek4_experts_per_token.is_some(),
+                    expert_count_override: deepseek4_experts_per_token.is_some(),
                     pflash: pflash_drafter.is_some() || pflash_mode_str != "off",
                 };
                 let admission = match hipfire_loader::admission::admit_source_with_options(

@@ -122,6 +122,12 @@ impl Qwen4Bundle {
         max_seq_len: usize,
         metadata: PleHashMetadata,
     ) -> Result<Self, BundleError> {
+        if !gpu.arch_caps.is_gfx1151() {
+            return Err(cleanup_transaction(
+                BundleError::Forward("Qwen4 ordinary-HIP path requires gfx1151".into()),
+                transaction.rollback(gpu),
+            ));
+        }
         let weights = match Qwen4Weights::assemble(&mut transaction, &config, placements) {
             Ok(weights) => weights,
             Err(error) => {

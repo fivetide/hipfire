@@ -396,9 +396,7 @@ pub fn validate_lm_head(
         | DType::MQ4G256V2
         | DType::MQ4G128V2
         | DType::MQ6G256V2
-        | DType::MFP4G32E8SOA => {
-            require_weight(weight, weight.m, weight.k, "LM-head weight")?
-        }
+        | DType::MFP4G32E8SOA => require_weight(weight, weight.m, weight.k, "LM-head weight")?,
         DType::F32 => {
             require_dense_weight(weight, weight.m, weight.k, DType::F32, "LM-head weight")?
         }
@@ -673,7 +671,10 @@ fn build_moe_decode<'a>(
     };
     Ok(MoeParams {
         dtypes,
-        recipe: MoeRecipe::SoftmaxGatedShared,
+        recipe: MoeRecipe::SoftmaxGatedShared {
+            bf16_round_trip: true,
+            shared_after_combine: true,
+        },
         route_policy: Some(moe.route_policy),
         normalization: MoeNormalization::Provided,
         batch_size: 1,
@@ -785,7 +786,10 @@ fn build_moe_prefill<'a>(
     };
     Ok(MoePrefillParams {
         dtypes,
-        recipe: MoeRecipe::SoftmaxGatedShared,
+        recipe: MoeRecipe::SoftmaxGatedShared {
+            bf16_round_trip: true,
+            shared_after_combine: true,
+        },
         route_policy: Some(moe.route_policy),
         prelude,
         batch_size: rows,

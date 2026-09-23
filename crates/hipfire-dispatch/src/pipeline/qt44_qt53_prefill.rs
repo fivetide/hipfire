@@ -155,13 +155,13 @@ pub(crate) fn shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<
         p.batch_size,
     )?;
     batch_projection(gpu, &shared.weights.up, x_gate, shared.up_out, p.batch_size)?;
-    // Source arithmetic stores the gate-side BF16 values before the nonlinear
-    // route.  Keep the explicit round trips even when the resident projection
-    // happens to be F32 so the typed route remains source-bound.
-    hip(gpu.bf16_round_trip_f32(p.prelude.router_logits))?;
-    hip(gpu.bf16_round_trip_f32(shared.scalar))?;
-    hip(gpu.bf16_round_trip_f32(shared.gate_out))?;
-    hip(gpu.bf16_round_trip_f32(shared.up_out))
+    if p.recipe.bf16_round_trip() {
+        hip(gpu.bf16_round_trip_f32(p.prelude.router_logits))?;
+        hip(gpu.bf16_round_trip_f32(shared.scalar))?;
+        hip(gpu.bf16_round_trip_f32(shared.gate_out))?;
+        hip(gpu.bf16_round_trip_f32(shared.up_out))?;
+    }
+    Ok(())
 }
 
 /// Apply the shared expert activation after the selector and gate/up projections.
@@ -176,22 +176,22 @@ pub(crate) fn shared_activation(
         .as_ref()
         .ok_or_else(|| DispatchError::Hip("grouped prefill shared weights missing".into()))?;
     let scalar = f32_view(shared.scalar, 0, p.batch_size);
-    #[cfg(feature = "deltanet")]
-    {
+    if p.recipe.bf16_round_trip() {
+        #[cfg(feature = "deltanet")]
         hip(gpu.sigmoid_f32(&scalar))?;
-    }
-    #[cfg(not(feature = "deltanet"))]
-    {
+        #[cfg(not(feature = "deltanet"))]
         return Err(DispatchError::UnsupportedVariant {
             family: "moe",
             variant: "grouped-shared-sigmoid-requires-deltanet",
             arch: "",
             quant: "",
         });
+        hip(gpu.bf16_round_trip_f32(&scalar))?;
     }
-    hip(gpu.bf16_round_trip_f32(&scalar))?;
     hip(gpu.silu_mul_f32(shared.gate_out, shared.up_out, shared.rotated))?;
-    hip(gpu.bf16_round_trip_f32(shared.rotated))?;
+    if p.recipe.bf16_round_trip() {
+        hip(gpu.bf16_round_trip_f32(shared.rotated))?;
+    }
     if shared.weights.down.dtype == DType::MQ4G128V2 {
         hip(gpu.rotate_x_mq_128_v2(
             shared.rotated,
@@ -203,9 +203,8 @@ pub(crate) fn shared_activation(
     Ok(())
 }
 
-/// Fold the shared expert after the routed combine.  The residual target is
-/// already initialized and contains the routed result; this preserves the
-/// source order and one-time sigmoid weighting.
+/// Fold the shared expert into the residual at the recipe's chosen placement,
+/// applying the selector sigmoid exactly once.
 pub(crate) fn shared_down(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
     require_geometry(p)?;
     let shared = p
@@ -218,10 +217,9 @@ pub(crate) fn shared_down(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(),
     let out = f32_view(p.down_expanded, 0, p.batch_size * p.down_m);
     match down.dtype {
         DType::BF16 | DType::F32 | DType::MQ4G256V2 | DType::MQ4G128V2 => {
-            // Shared activation already carries the source-required BF16
-            // boundary and, for QT53, the G128 basis.  This launch therefore
-            // performs the actual dense projection across all prompt rows
-            // without reapplying the transform per row.
+            // The shared activation is already in the basis consumed by this
+            // projection (G128 for QT53); the BF16 storage boundary, if any,
+            // was applied by the recipe before this launch.
             batch_projection(gpu, down, shared.rotated, &out, p.batch_size)?;
         }
         _ => {
@@ -233,19 +231,30 @@ pub(crate) fn shared_down(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(),
             })
         }
     }
-    hip(gpu.bf16_round_trip_f32(&out))?;
-    bf16_scaled_add_batched(
-        gpu,
-        &Bf16ScaledAddBatched {
-            residual: target,
-            value: &out,
-            scalar: shared.scalar,
-            rows: p.batch_size,
-            elements: p.down_m,
-        },
-    )
-    .map_err(|error| DispatchError::Hip(error.to_string()))?;
-    hip(gpu.bf16_round_trip_f32(target))
+    if p.recipe.bf16_round_trip() {
+        hip(gpu.bf16_round_trip_f32(&out))?;
+        bf16_scaled_add_batched(
+            gpu,
+            &Bf16ScaledAddBatched {
+                residual: target,
+                value: &out,
+                scalar: shared.scalar,
+                rows: p.batch_size,
+                elements: p.down_m,
+            },
+        )
+        .map_err(|error| DispatchError::Hip(error.to_string()))?;
+        hip(gpu.bf16_round_trip_f32(target))?;
+    } else {
+        hip(gpu.sigmoid_scaled_residual_add_batched_f32(
+            target,
+            &out,
+            shared.scalar,
+            p.batch_size,
+            p.down_m,
+        ))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn scatter(
@@ -305,8 +314,10 @@ pub(crate) fn gate_up(
             .checked_mul(p.k_top)
             .and_then(|slots| slots.checked_mul(p.mi))
             .ok_or_else(|| DispatchError::Hip("grouped gate/up extent overflows".into()))?;
-        hip(gpu.bf16_round_trip_f32(&f32_view(p.gate_batch, 0, active)))?;
-        hip(gpu.bf16_round_trip_f32(&f32_view(p.up_batch, 0, active)))?;
+        if p.recipe.bf16_round_trip() {
+            hip(gpu.bf16_round_trip_f32(&f32_view(p.gate_batch, 0, active)))?;
+            hip(gpu.bf16_round_trip_f32(&f32_view(p.up_batch, 0, active)))?;
+        }
         Ok(())
     }
 }
@@ -331,15 +342,20 @@ pub(crate) fn unscatter(
         .checked_mul(p.k_top)
         .and_then(|slots| slots.checked_mul(p.mi))
         .ok_or_else(|| DispatchError::Hip("grouped gate/up extent overflows".into()))?;
-    hip(gpu.bf16_round_trip_f32(&f32_view(p.gate_batch, 0, active)))?;
-    hip(gpu.bf16_round_trip_f32(&f32_view(p.up_batch, 0, active)))
+    if p.recipe.bf16_round_trip() {
+        hip(gpu.bf16_round_trip_f32(&f32_view(p.gate_batch, 0, active)))?;
+        hip(gpu.bf16_round_trip_f32(&f32_view(p.up_batch, 0, active)))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn activation(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
     require_geometry(p)?;
     let total_slots = p.batch_size * p.k_top;
     hip(gpu.silu_mul_f32(p.gate_batch, p.up_batch, p.rot_batch))?;
-    hip(gpu.bf16_round_trip_f32(p.rot_batch))?;
+    if p.recipe.bf16_round_trip() {
+        hip(gpu.bf16_round_trip_f32(p.rot_batch))?;
+    }
     hip(gpu.rotate_x_mq_128_v2(p.rot_batch, p.rot_batch, p.mi, total_slots))
 }
 
@@ -365,12 +381,12 @@ pub(crate) fn down(
             total_slots,
             p.n_exp,
         ))?;
-        // The scalar QT53 route rounds each expert output to BF16 before
-        // weighted combination.  The grouped kernel only decodes/accumulates
-        // its own route row, so perform that same boundary on every active
-        // grouped row before the combine stage.
+        // A BF16-source recipe rounds each grouped expert output before
+        // weighted combination, just as on the scalar route.
         let grouped = f32_view(p.y_down_grouped, 0, grouped_rows * p.down_m);
-        hip(gpu.bf16_round_trip_f32(&grouped))?;
+        if p.recipe.bf16_round_trip() {
+            hip(gpu.bf16_round_trip_f32(&grouped))?;
+        }
     } else {
         hip(gpu.gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded(
             p.expert_down_ptrs,
@@ -383,7 +399,9 @@ pub(crate) fn down(
             p.n_exp,
         ))?;
         let expanded = f32_view(p.down_expanded, 0, total_slots * p.down_m);
-        hip(gpu.bf16_round_trip_f32(&expanded))?;
+        if p.recipe.bf16_round_trip() {
+            hip(gpu.bf16_round_trip_f32(&expanded))?;
+        }
     }
     Ok(())
 }
@@ -418,5 +436,8 @@ pub(crate) fn combine(
             p.batch_size,
         ))?;
     }
-    hip(gpu.bf16_round_trip_f32(target))
+    if p.recipe.bf16_round_trip() {
+        hip(gpu.bf16_round_trip_f32(target))?;
+    }
+    Ok(())
 }

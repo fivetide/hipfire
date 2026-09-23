@@ -2369,14 +2369,14 @@ pub fn load_model_with_kv_backend(
                 admission::SourceAdmissionOptions {
                     spec,
                     kv_adaptive: admission::qwen4_kv_adaptive_requested(kv_adaptive_override),
-                    gemma4_drafter: false,
+                    eagle_drafter: false,
                     cask: cask.sidecar.is_some(),
                     state_quant: state_quant_override.is_some(),
                     non_single_compute: !matches!(
                         deepseek4_compute_placement,
                         hipfire_config::Deepseek4ComputePlacement::Single
                     ),
-                    deepseek4_experts: deepseek4_experts_per_token.is_some(),
+                    expert_count_override: deepseek4_experts_per_token.is_some(),
                     pflash: false,
                 },
             )?;
@@ -2593,14 +2593,14 @@ pub fn load_model_with_gemma4_drafter(
         crate::admission::SourceAdmissionOptions {
             spec,
             kv_adaptive: crate::admission::qwen4_kv_adaptive_requested(kv_adaptive_override),
-            gemma4_drafter: gemma4_drafter_path.is_some(),
+            eagle_drafter: gemma4_drafter_path.is_some(),
             cask: cask.sidecar.is_some(),
             state_quant: state_quant_override.is_some(),
             non_single_compute: !matches!(
                 deepseek4_compute_placement,
                 hipfire_config::Deepseek4ComputePlacement::Single
             ),
-            deepseek4_experts: deepseek4_experts_per_token.is_some(),
+            expert_count_override: deepseek4_experts_per_token.is_some(),
             pflash: false,
         },
     )?;

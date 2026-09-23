@@ -802,7 +802,10 @@ pub(crate) fn execute_moe(
     };
     let params = MoeParams {
         dtypes,
-        recipe: MoeRecipe::SoftmaxGatedShared,
+        recipe: MoeRecipe::SoftmaxGatedShared {
+            bf16_round_trip: true,
+            shared_after_combine: true,
+        },
         route_policy: Some(qwen4_route_policy(config, runtime.shared_down.dtype)),
         normalization: MoeNormalization::Provided,
         batch_size: 1,
@@ -1396,9 +1399,6 @@ impl Qwen4GpuForward {
         bundle: &Qwen4Bundle,
         max_chunk: usize,
     ) -> Result<Self, Qwen4GpuForwardError> {
-        if !gpu.arch_caps.is_gfx1151() {
-            return Err(invalid("Qwen4 ordinary-HIP path requires gfx1151"));
-        }
         let (scratch, host_token_bytes, host_ple_bytes) =
             Qwen4GpuForwardScratch::new(gpu, &bundle.config, max_chunk)?;
         let mut moe = Vec::with_capacity(bundle.config.num_hidden_layers);

@@ -482,7 +482,6 @@ impl<'a> SealedMoeOp<'a> {
                 .then_some(params.x_rot_local),
             shared_gate,
             shared_up,
-            selection.route,
         )
     }
 
@@ -490,7 +489,7 @@ impl<'a> SealedMoeOp<'a> {
         match self.state.call.protocol() {
             MoeProtocol::IndexedDecode => {
                 let (params, _) = self.state.decode_parts()?;
-                if params.recipe == MoeRecipe::SoftmaxGatedShared {
+                if matches!(params.recipe, MoeRecipe::SoftmaxGatedShared { .. }) {
                     return self.gate_side(gpu);
                 }
                 static GEMV_ROUTER: OnceLock<crate::families::gemv::GemvFamily> = OnceLock::new();
@@ -569,7 +568,7 @@ impl<'a> SealedMoeOp<'a> {
                     }
                 };
                 result?;
-                if params.recipe == MoeRecipe::SoftmaxGatedShared {
+                if matches!(params.recipe, MoeRecipe::SoftmaxGatedShared { .. }) {
                     super::dump_hidden_localize(
                         gpu,
                         prelude.router_logits,
@@ -704,7 +703,6 @@ impl<'a> SealedMoeOp<'a> {
                     .then_some(params.x_rot_local),
                 shared_gate,
                 shared_up,
-                selection.route,
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
@@ -983,7 +981,7 @@ fn lower_decode<'a>(
         MoeRouterInput::PrecomputedSoftmaxTopK | MoeRouterInput::PrecomputedSigmoidTopK
     );
     match params.recipe {
-        MoeRecipe::SoftmaxGatedShared => {
+        MoeRecipe::SoftmaxGatedShared { .. } => {
             if selection.resolution.needs_x_rot_local {
                 append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
             }
@@ -994,9 +992,7 @@ fn lower_decode<'a>(
                 append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateSide))?;
                 append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Route))?;
             }
-            if !matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped))
-                && !params.skip_shared
-            {
+            if !params.skip_shared && !params.recipe.shared_after_combine() {
                 append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
             }
         }
@@ -1036,23 +1032,15 @@ fn lower_decode<'a>(
             && !params.defer_routed_combine;
         if combine_after_down {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
-            if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped))
-                && !params.skip_shared
-            {
-                // Qwen4's source module performs routed index_add first and
-                // only then adds the shared expert output in BF16.
-                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
-            }
-        } else if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped))
-            && !params.skip_shared
-            && params.ep_mode == crate::families::moe::MoeEpMode::RootRoutedPartial
-        {
-            // Root-routed EP folds the gathered slots outside this local
-            // program; preserve the existing shared partial contract there.
+        }
+        if params.recipe.shared_after_combine() && !params.skip_shared {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
         }
     } else {
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::HostExperts))?;
+        if params.recipe.shared_after_combine() && !params.skip_shared {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
+        }
     }
     Ok(steps)
 }
@@ -1078,6 +1066,9 @@ fn lower_prefill<'a>(
             &mut steps,
             Step::MoeStage(op(state), MoeStage::SharedActivation),
         )?;
+        if !params.recipe.shared_after_combine() {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
+        }
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Route))?;
         if selection.resolution.use_path2 {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Scatter))?;
@@ -1093,7 +1084,9 @@ fn lower_prefill<'a>(
             Step::MoeStage(op(state), MoeStage::MutationFence),
         )?;
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
-        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
+        if params.recipe.shared_after_combine() {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
+        }
         return Ok(steps);
     }
     let adopted = matches!(
@@ -1101,7 +1094,7 @@ fn lower_prefill<'a>(
         super::sealed_moe::PrefillRouteMode::AdoptRoot { .. }
     );
     match params.recipe {
-        MoeRecipe::SoftmaxGatedShared => {
+        MoeRecipe::SoftmaxGatedShared { .. } => {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
             if !adopted {
                 append_step(
@@ -1117,7 +1110,9 @@ fn lower_prefill<'a>(
                 &mut steps,
                 Step::MoeStage(op(state), MoeStage::SharedActivation),
             )?;
-            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
+            if !params.recipe.shared_after_combine() {
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
+            }
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Route))?;
         }
         MoeRecipe::SigmoidRoutedNoShared => {
@@ -1151,6 +1146,9 @@ fn lower_prefill<'a>(
     );
     if !compact_ep && (selection.resolution.use_path2 || !selection.resolution.down_path0) {
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
+    }
+    if params.recipe.shared_after_combine() {
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
     }
     Ok(steps)
 }
@@ -1211,7 +1209,7 @@ pub(super) fn select_decode(
         ));
     }
     let mut resolution = MoeResolution::resolve_arch(&params.dtypes, params.k, ctx.arch.has_wmma());
-    let route = (params.recipe == MoeRecipe::SoftmaxGatedShared
+    let route = (matches!(params.recipe, MoeRecipe::SoftmaxGatedShared { .. })
         && params.batch_size == 1
         && params.ep_mode == crate::families::moe::MoeEpMode::None
         && params.routed_gate_up_paro.is_none()
@@ -1420,7 +1418,7 @@ pub(super) fn select_prefill(
     ctx: &DispatchCtx,
     params: &MoePrefillParams<'_>,
 ) -> Result<MoePrefillSelection, DispatchError> {
-    let route = (params.recipe == MoeRecipe::SoftmaxGatedShared
+    let route = (matches!(params.recipe, MoeRecipe::SoftmaxGatedShared { .. })
         && params.routed_out.is_none()
         && params.paro_gate_up.is_none()
         && params.paro_down.is_none()

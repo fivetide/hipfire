@@ -2621,7 +2621,10 @@ fn build_moe_prefill_params<'a>(
 
     let moe_prefill_params = hipfire_dispatch::families::moe::MoePrefillParams {
         dtypes: moe_dtypes,
-        recipe: hipfire_dispatch::families::moe::MoeRecipe::SoftmaxGatedShared,
+        recipe: hipfire_dispatch::families::moe::MoeRecipe::SoftmaxGatedShared {
+            bf16_round_trip: false,
+            shared_after_combine: false,
+        },
         route_policy: None,
         prelude,
         batch_size: n,

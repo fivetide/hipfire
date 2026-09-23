@@ -15,7 +15,6 @@ pub mod artifact;
 pub mod bundle;
 pub mod config;
 pub mod gpu_forward;
-pub mod gpu_ops;
 pub mod mtp_gpu;
 pub mod mtp_spec;
 pub mod ops;

@@ -2826,7 +2826,6 @@ fn decode_gate_side_stage(
     x_rot_local: Option<&GpuTensor>,
     shared_gate: &GpuTensor,
     shared_up: &GpuTensor,
-    route: Option<MoeRouteCapability>,
 ) -> Result<(), DispatchError> {
     let shared = p.shared.as_ref().ok_or_else(|| {
         DispatchError::Hip("shared gate-side stage requires shared weights".into())
@@ -3017,10 +3016,9 @@ fn decode_gate_side_stage(
             }
         }
     } // end `if !skip_routing` (gate-side GEMV)
-      // Qwen4's source model is BF16 end-to-end through the router and
-      // shared-expert projections.  The quantized GEMV contract is F32, so
-      // restore the source boundary before the downstream nonlinearities.
-    if route == Some(MoeRouteCapability::Qt44Qt53Grouped) {
+      // BF16-source recipes round F32 projection scratch at their storage
+      // boundary before the router and shared nonlinearities consume it.
+    if p.recipe.bf16_round_trip() {
         // The decode step program is single-row (`build_moe_decode` binds
         // `batch_size: 1`), but every scratch buffer is sized for the prefill
         // chunk cap (512 rows). Rounding the whole buffer would carry 512x the
@@ -3087,13 +3085,7 @@ fn decode_route_gpu_stage(
                 1,
                 p.norm_topk_prob,
             ))?;
-            // HF casts selected top-k probabilities back to the hidden
-            // dtype before expert weighting. Only the live row's k_top slots
-            // are ever read; the buffer is sized for the prefill chunk cap.
-            hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(p.topk_weights, 0, p.k)))?;
-            return Ok(());
-        }
-        if router_shared_fuse {
+        } else if router_shared_fuse {
             let shared_x_rot = unsafe {
                 GpuTensor {
                     buf: gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias(),
@@ -3140,6 +3132,10 @@ fn decode_route_gpu_stage(
                 p.norm_topk_prob
             ))?;
         }
+        if p.recipe.bf16_round_trip() {
+            // Only the selected slots are live; scratch may be prefill-sized.
+            hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(p.topk_weights, 0, p.k)))?;
+        }
     } // end `if !skip_routing` (top-k)
     Ok(())
 }
@@ -3171,17 +3167,22 @@ fn decode_shared_down_stage(
     if route == Some(MoeRouteCapability::Qt44Qt53Grouped) && !p.skip_shared {
         #[cfg(feature = "deltanet")]
         {
-            // Linear and sigmoid outputs are BF16 in the source module. The
-            // shared-expert selector writes one scalar per row and the only
-            // consumer (`bf16_scaled_add`) reads `scalar[0]`, so this boundary
-            // owes one element, not the full 512-row scratch buffer.
+            // Single-row decode consumes only selector scalar[0] for the
+            // shared add, regardless of BF16 or F32 accumulation. Round
+            // that live element, not the prefill-sized scratch buffer.
             let scalar_live = slice_moe_f32_view(scalar_buf, 0, 1);
-            hip!(gpu.bf16_round_trip_f32(&scalar_live))?;
+            if p.recipe.bf16_round_trip() {
+                hip!(gpu.bf16_round_trip_f32(&scalar_live))?;
+            }
             hip!(gpu.sigmoid_f32(&scalar_live))?;
-            hip!(gpu.bf16_round_trip_f32(&scalar_live))?;
+            if p.recipe.bf16_round_trip() {
+                hip!(gpu.bf16_round_trip_f32(&scalar_live))?;
+            }
             let shared_hid = slice_moe_f32_view(p.ffn_hidden, 0, smi);
             hip!(gpu.silu_mul_f32(shared_gate, shared_up, &shared_hid))?;
-            hip!(gpu.bf16_round_trip_f32(&shared_hid))?;
+            if p.recipe.bf16_round_trip() {
+                hip!(gpu.bf16_round_trip_f32(&shared_hid))?;
+            }
             static GEMV_QT44_QT53_SHARED_DOWN: LazyLock<GemvFamily> =
                 LazyLock::new(GemvFamily::new);
             if shared_down_w.dtype == DType::MQ4G128V2 {
@@ -3201,17 +3202,21 @@ fn decode_shared_down_stage(
             }
             // One live row of the shared-expert output (the buffer is the
             // prefill chunk cap wide).
-            hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(p.ffn_out, 0, p.hidden)))?;
-            hip!(bf16_scaled_add(
-                gpu,
-                &Bf16ScaledAdd {
-                    residual: out_target,
-                    value: p.ffn_out,
-                    scalar: scalar_buf,
-                    elements: p.hidden,
-                },
-            ))?;
-            hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(out_target, 0, p.hidden)))?;
+            if p.recipe.bf16_round_trip() {
+                hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(p.ffn_out, 0, p.hidden)))?;
+                hip!(bf16_scaled_add(
+                    gpu,
+                    &Bf16ScaledAdd {
+                        residual: out_target,
+                        value: p.ffn_out,
+                        scalar: scalar_buf,
+                        elements: p.hidden,
+                    },
+                ))?;
+                hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(out_target, 0, p.hidden)))?;
+            } else {
+                hip!(gpu.scaled_add_inplace_gpu_scalar_f32(out_target, p.ffn_out, scalar_buf))?;
+            }
             return Ok(());
         }
         #[cfg(not(feature = "deltanet"))]
@@ -3398,8 +3403,10 @@ fn decode_gate_up_stage(
             p.hidden,
             1,
         ))?;
-        hip!(gpu.bf16_round_trip_f32(&gate_batch))?;
-        hip!(gpu.bf16_round_trip_f32(&up_batch))?;
+        if p.recipe.bf16_round_trip() {
+            hip!(gpu.bf16_round_trip_f32(&gate_batch))?;
+            hip!(gpu.bf16_round_trip_f32(&up_batch))?;
+        }
         return Ok(());
     }
     if ninepath_d3 {
@@ -3580,6 +3587,14 @@ fn decode_gate_up_stage(
             p.k,
         ))?;
     }
+    if p.recipe.bf16_round_trip() {
+        let active = p
+            .k
+            .checked_mul(p.mi)
+            .ok_or_else(|| DispatchError::Hip("MoE gate/up round-trip extent overflows".into()))?;
+        hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(p.gate_batch, 0, active)))?;
+        hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(p.up_batch, 0, active)))?;
+    }
     Ok(())
 }
 
@@ -3590,15 +3605,17 @@ fn decode_activation_stage(
     route: Option<MoeRouteCapability>,
 ) -> Result<(), DispatchError> {
     if route == Some(MoeRouteCapability::Qt44Qt53Grouped) {
-        let routed_slots = 10usize
-            .checked_mul(p.mi)
-            .ok_or_else(|| DispatchError::Hip("QT44/QT53 routed slot width overflow".into()))?;
+        let routed_slots =
+            p.k.checked_mul(p.mi)
+                .ok_or_else(|| DispatchError::Hip("MoE routed slot width overflows".into()))?;
         let gate_batch = slice_moe_f32_view(p.gate_batch, 0, routed_slots);
         let up_batch = slice_moe_f32_view(p.up_batch, 0, routed_slots);
         let rot_batch = slice_moe_f32_view(p.rot_batch, 0, routed_slots);
         hip!(gpu.silu_mul_f32(&gate_batch, &up_batch, &rot_batch))?;
-        hip!(gpu.bf16_round_trip_f32(&rot_batch))?;
-        hip!(gpu.rotate_x_mq_128_v2(&rot_batch, &rot_batch, p.mi, 10))?;
+        if p.recipe.bf16_round_trip() {
+            hip!(gpu.bf16_round_trip_f32(&rot_batch))?;
+        }
+        hip!(gpu.rotate_x_mq_128_v2(&rot_batch, &rot_batch, p.mi, p.k))?;
         return Ok(());
     }
     // Gate→down: fused silu+mul+rotate
@@ -3655,6 +3672,12 @@ fn decode_activation_stage(
             p.k
         ))?;
     }
+    if p.recipe.bf16_round_trip() {
+        let active = p.k.checked_mul(p.mi).ok_or_else(|| {
+            DispatchError::Hip("MoE activation round-trip extent overflows".into())
+        })?;
+        hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(p.rot_batch, 0, active)))?;
+    }
     Ok(())
 }
 
@@ -3689,7 +3712,9 @@ fn decode_down_stage(
             1,
             p.n_exp,
         ))?;
-        hip!(gpu.bf16_round_trip_f32(&down_expanded))?;
+        if p.recipe.bf16_round_trip() {
+            hip!(gpu.bf16_round_trip_f32(&down_expanded))?;
+        }
         return Ok(());
     }
     // Expanded write — down GEMV by the DOWN dtype (mixed mq6-down lands here).
@@ -3921,6 +3946,19 @@ fn decode_down_stage(
             1,
         ))?;
     }
+    if p.recipe.bf16_round_trip()
+        && crate::families::moe::moe_down_writes_expanded(
+            p.dtypes.routed_down,
+            p.expert_dtype_tags.is_some(),
+        )
+        && !ninepath_d4
+        && !down_last_combine
+    {
+        let active =
+            p.k.checked_mul(p.hidden)
+                .ok_or_else(|| DispatchError::Hip("MoE down round-trip extent overflows".into()))?;
+        hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(p.down_expanded, 0, active)))?;
+    }
     Ok(())
 }
 
@@ -4080,8 +4118,10 @@ fn decode_cpu_experts_stage(
     let gemv = GEMV_FB.get_or_init(GemvFamily::new);
 
     let hess_x_norm: Option<Vec<f32>> = if gpu.hessian_capture.is_some()
-        && p.recipe == crate::families::moe::MoeRecipe::SoftmaxGatedShared
-    {
+        && matches!(
+            p.recipe,
+            crate::families::moe::MoeRecipe::SoftmaxGatedShared { .. }
+        ) {
         Some(hip!(gpu.download_f32(p.x_norm))?)
     } else {
         None
@@ -4184,19 +4224,20 @@ fn decode_combine_stage(
             p.hidden,
             1,
         ))?;
-        // One live row: the combine writes exactly `p.hidden` elements for a
-        // single-row step, while `target` is the prefill chunk cap wide.
-        hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(target, 0, p.hidden)))?;
-        return Ok(());
+    } else {
+        hip!(gpu.moe_down_combine_k8_batched(
+            p.down_expanded,
+            p.topk_weights,
+            target,
+            p.routed_down_m,
+            p.k,
+            1,
+        ))?;
     }
-    hip!(gpu.moe_down_combine_k8_batched(
-        p.down_expanded,
-        p.topk_weights,
-        target,
-        p.routed_down_m,
-        p.k,
-        1,
-    ))?;
+    if p.recipe.bf16_round_trip() {
+        // One live row: the target may be allocated to the prefill chunk cap.
+        hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(target, 0, p.hidden)))?;
+    }
     Ok(())
 }
 

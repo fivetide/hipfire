@@ -46,11 +46,11 @@ pub struct SourceAdmissionOptions {
     /// True only when `memory.kv_adaptive` is an active policy. The CLI
     /// serializes its ordinary `off` schema default as a nonempty string.
     pub kv_adaptive: bool,
-    pub gemma4_drafter: bool,
+    pub eagle_drafter: bool,
     pub cask: bool,
     pub state_quant: bool,
     pub non_single_compute: bool,
-    pub deepseek4_experts: bool,
+    pub expert_count_override: bool,
     pub pflash: bool,
 }
 
@@ -972,15 +972,15 @@ mod tests {
                     "EAGLE",
                     SourceAdmissionOptions {
                         spec: defaults,
-                        gemma4_drafter: true,
+                        eagle_drafter: true,
                         ..Default::default()
                     },
                 ),
                 (
-                    "DeepSeek4 experts",
+                    "expert-count override",
                     SourceAdmissionOptions {
                         spec: defaults,
-                        deepseek4_experts: true,
+                        expert_count_override: true,
                         ..Default::default()
                     },
                 ),
