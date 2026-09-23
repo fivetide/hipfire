@@ -837,14 +837,13 @@ fn source_dtype(dtype: &str) -> Result<DType, String> {
 /// BF16 (320-byte rows) or Q8F16 (170-byte rows) — so the *declared* dtype picks
 /// the stride and the manifest's `row_bytes` is only the default for dtypes
 /// whose row layout is not derived here.
-fn external_row_stride(dtype: DType, row_elements: usize) -> Option<usize> {
+/// Bytes of one external (row-addressed) row, or `None` for a dtype that is
+/// not a row tier.  A partial Q8_0 block is refused rather than padded: the
+/// encoder only ever writes whole blocks.
+pub fn external_row_stride(dtype: DType, row_elements: usize) -> Option<usize> {
     match dtype {
-        DType::F32 | DType::F16 | DType::BF16 => row_elements.checked_mul(dtype.size()),
-        // Q8_0 rows are `ceil(K/32)` 34-byte blocks. A partial block is refused
-        // rather than rounded: the encoder only ever writes whole blocks.
-        DType::Q8_0 if row_elements > 0 && row_elements % 32 == 0 => row_elements
-            .checked_div(32)
-            .and_then(|blocks| blocks.checked_mul(quant_block_bytes(dtype))),
+        DType::F32 | DType::F16 | DType::BF16 => dtype.row_bytes(row_elements),
+        DType::Q8_0 if row_elements % 32 == 0 => dtype.row_bytes(row_elements),
         _ => None,
     }
 }
@@ -913,9 +912,9 @@ fn expected_payload_bytes(shape: &[usize], dtype: DType) -> Result<Option<usize>
     if matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
         return Ok(expected_float_bytes(shape, dtype));
     }
-    let (group_size, group_bytes, require_aligned_k) = match dtype {
-        DType::MQ4G256V2 => (256usize, 136usize, true),
-        DType::MQ4G128V2 => (128usize, 68usize, false),
+    let k_alignment = match dtype {
+        DType::MQ4G256V2 => 256usize,
+        DType::MQ4G128V2 => 1,
         _ => return Ok(None),
     };
     if shape.len() < 2 {
@@ -928,21 +927,18 @@ fn expected_payload_bytes(shape: &[usize], dtype: DType) -> Result<Option<usize>
     if k == 0 {
         return Err(format!("{dtype:?} payload K dimension cannot be zero"));
     }
-    if require_aligned_k && k % group_size != 0 {
+    if k % k_alignment != 0 {
         return Err(format!(
-            "{dtype:?} payload requires K%{group_size}==0, got K={k}"
+            "{dtype:?} payload requires K%{k_alignment}==0, got K={k}"
         ));
     }
     let rows = shape[..shape.len() - 1]
         .iter()
         .try_fold(1usize, |product, &dim| product.checked_mul(dim))
         .ok_or_else(|| format!("{dtype:?} payload row count overflows usize"))?;
-    let groups_per_row = k
-        .checked_add(group_size - 1)
-        .ok_or_else(|| format!("{dtype:?} payload group count overflows usize"))?
-        / group_size;
-    rows.checked_mul(groups_per_row)
-        .and_then(|groups| groups.checked_mul(group_bytes))
+    dtype
+        .row_bytes(k)
+        .and_then(|row| rows.checked_mul(row))
         .ok_or_else(|| format!("{dtype:?} payload byte length overflows usize"))
         .map(Some)
 }

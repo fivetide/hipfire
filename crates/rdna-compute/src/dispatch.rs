@@ -530,6 +530,45 @@ impl DType {
         }
     }
 
+    /// Encoded bytes of one row of `k` logical values, or `None` for a dtype
+    /// without a fixed per-row layout here (or `k == 0`).
+    ///
+    /// Grouped formats store whole groups: a trailing partial group occupies a
+    /// full group. Whether a caller accepts such a row (external rows and
+    /// several kernels require `k` to be group-aligned) is the caller's
+    /// policy, not the layout's.
+    pub fn row_bytes(self, k: usize) -> Option<usize> {
+        if k == 0 {
+            return None;
+        }
+        let grouped = |group: usize, group_bytes: usize| k.div_ceil(group).checked_mul(group_bytes);
+        let blocks = k.div_ceil(32);
+        match self {
+            DType::F32 | DType::F16 | DType::BF16 => k.checked_mul(self.size()),
+            DType::Q8_0 => grouped(32, 34),
+            DType::HFQ4G256 | DType::MQ4G256 | DType::MQ4G256V2 => grouped(256, 136),
+            DType::MQ4G128V2 => grouped(128, 68),
+            DType::HFQ6G256 | DType::MQ6G256 | DType::MQ6G256V2 => grouped(256, 200),
+            DType::MQ3G256 => grouped(256, 104),
+            DType::MQ2G256 | DType::MQ2G256Lloyd => grouped(256, 72),
+            DType::MQ3G256Lloyd => grouped(256, 112),
+            DType::MQ4G256Lloyd => grouped(256, 160),
+            // HFQ4-G128 layout, see the variant.
+            DType::ParoQ4G128 => grouped(128, 72),
+            // E8 formats: a 16-byte row header, then per-32 blocks.
+            DType::MFP4G32E8 => blocks.checked_mul(17)?.checked_add(16),
+            DType::MFP3G32E8 => blocks.checked_mul(13)?.checked_add(16),
+            // SoA: header, one scale byte per block padded to 16, 16 bytes of
+            // nibbles per block.
+            DType::MFP4G32E8SOA => blocks
+                .checked_add(15)
+                .map(|scales| scales & !15)?
+                .checked_add(blocks.checked_mul(16)?)?
+                .checked_add(16),
+            _ => None,
+        }
+    }
+
     /// Whether a `WeightTensor` of this dtype should have the
     /// `<weight>.awq_scale.weight` F16 sidecar attached at load time.
     ///
@@ -5297,6 +5336,29 @@ impl Drop for Gpu {
 
 #[cfg(test)]
 mod tests {
+    /// Pins the per-row geometry the per-arch copies used to hard-code.
+    #[test]
+    fn row_bytes_matches_the_producer_layouts() {
+        assert_eq!(DType::BF16.row_bytes(160), Some(320));
+        assert_eq!(DType::F32.row_bytes(3), Some(12));
+        assert_eq!(DType::Q8_0.row_bytes(160), Some(170));
+        assert_eq!(DType::Q8_0.row_bytes(33), Some(68));
+        assert_eq!(DType::MQ4G256V2.row_bytes(2560), Some(10 * 136));
+        assert_eq!(DType::MQ4G128V2.row_bytes(640), Some(5 * 68));
+        assert_eq!(DType::MQ4G128V2.row_bytes(129), Some(2 * 68));
+        assert_eq!(DType::MQ6G256V2.row_bytes(2560), Some(10 * 200));
+        assert_eq!(DType::ParoQ4G128.row_bytes(128), Some(72));
+        assert_eq!(DType::MFP4G32E8SOA.row_bytes(2560), Some(16 + 80 + 80 * 16));
+        assert_eq!(DType::MFP4G32E8.row_bytes(4096), Some(2192));
+        assert_eq!(DType::MFP4G32E8SOA.row_bytes(4096), Some(2192));
+        assert_eq!(DType::MFP3G32E8.row_bytes(4096), Some(1680));
+        assert_eq!(DType::MFP4G32E8.row_bytes(256), Some(152));
+        assert_eq!(DType::MFP4G32E8SOA.row_bytes(256), Some(160));
+        assert_eq!(DType::MFP3G32E8.row_bytes(256), Some(120));
+        assert_eq!(DType::Q8_0.row_bytes(0), None);
+        assert_eq!(DType::Raw.row_bytes(8), None);
+    }
+
     use super::gen_fwht_signs;
     use super::DType;
     use super::Gpu;

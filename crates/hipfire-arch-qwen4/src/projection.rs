@@ -11,23 +11,8 @@
 use hipfire_dispatch::families::gemv::WeightRef;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-const QT44_GROUP_BYTES: usize = 136;
-const QT53_GROUP_BYTES: usize = 68;
-const QT47_GROUP_BYTES: usize = 200;
-const QT3_BLOCK_BYTES: usize = 34;
-
 pub(crate) fn row_stride(dtype: DType, k: usize) -> usize {
-    match dtype {
-        DType::MQ4G256V2 => k.div_ceil(256) * QT44_GROUP_BYTES,
-        DType::MQ6G256V2 => k.div_ceil(256) * QT47_GROUP_BYTES,
-        DType::Q8_0 => k.div_ceil(32) * QT3_BLOCK_BYTES,
-        DType::MFP4G32E8SOA => {
-            let n_blocks = k.div_ceil(32);
-            16 + (((n_blocks + 15) >> 4) << 4) + n_blocks * 16
-        }
-        DType::MQ4G128V2 => k.div_ceil(128) * QT53_GROUP_BYTES,
-        _ => k * dtype.size(),
-    }
+    dtype.row_bytes(k).unwrap_or(k * dtype.size())
 }
 
 pub(crate) fn checked_bytes(rows: usize, stride: usize) -> Option<usize> {
@@ -210,8 +195,8 @@ mod tests {
         // and the artifact boundary refuses it by name).
         assert_eq!(row_stride(DType::MFP4G32E8SOA, 768), 16 + 32 + 24 * 16);
         // Q8F16: 34-byte blocks of 32 weights.
-        assert_eq!(row_stride(DType::Q8_0, 2560), 80 * QT3_BLOCK_BYTES);
-        assert_eq!(row_stride(DType::Q8_0, 6144), 192 * QT3_BLOCK_BYTES);
+        assert_eq!(row_stride(DType::Q8_0, 2560), 80 * 34);
+        assert_eq!(row_stride(DType::Q8_0, 6144), 192 * 34);
     }
 
     #[test]

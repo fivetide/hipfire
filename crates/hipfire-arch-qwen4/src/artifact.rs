@@ -16,6 +16,7 @@ use crate::weights::{Qwen4Manifest, Qwen4Placement};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::model_source::{SourceFormat, SourceIdentity};
 use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency};
+use hipfire_runtime::weight_store::external_row_stride;
 use rdna_compute::DType;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -39,34 +40,6 @@ const QWEN4_QT_MFP4G32E8SOA: u8 = 35;
 /// 32-weight block size would pass every byte count here and then either panic
 /// or read unrotated activations.
 const QWEN4_MFP4G32E8SOA_K_ALIGNMENT: usize = 256;
-
-/// SoA row geometry, mirroring the producer's `mfp4e8soa_row_geometry`.
-fn mfp4e8soa_extent(shape: &[u32], name: &str) -> Result<(usize, usize), Qwen4ArtifactError> {
-    let k = usize::try_from(*shape.last().expect("shape length checked")).map_err(|_| {
-        Qwen4ArtifactError::new(format!("qwen4: source tensor {name} K overflows usize"))
-    })?;
-    if k == 0 || k % QWEN4_MFP4G32E8SOA_K_ALIGNMENT != 0 {
-        return Err(Qwen4ArtifactError::new(format!(
-            "qwen4: MFP4G32E8SOA tensor {name} needs a nonzero K multiple of \
-             {QWEN4_MFP4G32E8SOA_K_ALIGNMENT}, got {k}"
-        )));
-    }
-    let n_blocks = k / 32;
-    let scale_padded = ((n_blocks + 15) >> 4) << 4;
-    let row_stride = 16 + scale_padded + n_blocks * 16;
-    let rows = shape[..shape.len() - 1]
-        .iter()
-        .try_fold(1usize, |rows, &dimension| {
-            rows.checked_mul(usize::try_from(dimension).unwrap_or(usize::MAX))
-        })
-        .ok_or_else(|| {
-            Qwen4ArtifactError::new(format!("qwen4: source tensor {name} rows overflow"))
-        })?;
-    let extent = rows.checked_mul(row_stride).ok_or_else(|| {
-        Qwen4ArtifactError::new(format!("qwen4: source tensor {name} extent overflows"))
-    })?;
-    Ok((row_stride, extent))
-}
 
 const PLE_MULTIPLIERS_NAME: &str =
     "model.language_model.layers.1.ple.ple_embedding.layer_multipliers";
@@ -158,12 +131,13 @@ fn shape_elements(shape: &[u32], name: &str) -> Result<usize, Qwen4ArtifactError
     })
 }
 
+/// Row stride and byte extent of a packed `[rows..., K]` tensor, refusing a
+/// `K` that is not a multiple of `k_alignment` (1 = any `K`).
 fn quantized_extent(
     shape: &[u32],
     name: &str,
-    group_size: usize,
-    group_bytes: usize,
-    require_aligned_k: bool,
+    dtype: DType,
+    k_alignment: usize,
 ) -> Result<(usize, usize), Qwen4ArtifactError> {
     if shape.len() < 2 {
         return Err(Qwen4ArtifactError::new(format!(
@@ -175,38 +149,24 @@ fn quantized_extent(
             "qwen4: source tensor {name} K dimension overflows usize"
         ))
     })?;
-    if k == 0 {
+    if k == 0 || k % k_alignment != 0 {
         return Err(Qwen4ArtifactError::new(format!(
-            "qwen4: source tensor {name} K dimension is zero"
-        )));
-    }
-    if require_aligned_k && k % group_size != 0 {
-        return Err(Qwen4ArtifactError::new(format!(
-            "qwen4: source tensor {name} uses a {group_size}-wide quantizer but K={k} is not aligned"
+            "qwen4: {dtype:?} tensor {name} needs a nonzero K multiple of {k_alignment}, got {k}"
         )));
     }
     let rows = shape[..shape.len() - 1]
         .iter()
         .try_fold(1usize, |rows, &dimension| {
-            let dimension = usize::try_from(dimension).map_err(|_| {
-                Qwen4ArtifactError::new(format!(
-                    "qwen4: source tensor {name} row count overflows usize"
-                ))
-            })?;
-            rows.checked_mul(dimension).ok_or_else(|| {
-                Qwen4ArtifactError::new(format!(
-                    "qwen4: source tensor {name} row count overflows usize"
-                ))
-            })
+            rows.checked_mul(usize::try_from(dimension).ok()?)
+        })
+        .ok_or_else(|| {
+            Qwen4ArtifactError::new(format!(
+                "qwen4: source tensor {name} row count overflows usize"
+            ))
         })?;
-    let groups = k.checked_add(group_size - 1).ok_or_else(|| {
+    let row_stride = dtype.row_bytes(k).ok_or_else(|| {
         Qwen4ArtifactError::new(format!(
-            "qwen4: source tensor {name} group count overflows usize"
-        ))
-    })? / group_size;
-    let row_stride = groups.checked_mul(group_bytes).ok_or_else(|| {
-        Qwen4ArtifactError::new(format!(
-            "qwen4: source tensor {name} row stride overflows usize"
+            "qwen4: source tensor {name} has no {dtype:?} row layout for K={k}"
         ))
     })?;
     let extent = rows.checked_mul(row_stride).ok_or_else(|| {
@@ -215,24 +175,6 @@ fn quantized_extent(
         ))
     })?;
     Ok((row_stride, extent))
-}
-
-/// Bytes one row of `width` values occupies in a row-addressed table.
-///
-/// Only the tiers this architecture stores as addressable rows are answered;
-/// anything else is not a row tier and is refused by name at the call site.
-fn external_row_stride(dtype: DType, width: usize) -> Option<usize> {
-    match dtype {
-        DType::F32 => width.checked_mul(4),
-        DType::F16 | DType::BF16 => width.checked_mul(2),
-        // Q8F16 rows are `ceil(K/32)` 34-byte blocks; a partial block is
-        // refused rather than rounded, because the encoder only writes whole
-        // blocks.
-        DType::Q8_0 if width > 0 && width % 32 == 0 => width
-            .checked_div(32)
-            .and_then(|blocks| blocks.checked_mul(34)),
-        _ => None,
-    }
 }
 
 fn validate_weight_geometry(
@@ -283,7 +225,8 @@ fn validate_weight_geometry(
                     entry.name, info.group_size
                 )));
             }
-            let (row_stride, extent) = quantized_extent(&info.shape, &entry.name, 256, 136, true)?;
+            let (row_stride, extent) =
+                quantized_extent(&info.shape, &entry.name, DType::MQ4G256V2, 256)?;
             (Some(DType::MQ4G256V2), extent, row_stride)
         }
         QWEN4_QT_MQ6G256V2 => {
@@ -293,7 +236,8 @@ fn validate_weight_geometry(
                     entry.name, info.group_size
                 )));
             }
-            let (row_stride, extent) = quantized_extent(&info.shape, &entry.name, 256, 200, true)?;
+            let (row_stride, extent) =
+                quantized_extent(&info.shape, &entry.name, DType::MQ6G256V2, 256)?;
             (Some(DType::MQ6G256V2), extent, row_stride)
         }
         QWEN4_QT_MFP4G32E8SOA => {
@@ -303,7 +247,12 @@ fn validate_weight_geometry(
                     entry.name, info.group_size
                 )));
             }
-            let (row_stride, extent) = mfp4e8soa_extent(&info.shape, &entry.name)?;
+            let (row_stride, extent) = quantized_extent(
+                &info.shape,
+                &entry.name,
+                DType::MFP4G32E8SOA,
+                QWEN4_MFP4G32E8SOA_K_ALIGNMENT,
+            )?;
             (Some(DType::MFP4G32E8SOA), extent, row_stride)
         }
         QWEN4_QT_Q8F16 => {
@@ -313,7 +262,7 @@ fn validate_weight_geometry(
                     entry.name, info.group_size
                 )));
             }
-            let (row_stride, extent) = quantized_extent(&info.shape, &entry.name, 32, 34, false)?;
+            let (row_stride, extent) = quantized_extent(&info.shape, &entry.name, DType::Q8_0, 1)?;
             (Some(DType::Q8_0), extent, row_stride)
         }
         QWEN4_QT_MQ4G128V2 => {
@@ -323,7 +272,8 @@ fn validate_weight_geometry(
                     entry.name, info.group_size
                 )));
             }
-            let (row_stride, extent) = quantized_extent(&info.shape, &entry.name, 128, 68, false)?;
+            let (row_stride, extent) =
+                quantized_extent(&info.shape, &entry.name, DType::MQ4G128V2, 1)?;
             (Some(DType::MQ4G128V2), extent, row_stride)
         }
         other => {
@@ -1039,25 +989,33 @@ mod tests {
     /// producer's row count does — and refuse a K the decode kernels assert on.
     #[test]
     fn mfp4e8soa_extent_flattens_expert_blocks_and_requires_fwht_alignment() {
-        let (stride, extent) = mfp4e8soa_extent(&[512, 1280, 2560], "gate_up").unwrap();
+        let soa = |shape: &[u32], name: &str| {
+            quantized_extent(
+                shape,
+                name,
+                DType::MFP4G32E8SOA,
+                QWEN4_MFP4G32E8SOA_K_ALIGNMENT,
+            )
+        };
+        let (stride, extent) = soa(&[512, 1280, 2560], "gate_up").unwrap();
         assert_eq!(stride, 16 + 80 + 80 * 16);
         assert_eq!(extent, 512 * 1280 * stride);
 
         // The same rows as a flat rank-2 matrix describe the same payload: the
         // flattening is exactly the leading-dimension product.
-        let (_flat_stride, flat) = mfp4e8soa_extent(&[512 * 1280, 2560], "gate_up_flat").unwrap();
+        let (_flat_stride, flat) = soa(&[512 * 1280, 2560], "gate_up_flat").unwrap();
         assert_eq!(flat, extent);
 
         // `moe_intermediate_size = 640` is not one FWHT-256 segment, so the
         // routed down projection cannot be carried by this format at all: the
         // boundary must say so by name instead of admitting a payload whose
         // decode would drop the unaligned tail.
-        let error = mfp4e8soa_extent(&[512, 2560, 640], "down").unwrap_err();
+        let error = soa(&[512, 2560, 640], "down").unwrap_err();
         assert!(
             error.to_string().contains("multiple of 256"),
             "a K below one FWHT-256 segment must be refused by name, got: {error}"
         );
-        let error = mfp4e8soa_extent(&[512, 1280, 128], "gate_up").unwrap_err();
+        let error = soa(&[512, 1280, 128], "gate_up").unwrap_err();
         assert!(
             error.to_string().contains("multiple of 256"),
             "a K below one FWHT-256 segment must be refused by name, got: {error}"

@@ -20,6 +20,7 @@
 //! little-endian BF16, whatever tier the shards store.
 
 use crate::model_source::{SourceError, SourceRangeDescriptor};
+use rdna_compute::DType;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -78,17 +79,25 @@ const Q8_BLOCK_BYTES: usize = 34;
 const Q8_BLOCK_WEIGHTS: usize = 32;
 
 impl RowEncoding {
-    /// Encoded bytes of one physical row of `width` values.  Q8F16 requires
-    /// `width` to be a whole number of 32-value blocks.
-    pub const fn encoded_row_bytes(self, width: usize) -> usize {
+    /// The storage dtype of this encoding.
+    pub const fn dtype(self) -> DType {
         match self {
-            Self::Bf16 => width * 2,
-            Self::Q8F16 => (width / Q8_BLOCK_WEIGHTS) * Q8_BLOCK_BYTES,
+            Self::Bf16 => DType::BF16,
+            Self::Q8F16 => DType::Q8_0,
         }
     }
 
+    /// Encoded bytes of one physical row of `width` values.
+    ///
+    /// # Panics
+    /// If `width` is zero or, for Q8F16, not a whole number of 32-value blocks.
+    pub fn encoded_row_bytes(self, width: usize) -> usize {
+        crate::weight_store::external_row_stride(self.dtype(), width)
+            .expect("row width is a whole number of blocks")
+    }
+
     /// Bytes of one userspace page of `width`-value rows.
-    pub const fn page_bytes(self, width: usize) -> usize {
+    pub fn page_bytes(self, width: usize) -> usize {
         ROWS_PER_PAGE * self.encoded_row_bytes(width)
     }
 
