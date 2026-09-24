@@ -491,6 +491,53 @@ fn compare_i64(actual: &[i64], expected: &[i64], label: &str) -> Result<(), Stri
     Ok(())
 }
 
+/// Compare top-k routes per token as expert-sorted (expert, weight) pairs.
+/// Rank order carries no meaning (the combine accumulates in expert-id order)
+/// and experts whose router logits tie within the F32 tolerance may swap
+/// ranks; the selected set and each expert's weight must still match.
+#[allow(clippy::too_many_arguments)]
+fn compare_routes(
+    actual_experts: &[i64],
+    actual_weights: &[f32],
+    expected_experts: &[i64],
+    expected_weights: &[f32],
+    top_k: usize,
+    atol: f32,
+    rtol: f32,
+    label: &str,
+) -> Result<(f32, f32), String> {
+    if actual_experts.len() != actual_weights.len()
+        || expected_experts.len() != expected_weights.len()
+    {
+        return fail(format!("{label}: expert and weight counts differ"));
+    }
+    let by_expert = |experts: &[i64], weights: &[f32]| -> (Vec<i64>, Vec<f32>) {
+        let mut routes: Vec<(i64, f32)> = experts
+            .iter()
+            .copied()
+            .zip(weights.iter().copied())
+            .collect();
+        for token in routes.chunks_mut(top_k) {
+            token.sort_by_key(|route| route.0);
+        }
+        routes.into_iter().unzip()
+    };
+    let (actual_ids, actual_route_weights) = by_expert(actual_experts, actual_weights);
+    let (expected_ids, expected_route_weights) = by_expert(expected_experts, expected_weights);
+    compare_i64(
+        &actual_ids,
+        &expected_ids,
+        &format!("{label} selected experts"),
+    )?;
+    compare_f32(
+        &actual_route_weights,
+        &expected_route_weights,
+        atol,
+        rtol,
+        &format!("{label} routing weights"),
+    )
+}
+
 fn upload_bf16(gpu: &mut Gpu, values: &[f32], shape: &[usize]) -> Result<GpuTensor, String> {
     let words: Vec<u16> = values.iter().map(|value| f32_to_bf16(*value)).collect();
     let tensor = gpu
@@ -1850,6 +1897,9 @@ fn rope_reference(
     output
 }
 
+/// Host model of `indexed_attention_pool_rope_f32`: the pooled mean, its
+/// squares, the normalized key and the rotated output are rounded to BF16, and
+/// only the first `min(dim, 64)` channels are rotated.
 fn pool_rope_reference(
     raw: &[f32],
     blocks: usize,
@@ -1857,6 +1907,9 @@ fn pool_rope_reference(
     dim: usize,
     base: f32,
 ) -> Vec<f32> {
+    let bf16 = |value: f32| f32::from_bits((f32_to_bf16(value) as u32) << 16);
+    let rotary = dim.min(64);
+    let half = rotary / 2;
     let mut pooled = vec![0.0f32; blocks * dim];
     for block in 0..blocks {
         let mut mean = vec![0.0f32; dim];
@@ -1865,22 +1918,29 @@ fn pool_rope_reference(
                 mean[index] += raw[(block * compress + row) * dim + index] / compress as f32;
             }
         }
-        let inverse = (mean.iter().map(|value| value * value).sum::<f32>() / dim as f32 + RMS_EPS)
+        for value in &mut mean {
+            *value = bf16(*value);
+        }
+        let inverse = (mean.iter().map(|value| bf16(value * value)).sum::<f32>() / dim as f32
+            + RMS_EPS)
             .sqrt()
             .recip();
-        for value in &mut mean {
-            *value *= inverse;
-        }
-        let half = dim / 2;
+        let normalized: Vec<f32> = mean.iter().map(|value| bf16(value * inverse)).collect();
+        let mut rotated = normalized.clone();
         for index in 0..half {
-            let angle = (block * compress) as f32 / base.powf(2.0 * index as f32 / dim as f32);
+            let angle = (block * compress) as f32 * base.powf(-2.0 * index as f32 / rotary as f32);
             let (sine, cosine) = angle.sin_cos();
-            let first = mean[index];
-            let second = mean[index + half];
-            mean[index] = first * cosine - second * sine;
-            mean[index + half] = first * sine + second * cosine;
+            let first = normalized[index];
+            let second = normalized[index + half];
+            rotated[index] = first * cosine - second * sine;
+            rotated[index + half] = first * sine + second * cosine;
         }
-        pooled[block * dim..(block + 1) * dim].copy_from_slice(&mean);
+        for (slot, value) in pooled[block * dim..(block + 1) * dim]
+            .iter_mut()
+            .zip(rotated)
+        {
+            *slot = bf16(value);
+        }
     }
     pooled
 }
@@ -2097,6 +2157,9 @@ fn run_qsa(
     let capacity = selected_expected.len() / tokens;
     let blocks = tokens / QSA_COMPRESS;
     let (atol, rtol) = tolerance(manifest, "f32_accumulation")?;
+    // The pooled keys are BF16 (see `pool_rope_reference`), so they and the
+    // block scores built from them use the BF16 tolerance class.
+    let (bf16_atol, bf16_rtol) = tolerance(manifest, "bf16_input_f32_accumulation")?;
 
     let raw_gpu = gpu
         .upload_f32(&raw_keys.values, &[tokens, index_dim])
@@ -2131,8 +2194,8 @@ fn run_qsa(
     let pool_err = compare_f32(
         &pooled_actual,
         &pooled_ref,
-        atol,
-        rtol,
+        bf16_atol,
+        bf16_rtol,
         "QSA production pool/RoPE",
     )?;
 
@@ -2232,8 +2295,8 @@ fn run_qsa(
     compare_f32(
         &block_scores,
         &required(arrays, "block_scores")?.values,
-        atol,
-        rtol,
+        bf16_atol,
+        bf16_rtol,
         "QSA block scores",
     )?;
 
@@ -2854,17 +2917,19 @@ fn run_moe(
         rtol,
         "MoE router logits",
     )?;
-    compare_i64(
+    let expected_experts = required(arrays, "selected_experts")?;
+    let route_err = compare_routes(
         &actual.selected_experts,
-        required(arrays, "selected_experts")?.ints()?,
-        "MoE selected experts",
-    )?;
-    let route_err = compare_f32(
         &actual.routing_weights,
+        expected_experts.ints()?,
         &required(arrays, "routing_weights")?.values,
+        *expected_experts
+            .shape
+            .last()
+            .ok_or("selected_experts has no shape")?,
         atol,
         rtol,
-        "MoE normalized routing weights",
+        "MoE",
     )?;
     let routed_err = compare_f32(
         &actual.routed_output,
@@ -3464,9 +3529,12 @@ fn run_mtp(
         .ok_or("manifest generator seed missing")?;
     let (router, gate_up, down, shared_gate, shared_up, shared_down) =
         mtp_moe_weights(root_seed + 89, hidden_size, intermediate);
+    // The chained HC input above is only BF16-close to the oracle's, which can
+    // flip a top-10 choice between near-equal logits. Route the oracle's own
+    // MoE hidden so the discrete expert selection is checked on equal inputs.
     let moe = run_moe_operator(
         gpu,
-        &mlp_mixed,
+        &required(arrays, "mtp_moe_hidden")?.values,
         tokens,
         hidden_size,
         &router,
@@ -3483,17 +3551,19 @@ fn run_mtp(
         rtol,
         "MTP MoE router logits",
     )?;
-    compare_i64(
+    let expected_experts = required(arrays, "mtp_moe_selected_experts")?;
+    let moe_route_err = compare_routes(
         &moe.selected_experts,
-        required(arrays, "mtp_moe_selected_experts")?.ints()?,
-        "MTP MoE selected experts",
-    )?;
-    let moe_route_err = compare_f32(
         &moe.routing_weights,
+        expected_experts.ints()?,
         &required(arrays, "mtp_moe_routing_weights")?.values,
+        *expected_experts
+            .shape
+            .last()
+            .ok_or("mtp_moe_selected_experts has no shape")?,
         atol,
         rtol,
-        "MTP MoE routing weights",
+        "MTP MoE",
     )?;
     let (_mlp_weights, mlp_injected) = hc_inject_case(
         gpu,
