@@ -1482,47 +1482,49 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
     }
     __syncthreads();
 
-    int my_h = tid / QSA_TT;
-    int my_t = tid % QSA_TT;
-    const float* my_q = qs + my_h * QSA_HD;
-    const float* my_k = kt + my_t * QSA_KS;
-    float partial_max = -3.402823466e+38f;
-    for (int base = 0; base < selected_len; base += QSA_TT) {
-        float score = 0.0f;
-        for (int d0 = 0; d0 < QSA_HD; d0 += QSA_DC) {
-            for (int e = tid; e < QSA_TT * QSA_DC / 4; e += 256) {
-                int t = e / (QSA_DC / 4);
-                int c = (e % (QSA_DC / 4)) * 4;
-                int token = base + t < selected_len ? tokens[base + t] : -1;
-                *reinterpret_cast<float4*>(kt + t * QSA_KS + c) = token >= 0
-                    ? *reinterpret_cast<const float4*>(keys + token * kv_stride + d0 + c)
-                    : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            }
-            __syncthreads();
+    // Scores: each thread owns one selected row and all four heads, reading
+    // its key straight from global memory (four independent serial d-order
+    // chains; q comes from LDS as a broadcast).  No key tile, no barriers.
+    float partial_max[QSA_HG];
 #pragma unroll
-            for (int dd = 0; dd < QSA_DC; dd += 4) {
-                const float4 q4 = *reinterpret_cast<const float4*>(my_q + d0 + dd);
-                const float4 k4 = *reinterpret_cast<const float4*>(my_k + dd);
-                score += q4.x * k4.x;
-                score += q4.y * k4.y;
-                score += q4.z * k4.z;
-                score += q4.w * k4.w;
+    for (int h = 0; h < QSA_HG; ++h) partial_max[h] = -3.402823466e+38f;
+    for (int base = 0; base < selected_len; base += 256) {
+        const int index = base + tid;
+        const int token = index < selected_len ? tokens[index] : -1;
+        float score[QSA_HG];
+#pragma unroll
+        for (int h = 0; h < QSA_HG; ++h) score[h] = 0.0f;
+        if (token >= 0) {
+            const float4* key4 = reinterpret_cast<const float4*>(keys + token * kv_stride);
+#pragma unroll 4
+            for (int d4 = 0; d4 < QSA_HD / 4; ++d4) {
+                const float4 k4 = key4[d4];
+#pragma unroll
+                for (int h = 0; h < QSA_HG; ++h) {
+                    const float4 q4 = reinterpret_cast<const float4*>(qs + h * QSA_HD)[d4];
+                    score[h] += q4.x * k4.x;
+                    score[h] += q4.y * k4.y;
+                    score[h] += q4.z * k4.z;
+                    score[h] += q4.w * k4.w;
+                }
             }
-            __syncthreads();
         }
-        int index = base + my_t;
         if (index < selected_len) {
-            score /= sqrtf((float)QSA_HD);
-            weights[index * QSA_HG + my_h] = score;
-            if (tokens[index] >= 0) partial_max = fmaxf(partial_max, score);
+#pragma unroll
+            for (int h = 0; h < QSA_HG; ++h) {
+                const float scaled = score[h] / sqrtf((float)QSA_HD);
+                weights[index * QSA_HG + h] = scaled;
+                if (token >= 0) partial_max[h] = fmaxf(partial_max[h], scaled);
+            }
         }
     }
     // fmaxf is exact and order-independent, so the tree matches the serial scan.
-    kt[tid] = partial_max;
+#pragma unroll
+    for (int h = 0; h < QSA_HG; ++h) kt[h * 256 + tid] = partial_max[h];
     __syncthreads();
     if (tid < QSA_HG) {
         float head_max = -3.402823466e+38f;
-        for (int i = 0; i < QSA_TT; ++i) head_max = fmaxf(head_max, kt[tid * QSA_TT + i]);
+        for (int i = 0; i < 256; ++i) head_max = fmaxf(head_max, kt[tid * 256 + i]);
         maxes[tid] = head_max;
     }
     __syncthreads();

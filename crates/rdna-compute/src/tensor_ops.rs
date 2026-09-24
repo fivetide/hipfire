@@ -3023,8 +3023,10 @@ mod tests {
             return;
         }
         let (n_heads, n_kv_heads, head_dim, compress) = (24usize, 2usize, 256usize, 4usize);
-        let (rows, position_start, full_capacity) = (20usize, 150usize, 192usize);
-        let budget_blocks = 30usize;
+        // 600+ visible tokens with a 150-block budget: selections longer than
+        // one 256-row score pass, plus the causal tail.
+        let (rows, position_start, full_capacity) = (20usize, 610usize, 640usize);
+        let budget_blocks = 150usize;
         let capacity = budget_blocks * compress + compress - 1;
         let lcg = |seed: usize, n: usize| -> Vec<f32> {
             (0..n)
