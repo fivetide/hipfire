@@ -25298,7 +25298,7 @@ impl Gpu {
         // route change.  blockIdx.y is sixteen bits, so a wave may only cover
         // a token tile while the row groups fit that limit.
         let r16_shape = self.arch_caps.is_gfx1151()
-            && (128..=512).contains(&batch_size)
+            && (64..=512).contains(&batch_size)
             && m.div_ceil(16) <= 0xffff
             && matches!(
                 (m, k),
