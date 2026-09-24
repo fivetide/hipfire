@@ -210,6 +210,14 @@ extern "C" __global__ void gated_delta_step_shared_norm128_gfx1151(
 // and tid/128 selects the half; each thread retains 64 state values in
 // registers.  Shared handoffs serialize the kd=0..127 kv and output chains:
 // half 1 continues half 0's accumulator rather than combining partial sums.
+//
+// Nothing but the state recurrence is serial across rows, so the per-row Q/K
+// norm factors, decay and beta of up to 256 rows are computed up front (one
+// row per thread, each with the exact serial sum the per-row path uses) and
+// the next row's raw q/k/v are prefetched while the current row runs.  The
+// normalized q/k vectors are double-buffered so a row needs no trailing
+// barrier.  Every value is produced by the same expression sequence as
+// gated_delta_step_f32, so the result is bitwise unchanged.
 __launch_bounds__(256)
 extern "C" __global__ void gated_delta_step_halves_state128_persistent256_f32(
     const float* projection,
@@ -237,11 +245,16 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_f32(
     const int key_head = value_head / repeat;
     const int kd_base = half * 64;
     const int state_base = value_head * 128 * 128;
+    const int q_offset = key_head * 128;
+    const int k_offset = qk_width + key_head * 128;
+    const int v_offset = 2 * qk_width + value_head * 128;
 
-    __shared__ __hip_bfloat16 q_norm[128];
-    __shared__ __hip_bfloat16 k_norm[128];
-    __shared__ __hip_bfloat16 q_inv_shared;
-    __shared__ __hip_bfloat16 k_inv_shared;
+    __shared__ __hip_bfloat16 q_norm[2][128];
+    __shared__ __hip_bfloat16 k_norm[2][128];
+    __shared__ __hip_bfloat16 q_inv_rows[256];
+    __shared__ __hip_bfloat16 k_inv_rows[256];
+    __shared__ float decay_rows[256];
+    __shared__ float beta_rows[256];
     __shared__ float handoff[128];
 
     float state_half[64];
@@ -251,24 +264,30 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_f32(
             state[state_base + (kd_base + kd) * 128 + value_index];
     }
 
-    for (int row = 0; row < rows; ++row) {
-        const int row_base = row * qkv_width;
-        const int key_base = row_base + key_head * 128;
+    // Half 0 carries q/k channel value_index, half 1 carries v.
+    float raw_a = 0.0f;
+    float raw_b = 0.0f;
+    if (half == 0) {
+        raw_a = projection[q_offset + value_index];
+        raw_b = projection[k_offset + value_index];
+    } else {
+        raw_a = projection[v_offset + value_index];
+    }
 
-        if (half == 0) {
-            q_norm[value_index] = bf16_round(projection[key_base + value_index]);
-            k_norm[value_index] = bf16_round(
-                projection[row_base + qk_width + key_head * 128 + value_index]);
-        }
+    for (int block = 0; block < rows; block += 256) {
+        const int block_rows = min(256, rows - block);
         __syncthreads();
-
-        if (thread == 0) {
+        if (thread < block_rows) {
+            const int row = block + thread;
+            const int row_base = row * qkv_width;
             float q_sum_f32 = 0.0f;
             float k_sum_f32 = 0.0f;
             const __hip_bfloat16 eps = bf16_round(1.0e-6f);
             for (int kd = 0; kd < 128; ++kd) {
-                const __hip_bfloat16 q_value = q_norm[kd];
-                const __hip_bfloat16 k_value = k_norm[kd];
+                const __hip_bfloat16 q_value =
+                    bf16_round(projection[row_base + q_offset + kd]);
+                const __hip_bfloat16 k_value =
+                    bf16_round(projection[row_base + k_offset + kd]);
                 const float q_float = bf16_to_f32(q_value);
                 const float k_float = bf16_to_f32(k_value);
                 q_sum_f32 += bf16_to_f32(bf16_round(q_float * q_float));
@@ -276,89 +295,101 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_f32(
             }
             const __hip_bfloat16 q_sum = bf16_round(q_sum_f32);
             const __hip_bfloat16 k_sum = bf16_round(k_sum_f32);
-            q_inv_shared = bf16_round(
+            q_inv_rows[thread] = bf16_round(
                 rsqrtf(bf16_to_f32(q_sum) + bf16_to_f32(eps)));
-            k_inv_shared = bf16_round(
+            k_inv_rows[thread] = bf16_round(
                 rsqrtf(bf16_to_f32(k_sum) + bf16_to_f32(eps)));
+            decay_rows[thread] = expf(gate[row * value_heads + value_head]);
+            beta_rows[thread] = beta[row * value_heads + value_head];
         }
         __syncthreads();
 
-        if (half == 0) {
-            const __hip_bfloat16 q_inv = q_inv_shared;
-            const __hip_bfloat16 k_inv = k_inv_shared;
-            q_norm[value_index] = bf16_round(
-                bf16_to_f32(q_norm[value_index]) * bf16_to_f32(q_inv));
-            k_norm[value_index] = bf16_round(
-                bf16_to_f32(k_norm[value_index]) * bf16_to_f32(k_inv));
-        }
-        __syncthreads();
+        for (int r = 0; r < block_rows; ++r) {
+            const int row = block + r;
+            const int buf = r & 1;
+            const float cur_a = raw_a;
+            const float cur_b = raw_b;
+            if (row + 1 < rows) {
+                const int next_base = (row + 1) * qkv_width;
+                if (half == 0) {
+                    raw_a = projection[next_base + q_offset + value_index];
+                    raw_b = projection[next_base + k_offset + value_index];
+                } else {
+                    raw_a = projection[next_base + v_offset + value_index];
+                }
+            }
+            if (half == 0) {
+                q_norm[buf][value_index] = bf16_round(
+                    bf16_to_f32(bf16_round(cur_a)) * bf16_to_f32(q_inv_rows[r]));
+                k_norm[buf][value_index] = bf16_round(
+                    bf16_to_f32(bf16_round(cur_b)) * bf16_to_f32(k_inv_rows[r]));
+            }
+            __syncthreads();
 
-        const float decay = expf(gate[row * value_heads + value_head]);
-        const float beta_value = beta[row * value_heads + value_head];
+            const float decay = decay_rows[r];
+            const float beta_value = beta_rows[r];
 
-        #pragma unroll
-        for (int kd = 0; kd < 64; ++kd) {
-            state_half[kd] *= decay;
-        }
-
-        float kv_mem = 0.0f;
-        #pragma unroll
-        for (int kd = 0; kd < 64; ++kd) {
-            const float kv = bf16_to_f32(k_norm[kd_base + kd]);
-            kv_mem += state_half[kd] * kv;
-        }
-        if (half == 0) {
-            handoff[value_index] = kv_mem;
-        }
-        __syncthreads();
-
-        if (half == 1) {
-            kv_mem = handoff[value_index];
             #pragma unroll
             for (int kd = 0; kd < 64; ++kd) {
-                const float kv = bf16_to_f32(k_norm[64 + kd]);
+                state_half[kd] *= decay;
+            }
+
+            float kv_mem = 0.0f;
+            #pragma unroll
+            for (int kd = 0; kd < 64; ++kd) {
+                const float kv = bf16_to_f32(k_norm[buf][kd_base + kd]);
                 kv_mem += state_half[kd] * kv;
             }
-            const __hip_bfloat16 v_value =
-                bf16_round(projection[row_base + 2 * qk_width
-                                      + value_head * 128 + value_index]);
-            const float delta =
-                (bf16_to_f32(v_value) - kv_mem) * beta_value;
-            handoff[value_index] = delta;
-        }
-        __syncthreads();
+            if (half == 0) {
+                handoff[value_index] = kv_mem;
+            }
+            __syncthreads();
 
-        const float delta = handoff[value_index];
-        __syncthreads();
-        #pragma unroll
-        for (int kd = 0; kd < 64; ++kd) {
-            const float kv = bf16_to_f32(k_norm[kd_base + kd]);
-            state_half[kd] += kv * delta;
-        }
+            if (half == 1) {
+                kv_mem = handoff[value_index];
+                #pragma unroll
+                for (int kd = 0; kd < 64; ++kd) {
+                    const float kv = bf16_to_f32(k_norm[buf][64 + kd]);
+                    kv_mem += state_half[kd] * kv;
+                }
+                const __hip_bfloat16 v_value = bf16_round(cur_a);
+                const float delta =
+                    (bf16_to_f32(v_value) - kv_mem) * beta_value;
+                handoff[value_index] = delta;
+            }
+            __syncthreads();
 
-        float out = 0.0f;
-        #pragma unroll
-        for (int kd = 0; kd < 64; ++kd) {
-            float qv = bf16_to_f32(q_norm[kd_base + kd]);
-            qv *= query_scale;
-            out += state_half[kd] * qv;
-        }
-        if (half == 0) {
-            handoff[value_index] = out;
-        }
-        __syncthreads();
-
-        if (half == 1) {
-            out = handoff[value_index];
+            const float delta = handoff[value_index];
+            __syncthreads();
             #pragma unroll
             for (int kd = 0; kd < 64; ++kd) {
-                float qv = bf16_to_f32(q_norm[64 + kd]);
+                const float kv = bf16_to_f32(k_norm[buf][kd_base + kd]);
+                state_half[kd] += kv * delta;
+            }
+
+            float out = 0.0f;
+            #pragma unroll
+            for (int kd = 0; kd < 64; ++kd) {
+                float qv = bf16_to_f32(q_norm[buf][kd_base + kd]);
                 qv *= query_scale;
                 out += state_half[kd] * qv;
             }
-            output[row * value_width + value_head * 128 + value_index] = out;
+            if (half == 0) {
+                handoff[value_index] = out;
+            }
+            __syncthreads();
+
+            if (half == 1) {
+                out = handoff[value_index];
+                #pragma unroll
+                for (int kd = 0; kd < 64; ++kd) {
+                    float qv = bf16_to_f32(q_norm[buf][64 + kd]);
+                    qv *= query_scale;
+                    out += state_half[kd] * qv;
+                }
+                output[row * value_width + value_head * 128 + value_index] = out;
+            }
         }
-        __syncthreads();
     }
 
     #pragma unroll

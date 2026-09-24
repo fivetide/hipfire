@@ -2203,6 +2203,93 @@ mod tests {
         Gpu::init().ok()
     }
 
+    /// The persistent row-batched GDN recurrence must equal the per-row step
+    /// kernel bit for bit (outputs and final state), including across the
+    /// kernel's 256-row prologue block boundary.
+    #[test]
+    fn gdn_persistent_batch_is_bit_identical_to_per_row_steps() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let (key_heads, value_heads, dim, rows) = (2usize, 6usize, 128usize, 300usize);
+        let qk = key_heads * dim;
+        let value = value_heads * dim;
+        let qkv = 2 * qk + value;
+        let wave = |seed: usize, n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let h = i.wrapping_mul(2_654_435_761).wrapping_add(seed * 97) % 10007;
+                    (h as f32 - 5003.0) / 5003.0 * scale
+                })
+                .collect()
+        };
+        let projection = wave(1, rows * qkv, 1.5);
+        let gate: Vec<f32> = wave(2, rows * value_heads, 0.5).iter().map(|g| g - 0.6).collect();
+        let beta: Vec<f32> = wave(3, rows * value_heads, 0.45).iter().map(|b| b + 0.5).collect();
+        let state0 = wave(4, value * dim, 0.2);
+        let proj_gpu = gpu.upload_f32(&projection, &[projection.len()]).expect("projection");
+        let gate_gpu = gpu.upload_f32(&gate, &[gate.len()]).expect("gate");
+        let beta_gpu = gpu.upload_f32(&beta, &[beta.len()]).expect("beta");
+
+        let batched_state = gpu.upload_f32(&state0, &[state0.len()]).expect("state");
+        let batched_out = gpu.zeros(&[rows * value], DType::F32).expect("output");
+        gated_delta_step_batched(
+            &mut gpu,
+            &GatedDeltaStepBatched {
+                projection: &proj_gpu,
+                gate: &gate_gpu,
+                beta: &beta_gpu,
+                state: &batched_state,
+                output: &batched_out,
+                rows,
+                qkv_width: qkv,
+                key_heads,
+                value_heads,
+                key_dim: dim,
+                value_dim: dim,
+            },
+        )
+        .expect("batched GDN");
+
+        let row_state = gpu.upload_f32(&state0, &[state0.len()]).expect("state");
+        let row_out = gpu.zeros(&[rows * value], DType::F32).expect("output");
+        for row in 0..rows {
+            gated_delta_step(
+                &mut gpu,
+                &GatedDeltaStep {
+                    q: &proj_gpu.sub_offset(row * qkv, qk),
+                    k: &proj_gpu.sub_offset(row * qkv + qk, qk),
+                    v: &proj_gpu.sub_offset(row * qkv + 2 * qk, value),
+                    gate: &gate_gpu.sub_offset(row * value_heads, value_heads),
+                    beta: &beta_gpu.sub_offset(row * value_heads, value_heads),
+                    state: &row_state,
+                    output: &row_out.sub_offset(row * value, value),
+                    key_heads,
+                    value_heads,
+                    key_dim: dim,
+                    value_dim: dim,
+                },
+            )
+            .expect("per-row GDN");
+        }
+        let bits = |gpu: &Gpu, t: &GpuTensor| -> Vec<u32> {
+            gpu.download_f32(t).expect("download").iter().map(|v| v.to_bits()).collect()
+        };
+        let (a, b) = (bits(&gpu, &batched_out), bits(&gpu, &row_out));
+        assert!(a.iter().any(|v| *v != 0), "batched output is all zero");
+        let differing = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+        assert_eq!(differing, 0, "GDN outputs differ in {differing} cells");
+        assert_eq!(
+            bits(&gpu, &batched_state),
+            bits(&gpu, &row_state),
+            "GDN final state differs"
+        );
+        for tensor in [proj_gpu, gate_gpu, beta_gpu, batched_state, batched_out, row_state, row_out] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
     fn null_tensor(shape: &[usize], dtype: DType) -> GpuTensor {
         let mut tensor = GpuTensor::null_for_test();
         tensor.shape = shape.to_vec();
