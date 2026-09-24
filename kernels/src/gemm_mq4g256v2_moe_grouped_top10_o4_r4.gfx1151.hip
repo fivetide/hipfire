@@ -59,13 +59,13 @@ static __device__ __forceinline__ float hf_lane0_tree_sum(float v) {
     v += __int_as_float(__builtin_amdgcn_permlanex16(
         __float_as_int(v), __float_as_int(v), 0x76543210u, 0xfedcba98u, false, false));
     v += __int_as_float(__builtin_amdgcn_update_dpp(
-        __float_as_int(v), __float_as_int(v), 0x108, 0xf, 0xf, false));  // row_shl:8
+        0, __float_as_int(v), 0x108, 0xf, 0xf, true));  // row_shl:8
     v += __int_as_float(__builtin_amdgcn_update_dpp(
-        __float_as_int(v), __float_as_int(v), 0x104, 0xf, 0xf, false));  // row_shl:4
+        0, __float_as_int(v), 0x104, 0xf, 0xf, true));  // row_shl:4
     v += __int_as_float(__builtin_amdgcn_update_dpp(
-        __float_as_int(v), __float_as_int(v), 0x102, 0xf, 0xf, false));  // row_shl:2
+        0, __float_as_int(v), 0x102, 0xf, 0xf, true));  // row_shl:2
     v += __int_as_float(__builtin_amdgcn_update_dpp(
-        __float_as_int(v), __float_as_int(v), 0x101, 0xf, 0xf, false));  // row_shl:1
+        0, __float_as_int(v), 0x101, 0xf, 0xf, true));  // row_shl:1
     return v;
 }
 // Decode one output row's group weights.  The expressions are the production
