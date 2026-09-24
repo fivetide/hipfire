@@ -21,6 +21,30 @@
 //
 // Grid: [M, ceil(N / 4), 1].  A partial final token tile aliases its last
 // valid input row for masked lanes, so no out-of-range activation is read.
+
+// Lane 0 of `v += __shfl_down(v, off, 32)` for off = 16, 8, 4, 2, 1: the
+// balanced tree v[i] + v[i+off] over lanes i < off.  Only lanes below `off`
+// feed lane 0, so on gfx11/gfx12 the partner comes from a cross-row permlane
+// (off 16) and in-row DPP shifts folded into the adds (off < 16) instead of
+// LDS bpermutes; additions, operands and order are unchanged.  Only lane 0's
+// result is defined.
+static __device__ __forceinline__ float hf_lane0_tree_sum(float v) {
+#if defined(__GFX11__) || defined(__GFX12__)
+    v += __int_as_float(__builtin_amdgcn_permlanex16(
+        __float_as_int(v), __float_as_int(v), 0x76543210u, 0xfedcba98u, false, false));
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(v), 0x108, 0xf, 0xf, true));  // row_shl:8
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(v), 0x104, 0xf, 0xf, true));  // row_shl:4
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(v), 0x102, 0xf, 0xf, true));  // row_shl:2
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(v), 0x101, 0xf, 0xf, true));  // row_shl:1
+#else
+    for (int offset = 16; offset > 0; offset >>= 1) v += __shfl_down(v, offset, 32);
+#endif
+    return v;
+}
 __launch_bounds__(32, 16)
 extern "C" __global__ void gemm_bf16_xf32_multirow(
     const unsigned short* __restrict__ W,
@@ -126,12 +150,10 @@ extern "C" __global__ void gemm_bf16_xf32_multirow(
     float s1 = (a10 + a11) + (a12 + a13);
     float s2 = (a20 + a21) + (a22 + a23);
     float s3 = (a30 + a31) + (a32 + a33);
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        s0 += __shfl_down(s0, offset, 32);
-        s1 += __shfl_down(s1, offset, 32);
-        s2 += __shfl_down(s2, offset, 32);
-        s3 += __shfl_down(s3, offset, 32);
-    }
+    s0 = hf_lane0_tree_sum(s0);
+    s1 = hf_lane0_tree_sum(s1);
+    s2 = hf_lane0_tree_sum(s2);
+    s3 = hf_lane0_tree_sum(s3);
 
     if (lane == 0) {
         Y[(size_t)b0 * M + row] = s0;

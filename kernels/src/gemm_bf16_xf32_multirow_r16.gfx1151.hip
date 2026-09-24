@@ -48,6 +48,24 @@
 //     occur before any dereference; this kernel has no inter-thread barrier or
 //     shared state.
 
+// Lane 0 of the `v += __shfl_down(v, off, 32)` tree (off = 16..1) with the
+// partner values moved by permlanex16 / DPP folded into the adds instead of
+// LDS bpermute.  Same additions, operands and order; only lane 0's result is
+// defined.
+static __device__ __forceinline__ float hf_lane0_tree_sum(float v) {
+    v += __int_as_float(__builtin_amdgcn_permlanex16(
+        __float_as_int(v), __float_as_int(v), 0x76543210u, 0xfedcba98u, false, false));
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(v), 0x108, 0xf, 0xf, true));  // row_shl:8
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(v), 0x104, 0xf, 0xf, true));  // row_shl:4
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(v), 0x102, 0xf, 0xf, true));  // row_shl:2
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(v), 0x101, 0xf, 0xf, true));  // row_shl:1
+    return v;
+}
+
 __launch_bounds__(32, 4)
 extern "C" __global__ void gemm_bf16_xf32_multirow_r16_gfx1151(
     const unsigned short* __restrict__ W,
@@ -157,13 +175,11 @@ extern "C" __global__ void gemm_bf16_xf32_multirow_r16_gfx1151(
                 + (a2[row][stream] + a3[row][stream]);
         }
     }
-    for (int offset = 16; offset > 0; offset >>= 1) {
 #pragma unroll
-        for (int row = 0; row < HF_R16_ROWS; ++row) {
+    for (int row = 0; row < HF_R16_ROWS; ++row) {
 #pragma unroll
-            for (int stream = 0; stream < HF_R16_STREAMS; ++stream) {
-                sum[row][stream] += __shfl_down(sum[row][stream], offset, 32);
-            }
+        for (int stream = 0; stream < HF_R16_STREAMS; ++stream) {
+            sum[row][stream] = hf_lane0_tree_sum(sum[row][stream]);
         }
     }
 

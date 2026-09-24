@@ -39422,12 +39422,12 @@ mod tests {
         );
     }
 
-    /// The gfx1151 R16 BF16 route must equal the batch-1 BF16 GEMV bit for
-    /// bit on the Qwen4 shared-expert and router shapes it now serves,
-    /// including a partial two-token tile.
+    /// Every gfx1151 BF16 multirow route (R16 allowlist shapes and the
+    /// four-row kernel, wide and scalar-tail K) must equal the batch-1 BF16
+    /// GEMV bit for bit, including partial token tiles (N = 131).
     #[test]
     #[ignore = "requires a gfx1151 GPU and working HIP toolchain"]
-    fn bf16_r16_small_m_shapes_are_bit_identical_to_gemv() {
+    fn bf16_multirow_routes_are_bit_identical_to_gemv() {
         let mut gpu = match Gpu::init() {
             Ok(gpu) if gpu.arch_caps.is_gfx1151() => gpu,
             _ => {
@@ -39435,10 +39435,9 @@ mod tests {
                 return;
             }
         };
-        const K: usize = 2560;
         const N: usize = 131;
-        for m in [640usize, 512] {
-            let weights: Vec<u8> = (0..m * K)
+        for (m, k) in [(640usize, 2560usize), (512, 2560), (10240, 320), (2560, 640), (64, 324)] {
+            let weights: Vec<u8> = (0..m * k)
                 .flat_map(|i| {
                     let v = ((i.wrapping_mul(2_654_435_761) >> 7) % 4001) as f32 / 2000.0 - 1.0;
                     ((v.to_bits() >> 16) as u16).to_le_bytes()
@@ -39446,16 +39445,16 @@ mod tests {
                 .collect();
             let mut w = gpu.upload_raw(&weights, &[weights.len()]).expect("w upload");
             w.dtype = DType::BF16;
-            w.shape = vec![m, K];
-            let x: Vec<f32> = (0..N * K)
+            w.shape = vec![m, k];
+            let x: Vec<f32> = (0..N * k)
                 .map(|i| ((i * 7919 % 3001) as f32 - 1500.0) / 977.0)
                 .collect();
             let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("x upload");
             let y = gpu.zeros(&[N * m], DType::F32).expect("y");
-            gpu.gemm_bf16_xf32_multirow(&w, &x_gpu, &y, m, K, N).expect("r16 GEMM");
+            gpu.gemm_bf16_xf32_multirow(&w, &x_gpu, &y, m, k, N).expect("multirow GEMM");
             let y_ref = gpu.zeros(&[N * m], DType::F32).expect("y ref");
             for n in 0..N {
-                gpu.gemv_bf16_xf32(&w, &x_gpu.sub_offset(n * K, K), &y_ref.sub_offset(n * m, m), m, K)
+                gpu.gemv_bf16_xf32(&w, &x_gpu.sub_offset(n * k, k), &y_ref.sub_offset(n * m, m), m, k)
                     .expect("gemv row");
             }
             let got = gpu.download_f32(&y).expect("y download");
@@ -39466,7 +39465,7 @@ mod tests {
                 .zip(&want)
                 .filter(|(a, b)| a.to_bits() != b.to_bits())
                 .count();
-            assert_eq!(differing, 0, "m={m}: R16 GEMM differs from GEMV in {differing} cells");
+            assert_eq!(differing, 0, "({m},{k}): multirow GEMM differs from GEMV in {differing} cells");
         }
     }
 
