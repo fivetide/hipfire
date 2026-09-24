@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! gfx1151-only Qwen4 sealed-MoE channel proof.
+//! Qwen4 sealed-MoE channel proof.
 //!
 //! This executable launches the dedicated qt53 ordinary GEMV, indexed top-10
 //! down, grouped prefill down, and both top-10 combine kernels.  Every result
@@ -450,6 +450,36 @@ fn check_close(
     Ok(())
 }
 
+/// CPU model of the source-BF16 top-10 combine (`moe_down_combine_*_top10`):
+/// route weight, expert output, their product and every partial sum round to
+/// BF16, accumulating experts in ascending id order onto a zero residual.
+/// `slot_outputs` is `[tokens * TOP_K, hidden]`. Callers pass the GPU's own
+/// expert outputs so a last-ulp GEMV difference cannot flip a BF16 rounding.
+fn bf16_top10_combine(
+    slot_outputs: &[f32],
+    indices: &[i32],
+    weights: &[f32],
+    tokens: usize,
+    hidden: usize,
+) -> Vec<f32> {
+    let bf16 = |value: f32| bf16_bits_to_f32(f32_to_bf16_bits(value));
+    let mut combined = vec![0.0f32; tokens * hidden];
+    for token in 0..tokens {
+        let mut ranks: Vec<usize> = (0..TOP_K).collect();
+        ranks.sort_by_key(|&rank| indices[token * TOP_K + rank]);
+        for row in 0..hidden {
+            let mut accumulated = 0.0f32;
+            for &rank in &ranks {
+                let flat = token * TOP_K + rank;
+                let weighted = bf16(bf16(slot_outputs[flat * hidden + row]) * bf16(weights[flat]));
+                accumulated = bf16(accumulated + weighted);
+            }
+            combined[token * hidden + row] = accumulated;
+        }
+    }
+    combined
+}
+
 fn free_all(gpu: &mut Gpu, tensors: impl IntoIterator<Item = GpuTensor>) -> Result<(), String> {
     for tensor in tensors {
         gpu.free_tensor(tensor).map_err(|error| error.to_string())?;
@@ -473,7 +503,7 @@ fn embedding_row(gpu: &mut Gpu) -> Result<(), String> {
         dim,
     )?;
     report_quant_loss(
-        "HFQ4-G128 embedding row source-BF16 quant loss gfx1151",
+        "HFQ4-G128 embedding row source-BF16 quant loss",
         &source_values[token_id * dim..(token_id + 1) * dim],
         &expected,
     )?;
@@ -489,7 +519,7 @@ fn embedding_row(gpu: &mut Gpu) -> Result<(), String> {
         .download_f32(&output)
         .map_err(|error| error.to_string())?;
     let result = check_close(
-        "HFQ4-G128 embedding row exact payload gfx1151",
+        "HFQ4-G128 embedding row exact payload",
         &actual,
         &expected,
         1e-6,
@@ -533,7 +563,7 @@ fn qt53_dense_case(
         .download_f32(&x_rot)
         .map_err(|error| error.to_string())?;
     let rotation_result = check_close(
-        &format!("{label} activation FWHT gfx1151"),
+        &format!("{label} activation FWHT"),
         &rotated_actual,
         &x_rotated_cpu,
         3e-6,
@@ -566,7 +596,7 @@ fn qt53_dense_case(
 fn shared_dense_qt53(gpu: &mut Gpu) -> Result<(), String> {
     qt53_dense_case(
         gpu,
-        "qt53 shared/dense K=640 exact payload gfx1151",
+        "qt53 shared/dense K=640 exact payload",
         3,
         640,
         307,
@@ -578,7 +608,7 @@ fn qt53_boundary_matrix(gpu: &mut Gpu) -> Result<(), String> {
     for &k in &[1usize, 127, 128, 129, 160, 320] {
         qt53_dense_case(
             gpu,
-            &format!("qt53 dense boundary K={k} exact payload gfx1151"),
+            &format!("qt53 dense boundary K={k} exact payload"),
             2,
             k,
             503 + k,
@@ -618,7 +648,7 @@ fn ordinary_gemv(gpu: &mut Gpu) -> Result<(), String> {
             )
         })
         .collect();
-    let result = check_close("qt53 ordinary GEMV gfx1151", &actual, &expected, 3e-5);
+    let result = check_close("qt53 ordinary GEMV", &actual, &expected, 3e-5);
     free_all(gpu, [weight, x_gpu, y_gpu])?;
     result
 }
@@ -676,33 +706,34 @@ fn indexed_top10(gpu: &mut Gpu) -> Result<(), String> {
         experts_count,
     )
     .map_err(|error| error.to_string())?;
+    let expanded_host = gpu
+        .download_f32(&expanded)
+        .map_err(|error| error.to_string())?;
     gpu.moe_down_combine_top10_batched(&expanded, &indices, &weights, &residual, m, tokens)
         .map_err(|error| error.to_string())?;
     let actual = gpu
         .download_f32(&residual)
         .map_err(|error| error.to_string())?;
-    let mut expected = vec![0.0f32; tokens * m];
-    for token in 0..tokens {
-        for rank in 0..TOP_K {
-            let flat = token * TOP_K + rank;
-            let expert = indices_host[flat] as usize;
-            for row in 0..m {
-                let row_start = row * row_stride;
-                let value = qt53_dot(
-                    &expert_bytes[expert][row_start..row_start + row_stride],
-                    k,
-                    &x_host[flat * k..(flat + 1) * k],
-                );
-                expected[token * m + row] += weights_host[flat] * value;
-            }
+    let mut expected_expanded = vec![0.0f32; tokens * TOP_K * m];
+    for flat in 0..tokens * TOP_K {
+        let expert = indices_host[flat] as usize;
+        for row in 0..m {
+            let row_start = row * row_stride;
+            expected_expanded[flat * m + row] = qt53_dot(
+                &expert_bytes[expert][row_start..row_start + row_stride],
+                k,
+                &x_host[flat * k..(flat + 1) * k],
+            );
         }
     }
+    let expected = bf16_top10_combine(&expanded_host, &indices_host, &weights_host, tokens, m);
     let result = check_close(
-        "qt53 indexed top10 + combine gfx1151",
-        &actual,
-        &expected,
+        "qt53 indexed top10 GEMV",
+        &expanded_host,
+        &expected_expanded,
         4e-5,
-    );
+    )
+    .and_then(|()| check_close("qt53 top10 BF16 combine", &actual, &expected, 0.0));
     let mut owned = vec![ptrs, indices, x, expanded, weights, residual];
     owned.extend(expert_tensors);
     free_all(gpu, owned)?;
@@ -732,8 +763,7 @@ fn grouped_prefill(gpu: &mut Gpu) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
 
     // Exercise the dedicated qt44 gate/up grouped entry using the same top-10
-    // permutation. The qt44 launcher converts this synthetic F32 activation
-    // to the WMMA kernel's fp16 input internally.
+    // permutation.
     let gate_bytes: Vec<Vec<u8>> = (0..experts_count)
         .map(|expert| qt44_bytes(2 * intermediate, hidden, 71 + expert * 31))
         .collect();
@@ -818,31 +848,47 @@ fn grouped_prefill(gpu: &mut Gpu) -> Result<(), String> {
     let actual = gpu
         .download_f32(&residual)
         .map_err(|error| error.to_string())?;
-    let mut expected = vec![0.0f32; batch * hidden];
-    for token in 0..batch {
-        for rank in 0..TOP_K {
-            let flat = token * TOP_K + rank;
-            let expert = indices_host[flat] as usize;
-            for row in 0..hidden {
-                let row_start = row * row_stride;
-                let value = qt53_dot(
-                    &down_bytes[expert][row_start..row_start + row_stride],
-                    intermediate,
-                    &rot_host[flat * intermediate..(flat + 1) * intermediate],
-                );
-                expected[token * hidden + row] += weights_host[flat] * value;
-            }
+    let grouped_host = gpu
+        .download_f32(&grouped_down)
+        .map_err(|error| error.to_string())?;
+    let mut inverse_bytes = vec![0u8; total_slots * 4];
+    gpu.hip
+        .memcpy_dtoh(&mut inverse_bytes, &inverse.buf)
+        .map_err(|error| error.to_string())?;
+    let mut slot_outputs = vec![0.0f32; total_slots * hidden];
+    let mut expected_slots = vec![0.0f32; total_slots * hidden];
+    for flat in 0..total_slots {
+        let grouped_row =
+            i32::from_le_bytes(inverse_bytes[flat * 4..flat * 4 + 4].try_into().unwrap());
+        if grouped_row < 0 || grouped_row as usize >= grouped_rows {
+            return Err(format!(
+                "qt53 grouped prefill: slot {flat} maps to grouped row {grouped_row}"
+            ));
+        }
+        let grouped_row = grouped_row as usize;
+        slot_outputs[flat * hidden..(flat + 1) * hidden]
+            .copy_from_slice(&grouped_host[grouped_row * hidden..(grouped_row + 1) * hidden]);
+        let expert = indices_host[flat] as usize;
+        for row in 0..hidden {
+            let row_start = row * row_stride;
+            expected_slots[flat * hidden + row] = qt53_dot(
+                &down_bytes[expert][row_start..row_start + row_stride],
+                intermediate,
+                &rot_host[flat * intermediate..(flat + 1) * intermediate],
+            );
         }
     }
+    let expected = bf16_top10_combine(&slot_outputs, &indices_host, &weights_host, batch, hidden);
     let result = check_close(
-        "qt53 grouped prefill + combine gfx1151",
-        &actual,
-        &expected,
+        "qt53 grouped prefill GEMM",
+        &slot_outputs,
+        &expected_slots,
         5e-5,
-    );
+    )
+    .and_then(|()| check_close("qt53 grouped BF16 combine", &actual, &expected, 0.0));
 
     // The gate/up launch is deliberately after the independent qt53 check: if
-    // WMMA compilation or its top-10 gather/unscatter contract is broken, this
+    // kernel compilation or its top-10 gather/unscatter contract is broken, this
     // executable still reports it as a failed channel rather than hiding the
     // useful qt53 CPU-reference result behind a prior error.
     let gate_x_host: Vec<f32> = (0..batch * hidden)
@@ -889,7 +935,7 @@ fn grouped_prefill(gpu: &mut Gpu) -> Result<(), String> {
     if gate_probe.iter().any(|value| !value.is_finite()) {
         return Err("qt44 grouped gate/up top10 produced a non-finite value".to_string());
     }
-    println!("qt44 grouped gate/up + top10 unscatter gfx1151: PASS");
+    println!("qt44 grouped gate/up + top10 unscatter: PASS");
 
     let mut owned = vec![
         down_ptrs,
@@ -1042,7 +1088,7 @@ fn qt44_dense_case(
         .download_f32(&x_rot)
         .map_err(|error| error.to_string())?;
     let rotation_result = check_close(
-        &format!("{label} qt44 rotation basis gfx1151"),
+        &format!("{label} qt44 rotation basis"),
         &rotated_actual,
         &x_rotated_cpu,
         1e-6,
@@ -1099,7 +1145,7 @@ fn qt44_dense_case(
                     // which an addressing or basis fault (error of the order of
                     // the term sum) exceeds by two orders of magnitude.
                     let gemv_vs_gemm = check_close(
-                        &format!("{label} qt44 gemm-vs-gemv m={m} k={k} rows={rows} gfx1151"),
+                        &format!("{label} qt44 gemm-vs-gemv m={m} k={k} rows={rows}"),
                         &actual,
                         &per_row_actual,
                         0.5,
@@ -1108,7 +1154,7 @@ fn qt44_dense_case(
                     // single-row path is bit-exact, so the multi-row slack is
                     // the batched accumulation order, not the wire format.
                     let cpu = check_close(
-                        &format!("{label} qt44 dense m={m} k={k} rows={rows} gfx1151"),
+                        &format!("{label} qt44 dense m={m} k={k} rows={rows}"),
                         &actual,
                         &expected,
                         0.5,
@@ -1265,7 +1311,7 @@ fn mq6_dense_case(
         .download_f32(&x_rot)
         .map_err(|error| error.to_string())?;
     check_close(
-        &format!("{label} qt47 rotation basis gfx1151"),
+        &format!("{label} qt47 rotation basis"),
         &rotated_actual,
         &x_rotated_cpu,
         1e-6,
@@ -1292,7 +1338,7 @@ fn mq6_dense_case(
         }
     }
     let result = check_close(
-        &format!("{label} qt47 dense m={m} k={k} rows={rows} gfx1151"),
+        &format!("{label} qt47 dense m={m} k={k} rows={rows}"),
         &actual,
         &expected,
         0.5,
@@ -1316,12 +1362,6 @@ fn mq6_dense_cases(gpu: &mut Gpu) -> Result<(), String> {
 fn run() -> Result<(), String> {
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
     println!("GPU: {}", gpu.arch);
-    if !gpu.arch_caps.is_gfx1151() {
-        return Err(format!(
-            "this proof requires gfx1151, detected {}",
-            gpu.arch
-        ));
-    }
     qt44_dense_cases(&mut gpu)?;
     mq6_dense_cases(&mut gpu)?;
     embedding_row(&mut gpu)?;
@@ -1335,8 +1375,8 @@ fn run() -> Result<(), String> {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("Qwen4 gfx1151 qt53 channel: FAIL: {error}");
+        eprintln!("Qwen4 qt53 channel: FAIL: {error}");
         std::process::exit(1);
     }
-    println!("Qwen4 gfx1151 qt53 channel: PASS");
+    println!("Qwen4 qt53 channel: PASS");
 }

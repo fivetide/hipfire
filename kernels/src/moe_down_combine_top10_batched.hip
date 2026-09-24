@@ -29,6 +29,7 @@ extern "C" __global__ void moe_down_combine_top10_batched(
 ) {
     const int column = blockIdx.x * blockDim.x + threadIdx.x;
     const int token = blockIdx.y;
+    if (column >= hidden || token >= tokens) return;
     const size_t token_slot = (size_t)token * 10;
     __hip_bfloat16 accumulated = moe_top10_bf16_round(
         residual[(size_t)token * hidden + column]);
