@@ -382,11 +382,10 @@ pub(crate) fn down(
             p.n_exp,
         ))?;
         // A BF16-source recipe rounds each grouped expert output before
-        // weighted combination, just as on the scalar route.
-        let grouped = f32_view(p.y_down_grouped, 0, grouped_rows * p.down_m);
-        if p.recipe.bf16_round_trip() {
-            hip(gpu.bf16_round_trip_f32(&grouped))?;
-        }
+        // weighted combination, just as on the scalar route.  The grouped
+        // combine kernel performs that same RNE rounding on every row it
+        // reads, so a separate pass over all (padded) grouped rows would only
+        // re-round values that are already BF16-exact.
     } else {
         hip(gpu.gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded(
             p.expert_down_ptrs,
