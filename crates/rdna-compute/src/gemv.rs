@@ -7887,11 +7887,6 @@ impl Gpu {
             && m == 248_320
             && k == 2_048
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_LM_HEAD_K2048", false);
-        let use_wide = !gfx1151_lm_head_dot2
-            && !gfx1151_lm_head_r1_hybrid_buffer
-            && !use_multirow
-            && m >= 64
-            && !(self.arch_caps.is_rdna2() || self.arch_caps.is_rdna3_dgpu());
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq4g256v2", bytes);
         let result = if use_multirow {
@@ -7957,22 +7952,10 @@ impl Gpu {
                 &mut params,
                 blob_builder,
             )
-        } else if use_wide {
-            self.ensure_kernel(
-                "gemv_hfq4g256_wide_mq4v2",
-                kernels::GEMV_MQ4G256V2_SRC,
-                "gemv_mq4g256v2_wide",
-            )?;
-            let grid = ((m + 1) / 2) as u32;
-            self.launch_maybe_blob(
-                "gemv_mq4g256v2_wide",
-                [grid, 1, 1],
-                [64, 1, 1],
-                0,
-                &mut params,
-                blob_builder,
-            )
         } else {
+            // ponytail: wave64 GPUs take this 32-thread kernel; the HFQ4 launcher
+            // has a 64-thread wide variant this format never had. Port one if
+            // wave64 decode throughput matters.
             self.launch_maybe_blob(
                 func_name,
                 [m as u32, 1, 1],
