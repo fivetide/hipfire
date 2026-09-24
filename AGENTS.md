@@ -624,12 +624,10 @@ Caveats that are part of the fixture, not trivia:
 - Loading it needs a build whose qwen4 trunk source contract admits **both**
   packed trunk tiers and whose external-PLE admission accepts both PLE tiers.
   Older builds refuse at load; that refusal is correct, not a corrupt file.
-- **MTP is enabled by default on this recipe as of `6b9db7774`.** On gfx1151,
-  verification starts interleaved and switches to a four-row target when at
-  least 16 drafts matched across the last eight K=3 windows; sustained
-  low-acceptance streams remain interleaved. `HIPFIRE_MTP_INCREMENTAL=1`
-  forces interleaving, `0` forces batching. The batched MQ6 trunk uses
-  shared-weight F32 GEMV:
+- **MTP is enabled by default on this recipe as of `6b9db7774`.** Verification
+  defaults to incremental on every GPU. `HIPFIRE_MTP_INCREMENTAL=0` opts into
+  batched verification; `1` explicitly selects incremental verification.
+  The batched MQ6 trunk uses shared-weight F32 GEMV:
   the prior F16 WMMA route changed target logits and recurrent state.
   Teacher-forced prompt and replay steps advance MTP state without computing
   an unused language-head prediction; prompt target chunks emit only their

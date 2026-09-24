@@ -516,8 +516,6 @@ pub struct Qwen4MtpDrafter {
     /// Prompt rows one chunked prefill call may capture; mirrors the attached
     /// forward's chunk capacity and sizes the spec hidden capture buffer.
     prefill_rows: usize,
-    recent_acceptance: [u8; 8],
-    acceptance_samples: usize,
 }
 
 impl Qwen4MtpDrafter {
@@ -530,8 +528,6 @@ impl Qwen4MtpDrafter {
             pending_hidden: None,
             row_hidden: None,
             prefill_rows: 0,
-            recent_acceptance: [0; 8],
-            acceptance_samples: 0,
         }
     }
 
@@ -609,7 +605,8 @@ impl Qwen4MtpDrafter {
     /// it: no snapshot, no restore, no re-forward of the accepted prefix.  A
     /// cycle costs `accepted + 1` single-row forwards instead of a `k+1`-row
     /// batch plus a replay of the same prefix, and no draft step is wasted past
-    /// the rejection point.  Selection: `HIPFIRE_MTP_INCREMENTAL=1`.
+    /// the rejection point. This is the default; `HIPFIRE_MTP_INCREMENTAL=0`
+    /// explicitly selects batching.
     /// QSA reselects on row 0 of each window, including consecutive windows
     /// at nonzero request positions; later rows reuse that window's selection.
     fn mtp_step_incremental(
@@ -759,11 +756,6 @@ impl Qwen4MtpDrafter {
             .as_ref()
             .ok_or_else(|| "Qwen4 MTP pending hidden is not allocated".to_string())
     }
-
-    fn record_acceptance(&mut self, accepted: usize) {
-        self.recent_acceptance[self.acceptance_samples % 8] = accepted as u8;
-        self.acceptance_samples = self.acceptance_samples.saturating_add(1);
-    }
 }
 
 impl MtpDrafter for Qwen4MtpDrafter {
@@ -779,8 +771,6 @@ impl MtpDrafter for Qwen4MtpDrafter {
     ) -> Result<u32, String> {
         require_native_greedy(self.request.temp)?;
         validate_native_mtp_prefill_request(prompt_tokens, fill_tokens, start_pos, cache_hit)?;
-        self.recent_acceptance = [0; 8];
-        self.acceptance_samples = 0;
         // Native Qwen4 MTP has no exact target+MTP suffix rehydration yet.
         // Always discard any AR or stale MTP prefix and rebuild the complete
         // rendered prompt from position zero.
@@ -858,29 +848,10 @@ impl MtpDrafter for Qwen4MtpDrafter {
         }
         self.ensure_resources(gpu, target)?;
         let trace = std::env::var("HIPFIRE_MTP_TRACE").is_ok_and(|value| value == "1");
-        // A four-row target pays for rejected rows and replay. Only high recent
-        // acceptance amortizes it; start on the exact interleaved path and use
-        // the shared-weight batch on gfx1151 after eight measured windows.
-        let batch = gpu.arch_caps.is_gfx1151()
-            && k == 3
-            && self.acceptance_samples >= 8
-            && self
-                .recent_acceptance
-                .iter()
-                .map(|&n| n as usize)
-                .sum::<usize>()
-                >= 16;
-        let incremental = match std::env::var("HIPFIRE_MTP_INCREMENTAL").as_deref() {
-            Ok("0") => false,
-            Ok("1") => true,
-            _ => !batch,
-        };
+        // Incremental verification is the default on every GPU; batching is opt-in.
+        let incremental = !matches!(std::env::var("HIPFIRE_MTP_INCREMENTAL").as_deref(), Ok("0"));
         if incremental {
-            let result = self.mtp_step_incremental(gpu, target, position, seed, k, eos, trace);
-            if let Ok(window) = &result {
-                self.record_acceptance(window.accepted);
-            }
-            return result;
+            return self.mtp_step_incremental(gpu, target, position, seed, k, eos, trace);
         }
         {
             let bundle = Self::bundle(target)?;
@@ -1098,9 +1069,6 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 ));
             }
         }
-        if let Ok(window) = &result {
-            self.record_acceptance(window.accepted);
-        }
         result
     }
 
@@ -1142,8 +1110,6 @@ impl MtpDrafter for Qwen4MtpDrafter {
     }
 
     fn mtp_reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
-        self.recent_acceptance = [0; 8];
-        self.acceptance_samples = 0;
         if let Some(scratch) = self.scratch.as_mut() {
             if let Some(scratch) = scratch.as_any_mut().downcast_mut::<Qwen4SpecScratch>() {
                 scratch.target_snapshot = None;
