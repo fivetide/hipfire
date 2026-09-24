@@ -31730,10 +31730,7 @@ impl Gpu {
         if self.arch_caps.has_wmma_w32() {
             return self.gemm_mq4g256v2_residual_wmma(a_raw, x, y, m, k, batch_size);
         }
-        Err(hip_bridge::HipError::new(
-            0,
-            "gemm_hfq4g256_residual_mq4v2: gfx1201 or gfx11 wmma required",
-        ))
+        self.gemm_mq4g256v2_xbatch(a_raw, x, y, m, k, batch_size, true)
     }
 
     /// MQ4 v2 (qt=44) — plain batched GEMM `gemm_hfq4g256` sibling.
@@ -31743,9 +31740,9 @@ impl Gpu {
     /// (gfx1100/1101/1102/1150/1151/gfx1200/1201) this method provides
     /// plain-GEMM semantics by zeroing output and routing through the
     /// arch-aware residual WMMA path (`gemm_hfq4g256_residual_mq4v2`,
-    /// which dispatches gfx12 vs gfx11 internally). Other GPUs run the V2
-    /// GEMV once per row: the v1 scalar GEMM cannot decode V2 bytes (fp16
-    /// s0/z0/s1/z1 vs f32 scale/zero; WT2 KLD 12.1).
+    /// which dispatches gfx12 vs gfx11 internally). Other GPUs use the
+    /// x-batched scalar V2 GEMV: the v1 scalar GEMM cannot decode V2 bytes
+    /// (fp16 s0/z0/s1/z1 vs f32 scale/zero; WT2 KLD 12.1).
     pub fn gemm_mq4g256v2(
         &mut self,
         a_raw: &GpuTensor,
@@ -31769,10 +31766,14 @@ impl Gpu {
             }
             return self.gemm_hfq4g256_residual_mq4v2(a_raw, x, y, m, k, batch_size);
         }
-        self.gemm_mq4g256v2_gemv_rows(a_raw, x, y, m, k, batch_size)
+        self.gemm_mq4g256v2_xbatch(a_raw, x, y, m, k, batch_size, false)
     }
 
-    fn gemm_mq4g256v2_gemv_rows(
+    /// MQ4G256V2 without WMMA: the x-batched scalar GEMV decodes each weight
+    /// row once for up to four input rows, keeping the scalar kernel's per-row
+    /// accumulation order. `residual` selects `Y += W·X` over `Y = W·X`.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_mq4g256v2_xbatch(
         &mut self,
         a_raw: &GpuTensor,
         x: &GpuTensor,
@@ -31780,12 +31781,52 @@ impl Gpu {
         m: usize,
         k: usize,
         batch_size: usize,
+        residual: bool,
     ) -> HipResult<()> {
-        // ponytail: one GEMV launch per row; add a batched F32 kernel if wide prefill needs it.
-        for row in 0..batch_size {
-            let x_row = x.sub_offset(row * k, k);
-            let y_row = y.sub_offset(row * m, m);
-            self.gemv_mq4g256v2(a_raw, &x_row, &y_row, m, k)?;
+        // `HIPFIRE_MQ4G256V2_XBATCH_MAX` in both sources.
+        const XBATCH_MAX: usize = 4;
+        assert!(
+            k.is_multiple_of(256),
+            "MQ4G256V2 x-batch GEMV requires K%256==0"
+        );
+        self.bind_thread()?;
+        let (func, source) = if residual {
+            (
+                "gemv_mq4g256v2_xbatch_residual",
+                kernels::GEMV_MQ4G256V2_XBATCH_RESIDUAL_SRC,
+            )
+        } else {
+            ("gemv_mq4g256v2_xbatch", kernels::GEMV_MQ4G256V2_XBATCH_SRC)
+        };
+        self.ensure_kernel(func, source, func)?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        for start in (0..batch_size).step_by(XBATCH_MAX) {
+            let rows = XBATCH_MAX.min(batch_size - start);
+            let x_rows = x.sub_offset(start * k, rows * k);
+            let y_rows = y.sub_offset(start * m, rows * m);
+            let x_ptr = x_rows.buf.as_ptr();
+            let y_ptr = y_rows.buf.as_ptr();
+            let b_val = rows as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &a_ptr as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &y_ptr as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+                &b_val as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(func, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(b_val);
+                b
+            })?;
         }
         Ok(())
     }
@@ -31795,8 +31836,8 @@ impl Gpu {
     /// fp16 cache stomp, memset zero, gfx12 vs gfx11 dispatch, and the
     /// gfx1100 rm muse gate. Only the v2 SRC constant, `gemm_mq4g256v2` module
     /// name, and `gemm_mq4g256v2` kernel symbol change where a v2 source exists.
-    /// Dedicated V2 WMMA residual sources exist for gfx12 and gfx11; the
-    /// generic scalar fallback remains intentionally unavailable.
+    /// Dedicated V2 WMMA residual sources exist for gfx12 and gfx11; other
+    /// GPUs (or WMMA-disabled runs) use the x-batched scalar V2 GEMV.
     pub fn gemm_mq4g256v2_batched_lmhead(
         &mut self,
         a_raw: &GpuTensor,
@@ -31840,11 +31881,7 @@ impl Gpu {
                 "qt=44 gemm_mq4g256v2_batched_lmhead: no WMMA source for this arch",
             ));
         }
-        Err(hip_bridge::HipError::new(
-            0,
-            "qt=44 gemm_mq4g256v2_batched_lmhead: scalar fallback has no v2 source \
-             (GEMM_MQ4G256V2_SRC missing) — would mis-decode v2 bytes as v1",
-        ))
+        self.gemm_mq4g256v2_xbatch(a_raw, x, y, m, k, batch_size, false)
     }
     /// Alias with correct HFQ container naming: `hfq4g256v2` is the versioned
     /// container, `MQ4G256V2` is the rotated format that consumes it. See
@@ -35037,10 +35074,7 @@ impl Gpu {
                 "qt=47 gemm_mq6g256v2_batched_lmhead: no WMMA source for this arch",
             ));
         }
-        Err(hip_bridge::HipError::new(
-            0,
-            "qt=47 gemm_mq6g256v2_batched_lmhead: scalar fallback no v2 source",
-        ))
+        self.gemm_mq6g256v2_gemv_rows(a_raw, x, y, m, k, batch_size)
     }
 
     pub fn gemm_hfq6g256v2(
@@ -39205,10 +39239,11 @@ mod tests {
 
     #[test]
     #[ignore = "requires a GPU and working HIP toolchain"]
-    fn mq4v2_multirow_fallback_matches_independent_gemv_rows() {
+    fn mq4v2_xbatch_fallback_matches_gemv_rows_and_residual() {
         const M: usize = 17;
         const K: usize = 768;
-        const BATCH: usize = 3;
+        // More than one four-row x-batch chunk; K=768 exercises the tail groups.
+        const BATCH: usize = 6;
         let mut gpu = match Gpu::init() {
             Ok(gpu) => gpu,
             Err(error) => {
@@ -39245,8 +39280,8 @@ mod tests {
             .expect("poison batch output");
 
         // Force the no-WMMA path on this WMMA host.
-        gpu.gemm_mq4g256v2_gemv_rows(&weight, &input, &output, M, K, BATCH)
-            .expect("MQ4 v2 multirow fallback");
+        gpu.gemm_mq4g256v2_xbatch(&weight, &input, &output, M, K, BATCH, false)
+            .expect("MQ4 v2 x-batch fallback");
         let mut expected = Vec::with_capacity(BATCH * M);
         for row in 0..BATCH {
             let x = gpu
@@ -39271,6 +39306,25 @@ mod tests {
                 got.to_bits(),
                 *want,
                 "batch row {}, output {}",
+                index / M,
+                index % M
+            );
+        }
+
+        // Residual variant: Y += W·X on a nonzero Y must equal Y + (W·X).
+        let initial: Vec<f32> = (0..BATCH * M).map(|i| i as f32 * 0.375 - 7.0).collect();
+        let residual = gpu
+            .upload_f32(&initial, &[BATCH * M])
+            .expect("upload residual input");
+        gpu.gemm_mq4g256v2_xbatch(&weight, &input, &residual, M, K, BATCH, true)
+            .expect("MQ4 v2 x-batch residual fallback");
+        let residual = gpu.download_f32(&residual).expect("download residual");
+        for (index, ((got, base), plain)) in residual.iter().zip(&initial).zip(&actual).enumerate()
+        {
+            assert_eq!(
+                got.to_bits(),
+                (base + plain).to_bits(),
+                "residual batch row {}, output {}",
                 index / M,
                 index % M
             );

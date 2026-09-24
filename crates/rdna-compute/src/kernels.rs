@@ -1711,6 +1711,23 @@ pub const GEMV_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_K512_SRC: &str = concat!(
     "#define HIPFIRE_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_EPILOGUE 1\n",
     include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
 );
+/// Generic-K x-batched MQ4G256V2 GEMV (`y[b] = A . x[b]`, B <= 4): each weight
+/// row is decoded once per launch and every row keeps the scalar kernel's
+/// accumulation order. The batched path on GPUs without WMMA.
+pub const GEMV_MQ4G256V2_XBATCH_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_XBATCH 1\n",
+    "#define HIPFIRE_MQ4G256V2_XBATCH_MAX 4\n",
+    "#define HIPFIRE_MQ4G256V2_XBATCH_KERNEL gemv_mq4g256v2_xbatch\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+);
+/// Residual sibling of [`GEMV_MQ4G256V2_XBATCH_SRC`] (`y[b] += A . x[b]`).
+pub const GEMV_MQ4G256V2_XBATCH_RESIDUAL_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_XBATCH 1\n",
+    "#define HIPFIRE_MQ4G256V2_XBATCH_MAX 4\n",
+    "#define HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE 1\n",
+    "#define HIPFIRE_MQ4G256V2_XBATCH_KERNEL gemv_mq4g256v2_xbatch_residual\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+);
 
 pub const GEMV_MQ5G256V2_RESIDUAL_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
