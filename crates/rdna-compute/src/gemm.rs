@@ -31743,10 +31743,9 @@ impl Gpu {
     /// (gfx1100/1101/1102/1150/1151/gfx1200/1201) this method provides
     /// plain-GEMM semantics by zeroing output and routing through the
     /// arch-aware residual WMMA path (`gemm_hfq4g256_residual_mq4v2`,
-    /// which dispatches gfx12 vs gfx11 internally). On non-WMMA arches
-    /// it preserves the clear scalar-missing error — V2 bytes (fp16
-    /// s0/z0/s1/z1) cannot be decoded by the v1 scalar kernel (f32
-    /// scale/zero) and would produce noise (WT2 KLD 12.1).
+    /// which dispatches gfx12 vs gfx11 internally). Other GPUs run the V2
+    /// GEMV once per row: the v1 scalar GEMM cannot decode V2 bytes (fp16
+    /// s0/z0/s1/z1 vs f32 scale/zero; WT2 KLD 12.1).
     pub fn gemm_mq4g256v2(
         &mut self,
         a_raw: &GpuTensor,
@@ -31770,12 +31769,25 @@ impl Gpu {
             }
             return self.gemm_hfq4g256_residual_mq4v2(a_raw, x, y, m, k, batch_size);
         }
-        Err(hip_bridge::HipError::new(
-            0,
-            "qt=44 gemm_mq4g256v2: requires WMMA (gfx1100/gfx1101/gfx1102/gfx1150/gfx1151/gfx1200/gfx1201); \
-             no GEMM_MQ4G256V2 scalar source exists (would need GEMM_MQ4G256V2_SRC). V2 bytes cannot be \
-             decoded by the v1 scalar kernel (fp16 s0/z0/s1/z1 vs f32 scale/zero).",
-        ))
+        self.gemm_mq4g256v2_gemv_rows(a_raw, x, y, m, k, batch_size)
+    }
+
+    fn gemm_mq4g256v2_gemv_rows(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        // ponytail: one GEMV launch per row; add a batched F32 kernel if wide prefill needs it.
+        for row in 0..batch_size {
+            let x_row = x.sub_offset(row * k, k);
+            let y_row = y.sub_offset(row * m, m);
+            self.gemv_mq4g256v2(a_raw, &x_row, &y_row, m, k)?;
+        }
+        Ok(())
     }
 
     /// MQ4 v2 (qt=44) — batched lm_head sibling of `gemm_hfq4g256_batched_lmhead`.
@@ -39169,6 +39181,80 @@ mod tests {
             let y = gpu.zeros(&[M], DType::F32).expect("alloc row output");
             gpu.gemv_mq6g256v2(&weight, &x, &y, M, K)
                 .expect("MQ6 single-row GEMV");
+            gpu.hip.device_synchronize().expect("row sync");
+            expected.extend(
+                gpu.download_f32(&y)
+                    .expect("download independent row")
+                    .into_iter()
+                    .map(f32::to_bits),
+            );
+        }
+        assert_ne!(&expected[..M], &expected[M..2 * M]);
+
+        let actual = gpu.download_f32(&output).expect("download batch");
+        for (index, (got, want)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                *want,
+                "batch row {}, output {}",
+                index / M,
+                index % M
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU and working HIP toolchain"]
+    fn mq4v2_multirow_fallback_matches_independent_gemv_rows() {
+        const M: usize = 17;
+        const K: usize = 768;
+        const BATCH: usize = 3;
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("skip: no GPU ({error:?})");
+                return;
+            }
+        };
+
+        let groups = K / 256;
+        let mut packed = vec![0u8; M * groups * 136];
+        for row in 0..M {
+            for group in 0..groups {
+                let base = (row * groups + group) * 136;
+                packed[base..base + 2].copy_from_slice(&0x3000u16.to_le_bytes());
+                packed[base + 2..base + 4].copy_from_slice(&0xb000u16.to_le_bytes());
+                packed[base + 4..base + 6].copy_from_slice(&0x2c00u16.to_le_bytes());
+                packed[base + 6..base + 8].copy_from_slice(&0xac00u16.to_le_bytes());
+                for byte in 0..128 {
+                    packed[base + 8 + byte] = (row * 17 + group * 29 + byte * 31) as u8;
+                }
+            }
+        }
+        let weight = gpu
+            .upload_raw(&packed, &[packed.len()])
+            .expect("upload MQ4 v2");
+        let inputs: Vec<f32> = (0..BATCH * K)
+            .map(|i| (((i * 37 + 11) % 257) as f32 - 128.0) / 131.0)
+            .collect();
+        let input = gpu
+            .upload_f32(&inputs, &[BATCH * K])
+            .expect("upload batch input");
+        let output = gpu
+            .upload_f32(&vec![f32::NAN; BATCH * M], &[BATCH * M])
+            .expect("poison batch output");
+
+        // Force the no-WMMA path on this WMMA host.
+        gpu.gemm_mq4g256v2_gemv_rows(&weight, &input, &output, M, K, BATCH)
+            .expect("MQ4 v2 multirow fallback");
+        let mut expected = Vec::with_capacity(BATCH * M);
+        for row in 0..BATCH {
+            let x = gpu
+                .upload_f32(&inputs[row * K..(row + 1) * K], &[K])
+                .expect("upload independent row");
+            let y = gpu.zeros(&[M], DType::F32).expect("alloc row output");
+            gpu.gemv_mq4g256v2(&weight, &x, &y, M, K)
+                .expect("MQ4 v2 single-row GEMV");
             gpu.hip.device_synchronize().expect("row sync");
             expected.extend(
                 gpu.download_f32(&y)
