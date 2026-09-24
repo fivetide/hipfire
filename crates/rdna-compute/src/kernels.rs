@@ -1601,6 +1601,23 @@ pub const GEMV_MQ3G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq3
 pub const GEMV_MQ2G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq2g256v2.hip");
 /// MQ6G256V2: dual-scale 6-bit (qt=47).
 pub const GEMV_MQ6G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g256v2.hip");
+/// Generic-K x-batched MQ6G256V2 GEMV (`y[b] = A . x[b]`, B <= 4), one weight
+/// decode per launch and the scalar kernel's per-row accumulation order. The
+/// batched path on GPUs without WMMA.
+pub const GEMV_MQ6G256V2_XBATCH_SRC: &str = concat!(
+    "#define HIPFIRE_MQ6G256V2_XBATCH 1\n",
+    "#define HIPFIRE_MQ6G256V2_XBATCH_MAX 4\n",
+    "#define HIPFIRE_MQ6G256V2_XBATCH_KERNEL gemv_mq6g256v2_xbatch\n",
+    include_str!("../../../kernels/src/gemv_mq6g256v2.hip")
+);
+/// Residual sibling of [`GEMV_MQ6G256V2_XBATCH_SRC`] (`y[b] += A . x[b]`).
+pub const GEMV_MQ6G256V2_XBATCH_RESIDUAL_SRC: &str = concat!(
+    "#define HIPFIRE_MQ6G256V2_XBATCH 1\n",
+    "#define HIPFIRE_MQ6G256V2_XBATCH_MAX 4\n",
+    "#define HIPFIRE_MQ6G256V2_RESIDUAL_EPILOGUE 1\n",
+    "#define HIPFIRE_MQ6G256V2_XBATCH_KERNEL gemv_mq6g256v2_xbatch_residual\n",
+    include_str!("../../../kernels/src/gemv_mq6g256v2.hip")
+);
 /// Shared-weight F32 MQ6G256V2 GEMV over 2–4 pre-rotated activation rows.
 pub const GEMM_MQ6G256V2_F32_ROWS_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq6g256v2_f32_rows.hip");

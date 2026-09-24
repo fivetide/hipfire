@@ -31783,13 +31783,6 @@ impl Gpu {
         batch_size: usize,
         residual: bool,
     ) -> HipResult<()> {
-        // `HIPFIRE_MQ4G256V2_XBATCH_MAX` in both sources.
-        const XBATCH_MAX: usize = 4;
-        assert!(
-            k.is_multiple_of(256),
-            "MQ4G256V2 x-batch GEMV requires K%256==0"
-        );
-        self.bind_thread()?;
         let (func, source) = if residual {
             (
                 "gemv_mq4g256v2_xbatch_residual",
@@ -31798,6 +31791,30 @@ impl Gpu {
         } else {
             ("gemv_mq4g256v2_xbatch", kernels::GEMV_MQ4G256V2_XBATCH_SRC)
         };
+        self.gemv_v2_xbatch_rows(func, source, a_raw, x, y, m, k, batch_size)
+    }
+
+    /// Launch an x-batched V2 GEMV (`A, x, y, M, K, B` ABI) over `batch_size`
+    /// rows in chunks of `XBATCH_MAX`, the accumulator width of every x-batch
+    /// source (`HIPFIRE_MQ{4,6}G256V2_XBATCH_MAX`).
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_v2_xbatch_rows(
+        &mut self,
+        func: &'static str,
+        source: &'static str,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        const XBATCH_MAX: usize = 4;
+        assert!(
+            k.is_multiple_of(256),
+            "{func}: x-batch V2 GEMV requires K%256==0"
+        );
+        self.bind_thread()?;
         self.ensure_kernel(func, source, func)?;
         let a_ptr = a_raw.buf.as_ptr();
         let m_val = m as i32;
@@ -34970,6 +34987,7 @@ impl Gpu {
         }
         result
     }
+    /// `Y += W·X`. GPUs without WMMA use the x-batched scalar V2 GEMV.
     pub fn gemm_mq6g256v2_residual_wmma(
         &mut self,
         a_raw: &GpuTensor,
@@ -34985,10 +35003,7 @@ impl Gpu {
         if self.arch_caps.has_wmma_w32() {
             return self.gemm_mq6g256v2_residual_wmma_gfx11(a_raw, x, y, m, k, batch_size);
         }
-        Err(hip_bridge::HipError::new(
-            0,
-            "gemm_mq6g256v2_residual_wmma: gfx1201 or gfx11 wmma required",
-        ))
+        self.gemm_mq6g256v2_xbatch(a_raw, x, y, m, k, batch_size, true)
     }
 
     pub fn gemm_mq6g256v2(
@@ -35011,10 +35026,14 @@ impl Gpu {
             }
             return self.gemm_mq6g256v2_residual_wmma(a_raw, x, y, m, k, batch_size);
         }
-        self.gemm_mq6g256v2_gemv_rows(a_raw, x, y, m, k, batch_size)
+        self.gemm_mq6g256v2_xbatch(a_raw, x, y, m, k, batch_size, false)
     }
 
-    fn gemm_mq6g256v2_gemv_rows(
+    /// MQ6G256V2 without WMMA: the x-batched scalar GEMV decodes each weight
+    /// row once for up to four input rows, keeping the scalar kernel's per-row
+    /// accumulation order. `residual` selects `Y += W·X` over `Y = W·X`.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_mq6g256v2_xbatch(
         &mut self,
         a_raw: &GpuTensor,
         x: &GpuTensor,
@@ -35022,14 +35041,17 @@ impl Gpu {
         m: usize,
         k: usize,
         batch_size: usize,
+        residual: bool,
     ) -> HipResult<()> {
-        // ponytail: one GEMV launch per row; add a batched F32 kernel if wide prefill needs it.
-        for row in 0..batch_size {
-            let x_row = x.sub_offset(row * k, k);
-            let y_row = y.sub_offset(row * m, m);
-            self.gemv_mq6g256v2(a_raw, &x_row, &y_row, m, k)?;
-        }
-        Ok(())
+        let (func, source) = if residual {
+            (
+                "gemv_mq6g256v2_xbatch_residual",
+                kernels::GEMV_MQ6G256V2_XBATCH_RESIDUAL_SRC,
+            )
+        } else {
+            ("gemv_mq6g256v2_xbatch", kernels::GEMV_MQ6G256V2_XBATCH_SRC)
+        };
+        self.gemv_v2_xbatch_rows(func, source, a_raw, x, y, m, k, batch_size)
     }
 
     pub fn gemm_mq6g256v2_batched_lmhead(
@@ -35074,7 +35096,7 @@ impl Gpu {
                 "qt=47 gemm_mq6g256v2_batched_lmhead: no WMMA source for this arch",
             ));
         }
-        self.gemm_mq6g256v2_gemv_rows(a_raw, x, y, m, k, batch_size)
+        self.gemm_mq6g256v2_xbatch(a_raw, x, y, m, k, batch_size, false)
     }
 
     pub fn gemm_hfq6g256v2(
@@ -39164,10 +39186,12 @@ mod tests {
 
     #[test]
     #[ignore = "requires a GPU and working HIP toolchain"]
-    fn mq6_multirow_fallback_matches_independent_gemv_rows() {
+    fn mq6v2_xbatch_fallback_matches_gemv_rows_and_residual() {
         const M: usize = 17;
-        const K: usize = 1280;
-        const BATCH: usize = 5;
+        // One four-group quad plus all three tail groups.
+        const K: usize = 1792;
+        // More than one four-row x-batch chunk.
+        const BATCH: usize = 6;
         let mut gpu = match Gpu::init() {
             Ok(gpu) => gpu,
             Err(error) => {
@@ -39203,10 +39227,9 @@ mod tests {
             .upload_f32(&vec![f32::NAN; BATCH * M], &[BATCH * M])
             .expect("poison batch output");
 
-        // Force the no-WMMA path on this gfx1151 host; batch > 4 also covers
-        // rows outside the 2..=4 shared-weight F32 kernel.
-        gpu.gemm_mq6g256v2_gemv_rows(&weight, &input, &output, M, K, BATCH)
-            .expect("MQ6 multirow fallback");
+        // Force the no-WMMA path on this WMMA host.
+        gpu.gemm_mq6g256v2_xbatch(&weight, &input, &output, M, K, BATCH, false)
+            .expect("MQ6 x-batch fallback");
         let mut expected = Vec::with_capacity(BATCH * M);
         for row in 0..BATCH {
             let x = gpu
@@ -39231,6 +39254,25 @@ mod tests {
                 got.to_bits(),
                 *want,
                 "batch row {}, output {}",
+                index / M,
+                index % M
+            );
+        }
+
+        // Residual variant: Y += W·X on a nonzero Y must equal Y + (W·X).
+        let initial: Vec<f32> = (0..BATCH * M).map(|i| i as f32 * 0.375 - 7.0).collect();
+        let residual = gpu
+            .upload_f32(&initial, &[BATCH * M])
+            .expect("upload residual input");
+        gpu.gemm_mq6g256v2_xbatch(&weight, &input, &residual, M, K, BATCH, true)
+            .expect("MQ6 x-batch residual fallback");
+        let residual = gpu.download_f32(&residual).expect("download residual");
+        for (index, ((got, base), plain)) in residual.iter().zip(&initial).zip(&actual).enumerate()
+        {
+            assert_eq!(
+                got.to_bits(),
+                (base + plain).to_bits(),
+                "residual batch row {}, output {}",
                 index / M,
                 index % M
             );
