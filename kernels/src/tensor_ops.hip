@@ -1433,6 +1433,7 @@ extern "C" __global__ void indexed_attention_attention_f32_batched(
 #define QSA_HG 4
 #define QSA_TT 64
 #define QSA_DC 64
+#define QSA_KS (QSA_DC + 4)
 #define QSA_HD 256
 extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f32_batched_hg4(
     const float* q_with_gate,
@@ -1456,11 +1457,13 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
     int chosen = budget_blocks < block_count ? budget_blocks : block_count;
     int selected_len = chosen * compress + visible - block_count * compress;
     if (selected_len > capacity) selected_len = capacity;
-    extern __shared__ float lds[];
-    float* weights = lds;                              // [QSA_HG][selected_len]
+    // Every region is a multiple of 16 bytes so float4 LDS accesses stay aligned.
+    extern __shared__ float4 lds4[];
+    float* lds = reinterpret_cast<float*>(lds4);
+    float* weights = lds;                              // [selected_len][QSA_HG]
     float* qs = weights + QSA_HG * selected_len;       // [QSA_HG][QSA_HD]
-    float* kt = qs + QSA_HG * QSA_HD;                  // [QSA_TT][QSA_DC + 1]
-    float* maxes = kt + QSA_TT * (QSA_DC + 1);         // [QSA_HG]
+    float* kt = qs + QSA_HG * QSA_HD;                  // [QSA_TT][QSA_KS]
+    float* maxes = kt + QSA_TT * QSA_KS;               // [QSA_HG]
     int* tokens = reinterpret_cast<int*>(maxes + QSA_HG);  // [selected_len]
     int tid = (int)threadIdx.x;
     int head0 = (int)blockIdx.x * QSA_HG;
@@ -1482,28 +1485,35 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
     int my_h = tid / QSA_TT;
     int my_t = tid % QSA_TT;
     const float* my_q = qs + my_h * QSA_HD;
-    const float* my_k = kt + my_t * (QSA_DC + 1);
+    const float* my_k = kt + my_t * QSA_KS;
     float partial_max = -3.402823466e+38f;
     for (int base = 0; base < selected_len; base += QSA_TT) {
         float score = 0.0f;
         for (int d0 = 0; d0 < QSA_HD; d0 += QSA_DC) {
-            for (int e = tid; e < QSA_TT * QSA_DC; e += 256) {
-                int t = e / QSA_DC;
-                int dd = e % QSA_DC;
+            for (int e = tid; e < QSA_TT * QSA_DC / 4; e += 256) {
+                int t = e / (QSA_DC / 4);
+                int c = (e % (QSA_DC / 4)) * 4;
                 int token = base + t < selected_len ? tokens[base + t] : -1;
-                kt[t * (QSA_DC + 1) + dd] =
-                    token >= 0 ? keys[token * kv_stride + d0 + dd] : 0.0f;
+                *reinterpret_cast<float4*>(kt + t * QSA_KS + c) = token >= 0
+                    ? *reinterpret_cast<const float4*>(keys + token * kv_stride + d0 + c)
+                    : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             }
             __syncthreads();
-            for (int dd = 0; dd < QSA_DC; ++dd) {
-                score += my_q[d0 + dd] * my_k[dd];
+#pragma unroll
+            for (int dd = 0; dd < QSA_DC; dd += 4) {
+                const float4 q4 = *reinterpret_cast<const float4*>(my_q + d0 + dd);
+                const float4 k4 = *reinterpret_cast<const float4*>(my_k + dd);
+                score += q4.x * k4.x;
+                score += q4.y * k4.y;
+                score += q4.z * k4.z;
+                score += q4.w * k4.w;
             }
             __syncthreads();
         }
         int index = base + my_t;
         if (index < selected_len) {
             score /= sqrtf((float)QSA_HD);
-            weights[my_h * selected_len + index] = score;
+            weights[index * QSA_HG + my_h] = score;
             if (tokens[index] >= 0) partial_max = fmaxf(partial_max, score);
         }
     }
@@ -1517,8 +1527,7 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
     }
     __syncthreads();
     for (int i = tid; i < QSA_HG * selected_len; i += 256) {
-        int index = i % selected_len;
-        if (tokens[index] >= 0) weights[i] = expf(weights[i] - maxes[i / selected_len]);
+        if (tokens[i / QSA_HG] >= 0) weights[i] = expf(weights[i] - maxes[i % QSA_HG]);
     }
     __syncthreads();
 
@@ -1535,12 +1544,15 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
         int token = tokens[i];
         float value = values[(token < 0 ? 0 : token) * kv_stride + channel];
         if (token >= 0) {
-#pragma unroll
-            for (int h = 0; h < QSA_HG; ++h) {
-                float weight = weights[h * selected_len + i];
-                denominator[h] += weight;
-                numerator[h] += weight * value;
-            }
+            const float4 w4 = *reinterpret_cast<const float4*>(weights + i * QSA_HG);
+            denominator[0] += w4.x;
+            numerator[0] += w4.x * value;
+            denominator[1] += w4.y;
+            numerator[1] += w4.y * value;
+            denominator[2] += w4.z;
+            numerator[2] += w4.z * value;
+            denominator[3] += w4.w;
+            numerator[3] += w4.w * value;
         }
     }
 #pragma unroll
@@ -1552,6 +1564,7 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
             : 0.0f;
     }
 }
+#undef QSA_KS
 #undef QSA_HG
 #undef QSA_TT
 #undef QSA_DC

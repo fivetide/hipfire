@@ -1907,10 +1907,10 @@ fn qsa_attention_hg4_lds_bytes(
     {
         return None;
     }
-    // weights[4][sel] + tokens[sel] + q[4][256] + key tile[64][65] + maxes[4].
+    // weights[sel][4] + tokens[sel] + q[4][256] + key tile[64][68] + maxes[4].
     let bytes = shape_selected
         .checked_mul(4 * QSA_ATTENTION_HG4_HEADS + 4)?
-        .checked_add(4 * (QSA_ATTENTION_HG4_HEADS * 256 + 64 * 65 + QSA_ATTENTION_HG4_HEADS))?;
+        .checked_add(4 * (QSA_ATTENTION_HG4_HEADS * 256 + 64 * 68 + QSA_ATTENTION_HG4_HEADS))?;
     (bytes <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES).then_some(bytes as u32)
 }
 
