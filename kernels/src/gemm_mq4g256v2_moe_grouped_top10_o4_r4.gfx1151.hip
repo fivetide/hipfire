@@ -68,30 +68,6 @@ static __device__ __forceinline__ float hf_lane0_tree_sum(float v) {
         0, __float_as_int(v), 0x101, 0xf, 0xf, true));  // row_shl:1
     return v;
 }
-// Decode one output row's group weights.  The expressions are the production
-// O2×R8 expressions; SUF only renames the per-row temporaries so four rows can
-// coexist in one scope.
-#define HF_DECODE_ROW(G, PTR, VALID, SUF) \
-    const char* gp##SUF = (PTR) + (long long)(G) * 136; \
-    const unsigned int h##SUF = (VALID) \
-        ? *(const unsigned int*)(gp##SUF + hoff) : 0u; \
-    const float sc##SUF = (VALID) \
-        ? __half2float(__ushort_as_half( \
-            (unsigned short)(h##SUF & 0xFFFFu))) : 0.0f; \
-    const float zp##SUF = (VALID) \
-        ? __half2float(__ushort_as_half( \
-            (unsigned short)(h##SUF >> 16))) : 0.0f; \
-    const unsigned int pk##SUF = (VALID) \
-        ? *(const unsigned int*)(gp##SUF + 8 + boff) : 0u; \
-    const float w##SUF##0 = sc##SUF * (float)((pk##SUF >> 0) & 0xFu) + zp##SUF; \
-    const float w##SUF##1 = sc##SUF * (float)((pk##SUF >> 4) & 0xFu) + zp##SUF; \
-    const float w##SUF##2 = sc##SUF * (float)((pk##SUF >> 8) & 0xFu) + zp##SUF; \
-    const float w##SUF##3 = sc##SUF * (float)((pk##SUF >> 12) & 0xFu) + zp##SUF; \
-    const float w##SUF##4 = sc##SUF * (float)((pk##SUF >> 16) & 0xFu) + zp##SUF; \
-    const float w##SUF##5 = sc##SUF * (float)((pk##SUF >> 20) & 0xFu) + zp##SUF; \
-    const float w##SUF##6 = sc##SUF * (float)((pk##SUF >> 24) & 0xFu) + zp##SUF; \
-    const float w##SUF##7 = sc##SUF * (float)((pk##SUF >> 28) & 0xFu) + zp##SUF
-
 __launch_bounds__(32, 2)
 extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r4(
     const unsigned long long* __restrict__ expert_weight_ptrs,
@@ -143,22 +119,21 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r4(
     const int boff = tid * 4;
     const int hoff = (tid < 16) ? 0 : 4;
 
-    int flat[HF_MQ4_O4_R4_SLOTS];
+    // Dead slots alias X_src row 0 so their loads are unconditional; their
+    // accumulation is still skipped, leaving the +0.0 the store owes.
+    bool live[HF_MQ4_O4_R4_SLOTS];
     const float* x_rows[HF_MQ4_O4_R4_SLOTS];
     bool any_live = false;
 #pragma unroll
     for (int slot = 0; slot < HF_MQ4_O4_R4_SLOTS; ++slot) {
         const int grouped_slot = slot_start + slot;
-        flat[slot] = (grouped_slot < grouped_rows)
+        const int flat = (grouped_slot < grouped_rows)
             ? sorted_slot_index[grouped_slot] : -1;
-        if (flat[slot] >= 0) {
-            const int x_row = (x_row_div > 1)
-                ? (flat[slot] / x_row_div) : flat[slot];
-            x_rows[slot] = X_src + (long long)x_row * K;
-            any_live = true;
-        } else {
-            x_rows[slot] = nullptr;
-        }
+        live[slot] = flat >= 0;
+        const int x_row = !live[slot] ? 0
+            : (x_row_div > 1) ? (flat / x_row_div) : flat;
+        x_rows[slot] = X_src + (long long)x_row * K;
+        any_live |= live[slot];
     }
 
     // With no live slot every weight word of this subtile is multiplied by
@@ -183,28 +158,67 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r4(
     float acc32[HF_MQ4_O4_R4_SLOTS] = {};
     float acc33[HF_MQ4_O4_R4_SLOTS] = {};
 
-    // Decode one weight row for each adjacent output, then consume each X
-    // scalar through all four rows before advancing to the next slot.  Keeping
-    // the x0..x7 locals in this scope expresses the exact one-load/four-consumer
-    // invariant without introducing an X tile or LDS staging.
-#define ACCUM_GROUP(G, A0, A1, A2, A3) do { \
-        HF_DECODE_ROW(G, row_ptr0, true, 0); \
-        HF_DECODE_ROW(G, row_ptr1, row1_valid, 1); \
-        HF_DECODE_ROW(G, row_ptr2, row2_valid, 2); \
-        HF_DECODE_ROW(G, row_ptr3, row3_valid, 3); \
-        const int base = (G) * 256 + tid * 8; \
+    // Software pipeline: group g+1's header/payload words and X vectors are
+    // loaded while group g is decoded and accumulated.  Values and the
+    // per-element expressions are the production ones.
+    const char* row_ptr[4] = {row_ptr0, row_ptr1, row_ptr2, row_ptr3};
+    const bool row_ok[4] = {true, row1_valid, row2_valid, row3_valid};
+    unsigned int nh[4], npk[4];
+    float4 nxa[HF_MQ4_O4_R4_SLOTS], nxb[HF_MQ4_O4_R4_SLOTS];
+#define LOAD_GROUP(G) do { \
+        _Pragma("unroll") \
+        for (int r = 0; r < 4; ++r) { \
+            const char* gp = row_ptr[r] + (long long)(G) * 136; \
+            nh[r] = row_ok[r] ? *(const unsigned int*)(gp + hoff) : 0u; \
+            npk[r] = row_ok[r] ? *(const unsigned int*)(gp + 8 + boff) : 0u; \
+        } \
+        const int nbase = (G) * 256 + tid * 8; \
         _Pragma("unroll") \
         for (int slot = 0; slot < HF_MQ4_O4_R4_SLOTS; ++slot) { \
-            const float* x = x_rows[slot]; \
-            if (x == nullptr) continue; \
-            const float x0 = x[base + 0]; \
-            const float x1 = x[base + 1]; \
-            const float x2 = x[base + 2]; \
-            const float x3 = x[base + 3]; \
-            const float x4 = x[base + 4]; \
-            const float x5 = x[base + 5]; \
-            const float x6 = x[base + 6]; \
-            const float x7 = x[base + 7]; \
+            nxa[slot] = *(const float4*)(x_rows[slot] + nbase); \
+            nxb[slot] = *(const float4*)(x_rows[slot] + nbase + 4); \
+        } \
+    } while (0)
+#define DECODE_ROW(SUF, R) \
+    const float sc##SUF = __half2float(__ushort_as_half( \
+        (unsigned short)(ch[R] & 0xFFFFu))); \
+    const float zp##SUF = __half2float(__ushort_as_half( \
+        (unsigned short)(ch[R] >> 16))); \
+    const unsigned int pk##SUF = cpk[R]; \
+    const float w##SUF##0 = sc##SUF * (float)((pk##SUF >> 0) & 0xFu) + zp##SUF; \
+    const float w##SUF##1 = sc##SUF * (float)((pk##SUF >> 4) & 0xFu) + zp##SUF; \
+    const float w##SUF##2 = sc##SUF * (float)((pk##SUF >> 8) & 0xFu) + zp##SUF; \
+    const float w##SUF##3 = sc##SUF * (float)((pk##SUF >> 12) & 0xFu) + zp##SUF; \
+    const float w##SUF##4 = sc##SUF * (float)((pk##SUF >> 16) & 0xFu) + zp##SUF; \
+    const float w##SUF##5 = sc##SUF * (float)((pk##SUF >> 20) & 0xFu) + zp##SUF; \
+    const float w##SUF##6 = sc##SUF * (float)((pk##SUF >> 24) & 0xFu) + zp##SUF; \
+    const float w##SUF##7 = sc##SUF * (float)((pk##SUF >> 28) & 0xFu) + zp##SUF
+#define ACCUM_GROUP(G, A0, A1, A2, A3) do { \
+        unsigned int ch[4], cpk[4]; \
+        float4 cxa[HF_MQ4_O4_R4_SLOTS], cxb[HF_MQ4_O4_R4_SLOTS]; \
+        _Pragma("unroll") \
+        for (int r = 0; r < 4; ++r) { ch[r] = nh[r]; cpk[r] = npk[r]; } \
+        _Pragma("unroll") \
+        for (int slot = 0; slot < HF_MQ4_O4_R4_SLOTS; ++slot) { \
+            cxa[slot] = nxa[slot]; \
+            cxb[slot] = nxb[slot]; \
+        } \
+        if ((G) + 1 < group_walk) LOAD_GROUP((G) + 1); \
+        DECODE_ROW(0, 0); \
+        DECODE_ROW(1, 1); \
+        DECODE_ROW(2, 2); \
+        DECODE_ROW(3, 3); \
+        _Pragma("unroll") \
+        for (int slot = 0; slot < HF_MQ4_O4_R4_SLOTS; ++slot) { \
+            if (!live[slot]) continue; \
+            const float x0 = cxa[slot].x; \
+            const float x1 = cxa[slot].y; \
+            const float x2 = cxa[slot].z; \
+            const float x3 = cxa[slot].w; \
+            const float x4 = cxb[slot].x; \
+            const float x5 = cxb[slot].y; \
+            const float x6 = cxb[slot].z; \
+            const float x7 = cxb[slot].w; \
             (A0)[slot] += w00 * x0 + w01 * x1 + w02 * x2 + w03 * x3 \
                 + w04 * x4 + w05 * x5 + w06 * x6 + w07 * x7; \
             (A1)[slot] += w10 * x0 + w11 * x1 + w12 * x2 + w13 * x3 \
@@ -216,6 +230,7 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r4(
         } \
     } while (0)
 
+    if (group_walk > 0) LOAD_GROUP(0);
     int g = 0;
     for (; g + 3 < group_walk; g += 4) {
         ACCUM_GROUP(g, acc00, acc10, acc20, acc30);
@@ -240,6 +255,8 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r4(
         }
     }
 #undef ACCUM_GROUP
+#undef DECODE_ROW
+#undef LOAD_GROUP
 
     float sum0[HF_MQ4_O4_R4_SLOTS];
     float sum1[HF_MQ4_O4_R4_SLOTS];
