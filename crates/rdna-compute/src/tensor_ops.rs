@@ -1886,8 +1886,14 @@ pub struct IndexedAttentionAttentionBatch<'a> {
 /// Query heads per workgroup in `indexed_attention_attention_f32_batched_hg4`.
 const QSA_ATTENTION_HG4_HEADS: usize = 4;
 
+/// Below this many rows the grouped kernel launches too few workgroups
+/// (`rows * n_heads / 4`) to fill the GPU and the per-head kernel is faster
+/// (decode: 0.48 vs 0.73 ms per call at 1131 context on gfx1151).
+const QSA_ATTENTION_HG4_MIN_ROWS: usize = 16;
+
 /// Dynamic LDS for the grouped kernel, or `None` when the shape is not the one
-/// it is specialised for (gfx1151, head_dim 256, four heads per KV group).
+/// it is specialised for (gfx1151, head_dim 256, four heads per KV group,
+/// prefill-sized row counts).
 fn qsa_attention_hg4_lds_bytes(
     gpu: &Gpu,
     p: &IndexedAttentionAttentionBatch<'_>,
@@ -1897,6 +1903,7 @@ fn qsa_attention_hg4_lds_bytes(
     if !gpu.arch_caps.is_gfx1151()
         || p.head_dim != 256
         || group % QSA_ATTENTION_HG4_HEADS != 0
+        || p.rows < QSA_ATTENTION_HG4_MIN_ROWS
     {
         return None;
     }
@@ -2854,7 +2861,7 @@ mod tests {
             return;
         }
         let (n_heads, n_kv_heads, head_dim, compress) = (24usize, 2usize, 256usize, 4usize);
-        let (rows, position_start, full_capacity) = (7usize, 150usize, 192usize);
+        let (rows, position_start, full_capacity) = (20usize, 150usize, 192usize);
         let budget_blocks = 30usize;
         let capacity = budget_blocks * compress + compress - 1;
         let lcg = |seed: usize, n: usize| -> Vec<f32> {

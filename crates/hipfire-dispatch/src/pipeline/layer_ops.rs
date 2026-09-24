@@ -817,19 +817,9 @@ pub fn execute_gated_delta_net(
         op.rows,
         Some(op.rotation),
     )?;
-    let bf16 = view(op.bf16_scratch, 0, op.output.m);
-    for row in 0..op.rows {
-        let output_row = view(&output_batch, row * op.output.m, op.output.m);
-        hip(bf16_roundtrip_f32(
-            gpu,
-            &Bf16Roundtrip {
-                input: &output_row,
-                scratch: &bf16,
-                output: &output_row,
-                elements: op.output.m,
-            },
-        ))?;
-    }
+    // One elementwise launch over all rows; identical to the per-row scratch
+    // round trip for every non-NaN value.
+    hip(gpu.bf16_round_trip_f32(&output_batch))?;
     Ok(())
 }
 
