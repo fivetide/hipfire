@@ -110,18 +110,17 @@ pub enum MoeRouteCapability {
 }
 
 impl MoeRouteCapability {
-    /// The complete source-bound QT44/QT53 route is currently admitted only
-    /// on gfx1151; availability of an individual portable helper does not
-    /// certify the other projections or grouped path on another device.
-    pub(crate) fn admitted_on(self, arch: &rdna_compute::arch_caps::ArchCaps) -> bool {
+    /// The source-bound QT44/QT53 route is admitted on any GPU when DeltaNet
+    /// is enabled; the fixed geometry and format contract is checked separately.
+    pub(crate) fn admitted_on(self) -> bool {
         match self {
-            Self::Qt44Qt53Grouped => arch.is_gfx1151() && cfg!(feature = "deltanet"),
+            Self::Qt44Qt53Grouped => cfg!(feature = "deltanet"),
         }
     }
 }
 
 /// Exact geometry and wire-format contract of the available grouped kernels.
-/// This does not by itself admit a GPU; call `admitted_on` as well.
+/// The route also requires `admitted_on` and live operands matching the policy.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn grouped_route_geometry_supported(
     policy: &MoeRoutePolicy,

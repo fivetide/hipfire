@@ -73,11 +73,10 @@ fn reject_mq4g128v2_moe(dtypes: &crate::families::moe::MoeDtypes<'_>) -> Result<
     Ok(())
 }
 /// Select only a route whose architecture-declared kernel contract matches
-/// the bound geometry, formats, sidecars, and actual device. A mismatched QT53
-/// route is rejected by the sealer rather than delegated to generic kernels.
+/// the bound geometry, formats, and sidecars. A mismatched QT53 route is
+/// rejected by the sealer rather than delegated to generic kernels.
 #[allow(clippy::too_many_arguments)]
 fn select_grouped_route(
-    ctx: &DispatchCtx,
     dtypes: &crate::families::moe::MoeDtypes<'_>,
     n_exp: usize,
     k_top: usize,
@@ -99,7 +98,7 @@ fn select_grouped_route(
     };
     match policy.capability {
         MoeRouteCapability::Qt44Qt53Grouped
-            if policy.capability.admitted_on(&ctx.arch)
+            if policy.capability.admitted_on()
                 && crate::families::moe::grouped_route_geometry_supported(
                     &policy,
                     n_exp,
@@ -206,7 +205,6 @@ mod qwen4_route_tests {
         down_k: usize,
     ) -> bool {
         select_grouped_route(
-            &DispatchCtx::for_test("gfx1151"),
             dtypes,
             n_exp,
             k_top,
@@ -254,9 +252,8 @@ mod qwen4_route_tests {
     }
 
     #[test]
-    fn qwen4_route_accepts_canonical_shared_down_q53() {
+    fn qwen4_route_rejects_q53_on_generic_moe() {
         let dtypes = canonical_dtypes();
-        assert_eq!(is_canonical_qwen4(&dtypes), cfg!(feature = "deltanet"));
         // The generic MoE gate remains a hard rejection; only the canonical
         // typed route may consume this shared-down q53 operand.
         assert!(matches!(
@@ -278,31 +275,29 @@ mod qwen4_route_tests {
     }
 
     #[test]
-    fn route_rejects_unadmitted_device_or_routed_awq() {
+    fn route_accepts_canonical_contract_and_rejects_sidecars_or_shape() {
         let dtypes = canonical_dtypes();
-        for arch in ["gfx1100", "gfx1201"] {
-            assert_eq!(
-                select_grouped_route(
-                    &DispatchCtx::for_test(arch),
-                    &dtypes,
-                    512,
-                    10,
-                    2560,
-                    640,
-                    640,
-                    2560,
-                    2560,
-                    640,
-                    None,
-                    false,
-                    Some(policy(DType::MQ4G128V2)),
-                ),
-                None,
-            );
-        }
+        // Admission is device-independent: gfx1100, gfx1201, and gfx1151
+        // select the same route when the feature and operands match.
         assert_eq!(
             select_grouped_route(
-                &DispatchCtx::for_test("gfx1151"),
+                &dtypes,
+                512,
+                10,
+                2560,
+                640,
+                640,
+                2560,
+                2560,
+                640,
+                None,
+                false,
+                Some(policy(DType::MQ4G128V2)),
+            ),
+            cfg!(feature = "deltanet").then_some(MoeRouteCapability::Qt44Qt53Grouped),
+        );
+        assert_eq!(
+            select_grouped_route(
                 &dtypes,
                 512,
                 10,
@@ -320,7 +315,6 @@ mod qwen4_route_tests {
         );
         assert_eq!(
             select_grouped_route(
-                &DispatchCtx::for_test("gfx1151"),
                 &dtypes,
                 512,
                 10,
@@ -343,7 +337,6 @@ mod qwen4_route_tests {
         let dtypes = canonical_dtypes();
         let accepts = |declared: MoeRoutePolicy, experts| {
             select_grouped_route(
-                &DispatchCtx::for_test("gfx1151"),
                 &dtypes,
                 experts,
                 10,
@@ -360,7 +353,6 @@ mod qwen4_route_tests {
             .is_some()
         };
         let declared = policy(DType::MQ4G128V2);
-        assert_eq!(accepts(declared, 512), cfg!(feature = "deltanet"));
 
         let mut unsupported_geometry = declared;
         unsupported_geometry.geometry.experts = 513;

@@ -156,7 +156,7 @@ pub fn project_weight(
         }
     };
     let x = rotated.as_ref().unwrap_or(input);
-    if weight.dtype == DType::MQ6G256V2 && (2..=4).contains(&rows) && gpu.arch_caps.is_gfx1151() {
+    if weight.dtype == DType::MQ6G256V2 && (2..=4).contains(&rows) {
         return hip(gpu.gemm_mq6g256v2_f32_rows(weight.buf, x, output, weight.m, weight.k, rows));
     }
     let result = match (weight.dtype, rows > 1) {

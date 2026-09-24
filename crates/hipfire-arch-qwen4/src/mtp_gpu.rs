@@ -1656,13 +1656,11 @@ mod tests {
     use crate::config::compact_test_config;
     use crate::state::{Qwen4State, StateError};
 
-    fn try_gfx1151_gpu() -> Option<Gpu> {
-        let gpu = Gpu::init().ok()?;
-        if !gpu.arch_caps.is_gfx1151() {
-            eprintln!("skip: Qwen4 MTP arena tests require gfx1151");
-            return None;
-        }
-        Some(gpu)
+    fn try_gpu() -> Option<Gpu> {
+        Gpu::init().ok().or_else(|| {
+            eprintln!("skip: Qwen4 MTP arena tests require a GPU");
+            None
+        })
     }
 
     fn new_compact_mtp_state(gpu: &mut Gpu) -> MtpGpuState {
@@ -1676,7 +1674,7 @@ mod tests {
 
     #[test]
     fn mtp_snapshot_arena_enforces_ticket_lifecycle_before_copy() {
-        let Some(mut gpu) = try_gfx1151_gpu() else {
+        let Some(mut gpu) = try_gpu() else {
             return;
         };
         let mut state = new_compact_mtp_state(&mut gpu);
@@ -1755,7 +1753,7 @@ mod tests {
 
     #[test]
     fn dual_owner_rollback_restores_after_injected_replay_error() {
-        let Some(mut gpu) = try_gfx1151_gpu() else {
+        let Some(mut gpu) = try_gpu() else {
             return;
         };
         let config = compact_test_config();

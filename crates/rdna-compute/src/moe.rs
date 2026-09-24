@@ -2293,8 +2293,8 @@ impl Gpu {
     }
 
     /// Qwen4 qt53 grouped prefill down. K is logical intermediate width and
-    /// may be non-multiple-of-128; the kernel uses the exact padded grouped
-    /// capacity supplied by the sealed preflight.
+    /// may be non-multiple-of-128; the F32 parity kernel uses the exact padded
+    /// grouped capacity supplied by the sealed preflight.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_mq4g128v2_moe_grouped_top10(
         &mut self,
@@ -2310,26 +2310,16 @@ impl Gpu {
         x_src_rows: usize,
         n_exp: usize,
     ) -> HipResult<()> {
-        let use_o4_r16 = self.arch_caps.is_gfx1151() && m == 2560 && k == 640;
-        let (func, source, block_x, grid_x) = if use_o4_r16 {
+        let (func, source, grid_x) = if self.arch_caps.is_gfx1151() && m == 2560 && k == 640 {
             (
                 "gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151",
                 kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O4_R16_GFX1151_SRC,
-                32,
                 m.div_ceil(4),
-            )
-        } else if self.arch_caps.is_gfx1151() {
-            (
-                "gemm_mq4g128v2_moe_grouped_top10_multirow_gfx1151",
-                kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_MULTIROW_GFX1151_SRC,
-                32,
-                m,
             )
         } else {
             (
-                "gemm_mq4g128v2_moe_grouped_top10",
-                kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_SRC,
-                256,
+                "gemm_mq4g128v2_moe_grouped_top10_multirow",
+                kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_MULTIROW_SRC,
                 m,
             )
         };
@@ -2364,7 +2354,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             func,
             [grid_x as u32, grouped_rows.div_ceil(16) as u32, 1],
-            [block_x, 1, 1],
+            [32, 1, 1],
             0,
             &mut params,
             || {

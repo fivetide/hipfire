@@ -110,6 +110,10 @@ registered by `hipfire-arch-qwen4/src/gpu_ops.rs`, while
 contracts. This is an implementation ownership map, not replay/PM4 admission,
 physical-EP proof, or a performance promotion.
 
+With `deltanet` enabled, the fixed-geometry QT44/QT53 route is admitted on
+any AMD GPU for matching wire formats and operands; gfx1151-specific kernel
+optimizations do not gate ordinary-HIP serving.
+
 ## Request lifecycle
 
 ```text

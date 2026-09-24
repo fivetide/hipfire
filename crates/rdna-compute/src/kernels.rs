@@ -2038,15 +2038,11 @@ pub const GEMM_MQ4G128V2_MULTIROW_GFX1151_SRC: &str =
 pub const GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded.hip");
 
-/// Qwen4 qt=53 grouped-prefill down consumer.  The grouped output remains
-/// unweighted and is folded by the sealed top-10 combine.
-pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_SRC: &str =
-    include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10.hip");
-/// gfx1151 parity companion for the qt53 grouped down consumer.  It preserves
-/// the indexed decode kernel's 32-lane reduction association while reusing one
+/// Portable F32 parity consumer for qt53 grouped down.  It preserves the
+/// indexed decode kernel's 32-lane reduction association while reusing one
 /// decoded same-expert weight across the sixteen grouped route slots.
-pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_MULTIROW_GFX1151_SRC: &str =
-    include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10_multirow.gfx1151.hip");
+pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_MULTIROW_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10_multirow.hip");
 /// gfx1151 exact-shape O4×R16 companion for the QT53 grouped down consumer.
 /// It handles four adjacent output rows per wave while preserving the
 /// production sibling's R16 slot mapping, decode arithmetic, padded-K
@@ -2848,16 +2844,16 @@ pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC: &str =
 /// weight half) where qt13 carries one f32 pair for all 256. Same 136 B stride,
 /// same nibble packing.
 ///
-/// Exists because qt44 previously had no MoE grouped-expert path at all, so a
-/// qt44 A3B MoE model failed prefill outright. gfx11 (RDNA3/3.5); the gfx12
+/// The gfx11 (RDNA3/3.5) WMMA kernel is retained for other grouped qt44 MoE
+/// callers; Qwen4 top-10 uses the F32 SIMT consumer instead. The gfx12 WMMA
 /// sister is `GEMM_MQ4G256V2_MOE_GROUPED_WMMA_GFX12_SRC`. No i8 MMQ variant.
 pub const GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_moe_grouped_wmma_k2.hip");
-/// gfx1151 parity companion for qt44 grouped gate/up.  It retains the indexed
-/// F32 dequant/reduction arithmetic and reuses each decoded lane across the
-/// sixteen same-expert route slots instead of staging X/accumulators through
-/// F16 WMMA.
-pub const GEMM_MQ4G256V2_MOE_GROUPED_TOP10_SIMT_GFX1151_SRC: &str =
+/// Portable F32 parity consumer for qt44 grouped gate/up.  It retains the
+/// indexed F32 dequant/reduction arithmetic and reuses each decoded lane
+/// across sixteen same-expert route slots instead of staging X/accumulators
+/// through F16 WMMA.
+pub const GEMM_MQ4G256V2_MOE_GROUPED_TOP10_SIMT_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_moe_grouped_top10_simt.hip");
 
 /// gfx12 (RDNA4) sister of `GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC`.

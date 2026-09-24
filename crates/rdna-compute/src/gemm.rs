@@ -15458,10 +15458,9 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        debug_assert!(
-            self.arch_caps.is_gfx1151(),
-            "dense E8-SoA WMMA is gfx1151-only"
-        );
+        if !self.arch_caps.is_gfx1151() {
+            return self.gemm_mfp4g32_e8_soa_gemv_rows(weight, x, y, m, k, batch_size);
+        }
         assert!(k % 256 == 0, "dense E8-SoA WMMA requires K%256==0");
         const KERNEL: &str = "gemm_mfp4g32_e8_soa_wmma_gfx1151";
         self.ensure_kernel(
@@ -15516,6 +15515,24 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    fn gemm_mfp4g32_e8_soa_gemv_rows(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        // ponytail: one GEMV launch per row; add a batched F32 kernel if prefill throughput matters.
+        for row in 0..batch_size {
+            let x_row = x.sub_offset(row * k, k);
+            let y_row = y.sub_offset(row * m, m);
+            self.gemv_mfp4g32_e8_soa_prerotated(weight, &x_row, &y_row, m, k)?;
+        }
+        Ok(())
     }
 
     /// Two-token-tile variant of [`Self::gemm_mfp4g32_e8_soa_wmma`].
@@ -34945,10 +34962,25 @@ impl Gpu {
             }
             return self.gemm_mq6g256v2_residual_wmma(a_raw, x, y, m, k, batch_size);
         }
-        Err(hip_bridge::HipError::new(
-            0,
-            "qt=47 gemm_mq6g256v2: requires WMMA (gfx1100/gfx1101/gfx1102/gfx1150/gfx1151/gfx1200/gfx1201); no GEMM_MQ6G256V2 scalar source exists. V2 bytes cannot be decoded by v1.",
-        ))
+        self.gemm_mq6g256v2_gemv_rows(a_raw, x, y, m, k, batch_size)
+    }
+
+    fn gemm_mq6g256v2_gemv_rows(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        // ponytail: one GEMV launch per row; add a batched F32 kernel if wide prefill needs it.
+        for row in 0..batch_size {
+            let x_row = x.sub_offset(row * k, k);
+            let y_row = y.sub_offset(row * m, m);
+            self.gemv_mq6g256v2(a_raw, &x_row, &y_row, m, k)?;
+        }
+        Ok(())
     }
 
     pub fn gemm_mq6g256v2_batched_lmhead(
@@ -38786,9 +38818,9 @@ impl Gpu {
              (GEMM_MQ4CG256_SRC missing) — would mis-decode MQ4C fp16-header groups as v1 f32 header",
         ))
     }
-    /// Qwen4 fixed top-10 grouped qt44 gate/up entry.  The grouped WMMA
-    /// contraction is independent of K_TOP; this wrapper seals the only
-    /// supported source-row divisor and keeps the old k=8 family unchanged.
+    /// Qwen4 fixed top-10 grouped qt44 gate/up entry.  Keep the indexed
+    /// decode kernel's F32 arithmetic for every GPU; only the gfx1151 exact
+    /// shape uses the bit-identical O4×R4 optimization.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_mq4g256v2_moe_grouped_top10(
         &mut self,
@@ -38801,7 +38833,7 @@ impl Gpu {
         k: usize,
         x_row_div: usize,
         grouped_rows: usize,
-        x_src_rows: usize,
+        _x_src_rows: usize,
     ) -> HipResult<()> {
         if x_row_div != 10 {
             return Err(hip_bridge::HipError::new(
@@ -38809,21 +38841,8 @@ impl Gpu {
                 "gemm_mq4g256v2_moe_grouped_top10: x_row_div must be sealed top-k=10",
             ));
         }
-        if self.arch_caps.is_gfx1151() {
-            if m == 1280 && k == 2560 {
-                return self.gemm_mq4g256v2_moe_grouped_top10_o4_r4_gfx1151(
-                    expert_weight_ptrs,
-                    expert_tile_ids,
-                    sorted_slot_index,
-                    x_src,
-                    y_grouped,
-                    m,
-                    k,
-                    x_row_div,
-                    grouped_rows,
-                );
-            }
-            return self.gemm_mq4g256v2_moe_grouped_top10_simt_gfx1151(
+        if self.arch_caps.is_gfx1151() && m == 1280 && k == 2560 {
+            return self.gemm_mq4g256v2_moe_grouped_top10_o4_r4_gfx1151(
                 expert_weight_ptrs,
                 expert_tile_ids,
                 sorted_slot_index,
@@ -38835,7 +38854,7 @@ impl Gpu {
                 grouped_rows,
             );
         }
-        self.gemm_mq4g256v2_moe_grouped_wmma_k2(
+        self.gemm_mq4g256v2_moe_grouped_top10_simt(
             expert_weight_ptrs,
             expert_tile_ids,
             sorted_slot_index,
@@ -38845,7 +38864,6 @@ impl Gpu {
             k,
             x_row_div,
             grouped_rows,
-            x_src_rows,
         )
     }
     /// gfx1151 exact-shape O4×R4 companion for the Qwen4 QT44 grouped gate/up
@@ -38922,11 +38940,11 @@ impl Gpu {
         result
     }
 
-    /// gfx1151 SIMT parity companion for the qt44 grouped gate/up path.  It
-    /// intentionally consumes F32 X directly and mirrors the indexed decode
+    /// F32 SIMT parity companion for the qt44 grouped gate/up path on every
+    /// GPU.  It consumes F32 X directly and mirrors the indexed decode
     /// reduction instead of entering the F16 WMMA arithmetic path.
     #[allow(clippy::too_many_arguments)]
-    fn gemm_mq4g256v2_moe_grouped_top10_simt_gfx1151(
+    fn gemm_mq4g256v2_moe_grouped_top10_simt(
         &mut self,
         expert_weight_ptrs: &GpuTensor,
         expert_tile_ids: &GpuTensor,
@@ -38942,7 +38960,7 @@ impl Gpu {
         const FUNC: &str = "gemm_mq4g256v2_moe_grouped_top10_simt";
         self.ensure_kernel(
             FUNC,
-            kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_SIMT_GFX1151_SRC,
+            kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_SIMT_SRC,
             FUNC,
         )?;
         let ep = expert_weight_ptrs.buf.as_ptr();
@@ -38998,6 +39016,180 @@ impl Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a GPU and working HIP toolchain"]
+    fn e8_soa_multirow_fallback_matches_independent_gemv_rows() {
+        const M: usize = 17;
+        const K: usize = 512;
+        const BATCH: usize = 3;
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("skip: no GPU ({error:?})");
+                return;
+            }
+        };
+
+        let blocks = K / 32;
+        let scale_bytes = blocks.div_ceil(16) * 16;
+        let row_bytes = 16 + scale_bytes + blocks * 16;
+        let mut packed = vec![0u8; M * row_bytes];
+        for row in 0..M {
+            let base = row * row_bytes;
+            packed[base..base + 2].copy_from_slice(&0x3000u16.to_le_bytes()); // f16 scale 1/8
+            packed[base + 4..base + 6].copy_from_slice(&(blocks as u16).to_le_bytes());
+            packed[base + 6] = 0x06; // E8 SoA
+            for block in 0..blocks {
+                packed[base + 16 + block] = 0x38 + (block % 5) as u8;
+                for slot in 0..4 {
+                    let word = ((row * 97 + block * 13 + slot * 17) as u32)
+                        .wrapping_mul(0x1020_3041)
+                        ^ 0x8abc_def0;
+                    let offset = base + 16 + scale_bytes + block * 16 + slot * 4;
+                    packed[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+                }
+            }
+        }
+        let weight = gpu
+            .upload_raw(&packed, &[packed.len()])
+            .expect("upload E8 SoA");
+        let input_bytes: Vec<u8> = (0..BATCH * K)
+            .flat_map(|i| {
+                let value = ((i * 37 + 11) % 173) as f32 - 86.0;
+                (value / 137.0).to_ne_bytes()
+            })
+            .collect();
+        let input = gpu
+            .alloc_tensor(&[BATCH * K], DType::F32)
+            .expect("alloc batch input");
+        gpu.hip
+            .memcpy_htod(&input.buf, &input_bytes)
+            .expect("upload batch input");
+        let output = gpu
+            .alloc_tensor(&[BATCH * M], DType::F32)
+            .expect("alloc batch output");
+        gpu.hip
+            .memset(&output.buf, 0x7f, output.byte_size())
+            .expect("poison batch output");
+
+        // Force the non-gfx1151 branch on the gfx1151 test host.
+        gpu.gemm_mfp4g32_e8_soa_gemv_rows(&weight, &input, &output, M, K, BATCH)
+            .expect("multirow fallback");
+
+        let mut expected = vec![0u8; BATCH * M * 4];
+        for row in 0..BATCH {
+            // Separate input/output allocations keep the reference independent
+            // of the fallback's row-offset calculation.
+            let x = gpu.alloc_tensor(&[K], DType::F32).expect("alloc row input");
+            gpu.hip
+                .memcpy_htod(&x.buf, &input_bytes[row * K * 4..(row + 1) * K * 4])
+                .expect("upload row input");
+            let y = gpu
+                .alloc_tensor(&[M], DType::F32)
+                .expect("alloc row output");
+            gpu.gemv_mfp4g32_e8_soa_prerotated(&weight, &x, &y, M, K)
+                .expect("single-row GEMV");
+            gpu.hip.device_synchronize().expect("row sync");
+            gpu.hip
+                .memcpy_dtoh(&mut expected[row * M * 4..(row + 1) * M * 4], &y.buf)
+                .expect("download row");
+        }
+        assert_ne!(&expected[..M * 4], &expected[M * 4..2 * M * 4]);
+
+        let mut actual = vec![0u8; expected.len()];
+        gpu.hip
+            .memcpy_dtoh(&mut actual, &output.buf)
+            .expect("download batch");
+        for (index, (got, want)) in actual
+            .chunks_exact(4)
+            .zip(expected.chunks_exact(4))
+            .enumerate()
+        {
+            assert_eq!(
+                u32::from_ne_bytes(got.try_into().unwrap()),
+                u32::from_ne_bytes(want.try_into().unwrap()),
+                "batch row {}, output {}",
+                index / M,
+                index % M
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU and working HIP toolchain"]
+    fn mq6_multirow_fallback_matches_independent_gemv_rows() {
+        const M: usize = 17;
+        const K: usize = 1280;
+        const BATCH: usize = 5;
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("skip: no GPU ({error:?})");
+                return;
+            }
+        };
+
+        let groups = K / 256;
+        let mut packed = vec![0u8; M * groups * 200];
+        for row in 0..M {
+            for group in 0..groups {
+                let base = (row * groups + group) * 200;
+                packed[base..base + 2].copy_from_slice(&0x3000u16.to_le_bytes());
+                packed[base + 2..base + 4].copy_from_slice(&0xb000u16.to_le_bytes());
+                packed[base + 4..base + 6].copy_from_slice(&0x2c00u16.to_le_bytes());
+                packed[base + 6..base + 8].copy_from_slice(&0xac00u16.to_le_bytes());
+                for byte in 0..192 {
+                    packed[base + 8 + byte] = (row * 17 + group * 29 + byte * 31) as u8;
+                }
+            }
+        }
+        let weight = gpu
+            .upload_raw(&packed, &[packed.len()])
+            .expect("upload MQ6");
+        let inputs: Vec<f32> = (0..BATCH * K)
+            .map(|i| (((i * 37 + 11) % 257) as f32 - 128.0) / 131.0)
+            .collect();
+        let input = gpu
+            .upload_f32(&inputs, &[BATCH * K])
+            .expect("upload batch input");
+        let output = gpu
+            .upload_f32(&vec![f32::NAN; BATCH * M], &[BATCH * M])
+            .expect("poison batch output");
+
+        // Force the no-WMMA path on this gfx1151 host; batch > 4 also covers
+        // rows outside the 2..=4 shared-weight F32 kernel.
+        gpu.gemm_mq6g256v2_gemv_rows(&weight, &input, &output, M, K, BATCH)
+            .expect("MQ6 multirow fallback");
+        let mut expected = Vec::with_capacity(BATCH * M);
+        for row in 0..BATCH {
+            let x = gpu
+                .upload_f32(&inputs[row * K..(row + 1) * K], &[K])
+                .expect("upload independent row");
+            let y = gpu.zeros(&[M], DType::F32).expect("alloc row output");
+            gpu.gemv_mq6g256v2(&weight, &x, &y, M, K)
+                .expect("MQ6 single-row GEMV");
+            gpu.hip.device_synchronize().expect("row sync");
+            expected.extend(
+                gpu.download_f32(&y)
+                    .expect("download independent row")
+                    .into_iter()
+                    .map(f32::to_bits),
+            );
+        }
+        assert_ne!(&expected[..M], &expected[M..2 * M]);
+
+        let actual = gpu.download_f32(&output).expect("download batch");
+        for (index, (got, want)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                *want,
+                "batch row {}, output {}",
+                index / M,
+                index % M
+            );
+        }
+    }
 
     #[test]
     fn residual_kill_switch_dominates_ldsstage_and_ksplit() {

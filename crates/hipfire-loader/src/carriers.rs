@@ -209,7 +209,7 @@ impl Carrier for Qwen2Carrier {
 
 /// Executable local-path Qwen4 carrier.  Distribution/product admission stays
 /// outside this registry; this route only makes an already admitted HFQM
-/// artifact loadable on its one supported gfx1151 device.
+/// artifact loadable.
 fn qwen4_use_range_payload(
     is_uma: bool,
     residency: hipfire_runtime::weight_manifest::WeightResidency,

@@ -1138,13 +1138,11 @@ impl std::error::Error for StateError {}
 mod tests {
     use super::*;
 
-    fn try_gfx1151_gpu() -> Option<Gpu> {
-        let gpu = Gpu::init().ok()?;
-        if !gpu.arch_caps.is_gfx1151() {
-            eprintln!("skip: Qwen4 state arena tests require gfx1151");
-            return None;
-        }
-        Some(gpu)
+    fn try_gpu() -> Option<Gpu> {
+        Gpu::init().ok().or_else(|| {
+            eprintln!("skip: Qwen4 state arena tests require a GPU");
+            None
+        })
     }
 
     fn new_compact_state(gpu: &mut Gpu) -> Qwen4State {
@@ -1154,7 +1152,7 @@ mod tests {
 
     #[test]
     fn snapshot_arena_enforces_ticket_lifecycle_before_copy() {
-        let Some(mut gpu) = try_gfx1151_gpu() else {
+        let Some(mut gpu) = try_gpu() else {
             return;
         };
         let mut state = new_compact_state(&mut gpu);
@@ -1234,7 +1232,7 @@ mod tests {
 
     #[test]
     fn snapshot_arena_restores_device_state_and_marks() {
-        let Some(mut gpu) = try_gfx1151_gpu() else {
+        let Some(mut gpu) = try_gpu() else {
             return;
         };
         let mut state = new_compact_state(&mut gpu);

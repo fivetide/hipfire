@@ -2,12 +2,12 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — QT44 grouped top-10 gate/up with F32 scalar parity.
 //
-// This is the parity path for gfx1151.  It keeps the indexed decode kernel's
-// F32 input, MQ4G256V2 dequantization, four-accumulator lane traversal, and
-// wave32 reduction while reusing one decoded weight row across 16 routed
-// slots belonging to the same expert tile.  The WMMA path remains available
-// to non-gfx1151 callers, but its F16 staging/accumulation is not the source
-// arithmetic for this Qwen4 parity route.
+// This is the F32 parity path on every GPU other than the gfx1151 exact-shape
+// optimization.  It keeps the indexed decode kernel's F32 input, MQ4G256V2
+// dequantization, four-accumulator lane traversal, and 32-lane shuffle
+// reduction while reusing one decoded weight row across 16 routed slots of
+// the same expert tile. Other grouped qt44 MoE callers may still use WMMA,
+// whose F16 staging/accumulation is not the Qwen4 source arithmetic.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>

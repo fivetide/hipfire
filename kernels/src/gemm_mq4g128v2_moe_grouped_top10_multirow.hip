@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
-// hipfire — gfx1151 QT53 grouped top-10 down with same-expert slot weight reuse.
+// hipfire — QT53 grouped top-10 down with same-expert slot weight reuse.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
-// gfx1151-only multirow sibling of gemm_mq4g128v2_moe_grouped_top10.
+// Portable F32 parity consumer for grouped qt53 down.
 //
 // The arithmetic deliberately follows
 // gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded: all 32 lanes own
@@ -18,10 +18,9 @@
 // The logical K tail, group padding, slot sentinel handling, and output layout
 // are unchanged from both consumers.  Y_grouped remains unweighted; sealed
 // combine applies route weights exactly once.
-#if defined(__gfx1151__)
 
 __launch_bounds__(32, 8)
-extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_multirow_gfx1151(
+extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_multirow(
     const unsigned long long* __restrict__ expert_ptrs,
     const int* __restrict__ expert_tile_ids,
     const int* __restrict__ sorted_slot_index,
@@ -119,4 +118,3 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_multirow_gfx1151(
     }
 }
 
-#endif

@@ -1217,7 +1217,6 @@ pub(super) fn select_decode(
         && !params.defer_routed_combine)
         .then(|| {
             super::select_grouped_route(
-                ctx,
                 &params.dtypes,
                 params.n_exp,
                 params.k,
@@ -1428,7 +1427,6 @@ pub(super) fn select_prefill(
         ))
     .then(|| {
         super::select_grouped_route(
-            ctx,
             &params.dtypes,
             params.n_exp,
             params.k_top,
