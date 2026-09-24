@@ -782,7 +782,9 @@ extern "C" __global__ void gated_delta_gate_bf16_f32(
     (void)width;
 }
 // Row-batched gated RMSNorm. The recurrent output is rounded in place before
-// the norm reduction, matching the scalar BF16 boundary.
+// the norm reduction, matching the scalar BF16 boundary.  The rounded head is
+// staged in LDS so every channel's (identical, serial) sum reads LDS instead
+// of re-fetching the head from global memory.
 extern "C" __global__ void gated_delta_gate_bf16_f32_batched(
     float* recurrent,
     const float* z,
@@ -799,22 +801,24 @@ extern "C" __global__ void gated_delta_gate_bf16_f32_batched(
     const int head = flat_head % value_heads;
     const int width = value_heads * value_dim;
     const int start = row * width + head * value_dim;
+    __shared__ float rounded[128];
 
     if (channel < value_dim) {
-        recurrent[start + channel] =
-            bf16_to_f32(bf16_round(recurrent[start + channel]));
+        const float value = bf16_to_f32(bf16_round(recurrent[start + channel]));
+        rounded[channel] = value;
+        recurrent[start + channel] = value;
     }
     __syncthreads();
     if (channel >= value_dim) return;
 
     float sum = 0.0f;
     for (int i = 0; i < value_dim; ++i) {
-        const float value = bf16_to_f32(bf16_round(recurrent[start + i]));
+        const float value = bf16_to_f32(bf16_round(rounded[i]));
         sum += value * value;
     }
     const float inv = rsqrtf(sum / (float)value_dim + 1.0e-6f);
     const float normalized = bf16_to_f32(bf16_round(
-        recurrent[start + channel] * inv * bf16_to_f32(norm[channel])));
+        rounded[channel] * inv * bf16_to_f32(norm[channel])));
     const float gate = bf16_to_f32(bf16_round(z[start + channel]));
     output[start + channel] = bf16_to_f32(bf16_round(
         normalized / (1.0f + expf(-gate))));

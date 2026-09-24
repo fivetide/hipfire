@@ -1022,7 +1022,7 @@ pub fn gated_delta_gate_batched(gpu: &mut Gpu, p: &GatedDeltaGateBatched<'_>) ->
     gpu.launch_blob_recorded(
         "gated_delta_gate_bf16_f32_batched",
         [value_heads_grid, value_dim_grid, 1],
-        [256, 1, 1],
+        [128, 1, 1],
         0,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
@@ -2201,6 +2201,81 @@ mod tests {
 
     fn try_gpu() -> Option<Gpu> {
         Gpu::init().ok()
+    }
+
+    /// The batched gated RMSNorm (with its folded BF16 recurrent rounding)
+    /// must equal round-trip + per-row gate bit for bit, for both the gated
+    /// output and the in-place rounded recurrent buffer.
+    #[test]
+    fn gdn_gate_batch_is_bit_identical_to_per_row_gate() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let (rows, heads, dim) = (5usize, 6usize, 128usize);
+        let width = heads * dim;
+        let wave = |seed: usize, n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let h = i.wrapping_mul(2_654_435_761).wrapping_add(seed * 131) % 8191;
+                    (h as f32 - 4095.0) / 4095.0 * scale
+                })
+                .collect()
+        };
+        let recurrent = wave(1, rows * width, 3.0);
+        let z = wave(2, rows * width, 4.0);
+        let norm_bits: Vec<u8> = wave(3, dim, 1.0)
+            .iter()
+            .flat_map(|v| ((v.to_bits() >> 16) as u16 + 0x3f00).to_le_bytes())
+            .collect();
+        let mut norm = gpu.upload_raw(&norm_bits, &[norm_bits.len()]).expect("norm");
+        norm.dtype = DType::BF16;
+        norm.shape = vec![dim];
+        let z_gpu = gpu.upload_f32(&z, &[z.len()]).expect("z");
+
+        let rec_a = gpu.upload_f32(&recurrent, &[recurrent.len()]).expect("rec");
+        let out_a = gpu.zeros(&[rows * width], DType::F32).expect("out");
+        gated_delta_gate_batched(
+            &mut gpu,
+            &GatedDeltaGateBatched {
+                recurrent_output: &rec_a,
+                z: &z_gpu,
+                norm: &norm,
+                output: &out_a,
+                rows,
+                value_heads: heads,
+                value_dim: dim,
+            },
+        )
+        .expect("batched gate");
+
+        let rec_b = gpu.upload_f32(&recurrent, &[recurrent.len()]).expect("rec");
+        let out_b = gpu.zeros(&[rows * width], DType::F32).expect("out");
+        gpu.bf16_round_trip_f32(&rec_b).expect("round trip");
+        for row in 0..rows {
+            gated_delta_gate(
+                &mut gpu,
+                &GatedDeltaGate {
+                    recurrent_output: &rec_b.sub_offset(row * width, width),
+                    z: &z_gpu.sub_offset(row * width, width),
+                    norm: &norm,
+                    output: &out_b.sub_offset(row * width, width),
+                    value_heads: heads,
+                    value_dim: dim,
+                },
+            )
+            .expect("per-row gate");
+        }
+        let bits = |gpu: &Gpu, t: &GpuTensor| -> Vec<u32> {
+            gpu.download_f32(t).expect("download").iter().map(|v| v.to_bits()).collect()
+        };
+        let (a, b) = (bits(&gpu, &out_a), bits(&gpu, &out_b));
+        assert!(a.iter().any(|v| *v != 0), "gate output is all zero");
+        assert_eq!(a, b, "batched gate output differs");
+        assert_eq!(bits(&gpu, &rec_a), bits(&gpu, &rec_b), "rounded recurrent differs");
+        for tensor in [norm, z_gpu, rec_a, out_a, rec_b, out_b] {
+            gpu.free_tensor(tensor).expect("free");
+        }
     }
 
     /// The persistent row-batched GDN recurrence must equal the per-row step
