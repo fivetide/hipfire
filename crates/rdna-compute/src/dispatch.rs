@@ -4186,7 +4186,10 @@ impl Gpu {
             blob.push_i32(n_i32);
             blob
         };
-        let grid = (n as u32).div_ceil(256) * 256;
+        // Grid is in workgroups: one 256-thread block per 256 elements.  (It
+        // used to be the element count rounded up, i.e. 256x too many blocks,
+        // whose `blockIdx.x * blockDim.x` overflowed i32 past 2^31 threads.)
+        let grid = (n as u32).div_ceil(256);
         self.launch_maybe_blob(
             "copy_f32_buffer",
             [grid, 1, 1],
@@ -4247,7 +4250,7 @@ impl Gpu {
         let total = rows
             .checked_mul(row_elems)
             .ok_or_else(|| HipError::new(0, "copy_f32_strided_slot_buffer size overflow"))?;
-        let grid = (total as u32).div_ceil(256) * 256;
+        let grid = (total as u32).div_ceil(256);
         self.launch_maybe_blob(
             "copy_f32_strided_slot_buffer",
             [grid, 1, 1],
@@ -5689,6 +5692,27 @@ mod tests {
 
     fn try_gpu() -> Option<super::Gpu> {
         super::Gpu::init().ok()
+    }
+
+    /// A copy longer than 2^31 / 256 elements used to launch one block per
+    /// element; `blockIdx.x * blockDim.x` then overflowed i32 and the kernel
+    /// wrote before the destination (GPU page fault at 1024-row Qwen4 PLE).
+    #[test]
+    fn copy_f32_buffer_handles_more_than_8m_elements() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let n = 9 * 1024 * 1024 + 7;
+        let src: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let src_gpu = gpu.upload_f32(&src, &[n]).expect("src upload");
+        let dst_gpu = gpu.zeros(&[n + 64], super::DType::F32).expect("dst");
+        let dst_view = dst_gpu.sub_offset(32, n);
+        gpu.copy_f32_buffer(&dst_view, &src_gpu, n).expect("copy");
+        let out = gpu.download_f32(&dst_gpu).expect("download");
+        assert!(out[..32].iter().all(|v| *v == 0.0), "copy wrote before dst");
+        assert!(out[32 + n..].iter().all(|v| *v == 0.0), "copy wrote past dst");
+        assert!(out[32..32 + n].iter().zip(&src).all(|(a, b)| a == b), "copy mismatch");
     }
 
     #[test]
