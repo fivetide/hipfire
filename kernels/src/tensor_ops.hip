@@ -1389,6 +1389,139 @@ extern "C" __global__ void indexed_attention_attention_f32_batched(
         denominator > 0.0f ? numerator / denominator / (1.0f + expf(-gate)) : 0.0f;
 }
 
+// Bitwise-equal to indexed_attention_attention_f32_batched_serial for
+// head_dim == 256: every score is the same serial d-order dot and every
+// softmax sum runs in selected-row order per channel. One workgroup owns four
+// query heads of one KV group, so each key/value row is fetched once for all
+// four; keys are staged through a padded LDS tile for coalesced reads and
+// expf runs once per (head, token) instead of once per channel.
+#define QSA_HG 4
+#define QSA_TT 64
+#define QSA_DC 64
+#define QSA_HD 256
+extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f32_batched_hg4(
+    const float* q_with_gate,
+    const float* full_keys,
+    const float* full_values,
+    const int* selected_indices,
+    float* output,
+    int rows,
+    int position_start,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int budget_blocks,
+    int compress,
+    int capacity,
+    int full_capacity) {
+    int row = (int)blockIdx.z;
+    if (row >= rows) return;
+    int visible = position_start + row + 1;
+    int block_count = visible / compress;
+    int chosen = budget_blocks < block_count ? budget_blocks : block_count;
+    int selected_len = chosen * compress + visible - block_count * compress;
+    if (selected_len > capacity) selected_len = capacity;
+    extern __shared__ float lds[];
+    float* weights = lds;                              // [QSA_HG][selected_len]
+    float* qs = weights + QSA_HG * selected_len;       // [QSA_HG][QSA_HD]
+    float* kt = qs + QSA_HG * QSA_HD;                  // [QSA_TT][QSA_DC + 1]
+    float* maxes = kt + QSA_TT * (QSA_DC + 1);         // [QSA_HG]
+    int* tokens = reinterpret_cast<int*>(maxes + QSA_HG);  // [selected_len]
+    int tid = (int)threadIdx.x;
+    int head0 = (int)blockIdx.x * QSA_HG;
+    int kv_head = head0 / (n_heads / n_kv_heads);
+    int kv_stride = n_kv_heads * QSA_HD;
+    const float* keys = full_keys + kv_head * QSA_HD;
+    const float* values = full_values + kv_head * QSA_HD;
+    const int* row_selected = selected_indices + row * capacity;
+    int q_row = row * 2 * n_heads * QSA_HD;
+    for (int i = tid; i < selected_len; i += 256) {
+        int token = row_selected[i];
+        tokens[i] = (token >= 0 && token < full_capacity && token < visible) ? token : -1;
+    }
+    for (int i = tid; i < QSA_HG * QSA_HD; i += 256) {
+        qs[i] = q_with_gate[q_row + (head0 + i / QSA_HD) * QSA_HD * 2 + i % QSA_HD];
+    }
+    __syncthreads();
+
+    int my_h = tid / QSA_TT;
+    int my_t = tid % QSA_TT;
+    const float* my_q = qs + my_h * QSA_HD;
+    const float* my_k = kt + my_t * (QSA_DC + 1);
+    float partial_max = -3.402823466e+38f;
+    for (int base = 0; base < selected_len; base += QSA_TT) {
+        float score = 0.0f;
+        for (int d0 = 0; d0 < QSA_HD; d0 += QSA_DC) {
+            for (int e = tid; e < QSA_TT * QSA_DC; e += 256) {
+                int t = e / QSA_DC;
+                int dd = e % QSA_DC;
+                int token = base + t < selected_len ? tokens[base + t] : -1;
+                kt[t * (QSA_DC + 1) + dd] =
+                    token >= 0 ? keys[token * kv_stride + d0 + dd] : 0.0f;
+            }
+            __syncthreads();
+            for (int dd = 0; dd < QSA_DC; ++dd) {
+                score += my_q[d0 + dd] * my_k[dd];
+            }
+            __syncthreads();
+        }
+        int index = base + my_t;
+        if (index < selected_len) {
+            score /= sqrtf((float)QSA_HD);
+            weights[my_h * selected_len + index] = score;
+            if (tokens[index] >= 0) partial_max = fmaxf(partial_max, score);
+        }
+    }
+    // fmaxf is exact and order-independent, so the tree matches the serial scan.
+    kt[tid] = partial_max;
+    __syncthreads();
+    if (tid < QSA_HG) {
+        float head_max = -3.402823466e+38f;
+        for (int i = 0; i < QSA_TT; ++i) head_max = fmaxf(head_max, kt[tid * QSA_TT + i]);
+        maxes[tid] = head_max;
+    }
+    __syncthreads();
+    for (int i = tid; i < QSA_HG * selected_len; i += 256) {
+        int index = i % selected_len;
+        if (tokens[index] >= 0) weights[i] = expf(weights[i] - maxes[i / selected_len]);
+    }
+    __syncthreads();
+
+    int channel = tid;
+    float denominator[QSA_HG];
+    float numerator[QSA_HG];
+#pragma unroll
+    for (int h = 0; h < QSA_HG; ++h) {
+        denominator[h] = 0.0f;
+        numerator[h] = 0.0f;
+    }
+#pragma unroll 4
+    for (int i = 0; i < selected_len; ++i) {
+        int token = tokens[i];
+        float value = values[(token < 0 ? 0 : token) * kv_stride + channel];
+        if (token >= 0) {
+#pragma unroll
+            for (int h = 0; h < QSA_HG; ++h) {
+                float weight = weights[h * selected_len + i];
+                denominator[h] += weight;
+                numerator[h] += weight * value;
+            }
+        }
+    }
+#pragma unroll
+    for (int h = 0; h < QSA_HG; ++h) {
+        int head = head0 + h;
+        float gate = q_with_gate[q_row + head * QSA_HD * 2 + QSA_HD + channel];
+        output[row * n_heads * QSA_HD + head * QSA_HD + channel] = denominator[h] > 0.0f
+            ? numerator[h] / denominator[h] / (1.0f + expf(-gate))
+            : 0.0f;
+    }
+}
+#undef QSA_HG
+#undef QSA_TT
+#undef QSA_DC
+#undef QSA_HD
+
 extern "C" __global__ void indexed_attention_attention_f32_serial(
     const float* q_with_gate,
     const float* full_keys,

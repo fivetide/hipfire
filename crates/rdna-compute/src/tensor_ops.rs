@@ -1878,14 +1878,46 @@ pub struct IndexedAttentionAttentionBatch<'a> {
     /// selected-row capacity (`>= max_selected`); a caller without a capacity
     /// passes the position-derived length. Must be `>= max_selected`.
     ///
-    /// `grid.x` must stay exactly `n_heads` in either case: the batched kernel
-    /// reads `blockIdx.x` before its head mask.
+    /// `grid.x` is derived from `n_heads` only (all heads, or head groups of
+    /// four for the grouped kernel), so it stays position-independent.
     pub shape_selected: usize,
+}
+
+/// Query heads per workgroup in `indexed_attention_attention_f32_batched_hg4`.
+const QSA_ATTENTION_HG4_HEADS: usize = 4;
+
+/// Dynamic LDS for the grouped kernel, or `None` when the shape is not the one
+/// it is specialised for (gfx1151, head_dim 256, four heads per KV group).
+fn qsa_attention_hg4_lds_bytes(
+    gpu: &Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+    shape_selected: usize,
+) -> Option<u32> {
+    let group = p.n_heads / p.n_kv_heads;
+    if !gpu.arch_caps.is_gfx1151()
+        || p.head_dim != 256
+        || group % QSA_ATTENTION_HG4_HEADS != 0
+    {
+        return None;
+    }
+    // weights[4][sel] + tokens[sel] + q[4][256] + key tile[64][65] + maxes[4].
+    let bytes = shape_selected
+        .checked_mul(4 * QSA_ATTENTION_HG4_HEADS + 4)?
+        .checked_add(4 * (QSA_ATTENTION_HG4_HEADS * 256 + 64 * 65 + QSA_ATTENTION_HG4_HEADS))?;
+    (bytes <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES).then_some(bytes as u32)
 }
 
 pub fn indexed_attention_attention_batch(
     gpu: &mut Gpu,
     p: &IndexedAttentionAttentionBatch<'_>,
+) -> HipResult<()> {
+    indexed_attention_attention_batch_impl(gpu, p, true)
+}
+
+fn indexed_attention_attention_batch_impl(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+    allow_hg4: bool,
 ) -> HipResult<()> {
     for tensor in [p.q_with_gate, p.full_keys, p.full_values, p.output] {
         ensure_f32(tensor)?;
@@ -1962,10 +1994,24 @@ pub fn indexed_attention_attention_batch(
     let compress = checked_i32(p.compress, "QSA batch attention compress")?;
     let capacity = checked_i32(p.capacity, "QSA batch attention capacity")?;
     let full_capacity = checked_i32(p.full_capacity, "QSA batch attention cache capacity")?;
-    let head_grid = checked_u32(p.n_heads, "QSA batch attention head grid")?;
-    let dim_grid = blocks(p.head_dim)?;
     let row_grid = checked_u32(p.rows, "QSA batch attention row grid")?;
-    let (kernel_name, block, shared_mem) =
+    let hg4_bytes = allow_hg4
+        .then(|| qsa_attention_hg4_lds_bytes(gpu, p, shape_selected))
+        .flatten();
+    let (kernel_name, grid, shared_mem) = if let Some(bytes) = hg4_bytes
+    {
+        (
+            "indexed_attention_attention_f32_batched_hg4",
+            [
+                checked_u32(p.n_heads / QSA_ATTENTION_HG4_HEADS, "QSA batch attention head grid")?,
+                1,
+                row_grid,
+            ],
+            bytes,
+        )
+    } else {
+        let head_grid = checked_u32(p.n_heads, "QSA batch attention head grid")?;
+        let dim_grid = blocks(p.head_dim)?;
         match shape_selected.checked_mul(QSA_ATTENTION_LDS_BYTES_PER_ROW) {
             Some(bytes)
                 if gpu.arch_caps.is_gfx1151()
@@ -1975,16 +2021,18 @@ pub fn indexed_attention_attention_batch(
             {
                 (
                     "indexed_attention_attention_f32_batched",
-                    [QSA_ATTENTION_PARALLEL_THREADS, 1, 1],
+                    [head_grid, dim_grid, row_grid],
                     bytes as u32,
                 )
             }
             _ => (
                 "indexed_attention_attention_f32_batched_serial",
-                [QSA_ATTENTION_PARALLEL_THREADS, 1, 1],
+                [head_grid, dim_grid, row_grid],
                 0,
             ),
-        };
+        }
+    };
+    let block = [QSA_ATTENTION_PARALLEL_THREADS, 1, 1];
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel_name)?;
     let mut args = KernargBlob::new();
     for tensor in [
@@ -2019,7 +2067,7 @@ pub fn indexed_attention_attention_batch(
     }];
     gpu.launch_blob_recorded(
         kernel_name,
-        [head_grid, dim_grid, row_grid],
+        grid,
         block,
         shared_mem,
         args.as_mut_slice(),
@@ -2789,6 +2837,104 @@ mod tests {
         gpu.free_tensor(full_keys_gpu).expect("free keys");
         gpu.free_tensor(full_values_gpu).expect("free values");
         gpu.free_tensor(selected_gpu).expect("free selected");
+    }
+
+    /// The grouped QSA attention kernel must equal the per-head batched kernel
+    /// bit for bit at the production shape (24 heads, 2 KV heads, head_dim
+    /// 256): permuted selections, invalid slots, a partial key tile and
+    /// rows with and without a tail all included.
+    #[test]
+    fn qsa_attention_hg4_is_bit_identical_to_per_head_kernel() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1151() {
+            eprintln!("skip: grouped QSA attention is gfx1151-only");
+            return;
+        }
+        let (n_heads, n_kv_heads, head_dim, compress) = (24usize, 2usize, 256usize, 4usize);
+        let (rows, position_start, full_capacity) = (7usize, 150usize, 192usize);
+        let budget_blocks = 30usize;
+        let capacity = budget_blocks * compress + compress - 1;
+        let lcg = |seed: usize, n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i.wrapping_mul(2_654_435_761).wrapping_add(seed) % 2003) as f32 - 1001.0) / 997.0)
+                .collect()
+        };
+        let q = lcg(1, rows * n_heads * 2 * head_dim);
+        let keys = lcg(7, full_capacity * n_kv_heads * head_dim);
+        let values = lcg(13, full_capacity * n_kv_heads * head_dim);
+        let mut selected = vec![-1i32; rows * capacity];
+        for row in 0..rows {
+            let visible = position_start + row + 1;
+            let blocks = visible / compress;
+            let chosen = budget_blocks.min(blocks);
+            // Descending-stride block choice, then the tail, as the selector emits.
+            for slot in 0..chosen {
+                let block = (blocks - 1 - (slot * 7 + row) % blocks) as i32;
+                for r in 0..compress {
+                    selected[row * capacity + slot * compress + r] = block * compress as i32 + r as i32;
+                }
+            }
+            let mut offset = chosen * compress;
+            for token in blocks * compress..visible {
+                selected[row * capacity + offset] = token as i32;
+                offset += 1;
+            }
+            // An invalid slot inside the active length must be skipped.
+            selected[row * capacity + 3] = -1;
+        }
+        let q_gpu = gpu.upload_f32(&q, &[q.len()]).expect("q upload");
+        let keys_gpu = gpu.upload_f32(&keys, &[keys.len()]).expect("keys upload");
+        let values_gpu = gpu.upload_f32(&values, &[values.len()]).expect("values upload");
+        let selected_gpu = gpu
+            .zeros(&[selected.len() * std::mem::size_of::<i32>()], DType::Raw)
+            .expect("selected allocation");
+        let bytes = selected.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<_>>();
+        gpu.hip.memcpy_htod(&selected_gpu.buf, &bytes).expect("selected upload");
+        let run = |gpu: &mut Gpu, allow_hg4: bool| {
+            let output = gpu
+                .zeros(&[rows * n_heads * head_dim], DType::F32)
+                .expect("output allocation");
+            indexed_attention_attention_batch_impl(
+                gpu,
+                &IndexedAttentionAttentionBatch {
+                    q_with_gate: &q_gpu,
+                    full_keys: &keys_gpu,
+                    full_values: &values_gpu,
+                    selected: &selected_gpu,
+                    output: &output,
+                    rows,
+                    position_start,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    budget_blocks,
+                    compress,
+                    capacity,
+                    full_capacity,
+                    shape_selected: capacity,
+                },
+                allow_hg4,
+            )
+            .expect("QSA attention");
+            let values = gpu.download_f32(&output).expect("output download");
+            gpu.free_tensor(output).expect("free output");
+            values
+        };
+        let reference = run(&mut gpu, false);
+        let grouped = run(&mut gpu, true);
+        assert!(reference.iter().any(|v| *v != 0.0), "reference output is all zero");
+        let differing = reference
+            .iter()
+            .zip(&grouped)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(differing, 0, "grouped QSA attention differs in {differing} cells");
+        for tensor in [q_gpu, keys_gpu, values_gpu, selected_gpu] {
+            gpu.free_tensor(tensor).expect("free");
+        }
     }
 
     struct SelectCase {
