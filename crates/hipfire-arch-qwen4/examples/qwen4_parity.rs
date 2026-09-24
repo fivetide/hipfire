@@ -1661,7 +1661,10 @@ fn run_gdn(
         "GDN output norm vs source",
     )?;
     let z = required(arrays, "z_output_gate")?;
-    let norm_bf16 = upload_bf16(gpu, &norm_weight, &[value_dim])?;
+    // The oracle's gate norm weight is 1.0. `grouped_norm_f32` above is
+    // zero-centered (zeros mean 1), but the gate kernel applies its weight
+    // directly, as production does with the checkpoint's `linear_attn.norm`.
+    let norm_bf16 = upload_bf16(gpu, &vec![1.0f32; value_dim], &[value_dim])?;
     let mut gated_output = Vec::with_capacity(whole.len());
     for token in 0..tokens {
         let recurrent = gpu

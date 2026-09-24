@@ -24,6 +24,7 @@ import platform
 import re
 import errno
 import socket
+import shutil
 import struct
 import subprocess
 import sys
@@ -2462,7 +2463,13 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
     candidate_core_norm_torch = candidate_core_norm_storage.float()
     z_torch = torch.randn(tokens, value_heads * vdim, dtype=torch.float32) * 0.4
     source_output_gate_torch = source_core_norm_torch.reshape(tokens, value_heads * vdim) * torch.sigmoid(z_torch)
-    candidate_output_gate_torch = candidate_core_norm_torch.reshape(tokens, value_heads * vdim) * torch.sigmoid(z_torch)
+    # Kernel contract (gated_delta_gate_bf16_f32): z is rounded to BF16, the
+    # sigmoid is 1/(1+exp(-z)) in F32, and the gated output is rounded to BF16.
+    candidate_z_torch = z_torch.to(torch.bfloat16).float()
+    candidate_output_gate_torch = (
+        candidate_core_norm_torch.reshape(tokens, value_heads * vdim)
+        / (1.0 + torch.exp(-candidate_z_torch))
+    ).to(torch.bfloat16).float()
     out_proj_torch = torch.randn(8, value_heads * vdim, dtype=torch.float32) * 0.04
     source_output_torch = source_output_gate_torch @ out_proj_torch.transpose(0, 1)
     candidate_output_torch = candidate_output_gate_torch @ out_proj_torch.transpose(0, 1)
@@ -3051,7 +3058,7 @@ def _run_pinned_operations(source_text: Mapping[str, str], checkpoint: Mapping[s
                     "source": ["source_core_attention_output", "source_final_recurrent_state", "source_core_norm", "source_output_gate_sigmoid", "source_output"],
                     "candidate": ["candidate_core_attention_output", "candidate_bf16_core_attention_output", "candidate_bf16_core_attention_output_f32", "candidate_final_recurrent_state", "candidate_core_norm", "candidate_output_gate_sigmoid", "candidate_output"],
                 },
-                "candidate_activation_boundary": "BF16 source Q/K raw values use BF16 product/reduction/rsqrt/output in l2norm, then promote to F32; query scale is a separate F32 multiply; BF16 source V promotes to F32; recurrent state remains F32; explicit F32->BF16->F32 cast before RMSNormGated; BF16 storage words, promoted F32 candidate, raw source BF16, and strict raw F32 candidate remain separately reported",
+                "candidate_activation_boundary": "BF16 source Q/K raw values use BF16 product/reduction/rsqrt/output in l2norm, then promote to F32; query scale is a separate F32 multiply; BF16 source V promotes to F32; recurrent state remains F32; explicit F32->BF16->F32 cast before RMSNormGated; RMSNormGated rounds z and its gated output to BF16; BF16 storage words, promoted F32 candidate, raw source BF16, and strict raw F32 candidate remain separately reported",
             },
         ),
         (
