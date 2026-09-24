@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Run the generated Qwen4 operator oracle on the production gfx1151 path,
+//! Run the generated Qwen4 operator oracle on the production HIP path,
 //! execute the production HFQM carrier on the fixed teacher-forced corpus, or
 //! exercise real-model state/MTP rollback plus compact arena fault scenarios.
 //!
@@ -3767,12 +3767,6 @@ fn run_quality_candidate(
     let metadata = receipt.ple.clone();
     let placements = receipt.placements.clone();
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
-    if !gpu.arch_caps.is_gfx1151() {
-        return fail(format!(
-            "Qwen4 quality runner requires gfx1151, got {}",
-            gpu.arch
-        ));
-    }
     let mesh = DeviceMesh::single().map_err(|error| format!("qwen4 mesh: {error}"))?;
     let expected = WeightOrigin::for_single(&mesh, &gpu);
     let source = HfqModelSource::from_hfq(hfq);
@@ -3878,7 +3872,7 @@ fn run_quality_candidate(
     };
     let quality_rows = json!([{
         "variant": "qwen4-candidate",
-        "arch": "gfx1151",
+        "arch": gpu.arch,
         "scoring_mode": "teacher_forced",
         "n_chunks": 1,
         "mean_kld": Value::Null,
@@ -4039,12 +4033,6 @@ fn run_fixtures(fixtures_dir: PathBuf, output_path: PathBuf) -> Result<(), Strin
     }
     let cases = fixture_cases(manifest.get("fixtures").ok_or("manifest has no fixtures")?)?;
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
-    if !gpu.arch_caps.is_gfx1151() {
-        return fail(format!(
-            "Qwen4 parity runner requires gfx1151, got {}",
-            gpu.arch
-        ));
-    }
     let mut results = Vec::with_capacity(cases.len());
     for (name, relative_path, _schema) in cases {
         let arrays = read_npz(&fixtures_dir.join(&relative_path))?;

@@ -70,12 +70,6 @@ impl Family {
 type Families = BTreeMap<String, Value>;
 
 pub fn run_compact(gpu: &mut Gpu) -> Result<Value, String> {
-    if !gpu.arch_caps.is_gfx1151() {
-        return Err(format!(
-            "Qwen4 compact state parity requires gfx1151, got {}",
-            gpu.arch
-        ));
-    }
     let config = compact_test_config();
     let mut ar = Qwen4State::new(gpu, &config, MAX_SEQ)
         .map_err(|error| format!("allocate compact AR state: {error}"))?;
@@ -1461,12 +1455,6 @@ fn run_profile_inner(
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
     let gpu_init_ns = profile_duration_ns(gpu_init_started);
     emit_profile_load_checkpoint("gpu_init", gpu_init_ns);
-    if !gpu.arch_caps.is_gfx1151() {
-        return Err(format!(
-            "Qwen4 profile runner requires gfx1151, got {}",
-            gpu.arch
-        ));
-    }
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -1776,12 +1764,6 @@ pub fn run_state_parity(
     let metadata = receipt.ple.clone();
     let placements = receipt.placements.clone();
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
-    if !gpu.arch_caps.is_gfx1151() {
-        return Err(format!(
-            "Qwen4 state parity runner requires gfx1151, got {}",
-            gpu.arch
-        ));
-    }
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -2087,13 +2069,11 @@ fn read_state_tokens(path: &Path) -> Result<(Vec<u32>, Value), String> {
 mod tests {
     use super::*;
 
-    fn try_gfx1151_gpu() -> Option<Gpu> {
-        let gpu = Gpu::init().ok()?;
-        if !gpu.arch_caps.is_gfx1151() {
-            eprintln!("skip: Qwen4 compact state parity requires gfx1151");
-            return None;
-        }
-        Some(gpu)
+    fn try_gpu() -> Option<Gpu> {
+        Gpu::init().ok().or_else(|| {
+            eprintln!("skip: Qwen4 compact state parity requires a GPU");
+            None
+        })
     }
 
     fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
@@ -2126,7 +2106,7 @@ mod tests {
 
     #[test]
     fn compact_runner_reports_device_backed_state_parity_scenarios() {
-        let Some(mut gpu) = try_gfx1151_gpu() else {
+        let Some(mut gpu) = try_gpu() else {
             return;
         };
         let report = run_compact(&mut gpu).expect("compact state parity runner");
@@ -2135,7 +2115,7 @@ mod tests {
             field(&report, "schema").as_str(),
             Some("hipfire.qwen4.state_parity.compact.v1")
         );
-        assert_eq!(field(&report, "gpu_arch").as_str(), Some("gfx1151"));
+        assert_eq!(field(&report, "gpu_arch").as_str(), Some(gpu.arch.as_str()));
         assert_pass(&report);
 
         let cases = field(&report, "acceptance_cases")

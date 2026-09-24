@@ -6101,14 +6101,7 @@ mod tests {
              means the QUANT_STEP was folded twice (or not at all)"
         );
 
-        // Batched arm (the prefill shape).  `_wmma` is gfx1151-only; other
-        // archs would JIT a kernel built for the wrong target, so they stop
-        // here with the single-row numbers already reported.
-        if arch != "gfx1151" {
-            println!("E8-SoA batched arm skipped: gemm_mfp4g32_e8_soa_wmma is gfx1151-only");
-            return;
-        }
-
+        // Batched arm (the prefill shape): gfx1151 WMMA, per-row GEMV elsewhere.
         let batch_x = e8_probe_activations(BATCH, K, 0x0abc_def0_0000_0003);
         let mut batch_reference = Vec::with_capacity(BATCH * M);
         for row in 0..BATCH {
@@ -6163,7 +6156,7 @@ mod tests {
         );
         assert!(
             batch_wiring_error < 5e-4,
-            "batched E8 WMMA disagrees with the encoded weight's own dequant"
+            "batched E8 projection disagrees with the encoded weight's own dequant"
         );
     }
 }
