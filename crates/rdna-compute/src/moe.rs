@@ -2310,7 +2310,40 @@ impl Gpu {
         x_src_rows: usize,
         n_exp: usize,
     ) -> HipResult<()> {
-        let (func, source, grid_x) = if self.arch_caps.is_gfx1151() && m == 2560 && k == 640 {
+        let o4_r16 = self.arch_caps.is_gfx1151() && m == 2560 && k == 640;
+        self.gemm_mq4g128v2_moe_grouped_top10_with(
+            expert_ptrs,
+            expert_tile_ids,
+            sorted_slot_index,
+            x_src,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            grouped_rows,
+            x_src_rows,
+            n_exp,
+            o4_r16,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_mq4g128v2_moe_grouped_top10_with(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+        x_src_rows: usize,
+        n_exp: usize,
+        o4_r16: bool,
+    ) -> HipResult<()> {
+        let (func, source, grid_x) = if o4_r16 {
             (
                 "gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151",
                 kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O4_R16_GFX1151_SRC,
@@ -2377,5 +2410,90 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The gfx1151 O4×R16 grouped QT53 down kernel must reproduce the generic
+    /// multirow kernel bit for bit: two experts, dead (-1) slots, an all-dead
+    /// tile, a sentinel expert tile and a partial final tile.
+    #[test]
+    #[ignore = "requires a gfx1151 GPU and working HIP toolchain"]
+    fn down_o4_r16_is_bit_identical_to_multirow() {
+        const M: usize = 2560;
+        const K: usize = 640;
+        const GROUPED: usize = 330;
+        const SLOTS: usize = 400;
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) if gpu.arch_caps.is_gfx1151() => gpu,
+            _ => {
+                eprintln!("skip: needs gfx1151");
+                return;
+            }
+        };
+        let row_bytes = K / 128 * 68;
+        let expert = |seed: u32| -> Vec<u8> {
+            let mut bytes = vec![0u8; M * row_bytes];
+            let mut state = seed;
+            for chunk in bytes.chunks_mut(68) {
+                for byte in chunk.iter_mut() {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *byte = (state >> 24) as u8;
+                }
+                let jitter = (chunk[10] & 0x3f) as u16;
+                chunk[0..2].copy_from_slice(&(0x2c00u16 + jitter).to_le_bytes());
+                chunk[2..4].copy_from_slice(&(0xb000u16 + jitter).to_le_bytes());
+            }
+            bytes
+        };
+        let experts: Vec<GpuTensor> = [expert(3), expert(4)]
+            .iter()
+            .map(|bytes| gpu.upload_raw(bytes, &[bytes.len()]).expect("expert upload"))
+            .collect();
+        let ptrs: Vec<u8> = experts
+            .iter()
+            .flat_map(|tensor| (tensor.buf.as_ptr() as u64).to_le_bytes())
+            .collect();
+        let ptrs_gpu = gpu.upload_raw(&ptrs, &[ptrs.len()]).expect("ptr upload");
+        let tiles: Vec<i32> = (0..GROUPED.div_ceil(16))
+            .map(|t| if t % 5 == 2 { -1 } else { (t % 2) as i32 })
+            .collect();
+        let slots: Vec<i32> = (0..GROUPED)
+            .map(|s| match s % 23 {
+                3 | 17 => -1,
+                _ if (48..64).contains(&s) => -1,
+                _ => ((s * 37) % SLOTS) as i32,
+            })
+            .collect();
+        let to_bytes = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let tiles_gpu = gpu.upload_raw(&to_bytes(&tiles), &[tiles.len() * 4]).expect("tiles");
+        let slots_gpu = gpu.upload_raw(&to_bytes(&slots), &[slots.len() * 4]).expect("slots");
+        let x: Vec<f32> = (0..SLOTS * K)
+            .map(|i| ((i * 7919 % 4001) as f32 - 2000.0) / 1777.0)
+            .collect();
+        let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("x upload");
+        let mut run = |o4_r16: bool| {
+            let sentinel = vec![f32::from_bits(0x7fc0_1234); GROUPED * M];
+            let y = gpu.upload_f32(&sentinel, &[sentinel.len()]).expect("y upload");
+            gpu.gemm_mq4g128v2_moe_grouped_top10_with(
+                &ptrs_gpu, &tiles_gpu, &slots_gpu, &x_gpu, &y, M, K, 1, GROUPED, SLOTS, 2, o4_r16,
+            )
+            .expect("down launch");
+            let out = gpu.download_f32(&y).expect("y download");
+            gpu.free_tensor(y).expect("free y");
+            out
+        };
+        let reference = run(false);
+        let candidate = run(true);
+        assert!(reference.iter().any(|v| v.is_finite() && *v != 0.0));
+        let differing = reference
+            .iter()
+            .zip(&candidate)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(differing, 0, "O4xR16 down differs from multirow in {differing} cells");
     }
 }

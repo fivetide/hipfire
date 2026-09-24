@@ -54,6 +54,24 @@
 
 #if defined(__gfx1151__)
 
+// Lane 0 of the `v += __shfl_down(v, off, 32)` tree (off = 16..1) with the
+// partner values moved by permlanex16 / in-row DPP instead of LDS bpermute.
+// Same additions, operands and order; only lane 0's result (the one stored)
+// is defined.
+static __device__ __forceinline__ float hf_lane0_tree_sum(float v) {
+    v += __int_as_float(__builtin_amdgcn_permlanex16(
+        __float_as_int(v), __float_as_int(v), 0x76543210u, 0xfedcba98u, false, false));
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        __float_as_int(v), __float_as_int(v), 0x108, 0xf, 0xf, false));  // row_shl:8
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        __float_as_int(v), __float_as_int(v), 0x104, 0xf, 0xf, false));  // row_shl:4
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        __float_as_int(v), __float_as_int(v), 0x102, 0xf, 0xf, false));  // row_shl:2
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        __float_as_int(v), __float_as_int(v), 0x101, 0xf, 0xf, false));  // row_shl:1
+    return v;
+}
+
 __launch_bounds__(32, 8)
 extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
     const unsigned long long* __restrict__ expert_ptrs,
@@ -252,9 +270,7 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
         #pragma unroll
         for (int r = 0; r < 4; ++r) {
             if (!row_valid[r]) continue;
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                acc[r][slot] += __shfl_down(acc[r][slot], offset, 32);
-            }
+            acc[r][slot] = hf_lane0_tree_sum(acc[r][slot]);
         }
     }
 
