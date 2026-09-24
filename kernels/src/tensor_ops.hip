@@ -1541,21 +1541,43 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
         denominator[h] = 0.0f;
         numerator[h] = 0.0f;
     }
-#pragma unroll 4
-    for (int i = 0; i < selected_len; ++i) {
-        int token = tokens[i];
-        float value = values[(token < 0 ? 0 : token) * kv_stride + channel];
-        if (token >= 0) {
-            const float4 w4 = *reinterpret_cast<const float4*>(weights + i * QSA_HG);
-            denominator[0] += w4.x;
-            numerator[0] += w4.x * value;
-            denominator[1] += w4.y;
-            numerator[1] += w4.y * value;
-            denominator[2] += w4.z;
-            numerator[2] += w4.z * value;
-            denominator[3] += w4.w;
-            numerator[3] += w4.w * value;
+    // Invalid (-1) rows hold weight 0 (their score was never exponentiated)
+    // and read value 0, so they add +0.0 to sums that are never -0.0: the
+    // accumulation is branch-free and still bitwise the skipping version.
+    // Eight value loads are issued before their in-order accumulation.
+    int i = 0;
+    for (; i + 8 <= selected_len; i += 8) {
+        float value[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const int token = tokens[i + u];
+            value[u] = token >= 0 ? values[token * kv_stride + channel] : 0.0f;
         }
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const float4 w4 = *reinterpret_cast<const float4*>(weights + (i + u) * QSA_HG);
+            denominator[0] += w4.x;
+            numerator[0] += w4.x * value[u];
+            denominator[1] += w4.y;
+            numerator[1] += w4.y * value[u];
+            denominator[2] += w4.z;
+            numerator[2] += w4.z * value[u];
+            denominator[3] += w4.w;
+            numerator[3] += w4.w * value[u];
+        }
+    }
+    for (; i < selected_len; ++i) {
+        const int token = tokens[i];
+        const float value = token >= 0 ? values[token * kv_stride + channel] : 0.0f;
+        const float4 w4 = *reinterpret_cast<const float4*>(weights + i * QSA_HG);
+        denominator[0] += w4.x;
+        numerator[0] += w4.x * value;
+        denominator[1] += w4.y;
+        numerator[1] += w4.y * value;
+        denominator[2] += w4.z;
+        numerator[2] += w4.z * value;
+        denominator[3] += w4.w;
+        numerator[3] += w4.w * value;
     }
 #pragma unroll
     for (int h = 0; h < QSA_HG; ++h) {
