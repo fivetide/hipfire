@@ -24,7 +24,7 @@
 use hipfire_arch_qwen4::{admit_hfqm_artifact, PleHashMetadata, PleHistory, Qwen4HfqmArtifact};
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
-use hipfire_runtime::model_source::{ModelSource, SourcePayload};
+use hipfire_runtime::model_source::SourcePayload;
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use rdna_compute::tensor_ops::{
     bf16_roundtrip_f32, gated_delta_params_f32, gated_delta_step, hyper_read, hyper_write,
@@ -3759,7 +3759,7 @@ fn run_quality_candidate(
     output_path: &Path,
 ) -> Result<(), String> {
     let (tokens, corpus) = read_quality_tokens(corpus_path)?;
-    let hfq = HfqFile::open(model_path)
+    let mut hfq = HfqFile::open(model_path)
         .map_err(|error| format!("open HFQM {}: {error}", model_path.display()))?;
     let receipt = admit_hfqm_artifact(&hfq)
         .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
@@ -3770,6 +3770,12 @@ fn run_quality_candidate(
     let metadata = receipt.ple.clone();
     let placements = receipt.placements.clone();
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    // Load by byte range like the serve loader and state runner. The borrowed
+    // mmap path never finished on gfx1151 UMA (over an hour, stuck in SVM
+    // registration); range loading takes about a minute.
+    if gpu.is_uma() {
+        hfq.drop_mmap();
+    }
     let mesh = DeviceMesh::single().map_err(|error| format!("qwen4 mesh: {error}"))?;
     let expected = WeightOrigin::for_single(&mesh, &gpu);
     let source = HfqModelSource::from_hfq(hfq);
@@ -3780,17 +3786,11 @@ fn run_quality_candidate(
         &mut gpu,
         expected,
         |entry| {
-            if entry.residency.is_external() {
-                return source
-                    .tensor_range(&entry.name)
-                    .map_err(|error| error.to_string())?
-                    .map(SourcePayload::Range)
-                    .ok_or_else(|| format!("missing external tensor '{}'", entry.name));
-            }
-            let (info, bytes) = source
-                .tensor_data(&entry.name)
-                .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
-            Ok(SourcePayload::Borrowed { info, bytes })
+            source
+                .tensor_range(&entry.name)
+                .map_err(|error| error.to_string())?
+                .map(SourcePayload::Range)
+                .ok_or_else(|| format!("missing tensor '{}'", entry.name))
         },
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
