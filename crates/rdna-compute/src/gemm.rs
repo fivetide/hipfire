@@ -39469,6 +39469,96 @@ mod tests {
             assert_eq!(differing, 0, "m={m}: R16 GEMM differs from GEMV in {differing} cells");
         }
     }
+
+    /// The gfx1151 O4×R4 grouped gate/up kernel must reproduce the F32 SIMT
+    /// companion bit for bit: two experts, dead (-1) slots inside a subtile,
+    /// an all-dead subtile, a negative expert tile and a partial final tile.
+    #[test]
+    #[ignore = "requires a gfx1151 GPU and working HIP toolchain"]
+    fn gate_up_o4_r4_is_bit_identical_to_simt() {
+        const M: usize = 1280;
+        const K: usize = 2560;
+        const GROUPED: usize = 330;
+        const TOKENS: usize = 40;
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) if gpu.arch_caps.is_gfx1151() => gpu,
+            _ => {
+                eprintln!("skip: needs gfx1151");
+                return;
+            }
+        };
+        let row_bytes = K / 256 * 136;
+        let expert = |seed: u32| -> Vec<u8> {
+            let mut bytes = vec![0u8; M * row_bytes];
+            let mut state = seed;
+            for chunk in bytes.chunks_mut(136) {
+                for byte in chunk.iter_mut() {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *byte = (state >> 24) as u8;
+                }
+                // Two (scale, zero) f16 headers with small finite values.
+                for (offset, bits) in [(0, 0x2c00u16), (2, 0xb000), (4, 0x2a00), (6, 0x3000)] {
+                    let jitter = (chunk[8 + offset] & 0x3f) as u16;
+                    chunk[offset..offset + 2].copy_from_slice(&(bits + jitter).to_le_bytes());
+                }
+            }
+            bytes
+        };
+        let experts = [expert(1), expert(2)];
+        let expert_tensors: Vec<GpuTensor> = experts
+            .iter()
+            .map(|bytes| gpu.upload_raw(bytes, &[bytes.len()]).expect("expert upload"))
+            .collect();
+        let ptrs: Vec<u8> = expert_tensors
+            .iter()
+            .flat_map(|tensor| (tensor.buf.as_ptr() as u64).to_le_bytes())
+            .collect();
+        let ptrs_gpu = gpu.upload_raw(&ptrs, &[ptrs.len()]).expect("ptr upload");
+        // 16-slot tiles: expert 0, expert 1, dead tile, ...
+        let tiles: Vec<i32> = (0..GROUPED.div_ceil(16))
+            .map(|t| if t % 5 == 2 { -1 } else { (t % 2) as i32 })
+            .collect();
+        let slots: Vec<i32> = (0..GROUPED)
+            .map(|s| match s % 23 {
+                3 | 17 => -1,
+                _ if (40..44).contains(&s) => -1,
+                _ => ((s * 37) % (TOKENS * 10)) as i32,
+            })
+            .collect();
+        let to_bytes = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let tiles_gpu = gpu.upload_raw(&to_bytes(&tiles), &[tiles.len() * 4]).expect("tiles");
+        let slots_gpu = gpu.upload_raw(&to_bytes(&slots), &[slots.len() * 4]).expect("slots");
+        let x: Vec<f32> = (0..TOKENS * K)
+            .map(|i| ((i * 7919 % 4001) as f32 - 2000.0) / 1777.0)
+            .collect();
+        let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("x upload");
+        let mut run = |exact: bool| {
+            let sentinel = vec![f32::from_bits(0x7fc0_1234); GROUPED * M];
+            let y = gpu.upload_f32(&sentinel, &[sentinel.len()]).expect("y upload");
+            if exact {
+                gpu.gemm_mq4g256v2_moe_grouped_top10_simt(
+                    &ptrs_gpu, &tiles_gpu, &slots_gpu, &x_gpu, &y, M, K, 10, GROUPED,
+                )
+            } else {
+                gpu.gemm_mq4g256v2_moe_grouped_top10_o4_r4_gfx1151(
+                    &ptrs_gpu, &tiles_gpu, &slots_gpu, &x_gpu, &y, M, K, 10, GROUPED,
+                )
+            }
+            .expect("gate/up launch");
+            let out = gpu.download_f32(&y).expect("y download");
+            gpu.free_tensor(y).expect("free y");
+            out
+        };
+        let reference = run(true);
+        let candidate = run(false);
+        assert!(reference.iter().any(|v| v.is_finite() && *v != 0.0));
+        let differing = reference
+            .iter()
+            .zip(&candidate)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(differing, 0, "O4xR4 gate/up differs from SIMT in {differing} cells");
+    }
 }
 
 #[cfg(test)]

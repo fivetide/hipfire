@@ -51,6 +51,23 @@
 
 #define HF_MQ4_O4_R4_SLOTS 4
 
+// Lane 0 of the `v += __shfl_down(v, off, 32)` tree (off = 16..1) with the
+// partner values moved by permlanex16 / in-row DPP instead of LDS bpermute.
+// Same additions, operands and order; only lane 0's result (the one stored)
+// is defined.
+static __device__ __forceinline__ float hf_lane0_tree_sum(float v) {
+    v += __int_as_float(__builtin_amdgcn_permlanex16(
+        __float_as_int(v), __float_as_int(v), 0x76543210u, 0xfedcba98u, false, false));
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        __float_as_int(v), __float_as_int(v), 0x108, 0xf, 0xf, false));  // row_shl:8
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        __float_as_int(v), __float_as_int(v), 0x104, 0xf, 0xf, false));  // row_shl:4
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        __float_as_int(v), __float_as_int(v), 0x102, 0xf, 0xf, false));  // row_shl:2
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        __float_as_int(v), __float_as_int(v), 0x101, 0xf, 0xf, false));  // row_shl:1
+    return v;
+}
 // Decode one output row's group weights.  The expressions are the production
 // O2×R8 expressions; SUF only renames the per-row temporaries so four rows can
 // coexist in one scope.
@@ -240,15 +257,14 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r4(
             + (acc32[slot] + acc33[slot]);
     }
     // Full-wave reduction is deliberate: each output row has the exact same
-    // lane association as the production O2×R8 and O1×R16 kernels.
-    for (int offset = 16; offset > 0; offset >>= 1) {
+    // lane association as the production O2×R8 and O1×R16 kernels (lane 0 of
+    // the shuffle-down tree, partners moved by permlane/DPP).
 #pragma unroll
-        for (int slot = 0; slot < HF_MQ4_O4_R4_SLOTS; ++slot) {
-            sum0[slot] += __shfl_down(sum0[slot], offset, 32);
-            sum1[slot] += __shfl_down(sum1[slot], offset, 32);
-            sum2[slot] += __shfl_down(sum2[slot], offset, 32);
-            sum3[slot] += __shfl_down(sum3[slot], offset, 32);
-        }
+    for (int slot = 0; slot < HF_MQ4_O4_R4_SLOTS; ++slot) {
+        sum0[slot] = hf_lane0_tree_sum(sum0[slot]);
+        sum1[slot] = hf_lane0_tree_sum(sum1[slot]);
+        sum2[slot] = hf_lane0_tree_sum(sum2[slot]);
+        sum3[slot] = hf_lane0_tree_sum(sum3[slot]);
     }
 
     if (tid == 0) {
