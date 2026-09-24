@@ -2144,13 +2144,8 @@ pub fn argmax_f32(gpu: &mut Gpu, p: &ArgmaxF32<'_>) -> HipResult<()> {
 mod tests {
     use super::*;
 
-    fn try_gfx1151_gpu() -> Option<Gpu> {
-        let gpu = Gpu::init().ok()?;
-        if !gpu.arch_caps.is_gfx1151() {
-            eprintln!("skip: ordinary-HIP tensor-op validation requires gfx1151");
-            return None;
-        }
-        Some(gpu)
+    fn try_gpu() -> Option<Gpu> {
+        Gpu::init().ok()
     }
 
     fn null_tensor(shape: &[usize], dtype: DType) -> GpuTensor {
@@ -2162,8 +2157,8 @@ mod tests {
 
     #[test]
     fn recorded_blob_launch_enters_the_tape_with_the_bytes_it_launched() {
-        let Some(mut gpu) = try_gfx1151_gpu() else {
-            eprintln!("skip: no gfx1151 GPU");
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
             return;
         };
         let input = [1.0f32, -2.0, 3.5, 0.25];
@@ -2232,8 +2227,8 @@ mod tests {
 
     #[test]
     fn raw_index_outputs_require_i32_byte_capacity() {
-        let Some(mut gpu) = try_gfx1151_gpu() else {
-            eprintln!("skip: no gfx1151 GPU");
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
             return;
         };
 
@@ -2300,8 +2295,8 @@ mod tests {
 
     #[test]
     fn gdn_rejects_shape_before_kernel_launch() {
-        let Some(mut gpu) = try_gfx1151_gpu() else {
-            eprintln!("skip: no gfx1151 GPU");
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
             return;
         };
         let q = null_tensor(&[1], DType::F32);
@@ -2332,8 +2327,8 @@ mod tests {
 
     #[test]
     fn qsa_reuse_selection_rejects_byte_capacity_mismatch() {
-        let Some(mut gpu) = try_gfx1151_gpu() else {
-            eprintln!("skip: no gfx1151 GPU");
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
             return;
         };
         let selected = null_tensor(&[3], DType::Raw);
@@ -2358,8 +2353,8 @@ mod tests {
     /// declared offset, so a wrong offset fails here rather than at replay.
     #[test]
     fn qsa_position_fields_are_declared_to_the_recorder() {
-        let Some(mut gpu) = try_gfx1151_gpu() else {
-            eprintln!("skip: no gfx1151 GPU");
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
             return;
         };
         gpu.replay =
@@ -2617,8 +2612,8 @@ mod tests {
     /// the `block_count == 0` case where the wrapper's symbol choice differs.
     #[test]
     fn pinned_qsa_shapes_are_bit_identical_to_derived_shapes() {
-        let Some(mut gpu) = try_gfx1151_gpu() else {
-            eprintln!("skip: no gfx1151 GPU");
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
             return;
         };
 
@@ -2861,8 +2856,8 @@ mod tests {
     /// produced. This pins the semantics rather than mutual agreement.
     #[test]
     fn batched_select_orders_blocks_by_score_then_index() {
-        let Some(mut gpu) = try_gfx1151_gpu() else {
-            eprintln!("skip: no gfx1151 GPU");
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
             return;
         };
         let compress = 4usize;
@@ -2913,8 +2908,8 @@ mod tests {
     /// `shape_blocks` above the dynamic-LDS limit selects the serial symbol.
     #[test]
     fn batched_select_ranking_matches_the_serial_selection_sort() {
-        let Some(mut gpu) = try_gfx1151_gpu() else {
-            eprintln!("skip: no gfx1151 GPU");
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
             return;
         };
         const SERIAL_BOUND: usize = QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES / 4 + 1;
@@ -2972,8 +2967,8 @@ mod tests {
 
     #[test]
     fn qsa_reuse_selection_preserves_order_and_boundaries() {
-        let Some(mut gpu) = try_gfx1151_gpu() else {
-            eprintln!("skip: no gfx1151 GPU");
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
             return;
         };
         let capacity = 4usize;
@@ -3033,8 +3028,8 @@ mod tests {
     }
     #[test]
     fn qsa_norm_rope_matches_production_shape_and_preserves_gates() {
-        let Some(mut gpu) = try_gfx1151_gpu() else {
-            eprintln!("skip: no gfx1151 GPU");
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
             return;
         };
         const HEADS: usize = 2;

@@ -792,13 +792,8 @@ pub fn grouped_depthwise_conv_silu_add_bf16(
 mod tests {
     use super::*;
 
-    fn try_gfx1151_gpu() -> Option<Gpu> {
-        let gpu = Gpu::init().ok()?;
-        if !gpu.arch_caps.is_gfx1151() {
-            eprintln!("skip: grouped validation requires gfx1151");
-            return None;
-        }
-        Some(gpu)
+    fn try_gpu() -> Option<Gpu> {
+        Gpu::init().ok()
     }
 
     fn null_tensor(shape: &[usize], dtype: DType) -> GpuTensor {
@@ -820,8 +815,8 @@ mod tests {
 
     #[test]
     fn grouped_launchers_reject_flattened_extent_overflow() {
-        let Some(mut gpu) = try_gfx1151_gpu() else {
-            eprintln!("skip: no gfx1151 GPU");
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
             return;
         };
         let max = i32::MAX as usize;
