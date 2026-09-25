@@ -39,7 +39,7 @@ __device__ __forceinline__ half16_t dq_nibbles(unsigned int lo, unsigned int hi,
 // single-header group ([0..2) f16 scale, [2..4) f16 zero, [4..68) 64 B
 // nibbles: byte i holds weight 2i low / 2i+1 high).  Eight K-tiles per group.
 // F16 dequant and F16 inputs: not bit-exact with the F32 SIMT kernels.
-// K % 128 == 0.  Same expert-tile pairing and unrolled K-tile loop as the
+// K % 128 == 0, K <= 640.  Same expert-tile pairing and unrolled K-tile loop as the
 // gate/up kernel.  Grid [ceil(M/16), m_total/16], block 32.
 // F32 -> BF16 bits, round to nearest even; non-finite values truncate (the
 // BF16 round trip leaves them unchanged).  Widening the bits back gives the
@@ -50,11 +50,16 @@ __device__ __forceinline__ unsigned short moe_bf16_bits(float v) {
     return (unsigned short)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
 }
 
+// K <= 640 (the only dispatched shape): 11 16-byte pieces per lane cover a
+// wave's 16 rows of 5 * 68 bytes.
+constexpr int MOE_DOWN_PIECES = 11;
+
 template <bool PAIR, bool OUT_BF16>
 __device__ __forceinline__ void moe_down_wmma_tiles(
     const char* __restrict__ A, const int* __restrict__ sorted_slot_index,
     const _Float16* __restrict__ X_src, void* __restrict__ Y_grouped,
-    int M, int K, int x_row_div, int m_total, int tid, int row_start, int slot_start) {
+    int M, int K, int x_row_div, int m_total, int tid, int row_start, int slot_start,
+    unsigned int* __restrict__ a_lds) {
     const int lane = tid & 15;
     const half16_t zero_b = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     const _Float16* x_base[2] = {nullptr, nullptr};
@@ -67,12 +72,26 @@ __device__ __forceinline__ void moe_down_wmma_tiles(
                 x_base[t] = X_src + (long long)((x_row_div > 1) ? (flat / x_row_div) : flat) * K;
         }
     }
-    const int safe_row = (row_start + lane < M) ? (row_start + lane) : (M - 1);
     const int groups_per_row = K / 128;
-    const char* row_base = A + (long long)safe_row * groups_per_row * 68;
+    const int row_bytes = groups_per_row * 68;
     float8_t acc[2];
     acc[0] = float8_t{0, 0, 0, 0, 0, 0, 0, 0};
     acc[1] = float8_t{0, 0, 0, 0, 0, 0, 0, 0};
+    // The wave's 16 rows are one contiguous 16 * row_bytes span: stage it
+    // whole with b128 loads (per-lane 4-byte row reads ran DRAM well under
+    // streaming rate), then read each lane's row from LDS.
+    {
+        const int rows = min(16, M - row_start);
+        const int pieces = rows * row_bytes / 16;
+        const uint4* src = (const uint4*)(A + (long long)row_start * row_bytes);
+        uint4 v[MOE_DOWN_PIECES];
+#pragma unroll
+        for (int i = 0; i < MOE_DOWN_PIECES; i++) v[i] = src[min(tid + 32 * i, pieces - 1)];
+#pragma unroll
+        for (int i = 0; i < MOE_DOWN_PIECES; i++) ((uint4*)a_lds)[min(tid + 32 * i, pieces - 1)] = v[i];
+        __syncthreads();
+    }
+    const char* row_base = (const char*)a_lds + (long long)min(lane, M - 1 - row_start) * row_bytes;
     for (int g = 0; g < groups_per_row; g++) {
         const char* gp = row_base + g * 68;
         const unsigned int hdr = *(const unsigned int*)(gp);
@@ -100,19 +119,45 @@ __device__ __forceinline__ void moe_down_wmma_tiles(
             }
         }
     }
+    // Lane l < 16 holds rows 2j of column l, lane l + 16 rows 2j + 1.  One
+    // cross-half swap gives the low lane rows 0..7 and the high lane rows
+    // 8..15 of its column, stored as one 16-byte BF16 run (or two 16-byte
+    // F32 runs) instead of eight scattered 2-byte stores.
+    const int hi = tid >> 4;
 #pragma unroll
     for (int t = 0; t < (PAIR ? 2 : 1); t++) {
-        const int out_col = slot_start + 16 * t + lane;
-        if (out_col < m_total) {
+        float r[8];
 #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                const int out_row = row_start + 2 * j + (tid >> 4);
-                if (out_row >= M) continue;
-                const long long o = (long long)out_col * M + out_row;
+        for (int i = 0; i < 4; i++) {
+            const float give = hi ? acc[t][i] : acc[t][4 + i];
+            const float got = __int_as_float(__builtin_amdgcn_permlanex16(
+                __float_as_int(give), __float_as_int(give), 0x76543210u, 0xfedcba98u, false, false));
+            const float own = hi ? acc[t][4 + i] : acc[t][i];
+            r[2 * i] = hi ? got : own;
+            r[2 * i + 1] = hi ? own : got;
+        }
+        const int out_col = slot_start + 16 * t + lane;
+        const int row0 = row_start + 8 * hi;
+        if (out_col >= m_total || row0 >= M) continue;
+        const long long o = (long long)out_col * M + row0;
+        if (row0 + 8 > M) {
+            for (int i = 0; row0 + i < M; i++) {
                 if (OUT_BF16)
-                    ((unsigned short*)Y_grouped)[o] = moe_bf16_bits(acc[t][j]);
+                    ((unsigned short*)Y_grouped)[o + i] = moe_bf16_bits(r[i]);
                 else
-                    ((float*)Y_grouped)[o] = acc[t][j];
+                    ((float*)Y_grouped)[o + i] = r[i];
+            }
+        } else {
+            if (OUT_BF16) {
+                uint4 w;
+                w.x = moe_bf16_bits(r[0]) | ((unsigned)moe_bf16_bits(r[1]) << 16);
+                w.y = moe_bf16_bits(r[2]) | ((unsigned)moe_bf16_bits(r[3]) << 16);
+                w.z = moe_bf16_bits(r[4]) | ((unsigned)moe_bf16_bits(r[5]) << 16);
+                w.w = moe_bf16_bits(r[6]) | ((unsigned)moe_bf16_bits(r[7]) << 16);
+                *(uint4*)((unsigned short*)Y_grouped + o) = w;
+            } else {
+                *(float4*)((float*)Y_grouped + o) = make_float4(r[0], r[1], r[2], r[3]);
+                *(float4*)((float*)Y_grouped + o + 4) = make_float4(r[4], r[5], r[6], r[7]);
             }
         }
     }
@@ -139,10 +184,12 @@ __device__ __forceinline__ void gemm_mq4g128v2_moe_grouped_wmma_gfx1151_entry(
     if (local & 1) return;
     const char* A = reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
     const bool pair = (tile_y + 1) * 16 < m_total && expert_tile_ids[tile_y + 1] == expert_id;
+    // Declared here, not in the PAIR-templated body: one allocation, not two.
+    __shared__ __align__(16) unsigned int a_lds[MOE_DOWN_PIECES * 32 * 4];
     if (pair)
-        moe_down_wmma_tiles<true, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start);
+        moe_down_wmma_tiles<true, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start, a_lds);
     else
-        moe_down_wmma_tiles<false, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start);
+        moe_down_wmma_tiles<false, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start, a_lds);
 }
 
 #define MOE_WMMA_ARGS \

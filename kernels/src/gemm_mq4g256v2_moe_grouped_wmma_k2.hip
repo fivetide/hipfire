@@ -120,7 +120,8 @@ template <bool PAIR, bool OUT_BF16>
 __device__ __forceinline__ void moe_grouped_wmma_k2_tiles(
     const char* __restrict__ A, const int* __restrict__ sorted_slot_index,
     const _Float16* __restrict__ X_src, void* __restrict__ Y_grouped,
-    int M, int K, int x_row_div, int m_total, int tid, int row_start, int slot_start) {
+    int M, int K, int x_row_div, int m_total, int tid, int row_start, int slot_start,
+    unsigned int* __restrict__ a_lds) {
     const int lane = tid & 15;
     const _Float16* x_base[2] = {nullptr, nullptr};
 #pragma unroll
@@ -150,7 +151,6 @@ __device__ __forceinline__ void moe_grouped_wmma_k2_tiles(
         // and are staged in LDS for the lanes' row reads.  Loading 16 bytes of
         // 16 rows per instruction ran DRAM ~25% under streaming rate.  The
         // next pair is fetched into registers while this one computes.
-        __shared__ __align__(16) unsigned int a_lds[16 * 68];
 #define MOE_A_PIECE(i) min(tid + 32 * (i), 16 * 17 - 1)
 #define MOE_A_LOAD(v, i, G0)                                                         \
     {                                                                                \
@@ -185,19 +185,45 @@ __device__ __forceinline__ void moe_grouped_wmma_k2_tiles(
 #undef MOE_A_LOAD
 #undef MOE_A_PIECE
     }
+    // Lane l < 16 holds rows 2j of column l, lane l + 16 rows 2j + 1.  One
+    // cross-half swap gives the low lane rows 0..7 and the high lane rows
+    // 8..15 of its column, stored as one 16-byte BF16 run (or two 16-byte
+    // F32 runs) instead of eight scattered 2-byte stores.
+    const int hi = tid >> 4;
 #pragma unroll
     for (int t = 0; t < (PAIR ? 2 : 1); t++) {
-        const int out_col = slot_start + 16 * t + lane;
-        if (out_col < m_total) {
+        float r[8];
 #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                const int out_row = row_start + 2 * j + (tid >> 4);
-                if (out_row >= M) continue;
-                const long long o = (long long)out_col * M + out_row;
+        for (int i = 0; i < 4; i++) {
+            const float give = hi ? acc[t][i] : acc[t][4 + i];
+            const float got = __int_as_float(__builtin_amdgcn_permlanex16(
+                __float_as_int(give), __float_as_int(give), 0x76543210u, 0xfedcba98u, false, false));
+            const float own = hi ? acc[t][4 + i] : acc[t][i];
+            r[2 * i] = hi ? got : own;
+            r[2 * i + 1] = hi ? own : got;
+        }
+        const int out_col = slot_start + 16 * t + lane;
+        const int row0 = row_start + 8 * hi;
+        if (out_col >= m_total || row0 >= M) continue;
+        const long long o = (long long)out_col * M + row0;
+        if (row0 + 8 > M) {
+            for (int i = 0; row0 + i < M; i++) {
                 if (OUT_BF16)
-                    ((unsigned short*)Y_grouped)[o] = moe_bf16_bits(acc[t][j]);
+                    ((unsigned short*)Y_grouped)[o + i] = moe_bf16_bits(r[i]);
                 else
-                    ((float*)Y_grouped)[o] = acc[t][j];
+                    ((float*)Y_grouped)[o + i] = r[i];
+            }
+        } else {
+            if (OUT_BF16) {
+                uint4 w;
+                w.x = moe_bf16_bits(r[0]) | ((unsigned)moe_bf16_bits(r[1]) << 16);
+                w.y = moe_bf16_bits(r[2]) | ((unsigned)moe_bf16_bits(r[3]) << 16);
+                w.z = moe_bf16_bits(r[4]) | ((unsigned)moe_bf16_bits(r[5]) << 16);
+                w.w = moe_bf16_bits(r[6]) | ((unsigned)moe_bf16_bits(r[7]) << 16);
+                *(uint4*)((unsigned short*)Y_grouped + o) = w;
+            } else {
+                *(float4*)((float*)Y_grouped + o) = make_float4(r[0], r[1], r[2], r[3]);
+                *(float4*)((float*)Y_grouped + o + 4) = make_float4(r[4], r[5], r[6], r[7]);
             }
         }
     }
@@ -223,10 +249,12 @@ __device__ __forceinline__ void gemm_mq4g256v2_moe_grouped_wmma_k2_entry(
     if (local & 1) return;
     const char* A = reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
     const bool pair = (tile_y + 1) * 16 < m_total && expert_tile_ids[tile_y + 1] == expert_id;
+    // Declared here, not in the PAIR-templated body: one allocation, not two.
+    __shared__ __align__(16) unsigned int a_lds[16 * 68];
     if (pair)
-        moe_grouped_wmma_k2_tiles<true, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start);
+        moe_grouped_wmma_k2_tiles<true, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start, a_lds);
     else
-        moe_grouped_wmma_k2_tiles<false, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start);
+        moe_grouped_wmma_k2_tiles<false, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start, a_lds);
 }
 
 #define MOE_WMMA_ARGS \
