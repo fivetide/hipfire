@@ -68,6 +68,13 @@ static __device__ __forceinline__ float hf_lane0_tree_sum(float v) {
         0, __float_as_int(v), 0x101, 0xf, 0xf, true));  // row_shl:1
     return v;
 }
+// x & 0x0F0F0F0F, opaque to the optimizer so each nibble converts with one
+// v_cvt_f32_ubyteN instead of being re-canonicalized into v_bfe + cvt.
+static __device__ __forceinline__ unsigned int hf_nibble_bytes(unsigned int x) {
+    unsigned int r;
+    asm("v_and_b32 %0, 0x0f0f0f0f, %1" : "=v"(r) : "v"(x));
+    return r;
+}
 __launch_bounds__(32, 2)
 extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r4(
     const unsigned long long* __restrict__ expert_weight_ptrs,
@@ -118,11 +125,12 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r4(
 
     const int boff = tid * 4;
     const int hoff = (tid < 16) ? 0 : 4;
+    const int xoff = tid * 32;
 
     // Dead slots alias X_src row 0 so their loads are unconditional; their
     // accumulation is still skipped, leaving the +0.0 the store owes.
     bool live[HF_MQ4_O4_R4_SLOTS];
-    const float* x_rows[HF_MQ4_O4_R4_SLOTS];
+    int x_soff[HF_MQ4_O4_R4_SLOTS];
     bool any_live = false;
 #pragma unroll
     for (int slot = 0; slot < HF_MQ4_O4_R4_SLOTS; ++slot) {
@@ -132,7 +140,7 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r4(
         live[slot] = flat >= 0;
         const int x_row = !live[slot] ? 0
             : (x_row_div > 1) ? (flat / x_row_div) : flat;
-        x_rows[slot] = X_src + (long long)x_row * K;
+        x_soff[slot] = x_row * K * 4;
         any_live |= live[slot];
     }
 
@@ -161,22 +169,32 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r4(
     // Software pipeline: group g+1's header/payload words and X vectors are
     // loaded while group g is decoded and accumulated.  Values and the
     // per-element expressions are the production ones.
-    const char* row_ptr[4] = {row_ptr0, row_ptr1, row_ptr2, row_ptr3};
+    // Buffer loads: the uniform row/slot/group offsets ride in soffset and the
+    // lane offset in voffset, so no per-group 64-bit VGPR address arithmetic.
+    const __amdgpu_buffer_rsrc_t wrsrc =
+        __builtin_amdgcn_make_buffer_rsrc((void*)A, 0, 0x7FFFFFFF, 0x31004000);
+    const __amdgpu_buffer_rsrc_t xrsrc =
+        __builtin_amdgcn_make_buffer_rsrc((void*)X_src, 0, 0x7FFFFFFF, 0x31004000);
+    const int row_soff[4] = {
+        (int)(row_ptr0 - A), (int)(row_ptr1 - A), (int)(row_ptr2 - A), (int)(row_ptr3 - A)};
     const bool row_ok[4] = {true, row1_valid, row2_valid, row3_valid};
     unsigned int nh[4], npk[4];
     float4 nxa[HF_MQ4_O4_R4_SLOTS], nxb[HF_MQ4_O4_R4_SLOTS];
 #define LOAD_GROUP(G) do { \
         _Pragma("unroll") \
         for (int r = 0; r < 4; ++r) { \
-            const char* gp = row_ptr[r] + (long long)(G) * 136; \
-            nh[r] = row_ok[r] ? *(const unsigned int*)(gp + hoff) : 0u; \
-            npk[r] = row_ok[r] ? *(const unsigned int*)(gp + 8 + boff) : 0u; \
+            nh[r] = row_ok[r] ? __builtin_amdgcn_raw_buffer_load_b32( \
+                wrsrc, hoff, row_soff[r] + (G) * 136, 0) : 0u; \
+            npk[r] = row_ok[r] ? __builtin_amdgcn_raw_buffer_load_b32( \
+                wrsrc, 8 + boff, row_soff[r] + (G) * 136, 0) : 0u; \
         } \
-        const int nbase = (G) * 256 + tid * 8; \
         _Pragma("unroll") \
         for (int slot = 0; slot < HF_MQ4_O4_R4_SLOTS; ++slot) { \
-            nxa[slot] = *(const float4*)(x_rows[slot] + nbase); \
-            nxb[slot] = *(const float4*)(x_rows[slot] + nbase + 4); \
+            const int xs = x_soff[slot] + (G) * 1024; \
+            nxa[slot] = __builtin_bit_cast(float4, \
+                __builtin_amdgcn_raw_buffer_load_b128(xrsrc, xoff, xs, 0)); \
+            nxb[slot] = __builtin_bit_cast(float4, \
+                __builtin_amdgcn_raw_buffer_load_b128(xrsrc, xoff + 16, xs, 0)); \
         } \
     } while (0)
 #define DECODE_ROW(SUF, R) \
@@ -184,15 +202,16 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r4(
         (unsigned short)(ch[R] & 0xFFFFu))); \
     const float zp##SUF = __half2float(__ushort_as_half( \
         (unsigned short)(ch[R] >> 16))); \
-    const unsigned int pk##SUF = cpk[R]; \
-    const float w##SUF##0 = sc##SUF * (float)((pk##SUF >> 0) & 0xFu) + zp##SUF; \
-    const float w##SUF##1 = sc##SUF * (float)((pk##SUF >> 4) & 0xFu) + zp##SUF; \
-    const float w##SUF##2 = sc##SUF * (float)((pk##SUF >> 8) & 0xFu) + zp##SUF; \
-    const float w##SUF##3 = sc##SUF * (float)((pk##SUF >> 12) & 0xFu) + zp##SUF; \
-    const float w##SUF##4 = sc##SUF * (float)((pk##SUF >> 16) & 0xFu) + zp##SUF; \
-    const float w##SUF##5 = sc##SUF * (float)((pk##SUF >> 20) & 0xFu) + zp##SUF; \
-    const float w##SUF##6 = sc##SUF * (float)((pk##SUF >> 24) & 0xFu) + zp##SUF; \
-    const float w##SUF##7 = sc##SUF * (float)((pk##SUF >> 28) & 0xFu) + zp##SUF
+    const unsigned int lo##SUF = hf_nibble_bytes(cpk[R]); \
+    const unsigned int hi##SUF = hf_nibble_bytes(cpk[R] >> 4); \
+    const float w##SUF##0 = sc##SUF * (float)(lo##SUF & 0xFFu) + zp##SUF; \
+    const float w##SUF##1 = sc##SUF * (float)(hi##SUF & 0xFFu) + zp##SUF; \
+    const float w##SUF##2 = sc##SUF * (float)((lo##SUF >> 8) & 0xFFu) + zp##SUF; \
+    const float w##SUF##3 = sc##SUF * (float)((hi##SUF >> 8) & 0xFFu) + zp##SUF; \
+    const float w##SUF##4 = sc##SUF * (float)((lo##SUF >> 16) & 0xFFu) + zp##SUF; \
+    const float w##SUF##5 = sc##SUF * (float)((hi##SUF >> 16) & 0xFFu) + zp##SUF; \
+    const float w##SUF##6 = sc##SUF * (float)(lo##SUF >> 24) + zp##SUF; \
+    const float w##SUF##7 = sc##SUF * (float)(hi##SUF >> 24) + zp##SUF
 #define ACCUM_GROUP(G, A0, A1, A2, A3) do { \
         unsigned int ch[4], cpk[4]; \
         float4 cxa[HF_MQ4_O4_R4_SLOTS], cxb[HF_MQ4_O4_R4_SLOTS]; \
