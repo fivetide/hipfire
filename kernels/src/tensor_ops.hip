@@ -255,7 +255,9 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_f32(
     __shared__ __hip_bfloat16 k_inv_rows[256];
     __shared__ float decay_rows[256];
     __shared__ float beta_rows[256];
-    __shared__ float handoff[128];
+    __shared__ float handoff_kv[128];
+    __shared__ float handoff_delta[128];
+    __shared__ float handoff_out[128];
 
     float state_half[64];
     #pragma unroll
@@ -318,13 +320,18 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_f32(
                     raw_a = projection[next_base + v_offset + value_index];
                 }
             }
-            if (half == 0) {
-                q_norm[buf][value_index] = bf16_round(
-                    bf16_to_f32(bf16_round(cur_a)) * bf16_to_f32(q_inv_rows[r]));
-                k_norm[buf][value_index] = bf16_round(
-                    bf16_to_f32(bf16_round(cur_b)) * bf16_to_f32(k_inv_rows[r]));
+            // The first row of a parameter block stages its own normalized
+            // q/k; every later row's were staged by half 0 at the end of the
+            // previous row, behind that row's last barrier.
+            if (r == 0) {
+                if (half == 0) {
+                    q_norm[buf][value_index] = bf16_round(
+                        bf16_to_f32(bf16_round(cur_a)) * bf16_to_f32(q_inv_rows[r]));
+                    k_norm[buf][value_index] = bf16_round(
+                        bf16_to_f32(bf16_round(cur_b)) * bf16_to_f32(k_inv_rows[r]));
+                }
+                __syncthreads();
             }
-            __syncthreads();
 
             const float decay = decay_rows[r];
             const float beta_value = beta_rows[r];
@@ -341,12 +348,12 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_f32(
                 kv_mem += state_half[kd] * kv;
             }
             if (half == 0) {
-                handoff[value_index] = kv_mem;
+                handoff_kv[value_index] = kv_mem;
             }
             __syncthreads();
 
             if (half == 1) {
-                kv_mem = handoff[value_index];
+                kv_mem = handoff_kv[value_index];
                 #pragma unroll
                 for (int kd = 0; kd < 64; ++kd) {
                     const float kv = bf16_to_f32(k_norm[buf][64 + kd]);
@@ -355,12 +362,11 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_f32(
                 const __hip_bfloat16 v_value = bf16_round(cur_a);
                 const float delta =
                     (bf16_to_f32(v_value) - kv_mem) * beta_value;
-                handoff[value_index] = delta;
+                handoff_delta[value_index] = delta;
             }
             __syncthreads();
 
-            const float delta = handoff[value_index];
-            __syncthreads();
+            const float delta = handoff_delta[value_index];
             #pragma unroll
             for (int kd = 0; kd < 64; ++kd) {
                 const float kv = bf16_to_f32(k_norm[buf][kd_base + kd]);
@@ -375,12 +381,18 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_f32(
                 out += state_half[kd] * qv;
             }
             if (half == 0) {
-                handoff[value_index] = out;
+                handoff_out[value_index] = out;
+                if (r + 1 < block_rows) {
+                    q_norm[buf ^ 1][value_index] = bf16_round(
+                        bf16_to_f32(bf16_round(raw_a)) * bf16_to_f32(q_inv_rows[r + 1]));
+                    k_norm[buf ^ 1][value_index] = bf16_round(
+                        bf16_to_f32(bf16_round(raw_b)) * bf16_to_f32(k_inv_rows[r + 1]));
+                }
             }
             __syncthreads();
 
             if (half == 1) {
-                out = handoff[value_index];
+                out = handoff_out[value_index];
                 #pragma unroll
                 for (int kd = 0; kd < 64; ++kd) {
                     float qv = bf16_to_f32(q_norm[buf][64 + kd]);
