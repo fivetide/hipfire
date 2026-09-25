@@ -2077,14 +2077,14 @@ pub const GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC: &str =
 /// decoded same-expert weight across the sixteen grouped route slots.
 pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_MULTIROW_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10_multirow.hip");
-/// gfx1151 exact-shape O4×R16 companion for the QT53 grouped down consumer.
-/// It handles four adjacent output rows per wave while preserving the
+/// gfx1151 exact-shape O8×R16 companion for the QT53 grouped down consumer.
+/// It handles eight adjacent output rows per wave while preserving the
 /// production sibling's R16 slot mapping, decode arithmetic, padded-K
-/// handling, and wave32 reduction association. One decoded weight group now
-/// feeds four row chains, so each output element pays half the X traffic its
-/// two-row predecessor did.
-pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O4_R16_GFX1151_SRC: &str =
-    include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10_o4_r16.gfx1151.hip");
+/// handling, and wave32 reduction association. Each X vector now feeds eight
+/// row chains, a quarter of the X traffic per output of its two-row
+/// predecessor.
+pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O8_R16_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10_o8_r16.gfx1151.hip");
 /// gfx1151 exact-shape O4×R8 QT44 grouped gate/up consumer.
 /// Four waves per block each pair four adjacent output rows with one
 /// eight-slot subtile whose X is staged once per block through LDS; the

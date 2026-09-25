@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
-// hipfire — gfx1151 QT53 grouped top-10 down O4×R16.
+// hipfire — gfx1151 QT53 grouped top-10 down O8×R16.
 //
 // The previous production sibling assigned one wave to two adjacent output
 // rows and sixteen grouped route slots. This kernel keeps that exact R16
 // mapping, the per-element decode arithmetic, the padded-K handling, and the
-// wave32 shuffle association, but one wave computes four adjacent output rows.
-// The X value for each lane/slot/group is loaded once and consumed by all four
-// row accumulator chains, which halves the X bytes each output element pays
+// wave32 shuffle association, but one wave computes eight adjacent output rows.
+// The X value for each lane/slot/group is loaded once and consumed by all eight
+// row accumulator chains, which quarters the X bytes each output element pays
 // for; each row still decodes its own QT53 weights and owns its own
 // independent F32 accumulator chain.
 //
@@ -20,7 +20,7 @@
 //     the same left-to-right association. Production compiles these kernels
 //     without fast-math (hipcc --genco -O3, no -ffast-math), so the source
 //     association is the whole contract: no reassociation is permitted and a
-//     four-row body cannot disagree with the two-row sibling. Dequantizing
+//     multi-row body cannot disagree with the two-row sibling. Dequantizing
 //     with explicit fused intrinsics or re-associating the sum changes the
 //     last bits and is therefore wrong here.
 //   * Full QT53 groups read each lane's four K values with one aligned
@@ -34,10 +34,10 @@
 //   * Loads are batched, because the sibling's codegen issued one X load per
 //     slot with an immediate full wait. Four slots' X loads are now issued
 //     together before their FMA blocks, and each row's raw weight bytes are
-//     loaded for all four rows before any row is decoded.
+//     loaded for all rows before any row is decoded.
 //
 // Launch contract (same arguments and output layout as the production sibling):
-//   grid = [ceil(M / 4), ceil(grouped_rows / 16), 1], block = [32, 1, 1]
+//   grid = [ceil(M / 8), ceil(grouped_rows / 16), 1], block = [32, 1, 1]
 //   expert_tile_ids[tile] is -1 for a sentinel tile; slots beyond
 //   grouped_rows are padding and are never written.
 //   Y_grouped[grouped_slot * M + row] is unweighted grouped output.
@@ -79,8 +79,10 @@ static __device__ __forceinline__ void hf_lane0_tree_sum2(float& a, float& b) {
     b = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(v), 16));
 }
 
-__launch_bounds__(32, 8)
-extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
+// Eight adjacent output rows per wave: each X vector feeds eight rows.
+#define HF_ROWS 8
+__launch_bounds__(32, 4)
+extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151(
     const unsigned long long* __restrict__ expert_ptrs,
     const int* __restrict__ expert_tile_ids,
     const int* __restrict__ sorted_slot_index,
@@ -94,7 +96,7 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
     int n_exp
 ) {
     const int tid = threadIdx.x;
-    const int row0 = blockIdx.x * 4;
+    const int row0 = blockIdx.x * HF_ROWS;
     const int tile = blockIdx.y;
     const int slot_start = tile * 16;
     if (row0 >= M || slot_start >= grouped_rows || tid >= 32) return;
@@ -117,17 +119,17 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
                  "s"(flat_idx[9]), "s"(flat_idx[10]), "s"(flat_idx[11]),
                  "s"(flat_idx[12]), "s"(flat_idx[13]), "s"(flat_idx[14]),
                  "s"(flat_idx[15]), "s"(expert));
-    float acc[4][16];
+    float acc[HF_ROWS][16];
     const float* x_rows[16];
-    bool row_valid[4];
+    bool row_valid[HF_ROWS];
     #pragma unroll
     for (int slot = 0; slot < 16; ++slot) {
         #pragma unroll
-        for (int r = 0; r < 4; ++r) acc[r][slot] = 0.0f;
+        for (int r = 0; r < HF_ROWS; ++r) acc[r][slot] = 0.0f;
         x_rows[slot] = nullptr;
     }
     #pragma unroll
-    for (int r = 0; r < 4; ++r) row_valid[r] = (row0 + r) < M;
+    for (int r = 0; r < HF_ROWS; ++r) row_valid[r] = (row0 + r) < M;
 
     if (expert >= 0 && expert < n_exp && K > 0 && x_row_div > 0) {
         #pragma unroll
@@ -147,9 +149,9 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
         const char* A = reinterpret_cast<const char*>(expert_ptrs[expert]);
         const int groups = (K + 127) / 128;
         const long long row_stride = (long long)groups * 68;
-        const char* row_ptr[4];
+        const char* row_ptr[HF_ROWS];
         #pragma unroll
-        for (int r = 0; r < 4; ++r) {
+        for (int r = 0; r < HF_ROWS; ++r) {
             const int row = row_valid[r] ? (row0 + r) : (M - 1);
             row_ptr[r] = A + (long long)row * row_stride;
         }
@@ -164,11 +166,11 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
         // Clang's fast-math reassociation is free to permute an unpinned
         // chain, which changes the last bits of every output.
         auto accumulate = [&](int slot, float x0, float x1, float x2, float x3,
-                              const float (&scale)[4], const float (&zero)[4],
-                              const unsigned char (&b0)[4],
-                              const unsigned char (&b1)[4]) {
+                              const float (&scale)[HF_ROWS], const float (&zero)[HF_ROWS],
+                              const unsigned char (&b0)[HF_ROWS],
+                              const unsigned char (&b1)[HF_ROWS]) {
             #pragma unroll
-            for (int r = 0; r < 4; ++r) {
+            for (int r = 0; r < HF_ROWS; ++r) {
                 acc[r][slot] += (scale[r] * (float)(b0[r] & 0xF) + zero[r]) * x0
                     + (scale[r] * (float)(b0[r] >> 4) + zero[r]) * x1
                     + (scale[r] * (float)(b1[r] & 0xF) + zero[r]) * x2
@@ -184,9 +186,9 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
             (void*)A, 0, (int)((long long)M * row_stride), 0x31004000);
         const __amdgpu_buffer_rsrc_t xrsrc = __builtin_amdgcn_make_buffer_rsrc(
             (void*)X_src, 0, (int)((long long)x_src_rows * K * 4), 0x31004000);
-        int row_soff[4];
+        int row_soff[HF_ROWS];
         #pragma unroll
-        for (int r = 0; r < 4; ++r) row_soff[r] = (int)(row_ptr[r] - A);
+        for (int r = 0; r < HF_ROWS; ++r) row_soff[r] = (int)(row_ptr[r] - A);
         int x_soff[16];
         #pragma unroll
         for (int slot = 0; slot < 16; ++slot)
@@ -196,10 +198,10 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
             // Issue every row's raw group bytes before decoding any of them:
             // eight independent loads in flight instead of four dependent
             // load/decode pairs. The header is uniform: a scalar load.
-            unsigned int header[4];
-            unsigned short payload[4];
+            unsigned int header[HF_ROWS];
+            unsigned short payload[HF_ROWS];
             #pragma unroll
-            for (int r = 0; r < 4; ++r) {
+            for (int r = 0; r < HF_ROWS; ++r) {
                 if (row_valid[r]) {
                     const int goff = row_soff[r] + group * 68;
                     header[r] = *(const __attribute__((address_space(4))) unsigned int*)(
@@ -213,11 +215,11 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
             }
             // The nibbles as floats: the 0x0F0F mask is opaque so each one
             // converts with a single v_cvt_f32_ubyteN (values unchanged).
-            float scale[4];
-            float zero[4];
-            float n0[4], n1[4], n2[4], n3[4];
+            float scale[HF_ROWS];
+            float zero[HF_ROWS];
+            float n0[HF_ROWS], n1[HF_ROWS], n2[HF_ROWS], n3[HF_ROWS];
             #pragma unroll
-            for (int r = 0; r < 4; ++r) {
+            for (int r = 0; r < HF_ROWS; ++r) {
                 scale[r] = __half2float(__ushort_as_half(
                     (unsigned short)(header[r] & 0xFFFFU)));
                 zero[r] = __half2float(__ushort_as_half(
@@ -249,7 +251,7 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
                     if (x_rows[batch + i] == nullptr) continue;
                     const float4 xv = values[i];
                     #pragma unroll
-                    for (int r = 0; r < 4; ++r) {
+                    for (int r = 0; r < HF_ROWS; ++r) {
                         acc[r][batch + i] += (scale[r] * n0[r] + zero[r]) * xv.x
                             + (scale[r] * n1[r] + zero[r]) * xv.y
                             + (scale[r] * n2[r] + zero[r]) * xv.z
@@ -270,10 +272,10 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
             // Issue every row's raw group bytes before decoding any of them:
             // eight independent loads in flight instead of four dependent
             // load/decode pairs.
-            unsigned int header[4];
-            unsigned short payload[4];
+            unsigned int header[HF_ROWS];
+            unsigned short payload[HF_ROWS];
             #pragma unroll
-            for (int r = 0; r < 4; ++r) {
+            for (int r = 0; r < HF_ROWS; ++r) {
                 if (row_valid[r]) {
                     const char* gp = row_ptr[r] + (long long)group * 68;
                     header[r] = *(const unsigned int*)(gp + 0);
@@ -283,12 +285,12 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
                     payload[r] = static_cast<unsigned short>(0);
                 }
             }
-            float scale[4];
-            float zero[4];
-            unsigned char b0[4];
-            unsigned char b1[4];
+            float scale[HF_ROWS];
+            float zero[HF_ROWS];
+            unsigned char b0[HF_ROWS];
+            unsigned char b1[HF_ROWS];
             #pragma unroll
-            for (int r = 0; r < 4; ++r) {
+            for (int r = 0; r < HF_ROWS; ++r) {
                 scale[r] = __half2float(__ushort_as_half(
                     (unsigned short)(header[r] & 0xFFFFU)));
                 zero[r] = __half2float(__ushort_as_half(
@@ -320,8 +322,8 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
     #pragma unroll
     for (int slot = 0; slot < 16; ++slot) {
         if (x_rows[slot] == nullptr) continue;
-        hf_lane0_tree_sum2(acc[0][slot], acc[1][slot]);
-        hf_lane0_tree_sum2(acc[2][slot], acc[3][slot]);
+        #pragma unroll
+        for (int r = 0; r < HF_ROWS; r += 2) hf_lane0_tree_sum2(acc[r][slot], acc[r + 1][slot]);
     }
 
     if (tid == 0) {
@@ -330,7 +332,7 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
             const int grouped_slot = slot_start + slot;
             if (grouped_slot >= grouped_rows) continue;
             #pragma unroll
-            for (int r = 0; r < 4; ++r) {
+            for (int r = 0; r < HF_ROWS; ++r) {
                 if (row_valid[r])
                     Y_grouped[(long long)grouped_slot * M + row0 + r] =
                         acc[r][slot];
@@ -339,4 +341,5 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
     }
 }
 
+#undef HF_ROWS
 #endif

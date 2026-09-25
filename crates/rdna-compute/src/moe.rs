@@ -2368,7 +2368,7 @@ impl Gpu {
         x_src_rows: usize,
         n_exp: usize,
     ) -> HipResult<()> {
-        let o4_r16 = self.arch_caps.is_gfx1151() && m == 2560 && k == 640;
+        let o8_r16 = self.arch_caps.is_gfx1151() && m == 2560 && k == 640;
         self.gemm_mq4g128v2_moe_grouped_top10_with(
             expert_ptrs,
             expert_tile_ids,
@@ -2381,7 +2381,7 @@ impl Gpu {
             grouped_rows,
             x_src_rows,
             n_exp,
-            o4_r16,
+            o8_r16,
         )
     }
 
@@ -2399,13 +2399,13 @@ impl Gpu {
         grouped_rows: usize,
         x_src_rows: usize,
         n_exp: usize,
-        o4_r16: bool,
+        o8_r16: bool,
     ) -> HipResult<()> {
-        let (func, source, grid_x) = if o4_r16 {
+        let (func, source, grid_x) = if o8_r16 {
             (
-                "gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151",
-                kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O4_R16_GFX1151_SRC,
-                m.div_ceil(4),
+                "gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151",
+                kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O8_R16_GFX1151_SRC,
+                m.div_ceil(8),
             )
         } else {
             (
@@ -2475,12 +2475,12 @@ impl Gpu {
 mod tests {
     use super::*;
 
-    /// The gfx1151 O4×R16 grouped QT53 down kernel must reproduce the generic
+    /// The gfx1151 O8×R16 grouped QT53 down kernel must reproduce the generic
     /// multirow kernel bit for bit: two experts, dead (-1) slots, an all-dead
     /// tile, a sentinel expert tile and a partial final tile.
     #[test]
     #[ignore = "requires a gfx1151 GPU and working HIP toolchain"]
-    fn down_o4_r16_is_bit_identical_to_multirow() {
+    fn down_o8_r16_is_bit_identical_to_multirow() {
         const M: usize = 2560;
         const K: usize = 640;
         const GROUPED: usize = 330;
@@ -2540,13 +2540,13 @@ mod tests {
             .map(|i| ((i * 7919 % 4001) as f32 - 2000.0) / 1777.0)
             .collect();
         let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("x upload");
-        let mut run = |o4_r16: bool| {
+        let mut run = |o8_r16: bool| {
             let sentinel = vec![f32::from_bits(0x7fc0_1234); GROUPED * M];
             let y = gpu
                 .upload_f32(&sentinel, &[sentinel.len()])
                 .expect("y upload");
             gpu.gemm_mq4g128v2_moe_grouped_top10_with(
-                &ptrs_gpu, &tiles_gpu, &slots_gpu, &x_gpu, &y, M, K, 1, GROUPED, SLOTS, 2, o4_r16,
+                &ptrs_gpu, &tiles_gpu, &slots_gpu, &x_gpu, &y, M, K, 1, GROUPED, SLOTS, 2, o8_r16,
             )
             .expect("down launch");
             let out = gpu.download_f32(&y).expect("y download");
@@ -2563,7 +2563,7 @@ mod tests {
             .count();
         assert_eq!(
             differing, 0,
-            "O4xR16 down differs from multirow in {differing} cells"
+            "O8xR16 down differs from multirow in {differing} cells"
         );
     }
 
@@ -2613,7 +2613,14 @@ mod tests {
         let a = gpu.download_f32(&reference).expect("download");
         let b = gpu.download_f32(&fused).expect("download");
         assert!(a.iter().any(|v| *v != 0.0));
-        let differing = a.iter().zip(&b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
-        assert_eq!(differing, 0, "fused unscatter+SwiGLU differs in {differing} cells");
+        let differing = a
+            .iter()
+            .zip(&b)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(
+            differing, 0,
+            "fused unscatter+SwiGLU differs in {differing} cells"
+        );
     }
 }
