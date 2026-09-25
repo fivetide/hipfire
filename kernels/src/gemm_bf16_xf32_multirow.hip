@@ -273,18 +273,108 @@ __device__ __forceinline__ void bf16_rows_loop(
     }
 }
 
-__launch_bounds__(32, 8)
-extern "C" __global__ void gemm_bf16_xf32_multirow_rows2(
-    const unsigned short* __restrict__ W, const float* __restrict__ X,
-    float* __restrict__ Y, int M, int K, int N) {
-    bf16_rows_loop<2>(W, X, Y, M, K, N);
-}
 
 __launch_bounds__(32, 8)
 extern "C" __global__ void gemm_bf16_xf32_multirow_rows3(
     const unsigned short* __restrict__ W, const float* __restrict__ X,
     float* __restrict__ Y, int M, int K, int N) {
     bf16_rows_loop<3>(W, X, Y, M, K, N);
+}
+
+// Per-thread-output sibling for 256 < K <= 512 (K % 8 == 0): the four-row
+// kernel above spends a lane per 8 K values, so K = 320 leaves 24 of 32
+// lanes idle in its second step and pays a shuffle tree per output.  Here
+// lane = output row (32 rows per block, weights staged in LDS with an odd
+// dword stride) and each thread replays the reference's 32 lane partials
+// serially — same (a0..a3) chains, same (a0+a1)+(a2+a3) fold — then the
+// 16/8/4/2/1 tree in registers, so every output is bitwise identical.  Eight
+// waves take TPW tokens each, TGROUPS times.  The asm pins keep the unrolled
+// lane pairs from being hoisted into one another (spills otherwise).
+// Grid: [ceil(M / 32), ceil(N / (8 * TPW * TGROUPS)), 1], block 256,
+// dynamic LDS 32 * (K / 2 + 1) * 4 bytes.
+template <int ITERS, int TPW, int TGROUPS>
+__device__ __forceinline__ void bf16_per_thread(const unsigned short* __restrict__ W,
+    const float* __restrict__ X, float* __restrict__ Y, int M, int K, int N) {
+    extern __shared__ unsigned int ws[];
+    const int stride = K / 2 + 1;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int wave = __builtin_amdgcn_readfirstlane(tid >> 5);
+    const int row0 = blockIdx.x * 32;
+    const int vpr = K / 8;  // uint4 per row
+    for (int v = tid; v < 32 * vpr; v += 256) {
+        const int r = v / vpr, c = v - r * vpr;
+        const int row = row0 + r < M ? row0 + r : M - 1;
+        const uint4 u = *(const uint4*)(W + (size_t)row * K + c * 8);
+        unsigned int* d = ws + r * stride + c * 4;
+        d[0] = u.x; d[1] = u.y; d[2] = u.z; d[3] = u.w;
+    }
+    __syncthreads();
+    const unsigned int* wr = ws + lane * stride;
+    for (int tg = 0; tg < TGROUPS; ++tg) {
+        const int tbase = ((blockIdx.y * TGROUPS + tg) * 8 + wave) * TPW;
+        if (tbase >= N) break;
+        int tok[TPW];
+#pragma unroll
+        for (int t = 0; t < TPW; ++t) tok[t] = tbase + t < N ? tbase + t : tbase;
+        // Level-16 pairs first: vs[l] = s[l] + s[l + 16] is the first tree
+        // step, so each iteration retires two virtual lanes.
+        float h[TPW][16];
+#pragma unroll
+        for (int l = 0; l < 16; ++l) {
+            float sp[2][TPW];
+#pragma unroll
+            for (int p = 0; p < 2; ++p) {
+                const int vl = l + 16 * p;
+                float a[TPW][4];
+#pragma unroll
+                for (int t = 0; t < TPW; ++t) a[t][0] = a[t][1] = a[t][2] = a[t][3] = 0.0f;
+#pragma unroll
+                for (int it = 0; it < ITERS; ++it) {
+                    const int i = vl * 8 + it * 256;
+                    if (i + 8 > K) break;
+                    const unsigned int u0 = wr[i / 2], u1 = wr[i / 2 + 1], u2 = wr[i / 2 + 2], u3 = wr[i / 2 + 3];
+                    const float w0 = HF_BF16_LO(u0), w1 = HF_BF16_HI(u0);
+                    const float w2 = HF_BF16_LO(u1), w3 = HF_BF16_HI(u1);
+                    const float w4 = HF_BF16_LO(u2), w5 = HF_BF16_HI(u2);
+                    const float w6 = HF_BF16_LO(u3), w7 = HF_BF16_HI(u3);
+#pragma unroll
+                    for (int t = 0; t < TPW; ++t) {
+                        const float* xr = X + (size_t)tok[t] * K + i;
+                        a[t][0] += w0 * xr[0];
+                        a[t][1] += w1 * xr[1];
+                        a[t][2] += w2 * xr[2];
+                        a[t][3] += w3 * xr[3];
+                        a[t][0] += w4 * xr[4];
+                        a[t][1] += w5 * xr[5];
+                        a[t][2] += w6 * xr[6];
+                        a[t][3] += w7 * xr[7];
+                    }
+                }
+#pragma unroll
+                for (int t = 0; t < TPW; ++t) sp[p][t] = (a[t][0] + a[t][1]) + (a[t][2] + a[t][3]);
+            }
+#pragma unroll
+            for (int t = 0; t < TPW; ++t) {
+                h[t][l] = sp[0][t] + sp[1][t];
+                asm volatile("" : "+v"(h[t][l]) :: "memory");
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < TPW; ++t) {
+#pragma unroll
+            for (int off = 8; off > 0; off >>= 1)
+#pragma unroll
+                for (int l = 0; l < off; ++l) h[t][l] = h[t][l] + h[t][l + off];
+            if (row0 + lane < M && tbase + t < N) Y[(size_t)(tbase + t) * M + row0 + lane] = h[t][0];
+        }
+    }
+}
+__launch_bounds__(256, 1)
+extern "C" __global__ void gemm_bf16_xf32_multirow_pto2(
+    const unsigned short* __restrict__ W, const float* __restrict__ X,
+    float* __restrict__ Y, int M, int K, int N) {
+    bf16_per_thread<2, 2, 4>(W, X, Y, M, K, N);
 }
 
 #endif  // __GFX11__ || __GFX12__

@@ -25343,15 +25343,20 @@ impl Gpu {
                 [batch_size.div_ceil(2) as u32, m.div_ceil(16) as u32, 1],
                 32,
             )
-        } else if self.arch_caps.is_gfx1151() && k % 8 == 0 && (257..=768).contains(&k) {
+        } else if self.arch_caps.is_gfx1151() && k % 8 == 0 && (257..=512).contains(&k) {
+            // One thread per output row, weights in LDS, 64 tokens per
+            // block; bitwise identical to the four-row kernel.
+            (
+                "gemm_bf16_xf32_multirow_pto2",
+                kernels::GEMM_BF16_XF32_MULTIROW_SRC,
+                [m.div_ceil(32) as u32, batch_size.div_ceil(64) as u32, 1],
+                256,
+            )
+        } else if self.arch_caps.is_gfx1151() && k % 8 == 0 && (513..=768).contains(&k) {
             // Small K: one wave keeps its four tokens' X in registers and
             // walks sixteen rows; bitwise identical to the four-row kernel.
             (
-                if k <= 512 {
-                    "gemm_bf16_xf32_multirow_rows2"
-                } else {
-                    "gemm_bf16_xf32_multirow_rows3"
-                },
+                "gemm_bf16_xf32_multirow_rows3",
                 kernels::GEMM_BF16_XF32_MULTIROW_SRC,
                 [m.div_ceil(16) as u32, batch_size.div_ceil(4) as u32, 1],
                 32,
@@ -25363,6 +25368,11 @@ impl Gpu {
                 [m as u32, batch_size.div_ceil(4) as u32, 1],
                 32,
             )
+        };
+        let shared_bytes = if kernel == "gemm_bf16_xf32_multirow_pto2" {
+            (32 * (k / 2 + 1) * 4) as u32
+        } else {
+            0
         };
         self.ensure_kernel(kernel, source, kernel)?;
         let wp = weight.buf.as_ptr();
@@ -25381,16 +25391,23 @@ impl Gpu {
         ];
         let bytes = weight_bytes.saturating_add(x_bytes).saturating_add(y_bytes);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
-        let result = self.launch_maybe_blob(kernel, grid, [block, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(wp);
-            b.push_ptr(xp);
-            b.push_ptr(yp);
-            b.push_i32(mv);
-            b.push_i32(kv);
-            b.push_i32(nv);
-            b
-        });
+        let result = self.launch_maybe_blob(
+            kernel,
+            grid,
+            [block, 1, 1],
+            shared_bytes,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -39720,7 +39737,9 @@ mod tests {
                 chunk[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
             }
         }
-        let a = gpu.upload_raw(&weights, &[weights.len()]).expect("w upload");
+        let a = gpu
+            .upload_raw(&weights, &[weights.len()])
+            .expect("w upload");
         let x: Vec<f32> = (0..N * K)
             .map(|i| ((i * 7919 % 4001) as f32 - 2000.0) / 1777.0)
             .collect();
@@ -39729,8 +39748,11 @@ mod tests {
         gpu.gemm_mqv2_residual_wmma_gfx11_bt(6, 8, &a, &x_gpu, &y_ref, M, K, N)
             .expect("residual");
         let sentinel = vec![f32::from_bits(0x7fc0_1234); N * M];
-        let y = gpu.upload_f32(&sentinel, &[sentinel.len()]).expect("y upload");
-        gpu.gemm_mq6g256v2(&a, &x_gpu, &y, M, K, N).expect("overwrite");
+        let y = gpu
+            .upload_f32(&sentinel, &[sentinel.len()])
+            .expect("y upload");
+        gpu.gemm_mq6g256v2(&a, &x_gpu, &y, M, K, N)
+            .expect("overwrite");
         let want = gpu.download_f32(&y_ref).expect("y ref download");
         let got = gpu.download_f32(&y).expect("y download");
         assert!(want.iter().any(|v| *v != 0.0));
