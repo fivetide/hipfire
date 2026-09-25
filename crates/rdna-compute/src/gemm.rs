@@ -25327,17 +25327,28 @@ impl Gpu {
                     | (640, 2560)
                     | (512, 2560)
             );
-        let (kernel, source, grid) = if r16_shape {
+        // K % 256 == 0 (every allowlisted shape): four waves share each
+        // weight chunk through LDS; bitwise identical to the R16 kernel.
+        let (kernel, source, grid, block) = if r16_shape && k % 256 == 0 {
+            (
+                "gemm_bf16_xf32_multirow_r16w4_gfx1151",
+                kernels::GEMM_BF16_XF32_MULTIROW_R16_GFX1151_SRC,
+                [batch_size.div_ceil(8) as u32, m.div_ceil(16) as u32, 1],
+                128,
+            )
+        } else if r16_shape {
             (
                 "gemm_bf16_xf32_multirow_r16_gfx1151",
                 kernels::GEMM_BF16_XF32_MULTIROW_R16_GFX1151_SRC,
                 [batch_size.div_ceil(2) as u32, m.div_ceil(16) as u32, 1],
+                32,
             )
         } else {
             (
                 "gemm_bf16_xf32_multirow",
                 kernels::GEMM_BF16_XF32_MULTIROW_SRC,
                 [m as u32, batch_size.div_ceil(4) as u32, 1],
+                32,
             )
         };
         self.ensure_kernel(kernel, source, kernel)?;
@@ -25357,7 +25368,7 @@ impl Gpu {
         ];
         let bytes = weight_bytes.saturating_add(x_bytes).saturating_add(y_bytes);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
-        let result = self.launch_maybe_blob(kernel, grid, [32, 1, 1], 0, &mut params, || {
+        let result = self.launch_maybe_blob(kernel, grid, [block, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(wp);
             b.push_ptr(xp);
@@ -39473,6 +39484,7 @@ mod tests {
         for (m, k) in [
             (640usize, 2560usize),
             (512, 2560),
+            (320, 10240),
             (10240, 320),
             (2560, 640),
             (64, 324),

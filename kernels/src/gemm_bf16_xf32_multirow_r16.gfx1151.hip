@@ -197,3 +197,126 @@ extern "C" __global__ void gemm_bf16_xf32_multirow_r16_gfx1151(
         }
     }
 }
+
+// W-LDS sibling for K % 256 == 0: four waves own adjacent token pairs of the
+// same sixteen rows and share each 256-wide weight chunk through LDS instead
+// of each wave re-reading it from L2 (the R16 kernel is L2-bound on that
+// stream).  Every lane still consumes exactly the uint4 at lane * 8 of each
+// chunk, with the R16 kernel's accumulators, order and reduction, so the
+// result is bitwise identical to it.
+// Grid: [ceil(N / 8), ceil(M / 16), 1], block [128, 1, 1].
+__launch_bounds__(128, 1)
+extern "C" __global__ void gemm_bf16_xf32_multirow_r16w4_gfx1151(
+    const unsigned short* __restrict__ W,
+    const float* __restrict__ X,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N
+) {
+    __shared__ uint4 ws[HF_R16_ROWS * 32];
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int row_base = blockIdx.y * HF_R16_ROWS;
+    const int batch_base = (blockIdx.x * 4 + (tid >> 5)) * HF_R16_STREAMS;
+    // No early return: every wave takes part in the barriers.  Token pairs
+    // past N alias batch 0 and are not stored.
+    int batch[HF_R16_STREAMS];
+#pragma unroll
+    for (int stream = 0; stream < HF_R16_STREAMS; ++stream)
+        batch[stream] = (batch_base + stream < N) ? batch_base + stream
+                      : (batch_base < N ? batch_base : 0);
+
+    // Staging: thread tid copies uint4 v = j * 128 + tid of the 16 x 32 chunk.
+    const uint4* wsrc[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int v = j * 128 + tid;
+        const int r = row_base + (v >> 5);
+        wsrc[j] = (const uint4*)(W + (size_t)(r < M ? r : row_base) * K) + (v & 31);
+    }
+    uint4 st0 = wsrc[0][0], st1 = wsrc[1][0], st2 = wsrc[2][0], st3 = wsrc[3][0];
+
+    float a0[HF_R16_ROWS][HF_R16_STREAMS];
+    float a1[HF_R16_ROWS][HF_R16_STREAMS];
+    float a2[HF_R16_ROWS][HF_R16_STREAMS];
+    float a3[HF_R16_ROWS][HF_R16_STREAMS];
+#pragma unroll
+    for (int row = 0; row < HF_R16_ROWS; ++row) {
+#pragma unroll
+        for (int stream = 0; stream < HF_R16_STREAMS; ++stream) {
+            a0[row][stream] = 0.0f;
+            a1[row][stream] = 0.0f;
+            a2[row][stream] = 0.0f;
+            a3[row][stream] = 0.0f;
+        }
+    }
+
+    const int chunks = K / 256;
+    for (int c = 0; c < chunks; ++c) {
+        ws[tid] = st0;
+        ws[128 + tid] = st1;
+        ws[256 + tid] = st2;
+        ws[384 + tid] = st3;
+        __syncthreads();
+        const int cn = (c + 1 < chunks) ? c + 1 : c;
+        st0 = wsrc[0][cn * 32];
+        st1 = wsrc[1][cn * 32];
+        st2 = wsrc[2][cn * 32];
+        st3 = wsrc[3][cn * 32];
+        const int i = c * 256 + lane * 8;
+        // Each (row, stream) chain sees the R16 kernel's exact sequence; the
+        // chains are independent, so walking rows outermost keeps only one
+        // widened weight vector live.
+        float4 xa[HF_R16_STREAMS], xb[HF_R16_STREAMS];
+#pragma unroll
+        for (int stream = 0; stream < HF_R16_STREAMS; ++stream) {
+            const float* x_row = X + (size_t)batch[stream] * K;
+            xa[stream] = *(const float4*)(x_row + i);
+            xb[stream] = *(const float4*)(x_row + i + 4);
+        }
+#pragma unroll
+        for (int row = 0; row < HF_R16_ROWS; ++row) {
+            const uint4 wv = ws[row * 32 + lane];
+            const float w0 = HF_BF16_LO(wv.x), w1 = HF_BF16_HI(wv.x);
+            const float w2 = HF_BF16_LO(wv.y), w3 = HF_BF16_HI(wv.y);
+            const float w4 = HF_BF16_LO(wv.z), w5 = HF_BF16_HI(wv.z);
+            const float w6 = HF_BF16_LO(wv.w), w7 = HF_BF16_HI(wv.w);
+#pragma unroll
+            for (int stream = 0; stream < HF_R16_STREAMS; ++stream) {
+                a0[row][stream] += w0 * xa[stream].x;
+                a1[row][stream] += w1 * xa[stream].y;
+                a2[row][stream] += w2 * xa[stream].z;
+                a3[row][stream] += w3 * xa[stream].w;
+                a0[row][stream] += w4 * xb[stream].x;
+                a1[row][stream] += w5 * xb[stream].y;
+                a2[row][stream] += w6 * xb[stream].z;
+                a3[row][stream] += w7 * xb[stream].w;
+            }
+        }
+        __syncthreads();
+    }
+
+    float sum[HF_R16_ROWS][HF_R16_STREAMS];
+#pragma unroll
+    for (int row = 0; row < HF_R16_ROWS; ++row) {
+#pragma unroll
+        for (int stream = 0; stream < HF_R16_STREAMS; ++stream) {
+            sum[row][stream] = hf_lane0_tree_sum(
+                (a0[row][stream] + a1[row][stream]) + (a2[row][stream] + a3[row][stream]));
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int row = 0; row < HF_R16_ROWS; ++row) {
+            if (row_base + row >= M) continue;
+#pragma unroll
+            for (int stream = 0; stream < HF_R16_STREAMS; ++stream) {
+                if (batch_base + stream < N) {
+                    Y[(size_t)(batch_base + stream) * M + row_base + row] =
+                        sum[row][stream];
+                }
+            }
+        }
+    }
+}
