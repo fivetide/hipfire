@@ -2167,6 +2167,75 @@ impl Gpu {
         )
     }
 
+    /// Unscatter + SiLU of BF16 grouped gate/up rows fused with the 128-wide
+    /// MQ4G128V2 rotation, written to the shared FP16 X scratch as the MoE
+    /// down GEMM's input (`[grouped slots' flat rows x mi]`).  Bytes equal
+    /// `moe_gate_up_unscatter_silu_top10_bf16in` -> `rotate_x_mq_128_v2_f16`.
+    /// Valid until the next FP16 conversion.
+    pub fn moe_gate_up_unscatter_silu_rotate128_f16(
+        &mut self,
+        grouped_gate_up: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        mi: usize,
+        grouped_rows: usize,
+        total_slots: usize,
+        bf16_round_trip: bool,
+    ) -> HipResult<GpuTensor> {
+        if mi % 128 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fused unscatter/rotate needs mi % 128 == 0",
+            ));
+        }
+        self.bind_thread()?;
+        const FUNC: &str = "moe_gate_up_unscatter_silu_rotate128_f16";
+        self.ensure_kernel(
+            "moe_gate_up_unscatter_silu_top10",
+            kernels::MOE_GATE_UP_UNSCATTER_SILU_TOP10_SRC,
+            FUNC,
+        )?;
+        self.ensure_mq_signs_128()?;
+        let out = self.qwen4_f16_x_scratch(total_slots * mi)?;
+        let yp = grouped_gate_up.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let s1 = self.scratch.mq_signs1_128.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2_128.as_ref().unwrap().buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mi_val = mi as i32;
+        let rows_val = grouped_rows as i32;
+        let rt_val = i32::from(bf16_round_trip);
+        let mut params = [
+            &yp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mi_val as *const _ as *mut c_void,
+            &rows_val as *const _ as *mut c_void,
+            &rt_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            FUNC,
+            [grouped_rows as u32, (mi / 128) as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(yp);
+                b.push_ptr(sp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(op);
+                b.push_i32(mi_val);
+                b.push_i32(rows_val);
+                b.push_i32(rt_val);
+                b
+            },
+        )?;
+        Ok(out)
+    }
+
     /// [`Gpu::moe_gate_up_unscatter_silu_top10`] reading the grouped rows as BF16 bits (written by a
     /// `*_bf16out` MoE GEMM).
     #[allow(clippy::too_many_arguments)]

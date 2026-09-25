@@ -358,6 +358,10 @@ pub(crate) fn unscatter(
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
+    // Fused into the down stage (unscatter + SiLU + rotation -> F16).
+    if gateup_bf16(gpu, p) && down_wmma(gpu, p) && p.mi % 128 == 0 {
+        return Ok(());
+    }
     if gateup_bf16(gpu, p) {
         return hip(gpu.moe_gate_up_unscatter_silu_top10_bf16in(
             p.y_gate_up_grouped,
@@ -410,7 +414,18 @@ pub(crate) fn down(
     if use_path2 && down_wmma(gpu, p) {
         // Rotation and GEMM in one stage: the rotated F16 rows live in the
         // shared FP16 scratch, which another stage's GEMM would overwrite.
-        let x_f16 = hip(gpu.rotate_x_mq_128_v2_f16(p.rot_batch, p.mi, total_slots))?;
+        let x_f16 = if gateup_bf16(gpu, p) && p.mi % 128 == 0 {
+            hip(gpu.moe_gate_up_unscatter_silu_rotate128_f16(
+                p.y_gate_up_grouped,
+                p.sorted_slot_index,
+                p.mi,
+                grouped_rows,
+                total_slots,
+                p.recipe.bf16_round_trip(),
+            ))?
+        } else {
+            hip(gpu.rotate_x_mq_128_v2_f16(p.rot_batch, p.mi, total_slots))?
+        };
         hip(gpu.gemm_mq4g128v2_moe_grouped_top10_xf16(
             p.expert_down_ptrs,
             p.expert_tile_ids,
