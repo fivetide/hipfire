@@ -285,15 +285,25 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_f32(
             float q_sum_f32 = 0.0f;
             float k_sum_f32 = 0.0f;
             const __hip_bfloat16 eps = bf16_round(1.0e-6f);
-            for (int kd = 0; kd < 128; ++kd) {
-                const __hip_bfloat16 q_value =
-                    bf16_round(projection[row_base + q_offset + kd]);
-                const __hip_bfloat16 k_value =
-                    bf16_round(projection[row_base + k_offset + kd]);
-                const float q_float = bf16_to_f32(q_value);
-                const float k_float = bf16_to_f32(k_value);
-                q_sum_f32 += bf16_to_f32(bf16_round(q_float * q_float));
-                k_sum_f32 += bf16_to_f32(bf16_round(k_float * k_float));
+            // float4 loads, the next pair issued before the current one is
+            // consumed (a scalar load per kd waited a full memory round trip
+            // each); the kd-order sums are unchanged.  More loads in flight
+            // cost registers the live state needs.
+            const float4* q_row =
+                reinterpret_cast<const float4*>(projection + row_base + q_offset);
+            const float4* k_row =
+                reinterpret_cast<const float4*>(projection + row_base + k_offset);
+            float4 qn = q_row[0], kn = k_row[0];
+            for (int c = 0; c < 32; ++c) {
+                const float4 qc = qn, kc = kn;
+                if (c + 1 < 32) { qn = q_row[c + 1]; kn = k_row[c + 1]; }
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    const float q_float = bf16_to_f32(bf16_round((&qc.x)[u]));
+                    const float k_float = bf16_to_f32(bf16_round((&kc.x)[u]));
+                    q_sum_f32 += bf16_to_f32(bf16_round(q_float * q_float));
+                    k_sum_f32 += bf16_to_f32(bf16_round(k_float * k_float));
+                }
             }
             const __hip_bfloat16 q_sum = bf16_round(q_sum_f32);
             const __hip_bfloat16 k_sum = bf16_round(k_sum_f32);
