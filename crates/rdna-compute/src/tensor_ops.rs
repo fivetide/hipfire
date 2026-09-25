@@ -2017,10 +2017,10 @@ fn qsa_attention_hg4_lds_bytes(
     {
         return None;
     }
-    // weights[sel][4] + tokens[sel] + q[4][256] + partial maxes[4][256] + maxes[4].
+    // weights[sel][4] + tokens[sel] + partial maxes[4][256] + maxes[4].
     let bytes = shape_selected
         .checked_mul(4 * QSA_ATTENTION_HG4_HEADS + 4)?
-        .checked_add(4 * (QSA_ATTENTION_HG4_HEADS * 256 * 2 + QSA_ATTENTION_HG4_HEADS))?;
+        .checked_add(4 * (QSA_ATTENTION_HG4_HEADS * 256 + QSA_ATTENTION_HG4_HEADS))?;
     (bytes <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES).then_some(bytes as u32)
 }
 

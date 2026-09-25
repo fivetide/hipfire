@@ -1691,8 +1691,7 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
     extern __shared__ float4 lds4[];
     float* lds = reinterpret_cast<float*>(lds4);
     float* weights = lds;                              // [selected_len][QSA_HG]
-    float* qs = weights + QSA_HG * selected_len;       // [QSA_HG][QSA_HD]
-    float* kt = qs + QSA_HG * QSA_HD;                  // [QSA_HG][256] partial maxes
+    float* kt = weights + QSA_HG * selected_len;       // [QSA_HG][256] partial maxes
     float* maxes = kt + QSA_HG * 256;                  // [QSA_HG]
     int* tokens = reinterpret_cast<int*>(maxes + QSA_HG);  // [selected_len]
     int tid = (int)threadIdx.x;
@@ -1703,18 +1702,18 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
     const float* values = full_values + kv_head * QSA_HD;
     const int* row_selected = selected_indices + row * capacity;
     int q_row = row * 2 * n_heads * QSA_HD;
+    // The query rows are block-uniform: the score loop reads them as scalar
+    // loads (an SGPR FMA operand) instead of LDS broadcasts.
+    const float* __restrict__ qg = q_with_gate + q_row + head0 * QSA_HD * 2;
     for (int i = tid; i < selected_len; i += 256) {
         int token = row_selected[i];
         tokens[i] = (token >= 0 && token < full_capacity && token < visible) ? token : -1;
-    }
-    for (int i = tid; i < QSA_HG * QSA_HD; i += 256) {
-        qs[i] = q_with_gate[q_row + (head0 + i / QSA_HD) * QSA_HD * 2 + i % QSA_HD];
     }
     __syncthreads();
 
     // Scores: each thread owns one selected row and all four heads, reading
     // its key straight from global memory (four independent serial d-order
-    // chains; q comes from LDS as a broadcast).  No key tile, no barriers.
+    // chains; q comes from scalar loads).  No key tile, no barriers.
     float partial_max[QSA_HG];
 #pragma unroll
     for (int h = 0; h < QSA_HG; ++h) partial_max[h] = -3.402823466e+38f;
@@ -1731,7 +1730,7 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
                 const float4 k4 = key4[d4];
 #pragma unroll
                 for (int h = 0; h < QSA_HG; ++h) {
-                    const float4 q4 = reinterpret_cast<const float4*>(qs + h * QSA_HD)[d4];
+                    const float4 q4 = reinterpret_cast<const float4*>(qg + h * QSA_HD * 2)[d4];
                     score[h] += q4.x * k4.x;
                     score[h] += q4.y * k4.y;
                     score[h] += q4.z * k4.z;
