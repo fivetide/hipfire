@@ -15,6 +15,8 @@ use crate::{DType, Gpu, GpuTensor};
 pub(crate) const TENSOR_OPS_SRC: &str = include_str!("../../../kernels/src/tensor_ops.hip");
 const HYPER_READ_UP_WMMA_SRC: &str =
     include_str!("../../../kernels/src/hyper_read_up_wmma.gfx1151.hip");
+const INDEXED_ATTENTION_DENSE_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/indexed_attention_dense_wmma.gfx1151.hip");
 const QSA_SELECT_PARALLEL_THREADS: u32 = 256;
 // gfx1151's 64-KiB dynamic LDS budget; other devices use the serial path.
 // Oversized rows also use serial kernels without changing the contract.
@@ -2118,10 +2120,12 @@ pub fn indexed_attention_attention_batch(
     indexed_attention_attention_batch_impl(gpu, p, true)
 }
 
+/// `allow_fast` admits the grouped hg4 kernel and the dense F16 WMMA route;
+/// without it the per-head kernels run (the exact reference).
 fn indexed_attention_attention_batch_impl(
     gpu: &mut Gpu,
     p: &IndexedAttentionAttentionBatch<'_>,
-    allow_hg4: bool,
+    allow_fast: bool,
 ) -> HipResult<()> {
     for tensor in [p.q_with_gate, p.full_keys, p.full_values, p.output] {
         ensure_f32(tensor)?;
@@ -2175,6 +2179,9 @@ fn indexed_attention_attention_batch_impl(
     .checked_add(p.compress - 1)
     .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
     let max_selected = end_position.min(p.capacity).min(selected_bound);
+    if allow_fast && qsa_dense_wmma_applies(gpu, p, end_position) {
+        return qsa_dense_wmma(gpu, p, end_position);
+    }
     // Shape bound, not active length: the LDS reservation and symbol are what
     // must be position-independent. The kernel derives its own active
     // `selected_len` from the scalars, and the reservation is never read past
@@ -2205,7 +2212,7 @@ fn indexed_attention_attention_batch_impl(
     let capacity = checked_i32(p.capacity, "QSA batch attention capacity")?;
     let full_capacity = checked_i32(p.full_capacity, "QSA batch attention cache capacity")?;
     let row_grid = checked_u32(p.rows, "QSA batch attention row grid")?;
-    let hg4_bytes = allow_hg4
+    let hg4_bytes = allow_fast
         .then(|| qsa_attention_hg4_lds_bytes(gpu, p, shape_selected))
         .flatten();
     let (kernel_name, grid, shared_mem) = if let Some(bytes) = hg4_bytes {
@@ -2287,6 +2294,102 @@ fn indexed_attention_attention_batch_impl(
             grid: None,
             kernargs: &position_binding,
         },
+    )
+}
+
+/// Whether the dense F16 WMMA attention applies: the Qwen4 F16 route (gfx1151,
+/// >= QWEN4_F16_WMMA_MIN_TOKENS rows, no recorder or capture, not opted out),
+/// head_dim 256 in four-head KV groups, and every row's selection is its
+/// whole causal window: the budget covers every visible block and the
+/// capacity every visible token (indexed_attention_select then emits all of
+/// them).
+fn qsa_dense_wmma_applies(
+    gpu: &Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+    end_position: usize,
+) -> bool {
+    gpu.arch_caps.is_gfx1151()
+        && p.rows >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+        && *crate::gemm::QWEN4_F16_WMMA
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode
+        && p.head_dim == 256
+        && (p.n_heads / p.n_kv_heads) % 4 == 0
+        && end_position / p.compress <= p.budget_blocks
+        && end_position <= p.capacity
+}
+
+/// Causal GQA flash attention over cache rows `[0, end_position)` in F16
+/// WMMA (kernels/src/indexed_attention_dense_wmma.gfx1151.hip).  The F16 K
+/// and V^T copies live in the shared FP16 X scratch.
+fn qsa_dense_wmma(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+    end_position: usize,
+) -> HipResult<()> {
+    let width = checked_product(p.n_kv_heads, 256, "QSA dense KV width")?;
+    let tpad = end_position.div_ceil(32) * 32;
+    let k_elements = checked_product(end_position, width, "QSA dense K")?;
+    let vt_elements = checked_product(width, tpad, "QSA dense V")?;
+    let scratch = gpu.qwen4_f16_x_scratch(k_elements + vt_elements)?;
+    let k16 = scratch.buf.as_ptr();
+    let vt16 = unsafe { (k16 as *mut u8).add(k_elements * 2) } as *mut std::ffi::c_void;
+    let tokens = checked_i32(end_position, "QSA dense tokens")?;
+    let kv_heads = checked_i32(p.n_kv_heads, "QSA dense KV heads")?;
+    let tpad_i = checked_i32(tpad, "QSA dense padded tokens")?;
+    for kernel in [
+        "indexed_attention_kv_f16",
+        "indexed_attention_dense_wmma_f16",
+    ] {
+        gpu.ensure_kernel_public(
+            "indexed_attention_dense_wmma",
+            INDEXED_ATTENTION_DENSE_WMMA_SRC,
+            kernel,
+        )?;
+    }
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.full_keys.buf.as_ptr());
+    args.push_ptr(p.full_values.buf.as_ptr());
+    args.push_ptr(k16);
+    args.push_ptr(vt16);
+    args.push_i32(tokens);
+    args.push_i32(kv_heads);
+    args.push_i32(tpad_i);
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        "indexed_attention_kv_f16",
+        [
+            checked_u32(tpad, "QSA dense token grid")?,
+            p.n_kv_heads as u32,
+            1,
+        ],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.q_with_gate.buf.as_ptr());
+    args.push_ptr(k16);
+    args.push_ptr(vt16);
+    args.push_i32(tpad_i);
+    args.push_ptr(p.output.buf.as_ptr());
+    args.push_i32(checked_i32(p.rows, "QSA dense rows")?);
+    args.push_i32(checked_i32(p.position_start, "QSA dense position")?);
+    args.push_i32(checked_i32(p.n_heads, "QSA dense heads")?);
+    args.push_i32(kv_heads);
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        "indexed_attention_dense_wmma_f16",
+        [
+            checked_u32(p.rows.div_ceil(16), "QSA dense row grid")?,
+            checked_u32(p.n_heads / 4, "QSA dense head grid")?,
+            1,
+        ],
+        [128, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
 
@@ -3649,7 +3752,7 @@ mod tests {
         gpu.hip
             .memcpy_htod(&selected_gpu.buf, &bytes)
             .expect("selected upload");
-        let run = |gpu: &mut Gpu, allow_hg4: bool| {
+        let run = |gpu: &mut Gpu, allow_fast: bool| {
             let output = gpu
                 .zeros(&[rows * n_heads * head_dim], DType::F32)
                 .expect("output allocation");
@@ -3672,7 +3775,7 @@ mod tests {
                     full_capacity,
                     shape_selected: capacity,
                 },
-                allow_hg4,
+                allow_fast,
             )
             .expect("QSA attention");
             let values = gpu.download_f32(&output).expect("output download");
@@ -3694,6 +3797,105 @@ mod tests {
             differing, 0,
             "grouped QSA attention differs in {differing} cells"
         );
+        for tensor in [q_gpu, keys_gpu, values_gpu, selected_gpu] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
+    /// The dense F16 WMMA route (every row selects its whole causal window)
+    /// must match the exact per-head kernel to F16-rounding accuracy at the
+    /// production head shape, with a chunk offset and a partial row tile.
+    #[test]
+    fn qsa_dense_wmma_matches_per_head_kernel() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1151() || !*crate::gemm::QWEN4_F16_WMMA {
+            eprintln!("skip: dense QSA WMMA is the gfx1151 F16 route");
+            return;
+        }
+        let (n_heads, n_kv_heads, head_dim, compress) = (24usize, 2usize, 256usize, 4usize);
+        let (rows, position_start, full_capacity) = (521usize, 100usize, 640usize);
+        let (budget_blocks, capacity) = (2048usize, 640usize);
+        let lcg = |seed: usize, n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    ((i.wrapping_mul(2_654_435_761).wrapping_add(seed) % 2003) as f32 - 1001.0)
+                        / 997.0
+                })
+                .collect()
+        };
+        let q = lcg(1, rows * n_heads * 2 * head_dim);
+        let keys = lcg(7, full_capacity * n_kv_heads * head_dim);
+        let values = lcg(13, full_capacity * n_kv_heads * head_dim);
+        // The whole window, blocks then tail, as indexed_attention_select
+        // emits it when the budget covers every block.
+        let mut selected = vec![-1i32; rows * capacity];
+        for row in 0..rows {
+            for token in 0..position_start + row + 1 {
+                selected[row * capacity + token] = token as i32;
+            }
+        }
+        let q_gpu = gpu.upload_f32(&q, &[q.len()]).expect("q upload");
+        let keys_gpu = gpu.upload_f32(&keys, &[keys.len()]).expect("keys upload");
+        let values_gpu = gpu
+            .upload_f32(&values, &[values.len()])
+            .expect("values upload");
+        let selected_gpu = gpu
+            .zeros(&[selected.len() * std::mem::size_of::<i32>()], DType::Raw)
+            .expect("selected allocation");
+        let bytes = selected
+            .iter()
+            .flat_map(|v| v.to_ne_bytes())
+            .collect::<Vec<_>>();
+        gpu.hip
+            .memcpy_htod(&selected_gpu.buf, &bytes)
+            .expect("selected upload");
+        let run = |gpu: &mut Gpu, allow_fast: bool| {
+            let output = gpu
+                .zeros(&[rows * n_heads * head_dim], DType::F32)
+                .expect("output allocation");
+            indexed_attention_attention_batch_impl(
+                gpu,
+                &IndexedAttentionAttentionBatch {
+                    q_with_gate: &q_gpu,
+                    full_keys: &keys_gpu,
+                    full_values: &values_gpu,
+                    selected: &selected_gpu,
+                    output: &output,
+                    rows,
+                    position_start,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    budget_blocks,
+                    compress,
+                    capacity,
+                    full_capacity,
+                    shape_selected: capacity,
+                },
+                allow_fast,
+            )
+            .expect("QSA attention");
+            let values = gpu.download_f32(&output).expect("output download");
+            gpu.free_tensor(output).expect("free output");
+            values
+        };
+        let reference = run(&mut gpu, false);
+        let dense = run(&mut gpu, true);
+        let (mut err, mut norm) = (0.0f64, 0.0f64);
+        for (r, d) in reference.iter().zip(&dense) {
+            err += (*r as f64 - *d as f64).powi(2);
+            norm += (*r as f64).powi(2);
+        }
+        let rel = (err / norm).sqrt();
+        assert!(norm > 0.0, "reference output is all zero");
+        // F16 operands and probabilities: ~1e-3 relative; a wrong row, head,
+        // key range or dim mapping lands near 1.
+        assert!(rel < 5e-3, "dense QSA WMMA rel L2 {rel:.3e}");
+        // It is the WMMA route (F16 rounding), not the exact kernel.
+        assert!(rel > 0.0, "dense QSA WMMA route did not run");
         for tensor in [q_gpu, keys_gpu, values_gpu, selected_gpu] {
             gpu.free_tensor(tensor).expect("free");
         }
