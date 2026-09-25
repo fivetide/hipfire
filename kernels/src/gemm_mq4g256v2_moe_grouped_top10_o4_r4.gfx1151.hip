@@ -96,10 +96,24 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r4(
     const int tid = threadIdx.x;
     if (row0 >= M || slot_start >= grouped_rows || tid >= 32) return;
 
+    // Slot indices are loaded (clamped in range) up front, alongside the
+    // expert ID, instead of one dependent scalar round trip per slot.
+    int flat_raw[HF_MQ4_O4_R4_SLOTS];
+#pragma unroll
+    for (int slot = 0; slot < HF_MQ4_O4_R4_SLOTS; ++slot) {
+        const int grouped_slot = slot_start + slot;
+        flat_raw[slot] = sorted_slot_index[
+            grouped_slot < grouped_rows ? grouped_slot : grouped_rows - 1];
+    }
+
     // Production expert metadata is still one entry per old 16-slot tile, so
     // the four R4 subtiles of a tile share the same expert pointer.
     const int old_tile = subtile >> 2;
     const int expert_id = expert_tile_ids[old_tile];
+    // Keep the slot loads here: otherwise they sink below the branches and
+    // go back to one round trip each.
+    asm volatile("" :: "s"(flat_raw[0]), "s"(flat_raw[1]), "s"(flat_raw[2]),
+                 "s"(flat_raw[3]));
     if (expert_id < 0) return;
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
@@ -135,8 +149,7 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r4(
 #pragma unroll
     for (int slot = 0; slot < HF_MQ4_O4_R4_SLOTS; ++slot) {
         const int grouped_slot = slot_start + slot;
-        const int flat = (grouped_slot < grouped_rows)
-            ? sorted_slot_index[grouped_slot] : -1;
+        const int flat = (grouped_slot < grouped_rows) ? flat_raw[slot] : -1;
         live[slot] = flat >= 0;
         const int x_row = !live[slot] ? 0
             : (x_row_div > 1) ? (flat / x_row_div) : flat;

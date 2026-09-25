@@ -92,7 +92,24 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
     const int slot_start = tile * 16;
     if (row0 >= M || slot_start >= grouped_rows || tid >= 32) return;
 
+    // Issue all sixteen slot-index loads with the expert ID, before any is
+    // tested (clamped in range): a load behind each `continue` serializes
+    // sixteen dependent scalar round trips into the prologue, and the asm
+    // keeps the compiler from sinking them back below the branches.
+    int flat_idx[16];
+    #pragma unroll
+    for (int slot = 0; slot < 16; ++slot) {
+        const int grouped_slot = slot_start + slot;
+        flat_idx[slot] = sorted_slot_index[
+            grouped_slot < grouped_rows ? grouped_slot : grouped_rows - 1];
+    }
     const int expert = expert_tile_ids[tile];
+    asm volatile("" :: "s"(flat_idx[0]), "s"(flat_idx[1]), "s"(flat_idx[2]),
+                 "s"(flat_idx[3]), "s"(flat_idx[4]), "s"(flat_idx[5]),
+                 "s"(flat_idx[6]), "s"(flat_idx[7]), "s"(flat_idx[8]),
+                 "s"(flat_idx[9]), "s"(flat_idx[10]), "s"(flat_idx[11]),
+                 "s"(flat_idx[12]), "s"(flat_idx[13]), "s"(flat_idx[14]),
+                 "s"(flat_idx[15]), "s"(expert));
     float acc[4][16];
     const float* x_rows[16];
     bool row_valid[4];
@@ -110,7 +127,7 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
         for (int slot = 0; slot < 16; ++slot) {
             const int grouped_slot = slot_start + slot;
             if (grouped_slot >= grouped_rows) continue;
-            const int flat = sorted_slot_index[grouped_slot];
+            const int flat = flat_idx[slot];
             if (flat < 0) continue;
             // The Qwen4 grouped-down caller passes x_row_div == 1: every route
             // slot owns its own X row.  Skip the runtime integer division for
