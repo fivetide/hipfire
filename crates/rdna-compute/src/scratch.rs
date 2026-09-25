@@ -671,6 +671,8 @@ impl ScratchState {
             self.fp16_x_source_ptr = std::ptr::null_mut();
         }
 
+        // The scratch no longer holds the cached source's conversion.
+        self.fp16_x_source_ptr = std::ptr::null_mut();
         let in_ptr = x.buf.as_ptr();
         let out_ptr = self.fp16_x_scratch.as_ref().unwrap().as_ptr();
         let n_val = n_elems as i32;

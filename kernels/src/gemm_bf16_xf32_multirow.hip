@@ -378,3 +378,11 @@ extern "C" __global__ void gemm_bf16_xf32_multirow_pto2(
 }
 
 #endif  // __GFX11__ || __GFX12__
+
+// BF16 -> F16 (RNE via the F32 widening, which is exact).  Model-lifetime
+// weight shadows for the gfx1151 F16 WMMA prefill route.
+extern "C" __global__ void convert_bf16_to_f16(
+    const unsigned short* __restrict__ in, _Float16* __restrict__ out, int n) {
+    const int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) out[i] = (_Float16)__uint_as_float((unsigned int)in[i] << 16);
+}

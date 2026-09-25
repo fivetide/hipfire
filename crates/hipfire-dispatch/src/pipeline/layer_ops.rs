@@ -163,7 +163,15 @@ pub fn project_weight(
     let result = match (weight.dtype, rows > 1) {
         (DType::BF16, false) => gpu.gemv_bf16_xf32(weight.buf, x, output, weight.m, weight.k),
         (DType::BF16, true) => {
-            gpu.gemm_bf16_xf32_multirow(weight.buf, x, output, weight.m, weight.k, rows)
+            // gfx1151 long prefill: the KLD-gated F16 WMMA route, else exact.
+            match gpu.gemm_bf16_xf32_f16_wmma_qwen4(weight.buf, x, output, weight.m, weight.k, rows)
+            {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    gpu.gemm_bf16_xf32_multirow(weight.buf, x, output, weight.m, weight.k, rows)
+                }
+                Err(error) => Err(error),
+            }
         }
         (DType::MQ4G256V2, false) => gpu.gemv_mq4g256v2(weight.buf, x, output, weight.m, weight.k),
         (DType::MQ4G256V2, true) => {

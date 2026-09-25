@@ -12,15 +12,16 @@ use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
-/// `HIPFIRE_QWEN4_MOE_WMMA=0` keeps the Qwen4 grouped MoE GEMMs (gate/up and
-/// down) on the bit-exact F32 arms; the F16 WMMA arms are not bit-exact (see
-/// their call sites).  Read once: 96 launches per forward.
-pub(crate) static QWEN4_MOE_WMMA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_QWEN4_MOE_WMMA").map_or(true, |v| v.trim() != "0")
+/// `HIPFIRE_QWEN4_F16_WMMA=0` keeps Qwen4 prefill on the bit-exact F32 arms
+/// (grouped MoE gate/up and down, BF16 dense projections).  The F16 WMMA arms
+/// are not bit-exact (F16 dequant/inputs); each was admitted by KLD against
+/// the BF16 source.  Read once.
+pub(crate) static QWEN4_F16_WMMA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_QWEN4_F16_WMMA").map_or(true, |v| v.trim() != "0")
 });
-/// Tokens from which the F16 WMMA MoE arms win on gfx1151 (gate/up is
-/// slower below ~450; down breaks even below 512).
-pub(crate) const QWEN4_MOE_WMMA_MIN_TOKENS: usize = 512;
+/// Tokens from which the F16 WMMA arms are used on gfx1151 (the MoE gate/up
+/// arm is slower below ~450; the others break even or win).
+pub(crate) const QWEN4_F16_WMMA_MIN_TOKENS: usize = 512;
 
 /// One instantiation of the parameterised LDS-staged WMMA GEMM
 /// (`kernels/src/gemm_f16_x_f16_wmma_lds256.hip`).
@@ -25252,6 +25253,52 @@ impl Gpu {
         result
     }
 
+    /// Qwen4 prefill `Y[b, m] = Σ_k W[m, k]·X[b, k]` for a BF16 weight through
+    /// a model-lifetime F16 shadow, X converted to F16, and the LDS-staged F16
+    /// WMMA GEMM: 2.5-5x the BF16 multirow kernel on gfx1151 (320x10240 at
+    /// 1131 tokens: 1.14 -> 0.45 ms).  Not bit-exact; KLD-gated.  Returns
+    /// `false` (nothing launched) when the route does not apply: other archs,
+    /// short batches, K % 64 != 0, recorder/capture active, or opted out.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_xf32_f16_wmma_qwen4(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<bool> {
+        if !self.arch_caps.is_gfx1151()
+            || weight.dtype != DType::BF16
+            || batch_size < QWEN4_F16_WMMA_MIN_TOKENS
+            || k % 64 != 0
+            || self.replay.is_recording()
+            || self.graphs.capture_mode
+            || !*QWEN4_F16_WMMA
+        {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        let w16 = self.ensure_bf16_f16_shadow(weight, m, k)?;
+        let x16 = self.convert_fp16_x_uncached(x, batch_size * k)?;
+        let view = |ptr, elems: usize| GpuTensor {
+            buf: unsafe { DeviceBuffer::from_raw(ptr, elems * 2) },
+            shape: vec![elems],
+            dtype: DType::F16,
+        };
+        self.gemm_f16_x_f16_wmma_lds_auto(
+            &view(w16, m * k),
+            &view(x16, batch_size * k),
+            y,
+            None,
+            m,
+            k,
+            batch_size,
+        )?;
+        Ok(true)
+    }
+
     /// Exact BF16-weight × F32-input multirow GEMM with four- and
     /// sixteen-token tile variants. The four-row reference and the gfx1151
     /// variant reuse widened weights across their token rows while retaining
@@ -39055,12 +39102,12 @@ impl Gpu {
         // tokens; slower below ~450).  Not bit-exact — F16 dequant/inputs —
         // but KLD against the BF16 source is unchanged within noise (0.07525
         // vs 0.07475, paired CI [-0.0018, +0.0026], 8160 wikitext tokens).
-        // HIPFIRE_QWEN4_MOE_WMMA=0 keeps the F32 arms.
+        // HIPFIRE_QWEN4_F16_WMMA=0 keeps the F32 arms.
         if self.arch_caps.is_gfx1151()
             && m == 1280
             && k == 2560
-            && x_src_rows >= QWEN4_MOE_WMMA_MIN_TOKENS
-            && *QWEN4_MOE_WMMA
+            && x_src_rows >= QWEN4_F16_WMMA_MIN_TOKENS
+            && *QWEN4_F16_WMMA
         {
             return self.gemm_mq4g256v2_moe_grouped_wmma_k2(
                 expert_weight_ptrs,

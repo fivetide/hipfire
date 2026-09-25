@@ -3204,6 +3204,55 @@ impl Gpu {
         Ok(Some(ptr))
     }
 
+    /// Model-lifetime F16 shadow of a BF16 `[M × K]` weight, keyed on its
+    /// device pointer (weights are immutable after load); freed with the other
+    /// shadows on unload.  BF16 -> F16 rounds (and flushes values below the F16
+    /// range): callers must be accuracy-gated.
+    pub(crate) fn ensure_bf16_f16_shadow(
+        &mut self,
+        weight: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        let key = weight.buf.as_ptr() as usize;
+        if let Some(shadow) = self.fp16_shadow_cache.get(&key) {
+            return Ok(shadow.buf.as_ptr());
+        }
+        let n = m * k;
+        let fp16 = self.alloc_tensor(&[n], DType::F16)?;
+        self.ensure_kernel(
+            "gemm_bf16_xf32_multirow",
+            kernels::GEMM_BF16_XF32_MULTIROW_SRC,
+            "convert_bf16_to_f16",
+        )?;
+        let ip = weight.buf.as_ptr();
+        let op = fp16.buf.as_ptr();
+        let nv =
+            i32::try_from(n).map_err(|_| hip_bridge::HipError::new(0, "BF16 shadow too large"))?;
+        let mut params = [
+            &ip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &nv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "convert_bf16_to_f16",
+            [n.div_ceil(256) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip);
+                b.push_ptr(op);
+                b.push_i32(nv);
+                b
+            },
+        )?;
+        let ptr = fp16.buf.as_ptr();
+        self.fp16_shadow_cache.insert(key, fp16);
+        Ok(ptr)
+    }
+
     /// Ensure a model-lifetime FP16 shadow of a qt=35 MFP4G32E8SOA matrix.
     /// This entry is deliberately separate from the HFQ4 helper so adding the
     /// DeepSeek4 CDNA path cannot change any existing Qwen/HFQ4 dequant route.
