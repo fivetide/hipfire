@@ -13346,7 +13346,12 @@ impl Gpu {
         // The failure is silent: the model still emits fluent text. Measured on
         // Ornith 1.5 35B-A3B, prefill KLD was 0.993 with the cached call against
         // 0.044 on the per-token path for the identical artifact.
-        let x_f16_ptr = self.convert_fp16_x_uncached(x_src, x_src_rows * k)?;
+        // An F16-typed `x_src` is already the converted activation.
+        let x_f16_ptr = if x_src.dtype == DType::F16 {
+            x_src.buf.as_ptr()
+        } else {
+            self.convert_fp16_x_uncached(x_src, x_src_rows * k)?
+        };
 
         let ep = expert_weight_ptrs.buf.as_ptr();
         let tp = expert_tile_ids.buf.as_ptr();
@@ -13443,7 +13448,12 @@ impl Gpu {
         // and MoE prefill reuses the SAME x_rot_batch tensor for every layer with
         // different contents each time — so the cached variant hands every layer
         // after the first the fp16 activations of layer 0.
-        let x_f16_ptr = self.convert_fp16_x_uncached(x_src, x_src_rows * k)?;
+        // An F16-typed `x_src` is already the converted activation.
+        let x_f16_ptr = if x_src.dtype == DType::F16 {
+            x_src.buf.as_ptr()
+        } else {
+            self.convert_fp16_x_uncached(x_src, x_src_rows * k)?
+        };
 
         let ep = expert_weight_ptrs.buf.as_ptr();
         let tp = expert_tile_ids.buf.as_ptr();
@@ -16745,7 +16755,12 @@ impl Gpu {
         // and MoE prefill reuses the SAME x_rot_batch tensor for every layer with
         // different contents each time — so the cached variant hands every layer
         // after the first the fp16 activations of layer 0.
-        let x_f16_ptr = self.convert_fp16_x_uncached(x_src, x_src_rows * k)?;
+        // An F16-typed `x_src` is already the converted activation.
+        let x_f16_ptr = if x_src.dtype == DType::F16 {
+            x_src.buf.as_ptr()
+        } else {
+            self.convert_fp16_x_uncached(x_src, x_src_rows * k)?
+        };
 
         let ep = expert_weight_ptrs.buf.as_ptr();
         let dtp = expert_dtype_tags.buf.as_ptr();
@@ -39232,7 +39247,8 @@ impl Gpu {
 
     /// The Qwen4 grouped gate/up WMMA arm writing `y_grouped` as BF16 bits
     /// (RNE): the values a consumer's BF16 round trip of the F32 output yields.
-    /// Callers check [`Gpu::qwen4_moe_gateup_wmma_applies`].
+    /// `x_src` is F32 (converted here) or already F16.  Callers check
+    /// [`Gpu::qwen4_moe_gateup_wmma_applies`].
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_mq4g256v2_moe_grouped_top10_bf16out(
         &mut self,

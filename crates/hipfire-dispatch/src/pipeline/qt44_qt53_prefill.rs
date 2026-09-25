@@ -57,9 +57,29 @@ fn require_geometry(p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
 /// Prepare the routed expert activation basis.  The route's router/shared
 /// projections are BF16 and consume the natural input, while routed QT44
 /// gate/up consumes the FWHT basis.
-pub(crate) fn input_basis(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
+pub(crate) fn input_basis(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    use_path2: bool,
+) -> Result<(), DispatchError> {
     require_geometry(p)?;
+    if gateup_rotates_f16(gpu, p, use_path2) {
+        return Ok(());
+    }
     hip(gpu.rotate_x_mq_batched(p.x_norm_batch, p.x_rot_batch, p.gate_up_k, p.batch_size))
+}
+
+/// Whether the path-2 F16 WMMA gate/up rotates the activation straight to
+/// F16 itself (the bytes the F32 rotation + conversion produce): only when no
+/// shared projection reads the F32 basis `x_rot_batch`.
+fn gateup_rotates_f16(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
+    use_path2
+        && gateup_bf16(gpu, p)
+        && p.prelude.shared.as_ref().is_none_or(|shared| {
+            [&shared.weights.selector, &shared.weights.gate]
+                .iter()
+                .all(|w| w.dtype != DType::MQ4G256V2)
+        })
 }
 
 fn batch_projection(
@@ -326,11 +346,20 @@ pub(crate) fn gate_up(
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
     if use_path2 && gateup_bf16(gpu, p) {
+        let x_f16 = if gateup_rotates_f16(gpu, p, use_path2) {
+            Some(hip(gpu.rotate_x_mq_batched_f16(
+                p.x_norm_batch,
+                p.gate_up_k,
+                p.batch_size,
+            ))?)
+        } else {
+            None
+        };
         hip(gpu.gemm_mq4g256v2_moe_grouped_top10_bf16out(
             p.expert_gate_up_ptrs,
             p.expert_tile_ids,
             p.sorted_slot_index,
-            p.x_rot_batch,
+            x_f16.as_ref().unwrap_or(p.x_rot_batch),
             p.y_gate_up_grouped,
             2 * p.mi,
             p.gate_up_k,
