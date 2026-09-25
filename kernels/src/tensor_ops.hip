@@ -772,27 +772,28 @@ extern "C" __global__ void hyper_read_projected_f32(
 }
 
 
-// HC residual stream element j: F32, or BF16 bits when `bf16` (the Qwen4 F16
-// prefill route).  Every reader rounds the stream to BF16 first, so both
-// layouts yield the value it uses.
-static __device__ __forceinline__ float hc_state_load(const void* state, size_t j, int bf16) {
-    return bf16 ? __uint_as_float((unsigned int)((const unsigned short*)state)[j] << 16)
-                : ((const float*)state)[j];
+// HC residual stream element: F32, or BF16 bits on the Qwen4 F16 prefill
+// route.  Every reader rounds the stream to BF16 first, so both layouts
+// yield the value it uses.
+static __device__ __forceinline__ float hc_stream_value(float v) { return v; }
+static __device__ __forceinline__ float hc_stream_value(unsigned short b) {
+    return __uint_as_float((unsigned int)b << 16);
 }
 
-// Sum of squares of the BF16-rounded stream values at offset + j,
-// j = tid, tid + 256, ... < n, accumulated in that order (the 256-thread HC
-// norms' partial).  Ten loads are issued before they are consumed: the plain
-// strided loop waits a full memory round trip per element.
+// Sum of squares of the BF16-rounded stream values at j = tid, tid + 256,
+// ... < n, accumulated in that order (the 256-thread HC norms' partial).  Ten
+// loads are issued before they are consumed: the plain strided loop waits a
+// full memory round trip per element.
+template <typename T>
 static __device__ __forceinline__ float hc_bf16_square_partial(
-    const void* values, size_t offset, int tid, int n, int bf16) {
+    const T* values, int tid, int n) {
     float partial = 0.0f;
     for (int base = tid; base < n; base += 10 * 256) {
         float raw[10];
 #pragma unroll
         for (int u = 0; u < 10; ++u) {
             const int j = base + u * 256;
-            raw[u] = j < n ? hc_state_load(values, offset + j, bf16) : 0.0f;
+            raw[u] = j < n ? hc_stream_value(values[j]) : 0.0f;
         }
 #pragma unroll
         for (int u = 0; u < 10; ++u) {
@@ -875,16 +876,15 @@ extern "C" __global__ void hyper_write_bf16x2(
 // to F16 (RNE, as convert_f32_to_f16) for the F16 WMMA projection, and
 // `normalized`, when non-null, then holds the (already BF16-rounded) values
 // as BF16 bits.
-// `input` is the HC streams (BF16 bits when `state_bf16`).
-extern "C" __global__ void hyper_norm_f32(
-    const void* input,
+template <typename T>
+static __device__ __forceinline__ void hyper_norm_rows(
+    const T* input,
     const __hip_bfloat16* norm_weight,
     float* normalized,
     int branches,
     int hidden,
     int rows,
-    _Float16* normalized16,
-    int state_bf16) {
+    _Float16* normalized16) {
     const int branch = (int)blockIdx.x;
     const int row = (int)blockIdx.y;
     if (branch >= branches || row >= rows) return;
@@ -892,7 +892,7 @@ extern "C" __global__ void hyper_norm_f32(
     const int offset = (row * branches + branch) * hidden;
     const int weight_offset = branch * hidden;
     __shared__ float rms_sum[256];
-    rms_sum[tid] = hc_bf16_square_partial(input, offset, tid, hidden, state_bf16);
+    rms_sum[tid] = hc_bf16_square_partial(input + offset, tid, hidden);
     __syncthreads();
     for (int stride = (int)blockDim.x / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
@@ -905,7 +905,7 @@ extern "C" __global__ void hyper_norm_f32(
     for (int j = tid; j < hidden; j += 256) {
         const int column = offset + j;
         const float value = bf16_to_f32(bf16_round(
-            bf16_to_f32(bf16_round(hc_state_load(input, column, state_bf16)))
+            bf16_to_f32(bf16_round(hc_stream_value(input[column])))
             * inv * (1.0f + bf16_to_f32(norm_weight[weight_offset + j]))));
         if (normalized16) {
             normalized16[column] = (_Float16)value;
@@ -915,6 +915,24 @@ extern "C" __global__ void hyper_norm_f32(
             normalized[column] = value;
         }
     }
+}
+
+// `input` is the HC streams (BF16 bits when `state_bf16`).
+extern "C" __global__ void hyper_norm_f32(
+    const void* input,
+    const __hip_bfloat16* norm_weight,
+    float* normalized,
+    int branches,
+    int hidden,
+    int rows,
+    _Float16* normalized16,
+    int state_bf16) {
+    if (state_bf16)
+        hyper_norm_rows((const unsigned short*)input, norm_weight, normalized, branches, hidden,
+                        rows, normalized16);
+    else
+        hyper_norm_rows((const float*)input, norm_weight, normalized, branches, hidden, rows,
+                        normalized16);
 }
 // Lane 0 of `v += __shfl_down(v, off, 32)` for off = 16..1, with the
 // partners moved by permlanex16 / row DPP on gfx11/gfx12 (same additions and
