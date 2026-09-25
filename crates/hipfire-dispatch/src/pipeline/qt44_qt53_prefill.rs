@@ -511,12 +511,15 @@ pub(crate) fn combine(
     require_geometry(p)?;
     let target = p.routed_out.unwrap_or(p.x_batch);
     if use_path2 && down_wmma(gpu, p) {
+        // The rank order goes to `down_expanded`: unused on this route until
+        // the shared down, which runs after the combine.
         hip(gpu.moe_down_combine_grouped_top10_bf16in(
             p.y_down_grouped,
             p.inverse_perm,
             p.topk_indices,
             p.topk_weights,
             target,
+            p.down_expanded,
             p.down_m,
             grouped_rows,
             p.batch_size,

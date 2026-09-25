@@ -1916,12 +1916,12 @@ impl Gpu {
             hidden,
             grouped_rows,
             tokens,
-            false,
         )
     }
 
     /// [`Gpu::moe_down_combine_grouped_top10`] reading the grouped rows as BF16 bits (written by a
-    /// `*_bf16out` MoE GEMM).
+    /// `*_bf16out` MoE GEMM).  The per-token rank order is resolved once into `order`
+    /// (scratch of at least `tokens * 10 * 8` bytes) before the combine reads it.
     #[allow(clippy::too_many_arguments)]
     pub fn moe_down_combine_grouped_top10_bf16in(
         &mut self,
@@ -1930,20 +1930,81 @@ impl Gpu {
         topk_indices: &GpuTensor,
         topk_weights: &GpuTensor,
         residual: &GpuTensor,
+        order: &GpuTensor,
         hidden: usize,
         grouped_rows: usize,
         tokens: usize,
     ) -> HipResult<()> {
-        self.moe_down_combine_grouped_top10_impl(
-            grouped_down,
-            inverse_perm,
-            topk_indices,
-            topk_weights,
-            residual,
-            hidden,
-            grouped_rows,
-            tokens,
-            true,
+        self.bind_thread()?;
+        if hidden % 8 != 0 || order.buf.size() < tokens * 10 * 8 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "moe_down_combine_grouped_top10_bf16in: hidden % 8 != 0 or order scratch too small",
+            ));
+        }
+        const MODULE: &str = "moe_down_combine_grouped_top10";
+        for func in [
+            "moe_combine_order_top10",
+            "moe_down_combine_grouped_top10_bf16in",
+        ] {
+            self.ensure_kernel(MODULE, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, func)?;
+        }
+        let gp = grouped_down.buf.as_ptr();
+        let ip = inverse_perm.buf.as_ptr();
+        let tp = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let rp = residual.buf.as_ptr();
+        let op = order.buf.as_ptr();
+        let hv = hidden as i32;
+        let gr = grouped_rows as i32;
+        let tv = tokens as i32;
+        let mut params = [
+            &ip as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &gr as *const _ as *mut c_void,
+            &tv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "moe_combine_order_top10",
+            [(tokens as u32).div_ceil(64), 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip);
+                b.push_ptr(tp);
+                b.push_ptr(wp);
+                b.push_ptr(op);
+                b.push_i32(gr);
+                b.push_i32(tv);
+                b
+            },
+        )?;
+        let mut params = [
+            &gp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &hv as *const _ as *mut c_void,
+            &tv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "moe_down_combine_grouped_top10_bf16in",
+            [(hidden as u32 / 8).div_ceil(64), tokens as u32, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp);
+                b.push_ptr(op);
+                b.push_ptr(rp);
+                b.push_i32(hv);
+                b.push_i32(tv);
+                b
+            },
         )
     }
 
@@ -1957,16 +2018,10 @@ impl Gpu {
         hidden: usize,
         grouped_rows: usize,
         tokens: usize,
-        grouped_bf16: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const FUNC: &str = "moe_down_combine_grouped_top10";
-        let func = if grouped_bf16 {
-            "moe_down_combine_grouped_top10_bf16in"
-        } else {
-            FUNC
-        };
-        self.ensure_kernel(FUNC, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, func)?;
+        self.ensure_kernel(FUNC, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, FUNC)?;
         let gp = grouped_down.buf.as_ptr();
         let ip = inverse_perm.buf.as_ptr();
         let tp = topk_indices.buf.as_ptr();
@@ -1985,22 +2040,11 @@ impl Gpu {
             &gr as *const _ as *mut c_void,
             &tv as *const _ as *mut c_void,
         ];
-        // The BF16 entry takes eight columns per thread.
-        let (block, grid_x) = if grouped_bf16 {
-            if hidden % 8 != 0 {
-                return Err(hip_bridge::HipError::new(
-                    0,
-                    "moe_down_combine_grouped_top10_bf16in: hidden % 8 != 0",
-                ));
-            }
-            (64u32, (hidden as u32 / 8).div_ceil(64))
-        } else {
-            (256u32, (hidden as u32).div_ceil(256))
-        };
+        let (block, grid_x) = (256u32, (hidden as u32).div_ceil(256));
         let bytes = (grouped_rows * hidden + 3 * tokens * 10 + 2 * tokens * hidden) * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "elementwise", func, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
         let result = self.launch_maybe_blob(
-            func,
+            FUNC,
             [grid_x, tokens as u32, 1],
             [block, 1, 1],
             0,
