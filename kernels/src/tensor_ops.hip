@@ -629,13 +629,16 @@ extern "C" __global__ void hyper_write_f32(
     output[row_offset + column] = bf16_to_f32(bf16_round(value));
 }
 
+// `normalized16`, when non-null, also receives each normalized value rounded
+// to F16 (RNE, as convert_f32_to_f16) for the F16 WMMA projection.
 extern "C" __global__ void hyper_norm_f32(
     const float* input,
     const __hip_bfloat16* norm_weight,
     float* normalized,
     int branches,
     int hidden,
-    int rows) {
+    int rows,
+    _Float16* normalized16) {
     const int branch = (int)blockIdx.x;
     const int row = (int)blockIdx.y;
     if (branch >= branches || row >= rows) return;
@@ -655,9 +658,11 @@ extern "C" __global__ void hyper_norm_f32(
 #pragma unroll 10
     for (int j = tid; j < hidden; j += 256) {
         const int column = offset + j;
-        normalized[column] = bf16_to_f32(bf16_round(
+        const float value = bf16_to_f32(bf16_round(
             bf16_to_f32(bf16_round(input[column]))
             * inv * (1.0f + bf16_to_f32(norm_weight[weight_offset + j]))));
+        normalized[column] = value;
+        if (normalized16) normalized16[column] = (_Float16)value;
     }
 }
 // Lane 0 of `v += __shfl_down(v, off, 32)` for off = 16..1, with the

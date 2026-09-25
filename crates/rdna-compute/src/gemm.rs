@@ -25253,12 +25253,57 @@ impl Gpu {
         result
     }
 
-    /// Qwen4 prefill `Y[b, m] = Σ_k W[m, k]·X[b, k]` for a BF16 weight through
-    /// a model-lifetime F16 shadow, X converted to F16, and the LDS-staged F16
-    /// WMMA GEMM: 2.5-5x the BF16 multirow kernel on gfx1151 (320x10240 at
-    /// 1131 tokens: 1.14 -> 0.45 ms).  Not bit-exact; KLD-gated.  Returns
-    /// `false` (nothing launched) when the route does not apply: other archs,
-    /// short batches, K % 64 != 0, recorder/capture active, or opted out.
+    /// Whether the Qwen4 F16 WMMA route applies to a `[M × K]` BF16 weight at
+    /// `batch_size` rows: gfx1151, >= QWEN4_F16_WMMA_MIN_TOKENS rows,
+    /// K % 64 == 0, no recorder/capture active, not opted out.
+    pub fn qwen4_f16_wmma_applies(&self, weight: &GpuTensor, k: usize, batch_size: usize) -> bool {
+        self.arch_caps.is_gfx1151()
+            && weight.dtype == DType::BF16
+            && batch_size >= QWEN4_F16_WMMA_MIN_TOKENS
+            && k % 64 == 0
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && *QWEN4_F16_WMMA
+    }
+
+    /// The shared FP16 activation scratch as an `elems`-long F16 view, for a
+    /// producer that writes the F16 WMMA input itself.  Valid until the next
+    /// FP16 conversion.
+    pub fn qwen4_f16_x_scratch(&mut self, elems: usize) -> HipResult<GpuTensor> {
+        let ptr = self.scratch.fp16_x_scratch_writable(&self.hip, elems)?;
+        Ok(GpuTensor {
+            buf: unsafe { DeviceBuffer::from_raw(ptr, elems * 2) },
+            shape: vec![elems],
+            dtype: DType::F16,
+        })
+    }
+
+    /// `Y[b, m] = Σ_k W[m, k]·X[b, k]` for a BF16 weight through a
+    /// model-lifetime F16 shadow and the LDS-staged F16 WMMA GEMM, X already
+    /// F16.  2.5-5x the BF16 multirow kernel on gfx1151.  Not bit-exact:
+    /// callers are KLD-gated (see [`Gpu::qwen4_f16_wmma_applies`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_xf16_f16_wmma(
+        &mut self,
+        weight: &GpuTensor,
+        x_f16: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let w16 = self.ensure_bf16_f16_shadow(weight, m, k)?;
+        let w_view = GpuTensor {
+            buf: unsafe { DeviceBuffer::from_raw(w16, m * k * 2) },
+            shape: vec![m * k],
+            dtype: DType::F16,
+        };
+        self.gemm_f16_x_f16_wmma_lds_auto(&w_view, x_f16, y, None, m, k, batch_size)
+    }
+
+    /// [`Gpu::gemm_bf16_xf16_f16_wmma`] from F32 X when the route applies;
+    /// returns `false` with nothing launched otherwise.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_bf16_xf32_f16_wmma_qwen4(
         &mut self,
@@ -25269,33 +25314,17 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<bool> {
-        if !self.arch_caps.is_gfx1151()
-            || weight.dtype != DType::BF16
-            || batch_size < QWEN4_F16_WMMA_MIN_TOKENS
-            || k % 64 != 0
-            || self.replay.is_recording()
-            || self.graphs.capture_mode
-            || !*QWEN4_F16_WMMA
-        {
+        if !self.qwen4_f16_wmma_applies(weight, k, batch_size) {
             return Ok(false);
         }
         self.bind_thread()?;
-        let w16 = self.ensure_bf16_f16_shadow(weight, m, k)?;
         let x16 = self.convert_fp16_x_uncached(x, batch_size * k)?;
-        let view = |ptr, elems: usize| GpuTensor {
-            buf: unsafe { DeviceBuffer::from_raw(ptr, elems * 2) },
-            shape: vec![elems],
+        let x_view = GpuTensor {
+            buf: unsafe { DeviceBuffer::from_raw(x16, batch_size * k * 2) },
+            shape: vec![batch_size * k],
             dtype: DType::F16,
         };
-        self.gemm_f16_x_f16_wmma_lds_auto(
-            &view(w16, m * k),
-            &view(x16, batch_size * k),
-            y,
-            None,
-            m,
-            k,
-            batch_size,
-        )?;
+        self.gemm_bf16_xf16_f16_wmma(weight, &x_view, y, m, k, batch_size)?;
         Ok(true)
     }
 

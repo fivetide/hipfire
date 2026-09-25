@@ -18,7 +18,7 @@ use crate::types::DispatchError;
 use rdna_compute::tensor_ops::{
     argmax_f32, bf16_roundtrip_f32, gated_delta_conv, gated_delta_conv_batched, gated_delta_gate,
     gated_delta_gate_batched, gated_delta_params, gated_delta_params_batched, gated_delta_step,
-    gated_delta_step_batched, hc_activation_fused_f32, hyper_norm, hyper_norm_gate,
+    gated_delta_step_batched, hc_activation_fused_f32, hyper_norm, hyper_norm_f16, hyper_norm_gate,
     hyper_read_projected, hyper_read_up_fused, hyper_write, indexed_attention_attention_batch,
     indexed_attention_cache_append_batch, indexed_attention_norm_rope_batch,
     indexed_attention_pool_rope, indexed_attention_select_batch, scale_f32, ArgmaxF32,
@@ -292,24 +292,38 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
     let low = view(op.low, 0, op.rows * op.low_rank);
     let up = view(op.up, 0, op.rows * wide);
     let mixed = view(op.mixed, 0, op.rows * op.hidden);
-    hip(hyper_norm(
-        gpu,
-        &HyperNorm {
-            input: &input,
-            norm_weight: op.norm_weight,
-            normalized: &normalized,
-            branches: op.branches,
-            hidden: op.hidden,
-        },
-    ))?;
-    project_weight(
-        gpu,
-        &op.input_mix_down,
-        &normalized,
-        &low,
-        op.rows,
-        Some(op.rotation),
-    )?;
+    let norm = HyperNorm {
+        input: &input,
+        norm_weight: op.norm_weight,
+        normalized: &normalized,
+        branches: op.branches,
+        hidden: op.hidden,
+    };
+    // F16 WMMA down projection: the norm writes its F16 input directly.
+    if op.input_mix_down.dtype == DType::BF16
+        && gpu.qwen4_f16_wmma_applies(op.input_mix_down.buf, op.input_mix_down.k, op.rows)
+    {
+        let normalized_f16 = hip(gpu.qwen4_f16_x_scratch(op.rows * wide))?;
+        hip(hyper_norm_f16(gpu, &norm, &normalized_f16))?;
+        hip(gpu.gemm_bf16_xf16_f16_wmma(
+            op.input_mix_down.buf,
+            &normalized_f16,
+            &low,
+            op.input_mix_down.m,
+            op.input_mix_down.k,
+            op.rows,
+        ))?;
+    } else {
+        hip(hyper_norm(gpu, &norm))?;
+        project_weight(
+            gpu,
+            &op.input_mix_down,
+            &normalized,
+            &low,
+            op.rows,
+            Some(op.rotation),
+        )?;
+    }
     if gpu.arch_caps.is_gfx1151() {
         hip(hc_activation_fused_f32(
             gpu,

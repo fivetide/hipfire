@@ -630,6 +630,27 @@ impl ScratchState {
         Ok(self.fp16_x_scratch.as_ref().unwrap().as_ptr())
     }
 
+    /// The FP16 X scratch, grown to `n_elems`, for a caller that writes it
+    /// directly.  It no longer holds the cached source's conversion, so the
+    /// pointer-keyed `ensure_fp16_x` cache is dropped.
+    pub fn fp16_x_scratch_writable(
+        &mut self,
+        hip: &HipRuntime,
+        n_elems: usize,
+    ) -> HipResult<*mut c_void> {
+        let needed = n_elems * 2;
+        if self.fp16_x_scratch_bytes < needed {
+            grow_scratch_buffer(
+                hip,
+                &mut self.fp16_x_scratch,
+                &mut self.fp16_x_scratch_bytes,
+                needed,
+            )?;
+        }
+        self.fp16_x_source_ptr = std::ptr::null_mut();
+        Ok(self.fp16_x_scratch.as_ref().unwrap().as_ptr())
+    }
+
     /// Convert F32 to F16 without caching. Used when the same x tensor
     /// pointer is reused with different contents across layers (e.g.
     /// DeepSeek V4 prefill reuses the same x_in pointer with new contents
@@ -660,21 +681,8 @@ impl ScratchState {
             "convert_f32_to_f16",
         )?;
 
-        let needed = n_elems * 2;
-        if self.fp16_x_scratch_bytes < needed {
-            grow_scratch_buffer(
-                hip,
-                &mut self.fp16_x_scratch,
-                &mut self.fp16_x_scratch_bytes,
-                needed,
-            )?;
-            self.fp16_x_source_ptr = std::ptr::null_mut();
-        }
-
-        // The scratch no longer holds the cached source's conversion.
-        self.fp16_x_source_ptr = std::ptr::null_mut();
         let in_ptr = x.buf.as_ptr();
-        let out_ptr = self.fp16_x_scratch.as_ref().unwrap().as_ptr();
+        let out_ptr = self.fp16_x_scratch_writable(hip, n_elems)?;
         let n_val = n_elems as i32;
         let mut in_ptr_m = in_ptr;
         let mut out_ptr_m = out_ptr;

@@ -579,6 +579,27 @@ pub struct HyperNorm<'a> {
 }
 
 pub fn hyper_norm(gpu: &mut Gpu, p: &HyperNorm<'_>) -> HipResult<()> {
+    hyper_norm_impl(gpu, p, std::ptr::null_mut())
+}
+
+/// [`hyper_norm`] that also writes the normalized rows as F16 into
+/// `normalized_f16` (same element count), the F16 WMMA projection's input.
+pub fn hyper_norm_f16(
+    gpu: &mut Gpu,
+    p: &HyperNorm<'_>,
+    normalized_f16: &GpuTensor,
+) -> HipResult<()> {
+    if normalized_f16.dtype != DType::F16 || normalized_f16.numel() != p.normalized.numel() {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    hyper_norm_impl(gpu, p, normalized_f16.buf.as_ptr())
+}
+
+fn hyper_norm_impl(
+    gpu: &mut Gpu,
+    p: &HyperNorm<'_>,
+    normalized_f16: *mut std::ffi::c_void,
+) -> HipResult<()> {
     ensure_f32(p.input)?;
     ensure_f32(p.normalized)?;
     if p.norm_weight.dtype != DType::BF16 || p.branches == 0 || p.hidden == 0 {
@@ -606,6 +627,7 @@ pub fn hyper_norm(gpu: &mut Gpu, p: &HyperNorm<'_>) -> HipResult<()> {
     args.push_i32(branches);
     args.push_i32(hidden);
     args.push_i32(rows_i);
+    args.push_ptr(normalized_f16);
     args.pad_to(16);
     gpu.launch_blob_recorded(
         "hyper_norm_f32",
