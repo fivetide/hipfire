@@ -25340,6 +25340,22 @@ impl Gpu {
             shape: vec![m * k],
             dtype: DType::F16,
         };
+        // M < 512 with a long K (HC input_mix_down, 320 x 10240): the auto
+        // tile gives too few workgroups; 64 x 64 keeps each output's K order.
+        if m < 512 && k >= 4096 {
+            return self.gemm_f16_x_f16_wmma_lds_tiled_ld(
+                &w_view,
+                x_f16,
+                y,
+                None,
+                m,
+                k,
+                batch_size,
+                LdsTile::new(64, 64, 32, 64, 64, false).pipelined(),
+                k,
+                k,
+            );
+        }
         self.gemm_f16_x_f16_wmma_lds_auto(&w_view, x_f16, y, None, m, k, batch_size)
     }
 
@@ -26497,6 +26513,9 @@ impl Gpu {
         LdsTile::new(128, 128, 32, 64, 64, false).pipelined(),
         LdsTile::new(256, 256, 64, 64, 64, false).pipelined(),
         LdsTile::new(128, 256, 64, 64, 32, false).pipelined(),
+        // Short-M, long-K Qwen4 projections; see gemm_bf16_xf16_f16_wmma.
+        LdsTile::new(64, 64, 32, 64, 64, false),
+        LdsTile::new(64, 64, 32, 64, 64, false).pipelined(),
     ];
 
     /// Pick a tile and dispatch it.

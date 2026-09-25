@@ -1162,6 +1162,10 @@ WLDS_KERNEL(gemm_wmma_lds_128_256_32_64_k64_p,  128, 256, 2, 4, 64, false, true)
 WLDS_KERNEL(gemm_wmma_lds_128_128_32_64_k64_p,  128, 128, 2, 4, 64, false, true)
 WLDS_KERNEL(gemm_wmma_lds_256_256_64_64_k64_p,  256, 256, 4, 4, 64, false, true)
 WLDS_KERNEL(gemm_wmma_lds_128_256_64_64_k32_p,  128, 256, 4, 4, 32, false, true)
+// Qwen4 HC input_mix_down (M = 320, K = 10240): a 128-row tile leaves 3 x 9
+// workgroups for 40 CUs; 64 x 64 gives 90 (same K order per output, bitwise).
+WLDS_KERNEL(gemm_wmma_lds_64_64_32_64_k64,       64,  64, 2, 4, 64, false, false)
+WLDS_KERNEL(gemm_wmma_lds_64_64_32_64_k64_p,     64,  64, 2, 4, 64, false, true)
 
 // --- Fused-epilogue instantiations ------------------------------------------
 // Only the five tiles Gpu::lds_tile_for can return (the three per-arch
