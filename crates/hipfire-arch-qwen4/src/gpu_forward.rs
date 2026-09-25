@@ -1681,6 +1681,8 @@ impl Qwen4GpuForward {
 
         let router_logits = matrix_view(&self.scratch.router_logits, n, dims.num_experts)?;
         let scratch_desc = layer_scratch(&self.scratch, &router_logits);
+        // Decided once: every op touching the HC streams in this forward agrees.
+        let bf16_state = gpu.qwen4_bf16_streams(n);
         if config.num_hidden_layers.saturating_mul(7).saturating_add(1) > QWEN4_STEP_INLINE_CAPACITY
         {
             return Err(invalid(
@@ -1706,6 +1708,7 @@ impl Qwen4GpuForward {
                 let ple = ple_desc(&bundle.weights, ple_weights)?;
                 steps.push(Step::GroupedDepthwise(GroupedDepthwiseOp {
                     rotation: &self.scratch.rotation,
+                    state_bf16: bf16_state,
                     key: ple.key,
                     value: ple.value,
                     norm_key: ple.norm_key,
@@ -1739,6 +1742,7 @@ impl Qwen4GpuForward {
             }
             steps.push(Step::HyperRead(HyperReadOp {
                 rotation: &self.scratch.rotation,
+                state_bf16: bf16_state,
                 input: &self.scratch.streams,
                 norm_weight: attn_read.norm,
                 input_mix_down: attn_read.input_mix_down,
@@ -1866,6 +1870,7 @@ impl Qwen4GpuForward {
             let attn_write = &description.attn_hyper.write;
             steps.push(Step::HyperWrite(HyperWriteOp {
                 rotation: &self.scratch.rotation,
+                state_bf16: bf16_state,
                 input: &self.scratch.streams,
                 norm_weight: attn_write.norm,
                 block_inject: attn_write.block_inject,
@@ -1881,6 +1886,7 @@ impl Qwen4GpuForward {
             let mlp_read = &description.mlp_hyper.read;
             steps.push(Step::HyperRead(HyperReadOp {
                 rotation: &self.scratch.rotation,
+                state_bf16: bf16_state,
                 input: &self.scratch.streams,
                 norm_weight: mlp_read.norm,
                 input_mix_down: mlp_read.input_mix_down,
@@ -1910,6 +1916,7 @@ impl Qwen4GpuForward {
             let mlp_write = &description.mlp_hyper.write;
             steps.push(Step::HyperWrite(HyperWriteOp {
                 rotation: &self.scratch.rotation,
+                state_bf16: bf16_state,
                 input: &self.scratch.streams,
                 norm_weight: mlp_write.norm,
                 block_inject: mlp_write.block_inject,
@@ -1999,13 +2006,23 @@ impl Qwen4GpuForward {
             // [row, branch, hidden], so a launch-per-row/branch memcpy loop is
             // both unnecessary and visible in short AR prefill profiles.
             let wide = dims.wide();
-            gpu.hc_streams_init_from_embed_batched(
-                &embeddings,
-                &self.scratch.streams,
-                config.hidden_size as i32,
-                config.hc_count as i32,
-                n as i32,
-            )?;
+            if bf16_state {
+                gpu.hc_streams_init_from_embed_batched_bf16(
+                    &embeddings,
+                    &self.scratch.streams,
+                    config.hidden_size as i32,
+                    config.hc_count as i32,
+                    n as i32,
+                )?;
+            } else {
+                gpu.hc_streams_init_from_embed_batched(
+                    &embeddings,
+                    &self.scratch.streams,
+                    config.hidden_size as i32,
+                    config.hc_count as i32,
+                    n as i32,
+                )?;
+            }
 
             if ple.lease().is_none() {
                 let wait_started = qwen4_profile_start();
@@ -2150,7 +2167,16 @@ impl Qwen4GpuForward {
                 let wide_elements = n * wide;
                 let source = view(&self.scratch.streams, 0, wide_elements);
                 let destination = f32_view(capture, 0, wide_elements);
-                gpu.copy_d2d(&source, &destination, source.byte_size())?;
+                if bf16_state {
+                    rdna_compute::tensor_ops::hc_state_bf16_to_f32(
+                        gpu,
+                        &source,
+                        &destination,
+                        wide_elements,
+                    )?;
+                } else {
+                    gpu.copy_d2d(&source, &destination, source.byte_size())?;
+                }
             }
 
             if let Some(requested_rows) = requested_rows {
@@ -2167,6 +2193,7 @@ impl Qwen4GpuForward {
                     &self.scratch.streams,
                     &scratch_desc,
                     n,
+                    bf16_state,
                 )
                 .map_err(|error| {
                     Qwen4GpuForwardError::Dispatch(format!("execute Qwen4 final hyper: {error:?}"))

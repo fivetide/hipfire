@@ -606,6 +606,22 @@ extern "C" __global__ void gated_delta_step_cols_gate_f32(
 }
 #undef GDN_COL_ROWS
 
+// BF16-stored HC streams (Qwen4 F16 prefill route) for the PLE block, which
+// reads them as F32 (the values are BF16-exact there) and adds its output:
+// the F32 path stores streams + output unrounded and every reader rounds it
+// to BF16 first, so storing the rounded sum is the same value.
+extern "C" __global__ void hc_state_bf16_to_f32(
+    const unsigned short* state, float* out, int n) {
+    const int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) out[i] = __uint_as_float((unsigned int)state[i] << 16);
+}
+extern "C" __global__ void hc_state_bf16_add_f32(
+    unsigned short* state, const float* addend, int n) {
+    const int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n)
+        state[i] = bf16_round(__uint_as_float((unsigned int)state[i] << 16) + addend[i]).data;
+}
+
 // Source HF executes the recurrent/chunk result through a hidden BF16 cast
 // before RMSNormGated.  Keep the compact production buffer F32 for the
 // existing gate kernel while forcing the exact bounded BF16 storage boundary
@@ -756,19 +772,27 @@ extern "C" __global__ void hyper_read_projected_f32(
 }
 
 
-// Sum of squares of the BF16-rounded values at j = tid, tid + 256, ... < n,
-// accumulated in that order (the 256-thread HC norms' partial).  Ten loads
-// are issued before they are consumed: the plain strided loop waits a full
-// memory round trip per element.
+// HC residual stream element j: F32, or BF16 bits when `bf16` (the Qwen4 F16
+// prefill route).  Every reader rounds the stream to BF16 first, so both
+// layouts yield the value it uses.
+static __device__ __forceinline__ float hc_state_load(const void* state, size_t j, int bf16) {
+    return bf16 ? __uint_as_float((unsigned int)((const unsigned short*)state)[j] << 16)
+                : ((const float*)state)[j];
+}
+
+// Sum of squares of the BF16-rounded stream values at offset + j,
+// j = tid, tid + 256, ... < n, accumulated in that order (the 256-thread HC
+// norms' partial).  Ten loads are issued before they are consumed: the plain
+// strided loop waits a full memory round trip per element.
 static __device__ __forceinline__ float hc_bf16_square_partial(
-    const float* values, int tid, int n) {
+    const void* values, size_t offset, int tid, int n, int bf16) {
     float partial = 0.0f;
     for (int base = tid; base < n; base += 10 * 256) {
         float raw[10];
 #pragma unroll
         for (int u = 0; u < 10; ++u) {
             const int j = base + u * 256;
-            raw[u] = j < n ? values[j] : 0.0f;
+            raw[u] = j < n ? hc_state_load(values, offset + j, bf16) : 0.0f;
         }
 #pragma unroll
         for (int u = 0; u < 10; ++u) {
@@ -812,18 +836,55 @@ extern "C" __global__ void hyper_write_f32(
     output[row_offset + column] = bf16_to_f32(bf16_round(value));
 }
 
+// hyper_write_f32 on BF16-stored HC streams (the Qwen4 F16 prefill route):
+// two adjacent columns per thread (one 32-bit pair of BF16 values), the same
+// expression per column, the result stored as BF16 bits.  `hidden` is even.
+// Grid [ceil(branches * hidden / 512), rows], block 256.
+extern "C" __global__ void hyper_write_bf16x2(
+    const unsigned int* input,
+    const float* mixed,
+    const float* gates,
+    unsigned int* output,
+    int branches,
+    int hidden,
+    int rows) {
+    const int pair = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int column = 2 * pair;
+    const int row = (int)blockIdx.y;
+    const int wide = branches * hidden;
+    if (row >= rows || column >= wide) return;
+    const int branch = column / hidden;
+    const float gate_logit =
+        bf16_to_f32(bf16_round(gates[row * branches + branch]));
+    const float gate_scaled = bf16_to_f32(
+        bf16_round(gate_logit / (float)branches));
+    const float gate = bf16_to_f32(bf16_round(
+        2.0f * bf16_to_f32(bf16_round(
+            1.0f / (1.0f + expf(-gate_scaled))))));
+    const float2 m = *(const float2*)(mixed + row * hidden + column % hidden);
+    const unsigned int w = input[(row * wide + column) >> 1];
+    const float lo = bf16_to_f32(bf16_round(gate * bf16_to_f32(bf16_round(m.x))))
+        + __uint_as_float(w << 16);
+    const float hi = bf16_to_f32(bf16_round(gate * bf16_to_f32(bf16_round(m.y))))
+        + __uint_as_float(w & 0xFFFF0000u);
+    output[(row * wide + column) >> 1] =
+        (unsigned int)bf16_round(lo).data | ((unsigned int)bf16_round(hi).data << 16);
+}
+
 // `normalized16`, when non-null, also receives each normalized value rounded
 // to F16 (RNE, as convert_f32_to_f16) for the F16 WMMA projection, and
 // `normalized`, when non-null, then holds the (already BF16-rounded) values
 // as BF16 bits.
+// `input` is the HC streams (BF16 bits when `state_bf16`).
 extern "C" __global__ void hyper_norm_f32(
-    const float* input,
+    const void* input,
     const __hip_bfloat16* norm_weight,
     float* normalized,
     int branches,
     int hidden,
     int rows,
-    _Float16* normalized16) {
+    _Float16* normalized16,
+    int state_bf16) {
     const int branch = (int)blockIdx.x;
     const int row = (int)blockIdx.y;
     if (branch >= branches || row >= rows) return;
@@ -831,7 +892,7 @@ extern "C" __global__ void hyper_norm_f32(
     const int offset = (row * branches + branch) * hidden;
     const int weight_offset = branch * hidden;
     __shared__ float rms_sum[256];
-    rms_sum[tid] = hc_bf16_square_partial(input + offset, tid, hidden);
+    rms_sum[tid] = hc_bf16_square_partial(input, offset, tid, hidden, state_bf16);
     __syncthreads();
     for (int stride = (int)blockDim.x / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
@@ -844,7 +905,7 @@ extern "C" __global__ void hyper_norm_f32(
     for (int j = tid; j < hidden; j += 256) {
         const int column = offset + j;
         const float value = bf16_to_f32(bf16_round(
-            bf16_to_f32(bf16_round(input[column]))
+            bf16_to_f32(bf16_round(hc_state_load(input, column, state_bf16)))
             * inv * (1.0f + bf16_to_f32(norm_weight[weight_offset + j]))));
         if (normalized16) {
             normalized16[column] = (_Float16)value;
@@ -883,12 +944,14 @@ static __device__ __forceinline__ float hc_lane0_tree_sum(float v) {
 // row w, so both results are bitwise unchanged.
 // Grid [rows], block 256, dynamic LDS (2 * hidden + 4 * 256) * 4 bytes.
 // Requires four branches, hidden % 256 == 0 and hidden <= 2560.
+// `input` is the HC streams (BF16 bits when `state_bf16`).
 extern "C" __global__ __launch_bounds__(256) void hyper_norm_gate_f32(
-    const float* input,
+    const void* input,
     const __hip_bfloat16* norm_weight,
     const unsigned short* gate_weight,
     float* gates,
-    int hidden) {
+    int hidden,
+    int state_bf16) {
     constexpr int branches = 4;
     constexpr int U = 10;
     extern __shared__ float hc_lds[];
@@ -899,14 +962,26 @@ extern "C" __global__ __launch_bounds__(256) void hyper_norm_gate_f32(
     float* rms_sum = hc_lds + wide / 2;
     const int row = (int)blockIdx.x;
     const int tid = (int)threadIdx.x;
-    const float* in = input + (size_t)row * wide;
+    const size_t in = (size_t)row * wide;
     // The whole row is loaded up front (ten values per branch per thread).
     float raw[branches][U];
+    if (state_bf16) {
+        const unsigned short* s = (const unsigned short*)input + in;
 #pragma unroll
-    for (int b = 0; b < branches; ++b)
+        for (int b = 0; b < branches; ++b)
 #pragma unroll
-        for (int u = 0; u < U; ++u)
-            raw[b][u] = u < per ? in[b * hidden + tid + 256 * u] : 0.0f;
+            for (int u = 0; u < U; ++u)
+                raw[b][u] = u < per
+                    ? __uint_as_float((unsigned int)s[b * hidden + tid + 256 * u] << 16)
+                    : 0.0f;
+    } else {
+        const float* s = (const float*)input + in;
+#pragma unroll
+        for (int b = 0; b < branches; ++b)
+#pragma unroll
+            for (int u = 0; u < U; ++u)
+                raw[b][u] = u < per ? s[b * hidden + tid + 256 * u] : 0.0f;
+    }
 #pragma unroll
     for (int b = 0; b < branches; ++b) {
         float partial = 0.0f;

@@ -307,6 +307,7 @@ pub fn execute_final_hyper(
     streams: &GpuTensor,
     scratch: &Qwen4LayerScratch<'_>,
     rows: usize,
+    state_bf16: bool,
 ) -> Result<(), DispatchError> {
     validate_final_hyper(dims, weights, streams, scratch, rows)?;
     let wide = checked_mul(rows, dims.wide(), "final hyper input")?;
@@ -315,6 +316,7 @@ pub fn execute_final_hyper(
     execute_shared_final_hyper(
         gpu,
         &HyperReadOp {
+            state_bf16,
             rotation: scratch.rotation,
             input: &view(streams, 0, wide),
             norm_weight: weights.norm,

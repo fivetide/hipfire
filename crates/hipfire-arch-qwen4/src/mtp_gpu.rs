@@ -75,6 +75,7 @@ fn hc_read(
             normalized,
             branches: config.hc_count,
             hidden: config.hidden_size,
+            state_bf16: false,
         },
     )?;
     dispatch_gemv(
@@ -140,6 +141,7 @@ fn hc_write(
             normalized,
             branches: config.hc_count,
             hidden: config.hidden_size,
+            state_bf16: false,
         },
     )?;
     dispatch_gemv(
@@ -161,6 +163,7 @@ fn hc_write(
             output,
             branches: config.hc_count,
             hidden: config.hidden_size,
+            state_bf16: false,
         },
     )?;
     Ok(())
@@ -1234,6 +1237,7 @@ impl Qwen4MtpGpu {
                 normalized: &scratch.embedding_norm,
                 branches: 1,
                 hidden: config.hidden_size,
+                state_bf16: false,
             },
         )?;
         let fc_embedding = weights.resident(&weights.mtp.fc_embedding)?;
@@ -1256,6 +1260,7 @@ impl Qwen4MtpGpu {
                 normalized: &scratch.hidden_norm,
                 branches: MTP_BRANCHES,
                 hidden: config.hidden_size,
+                state_bf16: false,
             },
         )?;
         let fc_hidden = weights.resident(&weights.mtp.fc_hidden)?;

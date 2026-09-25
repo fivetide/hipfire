@@ -2016,6 +2016,7 @@ fn hc_read_case(
                     normalized: &y,
                     branches,
                     hidden,
+                    state_bf16: false,
                 },
             )
             .map_err(|error| error.to_string())?;
@@ -2131,6 +2132,7 @@ fn hc_inject_case(
                 output: &y,
                 branches,
                 hidden,
+                state_bf16: false,
             },
         )
         .map_err(|error| error.to_string())?;

@@ -25307,6 +25307,19 @@ impl Gpu {
             && *QWEN4_F16_WMMA
     }
 
+    /// Whether a Qwen4 forward of `rows` tokens keeps its HC residual streams as
+    /// BF16 bits (the F16 prefill route: gfx1151, >= QWEN4_F16_WMMA_MIN_TOKENS
+    /// rows, no recorder or capture, not opted out).  Every HC reader rounds
+    /// the stream to BF16 on load, so the stored value is the one it uses;
+    /// the forward decides once and hands the flag to every stream op.
+    pub fn qwen4_bf16_streams(&self, rows: usize) -> bool {
+        self.arch_caps.is_gfx1151()
+            && rows >= QWEN4_F16_WMMA_MIN_TOKENS
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && *QWEN4_F16_WMMA
+    }
+
     /// The shared FP16 activation scratch as an `elems`-long F16 view, for a
     /// producer that writes the F16 WMMA input itself.  Valid until the next
     /// FP16 conversion.

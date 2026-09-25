@@ -18,9 +18,10 @@ use crate::types::DispatchError;
 use rdna_compute::tensor_ops::{
     argmax_f32, bf16_roundtrip_f32, gated_delta_conv, gated_delta_conv_batched, gated_delta_gate,
     gated_delta_gate_batched, gated_delta_params, gated_delta_params_batched, gated_delta_step,
-    gated_delta_step_batched, gated_delta_step_gate_cols, hc_activation_fused_f32, hyper_norm,
-    hyper_norm_f16, hyper_norm_gate, hyper_read_projected, hyper_read_up_fused, hyper_read_up_wmma,
-    hyper_write, indexed_attention_attention_batch, indexed_attention_cache_append_batch,
+    gated_delta_step_batched, gated_delta_step_gate_cols, hc_activation_fused_f32,
+    hc_state_bf16_add_f32, hc_state_bf16_to_f32, hyper_norm, hyper_norm_f16, hyper_norm_gate,
+    hyper_read_projected, hyper_read_up_fused, hyper_read_up_wmma, hyper_write,
+    indexed_attention_attention_batch, indexed_attention_cache_append_batch,
     indexed_attention_norm_rope_batch, indexed_attention_pool_rope, indexed_attention_select_batch,
     scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv, GatedDeltaConvBatched, GatedDeltaGate,
     GatedDeltaGateBatched, GatedDeltaParams, GatedDeltaParamsBatched, GatedDeltaStep,
@@ -268,6 +269,9 @@ fn project_one(
 /// Hyper-connection read: grouped RMSNorm, low-rank down/up projections,
 /// source BF16 boundaries, sigmoid gating, and branch reduction.
 pub struct HyperReadOp<'a> {
+    /// The HC streams hold BF16 bits for this forward
+    /// ([`Gpu::qwen4_bf16_streams`]).
+    pub state_bf16: bool,
     pub input: &'a GpuTensor,
     pub norm_weight: &'a GpuTensor,
     pub input_mix_down: WeightRef<'a>,
@@ -348,6 +352,7 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
         normalized: &normalized,
         branches: op.branches,
         hidden: op.hidden,
+        state_bf16: op.state_bf16,
     };
     // gfx1151 multi-row: the up projection feeds the branch mix directly;
     // bitwise identical to the GEMM + hyper_read_projected pair below.
@@ -484,6 +489,9 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
 /// Hyper-connection write: grouped normalization, branch gate projection, and
 /// in-place residual injection in the source-defined BF16 order.
 pub struct HyperWriteOp<'a> {
+    /// The HC streams hold BF16 bits for this forward
+    /// ([`Gpu::qwen4_bf16_streams`]).
+    pub state_bf16: bool,
     pub input: &'a GpuTensor,
     pub norm_weight: &'a GpuTensor,
     pub block_inject: WeightRef<'a>,
@@ -573,6 +581,7 @@ pub fn execute_hyper_write(gpu: &mut Gpu, op: &HyperWriteOp<'_>) -> Result<(), D
                 rows: op.rows,
                 branches: op.branches,
                 hidden: op.hidden,
+                state_bf16: op.state_bf16,
             },
         ))?;
     } else {
@@ -584,6 +593,7 @@ pub fn execute_hyper_write(gpu: &mut Gpu, op: &HyperWriteOp<'_>) -> Result<(), D
                 normalized: &normalized,
                 branches: op.branches,
                 hidden: op.hidden,
+                state_bf16: op.state_bf16,
             },
         ))?;
         project_weight(
@@ -605,6 +615,7 @@ pub fn execute_hyper_write(gpu: &mut Gpu, op: &HyperWriteOp<'_>) -> Result<(), D
             output: &output,
             branches: op.branches,
             hidden: op.hidden,
+            state_bf16: op.state_bf16,
         },
     ))
 }
@@ -1484,6 +1495,9 @@ pub fn execute_indexed_attention(
 /// kernel/dilation are supplied by the architecture; the low-level wrapper
 /// does not know a model's fixed layer index or hidden width.
 pub struct GroupedDepthwiseOp<'a> {
+    /// The HC streams hold BF16 bits for this forward
+    /// ([`Gpu::qwen4_bf16_streams`]).
+    pub state_bf16: bool,
     pub key: WeightRef<'a>,
     pub value: WeightRef<'a>,
     pub norm_key: &'a GpuTensor,
@@ -1593,7 +1607,16 @@ pub fn execute_grouped_depthwise(
     )?;
     // A recorded launch, not a `copy_d2d`: a retained tape replays dispatches, so
     // a device copy inside the body would be state the replay cannot reproduce.
-    hip(gpu.copy_f32_buffer(&query, &streams, op.rows * channels))?;
+    if op.state_bf16 {
+        hip(hc_state_bf16_to_f32(
+            gpu,
+            &streams,
+            &query,
+            op.rows * channels,
+        ))?;
+    } else {
+        hip(gpu.copy_f32_buffer(&query, &streams, op.rows * channels))?;
+    }
     hip(rdna_compute::grouped_ops::grouped_gate_bf16(
         gpu,
         &rdna_compute::grouped_ops::GroupedGate {
@@ -1637,6 +1660,14 @@ pub fn execute_grouped_depthwise(
             },
         ),
     )?;
+    if op.state_bf16 {
+        return hip(hc_state_bf16_add_f32(
+            gpu,
+            &streams,
+            &output,
+            op.rows * channels,
+        ));
+    }
     hip(gpu.add_f32(&streams, &output, &streams))
 }
 
