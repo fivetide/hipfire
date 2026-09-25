@@ -39867,6 +39867,42 @@ mod tests {
         );
     }
 
+    /// The 128-wide rotation straight to F16 must equal rotating in F32 and
+    /// converting, at the Qwen4 down shape (K = 640, 1131 tokens x top-10).
+    #[test]
+    #[ignore = "requires a gfx1151 GPU and working HIP toolchain"]
+    fn rotate_128_f16_matches_rotate_then_convert() {
+        const K: usize = 640;
+        const ROWS: usize = 11310;
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) if gpu.arch_caps.is_gfx1151() => gpu,
+            _ => {
+                eprintln!("skip: needs gfx1151");
+                return;
+            }
+        };
+        let x: Vec<f32> = (0..ROWS * K)
+            .map(|i| ((i * 7919 % 4001) as f32 - 2000.0) / 311.0)
+            .collect();
+        let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("x");
+        let rot = gpu.zeros(&[ROWS * K], DType::F32).expect("rot");
+        gpu.rotate_x_mq_128_v2(&x_gpu, &rot, K, ROWS).expect("rotate");
+        let want_ptr = gpu.convert_fp16_x_uncached(&rot, ROWS * K).expect("convert");
+        let mut want = vec![0u8; ROWS * K * 2];
+        gpu.hip
+            .memcpy_dtoh(&mut want, unsafe { &DeviceBuffer::from_raw(want_ptr, ROWS * K * 2) })
+            .expect("want");
+        let got_t = gpu.rotate_x_mq_128_v2_f16(&x_gpu, K, ROWS).expect("rotate f16");
+        let mut got = vec![0u8; ROWS * K * 2];
+        gpu.hip.memcpy_dtoh(&mut got, &got_t.buf).expect("got");
+        let differing = got
+            .chunks_exact(2)
+            .zip(want.chunks_exact(2))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(differing, 0, "F16 rotation differs in {differing} values");
+    }
+
     /// Rotating straight to F16 and running the pre-converted MQ6 GEMM must
     /// produce the bytes of the F32 rotation + converting GEMM.
     #[test]

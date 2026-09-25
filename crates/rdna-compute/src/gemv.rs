@@ -3584,6 +3584,54 @@ impl Gpu {
     ///
     /// Unlike the legacy V1 launcher this handles a logical tail when K is
     /// not a multiple of 128 and writes only the logical K elements.
+    /// `rotate_x_mq_128_v2` into the shared FP16 X scratch: the rotated rows
+    /// rounded to F16 as `convert_f32_to_f16` would.  Valid until the next
+    /// FP16 conversion.
+    pub fn rotate_x_mq_128_v2_f16(
+        &mut self,
+        x: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "mq_rotate_x_128_v2",
+            kernels::MQ_ROTATE_X_128_V2_SRC,
+            "mq_rotate_x_128_v2_f16",
+        )?;
+        self.ensure_mq_signs_128()?;
+        let out = self.qwen4_f16_x_scratch(k * batch_size)?;
+        let xp = x.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let s1 = self.scratch.mq_signs1_128.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2_128.as_ref().unwrap().buf.as_ptr();
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "mq_rotate_x_128_v2_f16",
+            [k.div_ceil(128) as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(op);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_i32(kv);
+                b
+            },
+        )?;
+        Ok(out)
+    }
+
     pub fn rotate_x_mq_128_v2(
         &mut self,
         x: &GpuTensor,

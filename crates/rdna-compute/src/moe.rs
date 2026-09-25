@@ -2372,23 +2372,18 @@ impl Gpu {
         // F16 WMMA grouped down, 8.6 -> 5.4 ms at 1131 tokens.  Not
         // bit-exact (F16 dequant/inputs); gated by KLD against the BF16
         // source like the gate/up arm.  HIPFIRE_QWEN4_F16_WMMA=0 opts out.
-        if self.arch_caps.is_gfx1151()
-            && m == 2560
-            && k == 640
-            && x_row_div == 1
-            && x_src_rows >= 10 * crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
-            && *crate::gemm::QWEN4_F16_WMMA
-        {
+        if x_row_div == 1 && self.qwen4_moe_down_wmma_applies(m, k, x_src_rows) {
+            // Uncached: the activation buffer is reused with new contents per layer.
+            let xp = self.convert_fp16_x_uncached(x_src, x_src_rows * k)?;
             return self.gemm_mq4g128v2_moe_grouped_wmma_gfx1151(
                 expert_ptrs,
                 expert_tile_ids,
                 sorted_slot_index,
-                x_src,
+                xp,
                 y_grouped,
                 m,
                 k,
                 grouped_rows,
-                x_src_rows,
             );
         }
         let o8_r16 = self.arch_caps.is_gfx1151() && m == 2560 && k == 640;
@@ -2408,20 +2403,57 @@ impl Gpu {
         )
     }
 
-    /// F16 WMMA grouped QT53 down (gfx1151, K % 128 == 0): one 16x16 output
-    /// tile per wave, X converted to F16 per call.
+    /// Whether the gfx1151 F16 WMMA grouped QT53 down applies (one X row per
+    /// top-10 slot, >= QWEN4_F16_WMMA_MIN_TOKENS tokens, not opted out).
+    pub fn qwen4_moe_down_wmma_applies(&self, m: usize, k: usize, x_src_rows: usize) -> bool {
+        self.arch_caps.is_gfx1151()
+            && m == 2560
+            && k == 640
+            && x_src_rows >= 10 * crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+            && *crate::gemm::QWEN4_F16_WMMA
+    }
+
+    /// [`Gpu::gemm_mq4g128v2_moe_grouped_top10`] on the F16 WMMA route with X
+    /// already rotated to F16 (`rotate_x_mq_128_v2_f16`): the route's bytes
+    /// without its conversion pass.  Callers check
+    /// [`Gpu::qwen4_moe_down_wmma_applies`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq4g128v2_moe_grouped_top10_xf16(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_f16: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        grouped_rows: usize,
+    ) -> HipResult<()> {
+        self.gemm_mq4g128v2_moe_grouped_wmma_gfx1151(
+            expert_ptrs,
+            expert_tile_ids,
+            sorted_slot_index,
+            x_f16.buf.as_ptr(),
+            y_grouped,
+            m,
+            k,
+            grouped_rows,
+        )
+    }
+
+    /// F16 WMMA grouped QT53 down (gfx1151, K % 128 == 0) over F16 X
+    /// (`x_f16`, one row per top-10 slot): one 16x16 output tile per wave.
     #[allow(clippy::too_many_arguments)]
     fn gemm_mq4g128v2_moe_grouped_wmma_gfx1151(
         &mut self,
         expert_ptrs: &GpuTensor,
         expert_tile_ids: &GpuTensor,
         sorted_slot_index: &GpuTensor,
-        x_src: &GpuTensor,
+        x_f16: *mut c_void,
         y_grouped: &GpuTensor,
         m: usize,
         k: usize,
         grouped_rows: usize,
-        x_src_rows: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const FUNC: &str = "gemm_mq4g128v2_moe_grouped_wmma_gfx1151";
@@ -2430,8 +2462,7 @@ impl Gpu {
             kernels::GEMM_MQ4G128V2_MOE_GROUPED_WMMA_GFX1151_SRC,
             FUNC,
         )?;
-        // Uncached: the activation buffer is reused with new contents per layer.
-        let xp = self.convert_fp16_x_uncached(x_src, x_src_rows * k)?;
+        let xp = x_f16;
         let ep = expert_ptrs.buf.as_ptr();
         let tp = expert_tile_ids.buf.as_ptr();
         let sp = sorted_slot_index.buf.as_ptr();

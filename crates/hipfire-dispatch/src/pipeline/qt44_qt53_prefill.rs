@@ -356,6 +356,13 @@ pub(crate) fn activation(
             hip(gpu.bf16_round_trip_f32(p.rot_batch))?;
         }
     }
+    // The F16 WMMA down rotates straight to F16 itself (see `down`).
+    if use_path2
+        && p.down_k == p.mi
+        && gpu.qwen4_moe_down_wmma_applies(p.down_m, p.down_k, total_slots)
+    {
+        return Ok(());
+    }
     hip(gpu.rotate_x_mq_128_v2(p.rot_batch, p.rot_batch, p.mi, total_slots))
 }
 
@@ -367,7 +374,24 @@ pub(crate) fn down(
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
     let total_slots = p.batch_size * p.k_top;
-    if use_path2 {
+    if use_path2
+        && p.down_k == p.mi
+        && gpu.qwen4_moe_down_wmma_applies(p.down_m, p.down_k, total_slots)
+    {
+        // Rotation and GEMM in one stage: the rotated F16 rows live in the
+        // shared FP16 scratch, which another stage's GEMM would overwrite.
+        let x_f16 = hip(gpu.rotate_x_mq_128_v2_f16(p.rot_batch, p.mi, total_slots))?;
+        hip(gpu.gemm_mq4g128v2_moe_grouped_top10_xf16(
+            p.expert_down_ptrs,
+            p.expert_tile_ids,
+            p.sorted_slot_index,
+            &x_f16,
+            p.y_down_grouped,
+            p.down_m,
+            p.down_k,
+            grouped_rows,
+        ))?;
+    } else if use_path2 {
         hip(gpu.gemm_mq4g128v2_moe_grouped_top10(
             p.expert_down_ptrs,
             p.expert_tile_ids,
