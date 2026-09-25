@@ -583,7 +583,9 @@ pub fn hyper_norm(gpu: &mut Gpu, p: &HyperNorm<'_>) -> HipResult<()> {
 }
 
 /// [`hyper_norm`] that also writes the normalized rows as F16 into
-/// `normalized_f16` (same element count), the F16 WMMA projection's input.
+/// `normalized_f16` (same element count), the F16 WMMA projection's input,
+/// and stores `normalized` as BF16 bits (the values are BF16-rounded) in the
+/// first half of its buffer: read it with `HyperReadUpFused::normalized_bf16`.
 pub fn hyper_norm_f16(
     gpu: &mut Gpu,
     p: &HyperNorm<'_>,
@@ -704,6 +706,8 @@ pub struct HyperReadUpFused<'a> {
     pub rows: usize,
     pub hidden: usize,
     pub low_rank: usize,
+    /// `normalized` holds BF16 bits ([`hyper_norm_f16`]), not F32.
+    pub normalized_bf16: bool,
 }
 
 pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<()> {
@@ -739,6 +743,7 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
     args.push_i32(hidden);
     args.push_i32(low_rank);
     args.push_i32(rows);
+    args.push_i32(i32::from(p.normalized_bf16));
     args.pad_to(16);
     gpu.launch_blob_recorded(
         "hyper_read_up_fused_f32",
@@ -2648,9 +2653,40 @@ mod tests {
                 rows,
                 hidden,
                 low_rank,
+                normalized_bf16: false,
             },
         )
         .expect("fused");
+        // The same rows as BF16 bits (RNE) in the first half of an F32
+        // buffer, as hyper_norm_f16 stores them.
+        let mut bf16_bytes: Vec<u8> = wave(3, rows * wide, 2.0)
+            .iter()
+            .flat_map(|v| {
+                let u = v.to_bits();
+                (((u + 0x7FFF + ((u >> 16) & 1)) >> 16) as u16).to_le_bytes()
+            })
+            .collect();
+        bf16_bytes.resize(rows * wide * 4, 0);
+        let mut normalized_bf16 = gpu
+            .upload_raw(&bf16_bytes, &[bf16_bytes.len()])
+            .expect("normalized bf16");
+        normalized_bf16.dtype = DType::F32;
+        normalized_bf16.shape = vec![rows * wide];
+        let fused_bf16 = gpu.zeros(&[rows * hidden], DType::F32).expect("fused bf16");
+        hyper_read_up_fused(
+            &mut gpu,
+            &HyperReadUpFused {
+                up_weight: &up_weight,
+                low: &low,
+                normalized: &normalized_bf16,
+                mixed: &fused_bf16,
+                rows,
+                hidden,
+                low_rank,
+                normalized_bf16: true,
+            },
+        )
+        .expect("fused bf16");
         let up = gpu.zeros(&[rows * wide], DType::F32).expect("up");
         gpu.gemm_bf16_xf32_multirow(&up_weight, &low, &up, wide, low_rank, rows)
             .expect("gemm");
@@ -2679,10 +2715,17 @@ mod tests {
         let (a, b) = (bits(&gpu, &fused), bits(&gpu, &reference));
         assert!(b.iter().any(|v| *v != 0), "mix is all zero");
         assert_eq!(a, b, "fused HC read differs");
+        assert_eq!(
+            bits(&gpu, &fused_bf16),
+            b,
+            "BF16-normalized HC read differs"
+        );
         for tensor in [
             up_weight,
             low,
             normalized,
+            normalized_bf16,
+            fused_bf16,
             fused,
             up,
             reference,

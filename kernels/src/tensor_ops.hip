@@ -630,7 +630,8 @@ extern "C" __global__ void hyper_write_f32(
 }
 
 // `normalized16`, when non-null, also receives each normalized value rounded
-// to F16 (RNE, as convert_f32_to_f16) for the F16 WMMA projection.
+// to F16 (RNE, as convert_f32_to_f16) for the F16 WMMA projection, and
+// `normalized` then holds the (already BF16-rounded) values as BF16 bits.
 extern "C" __global__ void hyper_norm_f32(
     const float* input,
     const __hip_bfloat16* norm_weight,
@@ -661,8 +662,12 @@ extern "C" __global__ void hyper_norm_f32(
         const float value = bf16_to_f32(bf16_round(
             bf16_to_f32(bf16_round(input[column]))
             * inv * (1.0f + bf16_to_f32(norm_weight[weight_offset + j]))));
-        normalized[column] = value;
-        if (normalized16) normalized16[column] = (_Float16)value;
+        if (normalized16) {
+            normalized16[column] = (_Float16)value;
+            ((unsigned short*)normalized)[column] = (unsigned short)(__float_as_uint(value) >> 16);
+        } else {
+            normalized[column] = value;
+        }
     }
 }
 // Lane 0 of `v += __shfl_down(v, off, 32)` for off = 16..1, with the
@@ -778,6 +783,8 @@ extern "C" __global__ void hyper_norm_gate_f32(
 // (each widened weight serves four tokens).
 // Grid [hidden / 8, ceil(rows / 128)], block 256, dynamic LDS
 // 32 * (low_rank / 2 + 1) * 4 bytes.  branches == 4, hidden % 8 == 0.
+// `normalized_bf16` != 0: `normalized` holds BF16 bits (hyper_norm_f32 with
+// an F16 output), which widen to the value the F32 path rounds to.
 extern "C" __global__ __launch_bounds__(256, 1) void hyper_read_up_fused_f32(
     const unsigned short* __restrict__ W,
     const float* __restrict__ X,
@@ -785,7 +792,8 @@ extern "C" __global__ __launch_bounds__(256, 1) void hyper_read_up_fused_f32(
     float* __restrict__ mixed,
     int hidden,
     int K,
-    int N) {
+    int N,
+    int normalized_bf16) {
     constexpr int TPW = 4;
     constexpr int TGROUPS = 4;
     const int branches = 4;
@@ -865,7 +873,9 @@ extern "C" __global__ __launch_bounds__(256, 1) void hyper_read_up_fused_f32(
             const size_t token = (size_t)tok[t];
             const float gate_input = bf16_to_f32(bf16_round(h[t][0]));
             const float gate = bf16_to_f32(bf16_round(1.0f / (1.0f + expf(-gate_input))));
-            const float normed = bf16_to_f32(bf16_round(normalized[token * wide + my_row]));
+            const float normed = normalized_bf16
+                ? __uint_as_float((unsigned int)((const unsigned short*)normalized)[token * wide + my_row] << 16)
+                : bf16_to_f32(bf16_round(normalized[token * wide + my_row]));
             const float term = bf16_to_f32(bf16_round(gate * normed));
             float value = 0.0f;
 #pragma unroll

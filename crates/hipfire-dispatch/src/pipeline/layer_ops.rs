@@ -349,10 +349,23 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
         branches: op.branches,
         hidden: op.hidden,
     };
-    // F16 WMMA down projection: the norm writes its F16 input directly.
-    if op.input_mix_down.dtype == DType::BF16
-        && gpu.qwen4_f16_wmma_applies(op.input_mix_down.buf, op.input_mix_down.k, op.rows)
-    {
+    // gfx1151 multi-row: the up projection feeds the branch mix directly;
+    // bitwise identical to the GEMM + hyper_read_projected pair below.
+    let up_fused = gpu.arch_caps.is_gfx1151()
+        && op.rows > 1
+        && op.branches == 4
+        && op.input_mix_up.dtype == DType::BF16
+        && op.input_mix_up.m == wide
+        && op.input_mix_up.k == op.low_rank
+        && op.low_rank % 8 == 0
+        && (257..=512).contains(&op.low_rank)
+        && op.hidden % 8 == 0;
+    // F16 WMMA down projection: the norm writes its F16 input directly and
+    // leaves `normalized` as BF16 bits, which only the fused up path reads.
+    let f16 = up_fused
+        && op.input_mix_down.dtype == DType::BF16
+        && gpu.qwen4_f16_wmma_applies(op.input_mix_down.buf, op.input_mix_down.k, op.rows);
+    if f16 {
         let normalized_f16 = hip(gpu.qwen4_f16_x_scratch(op.rows * wide))?;
         hip(hyper_norm_f16(gpu, &norm, &normalized_f16))?;
         hip(gpu.gemm_bf16_xf16_f16_wmma(
@@ -428,18 +441,7 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
             ))?;
         }
     }
-    // gfx1151 multi-row: the up projection feeds the branch mix directly;
-    // bitwise identical to the GEMM + hyper_read_projected pair below.
-    if gpu.arch_caps.is_gfx1151()
-        && op.rows > 1
-        && op.branches == 4
-        && op.input_mix_up.dtype == DType::BF16
-        && op.input_mix_up.m == wide
-        && op.input_mix_up.k == op.low_rank
-        && op.low_rank % 8 == 0
-        && (257..=512).contains(&op.low_rank)
-        && op.hidden % 8 == 0
-    {
+    if up_fused {
         return hip(hyper_read_up_fused(
             gpu,
             &HyperReadUpFused {
@@ -450,6 +452,7 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
                 rows: op.rows,
                 hidden: op.hidden,
                 low_rank: op.low_rank,
+                normalized_bf16: f16,
             },
         ));
     }
