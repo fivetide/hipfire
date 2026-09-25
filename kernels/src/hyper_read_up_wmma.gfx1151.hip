@@ -3,8 +3,9 @@
 
 // HC read tail on gfx11 WMMA: the BF16 [4 * hidden, K] up projection of
 // `low` ([N, K] F32 holding BF16 values) with hyper_read_projected_f32's
-// branch mix fused, for `normalized` stored as BF16 bits (hyper_norm_f16).
-// Both operands are exact in BF16, so the logits differ from
+// branch mix fused, reading the normalized rows from hyper_norm_f16's F16
+// copy (the BF16-rounded values, exact in F16 above its 6e-5 normal floor).
+// Both GEMM operands are exact in BF16, so the logits differ from
 // hyper_read_up_fused_f32 only by F32 summation order (BF16 WMMA
 // accumulates in F32); the epilogue is that kernel's expression.
 //
@@ -29,7 +30,7 @@ static __device__ __forceinline__ float hru_bf16r(float v) {
 extern "C" __global__ __launch_bounds__(256) void hyper_read_up_wmma_bf16(
     const unsigned short* __restrict__ W,
     const float* __restrict__ X,
-    const unsigned short* __restrict__ normalized,
+    const _Float16* __restrict__ normalized,
     float* __restrict__ mixed,
     int hidden,
     int K,
@@ -53,7 +54,7 @@ extern "C" __global__ __launch_bounds__(256) void hyper_read_up_wmma_bf16(
     for (int t0 = blockIdx.y * TOKENS + wave * 16; t0 < block_end; t0 += 128) {
         // The epilogue's normalized values, fetched before the K loop so the
         // loads overlap the WMMA work.
-        unsigned int nv[4][8];
+        _Float16 nv[4][8];
 #pragma unroll
         for (int i = 0; i < 8; i++) {
             const int token = min(t0 + 2 * i + (lane >> 4), N - 1);
@@ -96,7 +97,7 @@ extern "C" __global__ __launch_bounds__(256) void hyper_read_up_wmma_bf16(
             for (int br = 0; br < 4; br++) {
                 const float gate_input = hru_bf16r(acc[br][i]);
                 const float gate = hru_bf16r(1.0f / (1.0f + expf(-gate_input)));
-                const float normed = __uint_as_float(nv[br][i] << 16);
+                const float normed = (float)nv[br][i];
                 value += hru_bf16r(gate * normed);
             }
             mixed[(size_t)token * hidden + j] = hru_bf16r(value / 4.0f);

@@ -768,7 +768,8 @@ extern "C" __global__ void hyper_write_f32(
 
 // `normalized16`, when non-null, also receives each normalized value rounded
 // to F16 (RNE, as convert_f32_to_f16) for the F16 WMMA projection, and
-// `normalized` then holds the (already BF16-rounded) values as BF16 bits.
+// `normalized`, when non-null, then holds the (already BF16-rounded) values
+// as BF16 bits.
 extern "C" __global__ void hyper_norm_f32(
     const float* input,
     const __hip_bfloat16* norm_weight,
@@ -801,7 +802,8 @@ extern "C" __global__ void hyper_norm_f32(
             * inv * (1.0f + bf16_to_f32(norm_weight[weight_offset + j]))));
         if (normalized16) {
             normalized16[column] = (_Float16)value;
-            ((unsigned short*)normalized)[column] = (unsigned short)(__float_as_uint(value) >> 16);
+            if (normalized)
+                ((unsigned short*)normalized)[column] = (unsigned short)(__float_as_uint(value) >> 16);
         } else {
             normalized[column] = value;
         }

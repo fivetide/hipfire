@@ -650,28 +650,31 @@ pub struct HyperNorm<'a> {
 }
 
 pub fn hyper_norm(gpu: &mut Gpu, p: &HyperNorm<'_>) -> HipResult<()> {
-    hyper_norm_impl(gpu, p, std::ptr::null_mut())
+    hyper_norm_impl(gpu, p, std::ptr::null_mut(), false)
 }
 
-/// [`hyper_norm`] that also writes the normalized rows as F16 into
-/// `normalized_f16` (same element count), the F16 WMMA projection's input,
-/// and stores `normalized` as BF16 bits (the values are BF16-rounded) in the
-/// first half of its buffer: read it with `HyperReadUpFused::normalized_bf16`.
+/// [`hyper_norm`] that writes the normalized rows as F16 into
+/// `normalized_f16` (same element count), the F16 WMMA projections' input,
+/// and with `bf16_copy` also stores `normalized` as BF16 bits (the values are
+/// BF16-rounded) in the first half of its buffer: read it with
+/// `HyperReadUpFused::normalized_bf16`.  Without it `normalized` is untouched.
 pub fn hyper_norm_f16(
     gpu: &mut Gpu,
     p: &HyperNorm<'_>,
     normalized_f16: &GpuTensor,
+    bf16_copy: bool,
 ) -> HipResult<()> {
     if normalized_f16.dtype != DType::F16 || normalized_f16.numel() != p.normalized.numel() {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
-    hyper_norm_impl(gpu, p, normalized_f16.buf.as_ptr())
+    hyper_norm_impl(gpu, p, normalized_f16.buf.as_ptr(), bf16_copy)
 }
 
 fn hyper_norm_impl(
     gpu: &mut Gpu,
     p: &HyperNorm<'_>,
     normalized_f16: *mut std::ffi::c_void,
+    bf16_copy: bool,
 ) -> HipResult<()> {
     ensure_f32(p.input)?;
     ensure_f32(p.normalized)?;
@@ -696,7 +699,11 @@ fn hyper_norm_impl(
     let mut args = KernargBlob::new();
     args.push_ptr(p.input.buf.as_ptr());
     args.push_ptr(p.norm_weight.buf.as_ptr());
-    args.push_ptr(p.normalized.buf.as_ptr());
+    args.push_ptr(if normalized_f16.is_null() || bf16_copy {
+        p.normalized.buf.as_ptr()
+    } else {
+        std::ptr::null_mut()
+    });
     args.push_i32(branches);
     args.push_i32(hidden);
     args.push_i32(rows_i);
@@ -829,17 +836,17 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
-/// [`hyper_read_up_fused`] on gfx11 BF16 WMMA for `normalized` stored as BF16
-/// bits ([`hyper_norm_f16`]). Not bit-exact: the logits accumulate the same
-/// exact BF16 products in WMMA's F32 order, so a gate occasionally rounds one
-/// BF16 step apart; the epilogue is unchanged.
+/// [`hyper_read_up_fused`] on gfx11 BF16 WMMA; `normalized` is
+/// [`hyper_norm_f16`]'s F16 copy (`normalized_bf16` is ignored). Not
+/// bit-exact: the logits accumulate the same exact BF16 products in WMMA's F32
+/// order, so a gate occasionally rounds one BF16 step apart; the epilogue is
+/// unchanged.
 pub fn hyper_read_up_wmma(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<()> {
     ensure_f32(p.low)?;
-    ensure_f32(p.normalized)?;
     ensure_f32(p.mixed)?;
     let wide = checked_product(4, p.hidden, "HC read width")?;
     if !gpu.arch_caps.is_gfx1151()
-        || !p.normalized_bf16
+        || p.normalized.dtype != DType::F16
         || p.up_weight.dtype != DType::BF16
         || p.rows == 0
         || p.hidden % 16 != 0
@@ -2956,12 +2963,34 @@ mod tests {
         );
         let wmma = gpu.zeros(&[rows * hidden], DType::F32).expect("wmma");
         if gpu.arch_caps.is_gfx1151() {
+            // hyper_norm_f16's F16 copy: the BF16-rounded values, exact in F16
+            // (all nonzero |v| here are normal F16s).
+            let f16_bytes: Vec<u8> = wave(3, rows * wide, 2.0)
+                .iter()
+                .flat_map(|v| {
+                    let u = v.to_bits();
+                    let b = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF_0000;
+                    let sign = ((b >> 16) & 0x8000) as u16;
+                    let bits = if b & 0x7FFF_FFFF == 0 {
+                        sign
+                    } else {
+                        let exp = ((b >> 23) & 0xFF) as u16 - 127 + 15;
+                        sign | (exp << 10) | ((b >> 13) & 0x3FF) as u16
+                    };
+                    bits.to_le_bytes()
+                })
+                .collect();
+            let mut normalized_f16 = gpu
+                .upload_raw(&f16_bytes, &[f16_bytes.len()])
+                .expect("normalized f16");
+            normalized_f16.dtype = DType::F16;
+            normalized_f16.shape = vec![rows * wide];
             hyper_read_up_wmma(
                 &mut gpu,
                 &HyperReadUpFused {
                     up_weight: &up_weight,
                     low: &low,
-                    normalized: &normalized_bf16,
+                    normalized: &normalized_f16,
                     mixed: &wmma,
                     rows,
                     hidden,
@@ -2985,6 +3014,7 @@ mod tests {
                 differ * 100 < reference.len(),
                 "WMMA HC read: {differ} differ"
             );
+            gpu.free_tensor(normalized_f16).expect("free");
         }
         for tensor in [
             up_weight,

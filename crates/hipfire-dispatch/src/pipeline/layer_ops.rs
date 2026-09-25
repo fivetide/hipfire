@@ -360,22 +360,26 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
         && op.low_rank % 8 == 0
         && (257..=512).contains(&op.low_rank)
         && op.hidden % 8 == 0;
-    // F16 WMMA down projection: the norm writes its F16 input directly and
-    // leaves `normalized` as BF16 bits, which only the fused up path reads.
+    // F16 WMMA down projection: the norm writes its F16 input directly.  The
+    // BF16 WMMA up read reuses that F16 copy; the SIMT fused read instead
+    // takes `normalized` as BF16 bits, which only it reads.
     let f16 = up_fused
         && op.input_mix_down.dtype == DType::BF16
         && gpu.qwen4_f16_wmma_applies(op.input_mix_down.buf, op.input_mix_down.k, op.rows);
+    let wmma_read = f16 && op.low_rank % 16 == 0 && op.low_rank <= 504 && op.hidden % 16 == 0;
+    let mut normalized_f16 = None;
     if f16 {
-        let normalized_f16 = hip(gpu.qwen4_f16_x_scratch(op.rows * wide))?;
-        hip(hyper_norm_f16(gpu, &norm, &normalized_f16))?;
+        let x16 = hip(gpu.qwen4_f16_x_scratch(op.rows * wide))?;
+        hip(hyper_norm_f16(gpu, &norm, &x16, !wmma_read))?;
         hip(gpu.gemm_bf16_xf16_f16_wmma(
             op.input_mix_down.buf,
-            &normalized_f16,
+            &x16,
             &low,
             op.input_mix_down.m,
             op.input_mix_down.k,
             op.rows,
         ))?;
+        normalized_f16 = Some(x16);
     } else {
         hip(hyper_norm(gpu, &norm))?;
         project_weight(
@@ -442,19 +446,23 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
         }
     }
     if up_fused {
+        // The F16 WMMA route's BF16 WMMA read (not bit-exact, see
+        // hyper_read_up_wmma) takes the norm's F16 copy.
+        let (normalized, normalized_bf16) = match normalized_f16.as_ref().filter(|_| wmma_read) {
+            Some(x16) => (x16, false),
+            None => (&normalized, f16),
+        };
         let read = HyperReadUpFused {
             up_weight: op.input_mix_up.buf,
             low: &low,
-            normalized: &normalized,
+            normalized,
             mixed: &mixed,
             rows: op.rows,
             hidden: op.hidden,
             low_rank: op.low_rank,
-            normalized_bf16: f16,
+            normalized_bf16,
         };
-        // The F16 WMMA route's BF16 WMMA read (not bit-exact, see
-        // hyper_read_up_wmma).
-        if f16 && op.low_rank % 16 == 0 && op.low_rank <= 504 && op.hidden % 16 == 0 {
+        if wmma_read {
             return hip(hyper_read_up_wmma(gpu, &read));
         }
         return hip(hyper_read_up_fused(gpu, &read));
