@@ -1119,10 +1119,14 @@ extern "C" __global__ __launch_bounds__(32) void gated_delta_gate_bf16_f32_batch
     *reinterpret_cast<float4*>(rounded + lane * 4) = value;
     __syncthreads();
 
+    // `rounded` already holds BF16 values (rounding them again is exact).
     float sum = 0.0f;
-    for (int i = 0; i < 128; ++i) {
-        const float v = bf16_to_f32(bf16_round(rounded[i]));
-        sum += v * v;
+    for (int i = 0; i < 128; i += 4) {
+        const float4 v = *reinterpret_cast<const float4*>(rounded + i);
+        sum += v.x * v.x;
+        sum += v.y * v.y;
+        sum += v.z * v.z;
+        sum += v.w * v.w;
     }
     const float inv = rsqrtf(sum / (float)value_dim + 1.0e-6f);
     const float4 zv = *reinterpret_cast<const float4*>(z + start + lane * 4);
@@ -1199,17 +1203,24 @@ extern "C" __global__ void indexed_attention_norm_rope_f32_batched(
     if (row >= rows || head >= heads) return;
     int start = row * row_stride + head * head_stride;
     __shared__ float input_row[256];
+    __shared__ float row_sum;
     if (channel < head_dim) {
         input_row[channel] = values[start + channel];
     }
     __syncthreads();
-    if (channel >= head_dim) return;
-    float sum = 0.0f;
-    for (int i = 0; i < head_dim; ++i) {
-        float row_value = input_row[i];
-        sum += row_value * row_value;
+    // One wave runs the serial i-order sum (identical in every lane) instead
+    // of every wave repeating it.
+    if (threadIdx.x < 32) {
+        float sum = 0.0f;
+        for (int i = 0; i < head_dim; ++i) {
+            float row_value = input_row[i];
+            sum += row_value * row_value;
+        }
+        if (threadIdx.x == 0) row_sum = sum;
     }
-    float inv = rsqrtf(sum / (float)head_dim + 1.0e-6f);
+    __syncthreads();
+    if (channel >= head_dim) return;
+    float inv = rsqrtf(row_sum / (float)head_dim + 1.0e-6f);
     float value = input_row[channel] * inv
         * (1.0f + bf16_to_f32(norm[channel]));
     if (channel < rotary_dim) {
