@@ -423,6 +423,143 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_f32(
 
 
 
+// GDN recurrence split by value column (non-bit-exact prefill arm).  Every
+// state column evolves independently (kv_mem, delta, update and output of
+// value column v read only column v), so a block owns 64 columns of one value
+// head and runs its rows with no block barrier: lane = column pair * 4 + kd
+// quarter, 2 x 32 state values per thread, kd sums as four chains per thread
+// plus a quad DPP reduction instead of the reference's serial kd order.
+// gated_delta_qk_norm_bf16_batched first stores every row's normalized q and
+// k (the reference's BF16 rounding points; the square sum as lane partials +
+// a wave tree) as BF16.
+//
+// qk norm: grid [rows], block 256; wave w takes items w, w + 8, ... of the
+// row's 2 * key_heads (q heads, then k heads).
+extern "C" __global__ __launch_bounds__(256) void gated_delta_qk_norm_bf16_batched(
+    const float* projection, __hip_bfloat16* qn, __hip_bfloat16* kn, int rows, int qkv_width,
+    int key_heads) {
+    const int row = blockIdx.x, wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const float* rowp = projection + (size_t)row * qkv_width;
+    for (int item = wave; item < 2 * key_heads; item += 8) {
+        const int is_k = item >= key_heads, kh = is_k ? item - key_heads : item;
+        const float4 raw = *(const float4*)(rowp + item * 128 + lane * 4);
+        float v[4] = {bf16_to_f32(bf16_round(raw.x)), bf16_to_f32(bf16_round(raw.y)),
+                      bf16_to_f32(bf16_round(raw.z)), bf16_to_f32(bf16_round(raw.w))};
+        float part = 0.0f;
+#pragma unroll
+        for (int u = 0; u < 4; ++u) part += bf16_to_f32(bf16_round(v[u] * v[u]));
+        part += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(part), 0xB1, 0xF, 0xF, false));
+        part += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(part), 0x4E, 0xF, 0xF, false));
+        part += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(part), 0x101F));
+        part += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(part), 0x201F));
+        part += __shfl_xor(part, 16, 32);
+        const __hip_bfloat16 eps = bf16_round(1.0e-6f);
+        const float inv = bf16_to_f32(bf16_round(rsqrtf(bf16_to_f32(bf16_round(part)) + bf16_to_f32(eps))));
+        __hip_bfloat16* dst = (is_k ? kn : qn) + ((size_t)row * key_heads + kh) * 128 + lane * 4;
+#pragma unroll
+        for (int u = 0; u < 4; ++u) dst[u] = bf16_round(v[u] * inv);
+    }
+}
+
+// Recurrence: grid [value_heads, 2], block 128; rows staged GDN_COL_ROWS at a
+// time in LDS.  key_dim == value_dim == 128.
+#define GDN_COL_ROWS 32
+__launch_bounds__(128)
+extern "C" __global__ void gated_delta_step_cols_f32(
+    const float* projection, const unsigned short* qn, const unsigned short* kn, const float* gate,
+    const float* beta,
+    float* state, float* output, int rows, int qkv_width, int key_heads, int value_heads, float query_scale) {
+    const int value_head = blockIdx.x, col0 = blockIdx.y * 64;
+    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, quarter = lane & 3;
+    const int cl = wave * 16 + (lane >> 2) * 2, col = col0 + cl;  // columns col, col + 1
+    const int key_head = value_head / (value_heads / key_heads);
+    const int v_offset = 2 * key_heads * 128 + value_head * 128;
+    const int state_base = value_head * 128 * 128;
+    __shared__ __align__(16) unsigned short q_lds[GDN_COL_ROWS][128];
+    __shared__ __align__(16) unsigned short k_lds[GDN_COL_ROWS][128];
+    __shared__ float v_lds[GDN_COL_ROWS][64];
+    __shared__ float decay_lds[GDN_COL_ROWS], beta_lds[GDN_COL_ROWS];
+    float s[32], t[32];
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        const float2 st = *(const float2*)(state + state_base + (quarter * 32 + i) * 128 + col);
+        s[i] = st.x; t[i] = st.y;
+    }
+    for (int r0 = 0; r0 < rows; r0 += GDN_COL_ROWS) {
+        const int nr = min(GDN_COL_ROWS, rows - r0);
+        __syncthreads();
+        for (int e = tid; e < nr * 16; e += 128) {
+            const int r = e >> 4, c8 = e & 15;
+            const size_t base = ((size_t)(r0 + r) * key_heads + key_head) * 128 + c8 * 8;
+            *(uint4*)&q_lds[r][c8 * 8] = *(const uint4*)(qn + base);
+            *(uint4*)&k_lds[r][c8 * 8] = *(const uint4*)(kn + base);
+        }
+        for (int e = tid; e < nr * 64; e += 128) {
+            const int r = e >> 6, c = e & 63;
+            v_lds[r][c] = bf16_to_f32(bf16_round(projection[(size_t)(r0 + r) * qkv_width + v_offset + col0 + c]));
+        }
+        if (tid < nr) {
+            decay_lds[tid] = expf(gate[(r0 + tid) * value_heads + value_head]);
+            beta_lds[tid] = beta[(r0 + tid) * value_heads + value_head];
+        }
+        __syncthreads();
+        for (int r = 0; r < nr; ++r) {
+            const float decay = decay_lds[r], beta_value = beta_lds[r];
+            const unsigned short* kr = &k_lds[r][quarter * 32];
+            const unsigned short* qr = &q_lds[r][quarter * 32];
+            float kv[32], qv[32];
+#pragma unroll
+            for (int i = 0; i < 32; i += 8) {
+                const uint4 w = *(const uint4*)(kr + i);
+                kv[i + 0] = __uint_as_float(w.x << 16); kv[i + 1] = __uint_as_float(w.x & 0xFFFF0000u);
+                kv[i + 2] = __uint_as_float(w.y << 16); kv[i + 3] = __uint_as_float(w.y & 0xFFFF0000u);
+                kv[i + 4] = __uint_as_float(w.z << 16); kv[i + 5] = __uint_as_float(w.z & 0xFFFF0000u);
+                kv[i + 6] = __uint_as_float(w.w << 16); kv[i + 7] = __uint_as_float(w.w & 0xFFFF0000u);
+                const uint4 x = *(const uint4*)(qr + i);
+                qv[i + 0] = __uint_as_float(x.x << 16); qv[i + 1] = __uint_as_float(x.x & 0xFFFF0000u);
+                qv[i + 2] = __uint_as_float(x.y << 16); qv[i + 3] = __uint_as_float(x.y & 0xFFFF0000u);
+                qv[i + 4] = __uint_as_float(x.z << 16); qv[i + 5] = __uint_as_float(x.z & 0xFFFF0000u);
+                qv[i + 6] = __uint_as_float(x.w << 16); qv[i + 7] = __uint_as_float(x.w & 0xFFFF0000u);
+            }
+#pragma unroll
+            for (int i = 0; i < 32; ++i) qv[i] *= query_scale;
+            float p0 = 0.f, p1 = 0.f, p2 = 0.f, p3 = 0.f, u0 = 0.f, u1 = 0.f, u2 = 0.f, u3 = 0.f;
+#pragma unroll
+            for (int i = 0; i < 32; i += 4) {
+                s[i] *= decay; s[i + 1] *= decay; s[i + 2] *= decay; s[i + 3] *= decay;
+                t[i] *= decay; t[i + 1] *= decay; t[i + 2] *= decay; t[i + 3] *= decay;
+                p0 += s[i] * kv[i]; p1 += s[i + 1] * kv[i + 1]; p2 += s[i + 2] * kv[i + 2]; p3 += s[i + 3] * kv[i + 3];
+                u0 += t[i] * kv[i]; u1 += t[i + 1] * kv[i + 1]; u2 += t[i + 2] * kv[i + 2]; u3 += t[i + 3] * kv[i + 3];
+            }
+            float ka = (p0 + p1) + (p2 + p3), kb = (u0 + u1) + (u2 + u3);
+            ka += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(ka), 0xB1, 0xF, 0xF, false));
+            kb += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(kb), 0xB1, 0xF, 0xF, false));
+            ka += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(ka), 0x4E, 0xF, 0xF, false));
+            kb += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(kb), 0x4E, 0xF, 0xF, false));
+            const float da = (v_lds[r][cl] - ka) * beta_value, db = (v_lds[r][cl + 1] - kb) * beta_value;
+            float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f, w0 = 0.f, w1 = 0.f, w2 = 0.f, w3 = 0.f;
+#pragma unroll
+            for (int i = 0; i < 32; i += 4) {
+                s[i] += kv[i] * da; s[i + 1] += kv[i + 1] * da; s[i + 2] += kv[i + 2] * da; s[i + 3] += kv[i + 3] * da;
+                t[i] += kv[i] * db; t[i + 1] += kv[i + 1] * db; t[i + 2] += kv[i + 2] * db; t[i + 3] += kv[i + 3] * db;
+                o0 += s[i] * qv[i]; o1 += s[i + 1] * qv[i + 1]; o2 += s[i + 2] * qv[i + 2]; o3 += s[i + 3] * qv[i + 3];
+                w0 += t[i] * qv[i]; w1 += t[i + 1] * qv[i + 1]; w2 += t[i + 2] * qv[i + 2]; w3 += t[i + 3] * qv[i + 3];
+            }
+            float oa = (o0 + o1) + (o2 + o3), ob = (w0 + w1) + (w2 + w3);
+            oa += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(oa), 0xB1, 0xF, 0xF, false));
+            ob += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(ob), 0xB1, 0xF, 0xF, false));
+            oa += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(oa), 0x4E, 0xF, 0xF, false));
+            ob += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(ob), 0x4E, 0xF, 0xF, false));
+            if (quarter == 0)
+                *(float2*)(output + (size_t)(r0 + r) * value_heads * 128 + value_head * 128 + col) = make_float2(oa, ob);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 32; ++i)
+        *(float2*)(state + state_base + (quarter * 32 + i) * 128 + col) = make_float2(s[i], t[i]);
+}
+#undef GDN_COL_ROWS
+
 // Source HF executes the recurrent/chunk result through a hidden BF16 cast
 // before RMSNormGated.  Keep the compact production buffer F32 for the
 // existing gate kernel while forcing the exact bounded BF16 storage boundary
