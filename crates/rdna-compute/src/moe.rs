@@ -2676,8 +2676,7 @@ impl Gpu {
             func,
             [m.div_ceil(16) as u32, grouped_rows.div_ceil(16) as u32, 1],
             [32, 1, 1],
-            // The kernel stages each 16-row weight tile in LDS.
-            (16 * (k / 128) * 68) as u32,
+            0,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
