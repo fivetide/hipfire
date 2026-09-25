@@ -2368,6 +2368,29 @@ impl Gpu {
         x_src_rows: usize,
         n_exp: usize,
     ) -> HipResult<()> {
+        // gfx1151, >= 512 tokens (x_row_div == 1: one X row per top-10 slot):
+        // F16 WMMA grouped down, 8.6 -> 5.4 ms at 1131 tokens.  Not
+        // bit-exact (F16 dequant/inputs); gated by KLD against the BF16
+        // source like the gate/up arm.  HIPFIRE_QWEN4_MOE_WMMA=0 opts out.
+        if self.arch_caps.is_gfx1151()
+            && m == 2560
+            && k == 640
+            && x_row_div == 1
+            && x_src_rows >= 10 * crate::gemm::QWEN4_MOE_WMMA_MIN_TOKENS
+            && *crate::gemm::QWEN4_MOE_WMMA
+        {
+            return self.gemm_mq4g128v2_moe_grouped_wmma_gfx1151(
+                expert_ptrs,
+                expert_tile_ids,
+                sorted_slot_index,
+                x_src,
+                y_grouped,
+                m,
+                k,
+                grouped_rows,
+                x_src_rows,
+            );
+        }
         let o8_r16 = self.arch_caps.is_gfx1151() && m == 2560 && k == 640;
         self.gemm_mq4g128v2_moe_grouped_top10_with(
             expert_ptrs,
@@ -2383,6 +2406,78 @@ impl Gpu {
             n_exp,
             o8_r16,
         )
+    }
+
+    /// F16 WMMA grouped QT53 down (gfx1151, K % 128 == 0): one 16x16 output
+    /// tile per wave, X converted to F16 per call.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_mq4g128v2_moe_grouped_wmma_gfx1151(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        grouped_rows: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "gemm_mq4g128v2_moe_grouped_wmma_gfx1151";
+        self.ensure_kernel(
+            FUNC,
+            kernels::GEMM_MQ4G128V2_MOE_GROUPED_WMMA_GFX1151_SRC,
+            FUNC,
+        )?;
+        // Uncached: the activation buffer is reused with new contents per layer.
+        let xp = self.convert_fp16_x_uncached(x_src, x_src_rows * k)?;
+        let ep = expert_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let yp = y_grouped.buf.as_ptr();
+        let mv = m as i32;
+        let kv = k as i32;
+        let rd = 1i32;
+        let gr = grouped_rows as i32;
+        let mut params = [
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &rd as *const _ as *mut c_void,
+            &gr as *const _ as *mut c_void,
+        ];
+        let bytes =
+            grouped_rows.saturating_mul(m.saturating_mul(4).saturating_add(k.saturating_mul(2)));
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [m.div_ceil(16) as u32, grouped_rows.div_ceil(16) as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(tp);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(rd);
+                b.push_i32(gr);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     #[allow(clippy::too_many_arguments)]

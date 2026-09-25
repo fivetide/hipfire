@@ -2085,6 +2085,9 @@ pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_MULTIROW_SRC: &str =
 /// predecessor.
 pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O8_R16_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10_o8_r16.gfx1151.hip");
+/// gfx1151 F16 WMMA grouped QT53 down (not bit-exact; see moe.rs routing).
+pub const GEMM_MQ4G128V2_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_wmma.gfx1151.hip");
 /// gfx1151 exact-shape O4×R8 QT44 grouped gate/up consumer.
 /// Four waves per block each pair four adjacent output rows with one
 /// eight-slot subtile whose X is staged once per block through LDS; the

@@ -12,12 +12,15 @@ use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
-/// `HIPFIRE_QWEN4_MOE_GATEUP_WMMA=0` keeps the Qwen4 grouped gate/up on the
-/// bit-exact F32 arms (the WMMA arm is not bit-exact; see its call site).
-/// Read once: 48 launches per forward.
-static QWEN4_MOE_GATEUP_WMMA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_QWEN4_MOE_GATEUP_WMMA").map_or(true, |v| v.trim() != "0")
+/// `HIPFIRE_QWEN4_MOE_WMMA=0` keeps the Qwen4 grouped MoE GEMMs (gate/up and
+/// down) on the bit-exact F32 arms; the F16 WMMA arms are not bit-exact (see
+/// their call sites).  Read once: 96 launches per forward.
+pub(crate) static QWEN4_MOE_WMMA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_QWEN4_MOE_WMMA").map_or(true, |v| v.trim() != "0")
 });
+/// Tokens from which the F16 WMMA MoE arms win on gfx1151 (gate/up is
+/// slower below ~450; down breaks even below 512).
+pub(crate) const QWEN4_MOE_WMMA_MIN_TOKENS: usize = 512;
 
 /// One instantiation of the parameterised LDS-staged WMMA GEMM
 /// (`kernels/src/gemm_f16_x_f16_wmma_lds256.hip`).
@@ -39052,12 +39055,12 @@ impl Gpu {
         // tokens; slower below ~450).  Not bit-exact — F16 dequant/inputs —
         // but KLD against the BF16 source is unchanged within noise (0.07525
         // vs 0.07475, paired CI [-0.0018, +0.0026], 8160 wikitext tokens).
-        // HIPFIRE_QWEN4_MOE_GATEUP_WMMA=0 keeps the F32 arms.
+        // HIPFIRE_QWEN4_MOE_WMMA=0 keeps the F32 arms.
         if self.arch_caps.is_gfx1151()
             && m == 1280
             && k == 2560
-            && x_src_rows >= 512
-            && *QWEN4_MOE_GATEUP_WMMA
+            && x_src_rows >= QWEN4_MOE_WMMA_MIN_TOKENS
+            && *QWEN4_MOE_WMMA
         {
             return self.gemm_mq4g256v2_moe_grouped_wmma_k2(
                 expert_weight_ptrs,
