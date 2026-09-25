@@ -24,8 +24,14 @@ static __device__ __forceinline__ float moe_bf16_round_trip(float v) {
     return box.f;
 }
 
-extern "C" __global__ void moe_gate_up_unscatter_silu_top10(
-    const float* __restrict__ Y_grouped,       // [m_total × 2*mi]
+static __device__ __forceinline__ float moe_widen(float v) { return v; }
+static __device__ __forceinline__ float moe_widen(unsigned short b) {
+    return __uint_as_float((unsigned int)b << 16);
+}
+
+template <typename T>
+__device__ __forceinline__ void moe_unscatter_silu(
+    const T* __restrict__ Y_grouped,           // [m_total × 2*mi]
     const int*   __restrict__ sorted_slot_index,
     float*       __restrict__ activation,      // [N × 10 × mi] (written)
     int mi, int m_total, int bf16_rt
@@ -38,8 +44,8 @@ extern "C" __global__ void moe_gate_up_unscatter_silu_top10(
     if (m_col >= mi) return;
 
     const long long y_base = (long long)slot * 2 * mi;
-    float v = Y_grouped[y_base + m_col];
-    float u = Y_grouped[y_base + mi + m_col];
+    float v = moe_widen(Y_grouped[y_base + m_col]);
+    float u = moe_widen(Y_grouped[y_base + mi + m_col]);
     if (bf16_rt) {
         v = moe_bf16_round_trip(v);
         u = moe_bf16_round_trip(u);
@@ -48,4 +54,17 @@ extern "C" __global__ void moe_gate_up_unscatter_silu_top10(
     float out = (v / (1.0f + expf(-v))) * u;
     if (bf16_rt) out = moe_bf16_round_trip(out);
     activation[(long long)flat * mi + m_col] = out;
+}
+
+extern "C" __global__ void moe_gate_up_unscatter_silu_top10(
+    const float* __restrict__ Y_grouped, const int* __restrict__ sorted_slot_index,
+    float* __restrict__ activation, int mi, int m_total, int bf16_rt) {
+    moe_unscatter_silu(Y_grouped, sorted_slot_index, activation, mi, m_total, bf16_rt);
+}
+
+// Grouped gate/up stored as BF16 bits (already the round trip's values).
+extern "C" __global__ void moe_gate_up_unscatter_silu_top10_bf16in(
+    const unsigned short* __restrict__ Y_grouped, const int* __restrict__ sorted_slot_index,
+    float* __restrict__ activation, int mi, int m_total, int bf16_rt) {
+    moe_unscatter_silu(Y_grouped, sorted_slot_index, activation, mi, m_total, bf16_rt);
 }

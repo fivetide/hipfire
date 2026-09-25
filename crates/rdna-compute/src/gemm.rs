@@ -13270,7 +13270,36 @@ impl Gpu {
     /// Fails closed on gfx12 — silently running the gfx11 WMMA intrinsic there
     /// would be wrong, and running the qt13 kernel would misread the header.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn gemm_mq4g256v2_moe_grouped_wmma_k2(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.gemm_mq4g256v2_moe_grouped_wmma_k2_impl(
+            expert_weight_ptrs,
+            expert_tile_ids,
+            sorted_slot_index,
+            x_src,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            x_src_rows,
+            false,
+        )
+    }
+
+    fn gemm_mq4g256v2_moe_grouped_wmma_k2_impl(
         &mut self,
         expert_weight_ptrs: &GpuTensor, // [E] u64
         expert_tile_ids: &GpuTensor,    // [m_total / 16] i32
@@ -13282,6 +13311,7 @@ impl Gpu {
         x_row_div: usize,
         m_total: usize,
         x_src_rows: usize,
+        bf16_out: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Arch-selecting, like the MQ2/MQ3-Lloyd grouped sisters: gfx11 takes
@@ -13296,6 +13326,17 @@ impl Gpu {
             ));
         }
         let (kernel_name, kernel_src) = kernels::mq4g256v2_moe_grouped_wmma_source(is_gfx12);
+        // The BF16-output entry exists in the gfx11 source only.
+        let kernel_name = match (bf16_out, is_gfx12) {
+            (false, _) => kernel_name,
+            (true, false) => "gemm_mq4g256v2_moe_grouped_wmma_k2_bf16out",
+            (true, true) => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "gemm_mq4g256v2_moe_grouped_wmma: BF16 output is gfx11-only",
+                ))
+            }
+        };
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         // UNCACHED conversion is mandatory here. `ensure_fp16_x` is pointer-keyed,
         // and MoE prefill reuses the SAME x_rot_batch tensor for every layer with
@@ -39141,6 +39182,48 @@ impl Gpu {
              (GEMM_MQ4CG256_SRC missing) — would mis-decode MQ4C fp16-header groups as v1 f32 header",
         ))
     }
+    /// Whether the Qwen4 grouped gate/up takes the F16 WMMA arm (gfx1151,
+    /// 1280x2560, >= QWEN4_F16_WMMA_MIN_TOKENS tokens, not opted out).
+    pub fn qwen4_moe_gateup_wmma_applies(&self, m: usize, k: usize, x_src_rows: usize) -> bool {
+        self.arch_caps.is_gfx1151()
+            && m == 1280
+            && k == 2560
+            && x_src_rows >= QWEN4_F16_WMMA_MIN_TOKENS
+            && *QWEN4_F16_WMMA
+    }
+
+    /// The Qwen4 grouped gate/up WMMA arm writing `y_grouped` as BF16 bits
+    /// (RNE): the values a consumer's BF16 round trip of the F32 output yields.
+    /// Callers check [`Gpu::qwen4_moe_gateup_wmma_applies`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq4g256v2_moe_grouped_top10_bf16out(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.gemm_mq4g256v2_moe_grouped_wmma_k2_impl(
+            expert_weight_ptrs,
+            expert_tile_ids,
+            sorted_slot_index,
+            x_src,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            grouped_rows,
+            x_src_rows,
+            true,
+        )
+    }
+
     /// Qwen4 fixed top-10 grouped qt44 gate/up entry.  Keep the indexed
     /// decode kernel's F32 arithmetic for every GPU; the gfx1151 exact shape
     /// uses the bit-identical O4×R8 optimization for short batches and the
@@ -39171,12 +39254,7 @@ impl Gpu {
         // but KLD against the BF16 source is unchanged within noise (0.07525
         // vs 0.07475, paired CI [-0.0018, +0.0026], 8160 wikitext tokens).
         // HIPFIRE_QWEN4_F16_WMMA=0 keeps the F32 arms.
-        if self.arch_caps.is_gfx1151()
-            && m == 1280
-            && k == 2560
-            && x_src_rows >= QWEN4_F16_WMMA_MIN_TOKENS
-            && *QWEN4_F16_WMMA
-        {
+        if self.qwen4_moe_gateup_wmma_applies(m, k, x_src_rows) {
             return self.gemm_mq4g256v2_moe_grouped_wmma_k2(
                 expert_weight_ptrs,
                 expert_tile_ids,
@@ -39886,13 +39964,20 @@ mod tests {
             .collect();
         let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("x");
         let rot = gpu.zeros(&[ROWS * K], DType::F32).expect("rot");
-        gpu.rotate_x_mq_128_v2(&x_gpu, &rot, K, ROWS).expect("rotate");
-        let want_ptr = gpu.convert_fp16_x_uncached(&rot, ROWS * K).expect("convert");
+        gpu.rotate_x_mq_128_v2(&x_gpu, &rot, K, ROWS)
+            .expect("rotate");
+        let want_ptr = gpu
+            .convert_fp16_x_uncached(&rot, ROWS * K)
+            .expect("convert");
         let mut want = vec![0u8; ROWS * K * 2];
         gpu.hip
-            .memcpy_dtoh(&mut want, unsafe { &DeviceBuffer::from_raw(want_ptr, ROWS * K * 2) })
+            .memcpy_dtoh(&mut want, unsafe {
+                &DeviceBuffer::from_raw(want_ptr, ROWS * K * 2)
+            })
             .expect("want");
-        let got_t = gpu.rotate_x_mq_128_v2_f16(&x_gpu, K, ROWS).expect("rotate f16");
+        let got_t = gpu
+            .rotate_x_mq_128_v2_f16(&x_gpu, K, ROWS)
+            .expect("rotate f16");
         let mut got = vec![0u8; ROWS * K * 2];
         gpu.hip.memcpy_dtoh(&mut got, &got_t.buf).expect("got");
         let differing = got

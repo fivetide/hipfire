@@ -1895,6 +1895,7 @@ impl Gpu {
     /// Qwen4 grouped combine.  `inverse_perm` is the sealed flat-to-grouped
     /// map and invalid rows are ignored by the bounds-safe kernel.  The
     /// top-k expert IDs are consumed to reproduce indexed BF16 expert order.
+    #[allow(clippy::too_many_arguments)]
     pub fn moe_down_combine_grouped_top10(
         &mut self,
         grouped_down: &GpuTensor,
@@ -1906,9 +1907,66 @@ impl Gpu {
         grouped_rows: usize,
         tokens: usize,
     ) -> HipResult<()> {
+        self.moe_down_combine_grouped_top10_impl(
+            grouped_down,
+            inverse_perm,
+            topk_indices,
+            topk_weights,
+            residual,
+            hidden,
+            grouped_rows,
+            tokens,
+            false,
+        )
+    }
+
+    /// [`Gpu::moe_down_combine_grouped_top10`] reading the grouped rows as BF16 bits (written by a
+    /// `*_bf16out` MoE GEMM).
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_down_combine_grouped_top10_bf16in(
+        &mut self,
+        grouped_down: &GpuTensor,
+        inverse_perm: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        residual: &GpuTensor,
+        hidden: usize,
+        grouped_rows: usize,
+        tokens: usize,
+    ) -> HipResult<()> {
+        self.moe_down_combine_grouped_top10_impl(
+            grouped_down,
+            inverse_perm,
+            topk_indices,
+            topk_weights,
+            residual,
+            hidden,
+            grouped_rows,
+            tokens,
+            true,
+        )
+    }
+
+    fn moe_down_combine_grouped_top10_impl(
+        &mut self,
+        grouped_down: &GpuTensor,
+        inverse_perm: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        residual: &GpuTensor,
+        hidden: usize,
+        grouped_rows: usize,
+        tokens: usize,
+        grouped_bf16: bool,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         const FUNC: &str = "moe_down_combine_grouped_top10";
-        self.ensure_kernel(FUNC, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, FUNC)?;
+        let func = if grouped_bf16 {
+            "moe_down_combine_grouped_top10_bf16in"
+        } else {
+            FUNC
+        };
+        self.ensure_kernel(FUNC, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, func)?;
         let gp = grouped_down.buf.as_ptr();
         let ip = inverse_perm.buf.as_ptr();
         let tp = topk_indices.buf.as_ptr();
@@ -1930,9 +1988,9 @@ impl Gpu {
         let block = 256u32;
         let grid_x = (hidden as u32).div_ceil(block);
         let bytes = (grouped_rows * hidden + 3 * tokens * 10 + 2 * tokens * hidden) * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", func, bytes);
         let result = self.launch_maybe_blob(
-            FUNC,
+            func,
             [grid_x, tokens as u32, 1],
             [block, 1, 1],
             0,
@@ -2088,6 +2146,7 @@ impl Gpu {
     /// SwiGLU when `bf16_round_trip`), bitwise the unfused sequence of
     /// `moe_gate_up_unscatter_top10`, `bf16_round_trip_f32` on gate/up,
     /// `silu_mul_f32` and `bf16_round_trip_f32` on the activation.
+    #[allow(clippy::too_many_arguments)]
     pub fn moe_gate_up_unscatter_silu_top10(
         &mut self,
         grouped_gate_up: &GpuTensor,
@@ -2097,9 +2156,58 @@ impl Gpu {
         grouped_rows: usize,
         bf16_round_trip: bool,
     ) -> HipResult<()> {
+        self.moe_gate_up_unscatter_silu_top10_impl(
+            grouped_gate_up,
+            sorted_slot_index,
+            activation,
+            mi,
+            grouped_rows,
+            bf16_round_trip,
+            false,
+        )
+    }
+
+    /// [`Gpu::moe_gate_up_unscatter_silu_top10`] reading the grouped rows as BF16 bits (written by a
+    /// `*_bf16out` MoE GEMM).
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_gate_up_unscatter_silu_top10_bf16in(
+        &mut self,
+        grouped_gate_up: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        activation: &GpuTensor,
+        mi: usize,
+        grouped_rows: usize,
+        bf16_round_trip: bool,
+    ) -> HipResult<()> {
+        self.moe_gate_up_unscatter_silu_top10_impl(
+            grouped_gate_up,
+            sorted_slot_index,
+            activation,
+            mi,
+            grouped_rows,
+            bf16_round_trip,
+            true,
+        )
+    }
+
+    fn moe_gate_up_unscatter_silu_top10_impl(
+        &mut self,
+        grouped_gate_up: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        activation: &GpuTensor,
+        mi: usize,
+        grouped_rows: usize,
+        bf16_round_trip: bool,
+        grouped_bf16: bool,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         const FUNC: &str = "moe_gate_up_unscatter_silu_top10";
-        self.ensure_kernel(FUNC, kernels::MOE_GATE_UP_UNSCATTER_SILU_TOP10_SRC, FUNC)?;
+        let func = if grouped_bf16 {
+            "moe_gate_up_unscatter_silu_top10_bf16in"
+        } else {
+            FUNC
+        };
+        self.ensure_kernel(FUNC, kernels::MOE_GATE_UP_UNSCATTER_SILU_TOP10_SRC, func)?;
         let yp = grouped_gate_up.buf.as_ptr();
         let sp = sorted_slot_index.buf.as_ptr();
         let ap = activation.buf.as_ptr();
@@ -2117,9 +2225,9 @@ impl Gpu {
         let block = 256u32;
         let grid_y = (mi as u32).div_ceil(block);
         let bytes = (grouped_rows * 3 * mi + grouped_rows) * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", func, bytes);
         let result = self.launch_maybe_blob(
-            FUNC,
+            func,
             [grouped_rows as u32, grid_y, 1],
             [block, 1, 1],
             0,
@@ -2384,6 +2492,7 @@ impl Gpu {
                 m,
                 k,
                 grouped_rows,
+                false,
             );
         }
         let o8_r16 = self.arch_caps.is_gfx1151() && m == 2560 && k == 640;
@@ -2415,7 +2524,8 @@ impl Gpu {
 
     /// [`Gpu::gemm_mq4g128v2_moe_grouped_top10`] on the F16 WMMA route with X
     /// already rotated to F16 (`rotate_x_mq_128_v2_f16`): the route's bytes
-    /// without its conversion pass.  Callers check
+    /// without its conversion pass; `bf16_out` stores Y as BF16 bits (RNE) for
+    /// the BF16-input combine.  Callers check
     /// [`Gpu::qwen4_moe_down_wmma_applies`].
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_mq4g128v2_moe_grouped_top10_xf16(
@@ -2428,6 +2538,7 @@ impl Gpu {
         m: usize,
         k: usize,
         grouped_rows: usize,
+        bf16_out: bool,
     ) -> HipResult<()> {
         self.gemm_mq4g128v2_moe_grouped_wmma_gfx1151(
             expert_ptrs,
@@ -2438,6 +2549,7 @@ impl Gpu {
             m,
             k,
             grouped_rows,
+            bf16_out,
         )
     }
 
@@ -2454,13 +2566,19 @@ impl Gpu {
         m: usize,
         k: usize,
         grouped_rows: usize,
+        bf16_out: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        let func = if bf16_out {
+            "gemm_mq4g128v2_moe_grouped_wmma_gfx1151_bf16out"
+        } else {
+            "gemm_mq4g128v2_moe_grouped_wmma_gfx1151"
+        };
         const FUNC: &str = "gemm_mq4g128v2_moe_grouped_wmma_gfx1151";
         self.ensure_kernel(
             FUNC,
             kernels::GEMM_MQ4G128V2_MOE_GROUPED_WMMA_GFX1151_SRC,
-            FUNC,
+            func,
         )?;
         let xp = x_f16;
         let ep = expert_ptrs.buf.as_ptr();
@@ -2484,9 +2602,9 @@ impl Gpu {
         ];
         let bytes =
             grouped_rows.saturating_mul(m.saturating_mul(4).saturating_add(k.saturating_mul(2)));
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", FUNC, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func, bytes);
         let result = self.launch_maybe_blob(
-            FUNC,
+            func,
             [m.div_ceil(16) as u32, grouped_rows.div_ceil(16) as u32, 1],
             [32, 1, 1],
             0,

@@ -278,6 +278,19 @@ pub(crate) fn scatter(
     ))
 }
 
+/// Whether the grouped gate/up takes the F16 WMMA arm and hands the unscatter
+/// BF16 rows: the recipe rounds gate/up to BF16 before SiLU anyway.
+fn gateup_bf16(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
+    p.recipe.bf16_round_trip()
+        && gpu.qwen4_moe_gateup_wmma_applies(2 * p.mi, p.gate_up_k, p.batch_size)
+}
+
+/// Whether the grouped down takes the F16 WMMA arm: rotated straight to F16 in
+/// `down`, output as BF16 for the combine, which rounds every row to BF16.
+fn down_wmma(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
+    p.down_k == p.mi && gpu.qwen4_moe_down_wmma_applies(p.down_m, p.down_k, p.batch_size * p.k_top)
+}
+
 pub(crate) fn gate_up(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
@@ -285,7 +298,20 @@ pub(crate) fn gate_up(
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
-    if use_path2 {
+    if use_path2 && gateup_bf16(gpu, p) {
+        hip(gpu.gemm_mq4g256v2_moe_grouped_top10_bf16out(
+            p.expert_gate_up_ptrs,
+            p.expert_tile_ids,
+            p.sorted_slot_index,
+            p.x_rot_batch,
+            p.y_gate_up_grouped,
+            2 * p.mi,
+            p.gate_up_k,
+            p.k_top,
+            grouped_rows,
+            p.batch_size,
+        ))
+    } else if use_path2 {
         hip(gpu.gemm_mq4g256v2_moe_grouped_top10(
             p.expert_gate_up_ptrs,
             p.expert_tile_ids,
@@ -332,6 +358,16 @@ pub(crate) fn unscatter(
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
+    if gateup_bf16(gpu, p) {
+        return hip(gpu.moe_gate_up_unscatter_silu_top10_bf16in(
+            p.y_gate_up_grouped,
+            p.sorted_slot_index,
+            p.rot_batch,
+            p.mi,
+            grouped_rows,
+            p.recipe.bf16_round_trip(),
+        ));
+    }
     hip(gpu.moe_gate_up_unscatter_silu_top10(
         p.y_gate_up_grouped,
         p.sorted_slot_index,
@@ -357,10 +393,7 @@ pub(crate) fn activation(
         }
     }
     // The F16 WMMA down rotates straight to F16 itself (see `down`).
-    if use_path2
-        && p.down_k == p.mi
-        && gpu.qwen4_moe_down_wmma_applies(p.down_m, p.down_k, total_slots)
-    {
+    if use_path2 && down_wmma(gpu, p) {
         return Ok(());
     }
     hip(gpu.rotate_x_mq_128_v2(p.rot_batch, p.rot_batch, p.mi, total_slots))
@@ -374,10 +407,7 @@ pub(crate) fn down(
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
     let total_slots = p.batch_size * p.k_top;
-    if use_path2
-        && p.down_k == p.mi
-        && gpu.qwen4_moe_down_wmma_applies(p.down_m, p.down_k, total_slots)
-    {
+    if use_path2 && down_wmma(gpu, p) {
         // Rotation and GEMM in one stage: the rotated F16 rows live in the
         // shared FP16 scratch, which another stage's GEMM would overwrite.
         let x_f16 = hip(gpu.rotate_x_mq_128_v2_f16(p.rot_batch, p.mi, total_slots))?;
@@ -390,6 +420,7 @@ pub(crate) fn down(
             p.down_m,
             p.down_k,
             grouped_rows,
+            true,
         ))?;
     } else if use_path2 {
         hip(gpu.gemm_mq4g128v2_moe_grouped_top10(
@@ -437,7 +468,18 @@ pub(crate) fn combine(
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
     let target = p.routed_out.unwrap_or(p.x_batch);
-    if use_path2 {
+    if use_path2 && down_wmma(gpu, p) {
+        hip(gpu.moe_down_combine_grouped_top10_bf16in(
+            p.y_down_grouped,
+            p.inverse_perm,
+            p.topk_indices,
+            p.topk_weights,
+            target,
+            p.down_m,
+            grouped_rows,
+            p.batch_size,
+        ))?;
+    } else if use_path2 {
         hip(gpu.moe_down_combine_grouped_top10(
             p.y_down_grouped,
             p.inverse_perm,

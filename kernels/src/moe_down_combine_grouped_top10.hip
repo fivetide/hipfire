@@ -20,9 +20,14 @@ static __device__ __forceinline__ float moe_top10_bf16_to_f32(__hip_bfloat16 val
 // moe_down_combine_top10_batched: route ranks are selected by ascending expert
 // ID, and residual, weight, output, product, and every accumulation are each
 // rounded through the source BF16 contract before the next rank.
-__launch_bounds__(256, 4)
-extern "C" __global__ void moe_down_combine_grouped_top10(
-    const float* __restrict__ grouped_down, // [grouped_rows * H], unweighted
+static __device__ __forceinline__ float moe_down_widen(float v) { return v; }
+static __device__ __forceinline__ float moe_down_widen(unsigned short b) {
+    return __uint_as_float((unsigned int)b << 16);
+}
+
+template <typename T>
+__device__ __forceinline__ void moe_down_combine_grouped(
+    const T* __restrict__ grouped_down,     // [grouped_rows * H], unweighted
     const int* __restrict__ inverse_perm,    // [N * 10], flat -> grouped row
     const int* __restrict__ topk_indices,     // [N * 10], expert IDs
     const float* __restrict__ topk_weights,   // [N * 10]
@@ -58,7 +63,7 @@ extern "C" __global__ void moe_down_combine_grouped_top10(
         const int grouped_row = inverse_perm[route_base + selected_rank];
         const float raw_output =
             (grouped_row >= 0 && grouped_row < grouped_rows)
-                ? grouped_down[(size_t)grouped_row * hidden + column]
+                ? moe_down_widen(grouped_down[(size_t)grouped_row * hidden + column])
                 : 0.0f;
         const __hip_bfloat16 output = moe_top10_bf16_round(raw_output);
         const __hip_bfloat16 weighted = moe_top10_bf16_round(
@@ -68,4 +73,23 @@ extern "C" __global__ void moe_down_combine_grouped_top10(
     }
     residual[(size_t)token * hidden + column] =
         moe_top10_bf16_to_f32(accumulated);
+}
+
+__launch_bounds__(256, 4)
+extern "C" __global__ void moe_down_combine_grouped_top10(
+    const float* __restrict__ grouped_down, const int* __restrict__ inverse_perm,
+    const int* __restrict__ topk_indices, const float* __restrict__ topk_weights,
+    float* __restrict__ residual, int hidden, int grouped_rows, int tokens) {
+    moe_down_combine_grouped(grouped_down, inverse_perm, topk_indices, topk_weights,
+                             residual, hidden, grouped_rows, tokens);
+}
+
+// Grouped down stored as BF16 bits: the values the BF16 round below yields.
+__launch_bounds__(256, 4)
+extern "C" __global__ void moe_down_combine_grouped_top10_bf16in(
+    const unsigned short* __restrict__ grouped_down, const int* __restrict__ inverse_perm,
+    const int* __restrict__ topk_indices, const float* __restrict__ topk_weights,
+    float* __restrict__ residual, int hidden, int grouped_rows, int tokens) {
+    moe_down_combine_grouped(grouped_down, inverse_perm, topk_indices, topk_weights,
+                             residual, hidden, grouped_rows, tokens);
 }

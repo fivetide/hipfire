@@ -71,10 +71,19 @@ __device__ __forceinline__ half16_t dq_nibbles(unsigned int lo, unsigned int hi,
 // tile); the odd tile's wave exits.  Every tile keeps the single-tile WMMA
 // sequence, so outputs are unchanged.  The K-tile loop is unrolled so later
 // tile pairs' loads issue ahead of the current decode/WMMA.
-template <bool PAIR>
+// F32 -> BF16 bits, round to nearest even; non-finite values truncate (the
+// BF16 round trip leaves them unchanged).  Widening the bits back gives the
+// value moe_bf16_round_trip / hip_bfloat16 rounding yields for finite input.
+__device__ __forceinline__ unsigned short moe_bf16_bits(float v) {
+    const unsigned int u = __float_as_uint(v);
+    if (!isfinite(v)) return (unsigned short)(u >> 16);
+    return (unsigned short)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+}
+
+template <bool PAIR, bool OUT_BF16>
 __device__ __forceinline__ void moe_grouped_wmma_k2_tiles(
     const char* __restrict__ A, const int* __restrict__ sorted_slot_index,
-    const _Float16* __restrict__ X_src, float* __restrict__ Y_grouped,
+    const _Float16* __restrict__ X_src, void* __restrict__ Y_grouped,
     int M, int K, int x_row_div, int m_total, int tid, int row_start, int slot_start) {
     const int lane = tid & 15;
     const half16_t zero_b = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -135,19 +144,24 @@ __device__ __forceinline__ void moe_grouped_wmma_k2_tiles(
 #pragma unroll
             for (int j = 0; j < 8; j++) {
                 const int out_row = row_start + 2 * j + (tid >> 4);
-                if (out_row < M) Y_grouped[(long long)out_col * M + out_row] = acc[t][j];
+                if (out_row >= M) continue;
+                const long long o = (long long)out_col * M + out_row;
+                if (OUT_BF16)
+                    ((unsigned short*)Y_grouped)[o] = moe_bf16_bits(acc[t][j]);
+                else
+                    ((float*)Y_grouped)[o] = acc[t][j];
             }
         }
     }
 }
 
-__launch_bounds__(32, 2)
-extern "C" __global__ void gemm_mq4g256v2_moe_grouped_wmma_k2(
+template <bool OUT_BF16>
+__device__ __forceinline__ void gemm_mq4g256v2_moe_grouped_wmma_k2_entry(
     const unsigned long long* __restrict__ expert_weight_ptrs,
     const int* __restrict__ expert_tile_ids,
     const int* __restrict__ sorted_slot_index,
     const _Float16* __restrict__ X_src,
-    float* __restrict__ Y_grouped,
+    void* __restrict__ Y_grouped,
     int M, int K, int x_row_div, int m_total) {
     const int tid = threadIdx.x;
     const int row_start = blockIdx.x * 16;
@@ -162,7 +176,25 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_wmma_k2(
     const char* A = reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
     const bool pair = (tile_y + 1) * 16 < m_total && expert_tile_ids[tile_y + 1] == expert_id;
     if (pair)
-        moe_grouped_wmma_k2_tiles<true>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start);
+        moe_grouped_wmma_k2_tiles<true, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start);
     else
-        moe_grouped_wmma_k2_tiles<false>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start);
+        moe_grouped_wmma_k2_tiles<false, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start);
 }
+
+#define MOE_WMMA_ARGS \
+    const unsigned long long* __restrict__ expert_weight_ptrs, \
+    const int* __restrict__ expert_tile_ids, const int* __restrict__ sorted_slot_index, \
+    const _Float16* __restrict__ X_src, void* __restrict__ Y_grouped, \
+    int M, int K, int x_row_div, int m_total
+__launch_bounds__(32, 2)
+extern "C" __global__ void gemm_mq4g256v2_moe_grouped_wmma_k2(MOE_WMMA_ARGS) {
+    gemm_mq4g256v2_moe_grouped_wmma_k2_entry<false>(expert_weight_ptrs, expert_tile_ids, sorted_slot_index, X_src,
+                         Y_grouped, M, K, x_row_div, m_total);
+}
+// Y_grouped as BF16 (RNE) for consumers that round each value to BF16 first.
+__launch_bounds__(32, 2)
+extern "C" __global__ void gemm_mq4g256v2_moe_grouped_wmma_k2_bf16out(MOE_WMMA_ARGS) {
+    gemm_mq4g256v2_moe_grouped_wmma_k2_entry<true>(expert_weight_ptrs, expert_tile_ids, sorted_slot_index, X_src,
+                        Y_grouped, M, K, x_row_div, m_total);
+}
+#undef MOE_WMMA_ARGS
