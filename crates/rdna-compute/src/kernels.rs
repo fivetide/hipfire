@@ -2085,17 +2085,17 @@ pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_MULTIROW_SRC: &str =
 /// two-row predecessor did.
 pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O4_R16_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10_o4_r16.gfx1151.hip");
-/// gfx1151 exact-shape O4×R4 QT44 grouped gate/up consumer.
-/// It pairs four adjacent output rows with four route slots at the same
-/// 4-chain × 4-slot × 4-row = 64 accumulator budget, so each group's eight X
-/// scalars feed four rows instead of two, while the 16-slot metadata and the
-/// static four-chain reduction order stay identical to the O2×R8 sibling.
-pub const GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R4_GFX1151_SRC: &str =
-    include_str!("../../../kernels/src/gemm_mq4g256v2_moe_grouped_top10_o4_r4.gfx1151.hip");
+/// gfx1151 exact-shape O4×R8 QT44 grouped gate/up consumer.
+/// Four waves per block each pair four adjacent output rows with one
+/// eight-slot subtile whose X is staged once per block through LDS; the
+/// 16-slot metadata and the static four-chain reduction order stay identical
+/// to the O2×R8 sibling.
+pub const GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R8_X4_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4.gfx1151.hip");
 /// gfx1151 exact-shape O2×R8 QT44 grouped gate/up consumer.
 /// It pairs two adjacent output rows with eight route slots while retaining
 /// the existing 16-slot metadata and the static four-chain reduction order.
-/// The O4×R4 consumer above serves the M=1280, K=2560 shape; this source is
+/// The O4×R8 consumer above serves the M=1280, K=2560 shape; this source is
 /// retained as that arm's bitwise reference and rollback path.
 pub const GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O2_R8_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_moe_grouped_top10_o2_r8.gfx1151.hip");

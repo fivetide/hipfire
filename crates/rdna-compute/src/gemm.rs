@@ -38950,7 +38950,7 @@ impl Gpu {
     }
     /// Qwen4 fixed top-10 grouped qt44 gate/up entry.  Keep the indexed
     /// decode kernel's F32 arithmetic for every GPU; only the gfx1151 exact
-    /// shape uses the bit-identical O4×R4 optimization.
+    /// shape uses the bit-identical O4×R8 optimization.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_mq4g256v2_moe_grouped_top10(
         &mut self,
@@ -38972,7 +38972,7 @@ impl Gpu {
             ));
         }
         if self.arch_caps.is_gfx1151() && m == 1280 && k == 2560 {
-            return self.gemm_mq4g256v2_moe_grouped_top10_o4_r4_gfx1151(
+            return self.gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_gfx1151(
                 expert_weight_ptrs,
                 expert_tile_ids,
                 sorted_slot_index,
@@ -38996,13 +38996,13 @@ impl Gpu {
             grouped_rows,
         )
     }
-    /// gfx1151 exact-shape O4×R4 companion for the Qwen4 QT44 grouped gate/up
-    /// path.  Four adjacent output rows are paired with four route slots at the
-    /// same 4-chain × 4-slot × 4-row = 64 accumulator budget as the O2×R8
-    /// sibling, so each group's X scalars feed four rows instead of two.  Like
-    /// the O2×R8 arm this is deliberately selected only for M=1280, K=2560.
+    /// gfx1151 exact-shape O4×R8 companion for the Qwen4 QT44 grouped gate/up
+    /// path.  Four waves per 128-thread block each pair four adjacent output
+    /// rows with one eight-slot subtile; the subtile's X is staged once per
+    /// block through LDS.  Like the O2×R8 arm this is deliberately selected
+    /// only for M=1280, K=2560.
     #[allow(clippy::too_many_arguments)]
-    fn gemm_mq4g256v2_moe_grouped_top10_o4_r4_gfx1151(
+    fn gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_gfx1151(
         &mut self,
         expert_weight_ptrs: &GpuTensor,
         expert_tile_ids: &GpuTensor,
@@ -39015,10 +39015,10 @@ impl Gpu {
         grouped_rows: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        const FUNC: &str = "gemm_mq4g256v2_moe_grouped_top10_o4_r4";
+        const FUNC: &str = "gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4";
         self.ensure_kernel(
             FUNC,
-            kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R4_GFX1151_SRC,
+            kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R8_X4_GFX1151_SRC,
             FUNC,
         )?;
         let ep = expert_weight_ptrs.buf.as_ptr();
@@ -39046,8 +39046,8 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "gemm", FUNC, bytes);
         let result = self.launch_maybe_blob(
             FUNC,
-            [m.div_ceil(4) as u32, grouped_rows.div_ceil(4) as u32, 1],
-            [32, 1, 1],
+            [m.div_ceil(16) as u32, grouped_rows.div_ceil(8) as u32, 1],
+            [128, 1, 1],
             0,
             &mut params,
             || {
@@ -39546,12 +39546,12 @@ mod tests {
         }
     }
 
-    /// The gfx1151 O4×R4 grouped gate/up kernel must reproduce the F32 SIMT
+    /// The gfx1151 O4×R8 grouped gate/up kernel must reproduce the F32 SIMT
     /// companion bit for bit: two experts, dead (-1) slots inside a subtile,
     /// an all-dead subtile, a negative expert tile and a partial final tile.
     #[test]
     #[ignore = "requires a gfx1151 GPU and working HIP toolchain"]
-    fn gate_up_o4_r4_is_bit_identical_to_simt() {
+    fn gate_up_o4_r8_is_bit_identical_to_simt() {
         const M: usize = 1280;
         const K: usize = 2560;
         const GROUPED: usize = 330;
@@ -39625,7 +39625,7 @@ mod tests {
                     &ptrs_gpu, &tiles_gpu, &slots_gpu, &x_gpu, &y, M, K, 10, GROUPED,
                 )
             } else {
-                gpu.gemm_mq4g256v2_moe_grouped_top10_o4_r4_gfx1151(
+                gpu.gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_gfx1151(
                     &ptrs_gpu, &tiles_gpu, &slots_gpu, &x_gpu, &y, M, K, 10, GROUPED,
                 )
             }
@@ -39644,7 +39644,7 @@ mod tests {
             .count();
         assert_eq!(
             differing, 0,
-            "O4xR4 gate/up differs from SIMT in {differing} cells"
+            "O4xR8 gate/up differs from SIMT in {differing} cells"
         );
     }
 }
