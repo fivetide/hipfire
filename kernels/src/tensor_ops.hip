@@ -509,6 +509,14 @@ extern "C" __global__ void gated_delta_step_cols_gate_f32(
             decay_lds[tid] = expf(gate[(r0 + tid) * value_heads + value_head]);
             beta_lds[tid] = beta[(r0 + tid) * value_heads + value_head];
         }
+        // The gate epilogue's z values (element tid + 256 i of the group),
+        // fetched now so they arrive while the rows run.
+        float zr[GDN_COL_ROWS * 128 / 256];
+#pragma unroll
+        for (int i = 0; i < GDN_COL_ROWS * 128 / 256; ++i) {
+            const int e = tid + 256 * i, r = e >> 7;
+            zr[i] = r < nr ? z[(size_t)(r0 + r) * value_width + value_head * 128 + (e & 127)] : 0.0f;
+        }
         __syncthreads();
         for (int r = 0; r < nr; ++r) {
             const float decay = decay_lds[r], beta_value = beta_lds[r];
@@ -579,13 +587,17 @@ extern "C" __global__ void gated_delta_step_cols_gate_f32(
             inv_lds[tid] = rsqrtf(sum / 128.0f + 1.0e-6f);
         }
         __syncthreads();
-        for (int e = tid; e < nr * 128; e += 256) {
-            const int r = e >> 7, c = e & 127;
-            const size_t at = (size_t)(r0 + r) * value_width + value_head * 128 + c;
-            const float v = __uint_as_float((unsigned int)out_lds[r][c] << 16);
-            const float normalized = bf16_to_f32(bf16_round(v * inv_lds[r] * bf16_to_f32(norm[c])));
-            const float g = bf16_to_f32(bf16_round(z[at]));
-            output[at] = bf16_to_f32(bf16_round(normalized / (1.0f + expf(-g))));
+#pragma unroll
+        for (int i = 0; i < GDN_COL_ROWS * 128 / 256; ++i) {
+            const int e = tid + 256 * i, r = e >> 7, c = e & 127;
+            if (r < nr) {
+                const size_t at = (size_t)(r0 + r) * value_width + value_head * 128 + c;
+                const float v = __uint_as_float((unsigned int)out_lds[r][c] << 16);
+                const float normalized =
+                    bf16_to_f32(bf16_round(v * inv_lds[r] * bf16_to_f32(norm[c])));
+                const float g = bf16_to_f32(bf16_round(zr[i]));
+                output[at] = bf16_to_f32(bf16_round(normalized / (1.0f + expf(-g))));
+            }
         }
     }
 #pragma unroll
