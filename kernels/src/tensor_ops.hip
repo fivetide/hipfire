@@ -743,8 +743,9 @@ extern "C" __global__ void hyper_norm_gate_f32(
 // lane l computes wide row (l >> 3) * hidden + j0 + (l & 7) exactly as the
 // per-thread GEMM does (32 replayed lane partials, shuffle tree), then the
 // four branch lanes of a column combine in branch order exactly as
-// hyper_read_projected_f32 does.  Eight waves take 2 tokens each, 4 times.
-// Grid [hidden / 8, ceil(rows / 64)], block 256, dynamic LDS
+// hyper_read_projected_f32 does.  Eight waves take 4 tokens each, 4 times
+// (each widened weight serves four tokens).
+// Grid [hidden / 8, ceil(rows / 128)], block 256, dynamic LDS
 // 32 * (low_rank / 2 + 1) * 4 bytes.  branches == 4, hidden % 8 == 0.
 extern "C" __global__ __launch_bounds__(256, 1) void hyper_read_up_fused_f32(
     const unsigned short* __restrict__ W,
@@ -754,7 +755,7 @@ extern "C" __global__ __launch_bounds__(256, 1) void hyper_read_up_fused_f32(
     int hidden,
     int K,
     int N) {
-    constexpr int TPW = 2;
+    constexpr int TPW = 4;
     constexpr int TGROUPS = 4;
     const int branches = 4;
     const int wide = branches * hidden;

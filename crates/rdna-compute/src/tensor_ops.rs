@@ -706,7 +706,7 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
     let low_rank = checked_i32(p.low_rank, "HC read low rank")?;
     let rows = checked_i32(p.rows, "HC read rows")?;
     let column_grid = checked_u32(p.hidden / 8, "HC read column grid")?;
-    let row_grid = checked_u32(p.rows.div_ceil(64), "HC read row grid")?;
+    let row_grid = checked_u32(p.rows.div_ceil(128), "HC read row grid")?;
     let lds_bytes = checked_u32(32 * (p.low_rank / 2 + 1) * 4, "HC read LDS")?;
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "hyper_read_up_fused_f32")?;
     let mut args = KernargBlob::new();
