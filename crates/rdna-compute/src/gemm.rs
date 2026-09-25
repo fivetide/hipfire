@@ -32522,6 +32522,24 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.mqv2_wmma_gfx11_bt(bits, batch_tile, a_raw, x, y, m, k, batch_size, false)
+    }
+
+    /// `overwrite` (`Y = W·X`, gfx1151 MQ6 BT8 only) equals zeroing Y and
+    /// then accumulating, in one launch.
+    #[allow(clippy::too_many_arguments)]
+    fn mqv2_wmma_gfx11_bt(
+        &mut self,
+        bits: u8,
+        batch_tile: usize,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        overwrite: bool,
+    ) -> HipResult<()> {
         let func_name: &'static str = match (bits, batch_tile) {
             (2, 4) => "gemm_mq2g256v2_residual_wmma_gfx11_bt4",
             (3, 4) => "gemm_mq3g256v2_residual_wmma_gfx11_bt4",
@@ -32543,10 +32561,16 @@ impl Gpu {
         // gfx1151 MQ6 BT8: four row tiles share each X chunk through LDS
         // (bitwise identical to BT8; the BT8 X re-reads were the bottleneck).
         let xlds = self.arch.as_str() == "gfx1151" && bits == 6 && batch_tile == 8;
-        let (func_name, rows_per_block, block) = if xlds {
-            ("gemm_mq6g256v2_residual_wmma_gfx11_bt8_x4", 64, 128)
-        } else {
-            (func_name, 16, 32)
+        let (func_name, rows_per_block, block) = match (xlds, overwrite) {
+            (true, false) => ("gemm_mq6g256v2_residual_wmma_gfx11_bt8_x4", 64, 128),
+            (true, true) => ("gemm_mq6g256v2_wmma_gfx11_bt8_x4", 64, 128),
+            (false, false) => (func_name, 16, 32),
+            (false, true) => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "mqv2_wmma_gfx11_bt: overwrite needs the gfx1151 MQ6 BT8 kernel",
+                ));
+            }
         };
         let group_bytes: usize = match bits {
             2 => crate::dispatch::MQ2G256V2_GROUP_BYTES,
@@ -35080,6 +35104,22 @@ impl Gpu {
         self.bind_thread()?;
         if self.arch_caps.has_wmma() {
             self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+            // The memset + residual route below would take the gfx1151 BT8
+            // X-LDS kernel; its overwrite form produces the same bytes in one
+            // launch.  Capture/replay keep the historical contract.
+            if self.arch_caps.is_gfx1151()
+                && !self.replay.is_recording()
+                && !self.graphs.capture_mode
+                && k % 256 == 0
+                && mqv2_prefill_batch_tile(
+                    self.arch.as_str(),
+                    6,
+                    MqV2PrefillProjection::Residual,
+                    batch_size,
+                ) == Some(8)
+            {
+                return self.mqv2_wmma_gfx11_bt(6, 8, a_raw, x, y, m, k, batch_size, true);
+            }
             match self.active_stream.as_ref() {
                 Some(stream) => self
                     .hip
@@ -39646,6 +39686,60 @@ mod tests {
             differing, 0,
             "O4xR8 gate/up differs from SIMT in {differing} cells"
         );
+    }
+
+    /// The gfx1151 MQ6 overwrite GEMM (one launch) must produce the bytes of
+    /// zeroing Y and accumulating with the residual kernel, including rows
+    /// past a 64-row block and a partial 128-token tile.
+    #[test]
+    #[ignore = "requires a gfx1151 GPU and working HIP toolchain"]
+    fn mq6_overwrite_matches_zeroed_residual() {
+        const M: usize = 200;
+        const K: usize = 512;
+        const N: usize = 131;
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) if gpu.arch_caps.is_gfx1151() => gpu,
+            _ => {
+                eprintln!("skip: needs gfx1151");
+                return;
+            }
+        };
+        let group = crate::dispatch::MQ6G256V2_GROUP_BYTES;
+        let mut weights = vec![0u8; M * K / 256 * group];
+        let mut state = 7u32;
+        for (index, chunk) in weights.chunks_mut(group).enumerate() {
+            // Every fifth row stays all-zero (exact zero products).
+            if (index / (K / 256)) % 5 == 4 {
+                continue;
+            }
+            for byte in chunk.iter_mut() {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *byte = (state >> 24) as u8;
+            }
+            for (offset, bits) in [(0, 0x2000u16), (2, 0xa800), (4, 0x2100), (6, 0xa900)] {
+                chunk[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
+            }
+        }
+        let a = gpu.upload_raw(&weights, &[weights.len()]).expect("w upload");
+        let x: Vec<f32> = (0..N * K)
+            .map(|i| ((i * 7919 % 4001) as f32 - 2000.0) / 1777.0)
+            .collect();
+        let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("x upload");
+        let y_ref = gpu.zeros(&[N * M], DType::F32).expect("y ref");
+        gpu.gemm_mqv2_residual_wmma_gfx11_bt(6, 8, &a, &x_gpu, &y_ref, M, K, N)
+            .expect("residual");
+        let sentinel = vec![f32::from_bits(0x7fc0_1234); N * M];
+        let y = gpu.upload_f32(&sentinel, &[sentinel.len()]).expect("y upload");
+        gpu.gemm_mq6g256v2(&a, &x_gpu, &y, M, K, N).expect("overwrite");
+        let want = gpu.download_f32(&y_ref).expect("y ref download");
+        let got = gpu.download_f32(&y).expect("y download");
+        assert!(want.iter().any(|v| *v != 0.0));
+        let differing = got
+            .iter()
+            .zip(&want)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(differing, 0, "overwrite differs in {differing} cells");
     }
 }
 

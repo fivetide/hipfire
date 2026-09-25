@@ -551,7 +551,7 @@ GEN_RESID_BT(6, 8)
 // are the BT kernel's, so results are bitwise identical to it.
 // Grid: [ceil(M/(16*RW)), ceil(N/(16*BV))]. Block: [32*RW].
 // ---------------------------------------------------------------------------
-template <int BITS, int BV, int RW>
+template <int BITS, int BV, int RW, bool OVERWRITE>
 __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
                                               const _Float16* __restrict__ X,
                                               float* __restrict__ Y,
@@ -645,7 +645,12 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
 #pragma unroll
             for (int j = 0; j < 8; j++) {
                 const int out_row = row_start + 2 * j + (lane >> 4);
-                if (out_row < M) Y[(long long)out_col * M + out_row] += acc[b][j];
+                if (out_row < M) {
+                    // Overwrite is the memset-then-accumulate result: +0.0
+                    // plus the sum (not folded: IEEE keeps +0.0 + -0.0 = +0.0).
+                    float* out = Y + (long long)out_col * M + out_row;
+                    *out = (OVERWRITE ? 0.0f : *out) + acc[b][j];
+                }
             }
         }
     }
@@ -659,7 +664,16 @@ gemm_mq6g256v2_residual_wmma_gfx11_bt8_x4(const char* __restrict__ A,
                                           const _Float16* __restrict__ X,
                                           float* __restrict__ Y,
                                           int M, int K, int N) {
-    resid_bt_xlds<6, 8, 4>(A, X, Y, M, K, N);
+    resid_bt_xlds<6, 8, 4, false>(A, X, Y, M, K, N);
+}
+
+// Y = W·X (the memset + residual pair in one launch).
+extern "C" __launch_bounds__(128, 1) __global__ void
+gemm_mq6g256v2_wmma_gfx11_bt8_x4(const char* __restrict__ A,
+                                 const _Float16* __restrict__ X,
+                                 float* __restrict__ Y,
+                                 int M, int K, int N) {
+    resid_bt_xlds<6, 8, 4, true>(A, X, Y, M, K, N);
 }
 
 #endif // __gfx1100__ || __gfx1151__
