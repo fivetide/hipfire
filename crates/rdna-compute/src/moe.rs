@@ -2451,7 +2451,10 @@ mod tests {
         };
         let experts: Vec<GpuTensor> = [expert(3), expert(4)]
             .iter()
-            .map(|bytes| gpu.upload_raw(bytes, &[bytes.len()]).expect("expert upload"))
+            .map(|bytes| {
+                gpu.upload_raw(bytes, &[bytes.len()])
+                    .expect("expert upload")
+            })
             .collect();
         let ptrs: Vec<u8> = experts
             .iter()
@@ -2469,15 +2472,21 @@ mod tests {
             })
             .collect();
         let to_bytes = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
-        let tiles_gpu = gpu.upload_raw(&to_bytes(&tiles), &[tiles.len() * 4]).expect("tiles");
-        let slots_gpu = gpu.upload_raw(&to_bytes(&slots), &[slots.len() * 4]).expect("slots");
+        let tiles_gpu = gpu
+            .upload_raw(&to_bytes(&tiles), &[tiles.len() * 4])
+            .expect("tiles");
+        let slots_gpu = gpu
+            .upload_raw(&to_bytes(&slots), &[slots.len() * 4])
+            .expect("slots");
         let x: Vec<f32> = (0..SLOTS * K)
             .map(|i| ((i * 7919 % 4001) as f32 - 2000.0) / 1777.0)
             .collect();
         let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("x upload");
         let mut run = |o4_r16: bool| {
             let sentinel = vec![f32::from_bits(0x7fc0_1234); GROUPED * M];
-            let y = gpu.upload_f32(&sentinel, &[sentinel.len()]).expect("y upload");
+            let y = gpu
+                .upload_f32(&sentinel, &[sentinel.len()])
+                .expect("y upload");
             gpu.gemm_mq4g128v2_moe_grouped_top10_with(
                 &ptrs_gpu, &tiles_gpu, &slots_gpu, &x_gpu, &y, M, K, 1, GROUPED, SLOTS, 2, o4_r16,
             )
@@ -2494,6 +2503,9 @@ mod tests {
             .zip(&candidate)
             .filter(|(a, b)| a.to_bits() != b.to_bits())
             .count();
-        assert_eq!(differing, 0, "O4xR16 down differs from multirow in {differing} cells");
+        assert_eq!(
+            differing, 0,
+            "O4xR16 down differs from multirow in {differing} cells"
+        );
     }
 }

@@ -9398,7 +9398,8 @@ impl Gpu {
         let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
         // Two-slab S2BT8 form by default; `HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
         // selects the single-slab symbols (see gate_up launcher).
-        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() != Ok("1")
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref()
+            != Ok("1")
             && batch_size % 128 == 0;
         // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
         // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
@@ -9472,9 +9473,15 @@ impl Gpu {
             &mut n_val as *mut _ as *mut c_void,
         ];
         let total_m = qkv_m + z_m + beta_m + alpha_m;
-        let row_tiles = if slabs2 { (total_m + 31) / 32 } else { (total_m + 15) / 16 };
+        let row_tiles = if slabs2 {
+            (total_m + 31) / 32
+        } else {
+            (total_m + 15) / 16
+        };
         let batch_tiles = (batch_size + 16 * bv - 1) / (16 * bv);
-        let bytes = crate::profile::gemv_hfq4g256_bytes(total_m, k) + batch_size * k + batch_size * total_m * 4;
+        let bytes = crate::profile::gemv_hfq4g256_bytes(total_m, k)
+            + batch_size * k
+            + batch_size * total_m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
         let result = self.launch_maybe_blob(
             func_name,
@@ -9547,7 +9554,8 @@ impl Gpu {
         let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
         // Two-slab S2BT8 form by default; `HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
         // selects the single-slab symbols (see gate_up launcher).
-        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() != Ok("1")
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref()
+            != Ok("1")
             && batch_size % 128 == 0;
         // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
         // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
@@ -9615,9 +9623,15 @@ impl Gpu {
             &mut n_val as *mut _ as *mut c_void,
         ];
         let total_m = q_m + k_m + v_m;
-        let row_tiles = if slabs2 { (total_m + 31) / 32 } else { (total_m + 15) / 16 };
+        let row_tiles = if slabs2 {
+            (total_m + 31) / 32
+        } else {
+            (total_m + 15) / 16
+        };
         let batch_tiles = (batch_size + 16 * bv - 1) / (16 * bv);
-        let bytes = crate::profile::gemv_hfq4g256_bytes(total_m, k) + batch_size * k + batch_size * total_m * 4;
+        let bytes = crate::profile::gemv_hfq4g256_bytes(total_m, k)
+            + batch_size * k
+            + batch_size * total_m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
         let result = self.launch_maybe_blob(
             func_name,
@@ -28365,14 +28379,18 @@ impl Gpu {
                         a_beta, x, xq, y_beta, beta_m, k, batch_size,
                     )?;
                 } else {
-                    self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_beta, xq, y_beta, beta_m, k, batch_size)?;
+                    self.gemm_mq4g256v2_mmq_set_prequant_iu4(
+                        a_beta, xq, y_beta, beta_m, k, batch_size,
+                    )?;
                 }
                 if alpha_m < 128 {
                     self.gemm_mq4g256v2_small_tail_set_iu4(
                         a_alpha, x, xq, y_alpha, alpha_m, k, batch_size,
                     )?;
                 } else {
-                    self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_alpha, xq, y_alpha, alpha_m, k, batch_size)?;
+                    self.gemm_mq4g256v2_mmq_set_prequant_iu4(
+                        a_alpha, xq, y_alpha, alpha_m, k, batch_size,
+                    )?;
                 }
                 return Ok(());
             }
@@ -28383,9 +28401,7 @@ impl Gpu {
             // ~2/3 of its 128-row tile (283 us at N=512); route to the
             // measured-best small-M tail kernel (SET semantics).
             if beta_m < 128 {
-                self.gemm_mq4g256v2_small_tail_set(
-                    a_beta, x, xq, y_beta, beta_m, k, batch_size,
-                )?;
+                self.gemm_mq4g256v2_small_tail_set(a_beta, x, xq, y_beta, beta_m, k, batch_size)?;
             } else {
                 self.gemm_mq4g256v2_mmq_set_prequant(a_beta, xq, y_beta, beta_m, k, batch_size)?;
             }
@@ -29584,7 +29600,8 @@ impl Gpu {
         // Two-slab S2BT8 form by default (`HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
         // selects the single-slab symbols): each wave covers 32 rows, halving
         // the row grid. One env read per call.
-        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() != Ok("1")
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref()
+            != Ok("1")
             && batch_size % 128 == 0;
         // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
         // past N=256. A masked BT12 tail beats the exact-divisor BT8/BT4 there
@@ -29650,7 +29667,11 @@ impl Gpu {
             &mut n_val as *mut _ as *mut c_void,
         ];
         let total_m = gate_m + up_m;
-        let row_tiles = if slabs2 { (total_m + 31) / 32 } else { (total_m + 15) / 16 };
+        let row_tiles = if slabs2 {
+            (total_m + 31) / 32
+        } else {
+            (total_m + 15) / 16
+        };
         let batch_tiles = (batch_size + 16 * bv - 1) / (16 * bv);
         let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
             + crate::profile::gemv_hfq4g256_bytes(up_m, k)
@@ -29736,7 +29757,9 @@ impl Gpu {
             // iu4-direct MMQ (W4A4 prefill) opt-in; flag off is unchanged.
             if self.flags.gfx11_mmq_iu4_enabled() {
                 let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
-                self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_gate, xq, y_gate, gate_m, k, batch_size)?;
+                self.gemm_mq4g256v2_mmq_set_prequant_iu4(
+                    a_gate, xq, y_gate, gate_m, k, batch_size,
+                )?;
                 self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_up, xq, y_up, up_m, k, batch_size)?;
                 return Ok(());
             }
@@ -30201,7 +30224,8 @@ impl Gpu {
         let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
         // Two-slab S2BT8 form by default; `HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
         // selects the single-slab symbols (see gate_up launcher).
-        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() != Ok("1")
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref()
+            != Ok("1")
             && batch_size % 128 == 0;
         // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
         // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
@@ -30358,7 +30382,8 @@ impl Gpu {
             && batch_size >= 64
             && batch_size % 64 == 0
         {
-            return self.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8(a_raw, x, y, m, k, batch_size, 1);
+            return self
+                .gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8(a_raw, x, y, m, k, batch_size, 1);
         }
         let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
             .map(|v| v != "0" && !v.is_empty())
@@ -39436,14 +39461,22 @@ mod tests {
             }
         };
         const N: usize = 131;
-        for (m, k) in [(640usize, 2560usize), (512, 2560), (10240, 320), (2560, 640), (64, 324)] {
+        for (m, k) in [
+            (640usize, 2560usize),
+            (512, 2560),
+            (10240, 320),
+            (2560, 640),
+            (64, 324),
+        ] {
             let weights: Vec<u8> = (0..m * k)
                 .flat_map(|i| {
                     let v = ((i.wrapping_mul(2_654_435_761) >> 7) % 4001) as f32 / 2000.0 - 1.0;
                     ((v.to_bits() >> 16) as u16).to_le_bytes()
                 })
                 .collect();
-            let mut w = gpu.upload_raw(&weights, &[weights.len()]).expect("w upload");
+            let mut w = gpu
+                .upload_raw(&weights, &[weights.len()])
+                .expect("w upload");
             w.dtype = DType::BF16;
             w.shape = vec![m, k];
             let x: Vec<f32> = (0..N * k)
@@ -39451,11 +39484,18 @@ mod tests {
                 .collect();
             let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("x upload");
             let y = gpu.zeros(&[N * m], DType::F32).expect("y");
-            gpu.gemm_bf16_xf32_multirow(&w, &x_gpu, &y, m, k, N).expect("multirow GEMM");
+            gpu.gemm_bf16_xf32_multirow(&w, &x_gpu, &y, m, k, N)
+                .expect("multirow GEMM");
             let y_ref = gpu.zeros(&[N * m], DType::F32).expect("y ref");
             for n in 0..N {
-                gpu.gemv_bf16_xf32(&w, &x_gpu.sub_offset(n * k, k), &y_ref.sub_offset(n * m, m), m, k)
-                    .expect("gemv row");
+                gpu.gemv_bf16_xf32(
+                    &w,
+                    &x_gpu.sub_offset(n * k, k),
+                    &y_ref.sub_offset(n * m, m),
+                    m,
+                    k,
+                )
+                .expect("gemv row");
             }
             let got = gpu.download_f32(&y).expect("y download");
             let want = gpu.download_f32(&y_ref).expect("y ref download");
@@ -39465,7 +39505,10 @@ mod tests {
                 .zip(&want)
                 .filter(|(a, b)| a.to_bits() != b.to_bits())
                 .count();
-            assert_eq!(differing, 0, "({m},{k}): multirow GEMM differs from GEMV in {differing} cells");
+            assert_eq!(
+                differing, 0,
+                "({m},{k}): multirow GEMM differs from GEMV in {differing} cells"
+            );
         }
     }
 
@@ -39506,7 +39549,10 @@ mod tests {
         let experts = [expert(1), expert(2)];
         let expert_tensors: Vec<GpuTensor> = experts
             .iter()
-            .map(|bytes| gpu.upload_raw(bytes, &[bytes.len()]).expect("expert upload"))
+            .map(|bytes| {
+                gpu.upload_raw(bytes, &[bytes.len()])
+                    .expect("expert upload")
+            })
             .collect();
         let ptrs: Vec<u8> = expert_tensors
             .iter()
@@ -39525,15 +39571,21 @@ mod tests {
             })
             .collect();
         let to_bytes = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
-        let tiles_gpu = gpu.upload_raw(&to_bytes(&tiles), &[tiles.len() * 4]).expect("tiles");
-        let slots_gpu = gpu.upload_raw(&to_bytes(&slots), &[slots.len() * 4]).expect("slots");
+        let tiles_gpu = gpu
+            .upload_raw(&to_bytes(&tiles), &[tiles.len() * 4])
+            .expect("tiles");
+        let slots_gpu = gpu
+            .upload_raw(&to_bytes(&slots), &[slots.len() * 4])
+            .expect("slots");
         let x: Vec<f32> = (0..TOKENS * K)
             .map(|i| ((i * 7919 % 4001) as f32 - 2000.0) / 1777.0)
             .collect();
         let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("x upload");
         let mut run = |exact: bool| {
             let sentinel = vec![f32::from_bits(0x7fc0_1234); GROUPED * M];
-            let y = gpu.upload_f32(&sentinel, &[sentinel.len()]).expect("y upload");
+            let y = gpu
+                .upload_f32(&sentinel, &[sentinel.len()])
+                .expect("y upload");
             if exact {
                 gpu.gemm_mq4g256v2_moe_grouped_top10_simt(
                     &ptrs_gpu, &tiles_gpu, &slots_gpu, &x_gpu, &y, M, K, 10, GROUPED,
@@ -39556,7 +39608,10 @@ mod tests {
             .zip(&candidate)
             .filter(|(a, b)| a.to_bits() != b.to_bits())
             .count();
-        assert_eq!(differing, 0, "O4xR4 gate/up differs from SIMT in {differing} cells");
+        assert_eq!(
+            differing, 0,
+            "O4xR4 gate/up differs from SIMT in {differing} cells"
+        );
     }
 }
 

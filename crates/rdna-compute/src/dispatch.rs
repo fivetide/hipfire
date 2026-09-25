@@ -5711,8 +5711,14 @@ mod tests {
         gpu.copy_f32_buffer(&dst_view, &src_gpu, n).expect("copy");
         let out = gpu.download_f32(&dst_gpu).expect("download");
         assert!(out[..32].iter().all(|v| *v == 0.0), "copy wrote before dst");
-        assert!(out[32 + n..].iter().all(|v| *v == 0.0), "copy wrote past dst");
-        assert!(out[32..32 + n].iter().zip(&src).all(|(a, b)| a == b), "copy mismatch");
+        assert!(
+            out[32 + n..].iter().all(|v| *v == 0.0),
+            "copy wrote past dst"
+        );
+        assert!(
+            out[32..32 + n].iter().zip(&src).all(|(a, b)| a == b),
+            "copy mismatch"
+        );
     }
 
     #[test]

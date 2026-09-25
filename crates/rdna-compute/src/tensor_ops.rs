@@ -2005,12 +2005,14 @@ fn indexed_attention_attention_batch_impl(
     let hg4_bytes = allow_hg4
         .then(|| qsa_attention_hg4_lds_bytes(gpu, p, shape_selected))
         .flatten();
-    let (kernel_name, grid, shared_mem) = if let Some(bytes) = hg4_bytes
-    {
+    let (kernel_name, grid, shared_mem) = if let Some(bytes) = hg4_bytes {
         (
             "indexed_attention_attention_f32_batched_hg4",
             [
-                checked_u32(p.n_heads / QSA_ATTENTION_HG4_HEADS, "QSA batch attention head grid")?,
+                checked_u32(
+                    p.n_heads / QSA_ATTENTION_HG4_HEADS,
+                    "QSA batch attention head grid",
+                )?,
                 1,
                 row_grid,
             ],
@@ -2228,7 +2230,9 @@ mod tests {
             .iter()
             .flat_map(|v| ((v.to_bits() >> 16) as u16 + 0x3f00).to_le_bytes())
             .collect();
-        let mut norm = gpu.upload_raw(&norm_bits, &[norm_bits.len()]).expect("norm");
+        let mut norm = gpu
+            .upload_raw(&norm_bits, &[norm_bits.len()])
+            .expect("norm");
         norm.dtype = DType::BF16;
         norm.shape = vec![dim];
         let z_gpu = gpu.upload_f32(&z, &[z.len()]).expect("z");
@@ -2267,12 +2271,20 @@ mod tests {
             .expect("per-row gate");
         }
         let bits = |gpu: &Gpu, t: &GpuTensor| -> Vec<u32> {
-            gpu.download_f32(t).expect("download").iter().map(|v| v.to_bits()).collect()
+            gpu.download_f32(t)
+                .expect("download")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
         };
         let (a, b) = (bits(&gpu, &out_a), bits(&gpu, &out_b));
         assert!(a.iter().any(|v| *v != 0), "gate output is all zero");
         assert_eq!(a, b, "batched gate output differs");
-        assert_eq!(bits(&gpu, &rec_a), bits(&gpu, &rec_b), "rounded recurrent differs");
+        assert_eq!(
+            bits(&gpu, &rec_a),
+            bits(&gpu, &rec_b),
+            "rounded recurrent differs"
+        );
         for tensor in [norm, z_gpu, rec_a, out_a, rec_b, out_b] {
             gpu.free_tensor(tensor).expect("free");
         }
@@ -2300,10 +2312,18 @@ mod tests {
                 .collect()
         };
         let projection = wave(1, rows * qkv, 1.5);
-        let gate: Vec<f32> = wave(2, rows * value_heads, 0.5).iter().map(|g| g - 0.6).collect();
-        let beta: Vec<f32> = wave(3, rows * value_heads, 0.45).iter().map(|b| b + 0.5).collect();
+        let gate: Vec<f32> = wave(2, rows * value_heads, 0.5)
+            .iter()
+            .map(|g| g - 0.6)
+            .collect();
+        let beta: Vec<f32> = wave(3, rows * value_heads, 0.45)
+            .iter()
+            .map(|b| b + 0.5)
+            .collect();
         let state0 = wave(4, value * dim, 0.2);
-        let proj_gpu = gpu.upload_f32(&projection, &[projection.len()]).expect("projection");
+        let proj_gpu = gpu
+            .upload_f32(&projection, &[projection.len()])
+            .expect("projection");
         let gate_gpu = gpu.upload_f32(&gate, &[gate.len()]).expect("gate");
         let beta_gpu = gpu.upload_f32(&beta, &[beta.len()]).expect("beta");
 
@@ -2349,7 +2369,11 @@ mod tests {
             .expect("per-row GDN");
         }
         let bits = |gpu: &Gpu, t: &GpuTensor| -> Vec<u32> {
-            gpu.download_f32(t).expect("download").iter().map(|v| v.to_bits()).collect()
+            gpu.download_f32(t)
+                .expect("download")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
         };
         let (a, b) = (bits(&gpu, &batched_out), bits(&gpu, &row_out));
         assert!(a.iter().any(|v| *v != 0), "batched output is all zero");
@@ -2360,7 +2384,15 @@ mod tests {
             bits(&gpu, &row_state),
             "GDN final state differs"
         );
-        for tensor in [proj_gpu, gate_gpu, beta_gpu, batched_state, batched_out, row_state, row_out] {
+        for tensor in [
+            proj_gpu,
+            gate_gpu,
+            beta_gpu,
+            batched_state,
+            batched_out,
+            row_state,
+            row_out,
+        ] {
             gpu.free_tensor(tensor).expect("free");
         }
     }
@@ -3030,7 +3062,10 @@ mod tests {
         let capacity = budget_blocks * compress + compress - 1;
         let lcg = |seed: usize, n: usize| -> Vec<f32> {
             (0..n)
-                .map(|i| ((i.wrapping_mul(2_654_435_761).wrapping_add(seed) % 2003) as f32 - 1001.0) / 997.0)
+                .map(|i| {
+                    ((i.wrapping_mul(2_654_435_761).wrapping_add(seed) % 2003) as f32 - 1001.0)
+                        / 997.0
+                })
                 .collect()
         };
         let q = lcg(1, rows * n_heads * 2 * head_dim);
@@ -3045,7 +3080,8 @@ mod tests {
             for slot in 0..chosen {
                 let block = (blocks - 1 - (slot * 7 + row) % blocks) as i32;
                 for r in 0..compress {
-                    selected[row * capacity + slot * compress + r] = block * compress as i32 + r as i32;
+                    selected[row * capacity + slot * compress + r] =
+                        block * compress as i32 + r as i32;
                 }
             }
             let mut offset = chosen * compress;
@@ -3058,12 +3094,19 @@ mod tests {
         }
         let q_gpu = gpu.upload_f32(&q, &[q.len()]).expect("q upload");
         let keys_gpu = gpu.upload_f32(&keys, &[keys.len()]).expect("keys upload");
-        let values_gpu = gpu.upload_f32(&values, &[values.len()]).expect("values upload");
+        let values_gpu = gpu
+            .upload_f32(&values, &[values.len()])
+            .expect("values upload");
         let selected_gpu = gpu
             .zeros(&[selected.len() * std::mem::size_of::<i32>()], DType::Raw)
             .expect("selected allocation");
-        let bytes = selected.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<_>>();
-        gpu.hip.memcpy_htod(&selected_gpu.buf, &bytes).expect("selected upload");
+        let bytes = selected
+            .iter()
+            .flat_map(|v| v.to_ne_bytes())
+            .collect::<Vec<_>>();
+        gpu.hip
+            .memcpy_htod(&selected_gpu.buf, &bytes)
+            .expect("selected upload");
         let run = |gpu: &mut Gpu, allow_hg4: bool| {
             let output = gpu
                 .zeros(&[rows * n_heads * head_dim], DType::F32)
@@ -3096,13 +3139,19 @@ mod tests {
         };
         let reference = run(&mut gpu, false);
         let grouped = run(&mut gpu, true);
-        assert!(reference.iter().any(|v| *v != 0.0), "reference output is all zero");
+        assert!(
+            reference.iter().any(|v| *v != 0.0),
+            "reference output is all zero"
+        );
         let differing = reference
             .iter()
             .zip(&grouped)
             .filter(|(a, b)| a.to_bits() != b.to_bits())
             .count();
-        assert_eq!(differing, 0, "grouped QSA attention differs in {differing} cells");
+        assert_eq!(
+            differing, 0,
+            "grouped QSA attention differs in {differing} cells"
+        );
         for tensor in [q_gpu, keys_gpu, values_gpu, selected_gpu] {
             gpu.free_tensor(tensor).expect("free");
         }
