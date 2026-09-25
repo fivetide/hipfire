@@ -697,7 +697,30 @@ extern "C" __global__ void hyper_norm_gate_f32(
     if (wave >= branches) return;
     const unsigned short* w_row = gate_weight + (size_t)wave * wide;
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-    for (int i = lane * 8; i + 8 <= wide; i += 32 * 8) {
+    // Weights are fetched ten steps at a time before they are consumed: one
+    // load per step waits a full memory round trip each.
+    constexpr int BATCH = 10;
+    int i = lane * 8;
+    for (; i + 8 + (BATCH - 1) * 256 <= wide; i += BATCH * 256) {
+        uint4 wb[BATCH];
+#pragma unroll
+        for (int u = 0; u < BATCH; ++u) wb[u] = *(const uint4*)(w_row + i + u * 256);
+#pragma unroll
+        for (int u = 0; u < BATCH; ++u) {
+            const uint4 wv = wb[u];
+            const float4 xa = *(const float4*)(xs + i + u * 256);
+            const float4 xb = *(const float4*)(xs + i + u * 256 + 4);
+            a0 += __uint_as_float(wv.x << 16) * xa.x;
+            a1 += __uint_as_float(wv.x & 0xFFFF0000u) * xa.y;
+            a2 += __uint_as_float(wv.y << 16) * xa.z;
+            a3 += __uint_as_float(wv.y & 0xFFFF0000u) * xa.w;
+            a0 += __uint_as_float(wv.z << 16) * xb.x;
+            a1 += __uint_as_float(wv.z & 0xFFFF0000u) * xb.y;
+            a2 += __uint_as_float(wv.w << 16) * xb.z;
+            a3 += __uint_as_float(wv.w & 0xFFFF0000u) * xb.w;
+        }
+    }
+    for (; i + 8 <= wide; i += 32 * 8) {
         const uint4 wv = *(const uint4*)(w_row + i);
         const float4 xa = *(const float4*)(xs + i);
         const float4 xb = *(const float4*)(xs + i + 4);
