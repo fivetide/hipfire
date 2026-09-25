@@ -51,13 +51,19 @@
 
 #define HF_MQ4_O4_R4_SLOTS 4
 
-// Lane 0 of the `v += __shfl_down(v, off, 32)` tree (off = 16..1) with the
-// partner values moved by permlanex16 / in-row DPP instead of LDS bpermute.
-// Same additions, operands and order; only lane 0's result (the one stored)
-// is defined.
-static __device__ __forceinline__ float hf_lane0_tree_sum(float v) {
+// Two lane-0 trees in one pass: lanes 0-15 carry a, lanes 16-31 carry b.
+// After the cross-row step lane i holds a[i] + a[i+16] and lane 16+i holds
+// b[16+i] + b[i] (the same sum, IEEE add commutes); the in-row DPP steps then
+// reduce both rows with the reference offsets, so a ends in lane 0 and b in
+// lane 16 bit-identical to lane 0 of the `v += __shfl_down(v, off, 32)` tree
+// (off = 16..1) applied to each.  a is returned in
+// lane 0; b is broadcast (readlane 16).
+static __device__ __forceinline__ void hf_lane0_tree_sum2(float& a, float& b) {
+    const bool lo = (threadIdx.x & 31) < 16;
+    float v = lo ? a : b;
+    const float o = lo ? b : a;
     v += __int_as_float(__builtin_amdgcn_permlanex16(
-        __float_as_int(v), __float_as_int(v), 0x76543210u, 0xfedcba98u, false, false));
+        __float_as_int(o), __float_as_int(o), 0x76543210u, 0xfedcba98u, false, false));
     v += __int_as_float(__builtin_amdgcn_update_dpp(
         0, __float_as_int(v), 0x108, 0xf, 0xf, true));  // row_shl:8
     v += __int_as_float(__builtin_amdgcn_update_dpp(
@@ -66,7 +72,8 @@ static __device__ __forceinline__ float hf_lane0_tree_sum(float v) {
         0, __float_as_int(v), 0x102, 0xf, 0xf, true));  // row_shl:2
     v += __int_as_float(__builtin_amdgcn_update_dpp(
         0, __float_as_int(v), 0x101, 0xf, 0xf, true));  // row_shl:1
-    return v;
+    a = v;
+    b = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(v), 16));
 }
 // x & 0x0F0F0F0F, opaque to the optimizer so each nibble converts with one
 // v_cvt_f32_ubyteN instead of being re-canonicalized into v_bfe + cvt.
@@ -310,10 +317,8 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r4(
     // the shuffle-down tree, partners moved by permlane/DPP).
 #pragma unroll
     for (int slot = 0; slot < HF_MQ4_O4_R4_SLOTS; ++slot) {
-        sum0[slot] = hf_lane0_tree_sum(sum0[slot]);
-        sum1[slot] = hf_lane0_tree_sum(sum1[slot]);
-        sum2[slot] = hf_lane0_tree_sum(sum2[slot]);
-        sum3[slot] = hf_lane0_tree_sum(sum3[slot]);
+        hf_lane0_tree_sum2(sum0[slot], sum1[slot]);
+        hf_lane0_tree_sum2(sum2[slot], sum3[slot]);
     }
 
     if (tid == 0) {

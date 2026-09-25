@@ -66,6 +66,30 @@ static __device__ __forceinline__ float hf_lane0_tree_sum(float v) {
     return v;
 }
 
+// Two lane-0 trees in one pass: lanes 0-15 carry a, lanes 16-31 carry b.
+// After the cross-row step lane i holds a[i] + a[i+16] and lane 16+i holds
+// b[16+i] + b[i] (the same sum, IEEE add commutes); the in-row DPP steps then
+// reduce both rows with the reference offsets, so a ends in lane 0 and b in
+// lane 16 bit-identical to two hf_lane0_tree_sum calls.  a is returned in
+// lane 0; b is broadcast (readlane 16).
+static __device__ __forceinline__ void hf_lane0_tree_sum2(float& a, float& b) {
+    const bool lo = (threadIdx.x & 31) < 16;
+    float v = lo ? a : b;
+    const float o = lo ? b : a;
+    v += __int_as_float(__builtin_amdgcn_permlanex16(
+        __float_as_int(o), __float_as_int(o), 0x76543210u, 0xfedcba98u, false, false));
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(v), 0x108, 0xf, 0xf, true));  // row_shl:8
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(v), 0x104, 0xf, 0xf, true));  // row_shl:4
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(v), 0x102, 0xf, 0xf, true));  // row_shl:2
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(v), 0x101, 0xf, 0xf, true));  // row_shl:1
+    a = v;
+    b = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(v), 16));
+}
+
 __launch_bounds__(32, 4)
 extern "C" __global__ void gemm_bf16_xf32_multirow_r16_gfx1151(
     const unsigned short* __restrict__ W,
@@ -302,9 +326,11 @@ extern "C" __global__ void gemm_bf16_xf32_multirow_r16w4_gfx1151(
     for (int row = 0; row < HF_R16_ROWS; ++row) {
 #pragma unroll
         for (int stream = 0; stream < HF_R16_STREAMS; ++stream) {
-            sum[row][stream] = hf_lane0_tree_sum(
-                (a0[row][stream] + a1[row][stream]) + (a2[row][stream] + a3[row][stream]));
+            sum[row][stream] =
+                (a0[row][stream] + a1[row][stream]) + (a2[row][stream] + a3[row][stream]);
         }
+        static_assert(HF_R16_STREAMS == 2, "streams are reduced as one pair");
+        hf_lane0_tree_sum2(sum[row][0], sum[row][1]);
     }
     if (lane == 0) {
 #pragma unroll
