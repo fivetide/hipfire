@@ -18,7 +18,7 @@ use crate::types::DispatchError;
 use rdna_compute::tensor_ops::{
     argmax_f32, bf16_roundtrip_f32, gated_delta_conv, gated_delta_conv_batched, gated_delta_gate,
     gated_delta_gate_batched, gated_delta_params, gated_delta_params_batched, gated_delta_step,
-    gated_delta_step_batched, gated_delta_step_gate_cols, hc_activation_fused_f32,
+    gated_delta_step_batched, gated_delta_step_gate_wmma, hc_activation_fused_f32,
     hc_state_bf16_add_f32, hc_state_bf16_to_f32, hyper_norm, hyper_norm_f16, hyper_norm_gate,
     hyper_read_projected, hyper_read_up_fused, hyper_read_up_wmma, hyper_write,
     indexed_attention_attention_batch, indexed_attention_cache_append_batch,
@@ -874,7 +874,7 @@ pub fn execute_gated_delta_net(
         };
         // The F16 prefill route fuses the gate into the column-split
         // recurrence (KLD-gated); otherwise the exact kernels run.
-        if !hip(gated_delta_step_gate_cols(gpu, &step, &gated))? {
+        if !hip(gated_delta_step_gate_wmma(gpu, &step, &gated))? {
             hip(gated_delta_step_batched(gpu, &step))?;
             hip(gated_delta_gate_batched(gpu, &gated))?;
         }

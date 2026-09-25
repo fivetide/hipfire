@@ -15,6 +15,8 @@ use crate::{DType, Gpu, GpuTensor};
 pub(crate) const TENSOR_OPS_SRC: &str = include_str!("../../../kernels/src/tensor_ops.hip");
 const HYPER_READ_UP_WMMA_SRC: &str =
     include_str!("../../../kernels/src/hyper_read_up_wmma.gfx1151.hip");
+const GATED_DELTA_CHUNK_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_chunk_wmma.gfx1151.hip");
 const INDEXED_ATTENTION_DENSE_WMMA_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_dense_wmma.gfx1151.hip");
 const QSA_SELECT_PARALLEL_THREADS: u32 = 256;
@@ -258,13 +260,13 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     )
 }
 /// [`gated_delta_step_batched`] followed by [`gated_delta_gate_batched`] as
-/// one column-split kernel on the Qwen4 F16 prefill route (gfx1151, >=
-/// QWEN4_F16_WMMA_MIN_TOKENS rows, no recorder or capture, not opted out):
-/// `gate.output` receives the gated rows and `p.output` is not written.  The
-/// recurrence sums kd in a different order than the exact kernel, so the
-/// route is KLD-gated; the gate is that kernel's expression.  Returns `false`
-/// with nothing launched when the route does not apply.
-pub fn gated_delta_step_gate_cols(
+/// one chunked (16-row WY form) F16 WMMA kernel on the Qwen4 F16 prefill
+/// route (gfx1151, >= QWEN4_F16_WMMA_MIN_TOKENS rows, no recorder or
+/// capture, not opted out): `gate.output` receives the gated rows and
+/// `p.output` is not written.  The recurrence's products round to F16, so
+/// the route is KLD-gated; the gate is that kernel's expression.  Returns
+/// `false` with nothing launched when the route does not apply.
+pub fn gated_delta_step_gate_wmma(
     gpu: &mut Gpu,
     p: &GatedDeltaStepBatched<'_>,
     gate: &GatedDeltaGateBatched<'_>,
@@ -308,12 +310,16 @@ pub fn gated_delta_step_gate_cols(
     let qn = gpu.qwen4_f16_x_scratch(2 * p.rows * qk)?;
     let qp = qn.buf.as_ptr();
     let kp = unsafe { (qp as *mut u8).add(p.rows * qk * 2) } as *mut std::ffi::c_void;
-    for kernel in [
+    gpu.ensure_kernel_public(
+        "tensor_ops",
+        TENSOR_OPS_SRC,
         "gated_delta_qk_norm_bf16_batched",
-        "gated_delta_step_cols_gate_f32",
-    ] {
-        gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
-    }
+    )?;
+    gpu.ensure_kernel_public(
+        "gated_delta_chunk_wmma",
+        GATED_DELTA_CHUNK_WMMA_SRC,
+        "gated_delta_chunk_gate_wmma",
+    )?;
     let mut args = KernargBlob::new();
     args.push_ptr(p.projection.buf.as_ptr());
     args.push_ptr(qp);
@@ -344,8 +350,8 @@ pub fn gated_delta_step_gate_cols(
     args.push_f32((p.key_dim as f32).sqrt().recip());
     args.pad_to(16);
     gpu.launch_blob_recorded(
-        "gated_delta_step_cols_gate_f32",
-        [checked_u32(p.value_heads, "GDN column head grid")?, 1, 1],
+        "gated_delta_chunk_gate_wmma",
+        [checked_u32(p.value_heads, "GDN chunk head grid")?, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
@@ -3399,18 +3405,18 @@ mod tests {
         }
     }
 
-    /// The fused column-split GDN recurrence + gate (Qwen4 F16 prefill route)
-    /// sums kd in its own order but must track the exact persistent kernel
-    /// followed by the gate kernel, in gated output and final state, across its
-    /// 32-row staging groups.
+    /// The chunked F16 WMMA GDN recurrence + gate (Qwen4 F16 prefill route)
+    /// must track the exact persistent kernel followed by the gate kernel, in
+    /// gated output and final state, across its 16-row chunks and a partial
+    /// last chunk.
     #[test]
-    fn gdn_column_gate_arm_matches_persistent_kernel_and_gate() {
+    fn gdn_chunk_gate_arm_matches_persistent_kernel_and_gate() {
         let Some(mut gpu) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
         if !gpu.arch_caps.is_gfx1151() || !*crate::gemm::QWEN4_F16_WMMA {
-            eprintln!("skip: the column arm is the gfx1151 F16 route");
+            eprintln!("skip: the chunked arm is the gfx1151 F16 route");
             return;
         }
         let (key_heads, value_heads, dim, rows) = (2usize, 6usize, 128usize, 530usize);
@@ -3479,8 +3485,8 @@ mod tests {
             };
             if fused {
                 assert!(
-                    gated_delta_step_gate_cols(gpu, &step, &gated).expect("fused GDN"),
-                    "column route did not apply"
+                    gated_delta_step_gate_wmma(gpu, &step, &gated).expect("fused GDN"),
+                    "chunked route did not apply"
                 );
             } else {
                 gated_delta_step_batched(gpu, &step).expect("batched GDN");
@@ -3506,15 +3512,12 @@ mod tests {
             assert!(norm > 0.0, "reference is all zero");
             (err / norm).sqrt()
         };
-        // Reordered F32 sums flip an occasional BF16 rounding of the gated
-        // output (~1e-3 relative); a wrong column, row, head or gate lands
-        // near 1.
+        // F16 operands flip an occasional BF16 rounding of the gated output
+        // (~2e-3 relative) and leave the state ~3e-4 off; a wrong column, row,
+        // head, chunk boundary or gate lands near 1.
         let (out_rel, state_rel) = (rel(&ref_out, &col_out), rel(&ref_state, &col_state));
-        assert!(
-            out_rel < 1e-2,
-            "GDN column gate output rel L2 {out_rel:.3e}"
-        );
-        assert!(state_rel < 1e-4, "GDN column state rel L2 {state_rel:.3e}");
+        assert!(out_rel < 1e-2, "GDN chunk gate output rel L2 {out_rel:.3e}");
+        assert!(state_rel < 2e-3, "GDN chunk state rel L2 {state_rel:.3e}");
         for tensor in [proj_gpu, gate_gpu, beta_gpu, z_gpu, norm_gpu] {
             gpu.free_tensor(tensor).expect("free");
         }

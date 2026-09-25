@@ -423,18 +423,11 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_f32(
 
 
 
-// GDN recurrence split by value column (non-bit-exact prefill arm).  Every
-// state column evolves independently (kv_mem, delta, update and output of
-// value column v read only column v), so a block owns one value head and runs
-// a row group with no block barrier: lane = column pair * 4 + kd quarter,
-// 2 x 32 state values per thread, kd sums as four chains per thread plus a
-// quad DPP reduction instead of the reference's serial kd order.
-// gated_delta_qk_norm_bf16_batched first stores every row's normalized q and
-// k (the reference's BF16 rounding points; the square sum as lane partials +
-// a wave tree) as BF16.
-//
-// qk norm: grid [rows], block 256; wave w takes items w, w + 8, ... of the
-// row's 2 * key_heads (q heads, then k heads).
+// Every row's normalized q and k for the chunked GDN prefill arm
+// (gated_delta_chunk_wmma.gfx1151.hip), at the reference's BF16 rounding
+// points (the square sum as lane partials + a wave tree), stored as BF16.
+// Grid [rows], block 256; wave w takes items w, w + 8, ... of the row's
+// 2 * key_heads (q heads, then k heads).
 extern "C" __global__ __launch_bounds__(256) void gated_delta_qk_norm_bf16_batched(
     const float* projection, __hip_bfloat16* qn, __hip_bfloat16* kn, int rows, int qkv_width,
     int key_heads) {
@@ -461,150 +454,6 @@ extern "C" __global__ __launch_bounds__(256) void gated_delta_qk_norm_bf16_batch
     }
 }
 
-// Recurrence + gated RMSNorm (gated_delta_gate_bf16_f32_batched's exact
-// expression): grid [value_heads], block 256 (one value head, all 128
-// columns); rows staged GDN_COL_ROWS at a time in LDS.  Each group's
-// BF16-rounded recurrent rows stay in LDS and the gate is applied at the end
-// of the group (serial i-order sum per row), so the recurrent output never
-// reaches global memory.  key_dim == value_dim == 128.
-#define GDN_COL_ROWS 32
-__launch_bounds__(256)
-extern "C" __global__ void gated_delta_step_cols_gate_f32(
-    const float* projection, const unsigned short* qn, const unsigned short* kn, const float* gate,
-    const float* beta, float* state, const float* z, const __hip_bfloat16* norm, float* output,
-    int rows, int qkv_width, int key_heads, int value_heads, float query_scale) {
-    const int value_head = blockIdx.x;
-    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, quarter = lane & 3;
-    const int cl = wave * 16 + (lane >> 2) * 2, col = cl;  // columns col, col + 1
-    const int key_head = value_head / (value_heads / key_heads);
-    const int v_offset = 2 * key_heads * 128 + value_head * 128;
-    const int value_width = value_heads * 128;
-    const int state_base = value_head * 128 * 128;
-    __shared__ __align__(16) unsigned short q_lds[GDN_COL_ROWS][128];
-    __shared__ __align__(16) unsigned short k_lds[GDN_COL_ROWS][128];
-    // v and the recurrent rows are BF16-rounded where they are used: BF16 bits.
-    __shared__ __align__(16) unsigned short v_lds[GDN_COL_ROWS][128];
-    __shared__ __align__(16) unsigned short out_lds[GDN_COL_ROWS][128];
-    __shared__ float decay_lds[GDN_COL_ROWS], beta_lds[GDN_COL_ROWS], inv_lds[GDN_COL_ROWS];
-    float s[32], t[32];
-#pragma unroll
-    for (int i = 0; i < 32; ++i) {
-        const float2 st = *(const float2*)(state + state_base + (quarter * 32 + i) * 128 + col);
-        s[i] = st.x; t[i] = st.y;
-    }
-    for (int r0 = 0; r0 < rows; r0 += GDN_COL_ROWS) {
-        const int nr = min(GDN_COL_ROWS, rows - r0);
-        __syncthreads();
-        for (int e = tid; e < nr * 16; e += 256) {
-            const int r = e >> 4, c8 = e & 15;
-            const size_t base = ((size_t)(r0 + r) * key_heads + key_head) * 128 + c8 * 8;
-            *(uint4*)&q_lds[r][c8 * 8] = *(const uint4*)(qn + base);
-            *(uint4*)&k_lds[r][c8 * 8] = *(const uint4*)(kn + base);
-        }
-        for (int e = tid; e < nr * 128; e += 256) {
-            const int r = e >> 7, c = e & 127;
-            v_lds[r][c] = bf16_round(projection[(size_t)(r0 + r) * qkv_width + v_offset + c]).data;
-        }
-        if (tid < nr) {
-            decay_lds[tid] = expf(gate[(r0 + tid) * value_heads + value_head]);
-            beta_lds[tid] = beta[(r0 + tid) * value_heads + value_head];
-        }
-        // The gate epilogue's z values (element tid + 256 i of the group),
-        // fetched now so they arrive while the rows run.
-        float zr[GDN_COL_ROWS * 128 / 256];
-#pragma unroll
-        for (int i = 0; i < GDN_COL_ROWS * 128 / 256; ++i) {
-            const int e = tid + 256 * i, r = e >> 7;
-            zr[i] = r < nr ? z[(size_t)(r0 + r) * value_width + value_head * 128 + (e & 127)] : 0.0f;
-        }
-        __syncthreads();
-        for (int r = 0; r < nr; ++r) {
-            const float decay = decay_lds[r], beta_value = beta_lds[r];
-            const unsigned short* kr = &k_lds[r][quarter * 32];
-            const unsigned short* qr = &q_lds[r][quarter * 32];
-            float kv[32], qv[32];
-#pragma unroll
-            for (int i = 0; i < 32; i += 8) {
-                const uint4 w = *(const uint4*)(kr + i);
-                kv[i + 0] = __uint_as_float(w.x << 16); kv[i + 1] = __uint_as_float(w.x & 0xFFFF0000u);
-                kv[i + 2] = __uint_as_float(w.y << 16); kv[i + 3] = __uint_as_float(w.y & 0xFFFF0000u);
-                kv[i + 4] = __uint_as_float(w.z << 16); kv[i + 5] = __uint_as_float(w.z & 0xFFFF0000u);
-                kv[i + 6] = __uint_as_float(w.w << 16); kv[i + 7] = __uint_as_float(w.w & 0xFFFF0000u);
-                const uint4 x = *(const uint4*)(qr + i);
-                qv[i + 0] = __uint_as_float(x.x << 16); qv[i + 1] = __uint_as_float(x.x & 0xFFFF0000u);
-                qv[i + 2] = __uint_as_float(x.y << 16); qv[i + 3] = __uint_as_float(x.y & 0xFFFF0000u);
-                qv[i + 4] = __uint_as_float(x.z << 16); qv[i + 5] = __uint_as_float(x.z & 0xFFFF0000u);
-                qv[i + 6] = __uint_as_float(x.w << 16); qv[i + 7] = __uint_as_float(x.w & 0xFFFF0000u);
-            }
-#pragma unroll
-            for (int i = 0; i < 32; ++i) qv[i] *= query_scale;
-            float p0 = 0.f, p1 = 0.f, p2 = 0.f, p3 = 0.f, u0 = 0.f, u1 = 0.f, u2 = 0.f, u3 = 0.f;
-#pragma unroll
-            for (int i = 0; i < 32; i += 4) {
-                s[i] *= decay; s[i + 1] *= decay; s[i + 2] *= decay; s[i + 3] *= decay;
-                t[i] *= decay; t[i + 1] *= decay; t[i + 2] *= decay; t[i + 3] *= decay;
-                p0 += s[i] * kv[i]; p1 += s[i + 1] * kv[i + 1]; p2 += s[i + 2] * kv[i + 2]; p3 += s[i + 3] * kv[i + 3];
-                u0 += t[i] * kv[i]; u1 += t[i + 1] * kv[i + 1]; u2 += t[i + 2] * kv[i + 2]; u3 += t[i + 3] * kv[i + 3];
-            }
-            float ka = (p0 + p1) + (p2 + p3), kb = (u0 + u1) + (u2 + u3);
-            ka += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(ka), 0xB1, 0xF, 0xF, false));
-            kb += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(kb), 0xB1, 0xF, 0xF, false));
-            ka += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(ka), 0x4E, 0xF, 0xF, false));
-            kb += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(kb), 0x4E, 0xF, 0xF, false));
-            const float da = (__uint_as_float((unsigned int)v_lds[r][cl] << 16) - ka) * beta_value;
-            const float db = (__uint_as_float((unsigned int)v_lds[r][cl + 1] << 16) - kb) * beta_value;
-            float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f, w0 = 0.f, w1 = 0.f, w2 = 0.f, w3 = 0.f;
-#pragma unroll
-            for (int i = 0; i < 32; i += 4) {
-                s[i] += kv[i] * da; s[i + 1] += kv[i + 1] * da; s[i + 2] += kv[i + 2] * da; s[i + 3] += kv[i + 3] * da;
-                t[i] += kv[i] * db; t[i + 1] += kv[i + 1] * db; t[i + 2] += kv[i + 2] * db; t[i + 3] += kv[i + 3] * db;
-                o0 += s[i] * qv[i]; o1 += s[i + 1] * qv[i + 1]; o2 += s[i + 2] * qv[i + 2]; o3 += s[i + 3] * qv[i + 3];
-                w0 += t[i] * qv[i]; w1 += t[i + 1] * qv[i + 1]; w2 += t[i + 2] * qv[i + 2]; w3 += t[i + 3] * qv[i + 3];
-            }
-            float oa = (o0 + o1) + (o2 + o3), ob = (w0 + w1) + (w2 + w3);
-            oa += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(oa), 0xB1, 0xF, 0xF, false));
-            ob += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(ob), 0xB1, 0xF, 0xF, false));
-            oa += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(oa), 0x4E, 0xF, 0xF, false));
-            ob += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(ob), 0x4E, 0xF, 0xF, false));
-            if (quarter == 0) {
-                out_lds[r][cl] = bf16_round(oa).data;
-                out_lds[r][cl + 1] = bf16_round(ob).data;
-            }
-        }
-        __syncthreads();
-        if (tid < nr) {
-            float sum = 0.0f;
-            for (int i = 0; i < 128; i += 8) {
-                const uint4 w = *(const uint4*)&out_lds[tid][i];
-                const unsigned int wv[4] = {w.x, w.y, w.z, w.w};
-#pragma unroll
-                for (int h = 0; h < 4; ++h) {
-                    const float lo = __uint_as_float(wv[h] << 16), hi = __uint_as_float(wv[h] & 0xFFFF0000u);
-                    sum += lo * lo;
-                    sum += hi * hi;
-                }
-            }
-            inv_lds[tid] = rsqrtf(sum / 128.0f + 1.0e-6f);
-        }
-        __syncthreads();
-#pragma unroll
-        for (int i = 0; i < GDN_COL_ROWS * 128 / 256; ++i) {
-            const int e = tid + 256 * i, r = e >> 7, c = e & 127;
-            if (r < nr) {
-                const size_t at = (size_t)(r0 + r) * value_width + value_head * 128 + c;
-                const float v = __uint_as_float((unsigned int)out_lds[r][c] << 16);
-                const float normalized =
-                    bf16_to_f32(bf16_round(v * inv_lds[r] * bf16_to_f32(norm[c])));
-                const float g = bf16_to_f32(bf16_round(zr[i]));
-                output[at] = bf16_to_f32(bf16_round(normalized / (1.0f + expf(-g))));
-            }
-        }
-    }
-#pragma unroll
-    for (int i = 0; i < 32; ++i)
-        *(float2*)(state + state_base + (quarter * 32 + i) * 128 + col) = make_float2(s[i], t[i]);
-}
-#undef GDN_COL_ROWS
 
 // BF16-stored HC streams (Qwen4 F16 prefill route) for the PLE block, which
 // reads them as F32 (the values are BF16-exact there) and adds its output:

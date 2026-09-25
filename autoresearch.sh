@@ -21,9 +21,9 @@ PROMPT_PATH = "benchmarks/prompts/glimmer_prefill_1024.txt"
 PROMPT_MD5 = "0ee8f86ada3683eda452bc294ec824a9"
 RUNS = int(os.environ.get("AR_RUNS", "3"))
 MAX_TOKENS = 16
-# Greedy token IDs recorded on the baseline build (text: "The text you provided contains a
-# repeated block of prose and Python code. Here is").
-REF_IDS = [760, 1414, 488, 3766, 5435, 264, 11173, 2424, 314, 1414, 321, 12654, 1970, 13, 5514, 369]  # segment 2: F16 WMMA gate/up + down, KLD-gated
+# Greedy token IDs recorded on the current KLD-gated build (text: "The text you provided contains a
+# repeated block of prose followed by a Python function definition").
+REF_IDS = [760, 1414, 488, 3766, 5435, 264, 11173, 2424, 314, 58655, 7854, 539, 264, 12654, 709, 7044]  # segment 2: KLD-gated arms (a9 chunked GDN)
 MIN_MATCH = 12  # leading tokens that must match REF_IDS
 
 prompt = open(PROMPT_PATH, "rb").read()
