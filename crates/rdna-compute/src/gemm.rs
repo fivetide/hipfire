@@ -12,6 +12,13 @@ use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
+/// `HIPFIRE_QWEN4_MOE_GATEUP_WMMA=0` keeps the Qwen4 grouped gate/up on the
+/// bit-exact F32 arms (the WMMA arm is not bit-exact; see its call site).
+/// Read once: 48 launches per forward.
+static QWEN4_MOE_GATEUP_WMMA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_QWEN4_MOE_GATEUP_WMMA").map_or(true, |v| v.trim() != "0")
+});
+
 /// One instantiation of the parameterised LDS-staged WMMA GEMM
 /// (`kernels/src/gemm_f16_x_f16_wmma_lds256.hip`).
 ///
@@ -39017,8 +39024,9 @@ impl Gpu {
         ))
     }
     /// Qwen4 fixed top-10 grouped qt44 gate/up entry.  Keep the indexed
-    /// decode kernel's F32 arithmetic for every GPU; only the gfx1151 exact
-    /// shape uses the bit-identical O4×R8 optimization.
+    /// decode kernel's F32 arithmetic for every GPU; the gfx1151 exact shape
+    /// uses the bit-identical O4×R8 optimization for short batches and the
+    /// F16 WMMA grouped GEMM from 512 tokens (PR #775).
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_mq4g256v2_moe_grouped_top10(
         &mut self,
@@ -39031,13 +39039,38 @@ impl Gpu {
         k: usize,
         x_row_div: usize,
         grouped_rows: usize,
-        _x_src_rows: usize,
+        x_src_rows: usize,
     ) -> HipResult<()> {
         if x_row_div != 10 {
             return Err(hip_bridge::HipError::new(
                 1,
                 "gemm_mq4g256v2_moe_grouped_top10: x_row_div must be sealed top-k=10",
             ));
+        }
+        // gfx1151, >= 512 tokens: the F16 WMMA grouped GEMM (60 VGPRs, 16
+        // waves/SIMD) beats the F32 O4×R8 kernel (9.6 vs 14.7 ms at 1131
+        // tokens; slower below ~450).  Not bit-exact — F16 dequant/inputs —
+        // but KLD against the BF16 source is unchanged within noise (0.07525
+        // vs 0.07475, paired CI [-0.0018, +0.0026], 8160 wikitext tokens).
+        // HIPFIRE_QWEN4_MOE_GATEUP_WMMA=0 keeps the F32 arms.
+        if self.arch_caps.is_gfx1151()
+            && m == 1280
+            && k == 2560
+            && x_src_rows >= 512
+            && *QWEN4_MOE_GATEUP_WMMA
+        {
+            return self.gemm_mq4g256v2_moe_grouped_wmma_k2(
+                expert_weight_ptrs,
+                expert_tile_ids,
+                sorted_slot_index,
+                x_src,
+                y_grouped,
+                m,
+                k,
+                x_row_div,
+                grouped_rows,
+                x_src_rows,
+            );
         }
         if self.arch_caps.is_gfx1151() && m == 1280 && k == 2560 {
             return self.gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_gfx1151(

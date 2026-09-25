@@ -16,6 +16,10 @@ hipfire-dispatch = { path = "../hipfire-dispatch", features = ["deltanet"] }
 smallvec = { version = "1.15.2", features = ["const_generics"] }
 sha2.workspace = true
 
+[dev-dependencies]
+memmap2.workspace = true
+saddle-quant = { path = "../saddle-quant" }
+
 [features]
 reference-parity = []
 
