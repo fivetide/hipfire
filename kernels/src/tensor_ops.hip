@@ -1311,6 +1311,54 @@ static __device__ __forceinline__ float indexed_attention_select_score_f32(
     return score;
 }
 
+// indexed_attention_select_score_f32 with four heads' dot chains side by
+// side, so each pooled value is loaded once for all four (float4 loads when
+// both rows are 16-byte aligned and index_dim % 4 == 0).  Every chain keeps
+// its d order and heads are added in order: the score is bitwise unchanged.
+static __device__ __forceinline__ float indexed_attention_select_score4_f32(
+    const float* query,
+    const float* pooled,
+    int block,
+    int index_heads,
+    int index_dim) {
+    const float* row = pooled + block * index_dim;
+    float score = 0.0f;
+    int head = 0;
+    if ((index_dim & 3) == 0
+        && ((reinterpret_cast<unsigned long long>(query)
+             | reinterpret_cast<unsigned long long>(row)) & 15) == 0) {
+        const float4* p4 = reinterpret_cast<const float4*>(row);
+        for (; head + 4 <= index_heads; head += 4) {
+            const float4* q0 = reinterpret_cast<const float4*>(query + head * index_dim);
+            const float4* q1 = q0 + index_dim / 4;
+            const float4* q2 = q1 + index_dim / 4;
+            const float4* q3 = q2 + index_dim / 4;
+            float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
+#pragma unroll 4
+            for (int d4 = 0; d4 < index_dim / 4; ++d4) {
+                const float4 p = p4[d4];
+                const float4 a = q0[d4], b = q1[d4], c = q2[d4], e = q3[d4];
+                dot0 += a.x * p.x; dot0 += a.y * p.y; dot0 += a.z * p.z; dot0 += a.w * p.w;
+                dot1 += b.x * p.x; dot1 += b.y * p.y; dot1 += b.z * p.z; dot1 += b.w * p.w;
+                dot2 += c.x * p.x; dot2 += c.y * p.y; dot2 += c.z * p.z; dot2 += c.w * p.w;
+                dot3 += e.x * p.x; dot3 += e.y * p.y; dot3 += e.z * p.z; dot3 += e.w * p.w;
+            }
+            score += fmaxf(dot0 / sqrtf((float)index_dim), 0.0f);
+            score += fmaxf(dot1 / sqrtf((float)index_dim), 0.0f);
+            score += fmaxf(dot2 / sqrtf((float)index_dim), 0.0f);
+            score += fmaxf(dot3 / sqrtf((float)index_dim), 0.0f);
+        }
+    }
+    for (; head < index_heads; ++head) {
+        float dot = 0.0f;
+        for (int d = 0; d < index_dim; ++d) {
+            dot += query[head * index_dim + d] * row[d];
+        }
+        score += fmaxf(dot / sqrtf((float)index_dim), 0.0f);
+    }
+    return score;
+}
+
 // Serial fallback off gfx1151 or when the score array exceeds its LDS limit.
 // Keep stable ascending-block tie selection and the causal tail unchanged.
 // Batched selection keeps one independent workgroup per query row. The row's
@@ -1401,7 +1449,7 @@ extern "C" __global__ void indexed_attention_select_f32_batched(
         for (int block = (int)threadIdx.x;
              block < row_block_count;
              block += (int)blockDim.x) {
-            scores[block] = indexed_attention_select_score_f32(
+            scores[block] = indexed_attention_select_score4_f32(
                 row_query, pooled, block, index_heads, index_dim);
         }
     }

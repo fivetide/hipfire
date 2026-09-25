@@ -46,8 +46,10 @@ extern "C" __global__ void moe_router_softmax_top10_f32(
     if (n_exp != 512 || top_k != 10) return;
 
     const size_t token_base = (size_t)token * 512;
-    float first_value = logits[token_base + thread];
-    float second_value = logits[token_base + thread + 256];
+    const float first_logit = logits[token_base + thread];
+    const float second_logit = logits[token_base + thread + 256];
+    float first_value = first_logit;
+    float second_value = second_logit;
     const int first_index = thread;
     const int second_index = thread + 256;
 
@@ -125,13 +127,22 @@ extern "C" __global__ void moe_router_softmax_top10_f32(
 
     // Preserve the reference's float32 operation order: full softmax in
     // expert-index order, followed by selected-probability renormalization.
-    // Selection is parallel; this one serial pass keeps routed-output numerics.
+    // The 512 exponentials are computed in parallel into LDS; one serial pass
+    // then sums them in expert order, keeping routed-output numerics.
+    __shared__ float exps[512];
+    __syncthreads();
+    {
+        const float max_logit = selected_values[0];
+        exps[thread] = expf(first_logit - max_logit);
+        exps[thread + 256] = expf(second_logit - max_logit);
+    }
+    __syncthreads();
     if (thread == 0) {
         const size_t output_base = (size_t)token * 10;
         const float max_logit = selected_values[0];
         float denom = 0.0f;
         for (int expert = 0; expert < 512; ++expert)
-            denom += expf(logits[token_base + expert] - max_logit);
+            denom += exps[expert];
         if (!(denom > 0.0f) || !isfinite(denom)) return;
 
         const float inv_denom = 1.0f / denom;
