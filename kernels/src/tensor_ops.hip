@@ -563,6 +563,31 @@ extern "C" __global__ void hyper_read_projected_f32(
 }
 
 
+// Sum of squares of the BF16-rounded values at j = tid, tid + 256, ... < n,
+// accumulated in that order (the 256-thread HC norms' partial).  Ten loads
+// are issued before they are consumed: the plain strided loop waits a full
+// memory round trip per element.
+static __device__ __forceinline__ float hc_bf16_square_partial(
+    const float* values, int tid, int n) {
+    float partial = 0.0f;
+    for (int base = tid; base < n; base += 10 * 256) {
+        float raw[10];
+#pragma unroll
+        for (int u = 0; u < 10; ++u) {
+            const int j = base + u * 256;
+            raw[u] = j < n ? values[j] : 0.0f;
+        }
+#pragma unroll
+        for (int u = 0; u < 10; ++u) {
+            if (base + u * 256 < n) {
+                const float value = bf16_to_f32(bf16_round(raw[u]));
+                partial += value * value;
+            }
+        }
+    }
+    return partial;
+}
+
 extern "C" __global__ void hyper_write_f32(
     const float* input,
     const float* normalized,
@@ -608,12 +633,7 @@ extern "C" __global__ void hyper_norm_f32(
     const int offset = (row * branches + branch) * hidden;
     const int weight_offset = branch * hidden;
     __shared__ float rms_sum[256];
-    float partial = 0.0f;
-    for (int j = tid; j < hidden; j += (int)blockDim.x) {
-        const float value = bf16_to_f32(bf16_round(input[offset + j]));
-        partial += value * value;
-    }
-    rms_sum[tid] = partial;
+    rms_sum[tid] = hc_bf16_square_partial(input + offset, tid, hidden);
     __syncthreads();
     for (int stride = (int)blockDim.x / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
@@ -622,7 +642,8 @@ extern "C" __global__ void hyper_norm_f32(
         __syncthreads();
     }
     const float inv = rsqrtf(rms_sum[0] / (float)hidden + 1.0e-6f);
-    for (int j = tid; j < hidden; j += (int)blockDim.x) {
+#pragma unroll 10
+    for (int j = tid; j < hidden; j += 256) {
         const int column = offset + j;
         normalized[column] = bf16_to_f32(bf16_round(
             bf16_to_f32(bf16_round(input[column]))
@@ -671,12 +692,7 @@ extern "C" __global__ void hyper_norm_gate_f32(
     const float* in = input + (size_t)row * wide;
     for (int branch = 0; branch < branches; ++branch) {
         const int offset = branch * hidden;
-        float partial = 0.0f;
-        for (int j = tid; j < hidden; j += (int)blockDim.x) {
-            const float value = bf16_to_f32(bf16_round(in[offset + j]));
-            partial += value * value;
-        }
-        rms_sum[tid] = partial;
+        rms_sum[tid] = hc_bf16_square_partial(in + offset, tid, hidden);
         __syncthreads();
         for (int stride = (int)blockDim.x / 2; stride > 0; stride >>= 1) {
             if (tid < stride) {
