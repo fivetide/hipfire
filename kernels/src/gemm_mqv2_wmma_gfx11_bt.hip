@@ -91,6 +91,34 @@ __device__ __forceinline__ half16_t decode_tile_split(const unsigned char* __res
     return __builtin_bit_cast(half16_t, both);
 }
 
+// decode_tile_split<6> from the tile's 48-bit little-endian code window
+// `code` (bytes lane_half * 6 .. +6 of the tile's 12): q_j = bits 6j..6j+5,
+// the same codes the byte-wise reader extracts, and the same expression.
+__device__ __forceinline__ half16_t decode6_tile_split(unsigned long long code,
+                                                       _Float16 sc_h,
+                                                       _Float16 zp_h,
+                                                       int lane_half) {
+    half8_bt_t mine;
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        const unsigned int q = (unsigned int)(code >> (6 * j)) & 63u;
+        mine[j] = sc_h * (_Float16)(float)q + zp_h;
+    }
+    const uint4_bt_t m = __builtin_bit_cast(uint4_bt_t, mine);
+    uint4_bt_t o;
+#pragma unroll
+    for (int k = 0; k < 4; k++)
+        o[k] = (unsigned int)__builtin_amdgcn_permlanex16(
+            (int)m[k], (int)m[k], 0x76543210u, 0xfedcba98u, false, false);
+    uint8_bt_t both;
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        both[k] = lane_half ? o[k] : m[k];
+        both[k + 4] = lane_half ? m[k] : o[k];
+    }
+    return __builtin_bit_cast(half16_t, both);
+}
+
 // ---------------------------------------------------------------------------
 // QKVZA overwrite BT4 — four projection regions (QKV/Z/beta/alpha)
 // Grid: [ceil((qkv_m+z_m+beta_m+alpha_m)/16), ceil(N/(16*BV))]. Block: [32].
@@ -572,7 +600,15 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
     const int batch_start = blockIdx.y * TOK;
     const int safe_row = (row_start + ml < M) ? (row_start + ml) : (M - 1);
     const int groups_per_row = K / 256;
-    const char* row_base = A + (long long)safe_row * groups_per_row * GROUP_BYTES;
+    static_assert(BITS == 6, "the chunk payload reader is written for 6-bit codes");
+    // Row bytes through a buffer resource: the per-lane row offset rides in
+    // voffset and the uniform group/chunk offset in soffset, so the payload
+    // is six 8-byte loads per chunk instead of 24 byte loads with 64-bit
+    // address arithmetic each.
+    const __amdgpu_buffer_rsrc_t arsrc =
+        __builtin_amdgcn_make_buffer_rsrc((void*)A, 0, 0x7FFFFFFF, 0x31004000);
+    const int row_off = safe_row * groups_per_row * GROUP_BYTES;
+    const int lane_half = lane >> 4;
 
     // Staging slots: consecutive threads copy consecutive 16 B of a token row.
     // Tokens past N read row 0, like the BT kernel's clamped sb[].
@@ -601,17 +637,25 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
         acc[b] = float8_t{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     const int nchunks = K / CK;
     for (int g = 0; g < groups_per_row; g++) {
-        const char* gp = row_base + g * GROUP_BYTES;
-        const unsigned int hA = *(const unsigned int*)(gp);
-        const unsigned int hB = *(const unsigned int*)(gp + 4);
+        const int goff = g * GROUP_BYTES;
+        const unsigned int hA = __builtin_amdgcn_raw_buffer_load_b32(arsrc, row_off, goff, 0);
+        const unsigned int hB = __builtin_amdgcn_raw_buffer_load_b32(arsrc, row_off + 4, goff, 0);
         const _Float16 sc0 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hA & 0xFFFFu)));
         const _Float16 zp0 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hA >> 16)));
         const _Float16 sc1 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hB & 0xFFFFu)));
         const _Float16 zp1 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hB >> 16)));
-        const unsigned char* payload = (const unsigned char*)(gp + 8);
 #pragma unroll
         for (int cq = 0; cq < 4; cq++) {
             const int c = g * 4 + cq;
+            // The chunk's four tiles: payload bytes cq * 48 .. +48 (8-aligned).
+            unsigned int d[12];
+#pragma unroll
+            for (int u = 0; u < 6; u++) {
+                const auto v = __builtin_amdgcn_raw_buffer_load_b64(
+                    arsrc, row_off + 8 + u * 8, goff + cq * 48, 0);
+                d[2 * u] = v[0];
+                d[2 * u + 1] = v[1];
+            }
             XL_FOR8(XL_STORE)
             __syncthreads();
             // Next chunk's global loads fly while this chunk computes (the
@@ -623,7 +667,13 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
                 const int kt = cq * 4 + j;
                 const _Float16 sc_h = (kt < 8) ? sc0 : sc1;
                 const _Float16 zp_h = (kt < 8) ? zp0 : zp1;
-                half16_t a_reg = decode_tile_split<BITS>(payload, kt, sc_h, zp_h, lane >> 4);
+                // Tile j is chunk bytes 12j .. 12j+11; this half's six start
+                // at 12j + 6 * lane_half.
+                const unsigned int lo = lane_half
+                    ? __builtin_amdgcn_alignbit(d[3 * j + 2], d[3 * j + 1], 16) : d[3 * j];
+                const unsigned int hi = lane_half ? (d[3 * j + 2] >> 16) : (d[3 * j + 1] & 0xFFFFu);
+                half16_t a_reg = decode6_tile_split(
+                    ((unsigned long long)hi << 32) | lo, sc_h, zp_h, lane_half);
 #pragma unroll
                 for (int b = 0; b < BV; b++) {
                     half16_t b_reg = *(const half16_t*)(xs + (b * 16 + ml) * STRIDE + j * 16);

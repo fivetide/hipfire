@@ -39716,9 +39716,10 @@ mod tests {
         );
     }
 
-    /// The gfx1151 MQ6 overwrite GEMM (one launch) must produce the bytes of
-    /// zeroing Y and accumulating with the residual kernel, including rows
-    /// past a 64-row block and a partial 128-token tile.
+    /// The gfx1151 MQ6 overwrite GEMM (one launch, X-LDS kernel with the
+    /// chunk payload reader) must produce the bytes of zeroing Y and
+    /// accumulating with the BT4 kernel (byte-wise decode_tile_split),
+    /// including rows past a 64-row block and a partial 128-token tile.
     #[test]
     #[ignore = "requires a gfx1151 GPU and working HIP toolchain"]
     fn mq6_overwrite_matches_zeroed_residual() {
@@ -39756,7 +39757,7 @@ mod tests {
             .collect();
         let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("x upload");
         let y_ref = gpu.zeros(&[N * M], DType::F32).expect("y ref");
-        gpu.gemm_mqv2_residual_wmma_gfx11_bt(6, 8, &a, &x_gpu, &y_ref, M, K, N)
+        gpu.gemm_mqv2_residual_wmma_gfx11_bt(6, 4, &a, &x_gpu, &y_ref, M, K, N)
             .expect("residual");
         let sentinel = vec![f32::from_bits(0x7fc0_1234); N * M];
         let y = gpu
