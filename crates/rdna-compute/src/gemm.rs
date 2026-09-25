@@ -32636,7 +32636,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.mqv2_wmma_gfx11_bt(bits, batch_tile, a_raw, x, y, m, k, batch_size, false)
+        self.mqv2_wmma_gfx11_bt(bits, batch_tile, a_raw, x, y, m, k, batch_size, false, None)
     }
 
     /// `overwrite` (`Y = W·X`, gfx1151 MQ6 BT8 only) equals zeroing Y and
@@ -32653,6 +32653,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
         overwrite: bool,
+        // X already converted to F16 (e.g. by `rotate_x_mq_batched_f16`);
+        // `None` converts `x` here.
+        x_f16: Option<*mut c_void>,
     ) -> HipResult<()> {
         let func_name: &'static str = match (bits, batch_tile) {
             (2, 4) => "gemm_mq2g256v2_residual_wmma_gfx11_bt4",
@@ -32709,7 +32712,10 @@ impl Gpu {
             "gemm_mqv2_wmma_gfx1100_bt"
         };
         self.ensure_kernel(module, kernels::GEMM_MQV2_WMMA_GFX11_BT_SRC, func_name)?;
-        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let x_f16_ptr = match x_f16 {
+            Some(ptr) => ptr,
+            None => self.ensure_fp16_x(x, batch_size * k)?,
+        };
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x_f16_ptr;
         let mut y_ptr = y.buf.as_ptr();
@@ -35206,6 +35212,39 @@ impl Gpu {
         self.gemm_mq6g256v2_xbatch(a_raw, x, y, m, k, batch_size, true)
     }
 
+    /// Whether [`Gpu::gemm_mq6g256v2_xf16`] applies: the gfx1151 BT8 X-LDS
+    /// overwrite route with no recorder or capture active.
+    pub fn gemm_mq6g256v2_xf16_applies(&self, k: usize, batch_size: usize) -> bool {
+        self.arch_caps.is_gfx1151()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && k % 256 == 0
+            && mqv2_prefill_batch_tile(
+                self.arch.as_str(),
+                6,
+                MqV2PrefillProjection::Residual,
+                batch_size,
+            ) == Some(8)
+    }
+
+    /// [`Gpu::gemm_mq6g256v2`] on the gfx1151 BT8 route with X already rotated
+    /// and converted to F16 (`x_f16`, `[batch_size × k]`): the bytes the F32
+    /// entry produces, without its conversion pass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq6g256v2_xf16(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_f16: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let ptr = x_f16.buf.as_ptr();
+        self.mqv2_wmma_gfx11_bt(6, 8, a_raw, x_f16, y, m, k, batch_size, true, Some(ptr))
+    }
+
     pub fn gemm_mq6g256v2(
         &mut self,
         a_raw: &GpuTensor,
@@ -35232,7 +35271,7 @@ impl Gpu {
                     batch_size,
                 ) == Some(8)
             {
-                return self.mqv2_wmma_gfx11_bt(6, 8, a_raw, x, y, m, k, batch_size, true);
+                return self.mqv2_wmma_gfx11_bt(6, 8, a_raw, x, y, m, k, batch_size, true, None);
             }
             match self.active_stream.as_ref() {
                 Some(stream) => self
@@ -39826,6 +39865,68 @@ mod tests {
             differing, 0,
             "O4xR8 gate/up differs from SIMT in {differing} cells"
         );
+    }
+
+    /// Rotating straight to F16 and running the pre-converted MQ6 GEMM must
+    /// produce the bytes of the F32 rotation + converting GEMM.
+    #[test]
+    #[ignore = "requires a gfx1151 GPU and working HIP toolchain"]
+    fn mq6_xf16_matches_f32_rotation_path() {
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) if gpu.arch_caps.is_gfx1151() => gpu,
+            _ => {
+                eprintln!("skip: needs gfx1151");
+                return;
+            }
+        };
+        for (M, K, N) in [
+            (200usize, 512usize, 131usize),
+            (48, 2560, 1131),
+            (10240, 2560, 1131),
+            (2560, 6144, 1131),
+        ] {
+            let group = crate::dispatch::MQ6G256V2_GROUP_BYTES;
+            let mut weights = vec![0u8; M * K / 256 * group];
+            let mut state = 11u32;
+            for chunk in weights.chunks_mut(group) {
+                for byte in chunk.iter_mut() {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *byte = (state >> 24) as u8;
+                }
+                for (offset, bits) in [(0, 0x2000u16), (2, 0xa800), (4, 0x2100), (6, 0xa900)] {
+                    chunk[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
+                }
+            }
+            let a = gpu.upload_raw(&weights, &[weights.len()]).expect("w");
+            let x: Vec<f32> = (0..N * K)
+                .map(|i| ((i * 7919 % 4001) as f32 - 2000.0) / 1777.0)
+                .collect();
+            let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("x");
+            assert!(gpu.gemm_mq6g256v2_xf16_applies(K, N));
+            let rot = gpu.zeros(&[N * K], DType::F32).expect("rot");
+            gpu.rotate_x_mq_batched(&x_gpu, &rot, K, N).expect("rotate");
+            let want_y = gpu.zeros(&[N * M], DType::F32).expect("y");
+            gpu.gemm_mq6g256v2(&a, &rot, &want_y, M, K, N)
+                .expect("f32 path");
+            let x16 = gpu
+                .rotate_x_mq_batched_f16(&x_gpu, K, N)
+                .expect("rotate f16");
+            let got_y = gpu.zeros(&[N * M], DType::F32).expect("y");
+            gpu.gemm_mq6g256v2_xf16(&a, &x16, &got_y, M, K, N)
+                .expect("f16 path");
+            let want = gpu.download_f32(&want_y).expect("want");
+            let got = gpu.download_f32(&got_y).expect("got");
+            assert!(want.iter().any(|v| *v != 0.0));
+            let differing = got
+                .iter()
+                .zip(&want)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                differing, 0,
+                "xf16 path differs in {differing} cells at M={M} K={K} N={N}"
+            );
+        }
     }
 
     /// The gfx1151 MQ6 overwrite GEMM (one launch, X-LDS kernel with the

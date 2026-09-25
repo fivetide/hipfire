@@ -118,6 +118,56 @@ pub fn project_weight(
     rows: usize,
     rotation: Option<&GpuTensor>,
 ) -> Result<(), DispatchError> {
+    project_weights(gpu, input, rows, rotation, &[(weight, output)])
+}
+
+/// [`project_weight`] for several weights reading the same `input`.  On the
+/// gfx1151 MQ6 BT8 route the input is rotated straight to F16 once per K and
+/// every MQ6 GEMM reads that copy (the per-weight path rotates to F32 and
+/// converts to F16 again for each); the bytes each GEMM sees are unchanged.
+pub fn project_weights(
+    gpu: &mut Gpu,
+    input: &GpuTensor,
+    rows: usize,
+    rotation: Option<&GpuTensor>,
+    projections: &[(&WeightRef<'_>, &GpuTensor)],
+) -> Result<(), DispatchError> {
+    let shared = |w: &WeightRef<'_>, gpu: &Gpu| {
+        w.dtype == DType::MQ6G256V2 && gpu.gemm_mq6g256v2_xf16_applies(w.k, rows)
+    };
+    // Shared-rotation weights first, grouped by K: other projections reuse
+    // the same F16 scratch and would overwrite the rotated copy.
+    let mut done = vec![false; projections.len()];
+    for i in 0..projections.len() {
+        let (weight, _) = projections[i];
+        if done[i] || !shared(weight, gpu) {
+            continue;
+        }
+        let x_f16 = hip(gpu.rotate_x_mq_batched_f16(input, weight.k, rows))?;
+        for j in i..projections.len() {
+            let (w, out) = projections[j];
+            if !done[j] && w.k == weight.k && shared(w, gpu) {
+                hip(gpu.gemm_mq6g256v2_xf16(w.buf, &x_f16, out, w.m, w.k, rows))?;
+                done[j] = true;
+            }
+        }
+    }
+    for (i, &(weight, output)) in projections.iter().enumerate() {
+        if !done[i] {
+            project_one(gpu, weight, input, output, rows, rotation)?;
+        }
+    }
+    Ok(())
+}
+
+fn project_one(
+    gpu: &mut Gpu,
+    weight: &WeightRef<'_>,
+    input: &GpuTensor,
+    output: &GpuTensor,
+    rows: usize,
+    rotation: Option<&GpuTensor>,
+) -> Result<(), DispatchError> {
     let rotated = match weight.dtype {
         // BF16 and Q8F16 read the natural activation: neither carries an FWHT
         // basis, so no rotation is owed and the scratch stays untouched.
@@ -713,22 +763,23 @@ pub fn execute_gated_delta_net(
     let qkv = 2 * qk + value;
     let projection = view(op.projection, 0, op.rows * qkv);
     let projection2 = view(op.projection2, 0, op.rows * qkv);
-    project_weight(
-        gpu,
-        &op.qkv,
-        op.input,
-        &projection,
-        op.rows,
-        Some(op.rotation),
-    )?;
     let a = view(op.a, 0, op.rows * op.value_heads);
     let b = view(op.b, 0, op.rows * op.value_heads);
     let gate = view(op.gate, 0, op.rows * op.value_heads);
     let beta = view(op.beta, 0, op.rows * op.value_heads);
     let z = view(op.z_output, 0, op.rows * value);
-    project_weight(gpu, &op.in_proj_a, op.input, &a, op.rows, Some(op.rotation))?;
-    project_weight(gpu, &op.in_proj_b, op.input, &b, op.rows, Some(op.rotation))?;
-    project_weight(gpu, &op.z, op.input, &z, op.rows, Some(op.rotation))?;
+    project_weights(
+        gpu,
+        op.input,
+        op.rows,
+        Some(op.rotation),
+        &[
+            (&op.qkv, &projection),
+            (&op.in_proj_a, &a),
+            (&op.in_proj_b, &b),
+            (&op.z, &z),
+        ],
+    )?;
     let history_rows = op.conv_kernel.saturating_sub(1);
     let persistent_batch = gpu.arch_caps.is_gfx1151()
         && op.rows > 1
@@ -1237,24 +1288,18 @@ pub fn execute_indexed_attention(
         0,
         op.rows * op.state.selected_capacity * std::mem::size_of::<i32>(),
     );
-    project_weight(
+    project_weights(
         gpu,
-        &op.indexer_qk,
         op.input,
-        &index_batch,
         op.rows,
         Some(op.rotation),
+        &[
+            (&op.indexer_qk, &index_batch),
+            (&op.q, &qgate_batch),
+            (&op.k, &k_batch),
+            (&op.v, &v_batch),
+        ],
     )?;
-    project_weight(
-        gpu,
-        &op.q,
-        op.input,
-        &qgate_batch,
-        op.rows,
-        Some(op.rotation),
-    )?;
-    project_weight(gpu, &op.k, op.input, &k_batch, op.rows, Some(op.rotation))?;
-    project_weight(gpu, &op.v, op.input, &v_batch, op.rows, Some(op.rotation))?;
 
     hip(indexed_attention_norm_rope_batch(
         gpu,
