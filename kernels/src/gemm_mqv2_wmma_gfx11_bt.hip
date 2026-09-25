@@ -48,6 +48,49 @@ __device__ __forceinline__ half16_t decode_tile(const unsigned char* __restrict_
     return out;
 }
 
+// The WMMA A operand is replicated across the two 16-lane halves, so each
+// half decodes only its own eight of the sixteen weights (elements 8h..8h+7,
+// whose codes start exactly BITS bytes further for h = 1) and the halves swap
+// their results through permlanex16.  Every weight is produced by the same
+// expression as decode_tile, so the assembled operand is bitwise identical.
+typedef _Float16 __attribute__((ext_vector_type(8))) half8_bt_t;
+typedef unsigned int __attribute__((ext_vector_type(4))) uint4_bt_t;
+typedef unsigned int __attribute__((ext_vector_type(8))) uint8_bt_t;
+template <int BITS>
+__device__ __forceinline__ half16_t decode_tile_split(const unsigned char* __restrict__ payload,
+                                                      int kt,
+                                                      _Float16 sc_h,
+                                                      _Float16 zp_h,
+                                                      int lane_half) {
+    constexpr unsigned int qmask = (1u << BITS) - 1u;
+    const unsigned char* __restrict__ p = payload + lane_half * BITS;
+    half8_bt_t mine;
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        const int bit_pos = (kt * 16 + j) * BITS;
+        const int byte_i = bit_pos >> 3;
+        const int bit_in_byte = bit_pos & 7;
+        unsigned int v = (unsigned int)p[byte_i];
+        if ((bit_in_byte + BITS) > 8)
+            v |= ((unsigned int)p[byte_i + 1]) << 8;
+        const unsigned int q = (v >> bit_in_byte) & qmask;
+        mine[j] = sc_h * (_Float16)(float)q + zp_h;
+    }
+    const uint4_bt_t m = __builtin_bit_cast(uint4_bt_t, mine);
+    uint4_bt_t o;
+#pragma unroll
+    for (int k = 0; k < 4; k++)
+        o[k] = (unsigned int)__builtin_amdgcn_permlanex16(
+            (int)m[k], (int)m[k], 0x76543210u, 0xfedcba98u, false, false);
+    uint8_bt_t both;
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        both[k] = lane_half ? o[k] : m[k];
+        both[k + 4] = lane_half ? m[k] : o[k];
+    }
+    return __builtin_bit_cast(half16_t, both);
+}
+
 // ---------------------------------------------------------------------------
 // QKVZA overwrite BT4 — four projection regions (QKV/Z/beta/alpha)
 // Grid: [ceil((qkv_m+z_m+beta_m+alpha_m)/16), ceil(N/(16*BV))]. Block: [32].
@@ -432,7 +475,7 @@ gemm_mq##BITS##g256v2_residual_wmma_gfx11_bt##BV( \
             const _Float16 sc_h = (kt < 8) ? sc0 : sc1; \
             const _Float16 zp_h = (kt < 8) ? zp0 : zp1; \
             const int k_off = kt * 16; \
-            half16_t a_reg = decode_tile<BITS>(payload, kt, sc_h, zp_h); \
+            half16_t a_reg = decode_tile_split<BITS>(payload, kt, sc_h, zp_h, tid >> 4); \
             _Pragma("unroll") \
             for (int b = 0; b < (BV); b++) { \
                 half16_t b_reg = *(const half16_t*)(xg[b] + k_off); \
