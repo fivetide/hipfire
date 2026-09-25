@@ -1009,10 +1009,11 @@ extern "C" __global__ void gated_delta_gate_bf16_f32(
     (void)width;
 }
 // Row-batched gated RMSNorm. The recurrent output is rounded in place before
-// the norm reduction, matching the scalar BF16 boundary.  The rounded head is
-// staged in LDS so every channel's (identical, serial) sum reads LDS instead
-// of re-fetching the head from global memory.
-extern "C" __global__ void gated_delta_gate_bf16_f32_batched(
+// the norm reduction, matching the scalar BF16 boundary.  One wave owns one
+// head (four channels per lane): the norm sum is the scalar kernel's serial
+// i = 0..127 chain, run once per wave over the LDS-staged rounded head rather
+// than once per channel thread.  Grid [rows * value_heads], block 32.
+extern "C" __global__ __launch_bounds__(32) void gated_delta_gate_bf16_f32_batched(
     float* recurrent,
     const float* z,
     const __hip_bfloat16* norm,
@@ -1021,34 +1022,40 @@ extern "C" __global__ void gated_delta_gate_bf16_f32_batched(
     int value_heads,
     int value_dim) {
     const int flat_head = (int)blockIdx.x;
-    const int channel = (int)(blockIdx.y * blockDim.x + threadIdx.x);
+    const int lane = (int)threadIdx.x;
     const int total_heads = rows * value_heads;
     if (flat_head >= total_heads || value_dim != 128) return;
-    const int row = flat_head / value_heads;
-    const int head = flat_head % value_heads;
-    const int width = value_heads * value_dim;
-    const int start = row * width + head * value_dim;
+    const int start = flat_head * 128;
     __shared__ float rounded[128];
 
-    if (channel < value_dim) {
-        const float value = bf16_to_f32(bf16_round(recurrent[start + channel]));
-        rounded[channel] = value;
-        recurrent[start + channel] = value;
-    }
+    const float4 raw = *reinterpret_cast<const float4*>(recurrent + start + lane * 4);
+    const float4 value = make_float4(
+        bf16_to_f32(bf16_round(raw.x)), bf16_to_f32(bf16_round(raw.y)),
+        bf16_to_f32(bf16_round(raw.z)), bf16_to_f32(bf16_round(raw.w)));
+    *reinterpret_cast<float4*>(recurrent + start + lane * 4) = value;
+    *reinterpret_cast<float4*>(rounded + lane * 4) = value;
     __syncthreads();
-    if (channel >= value_dim) return;
 
     float sum = 0.0f;
-    for (int i = 0; i < value_dim; ++i) {
-        const float value = bf16_to_f32(bf16_round(rounded[i]));
-        sum += value * value;
+    for (int i = 0; i < 128; ++i) {
+        const float v = bf16_to_f32(bf16_round(rounded[i]));
+        sum += v * v;
     }
     const float inv = rsqrtf(sum / (float)value_dim + 1.0e-6f);
-    const float normalized = bf16_to_f32(bf16_round(
-        rounded[channel] * inv * bf16_to_f32(norm[channel])));
-    const float gate = bf16_to_f32(bf16_round(z[start + channel]));
-    output[start + channel] = bf16_to_f32(bf16_round(
-        normalized / (1.0f + expf(-gate))));
+    const float4 zv = *reinterpret_cast<const float4*>(z + start + lane * 4);
+    const float in[4] = {value.x, value.y, value.z, value.w};
+    const float zs[4] = {zv.x, zv.y, zv.z, zv.w};
+    float out[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        const int channel = lane * 4 + e;
+        const float normalized = bf16_to_f32(bf16_round(
+            in[e] * inv * bf16_to_f32(norm[channel])));
+        const float gate = bf16_to_f32(bf16_round(zs[e]));
+        out[e] = bf16_to_f32(bf16_round(normalized / (1.0f + expf(-gate))));
+    }
+    *reinterpret_cast<float4*>(output + start + lane * 4) =
+        make_float4(out[0], out[1], out[2], out[3]);
 }
 
 extern "C" __global__ void indexed_attention_norm_rope_f32(

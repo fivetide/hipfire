@@ -1116,7 +1116,6 @@ pub fn gated_delta_gate_batched(gpu: &mut Gpu, p: &GatedDeltaGateBatched<'_>) ->
     let value_heads = checked_i32(p.value_heads, "GDN batched gate heads")?;
     let value_dim = checked_i32(p.value_dim, "GDN batched gate width")?;
     let value_heads_grid = checked_u32(elements / p.value_dim, "GDN batched gate grid")?;
-    let value_dim_grid = blocks(p.value_dim)?;
     gpu.ensure_kernel_public(
         "tensor_ops",
         TENSOR_OPS_SRC,
@@ -1132,8 +1131,8 @@ pub fn gated_delta_gate_batched(gpu: &mut Gpu, p: &GatedDeltaGateBatched<'_>) ->
     args.pad_to(16);
     gpu.launch_blob_recorded(
         "gated_delta_gate_bf16_f32_batched",
-        [value_heads_grid, value_dim_grid, 1],
-        [128, 1, 1],
+        [value_heads_grid, 1, 1],
+        [32, 1, 1],
         0,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
