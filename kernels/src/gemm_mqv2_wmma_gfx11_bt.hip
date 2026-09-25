@@ -542,4 +542,124 @@ GEN_RESID_BT(3, 8)
 GEN_RESID_BT(5, 8)
 GEN_RESID_BT(6, 8)
 
+// ---------------------------------------------------------------------------
+// Residual += BT with the X tile shared through LDS by RW row tiles.
+// The BT kernel above re-reads the same 16*BV-token X tile from L2 in every
+// 16-row wave; here RW waves (one 16-row tile each) stage each 64-wide K
+// chunk of that tile into LDS once and all read it from there.  Every wave's
+// A operand (decode_tile_split), B operand bytes, WMMA sequence and epilogue
+// are the BT kernel's, so results are bitwise identical to it.
+// Grid: [ceil(M/(16*RW)), ceil(N/(16*BV))]. Block: [32*RW].
+// ---------------------------------------------------------------------------
+template <int BITS, int BV, int RW>
+__device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
+                                              const _Float16* __restrict__ X,
+                                              float* __restrict__ Y,
+                                              int M, int K, int N) {
+    constexpr int GROUP_BYTES = 8 + 32 * BITS;
+    constexpr int TOK = 16 * BV;
+    constexpr int CK = 64;              // K per LDS chunk: four K-tiles
+    constexpr int STRIDE = CK + 8;      // halfs per token row; 144 B spreads banks
+    constexpr int NT = 32 * RW;
+    constexpr int VPT = CK / 8;         // 16 B vectors per token per chunk
+    constexpr int VECS = TOK * VPT / NT;
+    __shared__ __attribute__((aligned(16))) _Float16 xs[TOK * STRIDE];
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int ml = lane & 15;
+    const int row_start = (blockIdx.x * RW + (tid >> 5)) * 16;
+    const int batch_start = blockIdx.y * TOK;
+    const int safe_row = (row_start + ml < M) ? (row_start + ml) : (M - 1);
+    const int groups_per_row = K / 256;
+    const char* row_base = A + (long long)safe_row * groups_per_row * GROUP_BYTES;
+
+    // Staging slots: consecutive threads copy consecutive 16 B of a token row.
+    // Tokens past N read row 0, like the BT kernel's clamped sb[].
+    // Slot i covers token i * (NT / VPT) + tid / VPT, so its LDS offset is
+    // lds0 plus a compile-time constant.  Named scalars, not an array: the
+    // array stays in scratch because SROA runs before the loops unroll.
+    static_assert(VECS == 8, "staging is written out for eight slots");
+#define XL_FOR8(F) F(0) F(1) F(2) F(3) F(4) F(5) F(6) F(7)
+#define XL_OFF(I) \
+    const int xo##I = ((batch_start + I * (NT / VPT) + tid / VPT < N) \
+        ? (batch_start + I * (NT / VPT) + tid / VPT) : 0) * K + (tid % VPT) * 8;
+    XL_FOR8(XL_OFF)
+#undef XL_OFF
+    _Float16* lds0 = xs + (tid / VPT) * STRIDE + (tid % VPT) * 8;
+#define XL_LOAD(I) st##I = *(const uint4*)(X + xo##I + cn * CK);
+#define XL_STORE(I) *(uint4*)(lds0 + I * (NT / VPT) * STRIDE) = st##I;
+    uint4 st0, st1, st2, st3, st4, st5, st6, st7;
+    {
+        const int cn = 0;
+        XL_FOR8(XL_LOAD)
+    }
+
+    float8_t acc[BV];
+#pragma unroll
+    for (int b = 0; b < BV; b++)
+        acc[b] = float8_t{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    const int nchunks = K / CK;
+    for (int g = 0; g < groups_per_row; g++) {
+        const char* gp = row_base + g * GROUP_BYTES;
+        const unsigned int hA = *(const unsigned int*)(gp);
+        const unsigned int hB = *(const unsigned int*)(gp + 4);
+        const _Float16 sc0 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hA & 0xFFFFu)));
+        const _Float16 zp0 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hA >> 16)));
+        const _Float16 sc1 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hB & 0xFFFFu)));
+        const _Float16 zp1 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hB >> 16)));
+        const unsigned char* payload = (const unsigned char*)(gp + 8);
+#pragma unroll
+        for (int cq = 0; cq < 4; cq++) {
+            const int c = g * 4 + cq;
+            XL_FOR8(XL_STORE)
+            __syncthreads();
+            // Next chunk's global loads fly while this chunk computes (the
+            // last chunk harmlessly reloads itself).
+            const int cn = (c + 1 < nchunks) ? (c + 1) : c;
+            XL_FOR8(XL_LOAD)
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const int kt = cq * 4 + j;
+                const _Float16 sc_h = (kt < 8) ? sc0 : sc1;
+                const _Float16 zp_h = (kt < 8) ? zp0 : zp1;
+                half16_t a_reg = decode_tile_split<BITS>(payload, kt, sc_h, zp_h, lane >> 4);
+#pragma unroll
+                for (int b = 0; b < BV; b++) {
+                    half16_t b_reg = *(const half16_t*)(xs + (b * 16 + ml) * STRIDE + j * 16);
+                    acc[b] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_reg, acc[b]);
+                }
+            }
+            // WMMA has no memory chain, so without this the DAG scheduler
+            // sinks every chunk's WMMAs past the barriers and spills the
+            // B operands that were read before them.
+#pragma unroll
+            for (int b = 0; b < BV; b++) asm volatile("" : "+v"(acc[b]));
+            __syncthreads();
+        }
+    }
+#pragma unroll
+    for (int b = 0; b < BV; b++) {
+        const int out_col = batch_start + b * 16 + ml;
+        if (out_col < N) {
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const int out_row = row_start + 2 * j + (lane >> 4);
+                if (out_row < M) Y[(long long)out_col * M + out_row] += acc[b][j];
+            }
+        }
+    }
+#undef XL_STORE
+#undef XL_LOAD
+#undef XL_FOR8
+}
+
+extern "C" __launch_bounds__(128, 1) __global__ void
+gemm_mq6g256v2_residual_wmma_gfx11_bt8_x4(const char* __restrict__ A,
+                                          const _Float16* __restrict__ X,
+                                          float* __restrict__ Y,
+                                          int M, int K, int N) {
+    resid_bt_xlds<6, 8, 4>(A, X, Y, M, K, N);
+}
+
 #endif // __gfx1100__ || __gfx1151__

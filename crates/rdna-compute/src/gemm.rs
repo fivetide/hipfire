@@ -32515,6 +32515,14 @@ impl Gpu {
                 ));
             }
         };
+        // gfx1151 MQ6 BT8: four row tiles share each X chunk through LDS
+        // (bitwise identical to BT8; the BT8 X re-reads were the bottleneck).
+        let xlds = self.arch.as_str() == "gfx1151" && bits == 6 && batch_tile == 8;
+        let (func_name, rows_per_block, block) = if xlds {
+            ("gemm_mq6g256v2_residual_wmma_gfx11_bt8_x4", 64, 128)
+        } else {
+            (func_name, 16, 32)
+        };
         let group_bytes: usize = match bits {
             2 => crate::dispatch::MQ2G256V2_GROUP_BYTES,
             3 => crate::dispatch::MQ3G256V2_GROUP_BYTES,
@@ -32553,7 +32561,7 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
             &mut bs_val as *mut _ as *mut c_void,
         ];
-        let row_tiles = (m + 15) / 16;
+        let row_tiles = m.div_ceil(rows_per_block);
         let n_tile = 16 * batch_tile;
         let batch_tiles = batch_size.div_ceil(n_tile);
         let weight_bytes = m * (k / 256) * group_bytes;
@@ -32562,7 +32570,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             func_name,
             [row_tiles as u32, batch_tiles as u32, 1],
-            [32, 1, 1],
+            [block, 1, 1],
             0,
             &mut params,
             || {
