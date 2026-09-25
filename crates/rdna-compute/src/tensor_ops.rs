@@ -669,6 +669,64 @@ pub fn hyper_norm_gate(gpu: &mut Gpu, p: &HyperNormGate<'_>) -> HipResult<()> {
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
+
+/// gfx1151 HC read tail: the BF16 `[4 * hidden, low_rank]` up projection of
+/// `low` fused with `hyper_read_projected` (four branches), bitwise
+/// identical to the multi-row BF16 GEMM followed by that kernel; the
+/// projected logits are never written.
+pub struct HyperReadUpFused<'a> {
+    pub up_weight: &'a GpuTensor,
+    pub low: &'a GpuTensor,
+    pub normalized: &'a GpuTensor,
+    pub mixed: &'a GpuTensor,
+    pub rows: usize,
+    pub hidden: usize,
+    pub low_rank: usize,
+}
+
+pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<()> {
+    ensure_f32(p.low)?;
+    ensure_f32(p.normalized)?;
+    ensure_f32(p.mixed)?;
+    let wide = checked_product(4, p.hidden, "HC read width")?;
+    if p.up_weight.dtype != DType::BF16
+        || p.rows == 0
+        || p.hidden == 0
+        || p.hidden % 8 != 0
+        || p.low_rank % 8 != 0
+        || !(257..=512).contains(&p.low_rank)
+        || p.up_weight.numel() < wide * p.low_rank
+        || p.low.numel() < p.rows * p.low_rank
+        || p.normalized.numel() < p.rows * wide
+        || p.mixed.numel() < p.rows * p.hidden
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let hidden = checked_i32(p.hidden, "HC read hidden width")?;
+    let low_rank = checked_i32(p.low_rank, "HC read low rank")?;
+    let rows = checked_i32(p.rows, "HC read rows")?;
+    let column_grid = checked_u32(p.hidden / 8, "HC read column grid")?;
+    let row_grid = checked_u32(p.rows.div_ceil(64), "HC read row grid")?;
+    let lds_bytes = checked_u32(32 * (p.low_rank / 2 + 1) * 4, "HC read LDS")?;
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "hyper_read_up_fused_f32")?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.up_weight.buf.as_ptr());
+    args.push_ptr(p.low.buf.as_ptr());
+    args.push_ptr(p.normalized.buf.as_ptr());
+    args.push_ptr(p.mixed.buf.as_ptr());
+    args.push_i32(hidden);
+    args.push_i32(low_rank);
+    args.push_i32(rows);
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        "hyper_read_up_fused_f32",
+        [column_grid, row_grid, 1],
+        [256, 1, 1],
+        lds_bytes,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
 pub struct GatedDeltaConv<'a> {
     pub input: &'a GpuTensor,
     pub kernel: &'a GpuTensor,
@@ -2418,6 +2476,96 @@ mod tests {
         assert!(b.iter().any(|v| *v != 0), "gates are all zero");
         assert_eq!(a, b, "fused norm-gate differs");
         for tensor in [input, norm, gate_weight, fused, normalized, reference] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
+    /// The fused HC read tail (BF16 up projection + branch mix) must equal
+    /// the multi-row BF16 GEMM followed by hyper_read_projected bit for bit.
+    #[test]
+    fn hyper_read_up_fused_is_bit_identical_to_gemm_then_read() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1151() {
+            eprintln!("skip: needs gfx1151");
+            return;
+        }
+        let (rows, hidden, low_rank) = (131usize, 2560usize, 320usize);
+        let wide = 4 * hidden;
+        let wave = |seed: usize, n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let h = i.wrapping_mul(2_654_435_761).wrapping_add(seed * 131) % 8191;
+                    (h as f32 - 4095.0) / 4095.0 * scale
+                })
+                .collect()
+        };
+        let bytes: Vec<u8> = wave(1, wide * low_rank, 0.2)
+            .iter()
+            .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
+        let mut up_weight = gpu.upload_raw(&bytes, &[bytes.len()]).expect("up weight");
+        up_weight.dtype = DType::BF16;
+        up_weight.shape = vec![wide * low_rank];
+        let low = gpu
+            .upload_f32(&wave(2, rows * low_rank, 1.5), &[rows * low_rank])
+            .expect("low");
+        let normalized = gpu
+            .upload_f32(&wave(3, rows * wide, 2.0), &[rows * wide])
+            .expect("normalized");
+        let fused = gpu.zeros(&[rows * hidden], DType::F32).expect("fused");
+        hyper_read_up_fused(
+            &mut gpu,
+            &HyperReadUpFused {
+                up_weight: &up_weight,
+                low: &low,
+                normalized: &normalized,
+                mixed: &fused,
+                rows,
+                hidden,
+                low_rank,
+            },
+        )
+        .expect("fused");
+        let up = gpu.zeros(&[rows * wide], DType::F32).expect("up");
+        gpu.gemm_bf16_xf32_multirow(&up_weight, &low, &up, wide, low_rank, rows)
+            .expect("gemm");
+        let reference = gpu.zeros(&[rows * hidden], DType::F32).expect("reference");
+        let norm_weight = gpu.zeros(&[wide], DType::BF16).expect("norm weight");
+        hyper_read_projected(
+            &mut gpu,
+            &HyperReadProjected {
+                input: &normalized,
+                norm_weight: &norm_weight,
+                up: &up,
+                normalized: &normalized,
+                mixed: &reference,
+                branches: 4,
+                hidden,
+            },
+        )
+        .expect("read");
+        let bits = |gpu: &Gpu, t: &GpuTensor| -> Vec<u32> {
+            gpu.download_f32(t)
+                .expect("download")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        let (a, b) = (bits(&gpu, &fused), bits(&gpu, &reference));
+        assert!(b.iter().any(|v| *v != 0), "mix is all zero");
+        assert_eq!(a, b, "fused HC read differs");
+        for tensor in [
+            up_weight,
+            low,
+            normalized,
+            fused,
+            up,
+            reference,
+            norm_weight,
+        ] {
             gpu.free_tensor(tensor).expect("free");
         }
     }

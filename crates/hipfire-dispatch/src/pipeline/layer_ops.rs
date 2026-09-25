@@ -19,12 +19,12 @@ use rdna_compute::tensor_ops::{
     argmax_f32, bf16_roundtrip_f32, gated_delta_conv, gated_delta_conv_batched, gated_delta_gate,
     gated_delta_gate_batched, gated_delta_params, gated_delta_params_batched, gated_delta_step,
     gated_delta_step_batched, hc_activation_fused_f32, hyper_norm, hyper_norm_gate,
-    hyper_read_projected, hyper_write, indexed_attention_attention_batch,
+    hyper_read_projected, hyper_read_up_fused, hyper_write, indexed_attention_attention_batch,
     indexed_attention_cache_append_batch, indexed_attention_norm_rope_batch,
     indexed_attention_pool_rope, indexed_attention_select_batch, scale_f32, ArgmaxF32,
     Bf16Roundtrip, GatedDeltaConv, GatedDeltaConvBatched, GatedDeltaGate, GatedDeltaGateBatched,
     GatedDeltaParams, GatedDeltaParamsBatched, GatedDeltaStep, GatedDeltaStepBatched,
-    HcActivationFused, HyperNorm, HyperNormGate, HyperReadProjected, HyperWrite,
+    HcActivationFused, HyperNorm, HyperNormGate, HyperReadProjected, HyperReadUpFused, HyperWrite,
     IndexedAttentionAttentionBatch, IndexedAttentionCacheAppendBatch,
     IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope, IndexedAttentionSelectBatch, ScaleF32,
 };
@@ -355,6 +355,31 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
                 },
             ))?;
         }
+    }
+    // gfx1151 multi-row: the up projection feeds the branch mix directly;
+    // bitwise identical to the GEMM + hyper_read_projected pair below.
+    if gpu.arch_caps.is_gfx1151()
+        && op.rows > 1
+        && op.branches == 4
+        && op.input_mix_up.dtype == DType::BF16
+        && op.input_mix_up.m == wide
+        && op.input_mix_up.k == op.low_rank
+        && op.low_rank % 8 == 0
+        && (257..=512).contains(&op.low_rank)
+        && op.hidden % 8 == 0
+    {
+        return hip(hyper_read_up_fused(
+            gpu,
+            &HyperReadUpFused {
+                up_weight: op.input_mix_up.buf,
+                low: &low,
+                normalized: &normalized,
+                mixed: &mixed,
+                rows: op.rows,
+                hidden: op.hidden,
+                low_rank: op.low_rank,
+            },
+        ));
     }
     project_weight(gpu, &op.input_mix_up, &low, &up, op.rows, Some(op.rotation))?;
     hip(hyper_read_projected(
