@@ -425,10 +425,10 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_f32(
 
 // GDN recurrence split by value column (non-bit-exact prefill arm).  Every
 // state column evolves independently (kv_mem, delta, update and output of
-// value column v read only column v), so a block owns 64 columns of one value
-// head and runs its rows with no block barrier: lane = column pair * 4 + kd
-// quarter, 2 x 32 state values per thread, kd sums as four chains per thread
-// plus a quad DPP reduction instead of the reference's serial kd order.
+// value column v read only column v), so a block owns one value head and runs
+// a row group with no block barrier: lane = column pair * 4 + kd quarter,
+// 2 x 32 state values per thread, kd sums as four chains per thread plus a
+// quad DPP reduction instead of the reference's serial kd order.
 // gated_delta_qk_norm_bf16_batched first stores every row's normalized q and
 // k (the reference's BF16 rounding points; the square sum as lane partials +
 // a wave tree) as BF16.
@@ -461,24 +461,31 @@ extern "C" __global__ __launch_bounds__(256) void gated_delta_qk_norm_bf16_batch
     }
 }
 
-// Recurrence: grid [value_heads, 2], block 128; rows staged GDN_COL_ROWS at a
-// time in LDS.  key_dim == value_dim == 128.
+// Recurrence + gated RMSNorm (gated_delta_gate_bf16_f32_batched's exact
+// expression): grid [value_heads], block 256 (one value head, all 128
+// columns); rows staged GDN_COL_ROWS at a time in LDS.  Each group's
+// BF16-rounded recurrent rows stay in LDS and the gate is applied at the end
+// of the group (serial i-order sum per row), so the recurrent output never
+// reaches global memory.  key_dim == value_dim == 128.
 #define GDN_COL_ROWS 32
-__launch_bounds__(128)
-extern "C" __global__ void gated_delta_step_cols_f32(
+__launch_bounds__(256)
+extern "C" __global__ void gated_delta_step_cols_gate_f32(
     const float* projection, const unsigned short* qn, const unsigned short* kn, const float* gate,
-    const float* beta,
-    float* state, float* output, int rows, int qkv_width, int key_heads, int value_heads, float query_scale) {
-    const int value_head = blockIdx.x, col0 = blockIdx.y * 64;
+    const float* beta, float* state, const float* z, const __hip_bfloat16* norm, float* output,
+    int rows, int qkv_width, int key_heads, int value_heads, float query_scale) {
+    const int value_head = blockIdx.x;
     const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, quarter = lane & 3;
-    const int cl = wave * 16 + (lane >> 2) * 2, col = col0 + cl;  // columns col, col + 1
+    const int cl = wave * 16 + (lane >> 2) * 2, col = cl;  // columns col, col + 1
     const int key_head = value_head / (value_heads / key_heads);
     const int v_offset = 2 * key_heads * 128 + value_head * 128;
+    const int value_width = value_heads * 128;
     const int state_base = value_head * 128 * 128;
     __shared__ __align__(16) unsigned short q_lds[GDN_COL_ROWS][128];
     __shared__ __align__(16) unsigned short k_lds[GDN_COL_ROWS][128];
-    __shared__ float v_lds[GDN_COL_ROWS][64];
-    __shared__ float decay_lds[GDN_COL_ROWS], beta_lds[GDN_COL_ROWS];
+    // v and the recurrent rows are BF16-rounded where they are used: BF16 bits.
+    __shared__ __align__(16) unsigned short v_lds[GDN_COL_ROWS][128];
+    __shared__ __align__(16) unsigned short out_lds[GDN_COL_ROWS][128];
+    __shared__ float decay_lds[GDN_COL_ROWS], beta_lds[GDN_COL_ROWS], inv_lds[GDN_COL_ROWS];
     float s[32], t[32];
 #pragma unroll
     for (int i = 0; i < 32; ++i) {
@@ -488,15 +495,15 @@ extern "C" __global__ void gated_delta_step_cols_f32(
     for (int r0 = 0; r0 < rows; r0 += GDN_COL_ROWS) {
         const int nr = min(GDN_COL_ROWS, rows - r0);
         __syncthreads();
-        for (int e = tid; e < nr * 16; e += 128) {
+        for (int e = tid; e < nr * 16; e += 256) {
             const int r = e >> 4, c8 = e & 15;
             const size_t base = ((size_t)(r0 + r) * key_heads + key_head) * 128 + c8 * 8;
             *(uint4*)&q_lds[r][c8 * 8] = *(const uint4*)(qn + base);
             *(uint4*)&k_lds[r][c8 * 8] = *(const uint4*)(kn + base);
         }
-        for (int e = tid; e < nr * 64; e += 128) {
-            const int r = e >> 6, c = e & 63;
-            v_lds[r][c] = bf16_to_f32(bf16_round(projection[(size_t)(r0 + r) * qkv_width + v_offset + col0 + c]));
+        for (int e = tid; e < nr * 128; e += 256) {
+            const int r = e >> 7, c = e & 127;
+            v_lds[r][c] = bf16_round(projection[(size_t)(r0 + r) * qkv_width + v_offset + c]).data;
         }
         if (tid < nr) {
             decay_lds[tid] = expf(gate[(r0 + tid) * value_heads + value_head]);
@@ -536,7 +543,8 @@ extern "C" __global__ void gated_delta_step_cols_f32(
             kb += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(kb), 0xB1, 0xF, 0xF, false));
             ka += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(ka), 0x4E, 0xF, 0xF, false));
             kb += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(kb), 0x4E, 0xF, 0xF, false));
-            const float da = (v_lds[r][cl] - ka) * beta_value, db = (v_lds[r][cl + 1] - kb) * beta_value;
+            const float da = (__uint_as_float((unsigned int)v_lds[r][cl] << 16) - ka) * beta_value;
+            const float db = (__uint_as_float((unsigned int)v_lds[r][cl + 1] << 16) - kb) * beta_value;
             float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f, w0 = 0.f, w1 = 0.f, w2 = 0.f, w3 = 0.f;
 #pragma unroll
             for (int i = 0; i < 32; i += 4) {
@@ -550,8 +558,34 @@ extern "C" __global__ void gated_delta_step_cols_f32(
             ob += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(ob), 0xB1, 0xF, 0xF, false));
             oa += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(oa), 0x4E, 0xF, 0xF, false));
             ob += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(ob), 0x4E, 0xF, 0xF, false));
-            if (quarter == 0)
-                *(float2*)(output + (size_t)(r0 + r) * value_heads * 128 + value_head * 128 + col) = make_float2(oa, ob);
+            if (quarter == 0) {
+                out_lds[r][cl] = bf16_round(oa).data;
+                out_lds[r][cl + 1] = bf16_round(ob).data;
+            }
+        }
+        __syncthreads();
+        if (tid < nr) {
+            float sum = 0.0f;
+            for (int i = 0; i < 128; i += 8) {
+                const uint4 w = *(const uint4*)&out_lds[tid][i];
+                const unsigned int wv[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+                for (int h = 0; h < 4; ++h) {
+                    const float lo = __uint_as_float(wv[h] << 16), hi = __uint_as_float(wv[h] & 0xFFFF0000u);
+                    sum += lo * lo;
+                    sum += hi * hi;
+                }
+            }
+            inv_lds[tid] = rsqrtf(sum / 128.0f + 1.0e-6f);
+        }
+        __syncthreads();
+        for (int e = tid; e < nr * 128; e += 256) {
+            const int r = e >> 7, c = e & 127;
+            const size_t at = (size_t)(r0 + r) * value_width + value_head * 128 + c;
+            const float v = __uint_as_float((unsigned int)out_lds[r][c] << 16);
+            const float normalized = bf16_to_f32(bf16_round(v * inv_lds[r] * bf16_to_f32(norm[c])));
+            const float g = bf16_to_f32(bf16_round(z[at]));
+            output[at] = bf16_to_f32(bf16_round(normalized / (1.0f + expf(-g))));
         }
     }
 #pragma unroll

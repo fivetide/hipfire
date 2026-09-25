@@ -195,16 +195,6 @@ pub struct GatedDeltaStepBatched<'a> {
 }
 
 pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) -> HipResult<()> {
-    gated_delta_step_batched_impl(gpu, p, true)
-}
-
-/// `allow_cols` admits the column-split arm; without it the exact persistent
-/// kernel runs.
-fn gated_delta_step_batched_impl(
-    gpu: &mut Gpu,
-    p: &GatedDeltaStepBatched<'_>,
-    allow_cols: bool,
-) -> HipResult<()> {
     for tensor in [p.projection, p.gate, p.beta, p.state, p.output] {
         ensure_f32(tensor)?;
     }
@@ -244,63 +234,6 @@ fn gated_delta_step_batched_impl(
     let key_dim = checked_i32(p.key_dim, "GDN batched key width")?;
     let value_dim = checked_i32(p.value_dim, "GDN batched value width")?;
     let value_heads_grid = checked_u32(p.value_heads, "GDN batched value-head grid")?;
-    // The Qwen4 F16 prefill route (gfx1151, >= QWEN4_F16_WMMA_MIN_TOKENS
-    // rows, no recorder or capture, not opted out) takes the column-split
-    // recurrence; it sums kd in a different order, so it is KLD-gated.
-    if allow_cols
-        && gpu.arch_caps.is_gfx1151()
-        && p.rows >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
-        && *crate::gemm::QWEN4_F16_WMMA
-        && !gpu.replay.is_recording()
-        && !gpu.graphs.capture_mode
-    {
-        let qn = gpu.qwen4_f16_x_scratch(2 * p.rows * qk)?;
-        let qp = qn.buf.as_ptr();
-        let kp = unsafe { (qp as *mut u8).add(p.rows * qk * 2) } as *mut std::ffi::c_void;
-        for kernel in [
-            "gated_delta_qk_norm_bf16_batched",
-            "gated_delta_step_cols_f32",
-        ] {
-            gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
-        }
-        let mut args = KernargBlob::new();
-        args.push_ptr(p.projection.buf.as_ptr());
-        args.push_ptr(qp);
-        args.push_ptr(kp);
-        args.push_i32(rows);
-        args.push_i32(qkv_width);
-        args.push_i32(key_heads);
-        args.pad_to(16);
-        gpu.launch_blob_recorded(
-            "gated_delta_qk_norm_bf16_batched",
-            [checked_u32(p.rows, "GDN batched row grid")?, 1, 1],
-            [256, 1, 1],
-            0,
-            args.as_mut_slice(),
-            crate::dispatch::ReplayLaunchBindings::NONE,
-        )?;
-        let mut args = KernargBlob::new();
-        args.push_ptr(p.projection.buf.as_ptr());
-        args.push_ptr(qp);
-        args.push_ptr(kp);
-        for tensor in [p.gate, p.beta, p.state, p.output] {
-            args.push_ptr(tensor.buf.as_ptr());
-        }
-        args.push_i32(rows);
-        args.push_i32(qkv_width);
-        args.push_i32(key_heads);
-        args.push_i32(value_heads);
-        args.push_f32((p.key_dim as f32).sqrt().recip());
-        args.pad_to(16);
-        return gpu.launch_blob_recorded(
-            "gated_delta_step_cols_f32",
-            [value_heads_grid, 2, 1],
-            [128, 1, 1],
-            0,
-            args.as_mut_slice(),
-            crate::dispatch::ReplayLaunchBindings::NONE,
-        );
-    }
     let kernel = "gated_delta_step_halves_state128_persistent256_f32";
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
@@ -324,6 +257,103 @@ fn gated_delta_step_batched_impl(
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
+/// [`gated_delta_step_batched`] followed by [`gated_delta_gate_batched`] as
+/// one column-split kernel on the Qwen4 F16 prefill route (gfx1151, >=
+/// QWEN4_F16_WMMA_MIN_TOKENS rows, no recorder or capture, not opted out):
+/// `gate.output` receives the gated rows and `p.output` is not written.  The
+/// recurrence sums kd in a different order than the exact kernel, so the
+/// route is KLD-gated; the gate is that kernel's expression.  Returns `false`
+/// with nothing launched when the route does not apply.
+pub fn gated_delta_step_gate_cols(
+    gpu: &mut Gpu,
+    p: &GatedDeltaStepBatched<'_>,
+    gate: &GatedDeltaGateBatched<'_>,
+) -> HipResult<bool> {
+    if !(gpu.arch_caps.is_gfx1151()
+        && p.rows >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+        && *crate::gemm::QWEN4_F16_WMMA
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode)
+    {
+        return Ok(false);
+    }
+    for tensor in [p.projection, p.gate, p.beta, p.state, gate.z, gate.output] {
+        ensure_f32(tensor)?;
+    }
+    let qk = checked_product(p.key_heads, p.key_dim, "GDN column qk extent")?;
+    let value = checked_product(p.value_heads, p.value_dim, "GDN column value extent")?;
+    if p.key_dim != 128
+        || p.value_dim != 128
+        || p.key_heads == 0
+        || p.value_heads % p.key_heads != 0
+        || p.qkv_width != 2 * qk + value
+        || p.projection.numel() < p.rows * p.qkv_width
+        || p.gate.numel() < p.rows * p.value_heads
+        || p.beta.numel() < p.rows * p.value_heads
+        || p.state.numel() != value * p.key_dim
+        || gate.rows != p.rows
+        || gate.value_heads != p.value_heads
+        || gate.value_dim != p.value_dim
+        || gate.norm.dtype != DType::BF16
+        || gate.norm.numel() != p.value_dim
+        || gate.z.numel() < p.rows * value
+        || gate.output.numel() < p.rows * value
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let rows = checked_i32(p.rows, "GDN column rows")?;
+    let qkv_width = checked_i32(p.qkv_width, "GDN column qkv width")?;
+    let key_heads = checked_i32(p.key_heads, "GDN column key heads")?;
+    let value_heads = checked_i32(p.value_heads, "GDN column value heads")?;
+    let qn = gpu.qwen4_f16_x_scratch(2 * p.rows * qk)?;
+    let qp = qn.buf.as_ptr();
+    let kp = unsafe { (qp as *mut u8).add(p.rows * qk * 2) } as *mut std::ffi::c_void;
+    for kernel in [
+        "gated_delta_qk_norm_bf16_batched",
+        "gated_delta_step_cols_gate_f32",
+    ] {
+        gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
+    }
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.projection.buf.as_ptr());
+    args.push_ptr(qp);
+    args.push_ptr(kp);
+    args.push_i32(rows);
+    args.push_i32(qkv_width);
+    args.push_i32(key_heads);
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        "gated_delta_qk_norm_bf16_batched",
+        [checked_u32(p.rows, "GDN column row grid")?, 1, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.projection.buf.as_ptr());
+    args.push_ptr(qp);
+    args.push_ptr(kp);
+    for tensor in [p.gate, p.beta, p.state, gate.z, gate.norm, gate.output] {
+        args.push_ptr(tensor.buf.as_ptr());
+    }
+    args.push_i32(rows);
+    args.push_i32(qkv_width);
+    args.push_i32(key_heads);
+    args.push_i32(value_heads);
+    args.push_f32((p.key_dim as f32).sqrt().recip());
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        "gated_delta_step_cols_gate_f32",
+        [checked_u32(p.value_heads, "GDN column head grid")?, 1, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )?;
+    Ok(true)
+}
+
 /// Device-side F32 -> BF16 storage -> F32 conversion at a source activation
 /// boundary.  `scratch` is caller-owned and is allocated with the forward
 /// arena; no host transfer or per-token allocation occurs.
@@ -3139,11 +3169,12 @@ mod tests {
         }
     }
 
-    /// The column-split GDN arm (Qwen4 F16 prefill route) sums kd in its own
-    /// order but must track the exact persistent kernel's outputs and final
-    /// state to F32 accumulation accuracy, across its 32-row staging steps.
+    /// The fused column-split GDN recurrence + gate (Qwen4 F16 prefill route)
+    /// sums kd in its own order but must track the exact persistent kernel
+    /// followed by the gate kernel, in gated output and final state, across its
+    /// 32-row staging groups.
     #[test]
-    fn gdn_column_arm_matches_persistent_kernel() {
+    fn gdn_column_gate_arm_matches_persistent_kernel_and_gate() {
         let Some(mut gpu) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
@@ -3174,38 +3205,64 @@ mod tests {
             .map(|b| b + 0.5)
             .collect();
         let state0 = wave(4, value * dim, 0.2);
+        let z = wave(5, rows * value, 2.0);
+        let norm_bytes: Vec<u8> = wave(6, dim, 1.0)
+            .iter()
+            .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
         let proj_gpu = gpu
             .upload_f32(&projection, &[projection.len()])
             .expect("projection");
         let gate_gpu = gpu.upload_f32(&gate, &[gate.len()]).expect("gate");
         let beta_gpu = gpu.upload_f32(&beta, &[beta.len()]).expect("beta");
-        let run = |gpu: &mut Gpu, allow_cols: bool| {
+        let z_gpu = gpu.upload_f32(&z, &[z.len()]).expect("z");
+        let mut norm_gpu = gpu
+            .upload_raw(&norm_bytes, &[norm_bytes.len()])
+            .expect("norm");
+        norm_gpu.dtype = DType::BF16;
+        norm_gpu.shape = vec![dim];
+        let run = |gpu: &mut Gpu, fused: bool| {
             let state = gpu.upload_f32(&state0, &[state0.len()]).expect("state");
+            let recurrent = gpu.zeros(&[rows * value], DType::F32).expect("recurrent");
             let out = gpu.zeros(&[rows * value], DType::F32).expect("output");
-            gated_delta_step_batched_impl(
-                gpu,
-                &GatedDeltaStepBatched {
-                    projection: &proj_gpu,
-                    gate: &gate_gpu,
-                    beta: &beta_gpu,
-                    state: &state,
-                    output: &out,
-                    rows,
-                    qkv_width: qkv,
-                    key_heads,
-                    value_heads,
-                    key_dim: dim,
-                    value_dim: dim,
-                },
-                allow_cols,
-            )
-            .expect("batched GDN");
+            let step = GatedDeltaStepBatched {
+                projection: &proj_gpu,
+                gate: &gate_gpu,
+                beta: &beta_gpu,
+                state: &state,
+                output: &recurrent,
+                rows,
+                qkv_width: qkv,
+                key_heads,
+                value_heads,
+                key_dim: dim,
+                value_dim: dim,
+            };
+            let gated = GatedDeltaGateBatched {
+                recurrent_output: &recurrent,
+                z: &z_gpu,
+                norm: &norm_gpu,
+                output: &out,
+                rows,
+                value_heads,
+                value_dim: dim,
+            };
+            if fused {
+                assert!(
+                    gated_delta_step_gate_cols(gpu, &step, &gated).expect("fused GDN"),
+                    "column route did not apply"
+                );
+            } else {
+                gated_delta_step_batched(gpu, &step).expect("batched GDN");
+                gated_delta_gate_batched(gpu, &gated).expect("gate");
+            }
             let values = (
                 gpu.download_f32(&out).expect("download"),
                 gpu.download_f32(&state).expect("download"),
             );
-            gpu.free_tensor(out).expect("free");
-            gpu.free_tensor(state).expect("free");
+            for tensor in [out, recurrent, state] {
+                gpu.free_tensor(tensor).expect("free");
+            }
             values
         };
         let (ref_out, ref_state) = run(&mut gpu, false);
@@ -3219,15 +3276,16 @@ mod tests {
             assert!(norm > 0.0, "reference is all zero");
             (err / norm).sqrt()
         };
-        // Reordered F32 sums: ~1e-7; a wrong column, quarter or row lands
+        // Reordered F32 sums flip an occasional BF16 rounding of the gated
+        // output (~1e-3 relative); a wrong column, row, head or gate lands
         // near 1.
         let (out_rel, state_rel) = (rel(&ref_out, &col_out), rel(&ref_state, &col_state));
-        assert!(out_rel < 1e-4, "GDN column arm output rel L2 {out_rel:.3e}");
         assert!(
-            state_rel < 1e-4,
-            "GDN column arm state rel L2 {state_rel:.3e}"
+            out_rel < 1e-2,
+            "GDN column gate output rel L2 {out_rel:.3e}"
         );
-        for tensor in [proj_gpu, gate_gpu, beta_gpu] {
+        assert!(state_rel < 1e-4, "GDN column state rel L2 {state_rel:.3e}");
+        for tensor in [proj_gpu, gate_gpu, beta_gpu, z_gpu, norm_gpu] {
             gpu.free_tensor(tensor).expect("free");
         }
     }

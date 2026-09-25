@@ -18,9 +18,9 @@ use crate::types::DispatchError;
 use rdna_compute::tensor_ops::{
     argmax_f32, bf16_roundtrip_f32, gated_delta_conv, gated_delta_conv_batched, gated_delta_gate,
     gated_delta_gate_batched, gated_delta_params, gated_delta_params_batched, gated_delta_step,
-    gated_delta_step_batched, hc_activation_fused_f32, hyper_norm, hyper_norm_f16, hyper_norm_gate,
-    hyper_read_projected, hyper_read_up_fused, hyper_read_up_wmma, hyper_write,
-    indexed_attention_attention_batch, indexed_attention_cache_append_batch,
+    gated_delta_step_batched, gated_delta_step_gate_cols, hc_activation_fused_f32, hyper_norm,
+    hyper_norm_f16, hyper_norm_gate, hyper_read_projected, hyper_read_up_fused, hyper_read_up_wmma,
+    hyper_write, indexed_attention_attention_batch, indexed_attention_cache_append_batch,
     indexed_attention_norm_rope_batch, indexed_attention_pool_rope, indexed_attention_select_batch,
     scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv, GatedDeltaConvBatched, GatedDeltaGate,
     GatedDeltaGateBatched, GatedDeltaParams, GatedDeltaParamsBatched, GatedDeltaStep,
@@ -830,35 +830,35 @@ pub fn execute_gated_delta_net(
             },
         ))?;
         let recurrent_output = view(op.recurrent_output, 0, op.rows * value);
-        hip(gated_delta_step_batched(
-            gpu,
-            &GatedDeltaStepBatched {
-                projection: &projection2,
-                gate: &gate,
-                beta: &beta,
-                state: op.recurrent,
-                output: &recurrent_output,
-                rows: op.rows,
-                qkv_width: qkv,
-                key_heads: op.key_heads,
-                value_heads: op.value_heads,
-                key_dim: op.key_dim,
-                value_dim: op.value_dim,
-            },
-        ))?;
         let gdn_output = view(op.output_scratch, 0, op.rows * value);
-        hip(gated_delta_gate_batched(
-            gpu,
-            &GatedDeltaGateBatched {
-                recurrent_output: &recurrent_output,
-                z: &z,
-                norm: op.norm,
-                output: &gdn_output,
-                rows: op.rows,
-                value_heads: op.value_heads,
-                value_dim: op.value_dim,
-            },
-        ))?;
+        let step = GatedDeltaStepBatched {
+            projection: &projection2,
+            gate: &gate,
+            beta: &beta,
+            state: op.recurrent,
+            output: &recurrent_output,
+            rows: op.rows,
+            qkv_width: qkv,
+            key_heads: op.key_heads,
+            value_heads: op.value_heads,
+            key_dim: op.key_dim,
+            value_dim: op.value_dim,
+        };
+        let gated = GatedDeltaGateBatched {
+            recurrent_output: &recurrent_output,
+            z: &z,
+            norm: op.norm,
+            output: &gdn_output,
+            rows: op.rows,
+            value_heads: op.value_heads,
+            value_dim: op.value_dim,
+        };
+        // The F16 prefill route fuses the gate into the column-split
+        // recurrence (KLD-gated); otherwise the exact kernels run.
+        if !hip(gated_delta_step_gate_cols(gpu, &step, &gated))? {
+            hip(gated_delta_step_batched(gpu, &step))?;
+            hip(gated_delta_gate_batched(gpu, &gated))?;
+        }
     } else {
         for row in 0..op.rows {
             let position = op.start_position.saturating_add(row);
