@@ -162,3 +162,97 @@ extern "C" __global__ void gemm_bf16_xf32_multirow(
         if (batch_base + 3 < N) Y[(size_t)b3 * M + row] = s3;
     }
 }
+
+// Rows-loop sibling for small K (K % 8 == 0, ceil(K / 256) == ITERS): one wave
+// keeps its four token rows' X in registers and walks HF_ROWS_R output rows,
+// prefetching the next row's weights, instead of one wave per row re-loading
+// X.  Per (row, token) the lane traversal, accumulator chains, (a0+a1)+(a2+a3)
+// fold and shuffle tree are the kernel above's, so results are bitwise equal.
+// Grid: [ceil(N / 4), ceil(M / HF_ROWS_R), 1] (token tile fast), block 32.
+#define HF_ROWS_R 16
+template <int ITERS>
+__device__ __forceinline__ void bf16_rows_loop(
+    const unsigned short* __restrict__ W, const float* __restrict__ X,
+    float* __restrict__ Y, int M, int K, int N) {
+    const int lane = threadIdx.x;
+    const int batch_base = blockIdx.x * 4;
+    const int row_base = blockIdx.y * HF_ROWS_R;
+    if (row_base >= M || lane >= 32 || batch_base >= N) return;
+    const int b0 = batch_base;
+    const int bt[4] = {b0, (b0 + 1 < N) ? b0 + 1 : b0, (b0 + 2 < N) ? b0 + 2 : b0,
+                       (b0 + 3 < N) ? b0 + 3 : b0};
+    bool ok[ITERS];
+    float4 xa[ITERS][4], xb[ITERS][4];
+#pragma unroll
+    for (int it = 0; it < ITERS; ++it) {
+        const int i = lane * 8 + it * 256;
+        ok[it] = i + 8 <= K;
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const float* xr = X + (size_t)bt[t] * K + (ok[it] ? i : 0);
+            xa[it][t] = *(const float4*)(xr);
+            xb[it][t] = *(const float4*)(xr + 4);
+        }
+    }
+    const int rows = (M - row_base < HF_ROWS_R) ? M - row_base : HF_ROWS_R;
+    uint4 wn[ITERS];
+#pragma unroll
+    for (int it = 0; it < ITERS; ++it)
+        wn[it] = *(const uint4*)(W + (size_t)row_base * K + (ok[it] ? lane * 8 + it * 256 : 0));
+    for (int r = 0; r < rows; ++r) {
+        uint4 wv[ITERS];
+#pragma unroll
+        for (int it = 0; it < ITERS; ++it) wv[it] = wn[it];
+        const int rn = (r + 1 < rows) ? r + 1 : r;
+#pragma unroll
+        for (int it = 0; it < ITERS; ++it)
+            wn[it] = *(const uint4*)(W + (size_t)(row_base + rn) * K
+                                     + (ok[it] ? lane * 8 + it * 256 : 0));
+        float a[4][4];
+#pragma unroll
+        for (int t = 0; t < 4; ++t) a[t][0] = a[t][1] = a[t][2] = a[t][3] = 0.0f;
+#pragma unroll
+        for (int it = 0; it < ITERS; ++it) {
+            if (!ok[it]) continue;
+            const float w0 = HF_BF16_LO(wv[it].x), w1 = HF_BF16_HI(wv[it].x);
+            const float w2 = HF_BF16_LO(wv[it].y), w3 = HF_BF16_HI(wv[it].y);
+            const float w4 = HF_BF16_LO(wv[it].z), w5 = HF_BF16_HI(wv[it].z);
+            const float w6 = HF_BF16_LO(wv[it].w), w7 = HF_BF16_HI(wv[it].w);
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                a[t][0] += w0 * xa[it][t].x;
+                a[t][1] += w1 * xa[it][t].y;
+                a[t][2] += w2 * xa[it][t].z;
+                a[t][3] += w3 * xa[it][t].w;
+                a[t][0] += w4 * xb[it][t].x;
+                a[t][1] += w5 * xb[it][t].y;
+                a[t][2] += w6 * xb[it][t].z;
+                a[t][3] += w7 * xb[it][t].w;
+            }
+        }
+        float s[4];
+#pragma unroll
+        for (int t = 0; t < 4; ++t)
+            s[t] = hf_lane0_tree_sum((a[t][0] + a[t][1]) + (a[t][2] + a[t][3]));
+        if (lane == 0) {
+            const int row = row_base + r;
+#pragma unroll
+            for (int t = 0; t < 4; ++t)
+                if (batch_base + t < N) Y[(size_t)(batch_base + t) * M + row] = s[t];
+        }
+    }
+}
+
+__launch_bounds__(32, 8)
+extern "C" __global__ void gemm_bf16_xf32_multirow_rows2(
+    const unsigned short* __restrict__ W, const float* __restrict__ X,
+    float* __restrict__ Y, int M, int K, int N) {
+    bf16_rows_loop<2>(W, X, Y, M, K, N);
+}
+
+__launch_bounds__(32, 8)
+extern "C" __global__ void gemm_bf16_xf32_multirow_rows3(
+    const unsigned short* __restrict__ W, const float* __restrict__ X,
+    float* __restrict__ Y, int M, int K, int N) {
+    bf16_rows_loop<3>(W, X, Y, M, K, N);
+}

@@ -25343,6 +25343,19 @@ impl Gpu {
                 [batch_size.div_ceil(2) as u32, m.div_ceil(16) as u32, 1],
                 32,
             )
+        } else if self.arch_caps.is_gfx1151() && k % 8 == 0 && (257..=768).contains(&k) {
+            // Small K: one wave keeps its four tokens' X in registers and
+            // walks sixteen rows; bitwise identical to the four-row kernel.
+            (
+                if k <= 512 {
+                    "gemm_bf16_xf32_multirow_rows2"
+                } else {
+                    "gemm_bf16_xf32_multirow_rows3"
+                },
+                kernels::GEMM_BF16_XF32_MULTIROW_SRC,
+                [batch_size.div_ceil(4) as u32, m.div_ceil(16) as u32, 1],
+                32,
+            )
         } else {
             (
                 "gemm_bf16_xf32_multirow",
