@@ -195,15 +195,17 @@ static __device__ __forceinline__ void hf_lane0_tree_sum2(float& a, float& b) {
 // prefetching the next row's weights, instead of one wave per row re-loading
 // X.  Per (row, token) the lane traversal, accumulator chains, (a0+a1)+(a2+a3)
 // fold and shuffle tree are the kernel above's, so results are bitwise equal.
-// Grid: [ceil(N / 4), ceil(M / HF_ROWS_R), 1] (token tile fast), block 32.
+// Grid: [ceil(M / HF_ROWS_R), ceil(N / 4), 1], block 32.  Row groups vary
+// fastest: with token tiles fastest, concurrent waves write Y lines of many
+// token rows 4*M bytes apart and the kernel degrades ~8x once N > 512.
 #define HF_ROWS_R 16
 template <int ITERS>
 __device__ __forceinline__ void bf16_rows_loop(
     const unsigned short* __restrict__ W, const float* __restrict__ X,
     float* __restrict__ Y, int M, int K, int N) {
     const int lane = threadIdx.x;
-    const int batch_base = blockIdx.x * 4;
-    const int row_base = blockIdx.y * HF_ROWS_R;
+    const int batch_base = blockIdx.y * 4;
+    const int row_base = blockIdx.x * HF_ROWS_R;
     if (row_base >= M || lane >= 32 || batch_base >= N) return;
     const int b0 = batch_base;
     const int bt[4] = {b0, (b0 + 1 < N) ? b0 + 1 : b0, (b0 + 2 < N) ? b0 + 2 : b0,

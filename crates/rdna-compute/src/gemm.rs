@@ -25313,7 +25313,7 @@ impl Gpu {
         // route change.  blockIdx.y is sixteen bits, so a wave may only cover
         // a token tile while the row groups fit that limit.
         let r16_shape = self.arch_caps.is_gfx1151()
-            && (64..=512).contains(&batch_size)
+            && (64..=2048).contains(&batch_size)
             && m.div_ceil(16) <= 0xffff
             && matches!(
                 (m, k),
@@ -25333,7 +25333,7 @@ impl Gpu {
             (
                 "gemm_bf16_xf32_multirow_r16w4_gfx1151",
                 kernels::GEMM_BF16_XF32_MULTIROW_R16_GFX1151_SRC,
-                [batch_size.div_ceil(8) as u32, m.div_ceil(16) as u32, 1],
+                [m.div_ceil(16) as u32, batch_size.div_ceil(8) as u32, 1],
                 128,
             )
         } else if r16_shape {
@@ -25353,7 +25353,7 @@ impl Gpu {
                     "gemm_bf16_xf32_multirow_rows3"
                 },
                 kernels::GEMM_BF16_XF32_MULTIROW_SRC,
-                [batch_size.div_ceil(4) as u32, m.div_ceil(16) as u32, 1],
+                [m.div_ceil(16) as u32, batch_size.div_ceil(4) as u32, 1],
                 32,
             )
         } else {

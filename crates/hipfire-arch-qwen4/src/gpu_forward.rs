@@ -57,8 +57,10 @@ const EPSILON: f32 = 1.0e-6;
 ///
 /// Public serving calls may receive longer prompts; the forward owner tiles
 /// those requests over this bounded capacity instead of allocating
-/// prompt-sized grouped MoE buffers.
-pub(crate) const QWEN4_PREFILL_CHUNK_CAP: usize = 512;
+/// prompt-sized grouped MoE buffers.  Every chunk re-streams all expert
+/// weights, so the cap equals the Qwen4 contract's 2048-token `max_seq`:
+/// a prompt is one chunk (1131 tokens: 3 chunks at 512 were 8% slower).
+pub(crate) const QWEN4_PREFILL_CHUNK_CAP: usize = 2048;
 const QWEN4_STEP_INLINE_CAPACITY: usize = 384;
 const QWEN4_QSA_INLINE_CAPACITY: usize = 12;
 
