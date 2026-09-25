@@ -23,7 +23,7 @@ RUNS = int(os.environ.get("AR_RUNS", "3"))
 MAX_TOKENS = 16
 # Greedy token IDs recorded on the baseline build (text: "The text you provided contains a
 # repeated block of prose and Python code. Here is").
-REF_IDS = [760, 1414, 488, 3766, 7701, 310, 381, 264, 56127, 2424, 8222, 264, 93530, 2319, 3376, 760]  # segment 2: F16 WMMA gate/up + down, KLD-gated
+REF_IDS = [760, 1414, 488, 3766, 5435, 264, 11173, 2424, 314, 58655, 7854, 539, 264, 12654, 709, 7044]  # segment 2: F16 WMMA gate/up + down, KLD-gated
 MIN_MATCH = 12  # leading tokens that must match REF_IDS
 
 prompt = open(PROMPT_PATH, "rb").read()

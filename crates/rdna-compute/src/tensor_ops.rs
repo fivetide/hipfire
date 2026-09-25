@@ -13,6 +13,8 @@ use hip_bridge::{HipError, HipResult, KernargBlob};
 use crate::{DType, Gpu, GpuTensor};
 
 pub(crate) const TENSOR_OPS_SRC: &str = include_str!("../../../kernels/src/tensor_ops.hip");
+const HYPER_READ_UP_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/hyper_read_up_wmma.gfx1151.hip");
 const QSA_SELECT_PARALLEL_THREADS: u32 = 256;
 // gfx1151's 64-KiB dynamic LDS budget; other devices use the serial path.
 // Oversized rows also use serial kernels without changing the contract.
@@ -754,6 +756,59 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
+/// [`hyper_read_up_fused`] on gfx11 BF16 WMMA for `normalized` stored as BF16
+/// bits ([`hyper_norm_f16`]). Not bit-exact: the logits accumulate the same
+/// exact BF16 products in WMMA's F32 order, so a gate occasionally rounds one
+/// BF16 step apart; the epilogue is unchanged.
+pub fn hyper_read_up_wmma(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<()> {
+    ensure_f32(p.low)?;
+    ensure_f32(p.normalized)?;
+    ensure_f32(p.mixed)?;
+    let wide = checked_product(4, p.hidden, "HC read width")?;
+    if !gpu.arch_caps.is_gfx1151()
+        || !p.normalized_bf16
+        || p.up_weight.dtype != DType::BF16
+        || p.rows == 0
+        || p.hidden % 16 != 0
+        || p.low_rank % 16 != 0
+        || p.low_rank > 504
+        || p.up_weight.numel() < wide * p.low_rank
+        || p.low.numel() < p.rows * p.low_rank
+        || p.normalized.numel() < p.rows * wide
+        || p.mixed.numel() < p.rows * p.hidden
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let hidden = checked_i32(p.hidden, "HC read hidden width")?;
+    let low_rank = checked_i32(p.low_rank, "HC read low rank")?;
+    let rows = checked_i32(p.rows, "HC read rows")?;
+    let column_grid = checked_u32(p.hidden / 16, "HC read column grid")?;
+    let row_grid = checked_u32(p.rows.div_ceil(256), "HC read row grid")?;
+    let lds_bytes = checked_u32(64 * (p.low_rank + 8) * 2, "HC read LDS")?;
+    gpu.ensure_kernel_public(
+        "hyper_read_up_wmma",
+        HYPER_READ_UP_WMMA_SRC,
+        "hyper_read_up_wmma_bf16",
+    )?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.up_weight.buf.as_ptr());
+    args.push_ptr(p.low.buf.as_ptr());
+    args.push_ptr(p.normalized.buf.as_ptr());
+    args.push_ptr(p.mixed.buf.as_ptr());
+    args.push_i32(hidden);
+    args.push_i32(low_rank);
+    args.push_i32(rows);
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        "hyper_read_up_wmma_bf16",
+        [column_grid, row_grid, 1],
+        [256, 1, 1],
+        lds_bytes,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
 pub struct GatedDeltaConv<'a> {
     pub input: &'a GpuTensor,
     pub kernel: &'a GpuTensor,
@@ -2636,8 +2691,13 @@ mod tests {
         let mut up_weight = gpu.upload_raw(&bytes, &[bytes.len()]).expect("up weight");
         up_weight.dtype = DType::BF16;
         up_weight.shape = vec![wide * low_rank];
+        // BF16 values, as hc_activation leaves them (the WMMA read needs it).
+        let low_values: Vec<f32> = wave(2, rows * low_rank, 1.5)
+            .iter()
+            .map(|v| f32::from_bits(v.to_bits() & 0xFFFF_0000))
+            .collect();
         let low = gpu
-            .upload_f32(&wave(2, rows * low_rank, 1.5), &[rows * low_rank])
+            .upload_f32(&low_values, &[rows * low_rank])
             .expect("low");
         let normalized = gpu
             .upload_f32(&wave(3, rows * wide, 2.0), &[rows * wide])
@@ -2720,6 +2780,38 @@ mod tests {
             b,
             "BF16-normalized HC read differs"
         );
+        let wmma = gpu.zeros(&[rows * hidden], DType::F32).expect("wmma");
+        if gpu.arch_caps.is_gfx1151() {
+            hyper_read_up_wmma(
+                &mut gpu,
+                &HyperReadUpFused {
+                    up_weight: &up_weight,
+                    low: &low,
+                    normalized: &normalized_bf16,
+                    mixed: &wmma,
+                    rows,
+                    hidden,
+                    low_rank,
+                    normalized_bf16: true,
+                },
+            )
+            .expect("wmma");
+            // WMMA's F32 summation order may round a gate one BF16 step apart
+            // from the chain's; anything more is a layout or indexing error.
+            let reference = gpu.download_f32(&fused).expect("download");
+            let got = gpu.download_f32(&wmma).expect("download");
+            let far = reference
+                .iter()
+                .zip(&got)
+                .filter(|(r, w)| (*r - *w).abs() > r.abs().max(w.abs()) / 64.0 + 1e-6)
+                .count();
+            let differ = reference.iter().zip(&got).filter(|(r, w)| r != w).count();
+            assert_eq!(far, 0, "WMMA HC read beyond one BF16 step");
+            assert!(
+                differ * 100 < reference.len(),
+                "WMMA HC read: {differ} differ"
+            );
+        }
         for tensor in [
             up_weight,
             low,
@@ -2727,6 +2819,7 @@ mod tests {
             normalized_bf16,
             fused_bf16,
             fused,
+            wmma,
             up,
             reference,
             norm_weight,

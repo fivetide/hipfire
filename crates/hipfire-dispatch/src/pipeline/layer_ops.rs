@@ -19,13 +19,13 @@ use rdna_compute::tensor_ops::{
     argmax_f32, bf16_roundtrip_f32, gated_delta_conv, gated_delta_conv_batched, gated_delta_gate,
     gated_delta_gate_batched, gated_delta_params, gated_delta_params_batched, gated_delta_step,
     gated_delta_step_batched, hc_activation_fused_f32, hyper_norm, hyper_norm_f16, hyper_norm_gate,
-    hyper_read_projected, hyper_read_up_fused, hyper_write, indexed_attention_attention_batch,
-    indexed_attention_cache_append_batch, indexed_attention_norm_rope_batch,
-    indexed_attention_pool_rope, indexed_attention_select_batch, scale_f32, ArgmaxF32,
-    Bf16Roundtrip, GatedDeltaConv, GatedDeltaConvBatched, GatedDeltaGate, GatedDeltaGateBatched,
-    GatedDeltaParams, GatedDeltaParamsBatched, GatedDeltaStep, GatedDeltaStepBatched,
-    HcActivationFused, HyperNorm, HyperNormGate, HyperReadProjected, HyperReadUpFused, HyperWrite,
-    IndexedAttentionAttentionBatch, IndexedAttentionCacheAppendBatch,
+    hyper_read_projected, hyper_read_up_fused, hyper_read_up_wmma, hyper_write,
+    indexed_attention_attention_batch, indexed_attention_cache_append_batch,
+    indexed_attention_norm_rope_batch, indexed_attention_pool_rope, indexed_attention_select_batch,
+    scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv, GatedDeltaConvBatched, GatedDeltaGate,
+    GatedDeltaGateBatched, GatedDeltaParams, GatedDeltaParamsBatched, GatedDeltaStep,
+    GatedDeltaStepBatched, HcActivationFused, HyperNorm, HyperNormGate, HyperReadProjected,
+    HyperReadUpFused, HyperWrite, IndexedAttentionAttentionBatch, IndexedAttentionCacheAppendBatch,
     IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope, IndexedAttentionSelectBatch, ScaleF32,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -442,19 +442,22 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
         }
     }
     if up_fused {
-        return hip(hyper_read_up_fused(
-            gpu,
-            &HyperReadUpFused {
-                up_weight: op.input_mix_up.buf,
-                low: &low,
-                normalized: &normalized,
-                mixed: &mixed,
-                rows: op.rows,
-                hidden: op.hidden,
-                low_rank: op.low_rank,
-                normalized_bf16: f16,
-            },
-        ));
+        let read = HyperReadUpFused {
+            up_weight: op.input_mix_up.buf,
+            low: &low,
+            normalized: &normalized,
+            mixed: &mixed,
+            rows: op.rows,
+            hidden: op.hidden,
+            low_rank: op.low_rank,
+            normalized_bf16: f16,
+        };
+        // The F16 WMMA route's BF16 WMMA read (not bit-exact, see
+        // hyper_read_up_wmma).
+        if f16 && op.low_rank % 16 == 0 && op.low_rank <= 504 && op.hidden % 16 == 0 {
+            return hip(hyper_read_up_wmma(gpu, &read));
+        }
+        return hip(hyper_read_up_fused(gpu, &read));
     }
     project_weight(gpu, &op.input_mix_up, &low, &up, op.rows, Some(op.rotation))?;
     hip(hyper_read_projected(
