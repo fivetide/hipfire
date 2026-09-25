@@ -9,6 +9,30 @@
 
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
+typedef _Float16 __attribute__((ext_vector_type(2))) half2_p_t;
+typedef unsigned int __attribute__((ext_vector_type(8))) uint8_p_t;
+// Weights 2j, 2j+1 of nibble words (lo, hi) as sc*q + zp in F16: 0x6400 | q
+// is exactly 1024 + q, minus 1024 is exactly q, and one fused multiply-add
+// per pair is the per-element fma the scalar decode compiles to.
+__device__ __forceinline__ half16_t dq_nibbles(unsigned int lo, unsigned int hi,
+                                              _Float16 sc, _Float16 zp) {
+    const half2_p_t sc2 = {sc, sc};
+    const half2_p_t zp2 = {zp, zp};
+    const half2_p_t bias = {(_Float16)1024.0f, (_Float16)1024.0f};
+    uint8_p_t out;
+#pragma unroll
+    for (int p = 0; p < 8; p++) {
+        const unsigned int t = (p < 4 ? lo : hi) >> (8 * (p & 3));
+        const unsigned int bits = (t & 0xFu) | ((t << 12) & 0xF0000u) | 0x64006400u;
+        const half2_p_t q2 = __builtin_bit_cast(half2_p_t, bits) - bias;
+        out[p] = __builtin_bit_cast(unsigned int, __builtin_elementwise_fma(sc2, q2, zp2));
+    }
+    return __builtin_bit_cast(half16_t, out);
+}
+
+// `x_row_div` controls how sorted_slot_index maps to X_src rows:
+//   gate_up: X_src = x_rot_batch[N × K], x_row_div = K_TOP → x_row = flat / K_TOP
+//   down:    X_src = rot_batch[total_slots × K], x_row_div = 1 → x_row = flat
 
 // Grouped WMMA GEMM for MoE down over MQ4G128V2 (qt=53) routed experts:
 // gemm_mq4g256v2_moe_grouped_wmma_k2 (PR #775 gate/up arm) with the 68 B single-header group
@@ -54,6 +78,9 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_wmma_gfx1151(
         const _Float16 sc_h = __builtin_bit_cast(_Float16, (unsigned short)(hdr & 0xFFFFu));
         const _Float16 zp_h = __builtin_bit_cast(_Float16, (unsigned short)(hdr >> 16));
         const _Float16* xg = (x_base != nullptr) ? (x_base + g * 128) : nullptr;
+        // Unrolled: later tile pairs' loads issue ahead of this pair's
+        // decode/WMMA (the rolled loop waited each round trip; -23%).
+#pragma unroll
         for (int kt = 0; kt < 8; kt += 2) {
             const int k_off_a = kt * 16;
             const int k_off_b = (kt + 1) * 16;
@@ -69,19 +96,8 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_wmma_gfx1151(
                 b_a = zero_b;
                 b_b = zero_b;
             }
-            half16_t a_a;
-            #define DQ(reg, i, pk, sh) reg[i] = sc_h * (_Float16)(float)(((pk) >> (sh)) & 0xFu) + zp_h
-            DQ(a_a, 0,  pk0a,  0); DQ(a_a, 1,  pk0a,  4); DQ(a_a, 2,  pk0a,  8); DQ(a_a, 3,  pk0a, 12);
-            DQ(a_a, 4,  pk0a, 16); DQ(a_a, 5,  pk0a, 20); DQ(a_a, 6,  pk0a, 24); DQ(a_a, 7,  pk0a, 28);
-            DQ(a_a, 8,  pk1a,  0); DQ(a_a, 9,  pk1a,  4); DQ(a_a, 10, pk1a,  8); DQ(a_a, 11, pk1a, 12);
-            DQ(a_a, 12, pk1a, 16); DQ(a_a, 13, pk1a, 20); DQ(a_a, 14, pk1a, 24); DQ(a_a, 15, pk1a, 28);
-            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b_a, acc);
-            DQ(a_a, 0,  pk0b,  0); DQ(a_a, 1,  pk0b,  4); DQ(a_a, 2,  pk0b,  8); DQ(a_a, 3,  pk0b, 12);
-            DQ(a_a, 4,  pk0b, 16); DQ(a_a, 5,  pk0b, 20); DQ(a_a, 6,  pk0b, 24); DQ(a_a, 7,  pk0b, 28);
-            DQ(a_a, 8,  pk1b,  0); DQ(a_a, 9,  pk1b,  4); DQ(a_a, 10, pk1b,  8); DQ(a_a, 11, pk1b, 12);
-            DQ(a_a, 12, pk1b, 16); DQ(a_a, 13, pk1b, 20); DQ(a_a, 14, pk1b, 24); DQ(a_a, 15, pk1b, 28);
-            #undef DQ
-            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b_b, acc);
+            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(dq_nibbles(pk0a, pk1a, sc_h, zp_h), b_a, acc);
+            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(dq_nibbles(pk0b, pk1b, sc_h, zp_h), b_b, acc);
         }
     }
     const int out_col = slot_start + lane;
