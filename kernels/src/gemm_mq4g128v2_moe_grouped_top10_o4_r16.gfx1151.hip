@@ -152,37 +152,61 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
             }
         };
 
+        // Buffer loads: uniform row/slot/group offsets ride in soffset, the
+        // lane offset in voffset, so the loop carries no 64-bit VGPR address
+        // arithmetic. Slots with no X row read row 0 (in bounds) and skip the
+        // accumulation, so their loads need no branch.
+        const __amdgpu_buffer_rsrc_t wrsrc = __builtin_amdgcn_make_buffer_rsrc(
+            (void*)A, 0, (int)((long long)M * row_stride), 0x31004000);
+        const __amdgpu_buffer_rsrc_t xrsrc = __builtin_amdgcn_make_buffer_rsrc(
+            (void*)X_src, 0, (int)((long long)x_src_rows * K * 4), 0x31004000);
+        int row_soff[4];
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) row_soff[r] = (int)(row_ptr[r] - A);
+        int x_soff[16];
+        #pragma unroll
+        for (int slot = 0; slot < 16; ++slot)
+            x_soff[slot] = x_rows[slot] ? (int)((x_rows[slot] - X_src) * 4) : 0;
+
         for (int group = 0; group < vector_groups; ++group) {
             // Issue every row's raw group bytes before decoding any of them:
             // eight independent loads in flight instead of four dependent
-            // load/decode pairs.
+            // load/decode pairs. The header is uniform: a scalar load.
             unsigned int header[4];
             unsigned short payload[4];
             #pragma unroll
             for (int r = 0; r < 4; ++r) {
                 if (row_valid[r]) {
-                    const char* gp = row_ptr[r] + (long long)group * 68;
-                    header[r] = *(const unsigned int*)(gp + 0);
-                    payload[r] = *(const unsigned short*)(gp + 4 + tid * 2);
+                    const int goff = row_soff[r] + group * 68;
+                    header[r] = *(const __attribute__((address_space(4))) unsigned int*)(
+                        (const __attribute__((address_space(4))) char*)expert_ptrs[expert] + goff);
+                    payload[r] = __builtin_amdgcn_raw_buffer_load_b16(
+                        wrsrc, 4 + tid * 2, goff, 0);
                 } else {
                     header[r] = 0U;
                     payload[r] = static_cast<unsigned short>(0);
                 }
             }
+            // The nibbles as floats: the 0x0F0F mask is opaque so each one
+            // converts with a single v_cvt_f32_ubyteN (values unchanged).
             float scale[4];
             float zero[4];
-            unsigned char b0[4];
-            unsigned char b1[4];
+            float n0[4], n1[4], n2[4], n3[4];
             #pragma unroll
             for (int r = 0; r < 4; ++r) {
                 scale[r] = __half2float(__ushort_as_half(
                     (unsigned short)(header[r] & 0xFFFFU)));
                 zero[r] = __half2float(__ushort_as_half(
                     (unsigned short)(header[r] >> 16)));
-                b0[r] = (unsigned char)(payload[r] & 0xFFU);
-                b1[r] = (unsigned char)(payload[r] >> 8);
+                unsigned int lo, hi;
+                asm("v_and_b32 %0, 0x0f0f, %1" : "=v"(lo) : "v"((unsigned int)payload[r]));
+                asm("v_and_b32 %0, 0x0f0f, %1" : "=v"(hi) : "v"((unsigned int)payload[r] >> 4));
+                n0[r] = (float)(lo & 0xFFU);
+                n1[r] = (float)(hi & 0xFFU);
+                n2[r] = (float)(lo >> 8);
+                n3[r] = (float)(hi >> 8);
             }
-            const int base = group * 128 + tid * 4;
+            const int xvoff = tid * 16;
             // Four slots per batch: the four X loads are independent, so
             // issuing them together gives the scheduler four in-flight loads
             // before the first FMA needs one. Slots with no X row keep the
@@ -190,20 +214,23 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
             #pragma unroll
             for (int batch = 0; batch < 16; batch += 4) {
                 float4 values[4];
-                bool live[4];
                 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
-                    const float* x = x_rows[batch + i];
-                    live[i] = x != nullptr;
-                    values[i] = live[i]
-                        ? *reinterpret_cast<const float4*>(x + base)
-                        : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                    values[i] = __builtin_bit_cast(float4,
+                        __builtin_amdgcn_raw_buffer_load_b128(
+                            xrsrc, xvoff, x_soff[batch + i] + group * 512, 0));
                 }
                 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
-                    if (!live[i]) continue;
+                    if (x_rows[batch + i] == nullptr) continue;
                     const float4 xv = values[i];
-                    accumulate(batch + i, xv.x, xv.y, xv.z, xv.w, scale, zero, b0, b1);
+                    #pragma unroll
+                    for (int r = 0; r < 4; ++r) {
+                        acc[r][batch + i] += (scale[r] * n0[r] + zero[r]) * xv.x
+                            + (scale[r] * n1[r] + zero[r]) * xv.y
+                            + (scale[r] * n2[r] + zero[r]) * xv.z
+                            + (scale[r] * n3[r] + zero[r]) * xv.w;
+                    }
                 }
             }
         }
