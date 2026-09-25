@@ -163,6 +163,33 @@ extern "C" __global__ void gemm_bf16_xf32_multirow(
     }
 }
 
+
+// gfx11/gfx12 only (permlanex16 / row DPP); dispatched on gfx1151.
+#if defined(__GFX11__) || defined(__GFX12__)
+// Two lane-0 trees in one pass: lanes 0-15 carry a, lanes 16-31 carry b.
+// After the cross-row step lane i holds a[i] + a[i+16] and lane 16+i holds
+// b[16+i] + b[i] (the same sum, IEEE add commutes); the in-row DPP steps then
+// reduce both rows with the reference offsets, so a ends in lane 0 and b in
+// lane 16 bit-identical to two hf_lane0_tree_sum calls.  a is returned in
+// lane 0; b is broadcast (readlane 16).
+static __device__ __forceinline__ void hf_lane0_tree_sum2(float& a, float& b) {
+    const bool lo = (threadIdx.x & 31) < 16;
+    float v = lo ? a : b;
+    const float o = lo ? b : a;
+    v += __int_as_float(__builtin_amdgcn_permlanex16(
+        __float_as_int(o), __float_as_int(o), 0x76543210u, 0xfedcba98u, false, false));
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(v), 0x108, 0xf, 0xf, true));  // row_shl:8
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(v), 0x104, 0xf, 0xf, true));  // row_shl:4
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(v), 0x102, 0xf, 0xf, true));  // row_shl:2
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(v), 0x101, 0xf, 0xf, true));  // row_shl:1
+    a = v;
+    b = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(v), 16));
+}
+
 // Rows-loop sibling for small K (K % 8 == 0, ceil(K / 256) == ITERS): one wave
 // keeps its four token rows' X in registers and walks HF_ROWS_R output rows,
 // prefetching the next row's weights, instead of one wave per row re-loading
@@ -232,8 +259,9 @@ __device__ __forceinline__ void bf16_rows_loop(
         }
         float s[4];
 #pragma unroll
-        for (int t = 0; t < 4; ++t)
-            s[t] = hf_lane0_tree_sum((a[t][0] + a[t][1]) + (a[t][2] + a[t][3]));
+        for (int t = 0; t < 4; ++t) s[t] = (a[t][0] + a[t][1]) + (a[t][2] + a[t][3]);
+        hf_lane0_tree_sum2(s[0], s[1]);
+        hf_lane0_tree_sum2(s[2], s[3]);
         if (lane == 0) {
             const int row = row_base + r;
 #pragma unroll
@@ -256,3 +284,5 @@ extern "C" __global__ void gemm_bf16_xf32_multirow_rows3(
     float* __restrict__ Y, int M, int K, int N) {
     bf16_rows_loop<3>(W, X, Y, M, K, N);
 }
+
+#endif  // __GFX11__ || __GFX12__

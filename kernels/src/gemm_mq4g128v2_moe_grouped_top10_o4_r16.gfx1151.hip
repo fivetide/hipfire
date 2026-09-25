@@ -72,6 +72,30 @@ static __device__ __forceinline__ float hf_lane0_tree_sum(float v) {
     return v;
 }
 
+// Two lane-0 trees in one pass: lanes 0-15 carry a, lanes 16-31 carry b.
+// After the cross-row step lane i holds a[i] + a[i+16] and lane 16+i holds
+// b[16+i] + b[i] (the same sum, IEEE add commutes); the in-row DPP steps then
+// reduce both rows with the reference offsets, so a ends in lane 0 and b in
+// lane 16 bit-identical to two hf_lane0_tree_sum calls.  a is returned in
+// lane 0; b is broadcast (readlane 16).
+static __device__ __forceinline__ void hf_lane0_tree_sum2(float& a, float& b) {
+    const bool lo = (threadIdx.x & 31) < 16;
+    float v = lo ? a : b;
+    const float o = lo ? b : a;
+    v += __int_as_float(__builtin_amdgcn_permlanex16(
+        __float_as_int(o), __float_as_int(o), 0x76543210u, 0xfedcba98u, false, false));
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(v), 0x108, 0xf, 0xf, true));  // row_shl:8
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(v), 0x104, 0xf, 0xf, true));  // row_shl:4
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(v), 0x102, 0xf, 0xf, true));  // row_shl:2
+    v += __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(v), 0x101, 0xf, 0xf, true));  // row_shl:1
+    a = v;
+    b = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(v), 16));
+}
+
 __launch_bounds__(32, 8)
 extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
     const unsigned long long* __restrict__ expert_ptrs,
@@ -308,14 +332,13 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_top10_o4_r16_gfx1151(
     // reduction is skipped for those slots and for rows past M, both of which
     // are uniform (whole-wave) decisions. Every reduced accumulator keeps the
     // production sibling's offsets 16, 8, 4, 2, 1 and association.
+    // Rows are reduced in pairs (rows past M are reduced too but never
+    // stored).
     #pragma unroll
     for (int slot = 0; slot < 16; ++slot) {
         if (x_rows[slot] == nullptr) continue;
-        #pragma unroll
-        for (int r = 0; r < 4; ++r) {
-            if (!row_valid[r]) continue;
-            acc[r][slot] = hf_lane0_tree_sum(acc[r][slot]);
-        }
+        hf_lane0_tree_sum2(acc[0][slot], acc[1][slot]);
+        hf_lane0_tree_sum2(acc[2][slot], acc[3][slot]);
     }
 
     if (tid == 0) {
