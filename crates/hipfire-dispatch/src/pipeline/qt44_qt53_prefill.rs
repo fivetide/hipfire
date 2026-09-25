@@ -322,39 +322,39 @@ pub(crate) fn gate_up(
     }
 }
 
+/// Path-2 unscatter fused with the SwiGLU activation: the grouped gate/up
+/// rows go straight to the rotation input (`rot_batch`) with the recipe's BF16
+/// round trips, bitwise the unfused unscatter -> round trip -> silu_mul ->
+/// round trip sequence.  [`activation`] then only rotates.
 pub(crate) fn unscatter(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
-    hip(gpu.moe_gate_up_unscatter_top10(
+    hip(gpu.moe_gate_up_unscatter_silu_top10(
         p.y_gate_up_grouped,
         p.sorted_slot_index,
-        p.gate_batch,
-        p.up_batch,
+        p.rot_batch,
         p.mi,
         grouped_rows,
-        p.batch_size,
-    ))?;
-    let active = p
-        .batch_size
-        .checked_mul(p.k_top)
-        .and_then(|slots| slots.checked_mul(p.mi))
-        .ok_or_else(|| DispatchError::Hip("grouped gate/up extent overflows".into()))?;
-    if p.recipe.bf16_round_trip() {
-        hip(gpu.bf16_round_trip_f32(&f32_view(p.gate_batch, 0, active)))?;
-        hip(gpu.bf16_round_trip_f32(&f32_view(p.up_batch, 0, active)))?;
-    }
-    Ok(())
+        p.recipe.bf16_round_trip(),
+    ))
 }
 
-pub(crate) fn activation(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
+pub(crate) fn activation(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    use_path2: bool,
+) -> Result<(), DispatchError> {
     require_geometry(p)?;
     let total_slots = p.batch_size * p.k_top;
-    hip(gpu.silu_mul_f32(p.gate_batch, p.up_batch, p.rot_batch))?;
-    if p.recipe.bf16_round_trip() {
-        hip(gpu.bf16_round_trip_f32(p.rot_batch))?;
+    // Path 2's unscatter already produced the activation.
+    if !use_path2 {
+        hip(gpu.silu_mul_f32(p.gate_batch, p.up_batch, p.rot_batch))?;
+        if p.recipe.bf16_round_trip() {
+            hip(gpu.bf16_round_trip_f32(p.rot_batch))?;
+        }
     }
     hip(gpu.rotate_x_mq_128_v2(p.rot_batch, p.rot_batch, p.mi, total_slots))
 }

@@ -2083,6 +2083,64 @@ impl Gpu {
         result
     }
 
+    /// Qwen4 top-10 grouped gate/up unscatter fused with SwiGLU: writes the
+    /// activation `[tokens × 10 × mi]` directly (BF16 round trips around the
+    /// SwiGLU when `bf16_round_trip`), bitwise the unfused sequence of
+    /// `moe_gate_up_unscatter_top10`, `bf16_round_trip_f32` on gate/up,
+    /// `silu_mul_f32` and `bf16_round_trip_f32` on the activation.
+    pub fn moe_gate_up_unscatter_silu_top10(
+        &mut self,
+        grouped_gate_up: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        activation: &GpuTensor,
+        mi: usize,
+        grouped_rows: usize,
+        bf16_round_trip: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "moe_gate_up_unscatter_silu_top10";
+        self.ensure_kernel(FUNC, kernels::MOE_GATE_UP_UNSCATTER_SILU_TOP10_SRC, FUNC)?;
+        let yp = grouped_gate_up.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let ap = activation.buf.as_ptr();
+        let mi_val = mi as i32;
+        let rows_val = grouped_rows as i32;
+        let rt_val = i32::from(bf16_round_trip);
+        let mut params = [
+            &yp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &mi_val as *const _ as *mut c_void,
+            &rows_val as *const _ as *mut c_void,
+            &rt_val as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid_y = (mi as u32).div_ceil(block);
+        let bytes = (grouped_rows * 3 * mi + grouped_rows) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [grouped_rows as u32, grid_y, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(yp);
+                b.push_ptr(sp);
+                b.push_ptr(ap);
+                b.push_i32(mi_val);
+                b.push_i32(rows_val);
+                b.push_i32(rt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Qwen4 qt3/Q8F16 indexed down.  The kernel writes unweighted expanded
     /// rows; `moe_down_combine_top10_batched` owns all route weighting.
     #[allow(clippy::too_many_arguments)]
@@ -2507,5 +2565,55 @@ mod tests {
             differing, 0,
             "O4xR16 down differs from multirow in {differing} cells"
         );
+    }
+
+    /// The fused grouped gate/up unscatter + SwiGLU must equal the unfused
+    /// unscatter -> BF16 round trip (gate, up) -> silu_mul -> BF16 round trip
+    /// sequence bit for bit, with padding slots interleaved in the groups.
+    #[test]
+    fn unscatter_silu_matches_unfused_sequence() {
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) => gpu,
+            Err(_) => {
+                eprintln!("skip: no GPU");
+                return;
+            }
+        };
+        const MI: usize = 640;
+        const TOKENS: usize = 13;
+        let slots = TOKENS * 10;
+        // Every flat slot appears once, spread over groups with -1 padding.
+        let mut sorted = Vec::new();
+        for flat in 0..slots {
+            sorted.push(((flat * 37) % slots) as i32);
+            if flat % 7 == 3 {
+                sorted.push(-1);
+            }
+        }
+        let grouped = sorted.len();
+        let y: Vec<f32> = (0..grouped * 2 * MI)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) % 20011) as f32 - 10005.0) / 1777.0)
+            .collect();
+        let y_gpu = gpu.upload_f32(&y, &[y.len()]).expect("y");
+        let bytes: Vec<u8> = sorted.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let sorted_gpu = gpu.upload_raw(&bytes, &[bytes.len()]).expect("sorted");
+        let n = slots * MI;
+        let gate = gpu.zeros(&[n], DType::F32).expect("gate");
+        let up = gpu.zeros(&[n], DType::F32).expect("up");
+        let reference = gpu.zeros(&[n], DType::F32).expect("reference");
+        gpu.moe_gate_up_unscatter_top10(&y_gpu, &sorted_gpu, &gate, &up, MI, grouped, TOKENS)
+            .expect("unscatter");
+        gpu.bf16_round_trip_f32(&gate).expect("rt gate");
+        gpu.bf16_round_trip_f32(&up).expect("rt up");
+        gpu.silu_mul_f32(&gate, &up, &reference).expect("silu");
+        gpu.bf16_round_trip_f32(&reference).expect("rt act");
+        let fused = gpu.zeros(&[n], DType::F32).expect("fused");
+        gpu.moe_gate_up_unscatter_silu_top10(&y_gpu, &sorted_gpu, &fused, MI, grouped, true)
+            .expect("fused");
+        let a = gpu.download_f32(&reference).expect("download");
+        let b = gpu.download_f32(&fused).expect("download");
+        assert!(a.iter().any(|v| *v != 0.0));
+        let differing = a.iter().zip(&b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        assert_eq!(differing, 0, "fused unscatter+SwiGLU differs in {differing} cells");
     }
 }

@@ -3194,6 +3194,11 @@ pub const MOE_GATE_UP_UNSCATTER_TOP10_SRC: &str = concat!(
     "#define moe_gate_up_unscatter_k8 moe_gate_up_unscatter_top10\n",
     include_str!("../../../kernels/src/moe_gate_up_unscatter_k8.hip")
 );
+/// Qwen4 top-10 grouped gate/up unscatter fused with the BF16 round trips and
+/// SwiGLU (bitwise the unfused unscatter -> round trip -> silu_mul -> round
+/// trip sequence).
+pub const MOE_GATE_UP_UNSCATTER_SILU_TOP10_SRC: &str =
+    include_str!("../../../kernels/src/moe_gate_up_unscatter_silu_top10.hip");
 
 /// Phase D1 (2026-05-26): fused unscatter + SwiGLU + asymmetric clamp.
 /// Replaces `MOE_GATE_UP_UNSCATTER_K8_SRC` followed by

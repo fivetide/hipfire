@@ -844,7 +844,11 @@ impl<'a> SealedMoeOp<'a> {
         }
         let (params, selection) = self.state.prefill_parts()?;
         if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
-            return super::qt44_qt53_prefill::activation(gpu, params);
+            return super::qt44_qt53_prefill::activation(
+                gpu,
+                params,
+                selection.resolution.use_path2,
+            );
         }
         let total_slots = params
             .batch_size
