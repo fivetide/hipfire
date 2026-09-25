@@ -2,7 +2,8 @@
 #include <hip/hip_bfloat16.h>
 
 // HC read tail on gfx11 WMMA: the BF16 [4 * hidden, K] up projection of
-// `low` ([N, K] F32 holding BF16 values) with hyper_read_projected_f32's
+// `low` ([N, K] BF16 bits, hc_activation_fused_f32's packed output) with
+// hyper_read_projected_f32's
 // branch mix fused, reading the normalized rows from hyper_norm_f16's F16
 // copy (the BF16-rounded values, exact in F16 above its 6e-5 normal floor).
 // Both GEMM operands are exact in BF16, so the logits differ from
@@ -29,7 +30,7 @@ static __device__ __forceinline__ float hru_bf16r(float v) {
 
 extern "C" __global__ __launch_bounds__(256) void hyper_read_up_wmma_bf16(
     const unsigned short* __restrict__ W,
-    const float* __restrict__ X,
+    const unsigned short* __restrict__ X,
     const _Float16* __restrict__ normalized,
     float* __restrict__ mixed,
     int hidden,
@@ -62,24 +63,14 @@ extern "C" __global__ __launch_bounds__(256) void hyper_read_up_wmma_bf16(
             for (int br = 0; br < 4; br++)
                 nv[br][i] = normalized[(size_t)token * wide + br * hidden + j];
         }
-        const float* xr = X + (size_t)min(t0 + l16, N - 1) * K;
+        const unsigned short* xr = X + (size_t)min(t0 + l16, N - 1) * K;
         hru_f8_t acc[4];
 #pragma unroll
         for (int br = 0; br < 4; br++) acc[br] = hru_f8_t{0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll 4
         for (int k = 0; k < K; k += 16) {
-            // 16 F32 values -> their (exact) BF16 high halves.
-            const uint4 u0 = *(const uint4*)(xr + k), u1 = *(const uint4*)(xr + k + 4);
-            const uint4 u2 = *(const uint4*)(xr + k + 8), u3 = *(const uint4*)(xr + k + 12);
-            hru_u8_t xp;
-            xp[0] = __builtin_amdgcn_perm(u0.y, u0.x, 0x07060302u);
-            xp[1] = __builtin_amdgcn_perm(u0.w, u0.z, 0x07060302u);
-            xp[2] = __builtin_amdgcn_perm(u1.y, u1.x, 0x07060302u);
-            xp[3] = __builtin_amdgcn_perm(u1.w, u1.z, 0x07060302u);
-            xp[4] = __builtin_amdgcn_perm(u2.y, u2.x, 0x07060302u);
-            xp[5] = __builtin_amdgcn_perm(u2.w, u2.z, 0x07060302u);
-            xp[6] = __builtin_amdgcn_perm(u3.y, u3.x, 0x07060302u);
-            xp[7] = __builtin_amdgcn_perm(u3.w, u3.z, 0x07060302u);
+            const uint4 u0 = *(const uint4*)(xr + k), u1 = *(const uint4*)(xr + k + 8);
+            const hru_u8_t xp = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
             const hru_bf16x16_t a = __builtin_bit_cast(hru_bf16x16_t, xp);
 #pragma unroll
             for (int br = 0; br < 4; br++) {

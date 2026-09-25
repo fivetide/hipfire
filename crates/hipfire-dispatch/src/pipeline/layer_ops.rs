@@ -396,12 +396,20 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
             Some(op.rotation),
         )?;
     }
+    // The WMMA read takes `low` as packed BF16, staged in `up` (which that
+    // route does not otherwise use).
+    let low_bf16 = wmma_read.then(|| {
+        let mut packed = view(op.up, 0, op.rows * op.low_rank);
+        packed.dtype = DType::BF16;
+        packed
+    });
     if gpu.arch_caps.is_gfx1151() {
         hip(hc_activation_fused_f32(
             gpu,
             &HcActivationFused {
                 values: &low,
                 scale: 1.0 / op.branches as f32,
+                bf16_out: low_bf16.as_ref(),
             },
         ))?;
     } else {
@@ -459,7 +467,7 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
         };
         let read = HyperReadUpFused {
             up_weight: op.input_mix_up.buf,
-            low: &low,
+            low: low_bf16.as_ref().unwrap_or(&low),
             normalized,
             mixed: &mixed,
             rows: op.rows,

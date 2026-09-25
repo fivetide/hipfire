@@ -450,12 +450,17 @@ pub fn bf16_roundtrip_f32(gpu: &mut Gpu, p: &Bf16Roundtrip<'_>) -> HipResult<()>
 pub struct HcActivationFused<'a> {
     pub values: &'a GpuTensor,
     pub scale: f32,
+    /// Receives the (BF16-exact) results as packed BF16 instead of `values`.
+    pub bf16_out: Option<&'a GpuTensor>,
 }
 
 pub fn hc_activation_fused_f32(gpu: &mut Gpu, p: &HcActivationFused<'_>) -> HipResult<()> {
     ensure_f32(p.values)?;
     let elements = checked_extent(p.values.numel(), "HC activation extent")?;
-    if elements == 0 {
+    if elements == 0
+        || p.bf16_out
+            .is_some_and(|out| out.dtype != DType::BF16 || out.numel() < elements)
+    {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
     let elements_i = checked_i32(elements, "HC activation extent")?;
@@ -465,6 +470,10 @@ pub fn hc_activation_fused_f32(gpu: &mut Gpu, p: &HcActivationFused<'_>) -> HipR
     args.push_ptr(p.values.buf.as_ptr());
     args.push_i32(elements_i);
     args.push_f32(p.scale);
+    args.push_ptr(
+        p.bf16_out
+            .map_or(std::ptr::null_mut(), |out| out.buf.as_ptr()),
+    );
     args.pad_to(16);
     gpu.launch_blob_recorded(
         "hc_activation_fused_f32",
@@ -948,16 +957,17 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
-/// [`hyper_read_up_fused`] on gfx11 BF16 WMMA; `normalized` is
+/// [`hyper_read_up_fused`] on gfx11 BF16 WMMA; `low` is packed BF16
+/// ([`HcActivationFused::bf16_out`]) and `normalized` is
 /// [`hyper_norm_f16`]'s F16 copy (`normalized_bf16` is ignored). Not
 /// bit-exact: the logits accumulate the same exact BF16 products in WMMA's F32
 /// order, so a gate occasionally rounds one BF16 step apart; the epilogue is
 /// unchanged.
 pub fn hyper_read_up_wmma(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<()> {
-    ensure_f32(p.low)?;
     ensure_f32(p.mixed)?;
     let wide = checked_product(4, p.hidden, "HC read width")?;
     if !gpu.arch_caps.is_gfx1151()
+        || p.low.dtype != DType::BF16
         || p.normalized.dtype != DType::F16
         || p.up_weight.dtype != DType::BF16
         || p.rows == 0
@@ -3224,11 +3234,21 @@ mod tests {
                 .expect("normalized f16");
             normalized_f16.dtype = DType::F16;
             normalized_f16.shape = vec![rows * wide];
+            // `low` as packed BF16 bits, as hc_activation's bf16_out holds it.
+            let low_bytes: Vec<u8> = low_values
+                .iter()
+                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect();
+            let mut low_bf16 = gpu
+                .upload_raw(&low_bytes, &[low_bytes.len()])
+                .expect("low bf16");
+            low_bf16.dtype = DType::BF16;
+            low_bf16.shape = vec![rows * low_rank];
             hyper_read_up_wmma(
                 &mut gpu,
                 &HyperReadUpFused {
                     up_weight: &up_weight,
-                    low: &low,
+                    low: &low_bf16,
                     normalized: &normalized_f16,
                     mixed: &wmma,
                     rows,
@@ -3254,6 +3274,7 @@ mod tests {
                 "WMMA HC read: {differ} differ"
             );
             gpu.free_tensor(normalized_f16).expect("free");
+            gpu.free_tensor(low_bf16).expect("free");
         }
         for tensor in [
             up_weight,

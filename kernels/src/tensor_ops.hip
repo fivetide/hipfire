@@ -2364,11 +2364,13 @@ extern "C" __global__ void scale_f32(
 // HC-specific pointwise fusion.  This preserves the source order of the
 // three F32->BF16->F32 boundaries around scale and SiLU while replacing the
 // per-row roundtrip, flat scale, flat SiLU, and per-row roundtrip launches
-// with one launch over the contiguous low-rank buffer.
+// with one launch over the contiguous low-rank buffer.  With `bf16_out` the
+// (BF16-exact) results go there as packed BF16 bits and `values` is left as is.
 extern "C" __global__ void hc_activation_fused_f32(
     float* values,
     int elements,
-    float scale) {
+    float scale,
+    unsigned short* bf16_out) {
     const int index = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (index >= elements) return;
 
@@ -2376,7 +2378,10 @@ extern "C" __global__ void hc_activation_fused_f32(
     value *= scale;
     value = bf16_to_f32(bf16_round(value));
     value = value / (1.0f + expf(-value));
-    values[index] = bf16_to_f32(bf16_round(value));
+    if (bf16_out)
+        bf16_out[index] = bf16_round(value).data;
+    else
+        values[index] = bf16_to_f32(bf16_round(value));
 }
 
 // Deterministic device-side greedy top-1 over one or more contiguous logits

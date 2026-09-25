@@ -92,6 +92,7 @@ fn hc_read(
         &HcActivationFused {
             values: low,
             scale: 1.0 / config.hc_count as f32,
+            bf16_out: None,
         },
     )?;
     dispatch_gemv(
