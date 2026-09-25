@@ -625,6 +625,9 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
     _Float16* lds0 = xs + (tid / VPT) * STRIDE + (tid % VPT) * 8;
 #define XL_LOAD(I) st##I = *(const uint4*)(X + xo##I + cn * CK);
 #define XL_STORE(I) *(uint4*)(lds0 + I * (NT / VPT) * STRIDE) = st##I;
+    // The barriers order LDS only: __syncthreads would also wait for the
+    // in-flight next-chunk X and payload loads (WGP-mode workgroup fence).
+#define XL_BARRIER() asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory")
     uint4 st0, st1, st2, st3, st4, st5, st6, st7;
     {
         const int cn = 0;
@@ -657,7 +660,7 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
                 d[2 * u + 1] = v[1];
             }
             XL_FOR8(XL_STORE)
-            __syncthreads();
+            XL_BARRIER();
             // Next chunk's global loads fly while this chunk computes (the
             // last chunk harmlessly reloads itself).
             const int cn = (c + 1 < nchunks) ? (c + 1) : c;
@@ -685,7 +688,7 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
             // B operands that were read before them.
 #pragma unroll
             for (int b = 0; b < BV; b++) asm volatile("" : "+v"(acc[b]));
-            __syncthreads();
+            XL_BARRIER();
         }
     }
 #pragma unroll
@@ -705,6 +708,7 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
         }
     }
 #undef XL_STORE
+#undef XL_BARRIER
 #undef XL_LOAD
 #undef XL_FOR8
 }
