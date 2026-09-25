@@ -84,12 +84,66 @@ extern "C" __global__ void moe_down_combine_grouped_top10(
                              residual, hidden, grouped_rows, tokens);
 }
 
-// Grouped down stored as BF16 bits: the values the BF16 round below yields.
-__launch_bounds__(256, 4)
-extern "C" __global__ void moe_down_combine_grouped_top10_bf16in(
+// Grouped down stored as BF16 bits (the values the BF16 round above yields),
+// eight columns per thread: the ten route ranks' order (ascending expert ID,
+// block-uniform) is resolved first, every rank's 16-byte slice is loaded
+// before the in-order accumulation, and each column runs the exact
+// moe_down_combine_grouped arithmetic.  Grid [ceil(hidden / 512), tokens],
+// block 64, hidden % 8 == 0.
+extern "C" __global__ __launch_bounds__(64) void moe_down_combine_grouped_top10_bf16in(
     const unsigned short* __restrict__ grouped_down, const int* __restrict__ inverse_perm,
     const int* __restrict__ topk_indices, const float* __restrict__ topk_weights,
     float* __restrict__ residual, int hidden, int grouped_rows, int tokens) {
-    moe_down_combine_grouped(grouped_down, inverse_perm, topk_indices, topk_weights,
-                             residual, hidden, grouped_rows, tokens);
+    const int token = blockIdx.y;
+    const int col0 = (blockIdx.x * 64 + threadIdx.x) * 8;
+    if (token >= tokens || col0 >= hidden) return;
+    const size_t route_base = (size_t)token * 10;
+    int order[10];
+    int used_ranks = 0, n = 0;
+    for (int count = 0; count < 10; ++count) {
+        int selected_rank = -1, selected_expert = 0x7fffffff;
+        for (int rank = 0; rank < 10; ++rank) {
+            if ((used_ranks & (1 << rank)) != 0) continue;
+            const int expert = topk_indices[route_base + rank];
+            if (expert < selected_expert) { selected_expert = expert; selected_rank = rank; }
+        }
+        if (selected_rank < 0) break;
+        used_ranks |= 1 << selected_rank;
+        order[n++] = selected_rank;
+    }
+    uint4 rows[10];
+    float wts[10];
+#pragma unroll
+    for (int c = 0; c < 10; ++c) {
+        rows[c] = make_uint4(0, 0, 0, 0);
+        wts[c] = 0.0f;
+        if (c < n) {
+            const int rank = order[c];
+            wts[c] = moe_top10_bf16_to_f32(moe_top10_bf16_round(topk_weights[route_base + rank]));
+            const int grouped_row = inverse_perm[route_base + rank];
+            if (grouped_row >= 0 && grouped_row < grouped_rows)
+                rows[c] = *(const uint4*)(grouped_down + (size_t)grouped_row * hidden + col0);
+        }
+    }
+    float* res = residual + (size_t)token * hidden + col0;
+    const float4 r0 = *(const float4*)res, r1 = *(const float4*)(res + 4);
+    float acc[8] = {r0.x, r0.y, r0.z, r0.w, r1.x, r1.y, r1.z, r1.w};
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        __hip_bfloat16 accumulated = moe_top10_bf16_round(acc[e]);
+#pragma unroll
+        for (int c = 0; c < 10; ++c) {
+            if (c >= n) break;
+            const unsigned int w = (&rows[c].x)[e >> 1];
+            const float raw_output = __uint_as_float((e & 1) ? (w & 0xFFFF0000u) : (w << 16));
+            const __hip_bfloat16 output = moe_top10_bf16_round(raw_output);
+            const __hip_bfloat16 weighted = moe_top10_bf16_round(
+                moe_top10_bf16_to_f32(output) * wts[c]);
+            accumulated = moe_top10_bf16_round(
+                moe_top10_bf16_to_f32(accumulated) + moe_top10_bf16_to_f32(weighted));
+        }
+        acc[e] = moe_top10_bf16_to_f32(accumulated);
+    }
+    *(float4*)res = make_float4(acc[0], acc[1], acc[2], acc[3]);
+    *(float4*)(res + 4) = make_float4(acc[4], acc[5], acc[6], acc[7]);
 }

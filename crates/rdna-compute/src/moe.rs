@@ -1985,8 +1985,18 @@ impl Gpu {
             &gr as *const _ as *mut c_void,
             &tv as *const _ as *mut c_void,
         ];
-        let block = 256u32;
-        let grid_x = (hidden as u32).div_ceil(block);
+        // The BF16 entry takes eight columns per thread.
+        let (block, grid_x) = if grouped_bf16 {
+            if hidden % 8 != 0 {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "moe_down_combine_grouped_top10_bf16in: hidden % 8 != 0",
+                ));
+            }
+            (64u32, (hidden as u32 / 8).div_ceil(64))
+        } else {
+            (256u32, (hidden as u32).div_ceil(256))
+        };
         let bytes = (grouped_rows * hidden + 3 * tokens * 10 + 2 * tokens * hidden) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "elementwise", func, bytes);
         let result = self.launch_maybe_blob(
