@@ -691,20 +691,36 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
             XL_BARRIER();
         }
     }
+    // Lane l < 16 holds rows 2j of column l, lane l + 16 rows 2j + 1: one
+    // cross-half swap gives the low lane rows 0..7 and the high lane rows
+    // 8..15, stored as two 16-byte runs instead of eight scattered floats.
 #pragma unroll
     for (int b = 0; b < BV; b++) {
-        const int out_col = batch_start + b * 16 + ml;
-        if (out_col < N) {
+        float r[8];
 #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                const int out_row = row_start + 2 * j + (lane >> 4);
-                if (out_row < M) {
-                    // Overwrite is the memset-then-accumulate result: +0.0
-                    // plus the sum (not folded: IEEE keeps +0.0 + -0.0 = +0.0).
-                    float* out = Y + (long long)out_col * M + out_row;
-                    *out = (OVERWRITE ? 0.0f : *out) + acc[b][j];
-                }
-            }
+        for (int i = 0; i < 4; i++) {
+            const float give = lane_half ? acc[b][i] : acc[b][4 + i];
+            const float got = __int_as_float(__builtin_amdgcn_permlanex16(
+                __float_as_int(give), __float_as_int(give), 0x76543210u, 0xfedcba98u, false, false));
+            const float own = lane_half ? acc[b][4 + i] : acc[b][i];
+            r[2 * i] = lane_half ? got : own;
+            r[2 * i + 1] = lane_half ? own : got;
+        }
+        const int out_col = batch_start + b * 16 + ml;
+        const int row0 = row_start + 8 * lane_half;
+        if (out_col >= N || row0 >= M) continue;
+        float* out = Y + (long long)out_col * M + row0;
+        // Overwrite is the memset-then-accumulate result: +0.0 plus the sum
+        // (not folded: IEEE keeps +0.0 + -0.0 = +0.0).
+        if (row0 + 8 > M) {
+            for (int i = 0; row0 + i < M; i++) out[i] = (OVERWRITE ? 0.0f : out[i]) + r[i];
+        } else {
+            float4 o0 = OVERWRITE ? make_float4(0.0f, 0.0f, 0.0f, 0.0f) : *(const float4*)out;
+            float4 o1 = OVERWRITE ? make_float4(0.0f, 0.0f, 0.0f, 0.0f) : *(const float4*)(out + 4);
+            o0.x += r[0]; o0.y += r[1]; o0.z += r[2]; o0.w += r[3];
+            o1.x += r[4]; o1.y += r[5]; o1.z += r[6]; o1.w += r[7];
+            *(float4*)out = o0;
+            *(float4*)(out + 4) = o1;
         }
     }
 #undef XL_STORE
