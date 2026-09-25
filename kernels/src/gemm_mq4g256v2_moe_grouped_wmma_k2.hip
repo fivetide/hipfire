@@ -65,11 +65,12 @@ __device__ __forceinline__ half16_t dq_nibbles(unsigned int lo, unsigned int hi,
 //   gate_up: X_src = x_rot_batch[N × K], x_row_div = K_TOP → x_row = flat / K_TOP
 //   down:    X_src = rot_batch[total_slots × K], x_row_div = 1 → x_row = flat
 //
-// Tiles of one expert are consecutive in expert_tile_ids.  The wave at an even
-// expert-local tile index also computes the next tile of the same expert,
-// sharing each A load and decode (most experts have a second, mostly padded
-// tile); the odd tile's wave exits.  Every tile keeps the single-tile WMMA
-// sequence, so outputs are unchanged.  The K-tile loop is unrolled so later
+// Tiles of one expert are consecutive in expert_tile_ids.  The wave at an
+// expert-local tile index that is a multiple of four also computes the next
+// one to three tiles of the same expert, sharing each A load and decode
+// (prefill routing is skewed: hot experts own dozens of tiles); the other
+// waves of the run exit.  Every tile keeps the single-tile WMMA sequence, so
+// outputs are unchanged.  The K-tile loop is unrolled so later
 // tile pairs' X loads issue ahead of the current decode/WMMA.
 // F32 -> BF16 bits, round to nearest even; non-finite values truncate (the
 // BF16 round trip leaves them unchanged).  Widening the bits back gives the
@@ -83,7 +84,7 @@ __device__ __forceinline__ unsigned short moe_bf16_bits(float v) {
 // One 256-weight group of the lane's row against the tiles' X, in the
 // single-tile WMMA sequence.  `gw` holds the group's 34 words (header, 128
 // nibble bytes), in LDS or global memory.
-template <bool PAIR>
+template <int NT>
 __device__ __forceinline__ void moe_grouped_wmma_k2_group(
     const unsigned int* gw, const _Float16* const* x_base, int g, float8_t* acc) {
     const half16_t zero_b = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -93,7 +94,7 @@ __device__ __forceinline__ void moe_grouped_wmma_k2_group(
     const _Float16 zp_0 = __builtin_bit_cast(_Float16, (unsigned short)(hdr_lo >> 16));
     const _Float16 sc_1 = __builtin_bit_cast(_Float16, (unsigned short)(hdr_hi & 0xFFFFu));
     const _Float16 zp_1 = __builtin_bit_cast(_Float16, (unsigned short)(hdr_hi >> 16));
-    constexpr int KT_UNROLL = PAIR ? 4 : 8;  // PAIR at 8 spills
+    constexpr int KT_UNROLL = NT == 4 ? 2 : (NT == 2 ? 4 : 8);  // larger unrolls spill
 #pragma unroll KT_UNROLL
     for (int kt = 0; kt < 16; kt += 2) {
         const int k_off_a = kt * 16;
@@ -104,7 +105,7 @@ __device__ __forceinline__ void moe_grouped_wmma_k2_group(
         const half16_t a_a = dq_nibbles(gw[2 + 2 * kt], gw[3 + 2 * kt], sc_h, zp_h);
         const half16_t a_b = dq_nibbles(gw[4 + 2 * kt], gw[5 + 2 * kt], sc_h, zp_h);
 #pragma unroll
-        for (int t = 0; t < (PAIR ? 2 : 1); t++) {
+        for (int t = 0; t < NT; t++) {
             half16_t b_a = zero_b, b_b = zero_b;
             if (x_base[t] != nullptr) {
                 b_a = *(const half16_t*)(x_base[t] + g * 256 + k_off_a);
@@ -116,18 +117,18 @@ __device__ __forceinline__ void moe_grouped_wmma_k2_group(
     }
 }
 
-template <bool PAIR, bool OUT_BF16>
+template <int NT, bool OUT_BF16>
 __device__ __forceinline__ void moe_grouped_wmma_k2_tiles(
     const char* __restrict__ A, const int* __restrict__ sorted_slot_index,
     const _Float16* __restrict__ X_src, void* __restrict__ Y_grouped,
     int M, int K, int x_row_div, int m_total, int tid, int row_start, int slot_start,
-    unsigned int* __restrict__ a_lds) {
+    unsigned int* __restrict__ a_lds, int nlive) {
     const int lane = tid & 15;
-    const _Float16* x_base[2] = {nullptr, nullptr};
+    const _Float16* x_base[NT] = {};
 #pragma unroll
-    for (int t = 0; t < (PAIR ? 2 : 1); t++) {
+    for (int t = 0; t < NT; t++) {
         const int slot_idx = slot_start + 16 * t + lane;
-        if (slot_idx < m_total) {
+        if (t < nlive && slot_idx < m_total) {
             const int flat = sorted_slot_index[slot_idx];
             if (flat >= 0)
                 x_base[t] = X_src + (long long)((x_row_div > 1) ? (flat / x_row_div) : flat) * K;
@@ -136,14 +137,13 @@ __device__ __forceinline__ void moe_grouped_wmma_k2_tiles(
     const int safe_row = (row_start + lane < M) ? (row_start + lane) : (M - 1);
     const int groups_per_row = K / 256;
     const int row_bytes = groups_per_row * 136;
-    float8_t acc[2];
-    acc[0] = float8_t{0, 0, 0, 0, 0, 0, 0, 0};
-    acc[1] = float8_t{0, 0, 0, 0, 0, 0, 0, 0};
+    float8_t acc[NT];
+    for (int t = 0; t < NT; t++) acc[t] = float8_t{0, 0, 0, 0, 0, 0, 0, 0};
     if (groups_per_row % 2 != 0) {
         // Odd group count: rows are not 16-byte aligned for the staged path.
         const char* row_base = A + (long long)safe_row * row_bytes;
         for (int g = 0; g < groups_per_row; g++)
-            moe_grouped_wmma_k2_group<PAIR>((const unsigned int*)(row_base + g * 136), x_base, g, acc);
+            moe_grouped_wmma_k2_group<NT>((const unsigned int*)(row_base + g * 136), x_base, g, acc);
     } else {
         // Two groups of the 16 rows at a time: each row's 272 contiguous bytes
         // arrive with whole-line b128 loads (piece p = row p / 17, 16-byte
@@ -178,7 +178,7 @@ __device__ __forceinline__ void moe_grouped_wmma_k2_tiles(
             if (g0 + 2 < groups_per_row) { MOE_A_FETCH(g0 + 2) }
 #pragma unroll 1
             for (int gi = 0; gi < 2; gi++)
-                moe_grouped_wmma_k2_group<PAIR>(a_lds + lane * 68 + gi * 34, x_base, g0 + gi, acc);
+                moe_grouped_wmma_k2_group<NT>(a_lds + lane * 68 + gi * 34, x_base, g0 + gi, acc);
         }
 #undef MOE_A_FETCH
 #undef MOE_A_STORE
@@ -191,7 +191,7 @@ __device__ __forceinline__ void moe_grouped_wmma_k2_tiles(
     // F32 runs) instead of eight scattered 2-byte stores.
     const int hi = tid >> 4;
 #pragma unroll
-    for (int t = 0; t < (PAIR ? 2 : 1); t++) {
+    for (int t = 0; t < NT; t++) {
         float r[8];
 #pragma unroll
         for (int i = 0; i < 4; i++) {
@@ -203,6 +203,7 @@ __device__ __forceinline__ void moe_grouped_wmma_k2_tiles(
             r[2 * i + 1] = hi ? own : got;
         }
         const int out_col = slot_start + 16 * t + lane;
+        if (t >= nlive) continue;
         const int row0 = row_start + 8 * hi;
         if (out_col >= m_total || row0 >= M) continue;
         const long long o = (long long)out_col * M + row0;
@@ -246,15 +247,19 @@ __device__ __forceinline__ void gemm_mq4g256v2_moe_grouped_wmma_k2_entry(
     if (expert_id < 0) return;
     int local = 0;
     while (tile_y - local - 1 >= 0 && expert_tile_ids[tile_y - local - 1] == expert_id) ++local;
-    if (local & 1) return;
+    if (local % 4) return;
+    int run = 1;
+    while (run < 4 && (tile_y + run) * 16 < m_total && expert_tile_ids[tile_y + run] == expert_id) ++run;
     const char* A = reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
-    const bool pair = (tile_y + 1) * 16 < m_total && expert_tile_ids[tile_y + 1] == expert_id;
-    // Declared here, not in the PAIR-templated body: one allocation, not two.
+    // Declared here, not in the NT-templated body: one allocation, not three.
     __shared__ __align__(16) unsigned int a_lds[16 * 68];
-    if (pair)
-        moe_grouped_wmma_k2_tiles<true, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start, a_lds);
+    // A three-tile run takes the four-tile body with its last tile masked.
+    if (run >= 3)
+        moe_grouped_wmma_k2_tiles<4, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start, a_lds, run);
+    else if (run == 2)
+        moe_grouped_wmma_k2_tiles<2, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start, a_lds, 2);
     else
-        moe_grouped_wmma_k2_tiles<false, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start, a_lds);
+        moe_grouped_wmma_k2_tiles<1, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start, a_lds, 1);
 }
 
 #define MOE_WMMA_ARGS \

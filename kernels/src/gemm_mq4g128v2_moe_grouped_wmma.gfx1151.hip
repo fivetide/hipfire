@@ -39,8 +39,8 @@ __device__ __forceinline__ half16_t dq_nibbles(unsigned int lo, unsigned int hi,
 // single-header group ([0..2) f16 scale, [2..4) f16 zero, [4..68) 64 B
 // nibbles: byte i holds weight 2i low / 2i+1 high).  Eight K-tiles per group.
 // F16 dequant and F16 inputs: not bit-exact with the F32 SIMT kernels.
-// K % 128 == 0, K <= 640.  Same expert-tile pairing and unrolled K-tile loop as the
-// gate/up kernel.  Grid [ceil(M/16), m_total/16], block 32.
+// K % 128 == 0, K <= 640.  Same expert-tile grouping (up to four tiles per
+// wave) and unrolled K-tile loop as the gate/up kernel.  Grid [ceil(M/16), m_total/16], block 32.
 // F32 -> BF16 bits, round to nearest even; non-finite values truncate (the
 // BF16 round trip leaves them unchanged).  Widening the bits back gives the
 // value moe_bf16_round_trip / hip_bfloat16 rounding yields for finite input.
@@ -54,19 +54,19 @@ __device__ __forceinline__ unsigned short moe_bf16_bits(float v) {
 // wave's 16 rows of 5 * 68 bytes.
 constexpr int MOE_DOWN_PIECES = 11;
 
-template <bool PAIR, bool OUT_BF16>
+template <int NT, bool OUT_BF16>
 __device__ __forceinline__ void moe_down_wmma_tiles(
     const char* __restrict__ A, const int* __restrict__ sorted_slot_index,
     const _Float16* __restrict__ X_src, void* __restrict__ Y_grouped,
     int M, int K, int x_row_div, int m_total, int tid, int row_start, int slot_start,
-    unsigned int* __restrict__ a_lds) {
+    unsigned int* __restrict__ a_lds, int nlive) {
     const int lane = tid & 15;
     const half16_t zero_b = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-    const _Float16* x_base[2] = {nullptr, nullptr};
+    const _Float16* x_base[NT] = {};
 #pragma unroll
-    for (int t = 0; t < (PAIR ? 2 : 1); t++) {
+    for (int t = 0; t < NT; t++) {
         const int slot_idx = slot_start + 16 * t + lane;
-        if (slot_idx < m_total) {
+        if (t < nlive && slot_idx < m_total) {
             const int flat = sorted_slot_index[slot_idx];
             if (flat >= 0)
                 x_base[t] = X_src + (long long)((x_row_div > 1) ? (flat / x_row_div) : flat) * K;
@@ -74,9 +74,8 @@ __device__ __forceinline__ void moe_down_wmma_tiles(
     }
     const int groups_per_row = K / 128;
     const int row_bytes = groups_per_row * 68;
-    float8_t acc[2];
-    acc[0] = float8_t{0, 0, 0, 0, 0, 0, 0, 0};
-    acc[1] = float8_t{0, 0, 0, 0, 0, 0, 0, 0};
+    float8_t acc[NT];
+    for (int t = 0; t < NT; t++) acc[t] = float8_t{0, 0, 0, 0, 0, 0, 0, 0};
     // The wave's 16 rows are one contiguous 16 * row_bytes span: stage it
     // whole with b128 loads (per-lane 4-byte row reads ran DRAM well under
     // streaming rate), then read each lane's row from LDS.
@@ -97,7 +96,7 @@ __device__ __forceinline__ void moe_down_wmma_tiles(
         const unsigned int hdr = *(const unsigned int*)(gp);
         const _Float16 sc_h = __builtin_bit_cast(_Float16, (unsigned short)(hdr & 0xFFFFu));
         const _Float16 zp_h = __builtin_bit_cast(_Float16, (unsigned short)(hdr >> 16));
-#pragma unroll
+#pragma unroll (NT == 4 ? 2 : 4)  // full unroll spills at NT == 4
         for (int kt = 0; kt < 8; kt += 2) {
             const int k_off_a = kt * 16;
             const int k_off_b = (kt + 1) * 16;
@@ -108,7 +107,7 @@ __device__ __forceinline__ void moe_down_wmma_tiles(
             const half16_t a_a = dq_nibbles(pk0a, pk1a, sc_h, zp_h);
             const half16_t a_b = dq_nibbles(pk0b, pk1b, sc_h, zp_h);
 #pragma unroll
-            for (int t = 0; t < (PAIR ? 2 : 1); t++) {
+            for (int t = 0; t < NT; t++) {
                 half16_t b_a = zero_b, b_b = zero_b;
                 if (x_base[t] != nullptr) {
                     b_a = *(const half16_t*)(x_base[t] + g * 128 + k_off_a);
@@ -125,7 +124,7 @@ __device__ __forceinline__ void moe_down_wmma_tiles(
     // F32 runs) instead of eight scattered 2-byte stores.
     const int hi = tid >> 4;
 #pragma unroll
-    for (int t = 0; t < (PAIR ? 2 : 1); t++) {
+    for (int t = 0; t < NT; t++) {
         float r[8];
 #pragma unroll
         for (int i = 0; i < 4; i++) {
@@ -137,6 +136,7 @@ __device__ __forceinline__ void moe_down_wmma_tiles(
             r[2 * i + 1] = hi ? own : got;
         }
         const int out_col = slot_start + 16 * t + lane;
+        if (t >= nlive) continue;
         const int row0 = row_start + 8 * hi;
         if (out_col >= m_total || row0 >= M) continue;
         const long long o = (long long)out_col * M + row0;
@@ -181,15 +181,19 @@ __device__ __forceinline__ void gemm_mq4g128v2_moe_grouped_wmma_gfx1151_entry(
     if (expert_id < 0) return;
     int local = 0;
     while (tile_y - local - 1 >= 0 && expert_tile_ids[tile_y - local - 1] == expert_id) ++local;
-    if (local & 1) return;
+    if (local % 4) return;
+    int run = 1;
+    while (run < 4 && (tile_y + run) * 16 < m_total && expert_tile_ids[tile_y + run] == expert_id) ++run;
     const char* A = reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
-    const bool pair = (tile_y + 1) * 16 < m_total && expert_tile_ids[tile_y + 1] == expert_id;
-    // Declared here, not in the PAIR-templated body: one allocation, not two.
+    // Declared here, not in the NT-templated body: one allocation, not three.
     __shared__ __align__(16) unsigned int a_lds[MOE_DOWN_PIECES * 32 * 4];
-    if (pair)
-        moe_down_wmma_tiles<true, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start, a_lds);
+    // A three-tile run takes the four-tile body with its last tile masked.
+    if (run >= 3)
+        moe_down_wmma_tiles<4, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start, a_lds, run);
+    else if (run == 2)
+        moe_down_wmma_tiles<2, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start, a_lds, 2);
     else
-        moe_down_wmma_tiles<false, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start, a_lds);
+        moe_down_wmma_tiles<1, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start, a_lds, 1);
 }
 
 #define MOE_WMMA_ARGS \
