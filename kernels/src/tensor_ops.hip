@@ -1655,12 +1655,8 @@ extern "C" __global__ void indexed_attention_attention_f32_batched(
 // head_dim == 256: every score is the same serial d-order dot and every
 // softmax sum runs in selected-row order per channel. One workgroup owns four
 // query heads of one KV group, so each key/value row is fetched once for all
-// four; keys are staged through a padded LDS tile for coalesced reads and
-// expf runs once per (head, token) instead of once per channel.
+// four, and expf runs once per (head, token) instead of once per channel.
 #define QSA_HG 4
-#define QSA_TT 64
-#define QSA_DC 64
-#define QSA_KS (QSA_DC + 4)
 #define QSA_HD 256
 extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f32_batched_hg4(
     const float* q_with_gate,
@@ -1689,8 +1685,8 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
     float* lds = reinterpret_cast<float*>(lds4);
     float* weights = lds;                              // [selected_len][QSA_HG]
     float* qs = weights + QSA_HG * selected_len;       // [QSA_HG][QSA_HD]
-    float* kt = qs + QSA_HG * QSA_HD;                  // [QSA_TT][QSA_KS]
-    float* maxes = kt + QSA_TT * QSA_KS;               // [QSA_HG]
+    float* kt = qs + QSA_HG * QSA_HD;                  // [QSA_HG][256] partial maxes
+    float* maxes = kt + QSA_HG * 256;                  // [QSA_HG]
     int* tokens = reinterpret_cast<int*>(maxes + QSA_HG);  // [selected_len]
     int tid = (int)threadIdx.x;
     int head0 = (int)blockIdx.x * QSA_HG;
@@ -1815,10 +1811,7 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
             : 0.0f;
     }
 }
-#undef QSA_KS
 #undef QSA_HG
-#undef QSA_TT
-#undef QSA_DC
 #undef QSA_HD
 
 extern "C" __global__ void indexed_attention_attention_f32_serial(

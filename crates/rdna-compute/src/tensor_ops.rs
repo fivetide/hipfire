@@ -2018,10 +2018,10 @@ fn qsa_attention_hg4_lds_bytes(
     {
         return None;
     }
-    // weights[sel][4] + tokens[sel] + q[4][256] + key tile[64][68] + maxes[4].
+    // weights[sel][4] + tokens[sel] + q[4][256] + partial maxes[4][256] + maxes[4].
     let bytes = shape_selected
         .checked_mul(4 * QSA_ATTENTION_HG4_HEADS + 4)?
-        .checked_add(4 * (QSA_ATTENTION_HG4_HEADS * 256 + 64 * 68 + QSA_ATTENTION_HG4_HEADS))?;
+        .checked_add(4 * (QSA_ATTENTION_HG4_HEADS * 256 * 2 + QSA_ATTENTION_HG4_HEADS))?;
     (bytes <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES).then_some(bytes as u32)
 }
 
@@ -2102,7 +2102,13 @@ fn indexed_attention_attention_batch_impl(
             ),
         ));
     }
-    let shape_selected = p.shape_selected;
+    // Live (unrecorded) launches reserve LDS for this chunk's longest row
+    // only; a recorded launch keeps the position-independent shape bound.
+    let shape_selected = if gpu.replay.is_recording() || gpu.graphs.capture_mode {
+        p.shape_selected
+    } else {
+        max_selected
+    };
     let rows = checked_i32(p.rows, "QSA batch attention rows")?;
     let position_start = checked_i32(p.position_start, "QSA batch attention position")?;
     let n_heads = checked_i32(p.n_heads, "QSA batch attention heads")?;
