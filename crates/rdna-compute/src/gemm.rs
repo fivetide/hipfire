@@ -25329,7 +25329,16 @@ impl Gpu {
             );
         // K % 256 == 0 (every allowlisted shape): four waves share each
         // weight chunk through LDS; bitwise identical to the R16 kernel.
-        let (kernel, source, grid, block) = if r16_shape && k % 256 == 0 {
+        // Row groups sweep fastest unless the weight outweighs the activations.
+        let tokens_fast = m * 2 > batch_size * 4;
+        let (kernel, source, grid, block) = if r16_shape && k % 256 == 0 && tokens_fast {
+            (
+                "gemm_bf16_xf32_multirow_r16w4t_gfx1151",
+                kernels::GEMM_BF16_XF32_MULTIROW_R16_GFX1151_SRC,
+                [batch_size.div_ceil(8) as u32, m.div_ceil(16) as u32, 1],
+                128,
+            )
+        } else if r16_shape && k % 256 == 0 {
             (
                 "gemm_bf16_xf32_multirow_r16w4_gfx1151",
                 kernels::GEMM_BF16_XF32_MULTIROW_R16_GFX1151_SRC,

@@ -228,13 +228,15 @@ extern "C" __global__ void gemm_bf16_xf32_multirow_r16_gfx1151(
 // stream).  Every lane still consumes exactly the uint4 at lane * 8 of each
 // chunk, with the R16 kernel's accumulators, order and reduction, so the
 // result is bitwise identical to it.
-// Grid: [ceil(M / 16), ceil(N / 8), 1], block [128, 1, 1].  Row groups vary
-// fastest so a token tile's X is fetched once while the (small) weight
-// matrix is re-read from cache; with token tiles fastest, X is streamed once
-// per row group and falls out of the cache once N * K * 4 outgrows it
-// (320 x 10240 at N = 1131: 3.5x slower).
-__launch_bounds__(128, 1)
-extern "C" __global__ void gemm_bf16_xf32_multirow_r16w4_gfx1151(
+// Block [128, 1, 1].  Whichever operand is smaller should vary slowest in
+// the grid so it is the one re-read from cache:
+//   r16w4:  grid [ceil(M / 16), ceil(N / 8)], row groups fastest (weights
+//           re-read; 320 x 10240 at N = 1131: 3.5x faster than tokens fastest)
+//   r16w4t: grid [ceil(N / 8), ceil(M / 16)], token tiles fastest (X re-read;
+//           10240 x 2560 at N = 1131, where the 52 MB weight does not stay
+//           cached across the row-group sweep).
+template <bool TOKENS_FAST>
+static __device__ __forceinline__ void r16w4_body(
     const unsigned short* __restrict__ W,
     const float* __restrict__ X,
     float* __restrict__ Y,
@@ -245,8 +247,9 @@ extern "C" __global__ void gemm_bf16_xf32_multirow_r16w4_gfx1151(
     __shared__ uint4 ws[HF_R16_ROWS * 32];
     const int tid = threadIdx.x;
     const int lane = tid & 31;
-    const int row_base = blockIdx.x * HF_R16_ROWS;
-    const int batch_base = (blockIdx.y * 4 + (tid >> 5)) * HF_R16_STREAMS;
+    const int row_base = (TOKENS_FAST ? blockIdx.y : blockIdx.x) * HF_R16_ROWS;
+    const int tile = TOKENS_FAST ? blockIdx.x : blockIdx.y;
+    const int batch_base = (tile * 4 + (tid >> 5)) * HF_R16_STREAMS;
     // No early return: every wave takes part in the barriers.  Token pairs
     // past N alias batch 0 and are not stored.
     int batch[HF_R16_STREAMS];
@@ -349,4 +352,18 @@ extern "C" __global__ void gemm_bf16_xf32_multirow_r16w4_gfx1151(
             }
         }
     }
+}
+
+__launch_bounds__(128, 1)
+extern "C" __global__ void gemm_bf16_xf32_multirow_r16w4_gfx1151(
+    const unsigned short* __restrict__ W, const float* __restrict__ X,
+    float* __restrict__ Y, int M, int K, int N) {
+    r16w4_body<false>(W, X, Y, M, K, N);
+}
+
+__launch_bounds__(128, 1)
+extern "C" __global__ void gemm_bf16_xf32_multirow_r16w4t_gfx1151(
+    const unsigned short* __restrict__ W, const float* __restrict__ X,
+    float* __restrict__ Y, int M, int K, int N) {
+    r16w4_body<true>(W, X, Y, M, K, N);
 }
