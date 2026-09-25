@@ -18,12 +18,13 @@ use crate::types::DispatchError;
 use rdna_compute::tensor_ops::{
     argmax_f32, bf16_roundtrip_f32, gated_delta_conv, gated_delta_conv_batched, gated_delta_gate,
     gated_delta_gate_batched, gated_delta_params, gated_delta_params_batched, gated_delta_step,
-    gated_delta_step_batched, hc_activation_fused_f32, hyper_norm, hyper_read_projected,
-    hyper_write, indexed_attention_attention_batch, indexed_attention_cache_append_batch,
-    indexed_attention_norm_rope_batch, indexed_attention_pool_rope, indexed_attention_select_batch,
-    scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv, GatedDeltaConvBatched, GatedDeltaGate,
-    GatedDeltaGateBatched, GatedDeltaParams, GatedDeltaParamsBatched, GatedDeltaStep,
-    GatedDeltaStepBatched, HcActivationFused, HyperNorm, HyperReadProjected, HyperWrite,
+    gated_delta_step_batched, hc_activation_fused_f32, hyper_norm, hyper_norm_gate,
+    hyper_read_projected, hyper_write, indexed_attention_attention_batch,
+    indexed_attention_cache_append_batch, indexed_attention_norm_rope_batch,
+    indexed_attention_pool_rope, indexed_attention_select_batch, scale_f32, ArgmaxF32,
+    Bf16Roundtrip, GatedDeltaConv, GatedDeltaConvBatched, GatedDeltaGate, GatedDeltaGateBatched,
+    GatedDeltaParams, GatedDeltaParamsBatched, GatedDeltaStep, GatedDeltaStepBatched,
+    HcActivationFused, HyperNorm, HyperNormGate, HyperReadProjected, HyperWrite,
     IndexedAttentionAttentionBatch, IndexedAttentionCacheAppendBatch,
     IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope, IndexedAttentionSelectBatch, ScaleF32,
 };
@@ -441,24 +442,49 @@ pub fn execute_hyper_write(gpu: &mut Gpu, op: &HyperWriteOp<'_>) -> Result<(), D
     let mixed = view(op.mixed, 0, op.rows * op.hidden);
     let gates = view(op.gates, 0, op.rows * op.branches);
     let output = view(op.output, 0, op.rows * wide);
-    hip(hyper_norm(
-        gpu,
-        &HyperNorm {
-            input: &input,
-            norm_weight: op.norm_weight,
-            normalized: &normalized,
-            branches: op.branches,
-            hidden: op.hidden,
-        },
-    ))?;
-    project_weight(
-        gpu,
-        &op.block_inject,
-        &normalized,
-        &gates,
-        op.rows,
-        Some(op.rotation),
-    )?;
+    // gfx1151 multi-row: one launch normalizes each row into LDS and projects
+    // the BF16 gate from there; `normalized` (read by nothing below) is not
+    // written.  Bitwise identical to hyper_norm + project_weight.
+    let fused = gpu.arch_caps.is_gfx1151()
+        && op.rows > 1
+        && op.block_inject.dtype == DType::BF16
+        && op.block_inject.m == op.branches
+        && op.block_inject.k == wide
+        && op.branches <= 8
+        && wide % 8 == 0;
+    if fused {
+        hip(hyper_norm_gate(
+            gpu,
+            &HyperNormGate {
+                input: &input,
+                norm_weight: op.norm_weight,
+                gate_weight: op.block_inject.buf,
+                gates: &gates,
+                rows: op.rows,
+                branches: op.branches,
+                hidden: op.hidden,
+            },
+        ))?;
+    } else {
+        hip(hyper_norm(
+            gpu,
+            &HyperNorm {
+                input: &input,
+                norm_weight: op.norm_weight,
+                normalized: &normalized,
+                branches: op.branches,
+                hidden: op.hidden,
+            },
+        ))?;
+        project_weight(
+            gpu,
+            &op.block_inject,
+            &normalized,
+            &gates,
+            op.rows,
+            Some(op.rotation),
+        )?;
+    }
     hip(hyper_write(
         gpu,
         &HyperWrite {

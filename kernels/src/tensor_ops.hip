@@ -629,6 +629,90 @@ extern "C" __global__ void hyper_norm_f32(
             * inv * (1.0f + bf16_to_f32(norm_weight[weight_offset + j]))));
     }
 }
+// Lane 0 of `v += __shfl_down(v, off, 32)` for off = 16..1, with the
+// partners moved by permlanex16 / row DPP on gfx11/gfx12 (same additions and
+// order as gemm_bf16_xf32_multirow's reduction).
+static __device__ __forceinline__ float hc_lane0_tree_sum(float v) {
+#if defined(__GFX11__) || defined(__GFX12__)
+    v += __int_as_float(__builtin_amdgcn_permlanex16(
+        __float_as_int(v), __float_as_int(v), 0x76543210u, 0xfedcba98u, false, false));
+    v += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x108, 0xf, 0xf, true));
+    v += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x104, 0xf, 0xf, true));
+    v += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x102, 0xf, 0xf, true));
+    v += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x101, 0xf, 0xf, true));
+#else
+    for (int offset = 16; offset > 0; offset >>= 1) v += __shfl_down(v, offset, 32);
+#endif
+    return v;
+}
+
+// hyper_norm_f32 followed by the BF16 [branches, wide] gate projection of
+// that normalized row (gemm_bf16_xf32_multirow / gemv_bf16_xf32), for one
+// token per block, without materializing `normalized` in global memory.
+// Every branch uses hyper_norm_f32's exact partial sums and 256-wide LDS tree;
+// the normalized row lands in LDS and wave w < branches replays the BF16
+// kernels' lane traversal (lane*8, +256), four chains, (a0+a1)+(a2+a3) fold
+// and shuffle tree for gate row w, so both results are bitwise unchanged.
+// Grid [rows], block 256, dynamic LDS (branches * hidden + 256) * 4 bytes.
+// Requires (branches * hidden) % 8 == 0 and branches <= 8.
+extern "C" __global__ void hyper_norm_gate_f32(
+    const float* input,
+    const __hip_bfloat16* norm_weight,
+    const unsigned short* gate_weight,
+    float* gates,
+    int branches,
+    int hidden) {
+    extern __shared__ float hc_lds[];
+    const int wide = branches * hidden;
+    float* xs = hc_lds;
+    float* rms_sum = hc_lds + wide;
+    const int row = (int)blockIdx.x;
+    const int tid = (int)threadIdx.x;
+    const float* in = input + (size_t)row * wide;
+    for (int branch = 0; branch < branches; ++branch) {
+        const int offset = branch * hidden;
+        float partial = 0.0f;
+        for (int j = tid; j < hidden; j += (int)blockDim.x) {
+            const float value = bf16_to_f32(bf16_round(in[offset + j]));
+            partial += value * value;
+        }
+        rms_sum[tid] = partial;
+        __syncthreads();
+        for (int stride = (int)blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                rms_sum[tid] += rms_sum[tid + stride];
+            }
+            __syncthreads();
+        }
+        const float inv = rsqrtf(rms_sum[0] / (float)hidden + 1.0e-6f);
+        for (int j = tid; j < hidden; j += (int)blockDim.x) {
+            xs[offset + j] = bf16_to_f32(bf16_round(
+                bf16_to_f32(bf16_round(in[offset + j]))
+                * inv * (1.0f + bf16_to_f32(norm_weight[offset + j]))));
+        }
+        __syncthreads();
+    }
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    if (wave >= branches) return;
+    const unsigned short* w_row = gate_weight + (size_t)wave * wide;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (int i = lane * 8; i + 8 <= wide; i += 32 * 8) {
+        const uint4 wv = *(const uint4*)(w_row + i);
+        const float4 xa = *(const float4*)(xs + i);
+        const float4 xb = *(const float4*)(xs + i + 4);
+        a0 += __uint_as_float(wv.x << 16) * xa.x;
+        a1 += __uint_as_float(wv.x & 0xFFFF0000u) * xa.y;
+        a2 += __uint_as_float(wv.y << 16) * xa.z;
+        a3 += __uint_as_float(wv.y & 0xFFFF0000u) * xa.w;
+        a0 += __uint_as_float(wv.z << 16) * xb.x;
+        a1 += __uint_as_float(wv.z & 0xFFFF0000u) * xb.y;
+        a2 += __uint_as_float(wv.w << 16) * xb.z;
+        a3 += __uint_as_float(wv.w & 0xFFFF0000u) * xb.w;
+    }
+    const float sum = hc_lane0_tree_sum((a0 + a1) + (a2 + a3));
+    if (lane == 0) gates[(size_t)row * branches + wave] = sum;
+}
 extern "C" __global__ void gated_delta_conv_bf16_f32(
     const float* input,
     const __hip_bfloat16* kernel,

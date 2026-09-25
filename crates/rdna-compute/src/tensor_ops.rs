@@ -616,6 +616,59 @@ pub fn hyper_norm(gpu: &mut Gpu, p: &HyperNorm<'_>) -> HipResult<()> {
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
+
+/// `hyper_norm` of each row followed by its BF16 `[branches, branches *
+/// hidden]` gate projection (the multi-row BF16 GEMM), fused per row without
+/// writing `normalized`; bitwise identical to the two-launch sequence.
+pub struct HyperNormGate<'a> {
+    pub input: &'a GpuTensor,
+    pub norm_weight: &'a GpuTensor,
+    pub gate_weight: &'a GpuTensor,
+    pub gates: &'a GpuTensor,
+    pub rows: usize,
+    pub branches: usize,
+    pub hidden: usize,
+}
+
+pub fn hyper_norm_gate(gpu: &mut Gpu, p: &HyperNormGate<'_>) -> HipResult<()> {
+    ensure_f32(p.input)?;
+    ensure_f32(p.gates)?;
+    let wide = checked_product(p.branches, p.hidden, "HC norm-gate width")?;
+    if p.norm_weight.dtype != DType::BF16
+        || p.gate_weight.dtype != DType::BF16
+        || p.rows == 0
+        || p.branches == 0
+        || p.branches > 8
+        || wide % 8 != 0
+        || p.norm_weight.numel() != wide
+        || p.gate_weight.numel() < p.branches * wide
+        || p.input.numel() < p.rows * wide
+        || p.gates.numel() < p.rows * p.branches
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let branches = checked_i32(p.branches, "HC norm-gate branch count")?;
+    let hidden = checked_i32(p.hidden, "HC norm-gate hidden width")?;
+    let row_grid = checked_u32(p.rows, "HC norm-gate row grid")?;
+    let lds_bytes = checked_u32((wide + 256) * 4, "HC norm-gate LDS")?;
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "hyper_norm_gate_f32")?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.input.buf.as_ptr());
+    args.push_ptr(p.norm_weight.buf.as_ptr());
+    args.push_ptr(p.gate_weight.buf.as_ptr());
+    args.push_ptr(p.gates.buf.as_ptr());
+    args.push_i32(branches);
+    args.push_i32(hidden);
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        "hyper_norm_gate_f32",
+        [row_grid, 1, 1],
+        [256, 1, 1],
+        lds_bytes,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
 pub struct GatedDeltaConv<'a> {
     pub input: &'a GpuTensor,
     pub kernel: &'a GpuTensor,
@@ -2286,6 +2339,85 @@ mod tests {
             "rounded recurrent differs"
         );
         for tensor in [norm, z_gpu, rec_a, out_a, rec_b, out_b] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
+    /// The fused HC norm + BF16 gate projection must equal hyper_norm followed
+    /// by the multi-row BF16 GEMM bit for bit, at the production width.
+    #[test]
+    fn hyper_norm_gate_is_bit_identical_to_norm_then_gemm() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let (rows, branches, hidden) = (37usize, 4usize, 2560usize);
+        let wide = branches * hidden;
+        let wave = |seed: usize, n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let h = i.wrapping_mul(2_654_435_761).wrapping_add(seed * 131) % 8191;
+                    (h as f32 - 4095.0) / 4095.0 * scale
+                })
+                .collect()
+        };
+        let bf16 = |gpu: &mut Gpu, values: &[f32]| -> GpuTensor {
+            let bytes: Vec<u8> = values
+                .iter()
+                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect();
+            let mut tensor = gpu.upload_raw(&bytes, &[bytes.len()]).expect("bf16");
+            tensor.dtype = DType::BF16;
+            tensor.shape = vec![values.len()];
+            tensor
+        };
+        let input = gpu
+            .upload_f32(&wave(1, rows * wide, 3.0), &[rows * wide])
+            .expect("input");
+        let norm = bf16(&mut gpu, &wave(2, wide, 0.5));
+        let gate_weight = bf16(&mut gpu, &wave(3, branches * wide, 0.05));
+        let fused = gpu.zeros(&[rows * branches], DType::F32).expect("fused");
+        hyper_norm_gate(
+            &mut gpu,
+            &HyperNormGate {
+                input: &input,
+                norm_weight: &norm,
+                gate_weight: &gate_weight,
+                gates: &fused,
+                rows,
+                branches,
+                hidden,
+            },
+        )
+        .expect("fused");
+        let normalized = gpu.zeros(&[rows * wide], DType::F32).expect("normalized");
+        hyper_norm(
+            &mut gpu,
+            &HyperNorm {
+                input: &input,
+                norm_weight: &norm,
+                normalized: &normalized,
+                branches,
+                hidden,
+            },
+        )
+        .expect("norm");
+        let reference = gpu
+            .zeros(&[rows * branches], DType::F32)
+            .expect("reference");
+        gpu.gemm_bf16_xf32_multirow(&gate_weight, &normalized, &reference, branches, wide, rows)
+            .expect("gemm");
+        let bits = |gpu: &Gpu, t: &GpuTensor| -> Vec<u32> {
+            gpu.download_f32(t)
+                .expect("download")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        let (a, b) = (bits(&gpu, &fused), bits(&gpu, &reference));
+        assert!(b.iter().any(|v| *v != 0), "gates are all zero");
+        assert_eq!(a, b, "fused norm-gate differs");
+        for tensor in [input, norm, gate_weight, fused, normalized, reference] {
             gpu.free_tensor(tensor).expect("free");
         }
     }
