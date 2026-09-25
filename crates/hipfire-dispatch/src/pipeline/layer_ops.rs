@@ -16,17 +16,18 @@
 use crate::families::gemv::WeightRef;
 use crate::types::DispatchError;
 use rdna_compute::tensor_ops::{
-    argmax_f32, bf16_roundtrip_f32, gated_delta_conv, gated_delta_conv_batched, gated_delta_gate,
-    gated_delta_gate_batched, gated_delta_params, gated_delta_params_batched, gated_delta_step,
-    gated_delta_step_batched, gated_delta_step_gate_wmma, hc_activation_fused_f32,
-    hc_state_bf16_add_f32, hc_state_bf16_to_f32, hyper_norm, hyper_norm_f16, hyper_norm_gate,
-    hyper_read_projected, hyper_read_up_fused, hyper_read_up_wmma, hyper_write,
-    indexed_attention_attention_batch, indexed_attention_cache_append_batch,
-    indexed_attention_norm_rope_batch, indexed_attention_pool_rope, indexed_attention_select_batch,
-    scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv, GatedDeltaConvBatched, GatedDeltaGate,
-    GatedDeltaGateBatched, GatedDeltaParams, GatedDeltaParamsBatched, GatedDeltaStep,
-    GatedDeltaStepBatched, HcActivationFused, HyperNorm, HyperNormGate, HyperReadProjected,
-    HyperReadUpFused, HyperWrite, IndexedAttentionAttentionBatch, IndexedAttentionCacheAppendBatch,
+    argmax_f32, bf16_roundtrip_f32, gated_delta_chunk_route, gated_delta_conv,
+    gated_delta_conv_batched, gated_delta_gate, gated_delta_gate_batched, gated_delta_params,
+    gated_delta_params_batched, gated_delta_step, gated_delta_step_batched,
+    gated_delta_step_gate_wmma, hc_activation_fused_f32, hc_state_bf16_add_f32,
+    hc_state_bf16_to_f32, hyper_norm, hyper_norm_f16, hyper_norm_gate, hyper_read_projected,
+    hyper_read_up_fused, hyper_read_up_wmma, hyper_write, indexed_attention_attention_batch,
+    indexed_attention_cache_append_batch, indexed_attention_norm_rope_batch,
+    indexed_attention_pool_rope, indexed_attention_select_batch, scale_f32, ArgmaxF32,
+    Bf16Roundtrip, GatedDeltaConv, GatedDeltaConvBatched, GatedDeltaGate, GatedDeltaGateBatched,
+    GatedDeltaParams, GatedDeltaParamsBatched, GatedDeltaStep, GatedDeltaStepBatched,
+    HcActivationFused, HyperNorm, HyperNormGate, HyperReadProjected, HyperReadUpFused, HyperWrite,
+    IndexedAttentionAttentionBatch, IndexedAttentionCacheAppendBatch,
     IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope, IndexedAttentionSelectBatch, ScaleF32,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -820,13 +821,34 @@ pub fn execute_gated_delta_net(
         && op.conv_kernel == 4;
     if persistent_batch {
         let start_cursor = op.start_position % history_rows;
+        let recurrent_output = view(op.recurrent_output, 0, op.rows * value);
+        // The F16 prefill route's chunked recurrence reads the convolution
+        // output as packed BF16 (every value is BF16-rounded already).
+        let mut conv_output = view(op.projection2, 0, op.rows * qkv);
+        let dims = GatedDeltaStepBatched {
+            projection: &projection2,
+            gate: &gate,
+            beta: &beta,
+            state: op.recurrent,
+            output: &recurrent_output,
+            rows: op.rows,
+            qkv_width: qkv,
+            key_heads: op.key_heads,
+            value_heads: op.value_heads,
+            key_dim: op.key_dim,
+            value_dim: op.value_dim,
+        };
+        let chunked = gated_delta_chunk_route(gpu, &dims);
+        if chunked {
+            conv_output.dtype = DType::BF16;
+        }
         hip(gated_delta_conv_batched(
             gpu,
             &GatedDeltaConvBatched {
                 input: &projection,
                 kernel: op.conv,
                 history: op.conv_state,
-                output: &projection2,
+                output: &conv_output,
                 next_history: op.conv_state,
                 rows: op.rows,
                 channels: qkv,
@@ -848,20 +870,10 @@ pub fn execute_gated_delta_net(
                 heads: op.value_heads,
             },
         ))?;
-        let recurrent_output = view(op.recurrent_output, 0, op.rows * value);
         let gdn_output = view(op.output_scratch, 0, op.rows * value);
         let step = GatedDeltaStepBatched {
-            projection: &projection2,
-            gate: &gate,
-            beta: &beta,
-            state: op.recurrent,
-            output: &recurrent_output,
-            rows: op.rows,
-            qkv_width: qkv,
-            key_heads: op.key_heads,
-            value_heads: op.value_heads,
-            key_dim: op.key_dim,
-            value_dim: op.value_dim,
+            projection: &conv_output,
+            ..dims
         };
         let gated = GatedDeltaGateBatched {
             recurrent_output: &recurrent_output,
@@ -872,9 +884,11 @@ pub fn execute_gated_delta_net(
             value_heads: op.value_heads,
             value_dim: op.value_dim,
         };
-        // The F16 prefill route fuses the gate into the column-split
+        // The F16 prefill route fuses the gate into the chunked WMMA
         // recurrence (KLD-gated); otherwise the exact kernels run.
-        if !hip(gated_delta_step_gate_wmma(gpu, &step, &gated))? {
+        if chunked {
+            hip(gated_delta_step_gate_wmma(gpu, &step, &gated))?;
+        } else {
             hip(gated_delta_step_batched(gpu, &step))?;
             hip(gated_delta_gate_batched(gpu, &gated))?;
         }

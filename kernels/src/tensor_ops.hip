@@ -427,15 +427,18 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_f32(
 // (gated_delta_chunk_wmma.gfx1151.hip), at the reference's BF16 rounding
 // points (the square sum as lane partials + a wave tree), stored as BF16.
 // Grid [rows], block 256; wave w takes items w, w + 8, ... of the row's
-// 2 * key_heads (q heads, then k heads).
+// 2 * key_heads (q heads, then k heads).  `projection` is packed BF16 bits
+// (the convolution's BF16 output).
 extern "C" __global__ __launch_bounds__(256) void gated_delta_qk_norm_bf16_batched(
-    const float* projection, __hip_bfloat16* qn, __hip_bfloat16* kn, int rows, int qkv_width,
-    int key_heads) {
+    const unsigned short* projection, __hip_bfloat16* qn, __hip_bfloat16* kn, int rows,
+    int qkv_width, int key_heads) {
     const int row = blockIdx.x, wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const float* rowp = projection + (size_t)row * qkv_width;
+    const unsigned short* rowp = projection + (size_t)row * qkv_width;
     for (int item = wave; item < 2 * key_heads; item += 8) {
         const int is_k = item >= key_heads, kh = is_k ? item - key_heads : item;
-        const float4 raw = *(const float4*)(rowp + item * 128 + lane * 4);
+        const uint2 w = *(const uint2*)(rowp + item * 128 + lane * 4);
+        const float4 raw = {__uint_as_float(w.x << 16), __uint_as_float(w.x & 0xFFFF0000u),
+                            __uint_as_float(w.y << 16), __uint_as_float(w.y & 0xFFFF0000u)};
         float v[4] = {bf16_to_f32(bf16_round(raw.x)), bf16_to_f32(bf16_round(raw.y)),
                       bf16_to_f32(bf16_round(raw.z)), bf16_to_f32(bf16_round(raw.w))};
         float part = 0.0f;
@@ -1082,6 +1085,7 @@ extern "C" __global__ void gated_delta_conv_bf16_f32(
 // one channel and 16 consecutive rows, so every row is independent.  Only the
 // row-0 chunk reads the history, and it alone writes next_history after its
 // reads: history may alias next_history.
+// `output_bf16`: store the (BF16-rounded) outputs as packed BF16 bits.
 // Grid [ceil(channels / 256), ceil(rows / 16)], block 256.
 extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
     const float* input,
@@ -1093,7 +1097,8 @@ extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
     int channels,
     int history_rows,
     int kernel_size,
-    int start_cursor) {
+    int start_cursor,
+    int output_bf16) {
     const int channel = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     const int r0 = (int)blockIdx.y * 16;
     if (channel >= channels || r0 >= rows
@@ -1125,8 +1130,11 @@ extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
         value += k0 * bf16_to_f32(h0);
         value += k1 * bf16_to_f32(h1);
         value += k2 * bf16_to_f32(h2);
-        output[r * channels + channel] = bf16_to_f32(bf16_round(
-            value * (1.0f / (1.0f + expf(-value)))));
+        const __hip_bfloat16 out = bf16_round(value * (1.0f / (1.0f + expf(-value))));
+        if (output_bf16)
+            ((unsigned short*)output)[r * channels + channel] = out.data;
+        else
+            output[r * channels + channel] = bf16_to_f32(out);
         h0 = h1;
         h1 = h2;
         h2 = current_bf16;

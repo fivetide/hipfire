@@ -259,36 +259,42 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
+/// Whether [`gated_delta_step_gate_wmma`] applies: the Qwen4 F16 prefill
+/// route (gfx1151, >= QWEN4_F16_WMMA_MIN_TOKENS rows, no recorder or capture,
+/// not opted out) with 128-wide heads.  Decided before the convolution, which
+/// then stores its output as packed BF16 for that kernel.
+pub fn gated_delta_chunk_route(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool {
+    gpu.arch_caps.is_gfx1151()
+        && p.rows >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+        && *crate::gemm::QWEN4_F16_WMMA
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode
+        && p.key_dim == 128
+        && p.value_dim == 128
+        && p.key_heads > 0
+        && p.value_heads % p.key_heads == 0
+}
+
 /// [`gated_delta_step_batched`] followed by [`gated_delta_gate_batched`] as
-/// one chunked (16-row WY form) F16 WMMA kernel on the Qwen4 F16 prefill
-/// route (gfx1151, >= QWEN4_F16_WMMA_MIN_TOKENS rows, no recorder or
-/// capture, not opted out): `gate.output` receives the gated rows and
+/// one chunked (16-row WY form) F16 WMMA kernel where
+/// [`gated_delta_chunk_route`] holds; `p.projection` is the convolution
+/// output as packed BF16.  `gate.output` receives the gated rows and
 /// `p.output` is not written.  The recurrence's products round to F16, so
-/// the route is KLD-gated; the gate is that kernel's expression.  Returns
-/// `false` with nothing launched when the route does not apply.
+/// the route is KLD-gated; the gate is that kernel's expression.
 pub fn gated_delta_step_gate_wmma(
     gpu: &mut Gpu,
     p: &GatedDeltaStepBatched<'_>,
     gate: &GatedDeltaGateBatched<'_>,
-) -> HipResult<bool> {
-    if !(gpu.arch_caps.is_gfx1151()
-        && p.rows >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
-        && *crate::gemm::QWEN4_F16_WMMA
-        && !gpu.replay.is_recording()
-        && !gpu.graphs.capture_mode)
-    {
-        return Ok(false);
+) -> HipResult<()> {
+    if !gated_delta_chunk_route(gpu, p) || p.projection.dtype != DType::BF16 {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
-    for tensor in [p.projection, p.gate, p.beta, p.state, gate.z, gate.output] {
+    for tensor in [p.gate, p.beta, p.state, gate.z, gate.output] {
         ensure_f32(tensor)?;
     }
-    let qk = checked_product(p.key_heads, p.key_dim, "GDN column qk extent")?;
-    let value = checked_product(p.value_heads, p.value_dim, "GDN column value extent")?;
-    if p.key_dim != 128
-        || p.value_dim != 128
-        || p.key_heads == 0
-        || p.value_heads % p.key_heads != 0
-        || p.qkv_width != 2 * qk + value
+    let qk = checked_product(p.key_heads, p.key_dim, "GDN chunk qk extent")?;
+    let value = checked_product(p.value_heads, p.value_dim, "GDN chunk value extent")?;
+    if p.qkv_width != 2 * qk + value
         || p.projection.numel() < p.rows * p.qkv_width
         || p.gate.numel() < p.rows * p.value_heads
         || p.beta.numel() < p.rows * p.value_heads
@@ -303,10 +309,10 @@ pub fn gated_delta_step_gate_wmma(
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
-    let rows = checked_i32(p.rows, "GDN column rows")?;
-    let qkv_width = checked_i32(p.qkv_width, "GDN column qkv width")?;
-    let key_heads = checked_i32(p.key_heads, "GDN column key heads")?;
-    let value_heads = checked_i32(p.value_heads, "GDN column value heads")?;
+    let rows = checked_i32(p.rows, "GDN chunk rows")?;
+    let qkv_width = checked_i32(p.qkv_width, "GDN chunk qkv width")?;
+    let key_heads = checked_i32(p.key_heads, "GDN chunk key heads")?;
+    let value_heads = checked_i32(p.value_heads, "GDN chunk value heads")?;
     let qn = gpu.qwen4_f16_x_scratch(2 * p.rows * qk)?;
     let qp = qn.buf.as_ptr();
     let kp = unsafe { (qp as *mut u8).add(p.rows * qk * 2) } as *mut std::ffi::c_void;
@@ -330,7 +336,7 @@ pub fn gated_delta_step_gate_wmma(
     args.pad_to(16);
     gpu.launch_blob_recorded(
         "gated_delta_qk_norm_bf16_batched",
-        [checked_u32(p.rows, "GDN column row grid")?, 1, 1],
+        [checked_u32(p.rows, "GDN chunk row grid")?, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
@@ -356,8 +362,7 @@ pub fn gated_delta_step_gate_wmma(
         0,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
-    )?;
-    Ok(true)
+    )
 }
 
 /// BF16-stored HC streams (the Qwen4 F16 prefill route) widened to F32 for
@@ -1111,6 +1116,7 @@ pub fn gated_delta_conv(gpu: &mut Gpu, p: &GatedDeltaConv<'_>) -> HipResult<()> 
 }
 /// Ordered K=4 causal convolution over row-major `[rows, channels]` input.
 /// Each channel keeps its BF16-rounded history ring across the whole batch.
+/// A BF16-typed `output` receives the (BF16-rounded) values as packed BF16.
 pub struct GatedDeltaConvBatched<'a> {
     pub input: &'a GpuTensor,
     pub kernel: &'a GpuTensor,
@@ -1125,8 +1131,12 @@ pub struct GatedDeltaConvBatched<'a> {
 }
 
 pub fn gated_delta_conv_batched(gpu: &mut Gpu, p: &GatedDeltaConvBatched<'_>) -> HipResult<()> {
-    for tensor in [p.input, p.history, p.output, p.next_history] {
+    for tensor in [p.input, p.history, p.next_history] {
         ensure_f32(tensor)?;
+    }
+    let output_bf16 = p.output.dtype == DType::BF16;
+    if !output_bf16 {
+        ensure_f32(p.output)?;
     }
     if p.kernel.dtype != DType::BF16
         || p.rows == 0
@@ -1172,6 +1182,7 @@ pub fn gated_delta_conv_batched(gpu: &mut Gpu, p: &GatedDeltaConvBatched<'_>) ->
     args.push_i32(kernel_size);
     args.push_i32(start_cursor);
     let start_cursor_offset = args.len() - 4;
+    args.push_i32(i32::from(output_bf16));
     args.pad_to(16);
     // `start_cursor` is `start_position % history_rows` for the chunk (the
     // kernel advances the ring per row from there), so the declared binding
@@ -3457,12 +3468,26 @@ mod tests {
             .expect("norm");
         norm_gpu.dtype = DType::BF16;
         norm_gpu.shape = vec![dim];
+        // The chunked arm reads the convolution output as packed BF16: the
+        // same values the exact kernel rounds the F32 projection to.
+        let proj_bytes: Vec<u8> = projection
+            .iter()
+            .flat_map(|v| {
+                let u = v.to_bits();
+                (((u + 0x7FFF + ((u >> 16) & 1)) >> 16) as u16).to_le_bytes()
+            })
+            .collect();
+        let mut proj_bf16 = gpu
+            .upload_raw(&proj_bytes, &[proj_bytes.len()])
+            .expect("projection bf16");
+        proj_bf16.dtype = DType::BF16;
+        proj_bf16.shape = vec![projection.len()];
         let run = |gpu: &mut Gpu, fused: bool| {
             let state = gpu.upload_f32(&state0, &[state0.len()]).expect("state");
             let recurrent = gpu.zeros(&[rows * value], DType::F32).expect("recurrent");
             let out = gpu.zeros(&[rows * value], DType::F32).expect("output");
             let step = GatedDeltaStepBatched {
-                projection: &proj_gpu,
+                projection: if fused { &proj_bf16 } else { &proj_gpu },
                 gate: &gate_gpu,
                 beta: &beta_gpu,
                 state: &state,
@@ -3485,9 +3510,10 @@ mod tests {
             };
             if fused {
                 assert!(
-                    gated_delta_step_gate_wmma(gpu, &step, &gated).expect("fused GDN"),
+                    gated_delta_chunk_route(gpu, &step),
                     "chunked route did not apply"
                 );
+                gated_delta_step_gate_wmma(gpu, &step, &gated).expect("fused GDN");
             } else {
                 gated_delta_step_batched(gpu, &step).expect("batched GDN");
                 gated_delta_gate_batched(gpu, &gated).expect("gate");
@@ -3518,7 +3544,7 @@ mod tests {
         let (out_rel, state_rel) = (rel(&ref_out, &col_out), rel(&ref_state, &col_state));
         assert!(out_rel < 1e-2, "GDN chunk gate output rel L2 {out_rel:.3e}");
         assert!(state_rel < 2e-3, "GDN chunk state rel L2 {state_rel:.3e}");
-        for tensor in [proj_gpu, gate_gpu, beta_gpu, z_gpu, norm_gpu] {
+        for tensor in [proj_gpu, proj_bf16, gate_gpu, beta_gpu, z_gpu, norm_gpu] {
             gpu.free_tensor(tensor).expect("free");
         }
     }

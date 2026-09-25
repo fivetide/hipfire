@@ -19,6 +19,7 @@
 // registers; a C tile becomes a B operand by swapping half-waves.  The next
 // chunk's inputs are prefetched into registers during the current one; the
 // block barriers wait on LDS only, so the prefetch stays in flight.
+// `projection` is the convolution output as packed BF16 bits.
 // Grid [value_heads], block 256.  key_dim == value_dim == 128.
 
 typedef _Float16 __attribute__((ext_vector_type(16))) gc_h16;
@@ -49,7 +50,7 @@ static __device__ __forceinline__ gc_h16 gc_c_to_b(const gc_f8 c, int hi) {
 }
 __launch_bounds__(256)
 extern "C" __global__ void gated_delta_chunk_gate_wmma(
-    const float* __restrict__ projection, const unsigned short* __restrict__ qn, const unsigned short* __restrict__ kn,
+    const unsigned short* __restrict__ projection, const unsigned short* __restrict__ qn, const unsigned short* __restrict__ kn,
     const float* __restrict__ gate, const float* __restrict__ beta, float* __restrict__ state,
     const float* __restrict__ z, const hip_bfloat16* __restrict__ norm, float* __restrict__ output,
     int rows, int qkv_width, int key_heads, int value_heads, float query_scale) {
@@ -85,8 +86,11 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
             const size_t b = ((size_t)(c0 + si) * key_heads + kh) * 128 + sd;
             pk = *(const uint4*)(kn + b);
             pq = *(const uint4*)(qn + b);
-            const float* vp = projection + (size_t)(c0 + si) * qkv_width + v_offset + sd;
-            pv0 = *(const float4*)vp; pv1 = *(const float4*)(vp + 4);
+            const uint4 vw = *(const uint4*)(projection + (size_t)(c0 + si) * qkv_width + v_offset + sd);
+            pv0 = make_float4(__uint_as_float(vw.x << 16), __uint_as_float(vw.x & 0xFFFF0000u),
+                              __uint_as_float(vw.y << 16), __uint_as_float(vw.y & 0xFFFF0000u));
+            pv1 = make_float4(__uint_as_float(vw.z << 16), __uint_as_float(vw.z & 0xFFFF0000u),
+                              __uint_as_float(vw.w << 16), __uint_as_float(vw.w & 0xFFFF0000u));
         }
         if (tid < 16) {
             pg = tid < nn ? gate[(c0 + tid) * value_heads + vh] : 0.f;
@@ -159,7 +163,7 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
             const float b = bt_s[si], eg = expf(g_s[si]), ed = expf(g_s[15] - g_s[si]);
 #pragma unroll
             for (int h = 0; h < 8; ++h) {
-                vb_s[si][sd + h] = gc_bf16r(vf[h]) * b;
+                vb_s[si][sd + h] = vf[h] * b;
                 kdT[sd + h][si] = (_Float16)(kf[h] * ed);
             }
 #pragma unroll
