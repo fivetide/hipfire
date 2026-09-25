@@ -869,6 +869,7 @@ pub fn gated_delta_conv_batched(gpu: &mut Gpu, p: &GatedDeltaConvBatched<'_>) ->
     let kernel_size = checked_i32(p.kernel_size, "GDN batched convolution kernel width")?;
     let start_cursor = checked_i32(p.start_cursor, "GDN batched convolution cursor")?;
     let grid = blocks(p.channels)?;
+    let row_grid = checked_u32(p.rows.div_ceil(16), "GDN batched convolution row grid")?;
     let kernel = "gated_delta_conv_bf16_f32_batched_k4";
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
@@ -893,7 +894,7 @@ pub fn gated_delta_conv_batched(gpu: &mut Gpu, p: &GatedDeltaConvBatched<'_>) ->
     }];
     gpu.launch_blob_recorded(
         kernel,
-        [grid, 1, 1],
+        [grid, row_grid, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
@@ -2404,6 +2405,100 @@ mod tests {
         for tensor in [norm, z_gpu, rec_a, out_a, rec_b, out_b] {
             gpu.free_tensor(tensor).expect("free");
         }
+    }
+
+    /// The row-parallel batched convolution must equal the per-row ring kernel
+    /// run row by row (in-place history), for outputs and the final history,
+    /// across chunk boundaries, short batches and every start cursor.
+    #[test]
+    fn gdn_conv_batch_is_bit_identical_to_per_row_conv() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let channels = 300usize;
+        let wave = |seed: usize, n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let h = i.wrapping_mul(2_654_435_761).wrapping_add(seed * 131) % 8191;
+                    (h as f32 - 4095.0) / 4095.0 * scale
+                })
+                .collect()
+        };
+        let kernel_bits: Vec<u8> = wave(1, channels * 4, 1.0)
+            .iter()
+            .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
+        let mut kernel = gpu
+            .upload_raw(&kernel_bits, &[kernel_bits.len()])
+            .expect("kernel");
+        kernel.dtype = DType::BF16;
+        kernel.shape = vec![channels * 4];
+        let history = wave(2, channels * 3, 2.0);
+        let bits = |gpu: &Gpu, t: &GpuTensor| -> Vec<u32> {
+            gpu.download_f32(t)
+                .expect("download")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        for (rows, start_cursor) in [(1usize, 0usize), (2, 2), (3, 1), (17, 0), (37, 2), (40, 1)] {
+            let input = gpu
+                .upload_f32(&wave(3 + rows, rows * channels, 3.0), &[rows * channels])
+                .expect("input");
+            let hist_a = gpu.upload_f32(&history, &[history.len()]).expect("hist");
+            let out_a = gpu.zeros(&[rows * channels], DType::F32).expect("out");
+            gated_delta_conv_batched(
+                &mut gpu,
+                &GatedDeltaConvBatched {
+                    input: &input,
+                    kernel: &kernel,
+                    history: &hist_a,
+                    output: &out_a,
+                    next_history: &hist_a,
+                    rows,
+                    channels,
+                    history_rows: 3,
+                    kernel_size: 4,
+                    start_cursor,
+                },
+            )
+            .expect("batched conv");
+            let hist_b = gpu.upload_f32(&history, &[history.len()]).expect("hist");
+            let out_b = gpu.zeros(&[rows * channels], DType::F32).expect("out");
+            for row in 0..rows {
+                gated_delta_conv(
+                    &mut gpu,
+                    &GatedDeltaConv {
+                        input: &input.sub_offset(row * channels, channels),
+                        kernel: &kernel,
+                        history: &hist_b,
+                        output: &out_b.sub_offset(row * channels, channels),
+                        next_history: &hist_b,
+                        channels,
+                        history_rows: 3,
+                        kernel_size: 4,
+                        cursor: (start_cursor + row) % 3,
+                        row_index: row,
+                    },
+                )
+                .expect("per-row conv");
+            }
+            assert_eq!(
+                bits(&gpu, &out_a),
+                bits(&gpu, &out_b),
+                "rows {rows}: output"
+            );
+            assert_eq!(
+                bits(&gpu, &hist_a),
+                bits(&gpu, &hist_b),
+                "rows {rows}: history"
+            );
+            for tensor in [input, hist_a, out_a, hist_b, out_b] {
+                gpu.free_tensor(tensor).expect("free");
+            }
+        }
+        gpu.free_tensor(kernel).expect("free");
     }
 
     /// The fused HC norm + BF16 gate projection must equal hyper_norm followed

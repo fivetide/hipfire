@@ -876,8 +876,14 @@ extern "C" __global__ void gated_delta_conv_bf16_f32(
         next_history[cursor * channels + channel] = current;
     }
 }
-// K=4 ordered causal convolution. Each channel owns a local BF16 ring and
-// advances it through all rows, preserving the rowwise source boundaries.
+// K=4 causal convolution over row-major [rows, channels]: the per-row
+// kernel's ring, unrolled.  Row r reads x(r-3), x(r-2), x(r-1) (oldest
+// first), where x(j) is the BF16-rounded input row j, or for j < 0 the history
+// slot (start_cursor + j) mod 3 that the ring would still hold.  A thread owns
+// one channel and 16 consecutive rows, so every row is independent.  Only the
+// row-0 chunk reads the history, and it alone writes next_history after its
+// reads: history may alias next_history.
+// Grid [ceil(channels / 256), ceil(rows / 16)], block 256.
 extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
     const float* input,
     const __hip_bfloat16* kernel,
@@ -890,37 +896,45 @@ extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
     int kernel_size,
     int start_cursor) {
     const int channel = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    if (channel >= channels || rows <= 0
+    const int r0 = (int)blockIdx.y * 16;
+    if (channel >= channels || r0 >= rows
         || history_rows != 3 || kernel_size != 4) {
         return;
     }
-
-    __hip_bfloat16 history_ring[3];
-    for (int history_row = 0; history_row < 3; ++history_row) {
-        history_ring[history_row] = bf16_round(
-            history[history_row * channels + channel]);
-    }
-
-    int cursor = start_cursor;
-    for (int row = 0; row < rows; ++row) {
-        const int input_offset = row * channels + channel;
-        const __hip_bfloat16 current_bf16 = bf16_round(input[input_offset]);
-        const float current = bf16_to_f32(current_bf16);
-        float value = bf16_to_f32(kernel[channel * 4 + 3]) * current;
-        for (int tap = 0; tap < 3; ++tap) {
-            const int history_index = (cursor + tap) % 3;
-            value += bf16_to_f32(kernel[channel * 4 + tap])
-                * bf16_to_f32(history_ring[history_index]);
+    auto x = [&](int j) {
+        return j >= 0 ? bf16_round(input[j * channels + channel])
+                      : bf16_round(history[((start_cursor + j + 3) % 3) * channels + channel]);
+    };
+    const float k0 = bf16_to_f32(kernel[channel * 4 + 0]);
+    const float k1 = bf16_to_f32(kernel[channel * 4 + 1]);
+    const float k2 = bf16_to_f32(kernel[channel * 4 + 2]);
+    const float k3 = bf16_to_f32(kernel[channel * 4 + 3]);
+    __hip_bfloat16 h0 = x(r0 - 3), h1 = x(r0 - 2), h2 = x(r0 - 1);
+    // Ring slot s after the last row: the newest row j in [rows-3, rows-1]
+    // with (start_cursor + j) % 3 == s (the history slot itself when j < 0).
+    __hip_bfloat16 tail[3];
+    if (r0 == 0) {
+        for (int s = 0; s < 3; ++s) {
+            const int j = rows - 3 + ((s - (start_cursor + rows) % 3) + 6) % 3;
+            tail[s] = x(j);
         }
-        output[input_offset] = bf16_to_f32(bf16_round(
-            value * (1.0f / (1.0f + expf(-value)))));
-        history_ring[cursor] = current_bf16;
-        cursor = cursor == 2 ? 0 : cursor + 1;
     }
-
-    for (int history_row = 0; history_row < 3; ++history_row) {
-        next_history[history_row * channels + channel] =
-            bf16_to_f32(history_ring[history_row]);
+    const int r1 = min(r0 + 16, rows);
+    for (int r = r0; r < r1; ++r) {
+        const __hip_bfloat16 current_bf16 = bf16_round(input[r * channels + channel]);
+        float value = k3 * bf16_to_f32(current_bf16);
+        value += k0 * bf16_to_f32(h0);
+        value += k1 * bf16_to_f32(h1);
+        value += k2 * bf16_to_f32(h2);
+        output[r * channels + channel] = bf16_to_f32(bf16_round(
+            value * (1.0f / (1.0f + expf(-value)))));
+        h0 = h1;
+        h1 = h2;
+        h2 = current_bf16;
+    }
+    if (r0 == 0) {
+        for (int s = 0; s < 3; ++s)
+            next_history[s * channels + channel] = bf16_to_f32(tail[s]);
     }
 }
 
