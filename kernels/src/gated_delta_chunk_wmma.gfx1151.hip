@@ -77,20 +77,17 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
         for (int r = 0; r < 8; ++r)
             S[t][r] = state[state_base + (size_t)(16 * t + 2 * r + hi) * 128 + dv0 + l16];
     const int si = tid & 15, sd = (tid >> 4) * 8;
-    uint4 pk, pq; float4 pv0, pv1; float pg = 0.f, pb = 0.f;
+    // Raw prefetch registers, widened where used so the loads stay in flight.
+    uint4 pk, pq, pv; float pg = 0.f, pb = 0.f;
     const float nw = (float)norm[tid & 127];
     auto fetch = [&](int c0) {
         const int nn = min(16, rows - c0);
-        pk = make_uint4(0, 0, 0, 0); pq = pk; pv0 = make_float4(0, 0, 0, 0); pv1 = pv0;
+        pk = make_uint4(0, 0, 0, 0); pq = pk; pv = pk;
         if (si < nn) {
             const size_t b = ((size_t)(c0 + si) * key_heads + kh) * 128 + sd;
             pk = *(const uint4*)(kn + b);
             pq = *(const uint4*)(qn + b);
-            const uint4 vw = *(const uint4*)(projection + (size_t)(c0 + si) * qkv_width + v_offset + sd);
-            pv0 = make_float4(__uint_as_float(vw.x << 16), __uint_as_float(vw.x & 0xFFFF0000u),
-                              __uint_as_float(vw.y << 16), __uint_as_float(vw.y & 0xFFFF0000u));
-            pv1 = make_float4(__uint_as_float(vw.z << 16), __uint_as_float(vw.z & 0xFFFF0000u),
-                              __uint_as_float(vw.w << 16), __uint_as_float(vw.w & 0xFFFF0000u));
+            pv = *(const uint4*)(projection + (size_t)(c0 + si) * qkv_width + v_offset + sd);
         }
         if (tid < 16) {
             pg = tid < nn ? gate[(c0 + tid) * value_heads + vh] : 0.f;
@@ -140,7 +137,10 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
         }
         const unsigned int kw[4] = {pk.x, pk.y, pk.z, pk.w}, qw[4] = {pq.x, pq.y, pq.z, pq.w};
         float kf[8];
-        const float vf[8] = {pv0.x, pv0.y, pv0.z, pv0.w, pv1.x, pv1.y, pv1.z, pv1.w};
+        const float vf[8] = {__uint_as_float(pv.x << 16), __uint_as_float(pv.x & 0xFFFF0000u),
+                             __uint_as_float(pv.y << 16), __uint_as_float(pv.y & 0xFFFF0000u),
+                             __uint_as_float(pv.z << 16), __uint_as_float(pv.z & 0xFFFF0000u),
+                             __uint_as_float(pv.w << 16), __uint_as_float(pv.w & 0xFFFF0000u)};
 #pragma unroll
         for (int h = 0; h < 4; ++h) {
             kf[2 * h] = __uint_as_float(kw[h] << 16); kf[2 * h + 1] = __uint_as_float(kw[h] & 0xFFFF0000u);
