@@ -2024,7 +2024,15 @@ impl Qwen4GpuForward {
                 )?;
             }
 
-            if ple.lease().is_none() {
+            // PLE rows: wait for the host fetch, stage, upload and widen them.
+            // A prefill defers this until layer 0 is enqueued (the rows are first
+            // read at the PLE layer), so the host fetch overlaps GPU work; a
+            // single-token forward keeps it ahead of the retained-body boundary.
+            let host_ple_bytes = &mut self.host_ple_bytes;
+            let mut stage_ple = |gpu: &mut Gpu| -> Result<(), Qwen4GpuForwardError> {
+                if ple.lease().is_some() {
+                    return Ok(());
+                }
                 let wait_started = qwen4_profile_start();
                 let lease_result = ple.wait();
                 qwen4_profile_record(Qwen4ProfilePhase::PleWait, wait_started);
@@ -2035,12 +2043,11 @@ impl Qwen4GpuForward {
                     .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?
                     .len();
                 let stage_started = qwen4_profile_start();
-                let stage_result = lease.stage_into(&mut self.host_ple_bytes[..upload_len]);
+                let stage_result = lease.stage_into(&mut host_ple_bytes[..upload_len]);
                 qwen4_profile_record(Qwen4ProfilePhase::PleStage, stage_started);
                 stage_result.map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
                 let upload_started = qwen4_profile_start();
-                let upload_result =
-                    gpu.memcpy_htod_auto(&staged.buf, &self.host_ple_bytes[..upload_len]);
+                let upload_result = gpu.memcpy_htod_auto(&staged.buf, &host_ple_bytes[..upload_len]);
                 qwen4_profile_record(Qwen4ProfilePhase::PleUpload, upload_started);
                 upload_result?;
                 lease
@@ -2055,6 +2062,14 @@ impl Qwen4GpuForward {
                     PLE_ROW_WIDTH,
                 )?;
                 qwen4_profile_record(Qwen4ProfilePhase::PleApply, apply_started);
+                Ok(())
+            };
+            let ple_split = steps
+                .iter()
+                .position(|step| matches!(step, Step::GroupedDepthwise(_)))
+                .filter(|_| n > 1);
+            if ple_split.is_none() {
+                stage_ple(gpu)?;
             }
 
             // ── Retained-body boundary ────────────────────────────────────────
@@ -2118,6 +2133,9 @@ impl Qwen4GpuForward {
                 Some(_) => false,
                 None => gpu.replay.should_route_aql(),
             };
+            if ple_split.is_some() && (pm4_route || aql_route || shadow_route.is_some()) {
+                return Err(invalid("Qwen4 retained body with deferred PLE staging"));
+            }
             let routed = if pm4_route {
                 // SAFETY: the boundary above staged every host input the tape's
                 // recorded launches read, and every pointer in the tape is owned by
@@ -2156,11 +2174,21 @@ impl Qwen4GpuForward {
             };
 
             if !routed {
-                execute_validated_steps(gpu, &ctx, &steps).map_err(|error| {
-                    Qwen4GpuForwardError::Dispatch(format!(
-                        "execute Qwen4 layer program: {error:?}"
-                    ))
-                })?;
+                let execute = |gpu: &mut Gpu, steps: &[Step<'_>]| {
+                    execute_validated_steps(gpu, &ctx, steps).map_err(|error| {
+                        Qwen4GpuForwardError::Dispatch(format!(
+                            "execute Qwen4 layer program: {error:?}"
+                        ))
+                    })
+                };
+                match ple_split {
+                    Some(split) => {
+                        execute(gpu, &steps[..split])?;
+                        stage_ple(gpu)?;
+                        execute(gpu, &steps[split..])?;
+                    }
+                    None => execute(gpu, &steps)?,
+                }
             }
 
             if let Some(capture) = wide_hidden_capture.as_ref() {
