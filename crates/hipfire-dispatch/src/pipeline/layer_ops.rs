@@ -31,6 +31,7 @@ use rdna_compute::tensor_ops::{
     IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope, IndexedAttentionSelectBatch, ScaleF32,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
+use smallvec::SmallVec;
 
 #[inline]
 pub(super) fn hip<T>(result: Result<T, hip_bridge::HipError>) -> Result<T, DispatchError> {
@@ -154,6 +155,26 @@ pub fn project_weights(
             }
         }
     }
+    // BF16 weights on the F16 WMMA route: one F16 conversion per K.
+    for i in 0..projections.len() {
+        let (weight, _) = projections[i];
+        if done[i] || weight.dtype != DType::BF16 {
+            continue;
+        }
+        let group: SmallVec<[(&GpuTensor, &GpuTensor, usize); 4]> = projections[i..]
+            .iter()
+            .filter(|(w, _)| w.dtype == DType::BF16 && w.k == weight.k)
+            .map(|(w, out)| (w.buf, *out, w.m))
+            .collect();
+        if hip(gpu.gemm_bf16_xf32_f16_wmma_qwen4(&group, input, weight.k, rows))? {
+            for j in i..projections.len() {
+                let w = projections[j].0;
+                if w.dtype == DType::BF16 && w.k == weight.k {
+                    done[j] = true;
+                }
+            }
+        }
+    }
     for (i, &(weight, output)) in projections.iter().enumerate() {
         if !done[i] {
             project_one(gpu, weight, input, output, rows, rotation)?;
@@ -216,8 +237,12 @@ fn project_one(
         (DType::BF16, false) => gpu.gemv_bf16_xf32(weight.buf, x, output, weight.m, weight.k),
         (DType::BF16, true) => {
             // gfx1151 long prefill: the KLD-gated F16 WMMA route, else exact.
-            match gpu.gemm_bf16_xf32_f16_wmma_qwen4(weight.buf, x, output, weight.m, weight.k, rows)
-            {
+            match gpu.gemm_bf16_xf32_f16_wmma_qwen4(
+                &[(weight.buf, output, weight.m)],
+                x,
+                weight.k,
+                rows,
+            ) {
                 Ok(true) => Ok(()),
                 Ok(false) => {
                     gpu.gemm_bf16_xf32_multirow(weight.buf, x, output, weight.m, weight.k, rows)

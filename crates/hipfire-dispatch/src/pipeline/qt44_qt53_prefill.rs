@@ -116,50 +116,69 @@ pub(crate) fn shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<
         .shared
         .as_ref()
         .ok_or_else(|| DispatchError::Hip("grouped prefill shared weights missing".into()))?;
-    let x_selector = match shared.weights.selector.dtype {
-        DType::BF16 | DType::F32 => p.x_norm_batch,
-        DType::MQ4G256V2 => p.x_rot_batch,
-        _ => {
-            return Err(DispatchError::UnsupportedVariant {
-                family: "moe",
-                variant: "qt44-qt53-shared-selector-dtype",
-                arch: "",
-                quant: "unsupported",
-            })
-        }
-    };
-    batch_projection(
-        gpu,
-        &shared.weights.selector,
-        x_selector,
-        shared.scalar,
-        p.batch_size,
-    )?;
-    let x_gate = match shared.weights.gate.dtype {
-        DType::BF16 | DType::F32 => p.x_norm_batch,
-        DType::MQ4G256V2 => p.x_rot_batch,
-        _ => {
-            return Err(DispatchError::UnsupportedVariant {
-                family: "moe",
-                variant: "qt44-qt53-shared-gate-dtype",
-                arch: "",
-                quant: "unsupported",
-            })
-        }
-    };
-    batch_projection(
-        gpu,
-        &shared.weights.gate,
-        x_gate,
-        shared.gate_out,
-        p.batch_size,
-    )?;
-    batch_projection(gpu, &shared.weights.up, x_gate, shared.up_out, p.batch_size)?;
+    let weights = &shared.weights;
+    if [&weights.selector, &weights.gate, &weights.up]
+        .iter()
+        .all(|w| w.dtype == DType::BF16)
+    {
+        // All read the natural activation: one shared F16 conversion.
+        super::layer_ops::project_weights(
+            gpu,
+            p.x_norm_batch,
+            p.batch_size,
+            None,
+            &[
+                (&weights.selector, shared.scalar),
+                (&weights.gate, shared.gate_out),
+                (&weights.up, shared.up_out),
+            ],
+        )?;
+    } else {
+        let x_selector = match shared.weights.selector.dtype {
+            DType::BF16 | DType::F32 => p.x_norm_batch,
+            DType::MQ4G256V2 => p.x_rot_batch,
+            _ => {
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "moe",
+                    variant: "qt44-qt53-shared-selector-dtype",
+                    arch: "",
+                    quant: "unsupported",
+                })
+            }
+        };
+        batch_projection(
+            gpu,
+            &shared.weights.selector,
+            x_selector,
+            shared.scalar,
+            p.batch_size,
+        )?;
+        let x_gate = match shared.weights.gate.dtype {
+            DType::BF16 | DType::F32 => p.x_norm_batch,
+            DType::MQ4G256V2 => p.x_rot_batch,
+            _ => {
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "moe",
+                    variant: "qt44-qt53-shared-gate-dtype",
+                    arch: "",
+                    quant: "unsupported",
+                })
+            }
+        };
+        batch_projection(
+            gpu,
+            &shared.weights.gate,
+            x_gate,
+            shared.gate_out,
+            p.batch_size,
+        )?;
+        batch_projection(gpu, &shared.weights.up, x_gate, shared.up_out, p.batch_size)?;
+    }
     if p.recipe.bf16_round_trip() {
+        // gate/up are round-tripped where the activation reads them (their
+        // only reader), in the same pass.
         hip(gpu.bf16_round_trip_f32(p.prelude.router_logits))?;
         hip(gpu.bf16_round_trip_f32(shared.scalar))?;
-        hip(gpu.bf16_round_trip_f32(shared.gate_out))?;
-        hip(gpu.bf16_round_trip_f32(shared.up_out))?;
     }
     Ok(())
 }
@@ -188,9 +207,17 @@ pub(crate) fn shared_activation(
         });
         hip(gpu.bf16_round_trip_f32(&scalar))?;
     }
-    hip(gpu.silu_mul_f32(shared.gate_out, shared.up_out, shared.rotated))?;
+    // The live rows only: the shared buffers are sized for the chunk cap.
+    let live = p.batch_size * shared.intermediate;
+    let (gate, up, rotated) = (
+        f32_view(shared.gate_out, 0, live),
+        f32_view(shared.up_out, 0, live),
+        f32_view(shared.rotated, 0, live),
+    );
     if p.recipe.bf16_round_trip() {
-        hip(gpu.bf16_round_trip_f32(shared.rotated))?;
+        hip(gpu.silu_mul_bf16_rt_f32(&gate, &up, &rotated))?;
+    } else {
+        hip(gpu.silu_mul_f32(&gate, &up, &rotated))?;
     }
     if shared.weights.down.dtype == DType::MQ4G128V2 {
         hip(gpu.rotate_x_mq_128_v2(

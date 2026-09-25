@@ -25353,9 +25353,10 @@ impl Gpu {
             shape: vec![m * k],
             dtype: DType::F16,
         };
-        // M < 512 with a long K (HC input_mix_down, 320 x 10240): the auto
-        // tile gives too few workgroups; 64 x 64 keeps each output's K order.
-        if m < 512 && k >= 4096 {
+        // M < 512 (HC input_mix_down 320 x 10240, the shared-expert selector
+        // 1 x 2560): the auto tile gives too few workgroups; 64 x 64 keeps
+        // each output's K order.
+        if m < 512 {
             return self.gemm_f16_x_f16_wmma_lds_tiled_ld(
                 &w_view,
                 x_f16,
@@ -25372,19 +25373,22 @@ impl Gpu {
         self.gemm_f16_x_f16_wmma_lds_auto(&w_view, x_f16, y, None, m, k, batch_size)
     }
 
-    /// [`Gpu::gemm_bf16_xf16_f16_wmma`] from F32 X when the route applies;
-    /// returns `false` with nothing launched otherwise.
-    #[allow(clippy::too_many_arguments)]
+    /// [`Gpu::gemm_bf16_xf16_f16_wmma`] from F32 X for each `(weight, y, m)`
+    /// (all reading the same `[batch_size, k]` X, converted to F16 once) when
+    /// the route applies to every weight; returns `false` with nothing
+    /// launched otherwise.
     pub fn gemm_bf16_xf32_f16_wmma_qwen4(
         &mut self,
-        weight: &GpuTensor,
+        projections: &[(&GpuTensor, &GpuTensor, usize)],
         x: &GpuTensor,
-        y: &GpuTensor,
-        m: usize,
         k: usize,
         batch_size: usize,
     ) -> HipResult<bool> {
-        if !self.qwen4_f16_wmma_applies(weight, k, batch_size) {
+        if projections.is_empty()
+            || !projections
+                .iter()
+                .all(|(weight, _, _)| self.qwen4_f16_wmma_applies(weight, k, batch_size))
+        {
             return Ok(false);
         }
         self.bind_thread()?;
@@ -25394,7 +25398,9 @@ impl Gpu {
             shape: vec![batch_size * k],
             dtype: DType::F16,
         };
-        self.gemm_bf16_xf16_f16_wmma(weight, &x_view, y, m, k, batch_size)?;
+        for &(weight, y, m) in projections {
+            self.gemm_bf16_xf16_f16_wmma(weight, &x_view, y, m, k, batch_size)?;
+        }
         Ok(true)
     }
 

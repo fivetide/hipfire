@@ -583,8 +583,30 @@ impl Gpu {
         up: &GpuTensor,
         out: &GpuTensor,
     ) -> HipResult<()> {
+        self.silu_mul_launch("silu_mul_f32", gate, up, out)
+    }
+
+    /// [`Gpu::silu_mul_f32`] of BF16-round-tripped gate and up, the result
+    /// round-tripped too ([`Gpu::bf16_round_trip_f32`]'s rounding): the
+    /// round trip / silu_mul / round trip sequence in one pass.
+    pub fn silu_mul_bf16_rt_f32(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        out: &GpuTensor,
+    ) -> HipResult<()> {
+        self.silu_mul_launch("silu_mul_bf16_rt_f32", gate, up, out)
+    }
+
+    fn silu_mul_launch(
+        &mut self,
+        kernel: &'static str,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        out: &GpuTensor,
+    ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("silu_mul", kernels::SILU_MUL_SRC, "silu_mul_f32")?;
+        self.ensure_kernel("silu_mul", kernels::SILU_MUL_SRC, kernel)?;
 
         let n = gate.numel() as i32;
         let mut gate_ptr = gate.buf.as_ptr();
@@ -602,22 +624,16 @@ impl Gpu {
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
         let bytes = crate::profile::elementwise_bytes(n as usize);
-        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "silu_mul_f32", bytes);
-        let result = self.launch_maybe_blob(
-            "silu_mul_f32",
-            [grid, 1, 1],
-            [block, 1, 1],
-            0,
-            &mut params,
-            || {
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", kernel, bytes);
+        let result =
+            self.launch_maybe_blob(kernel, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(gate_ptr);
                 b.push_ptr(up_ptr);
                 b.push_ptr(out_ptr);
                 b.push_i32(n_val);
                 b
-            },
-        );
+            });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
