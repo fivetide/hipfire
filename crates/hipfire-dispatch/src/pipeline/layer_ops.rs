@@ -553,8 +553,7 @@ pub fn execute_hyper_write(gpu: &mut Gpu, op: &HyperWriteOp<'_>) -> Result<(), D
         && op.block_inject.dtype == DType::BF16
         && op.block_inject.m == op.branches
         && op.block_inject.k == wide
-        && op.branches <= 8
-        && wide % 8 == 0;
+        && HyperNormGate::supports(op.branches, op.hidden);
     if fused {
         hip(hyper_norm_gate(
             gpu,

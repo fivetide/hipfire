@@ -656,6 +656,14 @@ pub struct HyperNormGate<'a> {
     pub hidden: usize,
 }
 
+impl HyperNormGate<'_> {
+    /// Geometry the fused kernel supports: four branches, `hidden` a multiple
+    /// of 256 up to 2560.
+    pub fn supports(branches: usize, hidden: usize) -> bool {
+        branches == 4 && hidden % 256 == 0 && (256..=2560).contains(&hidden)
+    }
+}
+
 pub fn hyper_norm_gate(gpu: &mut Gpu, p: &HyperNormGate<'_>) -> HipResult<()> {
     ensure_f32(p.input)?;
     ensure_f32(p.gates)?;
@@ -663,9 +671,7 @@ pub fn hyper_norm_gate(gpu: &mut Gpu, p: &HyperNormGate<'_>) -> HipResult<()> {
     if p.norm_weight.dtype != DType::BF16
         || p.gate_weight.dtype != DType::BF16
         || p.rows == 0
-        || p.branches == 0
-        || p.branches > 8
-        || wide % 8 != 0
+        || !HyperNormGate::supports(p.branches, p.hidden)
         || p.norm_weight.numel() != wide
         || p.gate_weight.numel() < p.branches * wide
         || p.input.numel() < p.rows * wide
@@ -673,17 +679,15 @@ pub fn hyper_norm_gate(gpu: &mut Gpu, p: &HyperNormGate<'_>) -> HipResult<()> {
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
-    let branches = checked_i32(p.branches, "HC norm-gate branch count")?;
     let hidden = checked_i32(p.hidden, "HC norm-gate hidden width")?;
     let row_grid = checked_u32(p.rows, "HC norm-gate row grid")?;
-    let lds_bytes = checked_u32((wide + 256) * 4, "HC norm-gate LDS")?;
+    let lds_bytes = checked_u32((wide / 2 + 4 * 256) * 4, "HC norm-gate LDS")?;
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "hyper_norm_gate_f32")?;
     let mut args = KernargBlob::new();
     args.push_ptr(p.input.buf.as_ptr());
     args.push_ptr(p.norm_weight.buf.as_ptr());
     args.push_ptr(p.gate_weight.buf.as_ptr());
     args.push_ptr(p.gates.buf.as_ptr());
-    args.push_i32(branches);
     args.push_i32(hidden);
     args.pad_to(16);
     gpu.launch_blob_recorded(
