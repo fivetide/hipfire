@@ -312,11 +312,16 @@ impl Gpu {
         ];
         let grid_x = checked_u32(hc_count, "grouped gate branch grid")?;
         let grid_y = checked_u32(tokens, "grouped gate token grid")?;
+        // Key and query rows staged in LDS.
+        let lds_bytes = checked_u32(hidden_size * 8, "grouped gate LDS")?;
+        if lds_bytes > 64 * 1024 {
+            return Err(HipError::new(0, "grouped gate row exceeds LDS"));
+        }
         self.launch_maybe_blob(
             "grouped_gate_bf16",
             [grid_x, grid_y, 1],
-            [1, 1, 1],
-            0,
+            [256, 1, 1],
+            lds_bytes,
             &mut params,
             || {
                 let mut blob = KernargBlob::new();
@@ -890,5 +895,87 @@ mod tests {
             .expect_err("grouped convolution flattened extent must be bounded");
         assert!(error.to_string().contains("overflow") || error.to_string().contains("i32"));
         assert_eq!(gpu.last_launched_kernel(), None);
+    }
+
+    #[test]
+    fn grouped_gate_bf16_is_bit_identical_to_serial_f32_gate() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        const TOKENS: usize = 7;
+        const BRANCHES: usize = 4;
+        const HIDDEN: usize = 2560;
+        const CHANNELS: usize = BRANCHES * HIDDEN;
+        let wave = |n: usize, a: usize, b: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i * a % b) as f32 - b as f32 / 2.0) / b as f32)
+                .collect()
+        };
+        let key = gpu
+            .upload_f32(&wave(TOKENS * CHANNELS, 37, 251), &[TOKENS * CHANNELS])
+            .unwrap();
+        let query = gpu
+            .upload_f32(&wave(TOKENS * CHANNELS, 53, 241), &[TOKENS * CHANNELS])
+            .unwrap();
+        let value = gpu
+            .upload_f32(&wave(TOKENS * HIDDEN, 29, 233), &[TOKENS * HIDDEN])
+            .unwrap();
+        // BF16 norms and their exact F32 widening for the serial reference.
+        let norm_bits = |a: usize| -> Vec<u16> {
+            wave(CHANNELS, a, 199)
+                .iter()
+                .map(|v| (v.to_bits() >> 16) as u16)
+                .collect()
+        };
+        let (key_bits, query_bits) = (norm_bits(17), norm_bits(23));
+        let widen = |bits: &[u16]| -> Vec<f32> {
+            bits.iter()
+                .map(|b| f32::from_bits((*b as u32) << 16))
+                .collect()
+        };
+        let upload_bf16 = |gpu: &mut Gpu, bits: &[u16]| {
+            let tensor = gpu.zeros(&[CHANNELS], DType::BF16).unwrap();
+            let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_ne_bytes()).collect();
+            gpu.hip.memcpy_htod(&tensor.buf, &bytes).unwrap();
+            tensor
+        };
+        let key_norm = upload_bf16(&mut gpu, &key_bits);
+        let query_norm = upload_bf16(&mut gpu, &query_bits);
+        let key_norm_f32 = gpu.upload_f32(&widen(&key_bits), &[CHANNELS]).unwrap();
+        let query_norm_f32 = gpu.upload_f32(&widen(&query_bits), &[CHANNELS]).unwrap();
+        let got = gpu.zeros(&[TOKENS * CHANNELS], DType::F32).unwrap();
+        let want = gpu.zeros(&[TOKENS * CHANNELS], DType::F32).unwrap();
+        gpu.grouped_gate_bf16(
+            &key,
+            &query,
+            &value,
+            &key_norm,
+            &query_norm,
+            &got,
+            TOKENS,
+            BRANCHES,
+            HIDDEN,
+            1.0e-6,
+        )
+        .unwrap();
+        gpu.grouped_gate_f32(
+            &key,
+            &query,
+            &value,
+            &key_norm_f32,
+            &query_norm_f32,
+            &want,
+            TOKENS,
+            BRANCHES,
+            HIDDEN,
+            1.0e-6,
+        )
+        .unwrap();
+        let got = gpu.download_f32(&got).unwrap();
+        let want = gpu.download_f32(&want).unwrap();
+        for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "index {i}");
+        }
     }
 }

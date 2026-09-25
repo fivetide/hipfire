@@ -25326,6 +25326,8 @@ impl Gpu {
                     // Qwen4 shared-expert gate/up and router (N = 512 prefill).
                     | (640, 2560)
                     | (512, 2560)
+                    // Qwen4 PLE value projection (2.68 vs 4.96 ms at N = 1131).
+                    | (2560, 2560)
             );
         // K % 256 == 0 (every allowlisted shape): four waves share each
         // weight chunk through LDS; bitwise identical to the R16 kernel.

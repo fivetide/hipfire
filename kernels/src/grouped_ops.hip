@@ -189,6 +189,11 @@ extern "C" __global__ void grouped_depthwise_conv_silu_add_f32(
         }
     }
 }
+// One block per (branch, token), dynamic LDS 2 * hidden_size floats.  The
+// block stages the key/query rows and the normalized products in LDS; thread 0
+// runs the three serial reductions in the reference's index order and every
+// thread writes the gated row.  Same expressions per element, so the result is
+// bitwise the single-thread reference's.
 extern "C" __global__ void grouped_gate_bf16(
     const float* __restrict__ key,
     const float* __restrict__ query,
@@ -200,38 +205,56 @@ extern "C" __global__ void grouped_gate_bf16(
     int hc_count,
     int hidden_size,
     float epsilon) {
-    if (threadIdx.x != 0) return;
+    extern __shared__ float gate_lds[];
+    float* key_row = gate_lds;
+    float* query_row = gate_lds + hidden_size;
+    __shared__ float key_inverse, query_inverse, gate;
     const int branch = static_cast<int>(blockIdx.x);
     const int token = static_cast<int>(blockIdx.y);
+    const int tid = static_cast<int>(threadIdx.x);
     if (branch >= hc_count || token >= tokens) return;
     const int channels = hc_count * hidden_size;
     const int base = token * channels + branch * hidden_size;
-    float key_square = 0.0f;
-    float query_square = 0.0f;
-    for (int index = 0; index < hidden_size; ++index) {
-        const float key_value = key[base + index];
-        const float query_value = query[base + index];
-        key_square += key_value * key_value;
-        query_square += query_value * query_value;
+    for (int index = tid; index < hidden_size; index += static_cast<int>(blockDim.x)) {
+        key_row[index] = key[base + index];
+        query_row[index] = query[base + index];
     }
-    const float key_inverse = rsqrtf(key_square / static_cast<float>(hidden_size) + fmaxf(epsilon, 1.0e-12f));
-    const float query_inverse = rsqrtf(query_square / static_cast<float>(hidden_size) + fmaxf(epsilon, 1.0e-12f));
-    float dot = 0.0f;
-    for (int index = 0; index < hidden_size; ++index) {
+    __syncthreads();
+    if (tid == 0) {
+        float key_square = 0.0f;
+        float query_square = 0.0f;
+        for (int index = 0; index < hidden_size; ++index) {
+            const float key_value = key_row[index];
+            const float query_value = query_row[index];
+            key_square += key_value * key_value;
+            query_square += query_value * query_value;
+        }
+        key_inverse = rsqrtf(key_square / static_cast<float>(hidden_size) + fmaxf(epsilon, 1.0e-12f));
+        query_inverse = rsqrtf(query_square / static_cast<float>(hidden_size) + fmaxf(epsilon, 1.0e-12f));
+    }
+    __syncthreads();
+    for (int index = tid; index < hidden_size; index += static_cast<int>(blockDim.x)) {
         const int norm_index = branch * hidden_size + index;
-        const float key_value = key[base + index] * key_inverse
+        key_row[index] = key_row[index] * key_inverse
             * (1.0f + static_cast<float>(key_norm[norm_index]));
-        const float query_value = query[base + index] * query_inverse
+        query_row[index] = query_row[index] * query_inverse
             * (1.0f + static_cast<float>(query_norm[norm_index]));
-        dot += key_value * query_value;
     }
-    dot /= sqrtf(static_cast<float>(hidden_size));
-    const float sign = dot >= 0.0f ? 1.0f : -1.0f;
-    const float transformed = sign * sqrtf(fmaxf(fabsf(dot), 1.0e-6f));
-    const float gate = grouped_sigmoid(transformed);
+    __syncthreads();
+    if (tid == 0) {
+        float dot = 0.0f;
+        for (int index = 0; index < hidden_size; ++index) {
+            dot += key_row[index] * query_row[index];
+        }
+        dot /= sqrtf(static_cast<float>(hidden_size));
+        const float sign = dot >= 0.0f ? 1.0f : -1.0f;
+        const float transformed = sign * sqrtf(fmaxf(fabsf(dot), 1.0e-6f));
+        gate = grouped_sigmoid(transformed);
+    }
+    __syncthreads();
     const float* value_row = value + token * hidden_size;
     float* gated_row = gated + base;
-    for (int index = 0; index < hidden_size; ++index) {
+    for (int index = tid; index < hidden_size; index += static_cast<int>(blockDim.x)) {
         gated_row[index] = gate * value_row[index];
     }
 }
