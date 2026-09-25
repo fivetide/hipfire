@@ -40,7 +40,8 @@ __device__ __forceinline__ half16_t dq_nibbles(unsigned int lo, unsigned int hi,
 // nibbles: byte i holds weight 2i low / 2i+1 high).  Eight K-tiles per group.
 // F16 dequant and F16 inputs: not bit-exact with the F32 SIMT kernels.
 // K % 128 == 0.  Same expert-tile pairing and unrolled K-tile loop as the
-// gate/up kernel.  Grid [ceil(M/16), m_total/16], block 32.
+// gate/up kernel.  Grid [ceil(M/16), m_total/16], block 32, dynamic LDS
+// 16 * (K / 128) * 68 bytes.
 // F32 -> BF16 bits, round to nearest even; non-finite values truncate (the
 // BF16 round trip leaves them unchanged).  Widening the bits back gives the
 // value moe_bf16_round_trip / hip_bfloat16 rounding yields for finite input.
@@ -50,13 +51,40 @@ __device__ __forceinline__ unsigned short moe_bf16_bits(float v) {
     return (unsigned short)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
 }
 
+// One 128-weight group of the lane's row against the tiles' X.  `gw` holds
+// the group's 17 words (header, 64 nibble bytes), in LDS or global memory.
+template <bool PAIR>
+__device__ __forceinline__ void moe_down_wmma_group(
+    const unsigned int* gw, const _Float16* const* x_base, int g, float8_t* acc) {
+    const half16_t zero_b = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const unsigned int hdr = gw[0];
+    const _Float16 sc_h = __builtin_bit_cast(_Float16, (unsigned short)(hdr & 0xFFFFu));
+    const _Float16 zp_h = __builtin_bit_cast(_Float16, (unsigned short)(hdr >> 16));
+#pragma unroll
+    for (int kt = 0; kt < 8; kt += 2) {
+        const int k_off_a = kt * 16;
+        const int k_off_b = (kt + 1) * 16;
+        const half16_t a_a = dq_nibbles(gw[1 + 2 * kt], gw[2 + 2 * kt], sc_h, zp_h);
+        const half16_t a_b = dq_nibbles(gw[3 + 2 * kt], gw[4 + 2 * kt], sc_h, zp_h);
+#pragma unroll
+        for (int t = 0; t < (PAIR ? 2 : 1); t++) {
+            half16_t b_a = zero_b, b_b = zero_b;
+            if (x_base[t] != nullptr) {
+                b_a = *(const half16_t*)(x_base[t] + g * 128 + k_off_a);
+                b_b = *(const half16_t*)(x_base[t] + g * 128 + k_off_b);
+            }
+            acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b_a, acc[t]);
+            acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_b, b_b, acc[t]);
+        }
+    }
+}
+
 template <bool PAIR, bool OUT_BF16>
 __device__ __forceinline__ void moe_down_wmma_tiles(
     const char* __restrict__ A, const int* __restrict__ sorted_slot_index,
     const _Float16* __restrict__ X_src, void* __restrict__ Y_grouped,
     int M, int K, int x_row_div, int m_total, int tid, int row_start, int slot_start) {
     const int lane = tid & 15;
-    const half16_t zero_b = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     const _Float16* x_base[2] = {nullptr, nullptr};
 #pragma unroll
     for (int t = 0; t < (PAIR ? 2 : 1); t++) {
@@ -67,38 +95,29 @@ __device__ __forceinline__ void moe_down_wmma_tiles(
                 x_base[t] = X_src + (long long)((x_row_div > 1) ? (flat / x_row_div) : flat) * K;
         }
     }
-    const int safe_row = (row_start + lane < M) ? (row_start + lane) : (M - 1);
     const int groups_per_row = K / 128;
-    const char* row_base = A + (long long)safe_row * groups_per_row * 68;
+    const int row_words = groups_per_row * 17;
     float8_t acc[2];
     acc[0] = float8_t{0, 0, 0, 0, 0, 0, 0, 0};
     acc[1] = float8_t{0, 0, 0, 0, 0, 0, 0, 0};
-    for (int g = 0; g < groups_per_row; g++) {
-        const char* gp = row_base + g * 68;
-        const unsigned int hdr = *(const unsigned int*)(gp);
-        const _Float16 sc_h = __builtin_bit_cast(_Float16, (unsigned short)(hdr & 0xFFFFu));
-        const _Float16 zp_h = __builtin_bit_cast(_Float16, (unsigned short)(hdr >> 16));
-#pragma unroll
-        for (int kt = 0; kt < 8; kt += 2) {
-            const int k_off_a = kt * 16;
-            const int k_off_b = (kt + 1) * 16;
-            const unsigned int pk0a = *(const unsigned int*)(gp + 4 + k_off_a / 2);
-            const unsigned int pk1a = *(const unsigned int*)(gp + 4 + k_off_a / 2 + 4);
-            const unsigned int pk0b = *(const unsigned int*)(gp + 4 + k_off_b / 2);
-            const unsigned int pk1b = *(const unsigned int*)(gp + 4 + k_off_b / 2 + 4);
-            const half16_t a_a = dq_nibbles(pk0a, pk1a, sc_h, zp_h);
-            const half16_t a_b = dq_nibbles(pk0b, pk1b, sc_h, zp_h);
-#pragma unroll
-            for (int t = 0; t < (PAIR ? 2 : 1); t++) {
-                half16_t b_a = zero_b, b_b = zero_b;
-                if (x_base[t] != nullptr) {
-                    b_a = *(const half16_t*)(x_base[t] + g * 128 + k_off_a);
-                    b_b = *(const half16_t*)(x_base[t] + g * 128 + k_off_b);
-                }
-                acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b_a, acc[t]);
-                acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_b, b_b, acc[t]);
-            }
-        }
+    if (row_start + 16 <= M) {
+        // The 16 rows are one contiguous 16 * row_bytes block (16-byte
+        // aligned): whole-line b128 loads stage it in LDS (dynamic, exactly
+        // that size) and the lanes read their row from there.  Loading 8-16
+        // bytes of 16 rows per instruction ran DRAM well under streaming rate.
+        extern __shared__ __align__(16) unsigned int moe_down_a_lds[];
+        const uint4* tile = (const uint4*)(A + (long long)row_start * row_words * 4);
+        const int pieces = 4 * row_words;  // 16 rows * row_words words, 4 per piece
+#pragma unroll 4
+        for (int p = tid; p < pieces; p += 32)
+            ((uint4*)moe_down_a_lds)[p] = tile[p];
+        __syncthreads();
+        for (int g = 0; g < groups_per_row; g++)
+            moe_down_wmma_group<PAIR>(moe_down_a_lds + lane * row_words + g * 17, x_base, g, acc);
+    } else {
+        const char* row_base = A + (long long)min(row_start + lane, M - 1) * row_words * 4;
+        for (int g = 0; g < groups_per_row; g++)
+            moe_down_wmma_group<PAIR>((const unsigned int*)(row_base + g * 68), x_base, g, acc);
     }
 #pragma unroll
     for (int t = 0; t < (PAIR ? 2 : 1); t++) {

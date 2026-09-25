@@ -70,7 +70,7 @@ __device__ __forceinline__ half16_t dq_nibbles(unsigned int lo, unsigned int hi,
 // sharing each A load and decode (most experts have a second, mostly padded
 // tile); the odd tile's wave exits.  Every tile keeps the single-tile WMMA
 // sequence, so outputs are unchanged.  The K-tile loop is unrolled so later
-// tile pairs' loads issue ahead of the current decode/WMMA.
+// tile pairs' X loads issue ahead of the current decode/WMMA.
 // F32 -> BF16 bits, round to nearest even; non-finite values truncate (the
 // BF16 round trip leaves them unchanged).  Widening the bits back gives the
 // value moe_bf16_round_trip / hip_bfloat16 rounding yields for finite input.
@@ -80,13 +80,48 @@ __device__ __forceinline__ unsigned short moe_bf16_bits(float v) {
     return (unsigned short)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
 }
 
+// One 256-weight group of the lane's row against the tiles' X, in the
+// single-tile WMMA sequence.  `gw` holds the group's 34 words (header, 128
+// nibble bytes), in LDS or global memory.
+template <bool PAIR>
+__device__ __forceinline__ void moe_grouped_wmma_k2_group(
+    const unsigned int* gw, const _Float16* const* x_base, int g, float8_t* acc) {
+    const half16_t zero_b = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const unsigned int hdr_lo = gw[0];
+    const unsigned int hdr_hi = gw[1];
+    const _Float16 sc_0 = __builtin_bit_cast(_Float16, (unsigned short)(hdr_lo & 0xFFFFu));
+    const _Float16 zp_0 = __builtin_bit_cast(_Float16, (unsigned short)(hdr_lo >> 16));
+    const _Float16 sc_1 = __builtin_bit_cast(_Float16, (unsigned short)(hdr_hi & 0xFFFFu));
+    const _Float16 zp_1 = __builtin_bit_cast(_Float16, (unsigned short)(hdr_hi >> 16));
+    constexpr int KT_UNROLL = PAIR ? 4 : 8;  // PAIR at 8 spills
+#pragma unroll KT_UNROLL
+    for (int kt = 0; kt < 16; kt += 2) {
+        const int k_off_a = kt * 16;
+        const int k_off_b = (kt + 1) * 16;
+        const bool upper = (k_off_a >= 128);
+        const _Float16 sc_h = upper ? sc_1 : sc_0;
+        const _Float16 zp_h = upper ? zp_1 : zp_0;
+        const half16_t a_a = dq_nibbles(gw[2 + 2 * kt], gw[3 + 2 * kt], sc_h, zp_h);
+        const half16_t a_b = dq_nibbles(gw[4 + 2 * kt], gw[5 + 2 * kt], sc_h, zp_h);
+#pragma unroll
+        for (int t = 0; t < (PAIR ? 2 : 1); t++) {
+            half16_t b_a = zero_b, b_b = zero_b;
+            if (x_base[t] != nullptr) {
+                b_a = *(const half16_t*)(x_base[t] + g * 256 + k_off_a);
+                b_b = *(const half16_t*)(x_base[t] + g * 256 + k_off_b);
+            }
+            acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b_a, acc[t]);
+            acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_b, b_b, acc[t]);
+        }
+    }
+}
+
 template <bool PAIR, bool OUT_BF16>
 __device__ __forceinline__ void moe_grouped_wmma_k2_tiles(
     const char* __restrict__ A, const int* __restrict__ sorted_slot_index,
     const _Float16* __restrict__ X_src, void* __restrict__ Y_grouped,
     int M, int K, int x_row_div, int m_total, int tid, int row_start, int slot_start) {
     const int lane = tid & 15;
-    const half16_t zero_b = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     const _Float16* x_base[2] = {nullptr, nullptr};
 #pragma unroll
     for (int t = 0; t < (PAIR ? 2 : 1); t++) {
@@ -99,43 +134,56 @@ __device__ __forceinline__ void moe_grouped_wmma_k2_tiles(
     }
     const int safe_row = (row_start + lane < M) ? (row_start + lane) : (M - 1);
     const int groups_per_row = K / 256;
-    const char* row_base = A + (long long)safe_row * groups_per_row * 136;
+    const int row_bytes = groups_per_row * 136;
     float8_t acc[2];
     acc[0] = float8_t{0, 0, 0, 0, 0, 0, 0, 0};
     acc[1] = float8_t{0, 0, 0, 0, 0, 0, 0, 0};
-    for (int g = 0; g < groups_per_row; g++) {
-        const char* gp = row_base + g * 136;
-        const unsigned int hdr_lo = *(const unsigned int*)(gp);
-        const unsigned int hdr_hi = *(const unsigned int*)(gp + 4);
-        const _Float16 sc_0 = __builtin_bit_cast(_Float16, (unsigned short)(hdr_lo & 0xFFFFu));
-        const _Float16 zp_0 = __builtin_bit_cast(_Float16, (unsigned short)(hdr_lo >> 16));
-        const _Float16 sc_1 = __builtin_bit_cast(_Float16, (unsigned short)(hdr_hi & 0xFFFFu));
-        const _Float16 zp_1 = __builtin_bit_cast(_Float16, (unsigned short)(hdr_hi >> 16));
-    constexpr int KT_UNROLL = PAIR ? 4 : 8;  // PAIR at 8 spills
-#pragma unroll KT_UNROLL
-        for (int kt = 0; kt < 16; kt += 2) {
-            const int k_off_a = kt * 16;
-            const int k_off_b = (kt + 1) * 16;
-            const bool upper = (k_off_a >= 128);
-            const _Float16 sc_h = upper ? sc_1 : sc_0;
-            const _Float16 zp_h = upper ? zp_1 : zp_0;
-            const unsigned int pk0a = *(const unsigned int*)(gp + 8 + k_off_a / 2);
-            const unsigned int pk1a = *(const unsigned int*)(gp + 8 + k_off_a / 2 + 4);
-            const unsigned int pk0b = *(const unsigned int*)(gp + 8 + k_off_b / 2);
-            const unsigned int pk1b = *(const unsigned int*)(gp + 8 + k_off_b / 2 + 4);
-            const half16_t a_a = dq_nibbles(pk0a, pk1a, sc_h, zp_h);
-            const half16_t a_b = dq_nibbles(pk0b, pk1b, sc_h, zp_h);
-#pragma unroll
-            for (int t = 0; t < (PAIR ? 2 : 1); t++) {
-                half16_t b_a = zero_b, b_b = zero_b;
-                if (x_base[t] != nullptr) {
-                    b_a = *(const half16_t*)(x_base[t] + g * 256 + k_off_a);
-                    b_b = *(const half16_t*)(x_base[t] + g * 256 + k_off_b);
-                }
-                acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b_a, acc[t]);
-                acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_b, b_b, acc[t]);
-            }
+    if (groups_per_row % 2 != 0) {
+        // Odd group count: rows are not 16-byte aligned for the staged path.
+        const char* row_base = A + (long long)safe_row * row_bytes;
+        for (int g = 0; g < groups_per_row; g++)
+            moe_grouped_wmma_k2_group<PAIR>((const unsigned int*)(row_base + g * 136), x_base, g, acc);
+    } else {
+        // Two groups of the 16 rows at a time: each row's 272 contiguous bytes
+        // arrive with whole-line b128 loads (piece p = row p / 17, 16-byte
+        // chunk p % 17; nine per lane, the last clamped so no lane branches)
+        // and are staged in LDS for the lanes' row reads.  Loading 16 bytes of
+        // 16 rows per instruction ran DRAM ~25% under streaming rate.  The
+        // next pair is fetched into registers while this one computes.
+        __shared__ __align__(16) unsigned int a_lds[16 * 68];
+#define MOE_A_PIECE(i) min(tid + 32 * (i), 16 * 17 - 1)
+#define MOE_A_LOAD(v, i, G0)                                                         \
+    {                                                                                \
+        const int p_ = MOE_A_PIECE(i), r_ = p_ / 17;                                 \
+        v = *(const uint4*)(A + (long long)min(row_start + r_, M - 1) * row_bytes + \
+                            (G0) * 136 + (p_ - r_ * 17) * 16);                       \
+    }
+#define MOE_A_STORE(v, i)                                                  \
+    {                                                                      \
+        const int p_ = MOE_A_PIECE(i), r_ = p_ / 17;                       \
+        *(uint4*)(a_lds + r_ * 68 + (p_ - r_ * 17) * 4) = v;               \
+    }
+#define MOE_A_FETCH(G0)                                                         \
+    MOE_A_LOAD(n0, 0, G0) MOE_A_LOAD(n1, 1, G0) MOE_A_LOAD(n2, 2, G0)           \
+    MOE_A_LOAD(n3, 3, G0) MOE_A_LOAD(n4, 4, G0) MOE_A_LOAD(n5, 5, G0)           \
+    MOE_A_LOAD(n6, 6, G0) MOE_A_LOAD(n7, 7, G0) MOE_A_LOAD(n8, 8, G0)
+        uint4 n0, n1, n2, n3, n4, n5, n6, n7, n8;
+        MOE_A_FETCH(0)
+        for (int g0 = 0; g0 < groups_per_row; g0 += 2) {
+            __syncthreads();
+            MOE_A_STORE(n0, 0) MOE_A_STORE(n1, 1) MOE_A_STORE(n2, 2)
+            MOE_A_STORE(n3, 3) MOE_A_STORE(n4, 4) MOE_A_STORE(n5, 5)
+            MOE_A_STORE(n6, 6) MOE_A_STORE(n7, 7) MOE_A_STORE(n8, 8)
+            __syncthreads();
+            if (g0 + 2 < groups_per_row) { MOE_A_FETCH(g0 + 2) }
+#pragma unroll 1
+            for (int gi = 0; gi < 2; gi++)
+                moe_grouped_wmma_k2_group<PAIR>(a_lds + lane * 68 + gi * 34, x_base, g0 + gi, acc);
         }
+#undef MOE_A_FETCH
+#undef MOE_A_STORE
+#undef MOE_A_LOAD
+#undef MOE_A_PIECE
     }
 #pragma unroll
     for (int t = 0; t < (PAIR ? 2 : 1); t++) {
