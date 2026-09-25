@@ -232,7 +232,8 @@ pub(crate) fn shared_down(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(),
         }
     }
     if p.recipe.bf16_round_trip() {
-        hip(gpu.bf16_round_trip_f32(&out))?;
+        // The scaled add rounds `out`, the scalar and the residual to BF16
+        // itself and stores a BF16 value, so no round trip brackets it.
         bf16_scaled_add_batched(
             gpu,
             &Bf16ScaledAddBatched {
@@ -244,7 +245,6 @@ pub(crate) fn shared_down(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(),
             },
         )
         .map_err(|error| DispatchError::Hip(error.to_string()))?;
-        hip(gpu.bf16_round_trip_f32(target))?;
     } else {
         hip(gpu.sigmoid_scaled_residual_add_batched_f32(
             target,
@@ -516,7 +516,9 @@ pub(crate) fn combine(
             p.batch_size,
         ))?;
     }
-    if p.recipe.bf16_round_trip() {
+    // A shared down placed after the combine rounds `target` to BF16 as its
+    // first read, so the round trip is owed only when nothing follows.
+    if p.recipe.bf16_round_trip() && !p.recipe.shared_after_combine() {
         hip(gpu.bf16_round_trip_f32(target))?;
     }
     Ok(())
