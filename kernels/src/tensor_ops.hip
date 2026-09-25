@@ -984,13 +984,17 @@ extern "C" __global__ __launch_bounds__(256) void hyper_norm_gate_f32(
     // The whole row is loaded up front (ten values per branch per thread).
     float raw[branches][U];
     if (state_bf16) {
-        const unsigned short* s = (const unsigned short*)input + in;
+        // The BF16 row arrives with 16-byte loads into the LDS the normalized
+        // row later takes, then each thread reads its j = tid + 256u values.
+        const uint4* s = (const uint4*)((const unsigned short*)input + in);
+        for (int v = tid; v < wide / 8; v += 256) ((uint4*)xsb)[v] = s[v];
+        __syncthreads();
 #pragma unroll
         for (int b = 0; b < branches; ++b)
 #pragma unroll
             for (int u = 0; u < U; ++u)
                 raw[b][u] = u < per
-                    ? __uint_as_float((unsigned int)s[b * hidden + tid + 256 * u] << 16)
+                    ? __uint_as_float((unsigned int)xsb[b * hidden + tid + 256 * u] << 16)
                     : 0.0f;
     } else {
         const float* s = (const float*)input + in;
