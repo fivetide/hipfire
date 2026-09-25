@@ -391,7 +391,8 @@ fn mqv2_prefill_batch_tile(
 
         // MQ{2,3,5,6}V2 gfx1151 — promote QKVZA/QKV/residual BT4 and gate/up
         // BT12 for N>=96 (raw-bit + full-model wins across all four ops).
-        ("gfx1151", 6, Residual, 384..) => Some(8),
+        // MQ6 BT8 lowers to the X-LDS kernel, which beats BT4 from N=96 on.
+        ("gfx1151", 6, Residual, 96..) => Some(8),
         ("gfx1151", 2 | 3 | 5 | 6, Qkvza | Qkv | Residual, 96..) => Some(4),
         ("gfx1151", 2 | 3 | 5 | 6, GateUp, 96..) => Some(12),
 
