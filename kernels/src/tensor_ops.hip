@@ -1775,14 +1775,24 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
     // and read value 0, so they add +0.0 to sums that are never -0.0: the
     // accumulation is branch-free and still bitwise the skipping version.
     // Eight value loads are issued before their in-order accumulation.
+    // Token indices are block-uniform: read them as scalars and fetch each
+    // value row through a scalar buffer offset (invalid rows read row 0 and
+    // select 0.0, exactly the value the skipped row contributed).
+    const __amdgpu_buffer_rsrc_t vrsrc = __builtin_amdgcn_make_buffer_rsrc(
+        (void*)values, 0, 0x7FFFFFFF, 0x31004000);
+    const int voff = channel * 4;
+    auto value_at = [&](int index) {
+        const int token = __builtin_amdgcn_readfirstlane(row_selected[index]);
+        const bool ok = token >= 0 && token < full_capacity && token < visible;
+        const float v = __builtin_bit_cast(float, __builtin_amdgcn_raw_buffer_load_b32(
+            vrsrc, voff, ok ? token * kv_stride * 4 : 0, 0));
+        return ok ? v : 0.0f;
+    };
     int i = 0;
     for (; i + 8 <= selected_len; i += 8) {
         float value[8];
 #pragma unroll
-        for (int u = 0; u < 8; ++u) {
-            const int token = tokens[i + u];
-            value[u] = token >= 0 ? values[token * kv_stride + channel] : 0.0f;
-        }
+        for (int u = 0; u < 8; ++u) value[u] = value_at(i + u);
 #pragma unroll
         for (int u = 0; u < 8; ++u) {
             const float4 w4 = *reinterpret_cast<const float4*>(weights + (i + u) * QSA_HG);
@@ -1797,8 +1807,7 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
         }
     }
     for (; i < selected_len; ++i) {
-        const int token = tokens[i];
-        const float value = token >= 0 ? values[token * kv_stride + channel] : 0.0f;
+        const float value = value_at(i);
         const float4 w4 = *reinterpret_cast<const float4*>(weights + i * QSA_HG);
         denominator[0] += w4.x;
         numerator[0] += w4.x * value;
