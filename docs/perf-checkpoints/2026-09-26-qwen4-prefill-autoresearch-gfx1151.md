@@ -16,8 +16,9 @@ result, and not a product speed-floor update.
   (the Flash-Next pin in `AGENTS.md`).
 - Prompt `benchmarks/prompts/glimmer_prefill_1024.txt`, md5
   `0ee8f86ada3683eda452bc294ec824a9`, 1131 prompt tokens.
-- Harness `autoresearch.sh` on the branch. Final daemon (`1dcf81c02`, rebuilt
-  for this record) md5 `274f17b51f32177a8329a12a1a8fa15f`.
+- Harness `autoresearch.sh` at `fe1f26f76` (the campaign branch head; not kept
+  in the tree). Final daemon (`1dcf81c02`, rebuilt for this record) md5
+  `274f17b51f32177a8329a12a1a8fa15f`.
 
 ## Method
 
@@ -36,9 +37,9 @@ result, and not a product speed-floor update.
   predecessor: a kernel-level test against the replaced kernel, or matching
   output hashes in a standalone microbench, plus identical tokens.
 - Segment 2 (runs 105-180): non-bit-exact kernels admitted when KLD against
-  the BF16-source teacher (wikitext-2, 32 × 512 tokens, `qwen4_kld eval` +
-  `saddle-quant reduce`) is not separated-worse. The other segment-2 keeps
-  are bit-exact.
+  the BF16-source teacher (wikitext-2, 32 × 512 tokens; `qwen4_kld eval`,
+  built with `--features lab`, then `saddle-quant reduce`) is not
+  separated-worse. The other segment-2 keeps are bit-exact.
 - Several sub-1% keeps were confirmed with interleaved fresh-daemon A/B
   (9 + 9 samples) or rocprofv3 kernel deltas instead of the 3-sample median.
 - The GPU was shared with external `llama-server` processes. A run whose
