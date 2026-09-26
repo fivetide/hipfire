@@ -191,6 +191,13 @@ impl Gpu {
         if tokens == 0 || channels == 0 {
             return Ok(());
         }
+        // The kernel stages rows in GROUPED_GATE_CHUNK (64) index chunks.
+        if hidden_size % 64 != 0 {
+            return Err(HipError::new(
+                0,
+                "grouped gate hidden width must be a multiple of 64",
+            ));
+        }
         let tokens_i = checked_i32(tokens, "grouped gate token count")?;
         let hc_i = checked_i32(hc_count, "grouped branch count")?;
         let hidden_i = checked_i32(hidden_size, "grouped hidden width")?;
@@ -599,6 +606,11 @@ impl Gpu {
         let channels_i = checked_i32(channels, "grouped convolution channel count")?;
         let kernel_i = checked_i32(kernel_size, "grouped convolution kernel size")?;
         let dilation_i = checked_i32(dilation, "grouped convolution dilation")?;
+        // Tokens run in parallel chunks; a chunk of at least `history_rows`
+        // keeps every `state` read in chunk 0.
+        let chunk = history_rows.max(32);
+        let chunk_i = checked_i32(chunk, "grouped convolution token chunk")?;
+        let chunk_grid = checked_u32(tokens.div_ceil(chunk), "grouped convolution chunk grid")?;
         self.bind_thread()?;
         self.ensure_kernel(
             GROUPED_MODULE,
@@ -620,11 +632,12 @@ impl Gpu {
             &channels_i as *const _ as *mut c_void,
             &kernel_i as *const _ as *mut c_void,
             &dilation_i as *const _ as *mut c_void,
+            &chunk_i as *const _ as *mut c_void,
         ];
         let grid = checked_grid(channels, BLOCK, "grouped convolution channel grid")?;
         self.launch_maybe_blob(
             "grouped_depthwise_conv_silu_add_bf16",
-            [grid, 1, 1],
+            [grid, chunk_grid, 1],
             [BLOCK, 1, 1],
             0,
             &mut params,
@@ -639,6 +652,7 @@ impl Gpu {
                 blob.push_i32(channels_i);
                 blob.push_i32(kernel_i);
                 blob.push_i32(dilation_i);
+                blob.push_i32(chunk_i);
                 blob
             },
         )
@@ -976,6 +990,74 @@ mod tests {
         let want = gpu.download_f32(&want).unwrap();
         for (i, (a, b)) in got.iter().zip(&want).enumerate() {
             assert_eq!(a.to_bits(), b.to_bits(), "index {i}");
+        }
+    }
+
+    /// The BF16 convolution runs tokens in parallel chunks; outputs and the
+    /// rewritten history must still be bitwise the serial F32 kernel's, for a
+    /// prompt shorter than the history and one spanning several chunks.
+    #[test]
+    fn grouped_depthwise_bf16_chunks_match_serial_f32() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        const CHANNELS: usize = 300;
+        const KERNEL: usize = 4;
+        const DILATION: usize = 2;
+        const HISTORY: usize = (KERNEL - 1) * DILATION;
+        let wave = |n: usize, a: usize, b: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i * a % b) as f32 - b as f32 / 2.0) / b as f32)
+                .collect()
+        };
+        let weight_bits: Vec<u16> = wave(CHANNELS * KERNEL, 19, 197)
+            .iter()
+            .map(|v| (v.to_bits() >> 16) as u16)
+            .collect();
+        let weight_f32: Vec<f32> = weight_bits
+            .iter()
+            .map(|b| f32::from_bits((*b as u32) << 16))
+            .collect();
+        let weight = gpu.zeros(&[CHANNELS * KERNEL], DType::BF16).unwrap();
+        let bytes: Vec<u8> = weight_bits.iter().flat_map(|b| b.to_ne_bytes()).collect();
+        gpu.hip.memcpy_htod(&weight.buf, &bytes).unwrap();
+        let weight_wide = gpu.upload_f32(&weight_f32, &[CHANNELS * KERNEL]).unwrap();
+        for tokens in [3usize, 70] {
+            let gated = gpu
+                .upload_f32(&wave(tokens * CHANNELS, 37, 251), &[tokens * CHANNELS])
+                .unwrap();
+            let normed = gpu
+                .upload_f32(&wave(tokens * CHANNELS, 53, 241), &[tokens * CHANNELS])
+                .unwrap();
+            let history = wave(HISTORY * CHANNELS, 29, 233);
+            let state_got = gpu.upload_f32(&history, &[HISTORY * CHANNELS]).unwrap();
+            let state_want = gpu.upload_f32(&history, &[HISTORY * CHANNELS]).unwrap();
+            let got = gpu.zeros(&[tokens * CHANNELS], DType::F32).unwrap();
+            let want = gpu.zeros(&[tokens * CHANNELS], DType::F32).unwrap();
+            gpu.grouped_depthwise_conv_silu_add_bf16(
+                &gated, &normed, &weight, &state_got, &got, tokens, CHANNELS, KERNEL, DILATION,
+            )
+            .unwrap();
+            gpu.grouped_depthwise_conv_silu_add_f32(
+                &gated,
+                &normed,
+                &weight_wide,
+                &state_want,
+                &want,
+                tokens,
+                CHANNELS,
+                KERNEL,
+                DILATION,
+            )
+            .unwrap();
+            for (what, a, b) in [("output", &got, &want), ("state", &state_got, &state_want)] {
+                let a = gpu.download_f32(a).unwrap();
+                let b = gpu.download_f32(b).unwrap();
+                for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                    assert_eq!(x.to_bits(), y.to_bits(), "{tokens} tokens {what} index {i}");
+                }
+            }
         }
     }
 }

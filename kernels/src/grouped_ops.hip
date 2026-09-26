@@ -301,11 +301,16 @@ extern "C" __global__ void grouped_depthwise_conv_silu_add_bf16(
     int tokens,
     int channels,
     int kernel_size,
-    int dilation) {
+    int dilation,
+    int token_chunk) {
     const int channel = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (channel >= channels) return;
     const int history_rows = (kernel_size - 1) * dilation;
-    for (int token = 0; token < tokens; ++token) {
+    // Token chunk blockIdx.y; token_chunk >= history_rows, so only chunk 0
+    // reads `state`, and it alone rewrites it after its own reads.
+    const int token_begin = static_cast<int>(blockIdx.y) * token_chunk;
+    const int token_end = min(tokens, token_begin + token_chunk);
+    for (int token = token_begin; token < token_end; ++token) {
         float total = 0.0f;
         for (int tap = 0; tap < kernel_size; ++tap) {
             const int source = token + tap * dilation;
@@ -323,6 +328,7 @@ extern "C" __global__ void grouped_depthwise_conv_silu_add_bf16(
         output[token * channels + channel] =
             gated[token * channels + channel] + grouped_silu(total);
     }
+    if (blockIdx.y != 0) return;
     for (int row = 0; row < history_rows; ++row) {
         const int source = tokens + row;
         if (source < history_rows) {
