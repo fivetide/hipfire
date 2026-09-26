@@ -11,12 +11,12 @@
 // accumulates in F32); the epilogue is that kernel's expression.
 //
 // Block: hidden columns j0..j0+15 of all four branches (64 W rows, staged
-// in LDS) x 256 tokens; wave w takes the 16-token tiles w, w + 8.  X is the
+// in LDS) x 512 tokens; wave w takes the 16-token tiles w, w + 8, ...  X is the
 // WMMA A operand (tokens = rows), W the B operand (columns = j), so each
 // accumulator row is one token and the epilogue's normalized / mixed
 // accesses are contiguous in j.  The four branch accumulators of a lane hold
 // the same (token, j), so the branch mix is lane-local.
-// Grid [hidden / 16, ceil(N / 256)], block 256, dynamic LDS 64 * (K + 8) * 2
+// Grid [hidden / 16, ceil(N / 512)], block 256, dynamic LDS 64 * (K + 8) * 2
 // bytes.  hidden % 16 == 0, K % 16 == 0, K <= 504.
 
 typedef short __attribute__((ext_vector_type(16))) hru_bf16x16_t;
@@ -36,7 +36,7 @@ extern "C" __global__ __launch_bounds__(256) void hyper_read_up_wmma_bf16(
     int hidden,
     int K,
     int N) {
-    constexpr int TOKENS = 256;
+    constexpr int TOKENS = 512;  // 4% under 256: half the W staging per token
     extern __shared__ unsigned short hru_w[];
     const int ldw = K + 8;
     const int j0 = blockIdx.x * 16;

@@ -1002,7 +1002,7 @@ pub fn hyper_read_up_wmma(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<
     let low_rank = checked_i32(p.low_rank, "HC read low rank")?;
     let rows = checked_i32(p.rows, "HC read rows")?;
     let column_grid = checked_u32(p.hidden / 16, "HC read column grid")?;
-    let row_grid = checked_u32(p.rows.div_ceil(256), "HC read row grid")?;
+    let row_grid = checked_u32(p.rows.div_ceil(512), "HC read row grid")?;
     let lds_bytes = checked_u32(64 * (p.low_rank + 8) * 2, "HC read LDS")?;
     gpu.ensure_kernel_public(
         "hyper_read_up_wmma",
