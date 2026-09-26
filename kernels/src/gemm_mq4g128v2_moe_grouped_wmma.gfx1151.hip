@@ -46,7 +46,7 @@ __device__ __forceinline__ half16_t dq_nibbles(unsigned int lo, unsigned int hi,
 // single-header group ([0..2) f16 scale, [2..4) f16 zero, [4..68) 64 B
 // nibbles: byte i holds weight 2i low / 2i+1 high).  Eight K-tiles per group.
 // F16 dequant and F16 inputs: not bit-exact with the F32 SIMT kernels.
-// K % 128 == 0, K <= 640.  Same expert-tile grouping (up to four tiles per
+// K % 128 == 0.  Same expert-tile grouping (up to four tiles per
 // wave) and unrolled K-tile loop as the gate/up kernel.  Grid [ceil(M/16), m_total/16], block 32.
 // F32 -> BF16 bits, round to nearest even; non-finite values truncate (the
 // BF16 round trip leaves them unchanged).  Widening the bits back gives the
@@ -56,10 +56,6 @@ __device__ __forceinline__ unsigned short moe_bf16_bits(float v) {
     if (!isfinite(v)) return (unsigned short)(u >> 16);
     return (unsigned short)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
 }
-
-// K <= 640 (the only dispatched shape): 11 16-byte pieces per lane cover a
-// wave's 16 rows of 5 * 68 bytes.
-constexpr int MOE_DOWN_PIECES = 11;
 
 template <int NT, bool OUT_BF16>
 __device__ __forceinline__ void moe_down_wmma_tiles(
@@ -83,36 +79,45 @@ __device__ __forceinline__ void moe_down_wmma_tiles(
     const int row_bytes = groups_per_row * 68;
     float8_t acc[NT];
     for (int t = 0; t < NT; t++) acc[t] = float8_t{0, 0, 0, 0, 0, 0, 0, 0};
-    // The wave's 16 rows are one contiguous 16 * row_bytes span: stage it
-    // whole with b128 loads (per-lane 4-byte row reads ran DRAM well under
-    // streaming rate), then read each lane's row from LDS.
-    {
-        const int rows = min(16, M - row_start);
-        const int pieces = rows * row_bytes / 16;
-        const uint4* src = (const uint4*)(A + (long long)row_start * row_bytes);
-        uint4 v[MOE_DOWN_PIECES];
+    // The 16 rows' groups are staged in LDS one 68-byte group at a time,
+    // double-buffered: group g+1's 16 x 68 bytes (272 dwords, nine per lane)
+    // load while group g computes, so each wave overlaps its own weight
+    // stream (staging the whole 16-row tile first left every wave waiting
+    // on it before any compute).
+    const int rows_live = min(16, M - row_start);
+    const char* Ablk = A + (long long)row_start * row_bytes;
+    unsigned int pf[9];
+    auto load_group = [&](int g) {
 #pragma unroll
-        for (int i = 0; i < MOE_DOWN_PIECES; i++) v[i] = src[min(tid + 32 * i, pieces - 1)];
+        for (int i = 0; i < 9; i++) {
+            const int d = min(tid + 32 * i, 16 * 17 - 1);
+            const int r = min(d / 17, rows_live - 1), w = d - (d / 17) * 17;
+            pf[i] = *(const unsigned int*)(Ablk + r * row_bytes + g * 68 + w * 4);
+        }
+    };
+    auto store_group = [&](int buf) {
 #pragma unroll
-        for (int i = 0; i < MOE_DOWN_PIECES; i++) ((uint4*)a_lds)[min(tid + 32 * i, pieces - 1)] = v[i];
-        __syncthreads();
-    }
-    const char* row_base = (const char*)a_lds + (long long)min(lane, M - 1 - row_start) * row_bytes;
+        for (int i = 0; i < 9; i++) {
+            const int d = min(tid + 32 * i, 16 * 17 - 1);
+            a_lds[buf * 16 * 17 + d] = pf[i];
+        }
+    };
+    load_group(0);
+    store_group(0);
+    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+    const int my_row = min(lane, rows_live - 1);
     for (int g = 0; g < groups_per_row; g++) {
-        const char* gp = row_base + g * 68;
-        const unsigned int hdr = *(const unsigned int*)(gp);
+        if (g + 1 < groups_per_row) load_group(g + 1);
+        const unsigned int* gw = a_lds + (g & 1) * 16 * 17 + my_row * 17;
+        const unsigned int hdr = gw[0];
         const _Float16 sc_h = __builtin_bit_cast(_Float16, (unsigned short)(hdr & 0xFFFFu));
         const _Float16 zp_h = __builtin_bit_cast(_Float16, (unsigned short)(hdr >> 16));
 #pragma unroll (NT == 4 ? 2 : 4)  // full unroll spills at NT == 4
         for (int kt = 0; kt < 8; kt += 2) {
             const int k_off_a = kt * 16;
             const int k_off_b = (kt + 1) * 16;
-            const unsigned int pk0a = *(const unsigned int*)(gp + 4 + k_off_a / 2);
-            const unsigned int pk1a = *(const unsigned int*)(gp + 4 + k_off_a / 2 + 4);
-            const unsigned int pk0b = *(const unsigned int*)(gp + 4 + k_off_b / 2);
-            const unsigned int pk1b = *(const unsigned int*)(gp + 4 + k_off_b / 2 + 4);
-            const half16_t a_a = dq_nibbles(pk0a, pk1a, sc_h, zp_h);
-            const half16_t a_b = dq_nibbles(pk0b, pk1b, sc_h, zp_h);
+            const half16_t a_a = dq_nibbles(gw[1 + k_off_a / 8], gw[2 + k_off_a / 8], sc_h, zp_h);
+            const half16_t a_b = dq_nibbles(gw[1 + k_off_b / 8], gw[2 + k_off_b / 8], sc_h, zp_h);
 #pragma unroll
             for (int t = 0; t < NT; t++) {
                 half16_t b_a = zero_b, b_b = zero_b;
@@ -123,6 +128,10 @@ __device__ __forceinline__ void moe_down_wmma_tiles(
                 acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b_a, acc[t]);
                 acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_b, b_b, acc[t]);
             }
+        }
+        if (g + 1 < groups_per_row) {
+            store_group((g + 1) & 1);
+            asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
         }
     }
     // Lane l < 16 holds rows 2j of column l, lane l + 16 rows 2j + 1.  One
@@ -193,7 +202,7 @@ __device__ __forceinline__ void gemm_mq4g128v2_moe_grouped_wmma_gfx1151_entry(
     while (run < 4 && (tile_y + run) * 16 < m_total && expert_tile_ids[tile_y + run] == expert_id) ++run;
     const char* A = reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
     // Declared here, not in the NT-templated body: one allocation, not three.
-    __shared__ __align__(16) unsigned int a_lds[MOE_DOWN_PIECES * 32 * 4];
+    __shared__ __align__(16) unsigned int a_lds[2 * 16 * 17];
     // A three-tile run takes the four-tile body with its last tile masked.
     if (run >= 3)
         moe_down_wmma_tiles<4, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start, a_lds, run);
