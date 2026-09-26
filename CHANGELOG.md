@@ -4,8 +4,9 @@
 
 - Qwen4 prefill on gfx1151: 185 → 1301 tok/s on a 1131-token prompt
   (TTFT 6.10 → 0.87 s; decode unchanged at ~20 tok/s) for
-  `qwen3.8-flash-next.mq6q8-pleq8`. Routed MoE gate/up and down, the BF16
-  dense projections (through a model-lifetime F16 weight shadow), the HC
+  `qwen3.8-flash-next.mq6q8-pleq8`. Routed MoE gate/up (the WMMA kernel from
+  PR #775, @nwoolmer) and down, the BF16 dense projections (through a
+  model-lifetime F16 weight shadow), the HC
   read, full-window QSA attention and the chunked GDN recurrence run on F16
   WMMA from 512 tokens; KLD against the BF16 source is 0.073471 against
   0.074745 bit-exact, not separated. `HIPFIRE_QWEN4_F16_WMMA=0` keeps the
