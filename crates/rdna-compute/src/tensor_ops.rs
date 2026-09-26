@@ -3253,7 +3253,7 @@ mod tests {
                     let bits = if b & 0x7FFF_FFFF == 0 {
                         sign
                     } else {
-                        let exp = ((b >> 23) & 0xFF) as u16 - 127 + 15;
+                        let exp = ((b >> 23) & 0xFF) as u16 + 15 - 127;
                         sign | (exp << 10) | ((b >> 13) & 0x3FF) as u16
                     };
                     bits.to_le_bytes()
