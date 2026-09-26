@@ -579,7 +579,7 @@ GEN_RESID_BT(6, 8)
 // are the BT kernel's, so results are bitwise identical to it.
 // Grid: [ceil(M/(16*RW)), ceil(N/(16*BV))]. Block: [32*RW].
 // ---------------------------------------------------------------------------
-template <int BITS, int BV, int RW, bool OVERWRITE>
+template <int BITS, int BV, int RW, bool OVERWRITE, bool OUT_BF16 = false>
 __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
                                               const _Float16* __restrict__ X,
                                               float* __restrict__ Y,
@@ -709,6 +709,24 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
         const int out_col = batch_start + b * 16 + ml;
         const int row0 = row_start + 8 * lane_half;
         if (out_col >= N || row0 >= M) continue;
+        if (OUT_BF16) {
+            // Overwrite values rounded to BF16 (RNE; non-finite truncate), as
+            // BF16 bits: what a consumer that rounds each value first reads.
+            unsigned short* outb = (unsigned short*)Y + (long long)out_col * M + row0;
+            unsigned short h[8];
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const unsigned int u = __float_as_uint(0.0f + r[i]);
+                h[i] = isfinite(0.0f + r[i]) ? (unsigned short)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16)
+                                             : (unsigned short)(u >> 16);
+            }
+            if (row0 + 8 > M) {
+                for (int i = 0; row0 + i < M; i++) outb[i] = h[i];
+            } else {
+                *(uint4*)outb = __builtin_bit_cast(uint4, h);
+            }
+            continue;
+        }
         float* out = Y + (long long)out_col * M + row0;
         // Overwrite is the memset-then-accumulate result: +0.0 plus the sum
         // (not folded: IEEE keeps +0.0 + -0.0 = +0.0).
@@ -744,6 +762,15 @@ gemm_mq6g256v2_wmma_gfx11_bt8_x4(const char* __restrict__ A,
                                  float* __restrict__ Y,
                                  int M, int K, int N) {
     resid_bt_xlds<6, 8, 4, true>(A, X, Y, M, K, N);
+}
+
+// Y = W·X stored as BF16 bits (Y is [N, M] BF16).
+extern "C" __launch_bounds__(128, 1) __global__ void
+gemm_mq6g256v2_wmma_gfx11_bt8_x4_bf16out(const char* __restrict__ A,
+                                         const _Float16* __restrict__ X,
+                                         float* __restrict__ Y,
+                                         int M, int K, int N) {
+    resid_bt_xlds<6, 8, 4, true, true>(A, X, Y, M, K, N);
 }
 
 #endif // __gfx1100__ || __gfx1151__

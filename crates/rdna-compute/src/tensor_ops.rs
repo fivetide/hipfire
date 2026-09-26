@@ -1137,12 +1137,17 @@ pub struct GatedDeltaConvBatched<'a> {
 }
 
 pub fn gated_delta_conv_batched(gpu: &mut Gpu, p: &GatedDeltaConvBatched<'_>) -> HipResult<()> {
-    for tensor in [p.input, p.history, p.next_history] {
+    for tensor in [p.history, p.next_history] {
         ensure_f32(tensor)?;
     }
+    // Input and output are each F32 or BF16 bits (BF16-rounded values).
     let output_bf16 = p.output.dtype == DType::BF16;
     if !output_bf16 {
         ensure_f32(p.output)?;
+    }
+    let input_bf16 = p.input.dtype == DType::BF16;
+    if !input_bf16 {
+        ensure_f32(p.input)?;
     }
     if p.kernel.dtype != DType::BF16
         || p.rows == 0
@@ -1189,6 +1194,7 @@ pub fn gated_delta_conv_batched(gpu: &mut Gpu, p: &GatedDeltaConvBatched<'_>) ->
     args.push_i32(start_cursor);
     let start_cursor_offset = args.len() - 4;
     args.push_i32(i32::from(output_bf16));
+    args.push_i32(i32::from(input_bf16));
     args.pad_to(16);
     // `start_cursor` is `start_position % history_rows` for the chunk (the
     // kernel advances the ring per row from there), so the declared binding

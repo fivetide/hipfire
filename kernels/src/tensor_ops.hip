@@ -1098,15 +1098,25 @@ extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
     int history_rows,
     int kernel_size,
     int start_cursor,
-    int output_bf16) {
+    int output_bf16,
+    int input_bf16) {
     const int channel = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     const int r0 = (int)blockIdx.y * 16;
     if (channel >= channels || r0 >= rows
         || history_rows != 3 || kernel_size != 4) {
         return;
     }
+    // `input_bf16`: the projection is stored as BF16 bits (its rounded values).
+    auto in = [&](int j) {
+        if (input_bf16) {
+            __hip_bfloat16 b;
+            b.data = ((const unsigned short*)input)[j * channels + channel];
+            return b;
+        }
+        return bf16_round(input[j * channels + channel]);
+    };
     auto x = [&](int j) {
-        return j >= 0 ? bf16_round(input[j * channels + channel])
+        return j >= 0 ? in(j)
                       : bf16_round(history[((start_cursor + j + 3) % 3) * channels + channel]);
     };
     const float k0 = bf16_to_f32(kernel[channel * 4 + 0]);
@@ -1125,7 +1135,7 @@ extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
     }
     const int r1 = min(r0 + 16, rows);
     for (int r = r0; r < r1; ++r) {
-        const __hip_bfloat16 current_bf16 = bf16_round(input[r * channels + channel]);
+        const __hip_bfloat16 current_bf16 = in(r);
         float value = k3 * bf16_to_f32(current_bf16);
         value += k0 * bf16_to_f32(h0);
         value += k1 * bf16_to_f32(h1);

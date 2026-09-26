@@ -32774,6 +32774,10 @@ impl Gpu {
         let xlds = self.arch.as_str() == "gfx1151" && bits == 6 && batch_tile == 8;
         let (func_name, rows_per_block, block) = match (xlds, overwrite) {
             (true, false) => ("gemm_mq6g256v2_residual_wmma_gfx11_bt8_x4", 64, 128),
+            // A BF16 `y` takes the values rounded to BF16 (RNE) as BF16 bits.
+            (true, true) if y.dtype == DType::BF16 => {
+                ("gemm_mq6g256v2_wmma_gfx11_bt8_x4_bf16out", 64, 128)
+            }
             (true, true) => ("gemm_mq6g256v2_wmma_gfx11_bt8_x4", 64, 128),
             (false, false) => (func_name, 16, 32),
             (false, true) => {

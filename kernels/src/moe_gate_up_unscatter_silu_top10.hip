@@ -91,11 +91,18 @@ extern "C" __global__ __launch_bounds__(32, 16) void moe_gate_up_unscatter_silu_
     const int d0 = tid * 4;
     const int base = blockIdx.y * 128 + d0;
     const long long y_base = (long long)slot * 2 * mi;
+    // Four gate and four up values arrive as one 8-byte load each.
+    const uint2 gw = *(const uint2*)(Y_grouped + y_base + base);
+    const uint2 uw = *(const uint2*)(Y_grouped + y_base + mi + base);
+    const unsigned short gh[4] = {(unsigned short)gw.x, (unsigned short)(gw.x >> 16),
+                                  (unsigned short)gw.y, (unsigned short)(gw.y >> 16)};
+    const unsigned short uh[4] = {(unsigned short)uw.x, (unsigned short)(uw.x >> 16),
+                                  (unsigned short)uw.y, (unsigned short)(uw.y >> 16)};
     float a[4];
 #pragma unroll
     for (int i = 0; i < 4; i++) {
-        float v = moe_widen(Y_grouped[y_base + base + i]);
-        float u = moe_widen(Y_grouped[y_base + mi + base + i]);
+        float v = moe_widen(gh[i]);
+        float u = moe_widen(uh[i]);
         if (bf16_rt) {
             v = moe_bf16_round_trip(v);
             u = moe_bf16_round_trip(u);
@@ -130,15 +137,17 @@ extern "C" __global__ __launch_bounds__(32, 16) void moe_gate_up_unscatter_silu_
 #undef HBFLY4
 #undef HBFLY
     const float scale = 0.0883883476f;
-    _Float16* out = x16 + (long long)flat * mi + base;
+    // The four halves leave as one 8-byte store.
+    _Float16 h[4];
 #define ROT128_F16(i, v) do { \
         float r_ = (v) * scale * signs2[d0 + (i)]; \
         asm volatile("" : "+v"(r_)); \
-        out[i] = (_Float16)r_; \
+        h[i] = (_Float16)r_; \
     } while (0)
     ROT128_F16(0, v0);
     ROT128_F16(1, v1);
     ROT128_F16(2, v2);
     ROT128_F16(3, v3);
 #undef ROT128_F16
+    *(uint2*)(x16 + (long long)flat * mi + base) = __builtin_bit_cast(uint2, h);
 }

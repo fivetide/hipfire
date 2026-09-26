@@ -828,13 +828,42 @@ pub fn execute_gated_delta_net(
     let qk = op.key_heads * op.key_dim;
     let value = op.value_heads * op.value_dim;
     let qkv = 2 * qk + value;
-    let projection = view(op.projection, 0, op.rows * qkv);
+    let mut projection = view(op.projection, 0, op.rows * qkv);
     let projection2 = view(op.projection2, 0, op.rows * qkv);
     let a = view(op.a, 0, op.rows * op.value_heads);
     let b = view(op.b, 0, op.rows * op.value_heads);
     let gate = view(op.gate, 0, op.rows * op.value_heads);
     let beta = view(op.beta, 0, op.rows * op.value_heads);
     let z = view(op.z_output, 0, op.rows * value);
+    let history_rows = op.conv_kernel.saturating_sub(1);
+    let persistent_batch = gpu.arch_caps.is_gfx1151()
+        && op.rows > 1
+        && op.key_dim == 128
+        && op.value_dim == 128
+        && op.conv_kernel == 4;
+    let recurrent_output = view(op.recurrent_output, 0, op.rows * value);
+    let dims = GatedDeltaStepBatched {
+        projection: &projection2,
+        gate: &gate,
+        beta: &beta,
+        state: op.recurrent,
+        output: &recurrent_output,
+        rows: op.rows,
+        qkv_width: qkv,
+        key_heads: op.key_heads,
+        value_heads: op.value_heads,
+        key_dim: op.key_dim,
+        value_dim: op.value_dim,
+    };
+    let chunked = persistent_batch && gated_delta_chunk_route(gpu, &dims);
+    // On the chunked route the qkv projection is read (by the convolution)
+    // only through its BF16 rounding, so the MQ6 GEMM stores it as BF16 bits.
+    let bf16_store = |w: &WeightRef<'_>, gpu: &Gpu| {
+        chunked && w.dtype == DType::MQ6G256V2 && gpu.gemm_mq6g256v2_xf16_applies(w.k, op.rows)
+    };
+    if bf16_store(&op.qkv, gpu) {
+        projection.dtype = DType::BF16;
+    }
     project_weights(
         gpu,
         op.input,
@@ -847,33 +876,12 @@ pub fn execute_gated_delta_net(
             (&op.z, &z),
         ],
     )?;
-    let history_rows = op.conv_kernel.saturating_sub(1);
-    let persistent_batch = gpu.arch_caps.is_gfx1151()
-        && op.rows > 1
-        && op.key_dim == 128
-        && op.value_dim == 128
-        && op.conv_kernel == 4;
     let mut gdn_output = view(op.output_scratch, 0, op.rows * value);
     if persistent_batch {
         let start_cursor = op.start_position % history_rows;
-        let recurrent_output = view(op.recurrent_output, 0, op.rows * value);
         // The F16 prefill route's chunked recurrence reads the convolution
         // output as packed BF16 (every value is BF16-rounded already).
         let mut conv_output = view(op.projection2, 0, op.rows * qkv);
-        let dims = GatedDeltaStepBatched {
-            projection: &projection2,
-            gate: &gate,
-            beta: &beta,
-            state: op.recurrent,
-            output: &recurrent_output,
-            rows: op.rows,
-            qkv_width: qkv,
-            key_heads: op.key_heads,
-            value_heads: op.value_heads,
-            key_dim: op.key_dim,
-            value_dim: op.value_dim,
-        };
-        let chunked = gated_delta_chunk_route(gpu, &dims);
         if chunked {
             conv_output.dtype = DType::BF16;
         }
@@ -907,10 +915,7 @@ pub fn execute_gated_delta_net(
         ))?;
         // The chunked route's output is BF16-rounded: stored as BF16 when the
         // output projection rotates it straight to F16 (half the bytes).
-        if chunked
-            && op.output.dtype == DType::MQ6G256V2
-            && gpu.gemm_mq6g256v2_xf16_applies(op.output.k, op.rows)
-        {
+        if bf16_store(&op.output, gpu) {
             gdn_output.dtype = DType::BF16;
         }
         let step = GatedDeltaStepBatched {
