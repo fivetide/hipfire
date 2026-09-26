@@ -143,9 +143,15 @@ __global__ void mq_rotate_x(
 // mq_rotate_x writing F16 (the same float value, rounded as
 // convert_f32_to_f16 does): the MQ WMMA GEMMs' input without the F32
 // round trip and separate conversion pass.
-extern "C" __launch_bounds__(32, 16)
-__global__ void mq_rotate_x_f16(
-    const float* __restrict__ x_in,
+// F32 or BF16 input (the chunked GDN output stores its BF16-rounded values
+// as BF16 bits; widening them is exact, so both entries rotate equal values).
+static __device__ __forceinline__ float mq_rotate_load(const float* p) { return *p; }
+static __device__ __forceinline__ float mq_rotate_load(const unsigned short* p) {
+    return __uint_as_float((unsigned int)*p << 16);
+}
+template <typename XT>
+__device__ __forceinline__ void mq_rotate_x_f16_body(
+    const XT* __restrict__ x_in,
     _Float16* __restrict__ x_out,
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
@@ -158,20 +164,20 @@ __global__ void mq_rotate_x_f16(
     const int group = linear_group - batch * groups_total;
 
     const long long batch_off = (long long)batch * K;
-    const float* x_in_b  = x_in  + batch_off;
+    const XT* x_in_b  = x_in  + batch_off;
           _Float16* x_out_b = x_out + batch_off;
 
     int d0 = tid * 8;
     int base = group * 256 + d0;
 
-    float v0 = x_in_b[base]     * signs1[d0];
-    float v1 = x_in_b[base + 1] * signs1[d0 + 1];
-    float v2 = x_in_b[base + 2] * signs1[d0 + 2];
-    float v3 = x_in_b[base + 3] * signs1[d0 + 3];
-    float v4 = x_in_b[base + 4] * signs1[d0 + 4];
-    float v5 = x_in_b[base + 5] * signs1[d0 + 5];
-    float v6 = x_in_b[base + 6] * signs1[d0 + 6];
-    float v7 = x_in_b[base + 7] * signs1[d0 + 7];
+    float v0 = mq_rotate_load(x_in_b + base)     * signs1[d0];
+    float v1 = mq_rotate_load(x_in_b + base + 1) * signs1[d0 + 1];
+    float v2 = mq_rotate_load(x_in_b + base + 2) * signs1[d0 + 2];
+    float v3 = mq_rotate_load(x_in_b + base + 3) * signs1[d0 + 3];
+    float v4 = mq_rotate_load(x_in_b + base + 4) * signs1[d0 + 4];
+    float v5 = mq_rotate_load(x_in_b + base + 5) * signs1[d0 + 5];
+    float v6 = mq_rotate_load(x_in_b + base + 6) * signs1[d0 + 6];
+    float v7 = mq_rotate_load(x_in_b + base + 7) * signs1[d0 + 7];
 
     // Local butterfly: strides 1, 2, 4
     float t;
@@ -212,18 +218,33 @@ __global__ void mq_rotate_x_f16(
     // The F32 product is pinned before the conversion: fast-math may otherwise
     // fold the scale into an F16 multiply and round differently from
     // mq_rotate_x followed by convert_f32_to_f16.
+    // One 16-byte store of the eight halves.
+    _Float16 h_[8];
     #define MQ_ROT_F16(o, v, d) do { \
         float r_ = (v) * s * signs2[d]; \
         asm volatile("" : "+v"(r_)); \
-        x_out_b[o] = (_Float16)r_; \
+        h_[o] = (_Float16)r_; \
     } while (0)
-    MQ_ROT_F16(base, v0, d0);
-    MQ_ROT_F16(base + 1, v1, d0 + 1);
-    MQ_ROT_F16(base + 2, v2, d0 + 2);
-    MQ_ROT_F16(base + 3, v3, d0 + 3);
-    MQ_ROT_F16(base + 4, v4, d0 + 4);
-    MQ_ROT_F16(base + 5, v5, d0 + 5);
-    MQ_ROT_F16(base + 6, v6, d0 + 6);
-    MQ_ROT_F16(base + 7, v7, d0 + 7);
+    MQ_ROT_F16(0, v0, d0);
+    MQ_ROT_F16(1, v1, d0 + 1);
+    MQ_ROT_F16(2, v2, d0 + 2);
+    MQ_ROT_F16(3, v3, d0 + 3);
+    MQ_ROT_F16(4, v4, d0 + 4);
+    MQ_ROT_F16(5, v5, d0 + 5);
+    MQ_ROT_F16(6, v6, d0 + 6);
+    MQ_ROT_F16(7, v7, d0 + 7);
     #undef MQ_ROT_F16
+    *(uint4*)(x_out_b + base) = __builtin_bit_cast(uint4, h_);
+}
+extern "C" __launch_bounds__(32, 16)
+__global__ void mq_rotate_x_f16(
+    const float* __restrict__ x_in, _Float16* __restrict__ x_out,
+    const float* __restrict__ signs1, const float* __restrict__ signs2, int K) {
+    mq_rotate_x_f16_body(x_in, x_out, signs1, signs2, K);
+}
+extern "C" __launch_bounds__(32, 16)
+__global__ void mq_rotate_x_bf16_f16(
+    const unsigned short* __restrict__ x_in, _Float16* __restrict__ x_out,
+    const float* __restrict__ signs1, const float* __restrict__ signs2, int K) {
+    mq_rotate_x_f16_body(x_in, x_out, signs1, signs2, K);
 }

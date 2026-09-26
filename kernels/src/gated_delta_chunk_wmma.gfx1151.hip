@@ -19,7 +19,8 @@
 // registers; a C tile becomes a B operand by swapping half-waves.  The next
 // chunk's inputs are prefetched into registers during the current one; the
 // block barriers wait on LDS only, so the prefetch stays in flight.
-// `projection` is the convolution output as packed BF16 bits.
+// `projection` is the convolution output as packed BF16 bits.  The output
+// values are BF16-rounded; `output_bf16` stores them as BF16 bits, else F32.
 // Grid [value_heads], block 256.  key_dim == value_dim == 128.
 
 typedef _Float16 __attribute__((ext_vector_type(16))) gc_h16;
@@ -52,8 +53,8 @@ __launch_bounds__(256)
 extern "C" __global__ void gated_delta_chunk_gate_wmma(
     const unsigned short* __restrict__ projection, const unsigned short* __restrict__ qn, const unsigned short* __restrict__ kn,
     const float* __restrict__ gate, const float* __restrict__ beta, float* __restrict__ state,
-    const float* __restrict__ z, const hip_bfloat16* __restrict__ norm, float* __restrict__ output,
-    int rows, int qkv_width, int key_heads, int value_heads, float query_scale) {
+    const float* __restrict__ z, const hip_bfloat16* __restrict__ norm, void* __restrict__ output,
+    int rows, int qkv_width, int key_heads, int value_heads, float query_scale, int output_bf16) {
     const int vh = blockIdx.x;
     const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, l16 = lane & 15, hi = lane >> 4;
     const int kh = vh / (value_heads / key_heads);
@@ -120,7 +121,11 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
                 const float v = __uint_as_float((unsigned int)out_s[r][c] << 16);
                 const float normalized = gc_bf16r(v * inv_s[r] * nw);
                 const float g = gc_bf16r(zc[i]);
-                output[at] = gc_bf16r(normalized / (1.0f + expf(-g)));
+                const float y = gc_bf16r(normalized / (1.0f + expf(-g)));
+                if (output_bf16)
+                    ((unsigned short*)output)[at] = (unsigned short)(__float_as_uint(y) >> 16);
+                else
+                    ((float*)output)[at] = y;
             }
         }
     };

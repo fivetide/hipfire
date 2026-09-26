@@ -289,8 +289,13 @@ pub fn gated_delta_step_gate_wmma(
     if !gated_delta_chunk_route(gpu, p) || p.projection.dtype != DType::BF16 {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
-    for tensor in [p.gate, p.beta, p.state, gate.z, gate.output] {
+    for tensor in [p.gate, p.beta, p.state, gate.z] {
         ensure_f32(tensor)?;
+    }
+    // The gated output is BF16-rounded: stored as BF16 bits or F32.
+    let output_bf16 = gate.output.dtype == DType::BF16;
+    if !output_bf16 {
+        ensure_f32(gate.output)?;
     }
     let qk = checked_product(p.key_heads, p.key_dim, "GDN chunk qk extent")?;
     let value = checked_product(p.value_heads, p.value_dim, "GDN chunk value extent")?;
@@ -354,6 +359,7 @@ pub fn gated_delta_step_gate_wmma(
     args.push_i32(key_heads);
     args.push_i32(value_heads);
     args.push_f32((p.key_dim as f32).sqrt().recip());
+    args.push_i32(i32::from(output_bf16));
     args.pad_to(16);
     gpu.launch_blob_recorded(
         "gated_delta_chunk_gate_wmma",

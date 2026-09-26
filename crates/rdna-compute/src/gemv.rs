@@ -3473,6 +3473,7 @@ impl Gpu {
     /// `rotate_x_mq_batched` into the shared FP16 X scratch (gfx11 wave32):
     /// the rotated rows rounded to F16 as `convert_f32_to_f16` would, for the
     /// MQ WMMA GEMMs' `*_xf16` entries.  Valid until the next FP16 conversion.
+    /// `x` is F32 or BF16.
     pub fn rotate_x_mq_batched_f16(
         &mut self,
         x: &GpuTensor,
@@ -3480,7 +3481,12 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<GpuTensor> {
         self.bind_thread()?;
-        self.ensure_kernel("mq_rotate_x", kernels::GEMV_MQ4G256_SRC, "mq_rotate_x_f16")?;
+        let func = if x.dtype == DType::BF16 {
+            "mq_rotate_x_bf16_f16"
+        } else {
+            "mq_rotate_x_f16"
+        };
+        self.ensure_kernel("mq_rotate_x", kernels::GEMV_MQ4G256_SRC, func)?;
         self.ensure_mq_signs()?;
         let out = self.qwen4_f16_x_scratch(k * batch_size)?;
         let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
@@ -3496,7 +3502,7 @@ impl Gpu {
             &kv as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            "mq_rotate_x_f16",
+            func,
             [((k / 256) * batch_size) as u32, 1, 1],
             [32, 1, 1],
             0,

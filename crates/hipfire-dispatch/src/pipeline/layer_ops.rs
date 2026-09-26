@@ -155,6 +155,15 @@ pub fn project_weights(
             }
         }
     }
+    // Only the shared MQ6 rotation reads a BF16 activation.
+    if input.dtype != DType::F32 && done.iter().any(|d| !d) {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "layer-operations",
+            variant: "non-f32-activation",
+            arch: "",
+            quant: "unsupported",
+        });
+    }
     // BF16 weights on the F16 WMMA route: one F16 conversion per K.
     for i in 0..projections.len() {
         let (weight, _) = projections[i];
@@ -844,6 +853,7 @@ pub fn execute_gated_delta_net(
         && op.key_dim == 128
         && op.value_dim == 128
         && op.conv_kernel == 4;
+    let mut gdn_output = view(op.output_scratch, 0, op.rows * value);
     if persistent_batch {
         let start_cursor = op.start_position % history_rows;
         let recurrent_output = view(op.recurrent_output, 0, op.rows * value);
@@ -895,7 +905,14 @@ pub fn execute_gated_delta_net(
                 heads: op.value_heads,
             },
         ))?;
-        let gdn_output = view(op.output_scratch, 0, op.rows * value);
+        // The chunked route's output is BF16-rounded: stored as BF16 when the
+        // output projection rotates it straight to F16 (half the bytes).
+        if chunked
+            && op.output.dtype == DType::MQ6G256V2
+            && gpu.gemm_mq6g256v2_xf16_applies(op.output.k, op.rows)
+        {
+            gdn_output.dtype = DType::BF16;
+        }
         let step = GatedDeltaStepBatched {
             projection: &conv_output,
             ..dims
@@ -1007,7 +1024,7 @@ pub fn execute_gated_delta_net(
     project_weight(
         gpu,
         &op.output,
-        &op.output_scratch.sub_offset(0, op.rows * value),
+        &gdn_output,
         &output_batch,
         op.rows,
         Some(op.rotation),
