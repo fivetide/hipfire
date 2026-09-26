@@ -141,56 +141,43 @@ __device__ __forceinline__ void moe_grouped_wmma_k2_tiles(
                 x_base[t] = X_src + (long long)((x_row_div > 1) ? (flat / x_row_div) : flat) * K;
         }
     }
-    const int safe_row = (row_start + lane < M) ? (row_start + lane) : (M - 1);
     const int groups_per_row = K / 256;
     const int row_bytes = groups_per_row * 136;
     float8_t acc[NT];
     for (int t = 0; t < NT; t++) acc[t] = float8_t{0, 0, 0, 0, 0, 0, 0, 0};
-    if (groups_per_row % 2 != 0) {
-        // Odd group count: rows are not 16-byte aligned for the staged path.
-        const char* row_base = A + (long long)safe_row * row_bytes;
-        for (int g = 0; g < groups_per_row; g++)
-            moe_grouped_wmma_k2_group<NT>((const unsigned int*)(row_base + g * 136), x_base, g, acc);
-    } else {
-        // Two groups of the 16 rows at a time: each row's 272 contiguous bytes
-        // arrive with whole-line b128 loads (piece p = row p / 17, 16-byte
-        // chunk p % 17; nine per lane, the last clamped so no lane branches)
-        // and are staged in LDS for the lanes' row reads.  Loading 16 bytes of
-        // 16 rows per instruction ran DRAM ~25% under streaming rate.  The
-        // next pair is fetched into registers while this one computes.
-#define MOE_A_PIECE(i) min(tid + 32 * (i), 16 * 17 - 1)
-#define MOE_A_LOAD(v, i, G0)                                                         \
-    {                                                                                \
-        const int p_ = MOE_A_PIECE(i), r_ = p_ / 17;                                 \
-        v = *(const uint4*)(A + (long long)min(row_start + r_, M - 1) * row_bytes + \
-                            (G0) * 136 + (p_ - r_ * 17) * 16);                       \
-    }
-#define MOE_A_STORE(v, i)                                                  \
-    {                                                                      \
-        const int p_ = MOE_A_PIECE(i), r_ = p_ / 17;                       \
-        *(uint4*)(a_lds + r_ * 68 + (p_ - r_ * 17) * 4) = v;               \
-    }
-#define MOE_A_FETCH(G0)                                                         \
-    MOE_A_LOAD(n0, 0, G0) MOE_A_LOAD(n1, 1, G0) MOE_A_LOAD(n2, 2, G0)           \
-    MOE_A_LOAD(n3, 3, G0) MOE_A_LOAD(n4, 4, G0) MOE_A_LOAD(n5, 5, G0)           \
-    MOE_A_LOAD(n6, 6, G0) MOE_A_LOAD(n7, 7, G0) MOE_A_LOAD(n8, 8, G0)
-        uint4 n0, n1, n2, n3, n4, n5, n6, n7, n8;
-        MOE_A_FETCH(0)
-        for (int g0 = 0; g0 < groups_per_row; g0 += 2) {
-            __syncthreads();
-            MOE_A_STORE(n0, 0) MOE_A_STORE(n1, 1) MOE_A_STORE(n2, 2)
-            MOE_A_STORE(n3, 3) MOE_A_STORE(n4, 4) MOE_A_STORE(n5, 5)
-            MOE_A_STORE(n6, 6) MOE_A_STORE(n7, 7) MOE_A_STORE(n8, 8)
-            __syncthreads();
-            if (g0 + 2 < groups_per_row) { MOE_A_FETCH(g0 + 2) }
-#pragma unroll 1
-            for (int gi = 0; gi < 2; gi++)
-                moe_grouped_wmma_k2_group<NT>(a_lds + lane * 68 + gi * 34, x_base, g0 + gi, acc);
+    // One 136-byte group of the 16 rows at a time (272 8-byte pieces,
+    // nine per lane, the last clamped so no lane branches), double-
+    // buffered in LDS: group g+1 loads while group g computes.  Loading
+    // 16 bytes of 16 rows per instruction ran DRAM ~25% under streaming
+    // rate; group-pair steps overlapped less of each wave's own stream.
+    const char* Ablk = A + (long long)row_start * row_bytes;
+    const int rows_live = min(16, M - row_start);
+    unsigned long long pf[9];
+    auto load_group = [&](int g) {
+#pragma unroll
+        for (int i = 0; i < 9; i++) {
+            const int p = min(tid + 32 * i, 16 * 17 - 1);
+            const int r = min(p / 17, rows_live - 1), w = p - (p / 17) * 17;
+            pf[i] = *(const unsigned long long*)(Ablk + r * row_bytes + g * 136 + w * 8);
         }
-#undef MOE_A_FETCH
-#undef MOE_A_STORE
-#undef MOE_A_LOAD
-#undef MOE_A_PIECE
+    };
+    auto store_group = [&](int buf) {
+#pragma unroll
+        for (int i = 0; i < 9; i++) {
+            const int p = min(tid + 32 * i, 16 * 17 - 1);
+            *(unsigned long long*)(a_lds + buf * 16 * 34 + p * 2) = pf[i];
+        }
+    };
+    load_group(0);
+    store_group(0);
+    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+    for (int g = 0; g < groups_per_row; g++) {
+        if (g + 1 < groups_per_row) load_group(g + 1);
+        moe_grouped_wmma_k2_group<NT>(a_lds + (g & 1) * 16 * 34 + lane * 34, x_base, g, acc);
+        if (g + 1 < groups_per_row) {
+            store_group((g + 1) & 1);
+            asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+        }
     }
     // Lane l < 16 holds rows 2j of column l, lane l + 16 rows 2j + 1.  One
     // cross-half swap gives the low lane rows 0..7 and the high lane rows
