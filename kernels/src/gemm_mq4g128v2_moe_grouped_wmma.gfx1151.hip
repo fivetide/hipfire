@@ -11,19 +11,26 @@ typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
 typedef _Float16 __attribute__((ext_vector_type(2))) half2_p_t;
 typedef unsigned int __attribute__((ext_vector_type(8))) uint8_p_t;
-// Weights 2j, 2j+1 of nibble words (lo, hi) as sc*q + zp in F16: 0x6400 | q
-// is exactly 1024 + q, minus 1024 is exactly q, and one fused multiply-add
-// per pair is the per-element fma the scalar decode compiles to.
+// Weights 2j, 2j+1 of nibble words (lo, hi) as sc*q + zp in F16.
 __device__ __forceinline__ half16_t dq_nibbles(unsigned int lo, unsigned int hi,
                                               _Float16 sc, _Float16 zp) {
+    // Byte p of a word holds weights 2p (low nibble) and 2p + 1 (high
+    // nibble).  One byte permute copies byte p into bytes 0 and 2, one and-or
+    // keeps the low nibble at bits 0-3 of half 0 (0x6400 | q is exactly
+    // 1024 + q) and the high nibble at bits 4-7 of half 1 (0x5400 | q << 4 is
+    // exactly 64 + q), so subtracting {1024, 64} yields both codes exactly and
+    // one fused multiply-add per pair is the per-element sc * q + zp.
     const half2_p_t sc2 = {sc, sc};
     const half2_p_t zp2 = {zp, zp};
-    const half2_p_t bias = {(_Float16)1024.0f, (_Float16)1024.0f};
+    const half2_p_t bias = {(_Float16)1024.0f, (_Float16)64.0f};
     uint8_p_t out;
 #pragma unroll
     for (int p = 0; p < 8; p++) {
-        const unsigned int t = (p < 4 ? lo : hi) >> (8 * (p & 3));
-        const unsigned int bits = (t & 0xFu) | ((t << 12) & 0xF0000u) | 0x64006400u;
+        const unsigned int w = p < 4 ? lo : hi;
+        const unsigned int b = (unsigned)(p & 3);
+        const unsigned int bits =
+            (__builtin_amdgcn_perm(w, w, b | (12u << 8) | (b << 16) | (12u << 24)) & 0x00F0000Fu)
+            | 0x54006400u;
         const half2_p_t q2 = __builtin_bit_cast(half2_p_t, bits) - bias;
         out[p] = __builtin_bit_cast(unsigned int, __builtin_elementwise_fma(sc2, q2, zp2));
     }
