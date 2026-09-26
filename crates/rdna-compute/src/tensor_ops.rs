@@ -146,7 +146,8 @@ pub fn gated_delta_step(gpu: &mut Gpu, p: &GatedDeltaStep<'_>) -> HipResult<()> 
     let value_dim = checked_i32(p.value_dim, "GDN value width")?;
     let value_heads_grid = checked_u32(p.value_heads, "GDN value-head grid")?;
     let value_dim_grid = blocks(p.value_dim)?;
-    let shared_norm128 = gpu.arch_caps.is_gfx1151() && p.key_dim == 128 && p.value_dim == 128;
+    let shared_norm128 =
+        gpu.arch_caps.qwen4_tuned_routes() && p.key_dim == 128 && p.value_dim == 128;
     let kernel = if shared_norm128 {
         "gated_delta_step_shared_norm128_gfx1151"
     } else {
@@ -260,11 +261,11 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     )
 }
 /// Whether [`gated_delta_step_gate_wmma`] applies: the Qwen4 F16 prefill
-/// route (gfx1151, >= QWEN4_F16_WMMA_MIN_TOKENS rows, no recorder or capture,
+/// route (Qwen4-tuned arch, >= QWEN4_F16_WMMA_MIN_TOKENS rows, no recorder or capture,
 /// not opted out) with 128-wide heads.  Decided before the convolution, which
 /// then stores its output as packed BF16 for that kernel.
 pub fn gated_delta_chunk_route(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool {
-    gpu.arch_caps.is_gfx1151()
+    gpu.arch_caps.qwen4_tuned_routes()
         && p.rows >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
         && *crate::gemm::QWEN4_F16_WMMA
         && !gpu.replay.is_recording()
@@ -983,7 +984,7 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
 pub fn hyper_read_up_wmma(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<()> {
     ensure_f32(p.mixed)?;
     let wide = checked_product(4, p.hidden, "HC read width")?;
-    if !gpu.arch_caps.is_gfx1151()
+    if !gpu.arch_caps.qwen4_tuned_routes()
         || p.low.dtype != DType::BF16
         || p.normalized.dtype != DType::F16
         || p.up_weight.dtype != DType::BF16
@@ -1782,7 +1783,7 @@ pub fn indexed_attention_select(gpu: &mut Gpu, p: &IndexedAttentionSelect<'_>) -
     let (kernel_name, block, shared_mem) =
         match p.block_count.checked_mul(std::mem::size_of::<f32>()) {
             Some(bytes)
-                if gpu.arch_caps.is_gfx1151()
+                if gpu.arch_caps.qwen4_tuned_routes()
                     && bytes <= QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES
                     && bytes <= u32::MAX as usize =>
             {
@@ -1931,7 +1932,7 @@ pub fn indexed_attention_select_batch(
     let (kernel_name, block, shared_mem) =
         match shape_blocks.checked_mul(std::mem::size_of::<f32>()) {
             Some(bytes)
-                if gpu.arch_caps.is_gfx1151()
+                if gpu.arch_caps.qwen4_tuned_routes()
                     && shape_blocks > 0
                     && bytes <= QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES
                     && bytes <= u32::MAX as usize =>
@@ -2249,7 +2250,7 @@ pub fn indexed_attention_attention(
     let (kernel_name, shared_mem) =
         match p.selected_len.checked_mul(QSA_ATTENTION_LDS_BYTES_PER_ROW) {
             Some(bytes)
-                if gpu.arch_caps.is_gfx1151()
+                if gpu.arch_caps.qwen4_tuned_routes()
                     && bytes <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
                     && bytes <= u32::MAX as usize =>
             {
@@ -2316,7 +2317,7 @@ const QSA_ATTENTION_HG4_HEADS: usize = 4;
 const QSA_ATTENTION_HG4_MIN_ROWS: usize = 16;
 
 /// Dynamic LDS for the grouped kernel, or `None` when the shape is not the one
-/// it is specialised for (gfx1151, head_dim 256, four heads per KV group,
+/// it is specialised for (Qwen4-tuned arch, head_dim 256, four heads per KV group,
 /// prefill-sized row counts).
 fn qsa_attention_hg4_lds_bytes(
     gpu: &Gpu,
@@ -2324,7 +2325,7 @@ fn qsa_attention_hg4_lds_bytes(
     shape_selected: usize,
 ) -> Option<u32> {
     let group = p.n_heads / p.n_kv_heads;
-    if !gpu.arch_caps.is_gfx1151()
+    if !gpu.arch_caps.qwen4_tuned_routes()
         || p.head_dim != 256
         || group % QSA_ATTENTION_HG4_HEADS != 0
         || p.rows < QSA_ATTENTION_HG4_MIN_ROWS
@@ -2458,7 +2459,7 @@ fn indexed_attention_attention_batch_impl(
         let dim_grid = blocks(p.head_dim)?;
         match shape_selected.checked_mul(QSA_ATTENTION_LDS_BYTES_PER_ROW) {
             Some(bytes)
-                if gpu.arch_caps.is_gfx1151()
+                if gpu.arch_caps.qwen4_tuned_routes()
                     && shape_selected > 0
                     && bytes <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
                     && bytes <= u32::MAX as usize =>
@@ -2522,7 +2523,7 @@ fn indexed_attention_attention_batch_impl(
     )
 }
 
-/// Whether the dense F16 WMMA attention applies: the Qwen4 F16 route (gfx1151,
+/// Whether the dense F16 WMMA attention applies: the Qwen4 F16 route (Qwen4-tuned arch,
 /// >= QWEN4_F16_WMMA_MIN_TOKENS rows, no recorder or capture, not opted out),
 /// head_dim 256 in four-head KV groups, and every row's selection is its
 /// whole causal window: the budget covers every visible block and the
@@ -2533,7 +2534,7 @@ fn qsa_dense_wmma_applies(
     p: &IndexedAttentionAttentionBatch<'_>,
     end_position: usize,
 ) -> bool {
-    gpu.arch_caps.is_gfx1151()
+    gpu.arch_caps.qwen4_tuned_routes()
         && p.rows >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
         && *crate::gemm::QWEN4_F16_WMMA
         && !gpu.replay.is_recording()
@@ -3129,8 +3130,8 @@ mod tests {
             eprintln!("skip: no GPU");
             return;
         };
-        if !gpu.arch_caps.is_gfx1151() {
-            eprintln!("skip: needs gfx1151");
+        if !gpu.arch_caps.qwen4_tuned_routes() {
+            eprintln!("skip: Qwen4-tuned routes are off on this GPU");
             return;
         }
         let (rows, hidden, low_rank) = (131usize, 2560usize, 320usize);
@@ -3240,7 +3241,7 @@ mod tests {
             "BF16-normalized HC read differs"
         );
         let wmma = gpu.zeros(&[rows * hidden], DType::F32).expect("wmma");
-        if gpu.arch_caps.is_gfx1151() {
+        if gpu.arch_caps.qwen4_tuned_routes() {
             // hyper_norm_f16's F16 copy: the BF16-rounded values, exact in F16
             // (all nonzero |v| here are normal F16s).
             let f16_bytes: Vec<u8> = wave(3, rows * wide, 2.0)
@@ -3438,8 +3439,8 @@ mod tests {
             eprintln!("skip: no GPU");
             return;
         };
-        if !gpu.arch_caps.is_gfx1151() || !*crate::gemm::QWEN4_F16_WMMA {
-            eprintln!("skip: the chunked arm is the gfx1151 F16 route");
+        if !gpu.arch_caps.qwen4_tuned_routes() || !*crate::gemm::QWEN4_F16_WMMA {
+            eprintln!("skip: Qwen4-tuned routes are off on this GPU");
             return;
         }
         let (key_heads, value_heads, dim, rows) = (2usize, 6usize, 128usize, 530usize);
@@ -4214,8 +4215,8 @@ mod tests {
             eprintln!("skip: no GPU");
             return;
         };
-        if !gpu.arch_caps.is_gfx1151() {
-            eprintln!("skip: grouped QSA attention is gfx1151-only");
+        if !gpu.arch_caps.qwen4_tuned_routes() {
+            eprintln!("skip: Qwen4-tuned routes are off on this GPU");
             return;
         }
         let (n_heads, n_kv_heads, head_dim, compress) = (24usize, 2usize, 256usize, 4usize);
@@ -4330,8 +4331,8 @@ mod tests {
             eprintln!("skip: no GPU");
             return;
         };
-        if !gpu.arch_caps.is_gfx1151() || !*crate::gemm::QWEN4_F16_WMMA {
-            eprintln!("skip: dense QSA WMMA is the gfx1151 F16 route");
+        if !gpu.arch_caps.qwen4_tuned_routes() || !*crate::gemm::QWEN4_F16_WMMA {
+            eprintln!("skip: Qwen4-tuned routes are off on this GPU");
             return;
         }
         let (n_heads, n_kv_heads, head_dim, compress) = (24usize, 2usize, 256usize, 4usize);

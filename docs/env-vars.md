@@ -155,6 +155,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_CALIB_BF16` | Calibration-only: keep native-BF16 teachers in BF16 (`kernel.calib_force_bf16`, default off; shipped inference unaffected) |
 | `HIPFIRE_GFX12_MQ4V2_FP8_GATEUP` / `_RESID` / `_QKVZA` / `_QKV` | gfx1201 FP8-WMMA MQ4v2 prefill route — default ON on exact gfx1201 (prefill chunk 512); `=0` on any one opts out toward the F16 path (chunk 384). `=1` forces on; launchers stay exact-gfx1201-only, so other arches are unchanged |
 | `HIPFIRE_GFX12_MQ4V2_FP8_SLABS` | Two-slab S2BT8 FP8 symbols by default; `=1` selects the single-slab symbols |
+| `HIPFIRE_QWEN4_GFX11` | Qwen4 routes tuned on gfx1151 (F16 WMMA prefill, MQ6 X-LDS, MoE/BF16/GDN/HC/QSA kernels) run by default on the RDNA3.5 APUs gfx1150/1151/1152; `=1` (`developer.qwen4_gfx11`) admits every other gfx11 GPU. Unmeasured there; gfx12 and older never take them (`ArchCaps::qwen4_tuned_routes`) |
 
 ### LFM (arch 11) — branch-scoped optimized prefill
 

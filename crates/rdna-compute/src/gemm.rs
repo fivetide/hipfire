@@ -19,7 +19,7 @@ use std::sync::OnceLock;
 pub(crate) static QWEN4_F16_WMMA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_var("HIPFIRE_QWEN4_F16_WMMA").map_or(true, |v| v.trim() != "0")
 });
-/// Tokens from which the F16 WMMA arms are used on gfx1151 (the MoE gate/up
+/// Tokens from which the F16 WMMA arms are used (measured on gfx1151; the MoE gate/up
 /// arm is slower below ~450; the others break even or win).
 pub(crate) const QWEN4_F16_WMMA_MIN_TOKENS: usize = 512;
 
@@ -342,6 +342,8 @@ pub(crate) enum ResidualVerifyTier {
 fn mqv2_gfx11_bt_admitted(arch: &str, bits: u8) -> bool {
     match arch {
         "gfx1151" => matches!(bits, 2 | 3 | 5 | 6),
+        // MQ6 residual BT8 (the X-LDS kernel) for the Qwen4-tuned APU class.
+        "gfx1150" | "gfx1152" => bits == 6,
         // Exact gfx1100 MQ3 remains quarantined; MQ5/MQ6 are production.
         "gfx1100" => matches!(bits, 5 | 6),
         _ => false,
@@ -402,8 +404,9 @@ fn mqv2_prefill_batch_tile(
 
         // MQ{2,3,5,6}V2 gfx1151 — promote QKVZA/QKV/residual BT4 and gate/up
         // BT12 for N>=96 (raw-bit + full-model wins across all four ops).
-        // MQ6 BT8 lowers to the X-LDS kernel, which beats BT4 from N=96 on.
-        ("gfx1151", 6, Residual, 96..) => Some(8),
+        // MQ6 BT8 lowers to the X-LDS kernel, which beats BT4 from N=96 on;
+        // the other RDNA3.5 APUs take it with the Qwen4-tuned routes.
+        ("gfx1150" | "gfx1151" | "gfx1152", 6, Residual, 96..) => Some(8),
         ("gfx1151", 2 | 3 | 5 | 6, Qkvza | Qkv | Residual, 96..) => Some(4),
         ("gfx1151", 2 | 3 | 5 | 6, GateUp, 96..) => Some(12),
 
@@ -25312,10 +25315,10 @@ impl Gpu {
     }
 
     /// Whether the Qwen4 F16 WMMA route applies to a `[M × K]` BF16 weight at
-    /// `batch_size` rows: gfx1151, >= QWEN4_F16_WMMA_MIN_TOKENS rows,
+    /// `batch_size` rows: Qwen4-tuned arch, >= QWEN4_F16_WMMA_MIN_TOKENS rows,
     /// K % 64 == 0, no recorder/capture active, not opted out.
     pub fn qwen4_f16_wmma_applies(&self, weight: &GpuTensor, k: usize, batch_size: usize) -> bool {
-        self.arch_caps.is_gfx1151()
+        self.arch_caps.qwen4_tuned_routes()
             && weight.dtype == DType::BF16
             && batch_size >= QWEN4_F16_WMMA_MIN_TOKENS
             && k % 64 == 0
@@ -25325,12 +25328,12 @@ impl Gpu {
     }
 
     /// Whether a Qwen4 forward of `rows` tokens keeps its HC residual streams as
-    /// BF16 bits (the F16 prefill route: gfx1151, >= QWEN4_F16_WMMA_MIN_TOKENS
+    /// BF16 bits (the F16 prefill route: Qwen4-tuned arch, >= QWEN4_F16_WMMA_MIN_TOKENS
     /// rows, no recorder or capture, not opted out).  Every HC reader rounds
     /// the stream to BF16 on load, so the stored value is the one it uses;
     /// the forward decides once and hands the flag to every stream op.
     pub fn qwen4_bf16_streams(&self, rows: usize) -> bool {
-        self.arch_caps.is_gfx1151()
+        self.arch_caps.qwen4_tuned_routes()
             && rows >= QWEN4_F16_WMMA_MIN_TOKENS
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
@@ -25497,7 +25500,7 @@ impl Gpu {
         // The allowlist is unchanged; only the tile shape and grid inside this
         // route change.  blockIdx.y is sixteen bits, so a wave may only cover
         // a token tile while the row groups fit that limit.
-        let r16_shape = self.arch_caps.is_gfx1151()
+        let r16_shape = self.arch_caps.qwen4_tuned_routes()
             && (64..=2048).contains(&batch_size)
             && m.div_ceil(16) <= 0xffff
             && matches!(
@@ -25539,7 +25542,7 @@ impl Gpu {
                 [batch_size.div_ceil(2) as u32, m.div_ceil(16) as u32, 1],
                 32,
             )
-        } else if self.arch_caps.is_gfx1151() && k % 8 == 0 && (257..=512).contains(&k) {
+        } else if self.arch_caps.qwen4_tuned_routes() && k % 8 == 0 && (257..=512).contains(&k) {
             // One thread per output row, weights in LDS, 64 tokens per
             // block; bitwise identical to the four-row kernel.
             (
@@ -25548,7 +25551,7 @@ impl Gpu {
                 [m.div_ceil(32) as u32, batch_size.div_ceil(64) as u32, 1],
                 256,
             )
-        } else if self.arch_caps.is_gfx1151() && k % 8 == 0 && (513..=768).contains(&k) {
+        } else if self.arch_caps.qwen4_tuned_routes() && k % 8 == 0 && (513..=768).contains(&k) {
             // Small K: one wave keeps its four tokens' X in registers and
             // walks sixteen rows; bitwise identical to the four-row kernel.
             (
@@ -25630,7 +25633,7 @@ impl Gpu {
         }
 
         self.bind_thread()?;
-        let gfx1151_multirow = batch_size > 1 && self.arch_caps.is_gfx1151();
+        let gfx1151_multirow = batch_size > 1 && self.arch_caps.qwen4_tuned_routes();
         let (func, source, token_tiles) = if gfx1151_multirow {
             (
                 "gemm_mq4g128v2_multirow_gfx1151",
@@ -32777,9 +32780,10 @@ impl Gpu {
                 ));
             }
         };
-        // gfx1151 MQ6 BT8: four row tiles share each X chunk through LDS
-        // (bitwise identical to BT8; the BT8 X re-reads were the bottleneck).
-        let xlds = self.arch.as_str() == "gfx1151" && bits == 6 && batch_tile == 8;
+        // MQ6 BT8 on the Qwen4-tuned archs: four row tiles share each X chunk
+        // through LDS (bitwise identical to BT8; the BT8 X re-reads were the
+        // bottleneck on gfx1151).
+        let xlds = self.arch_caps.qwen4_tuned_routes() && bits == 6 && batch_tile == 8;
         let (func_name, rows_per_block, block) = match (xlds, overwrite) {
             (true, false) => ("gemm_mq6g256v2_residual_wmma_gfx11_bt8_x4", 64, 128),
             // A BF16 `y` takes the values rounded to BF16 (RNE) as BF16 bits.
@@ -35318,10 +35322,10 @@ impl Gpu {
         self.gemm_mq6g256v2_xbatch(a_raw, x, y, m, k, batch_size, true)
     }
 
-    /// Whether [`Gpu::gemm_mq6g256v2_xf16`] applies: the gfx1151 BT8 X-LDS
+    /// Whether [`Gpu::gemm_mq6g256v2_xf16`] applies: the BT8 X-LDS
     /// overwrite route with no recorder or capture active.
     pub fn gemm_mq6g256v2_xf16_applies(&self, k: usize, batch_size: usize) -> bool {
-        self.arch_caps.is_gfx1151()
+        self.arch_caps.qwen4_tuned_routes()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && k % 256 == 0
@@ -35363,10 +35367,10 @@ impl Gpu {
         self.bind_thread()?;
         if self.arch_caps.has_wmma() {
             self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
-            // The memset + residual route below would take the gfx1151 BT8
+            // The memset + residual route below would take the BT8
             // X-LDS kernel; its overwrite form produces the same bytes in one
             // launch.  Capture/replay keep the historical contract.
-            if self.arch_caps.is_gfx1151()
+            if self.arch_caps.qwen4_tuned_routes()
                 && !self.replay.is_recording()
                 && !self.graphs.capture_mode
                 && k % 256 == 0
@@ -39247,10 +39251,10 @@ impl Gpu {
              (GEMM_MQ4CG256_SRC missing) — would mis-decode MQ4C fp16-header groups as v1 f32 header",
         ))
     }
-    /// Whether the Qwen4 grouped gate/up takes the F16 WMMA arm (gfx1151,
+    /// Whether the Qwen4 grouped gate/up takes the F16 WMMA arm (Qwen4-tuned arch,
     /// 1280x2560, >= QWEN4_F16_WMMA_MIN_TOKENS tokens, not opted out).
     pub fn qwen4_moe_gateup_wmma_applies(&self, m: usize, k: usize, x_src_rows: usize) -> bool {
-        self.arch_caps.is_gfx1151()
+        self.arch_caps.qwen4_tuned_routes()
             && m == 1280
             && k == 2560
             && x_src_rows >= QWEN4_F16_WMMA_MIN_TOKENS
@@ -39373,7 +39377,7 @@ impl Gpu {
                 x_src_rows,
             );
         }
-        if self.arch_caps.is_gfx1151() && m == 1280 && k == 2560 {
+        if self.arch_caps.qwen4_tuned_routes() && m == 1280 && k == 2560 {
             return self.gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_gfx1151(
                 expert_weight_ptrs,
                 expert_tile_ids,
@@ -39886,12 +39890,12 @@ mod tests {
     /// four-row kernel, wide and scalar-tail K) must equal the batch-1 BF16
     /// GEMV bit for bit, including partial token tiles (N = 131).
     #[test]
-    #[ignore = "requires a gfx1151 GPU and working HIP toolchain"]
+    #[ignore = "requires a Qwen4-tuned GPU and working HIP toolchain"]
     fn bf16_multirow_routes_are_bit_identical_to_gemv() {
         let mut gpu = match Gpu::init() {
-            Ok(gpu) if gpu.arch_caps.is_gfx1151() => gpu,
+            Ok(gpu) if gpu.arch_caps.qwen4_tuned_routes() => gpu,
             _ => {
-                eprintln!("skip: needs gfx1151");
+                eprintln!("skip: Qwen4-tuned routes are off on this GPU");
                 return;
             }
         };
@@ -39952,16 +39956,16 @@ mod tests {
     /// companion bit for bit: two experts, dead (-1) slots inside a subtile,
     /// an all-dead subtile, a negative expert tile and a partial final tile.
     #[test]
-    #[ignore = "requires a gfx1151 GPU and working HIP toolchain"]
+    #[ignore = "requires a Qwen4-tuned GPU and working HIP toolchain"]
     fn gate_up_o4_r8_is_bit_identical_to_simt() {
         const M: usize = 1280;
         const K: usize = 2560;
         const GROUPED: usize = 330;
         const TOKENS: usize = 40;
         let mut gpu = match Gpu::init() {
-            Ok(gpu) if gpu.arch_caps.is_gfx1151() => gpu,
+            Ok(gpu) if gpu.arch_caps.qwen4_tuned_routes() => gpu,
             _ => {
-                eprintln!("skip: needs gfx1151");
+                eprintln!("skip: Qwen4-tuned routes are off on this GPU");
                 return;
             }
         };
@@ -40053,14 +40057,14 @@ mod tests {
     /// The 128-wide rotation straight to F16 must equal rotating in F32 and
     /// converting, at the Qwen4 down shape (K = 640, 1131 tokens x top-10).
     #[test]
-    #[ignore = "requires a gfx1151 GPU and working HIP toolchain"]
+    #[ignore = "requires a Qwen4-tuned GPU and working HIP toolchain"]
     fn rotate_128_f16_matches_rotate_then_convert() {
         const K: usize = 640;
         const ROWS: usize = 11310;
         let mut gpu = match Gpu::init() {
-            Ok(gpu) if gpu.arch_caps.is_gfx1151() => gpu,
+            Ok(gpu) if gpu.arch_caps.qwen4_tuned_routes() => gpu,
             _ => {
-                eprintln!("skip: needs gfx1151");
+                eprintln!("skip: Qwen4-tuned routes are off on this GPU");
                 return;
             }
         };
@@ -40096,12 +40100,12 @@ mod tests {
     /// Rotating straight to F16 and running the pre-converted MQ6 GEMM must
     /// produce the bytes of the F32 rotation + converting GEMM.
     #[test]
-    #[ignore = "requires a gfx1151 GPU and working HIP toolchain"]
+    #[ignore = "requires a Qwen4-tuned GPU and working HIP toolchain"]
     fn mq6_xf16_matches_f32_rotation_path() {
         let mut gpu = match Gpu::init() {
-            Ok(gpu) if gpu.arch_caps.is_gfx1151() => gpu,
+            Ok(gpu) if gpu.arch_caps.qwen4_tuned_routes() => gpu,
             _ => {
-                eprintln!("skip: needs gfx1151");
+                eprintln!("skip: Qwen4-tuned routes are off on this GPU");
                 return;
             }
         };
@@ -40160,15 +40164,15 @@ mod tests {
     /// accumulating with the BT4 kernel (byte-wise decode_tile_split),
     /// including rows past a 64-row block and a partial 128-token tile.
     #[test]
-    #[ignore = "requires a gfx1151 GPU and working HIP toolchain"]
+    #[ignore = "requires a Qwen4-tuned GPU and working HIP toolchain"]
     fn mq6_overwrite_matches_zeroed_residual() {
         const M: usize = 200;
         const K: usize = 512;
         const N: usize = 131;
         let mut gpu = match Gpu::init() {
-            Ok(gpu) if gpu.arch_caps.is_gfx1151() => gpu,
+            Ok(gpu) if gpu.arch_caps.qwen4_tuned_routes() => gpu,
             _ => {
-                eprintln!("skip: needs gfx1151");
+                eprintln!("skip: Qwen4-tuned routes are off on this GPU");
                 return;
             }
         };

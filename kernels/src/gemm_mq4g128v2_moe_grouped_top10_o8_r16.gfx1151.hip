@@ -52,7 +52,8 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
-#if defined(__gfx1151__)
+// gfx11 wave32 ISA; tuned on gfx1151 (ArchCaps::qwen4_tuned_routes admits it).
+#if defined(__GFX11__)
 
 // Two lane-0 trees in one pass: lanes 0-15 carry a, lanes 16-31 carry b.
 // After the cross-row step lane i holds a[i] + a[i+16] and lane 16+i holds

@@ -2,10 +2,27 @@
 
 ## Unreleased
 
+- Qwen4 prefill on gfx1151: 185 → 1301 tok/s on a 1131-token prompt
+  (TTFT 6.10 → 0.87 s; decode unchanged at ~20 tok/s) for
+  `qwen3.8-flash-next.mq6q8-pleq8`. Routed MoE gate/up and down, the BF16
+  dense projections (through a model-lifetime F16 weight shadow), the HC
+  read, full-window QSA attention and the chunked GDN recurrence run on F16
+  WMMA from 512 tokens; KLD against the BF16 source is 0.073471 against
+  0.074745 bit-exact, not separated. `HIPFIRE_QWEN4_F16_WMMA=0` keeps the
+  bit-exact arms. Every other change is bit-exact. Method, per-run ledger and
+  reusable levers:
+  [the checkpoint](docs/perf-checkpoints/2026-09-26-qwen4-prefill-autoresearch-gfx1151.md).
+
+- The Qwen4 routes tuned on gfx1151 now dispatch by capability: on by default
+  on the RDNA3.5 APUs (gfx1150/1151/1152), and on every other gfx11 GPU with
+  `HIPFIRE_QWEN4_GFX11=1` (`developer.qwen4_gfx11`). All their kernel sources
+  compile to the same kernels for gfx1100-gfx1152; they are unmeasured off
+  gfx1151. gfx12 and older keep the portable kernels.
+
 - Review follow-up: Qwen4's grouped QT44/QT53 route now carries an
   architecture-declared geometry/format contract and remains limited to its
   proven gfx1151 kernel shape. Shared tensor ops use portable HIP fallbacks
-  outside gfx1151; pipeline steps are immutable, with QSA bookkeeping owned by
+  off the Qwen4-tuned GPUs; pipeline steps are immutable, with QSA bookkeeping owned by
   the caller and granular MoE stages sharing one step variant. Qwen4 admission
   is carrier-owned, its HIP source lives under `kernels/src/`, and reference
   MTP/parity code requires the `reference-parity` feature outside tests.

@@ -2615,7 +2615,7 @@ impl Gpu {
                 false,
             );
         }
-        let o8_r16 = self.arch_caps.is_gfx1151() && m == 2560 && k == 640;
+        let o8_r16 = self.arch_caps.qwen4_tuned_routes() && m == 2560 && k == 640;
         self.gemm_mq4g128v2_moe_grouped_top10_with(
             expert_ptrs,
             expert_tile_ids,
@@ -2632,10 +2632,10 @@ impl Gpu {
         )
     }
 
-    /// Whether the gfx1151 F16 WMMA grouped QT53 down applies (one X row per
+    /// Whether the F16 WMMA grouped QT53 down applies (Qwen4-tuned arch, one X row per
     /// top-10 slot, >= QWEN4_F16_WMMA_MIN_TOKENS tokens, not opted out).
     pub fn qwen4_moe_down_wmma_applies(&self, m: usize, k: usize, x_src_rows: usize) -> bool {
-        self.arch_caps.is_gfx1151()
+        self.arch_caps.qwen4_tuned_routes()
             && m == 2560
             && k == 640
             && x_src_rows >= 10 * crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
@@ -2843,16 +2843,16 @@ mod tests {
     /// multirow kernel bit for bit: two experts, dead (-1) slots, an all-dead
     /// tile, a sentinel expert tile and a partial final tile.
     #[test]
-    #[ignore = "requires a gfx1151 GPU and working HIP toolchain"]
+    #[ignore = "requires a Qwen4-tuned GPU and working HIP toolchain"]
     fn down_o8_r16_is_bit_identical_to_multirow() {
         const M: usize = 2560;
         const K: usize = 640;
         const GROUPED: usize = 330;
         const SLOTS: usize = 400;
         let mut gpu = match Gpu::init() {
-            Ok(gpu) if gpu.arch_caps.is_gfx1151() => gpu,
+            Ok(gpu) if gpu.arch_caps.qwen4_tuned_routes() => gpu,
             _ => {
-                eprintln!("skip: needs gfx1151");
+                eprintln!("skip: Qwen4-tuned routes are off on this GPU");
                 return;
             }
         };

@@ -18,7 +18,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
-#if defined(__gfx1100__) || defined(__gfx1151__)
+#if defined(__GFX11__)
 
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
@@ -773,4 +773,4 @@ gemm_mq6g256v2_wmma_gfx11_bt8_x4_bf16out(const char* __restrict__ A,
     resid_bt_xlds<6, 8, 4, true, true>(A, X, Y, M, K, N);
 }
 
-#endif // __gfx1100__ || __gfx1151__
+#endif // __GFX11__

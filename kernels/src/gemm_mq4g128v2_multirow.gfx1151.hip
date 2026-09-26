@@ -11,7 +11,8 @@
 // owns one output row and four prompt rows.  The weight decode is shared by
 // those four rows, while each row keeps the scalar gemv accumulator and
 // reduction association unchanged.
-#if defined(__gfx1151__)
+// gfx11 wave32 ISA; tuned on gfx1151 (ArchCaps::qwen4_tuned_routes admits it).
+#if defined(__GFX11__)
 __launch_bounds__(32, 16)
 extern "C" __global__ void gemm_mq4g128v2_multirow_gfx1151(
     const char* __restrict__ A,
