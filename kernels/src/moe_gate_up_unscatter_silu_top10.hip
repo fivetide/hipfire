@@ -69,19 +69,20 @@ extern "C" __global__ void moe_gate_up_unscatter_silu_top10_bf16in(
     moe_unscatter_silu(Y_grouped, sorted_slot_index, activation, mi, m_total, bf16_rt);
 }
 
-// Unscatter + SiLU (the kernel above, BF16 rows) fused with the 128-wide FWHT
-// of kernels/src/mq_rotate_x_128_v2.hip, writing the MoE down GEMM's F16 input
-// straight to `x16` ([N*10 x mi], flat row order).  Per value: the unscatter's
-// activation expression, then the rotation's butterfly and pinned F32 product
-// before the F16 cast, so the bytes equal unscatter -> mq_rotate_x_128_v2 ->
+// Unscatter of the SwiGLU activation the gate/up GEMM's SILU epilogue wrote
+// as BF16 ([m_total x mi], already the unfused round trip's values) fused
+// with the 128-wide FWHT of kernels/src/mq_rotate_x_128_v2.hip, writing the
+// MoE down GEMM's F16 input straight to `x16` ([N*10 x mi], flat row order).
+// Per value: the rotation's butterfly and pinned F32 product before the F16
+// cast, so the bytes equal unscatter -> mq_rotate_x_128_v2 ->
 // convert_f32_to_f16.  mi % 128 == 0.  Grid (m_total, mi / 128), block 32.
-extern "C" __global__ __launch_bounds__(32, 16) void moe_gate_up_unscatter_silu_rotate128_f16(
-    const unsigned short* __restrict__ Y_grouped,
+extern "C" __global__ __launch_bounds__(32, 16) void moe_unscatter_rotate128_f16(
+    const unsigned short* __restrict__ act_grouped,
     const int*   __restrict__ sorted_slot_index,
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
     _Float16*    __restrict__ x16,
-    int mi, int m_total, int bf16_rt
+    int mi, int m_total
 ) {
     const int slot = blockIdx.x;
     if (slot >= m_total) return;
@@ -90,29 +91,10 @@ extern "C" __global__ __launch_bounds__(32, 16) void moe_gate_up_unscatter_silu_
     const int tid = threadIdx.x;
     const int d0 = tid * 4;
     const int base = blockIdx.y * 128 + d0;
-    const long long y_base = (long long)slot * 2 * mi;
-    // Four gate and four up values arrive as one 8-byte load each.
-    const uint2 gw = *(const uint2*)(Y_grouped + y_base + base);
-    const uint2 uw = *(const uint2*)(Y_grouped + y_base + mi + base);
-    const unsigned short gh[4] = {(unsigned short)gw.x, (unsigned short)(gw.x >> 16),
-                                  (unsigned short)gw.y, (unsigned short)(gw.y >> 16)};
-    const unsigned short uh[4] = {(unsigned short)uw.x, (unsigned short)(uw.x >> 16),
-                                  (unsigned short)uw.y, (unsigned short)(uw.y >> 16)};
-    float a[4];
-#pragma unroll
-    for (int i = 0; i < 4; i++) {
-        float v = moe_widen(gh[i]);
-        float u = moe_widen(uh[i]);
-        if (bf16_rt) {
-            v = moe_bf16_round_trip(v);
-            u = moe_bf16_round_trip(u);
-        }
-        float out = (v / (1.0f + expf(-v))) * u;
-        if (bf16_rt) out = moe_bf16_round_trip(out);
-        // The activation is stored and reloaded as F32 on the unfused path.
-        asm volatile("" : "+v"(out));
-        a[i] = out;
-    }
+    // Four activations arrive as one 8-byte load.
+    const uint2 aw = *(const uint2*)(act_grouped + (long long)slot * mi + base);
+    const float a[4] = {moe_widen((unsigned short)aw.x), moe_widen((unsigned short)(aw.x >> 16)),
+                        moe_widen((unsigned short)aw.y), moe_widen((unsigned short)(aw.y >> 16))};
     float v0 = a[0] * signs1[d0];
     float v1 = a[1] * signs1[d0 + 1];
     float v2 = a[2] * signs1[d0 + 2];

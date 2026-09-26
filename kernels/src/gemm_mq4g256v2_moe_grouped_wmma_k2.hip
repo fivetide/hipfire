@@ -124,7 +124,17 @@ __device__ __forceinline__ void moe_grouped_wmma_k2_group(
     }
 }
 
-template <int NT, bool OUT_BF16>
+// SILU: the 16 A rows are gate rows row_start/2 .. +7 and the matching up
+// rows M/2 + row_start/2 .. +7, and the epilogue stores the SwiGLU activation
+// rt(silu(bf16(g)) * bf16(u)) (moe_gate_up_unscatter_silu's expression with
+// its BF16 round trips) as BF16 into Y_grouped, [m_total, M/2].
+static __device__ __forceinline__ float moe_bf16_round_trip(float v) {
+    if (!isfinite(v)) return v;
+    const unsigned int u = __float_as_uint(v);
+    return __uint_as_float((u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u);
+}
+
+template <int NT, bool OUT_BF16, bool SILU = false>
 __device__ __forceinline__ void moe_grouped_wmma_k2_tiles(
     const char* __restrict__ A, const int* __restrict__ sorted_slot_index,
     const _Float16* __restrict__ X_src, void* __restrict__ Y_grouped,
@@ -150,15 +160,20 @@ __device__ __forceinline__ void moe_grouped_wmma_k2_tiles(
     // buffered in LDS: group g+1 loads while group g computes.  Loading
     // 16 bytes of 16 rows per instruction ran DRAM ~25% under streaming
     // rate; group-pair steps overlapped less of each wave's own stream.
-    const char* Ablk = A + (long long)row_start * row_bytes;
     const int rows_live = min(16, M - row_start);
+    // Weight row of tile row r (SILU pairs gate and up rows, see above).
+    auto weight_row = [&](int r) -> long long {
+        if (SILU)
+            return r < 8 ? row_start / 2 + r : M / 2 + row_start / 2 + r - 8;
+        return row_start + min(r, rows_live - 1);
+    };
     unsigned long long pf[9];
     auto load_group = [&](int g) {
 #pragma unroll
         for (int i = 0; i < 9; i++) {
             const int p = min(tid + 32 * i, 16 * 17 - 1);
-            const int r = min(p / 17, rows_live - 1), w = p - (p / 17) * 17;
-            pf[i] = *(const unsigned long long*)(Ablk + r * row_bytes + g * 136 + w * 8);
+            const int r = p / 17, w = p - r * 17;
+            pf[i] = *(const unsigned long long*)(A + weight_row(r) * row_bytes + g * 136 + w * 8);
         }
     };
     auto store_group = [&](int buf) {
@@ -197,6 +212,28 @@ __device__ __forceinline__ void moe_grouped_wmma_k2_tiles(
             r[2 * i + 1] = hi ? own : got;
         }
         const int out_col = slot_start + 16 * t + lane;
+        if (SILU) {
+            // Low lane: gate columns 0..7 of the block; high lane: up.  One
+            // more swap gives each half four (gate, up) pairs.
+            float h[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const float give = hi ? r[i] : r[4 + i];
+                const float got = __int_as_float(__builtin_amdgcn_permlanex16(
+                    __float_as_int(give), __float_as_int(give), 0x76543210u, 0xfedcba98u, false, false));
+                const float g = hi ? got : r[i];
+                const float u = hi ? r[4 + i] : got;
+                const float v = __uint_as_float((unsigned int)moe_bf16_bits(g) << 16);
+                const float w = __uint_as_float((unsigned int)moe_bf16_bits(u) << 16);
+                h[i] = moe_bf16_round_trip((v / (1.0f + expf(-v))) * w);
+            }
+            if (t >= nlive || out_col >= m_total) continue;
+            uint2 o;
+            o.x = (__float_as_uint(h[0]) >> 16) | (__float_as_uint(h[1]) & 0xFFFF0000u);
+            o.y = (__float_as_uint(h[2]) >> 16) | (__float_as_uint(h[3]) & 0xFFFF0000u);
+            *(uint2*)((unsigned short*)Y_grouped + (long long)out_col * (M / 2) + row_start / 2 + 4 * hi) = o;
+            continue;
+        }
         if (t >= nlive) continue;
         const int row0 = row_start + 8 * hi;
         if (out_col >= m_total || row0 >= M) continue;
@@ -224,7 +261,7 @@ __device__ __forceinline__ void moe_grouped_wmma_k2_tiles(
     }
 }
 
-template <bool OUT_BF16>
+template <bool OUT_BF16, bool SILU = false>
 __device__ __forceinline__ void gemm_mq4g256v2_moe_grouped_wmma_k2_entry(
     const unsigned long long* __restrict__ expert_weight_ptrs,
     const int* __restrict__ expert_tile_ids,
@@ -249,11 +286,11 @@ __device__ __forceinline__ void gemm_mq4g256v2_moe_grouped_wmma_k2_entry(
     __shared__ __align__(16) unsigned int a_lds[16 * 68];
     // A three-tile run takes the four-tile body with its last tile masked.
     if (run >= 3)
-        moe_grouped_wmma_k2_tiles<4, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start, a_lds, run);
+        moe_grouped_wmma_k2_tiles<4, OUT_BF16, SILU>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start, a_lds, run);
     else if (run == 2)
-        moe_grouped_wmma_k2_tiles<2, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start, a_lds, 2);
+        moe_grouped_wmma_k2_tiles<2, OUT_BF16, SILU>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start, a_lds, 2);
     else
-        moe_grouped_wmma_k2_tiles<1, OUT_BF16>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start, a_lds, 1);
+        moe_grouped_wmma_k2_tiles<1, OUT_BF16, SILU>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, tid, row_start, slot_start, a_lds, 1);
 }
 
 #define MOE_WMMA_ARGS \
@@ -270,6 +307,12 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_wmma_k2(MOE_WMMA_ARGS) {
 __launch_bounds__(32, 2)
 extern "C" __global__ void gemm_mq4g256v2_moe_grouped_wmma_k2_bf16out(MOE_WMMA_ARGS) {
     gemm_mq4g256v2_moe_grouped_wmma_k2_entry<true>(expert_weight_ptrs, expert_tile_ids, sorted_slot_index, X_src,
+                        Y_grouped, M, K, x_row_div, m_total);
+}
+// Y_grouped = the SwiGLU activation [m_total, M/2] as BF16 (see SILU above).
+__launch_bounds__(32, 2)
+extern "C" __global__ void gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out(MOE_WMMA_ARGS) {
+    gemm_mq4g256v2_moe_grouped_wmma_k2_entry<true, true>(expert_weight_ptrs, expert_tile_ids, sorted_slot_index, X_src,
                         Y_grouped, M, K, x_row_div, m_total);
 }
 #undef MOE_WMMA_ARGS

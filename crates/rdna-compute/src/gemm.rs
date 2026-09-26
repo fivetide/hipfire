@@ -13295,10 +13295,12 @@ impl Gpu {
             x_row_div,
             m_total,
             x_src_rows,
-            false,
+            None,
         )
     }
 
+    /// `gfx11_entry`: a BF16-output entry of the gfx11 source; None takes the
+    /// arch's F32 entry.
     fn gemm_mq4g256v2_moe_grouped_wmma_k2_impl(
         &mut self,
         expert_weight_ptrs: &GpuTensor, // [E] u64
@@ -13311,7 +13313,7 @@ impl Gpu {
         x_row_div: usize,
         m_total: usize,
         x_src_rows: usize,
-        bf16_out: bool,
+        gfx11_entry: Option<&'static str>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Arch-selecting, like the MQ2/MQ3-Lloyd grouped sisters: gfx11 takes
@@ -13326,11 +13328,11 @@ impl Gpu {
             ));
         }
         let (kernel_name, kernel_src) = kernels::mq4g256v2_moe_grouped_wmma_source(is_gfx12);
-        // The BF16-output entry exists in the gfx11 source only.
-        let kernel_name = match (bf16_out, is_gfx12) {
-            (false, _) => kernel_name,
-            (true, false) => "gemm_mq4g256v2_moe_grouped_wmma_k2_bf16out",
-            (true, true) => {
+        // The BF16-output entries exist in the gfx11 source only.
+        let kernel_name = match (gfx11_entry, is_gfx12) {
+            (None, _) => kernel_name,
+            (Some(entry), false) => entry,
+            (Some(_), true) => {
                 return Err(hip_bridge::HipError::new(
                     0,
                     "gemm_mq4g256v2_moe_grouped_wmma: BF16 output is gfx11-only",
@@ -39284,7 +39286,46 @@ impl Gpu {
             x_row_div,
             grouped_rows,
             x_src_rows,
-            true,
+            Some("gemm_mq4g256v2_moe_grouped_wmma_k2_bf16out"),
+        )
+    }
+
+    /// [`Gpu::gemm_mq4g256v2_moe_grouped_top10_bf16out`] storing the SwiGLU
+    /// activation instead: `y_grouped` is `[grouped_rows x m/2]` BF16 bits of
+    /// round-trip(silu(gate) * up) over the BF16 gate/up values, exactly the
+    /// `moe_gate_up_unscatter_silu_top10_bf16in` expression.  `m % 16 == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq4g256v2_moe_grouped_top10_silu_bf16out(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        if m % 16 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "SwiGLU gate/up epilogue needs m % 16 == 0",
+            ));
+        }
+        self.gemm_mq4g256v2_moe_grouped_wmma_k2_impl(
+            expert_weight_ptrs,
+            expert_tile_ids,
+            sorted_slot_index,
+            x_src,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            grouped_rows,
+            x_src_rows,
+            Some("gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out"),
         )
     }
 
