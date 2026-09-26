@@ -25370,22 +25370,28 @@ impl Gpu {
         };
         // M < 512 (HC input_mix_down 320 x 10240, the shared-expert selector
         // 1 x 2560): the auto tile gives too few workgroups; 64 x 64 keeps
-        // each output's K order.
-        if m < 512 {
-            return self.gemm_f16_x_f16_wmma_lds_tiled_ld(
-                &w_view,
-                x_f16,
-                y,
-                None,
-                m,
-                k,
-                batch_size,
-                LdsTile::new(64, 64, 32, 64, 64, false).pipelined(),
-                k,
-                k,
-            );
-        }
-        self.gemm_f16_x_f16_wmma_lds_auto(&w_view, x_f16, y, None, m, k, batch_size)
+        // each output's K order.  M < 1024 (router 512, shared gate/up 640 at
+        // K 2560): 128 x 128 over 128 x 256, 175 vs 213 us at 640 x 2560 x 1131;
+        // every tile keeps each output's K order.
+        let tile = match m {
+            0..512 => LdsTile::new(64, 64, 32, 64, 64, false),
+            512..1024 => LdsTile::new(128, 128, 32, 64, 64, false),
+            _ => {
+                return self.gemm_f16_x_f16_wmma_lds_auto(&w_view, x_f16, y, None, m, k, batch_size)
+            }
+        };
+        self.gemm_f16_x_f16_wmma_lds_tiled_ld(
+            &w_view,
+            x_f16,
+            y,
+            None,
+            m,
+            k,
+            batch_size,
+            tile.pipelined(),
+            k,
+            k,
+        )
     }
 
     /// [`Gpu::gemm_bf16_xf16_f16_wmma`] from F32 X for each `(weight, y, m)`
