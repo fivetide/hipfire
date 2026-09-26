@@ -22,7 +22,12 @@ saddle-quant = { path = "../saddle-quant" }
 
 [features]
 reference-parity = []
+lab = []
 
 [[example]]
 name = "qwen4_parity"
 required-features = ["reference-parity"]
+
+[[example]]
+name = "qwen4_kld"
+required-features = ["lab"]
