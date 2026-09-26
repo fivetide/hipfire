@@ -2611,7 +2611,7 @@ fn qsa_dense_wmma(
             checked_u32(p.n_heads / 4, "QSA dense head grid")?,
             1,
         ],
-        [128, 1, 1],
+        [256, 1, 1],
         0,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
