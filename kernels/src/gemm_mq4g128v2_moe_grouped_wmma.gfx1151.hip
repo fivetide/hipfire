@@ -5,7 +5,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
-// gfx11 wave32 ISA; tuned on gfx1151 (ArchCaps::qwen4_tuned_routes admits it).
+// gfx11 wave32 WMMA (ArchCaps::has_wmma_w32); tuned on gfx1151.
 #if defined(__GFX11__)
 
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;

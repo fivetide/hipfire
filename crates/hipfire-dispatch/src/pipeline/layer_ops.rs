@@ -389,9 +389,9 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
         hidden: op.hidden,
         state_bf16: op.state_bf16,
     };
-    // Qwen4-tuned multi-row: the up projection feeds the branch mix directly;
-    // bitwise identical to the GEMM + hyper_read_projected pair below.
-    let up_fused = gpu.arch_caps.qwen4_tuned_routes()
+    // Multi-row: the up projection feeds the branch mix directly; bitwise
+    // identical to the GEMM + hyper_read_projected pair below.
+    let up_fused = gpu.arch_caps.has_gfx11_plus_simt()
         && op.rows > 1
         && op.branches == 4
         && op.input_mix_up.dtype == DType::BF16
@@ -438,7 +438,7 @@ pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), Dis
         packed.dtype = DType::BF16;
         packed
     });
-    if gpu.arch_caps.qwen4_tuned_routes() {
+    if gpu.arch_caps.has_gfx11_plus_simt() {
         hip(hc_activation_fused_f32(
             gpu,
             &HcActivationFused {
@@ -604,10 +604,10 @@ pub fn execute_hyper_write(gpu: &mut Gpu, op: &HyperWriteOp<'_>) -> Result<(), D
     let mixed = view(op.mixed, 0, op.rows * op.hidden);
     let gates = view(op.gates, 0, op.rows * op.branches);
     let output = view(op.output, 0, op.rows * wide);
-    // Qwen4-tuned multi-row: one launch normalizes each row into LDS and projects
-    // the BF16 gate from there; `normalized` (read by nothing below) is not
+    // Multi-row: one launch normalizes each row into LDS and projects the
+    // BF16 gate from there; `normalized` (read by nothing below) is not
     // written.  Bitwise identical to hyper_norm + project_weight.
-    let fused = gpu.arch_caps.qwen4_tuned_routes()
+    let fused = gpu.arch_caps.has_gfx11_plus_simt()
         && op.rows > 1
         && op.block_inject.dtype == DType::BF16
         && op.block_inject.m == op.branches
@@ -836,7 +836,7 @@ pub fn execute_gated_delta_net(
     let beta = view(op.beta, 0, op.rows * op.value_heads);
     let z = view(op.z_output, 0, op.rows * value);
     let history_rows = op.conv_kernel.saturating_sub(1);
-    let persistent_batch = gpu.arch_caps.qwen4_tuned_routes()
+    let persistent_batch = gpu.arch_caps.has_gfx11_plus_simt()
         && op.rows > 1
         && op.key_dim == 128
         && op.value_dim == 128

@@ -164,7 +164,7 @@ extern "C" __global__ void gemm_bf16_xf32_multirow(
 }
 
 
-// gfx11/gfx12 only (permlanex16 / row DPP); dispatched on gfx1151.
+// gfx11/gfx12 only (permlanex16 / row DPP; ArchCaps::has_gfx11_plus_simt).
 #if defined(__GFX11__) || defined(__GFX12__)
 // Two lane-0 trees in one pass: lanes 0-15 carry a, lanes 16-31 carry b.
 // After the cross-row step lane i holds a[i] + a[i+16] and lane 16+i holds

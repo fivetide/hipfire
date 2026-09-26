@@ -326,9 +326,11 @@ pub(crate) fn scatter(
 }
 
 /// Whether the grouped gate/up takes the F16 WMMA arm and hands the unscatter
-/// BF16 rows: the recipe rounds gate/up to BF16 before SiLU anyway.
+/// BF16 rows: the recipe rounds gate/up to BF16 before SiLU anyway.  The
+/// BF16-output entries exist in the gfx11 source only.
 fn gateup_bf16(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
     p.recipe.bf16_round_trip()
+        && gpu.arch_caps.has_wmma_w32()
         && gpu.qwen4_moe_gateup_wmma_applies(2 * p.mi, p.gate_up_k, p.batch_size)
 }
 

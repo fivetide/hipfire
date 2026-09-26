@@ -58,6 +58,7 @@ pub struct ArchCaps {
     has_wmma: bool,
     has_wmma_w32: bool,
     has_wmma_w32_gfx12: bool,
+    has_gfx11_plus_simt: bool,
     has_dot2_f32_f16: bool,
     has_mmq: bool,
     is_gcn5_wave64: bool,
@@ -143,6 +144,7 @@ impl ArchCaps {
         let has_wmma = is_rdna3 || is_rdna4;
         let has_wmma_w32 = is_rdna3;
         let has_wmma_w32_gfx12 = is_rdna4;
+        let has_gfx11_plus_simt = is_rdna3 || is_rdna4;
         let has_dot2_f32_f16 = is_rdna1p1 || is_rdna2 || is_rdna3 || is_rdna4;
         let has_mmq = is_gfx906 || is_rdna3;
         let is_gcn5_wave64 = is_gfx906 || (is_gfx908 && flags.gcn5_wave64_hybrid.unwrap_or(false));
@@ -204,6 +206,7 @@ impl ArchCaps {
             has_wmma,
             has_wmma_w32,
             has_wmma_w32_gfx12,
+            has_gfx11_plus_simt,
             has_dot2_f32_f16,
             has_mmq,
             is_gcn5_wave64,
@@ -397,17 +400,6 @@ impl ArchCaps {
     pub fn supports_ds4_f16_compressor_cache(&self) -> bool {
         self.has_wmma_w32 || self.has_wmma_w32_gfx12
     }
-    /// Qwen4 routes tuned on gfx1151: the gfx11 wave32 WMMA and SIMT kernels
-    /// selected in place of the portable parity kernels (F16 WMMA prefill,
-    /// MQ6 X-LDS, MoE O4xR8/O8xR16, BF16 r16, GDN/HC/QSA fusions).  Measured
-    /// only on gfx1151, so on by default for the RDNA3.5 APU class that
-    /// shares its memory system; any other gfx11 GPU takes them with
-    /// `HIPFIRE_QWEN4_GFX11=1` (`developer.qwen4_gfx11`) until measured
-    /// there.  Never outside gfx11: the WMMA and `s_waitcnt` kernels do not
-    /// compile for gfx12, and the SIMT ones are unvalidated off gfx11.
-    pub fn qwen4_tuned_routes(&self) -> bool {
-        self.has_wmma_w32 && (self.is_rdna3p5 || self.flags.qwen4_gfx11)
-    }
     pub fn is_rdna4(&self) -> bool {
         self.is_rdna4
     }
@@ -424,6 +416,13 @@ impl ArchCaps {
     }
     pub fn has_wmma_w32_gfx12(&self) -> bool {
         self.has_wmma_w32_gfx12
+    }
+    /// gfx11-generation wave32 SIMT ISA, shared by gfx12: DPP16 row shifts,
+    /// `permlanex16`, and the gfx11+ buffer-resource descriptor (word3
+    /// `0x31004000`).  Kernels that need only these (no WMMA) compile from one
+    /// source for both generations behind `__GFX11__ || __GFX12__`.
+    pub fn has_gfx11_plus_simt(&self) -> bool {
+        self.has_gfx11_plus_simt
     }
     pub fn has_dot2_f32_f16(&self) -> bool {
         self.has_dot2_f32_f16
@@ -726,34 +725,15 @@ mod tests {
     }
 
     #[test]
-    fn qwen4_tuned_routes_default_apus_opt_in_gfx11() {
-        for arch in &["gfx1150", "gfx1151", "gfx1152"] {
-            assert!(make_caps(arch).qwen4_tuned_routes(), "{arch} is default-on");
+    fn gfx11_plus_simt_covers_rdna3_and_rdna4_only() {
+        for arch in &[
+            "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200",
+            "gfx1201",
+        ] {
+            assert!(make_caps(arch).has_gfx11_plus_simt(), "{arch}");
         }
-        let off = &[
-            "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1201", "gfx1030", "gfx942",
-        ];
-        for arch in off {
-            assert!(
-                !make_caps(arch).qwen4_tuned_routes(),
-                "{arch} needs the opt-in"
-            );
-        }
-        let opt_in = Arc::new(FeatureFlags {
-            qwen4_gfx11: true,
-            ..FeatureFlags::for_test("gfx1100")
-        });
-        for arch in &["gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1151"] {
-            assert!(
-                ArchCaps::new(arch, opt_in.clone()).qwen4_tuned_routes(),
-                "{arch} opted in"
-            );
-        }
-        for arch in &["gfx1200", "gfx1201", "gfx1030", "gfx906", "gfx942"] {
-            assert!(
-                !ArchCaps::new(arch, opt_in.clone()).qwen4_tuned_routes(),
-                "{arch} lacks gfx11 ISA"
-            );
+        for arch in &["gfx1010", "gfx1030", "gfx906", "gfx908", "gfx942"] {
+            assert!(!make_caps(arch).has_gfx11_plus_simt(), "{arch}");
         }
     }
 

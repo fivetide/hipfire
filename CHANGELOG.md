@@ -14,11 +14,14 @@
   reusable levers:
   [the checkpoint](docs/perf-checkpoints/2026-09-26-qwen4-prefill-autoresearch-gfx1151.md).
 
-- The Qwen4 routes tuned on gfx1151 now dispatch by capability: on by default
-  on the RDNA3.5 APUs (gfx1150/1151/1152), and on every other gfx11 GPU with
-  `HIPFIRE_QWEN4_GFX11=1` (`developer.qwen4_gfx11`). All their kernel sources
-  compile to the same kernels for gfx1100-gfx1152; they are unmeasured off
-  gfx1151. gfx12 and older keep the portable kernels.
+- The Qwen4 routes tuned on gfx1151 now dispatch by ISA capability, on by
+  default wherever their kernels exist: the SIMT/LDS kernels (BF16 multirow,
+  MQ4G128 multirow, MoE O4xR8/O8xR16, GDN/HC/QSA fusions) on gfx11 and gfx12
+  (`has_gfx11_plus_simt`), the gfx11 WMMA kernels (F16 prefill, MQ6 X-LDS,
+  QT53 down, GDN chunk, QSA dense, HC WMMA read) on every gfx11 GPU
+  (`has_wmma_w32`); the grouped gate/up F16 WMMA F32 arm also uses its gfx12
+  sibling. `HIPFIRE_QWEN4_GFX11` is removed. Measured only on gfx1151; gfx12
+  runs the portable kernels where no gfx12 WMMA port exists.
 
 - Review follow-up: Qwen4's grouped QT44/QT53 route now carries an
   architecture-declared geometry/format contract and remains limited to its
