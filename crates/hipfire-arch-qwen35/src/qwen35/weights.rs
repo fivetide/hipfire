@@ -2997,3 +2997,25 @@ mod tests {
         }
     }
 }
+
+impl DeltaNetLayerWeights {
+    pub(crate) fn dense_ffn(&self) -> super::prefill::DenseFfnWeights<'_> {
+        super::prefill::DenseFfnWeights {
+            norm: &self.ffn_norm,
+            gate: &self.w_gate,
+            up: &self.w_up,
+            down: &self.w_down,
+        }
+    }
+}
+
+impl FullAttnLayerWeights {
+    pub(crate) fn dense_ffn(&self) -> super::prefill::DenseFfnWeights<'_> {
+        super::prefill::DenseFfnWeights {
+            norm: &self.ffn_norm,
+            gate: &self.w_gate,
+            up: &self.w_up,
+            down: &self.w_down,
+        }
+    }
+}

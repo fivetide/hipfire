@@ -26,6 +26,7 @@ pub use sealed_moe::{
 pub(crate) mod moe_program;
 pub(crate) mod qt44_qt53_prefill;
 pub use moe_program::{MoeStage, SealedMoeOp};
+pub mod batched;
 #[cfg(feature = "deltanet")]
 pub mod hybrid;
 pub(crate) mod draft_head;
