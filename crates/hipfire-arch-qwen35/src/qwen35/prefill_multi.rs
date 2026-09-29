@@ -234,7 +234,7 @@ fn any_lane_s4(gpu: &Gpu, reqs: &[MultiChunkRequest<'_>], w_dtype: rdna_compute:
     !gpu.arch_caps.is_gfx1201()
         && reqs
             .iter()
-            .any(|r| s4_residual_fast(gpu, r.fusion, w_dtype, &BatchEpilogue::Residual, r.tokens.len()))
+            .any(|r| s4_residual_fast(gpu, r.fusion == DflashFusionCtx::ChainVerify, w_dtype, &BatchEpilogue::Residual, r.tokens.len()))
 }
 
 /// Capture the post-layer residual rows of every request whose ring extracts
@@ -368,7 +368,9 @@ pub fn forward_prefill_batch_multi(
     let views: Vec<_> = reqs.iter().zip(&offs).map(|(r, &o)| rows_view(pbs, config, o, r.tokens.len())).collect();
     // Any request on the ChainVerify gfx1100 F16 projection route at its own
     // row count: the projection/FFN input stages run per request view.
-    let split_proj = reqs.iter().any(|r| mq_f16_projection_fast_route(gpu, r.fusion, r.tokens.len(), dim));
+    let split_proj = reqs
+        .iter()
+        .any(|r| mq_f16_projection_fast_route(gpu, r.fusion == DflashFusionCtx::ChainVerify, r.tokens.len(), dim));
 
     let tokens: Vec<u32> = reqs.iter().flat_map(|r| r.tokens.iter().copied()).collect();
     batch_chunk_embed_tokens(gpu, weights, &tokens, s, pbs, total, dim, dim * 4, true, false, false, None, None)?;
@@ -487,8 +489,8 @@ pub fn forward_prefill_batch_multi(
                             r.fusion,
                             GdnScanOut::F32,
                         )?;
-                        batch_chunk_delta_net_ffn(
-                            gpu, layer, config, view, n, dim, hidden_dim, q8_wmma_arch, arch_has_wmma,
+                        batch_chunk_dense_ffn(
+                            gpu, layer.dense_ffn(), config, view, n, dim, hidden_dim, q8_wmma_arch,
                             BatchEpilogue::Residual, r.fusion,
                         )?;
                     }
@@ -506,8 +508,8 @@ pub fn forward_prefill_batch_multi(
                         shared_fusion,
                         GdnScanOut::F32,
                     )?;
-                    batch_chunk_delta_net_ffn(
-                        gpu, layer, config, pbs, total, dim, hidden_dim, q8_wmma_arch, arch_has_wmma,
+                    batch_chunk_dense_ffn(
+                        gpu, layer.dense_ffn(), config, pbs, total, dim, hidden_dim, q8_wmma_arch,
                         BatchEpilogue::Residual, shared_fusion,
                     )?;
                 }
@@ -599,8 +601,8 @@ pub fn forward_prefill_batch_multi(
                             false,
                             None,
                         )?;
-                        batch_chunk_full_attn_ffn(
-                            gpu, layer, config, view, n, dim, hidden_dim, q8_wmma_arch, arch_has_wmma,
+                        batch_chunk_dense_ffn(
+                            gpu, layer.dense_ffn(), config, view, n, dim, hidden_dim, q8_wmma_arch,
                             BatchEpilogue::Residual, r.fusion,
                         )?;
                     }
@@ -617,8 +619,8 @@ pub fn forward_prefill_batch_multi(
                         false,
                         None,
                     )?;
-                    batch_chunk_full_attn_ffn(
-                        gpu, layer, config, pbs, total, dim, hidden_dim, q8_wmma_arch, arch_has_wmma,
+                    batch_chunk_dense_ffn(
+                        gpu, layer.dense_ffn(), config, pbs, total, dim, hidden_dim, q8_wmma_arch,
                         BatchEpilogue::Residual, shared_fusion,
                     )?;
                 }

@@ -5504,15 +5504,14 @@ fn forward_prefill_dense_tp_batched(
                             else {
                                 unreachable!();
                             };
-                            if let Err(e) = crate::qwen35::prefill::batch_chunk_delta_net_ffn(
+                            if let Err(e) = crate::qwen35::prefill::batch_chunk_dense_ffn(
                                 &mut gpus.devices[rank],
-                                layer,
+                                layer.dense_ffn(),
                                 &configs[rank],
                                 pbs_vec[rank],
                                 n,
                                 dim,
                                 configs[rank].hidden_dim,
-                                q8_flags[rank],
                                 q8_flags[rank],
                                 BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
@@ -5637,15 +5636,14 @@ fn forward_prefill_dense_tp_batched(
                             else {
                                 unreachable!();
                             };
-                            if let Err(e) = crate::qwen35::prefill::batch_chunk_full_attn_ffn(
+                            if let Err(e) = crate::qwen35::prefill::batch_chunk_dense_ffn(
                                 &mut gpus.devices[rank],
-                                layer,
+                                layer.dense_ffn(),
                                 &configs[rank],
                                 pbs_vec[rank],
                                 n,
                                 dim,
                                 configs[rank].hidden_dim,
-                                q8_flags[rank],
                                 q8_flags[rank],
                                 BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
