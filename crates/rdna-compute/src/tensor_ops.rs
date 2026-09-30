@@ -1527,7 +1527,10 @@ fn gated_delta_conv_batched_impl(
     // BF16 in and out: four channels per thread, eight rows per block row.
     let x4 = input_bf16 && output_bf16 && p.channels % 4 == 0;
     let (grid, rows_per_block) = if x4 {
-        (checked_u32(p.channels.div_ceil(1024), "GDN batched convolution grid")?, 8)
+        (
+            checked_u32(p.channels.div_ceil(1024), "GDN batched convolution grid")?,
+            8,
+        )
     } else {
         (blocks(p.channels)?, 16)
     };
@@ -1576,7 +1579,10 @@ fn gated_delta_conv_batched_impl(
     args.pad_to(16);
     // The x4 kernel spreads the parameter blocks over every block row.
     let param_span = if x4 { 256 * row_grid as usize } else { 256 };
-    let param_grid = checked_u32(param_elements.div_ceil(param_span), "GDN batched parameter grid")?;
+    let param_grid = checked_u32(
+        param_elements.div_ceil(param_span),
+        "GDN batched parameter grid",
+    )?;
     // `start_cursor` is `start_position % history_rows` for the chunk (the
     // kernel advances the ring per row from there), so the declared binding
     // re-derives it at the replay position.
@@ -3692,25 +3698,37 @@ mod tests {
                 .into_iter()
                 .flat_map(rne)
                 .collect();
-            let mut input_bf16 = gpu.upload_raw(&in_bits, &[in_bits.len()]).expect("bf16 input");
+            let mut input_bf16 = gpu
+                .upload_raw(&in_bits, &[in_bits.len()])
+                .expect("bf16 input");
             input_bf16.dtype = DType::BF16;
             input_bf16.shape = vec![rows * channels];
-            let mut out_c = gpu.zeros(&[rows * channels / 2], DType::F32).expect("bf16 out");
+            let mut out_c = gpu
+                .zeros(&[rows * channels / 2], DType::F32)
+                .expect("bf16 out");
             out_c.dtype = DType::BF16;
             out_c.shape = vec![rows * channels];
             let hist_c = gpu.upload_f32(&history, &[history.len()]).expect("hist");
             let heads = 5usize;
-            let pa = gpu.upload_f32(&wave(7, rows * heads, 4.0), &[rows * heads]).expect("a");
-            let pb = gpu.upload_f32(&wave(8, rows * heads, 4.0), &[rows * heads]).expect("b");
+            let pa = gpu
+                .upload_f32(&wave(7, rows * heads, 4.0), &[rows * heads])
+                .expect("a");
+            let pb = gpu
+                .upload_f32(&wave(8, rows * heads, 4.0), &[rows * heads])
+                .expect("b");
             let head_bits: Vec<u8> = wave(9, 2 * heads, 1.0).into_iter().flat_map(rne).collect();
-            let mut a_log = gpu.upload_raw(&head_bits[..2 * heads], &[2 * heads]).expect("a_log");
+            let mut a_log = gpu
+                .upload_raw(&head_bits[..2 * heads], &[2 * heads])
+                .expect("a_log");
             a_log.dtype = DType::BF16;
             a_log.shape = vec![heads];
-            let mut dt_bias = gpu.upload_raw(&head_bits[2 * heads..], &[2 * heads]).expect("dt");
+            let mut dt_bias = gpu
+                .upload_raw(&head_bits[2 * heads..], &[2 * heads])
+                .expect("dt");
             dt_bias.dtype = DType::BF16;
             dt_bias.shape = vec![heads];
-            let [gate_c, beta_c, gate_d, beta_d] = [(); 4]
-                .map(|()| gpu.zeros(&[rows * heads], DType::F32).expect("params"));
+            let [gate_c, beta_c, gate_d, beta_d] =
+                [(); 4].map(|()| gpu.zeros(&[rows * heads], DType::F32).expect("params"));
             let params = |gate, beta| GatedDeltaParamsBatched {
                 a: &pa,
                 b: &pb,
@@ -3747,9 +3765,21 @@ mod tests {
                 .collect();
             let want: Vec<u32> = bits(&gpu, &out_b).iter().map(|w| w >> 16).collect();
             assert_eq!(got, want, "rows {rows}: bf16 output");
-            assert_eq!(bits(&gpu, &hist_c), bits(&gpu, &hist_b), "rows {rows}: bf16 history");
-            assert_eq!(bits(&gpu, &gate_c), bits(&gpu, &gate_d), "rows {rows}: gate");
-            assert_eq!(bits(&gpu, &beta_c), bits(&gpu, &beta_d), "rows {rows}: beta");
+            assert_eq!(
+                bits(&gpu, &hist_c),
+                bits(&gpu, &hist_b),
+                "rows {rows}: bf16 history"
+            );
+            assert_eq!(
+                bits(&gpu, &gate_c),
+                bits(&gpu, &gate_d),
+                "rows {rows}: gate"
+            );
+            assert_eq!(
+                bits(&gpu, &beta_c),
+                bits(&gpu, &beta_d),
+                "rows {rows}: beta"
+            );
             for tensor in [
                 input, hist_a, out_a, hist_b, out_b, input_bf16, out_c, hist_c, pa, pb, a_log,
                 dt_bias, gate_c, beta_c, gate_d, beta_d,
@@ -3814,7 +3844,9 @@ mod tests {
         )
         .expect("fused");
         let f16_ref = gpu.zeros(&[rows * ld], DType::F16).expect("f16 ref");
-        let read_normalized = gpu.zeros(&[rows * wide], DType::F32).expect("read normalized");
+        let read_normalized = gpu
+            .zeros(&[rows * wide], DType::F32)
+            .expect("read normalized");
         hyper_norm_f16(
             &mut gpu,
             &HyperNorm {
@@ -3852,7 +3884,9 @@ mod tests {
             .expect("bf16 streams");
         bf16_streams.dtype = DType::F32;
         bf16_streams.shape = vec![rows * wide];
-        let gates_bf16 = gpu.zeros(&[rows * branches], DType::F32).expect("gates bf16");
+        let gates_bf16 = gpu
+            .zeros(&[rows * branches], DType::F32)
+            .expect("gates bf16");
         let f16_bf16 = gpu.zeros(&[rows * ld], DType::F16).expect("f16 bf16");
         hyper_norm_gate(
             &mut gpu,
@@ -3875,8 +3909,16 @@ mod tests {
             "BF16-stream read F16 differs"
         );
         assert_eq!(
-            gpu.download_f32(&gates_bf16).expect("download").iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            gpu.download_f32(&fused).expect("download").iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            gpu.download_f32(&gates_bf16)
+                .expect("download")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            gpu.download_f32(&fused)
+                .expect("download")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
             "BF16-stream gates differ"
         );
         for tensor in [bf16_streams, gates_bf16, f16_bf16] {
