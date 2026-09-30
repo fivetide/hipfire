@@ -5555,8 +5555,18 @@ mod tests {
                         if rows > compress - 1 {
                             continue;
                         }
-                        for &block_count in &[0usize, 1, 3, 17, 72, 128, 500] {
+                        // Rows of at least two budgets take the threshold
+                        // path; integer keys force ties at the threshold.
+                        for &block_count in &[0usize, 1, 3, 17, 72, 128, 500, 1100, 2100] {
                             for &budget_blocks in &[1usize, 4, 64, 512] {
+                                // The serial reference costs budget^2 * blocks:
+                                // past 500 blocks only the pinned geometry
+                                // runs the 512-block budget.
+                                let pinned = compress == 4 && index_heads == 4 && index_dim == 128;
+                                if block_count > 500 && budget_blocks > 64 && !(pinned && block_count == 1100) {
+                                    continue;
+                                }
+                                for ties in [false, true] {
                                 let case = SelectCase {
                                     compress,
                                     index_heads,
@@ -5568,10 +5578,10 @@ mod tests {
                                     position_start: block_count * compress,
                                 };
                                 let pooled: Vec<f32> = (0..block_count * index_dim + index_dim)
-                                    .map(|_| next())
+                                    .map(|_| if ties { next().round() } else { next() })
                                     .collect();
                                 let query: Vec<f32> = (0..rows * index_heads * index_dim)
-                                    .map(|_| next())
+                                    .map(|_| if ties { next().round() } else { next() })
                                     .collect();
                                 let parallel =
                                     run_select_case(&mut gpu, &case, &pooled, &query, block_count);
@@ -5581,8 +5591,9 @@ mod tests {
                                     parallel, serial,
                                     "parallel ranking diverged from the serial selection sort: \
                                      compress={compress} heads={index_heads} dim={index_dim} \
-                                     rows={rows} blocks={block_count} budget={budget_blocks}"
+                                     rows={rows} blocks={block_count} budget={budget_blocks} ties={ties}"
                                 );
+                                }
                             }
                         }
                     }

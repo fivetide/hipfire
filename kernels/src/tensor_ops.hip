@@ -2216,6 +2216,144 @@ extern "C" __global__ void indexed_attention_select_f32_batched_serial(
     }
 }
 
+// Block-wide sum of one int per thread (wave32, blockDim a multiple of 32).
+// The dynamic LDS holds the whole score row, up to the 64 KiB limit, so the
+// per-wave partials go through `scratch` (8+ global words the calling
+// workgroup owns); callers alternate two scratch slots between consecutive
+// sums so a fast wave's next write cannot race a slow wave's read.
+static __device__ __forceinline__ int indexed_attention_select_block_sum(
+    int value, int* scratch) {
+    for (int offset = 16; offset > 0; offset >>= 1) value += __shfl_xor(value, offset, 32);
+    if ((threadIdx.x & 31) == 0) scratch[threadIdx.x >> 5] = value;
+    __syncthreads();
+    int total = 0;
+    for (int wave = 0; wave < (int)(blockDim.x >> 5); ++wave) total += scratch[wave];
+    return total;
+}
+
+// Top-`chosen` blocks of one row by (score desc, index asc) without the
+// O(blocks^2) all-pairs rank. Scores are sums of fmaxf(., 0) from +0, so they
+// are non-negative, never NaN and never -0: their bit patterns order like the
+// floats. A bitwise search finds T, the chosen-th largest key; every key > T
+// is selected and ranked among those (< chosen) entries, and the first
+// `chosen - count(key > T)` keys equal to T, in index order, take the next
+// ranks. The row's own `row_selected` words are the scratch: [0, 32) for the
+// block sums, [32, 32 + 2 * chosen) for the (key, block) list, which is then
+// copied over the dead score row in LDS. The caller guarantees
+// capacity >= 32 + 2 * chosen and row_block_count >= 2 * chosen (so the
+// list fits the LDS reservation); the bytes written equal the rank path's.
+static __device__ void indexed_attention_select_threshold(
+    float* scores,
+    int* row_selected,
+    int* mirror,
+    int row_block_count,
+    int chosen,
+    int compress,
+    int visible,
+    int capacity) {
+    const int tid = (int)threadIdx.x;
+    const int threads = (int)blockDim.x;
+    const int lane = tid & 31;
+    const int wave = tid >> 5;
+    const unsigned* keys = reinterpret_cast<const unsigned*>(scores);
+    unsigned threshold = 0u;
+    int pass = 0;
+    for (int bit = 30; bit >= 0; --bit) {
+        const unsigned candidate = threshold | (1u << bit);
+        int count = 0;
+        for (int block = tid; block < row_block_count; block += threads)
+            count += keys[block] >= candidate;
+        if (indexed_attention_select_block_sum(count, row_selected + ((pass++ & 1) << 3)) >= chosen)
+            threshold = candidate;
+    }
+    // Ordered compaction over contiguous per-thread ranges: counts of keys
+    // above and equal to T, packed (both < 2^16) into one scan.
+    const int per = (row_block_count + threads - 1) / threads;
+    const int first = min(tid * per, row_block_count);
+    const int last = min(first + per, row_block_count);
+    int packed = 0;
+    for (int block = first; block < last; ++block) {
+        const unsigned key = keys[block];
+        packed += key > threshold ? 1 : (key == threshold ? 1 << 16 : 0);
+    }
+    int inclusive = packed;
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        const int up = __shfl_up(inclusive, offset, 32);
+        if (lane >= offset) inclusive += up;
+    }
+    int* wave_totals = row_selected + 16;
+    if (lane == 31) wave_totals[wave] = inclusive;
+    __syncthreads();
+    int before = 0, total = 0;
+    for (int w = 0; w < (threads >> 5); ++w) {
+        const int value = wave_totals[w];
+        if (w < wave) before += value;
+        total += value;
+    }
+    const int exclusive = before + inclusive - packed;
+    const int above = total & 0xffff;
+    const int equal_needed = chosen - above;
+    int above_slot = exclusive & 0xffff;
+    int equal_seen = exclusive >> 16;
+    int* list = row_selected + 32;
+    for (int block = first; block < last; ++block) {
+        const unsigned key = keys[block];
+        if (key > threshold) {
+            list[2 * above_slot] = (int)key;
+            list[2 * above_slot + 1] = block;
+            ++above_slot;
+        } else if (key == threshold) {
+            if (equal_seen < equal_needed) {
+                list[2 * (above + equal_seen)] = (int)key;
+                list[2 * (above + equal_seen) + 1] = block;
+            }
+            ++equal_seen;
+        }
+    }
+    __syncthreads();
+    int2* entries = reinterpret_cast<int2*>(scores);
+    for (int i = tid; i < chosen; i += threads) entries[i] = make_int2(list[2 * i], list[2 * i + 1]);
+    __syncthreads();
+    // Entries past `above` already sit at their rank; the caller keeps
+    // chosen <= 2 * blockDim.x, so each thread holds at most two in registers.
+    int ranks[2] = {-1, -1};
+    int blocks[2] = {0, 0};
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        const int i = tid + k * threads;
+        if (i >= chosen) break;
+        const int2 entry = entries[i];
+        int rank = i;
+        if (i < above) {
+            rank = 0;
+            const unsigned key = (unsigned)entry.x;
+            for (int j = 0; j < above; ++j) {
+                const int2 other = entries[j];
+                rank += (unsigned)other.x > key || ((unsigned)other.x == key && other.y < entry.y);
+            }
+        }
+        ranks[k] = rank;
+        blocks[k] = entry.y;
+    }
+    for (int i = tid; i < capacity; i += threads) {
+        row_selected[i] = -1;
+        if (mirror) mirror[i] = -1;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        if (ranks[k] < 0) break;
+        for (int slot = 0; slot < compress; ++slot) {
+            const int index = ranks[k] * compress + slot;
+            const int token = blocks[k] * compress + slot;
+            if (index < capacity && token < visible) {
+                row_selected[index] = token;
+                if (mirror) mirror[index] = token;
+            }
+        }
+    }
+}
+
 extern "C" __global__ void indexed_attention_select_f32_batched(
     const float* query,
     const float* pooled,
@@ -2257,6 +2395,11 @@ extern "C" __global__ void indexed_attention_select_f32_batched(
     }
     __syncthreads();
     int chosen = budget_blocks < row_block_count ? budget_blocks : row_block_count;
+    if (chosen > 0 && row_block_count >= 2 * chosen && capacity >= 32 + 2 * chosen
+        && chosen <= 2 * (int)blockDim.x) {
+        indexed_attention_select_threshold(scores, row_selected, mirror, row_block_count,
+                                           chosen, compress, visible, capacity);
+    } else {
     // rank(block) counts the blocks that sort before it under
     // (score desc, index asc) — the exact order the serial selection sort
     // produced — so writing block `b` at slot `rank(b)` emits the same bytes.
@@ -2292,6 +2435,7 @@ extern "C" __global__ void indexed_attention_select_f32_batched(
                 }
             }
         }
+    }
     }
     int tail_start = row_block_count * compress;
     int offset = chosen * compress;
