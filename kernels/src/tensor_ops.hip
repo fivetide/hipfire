@@ -1028,18 +1028,51 @@ extern "C" __global__ __launch_bounds__(256) void hyper_norm_gate_f32(
         }
         __syncthreads();
     }
+    if (state_bf16 && normalized16) {
+        // The BF16 row is still in LDS: each thread normalizes eight
+        // consecutive values, so the weights load and the F16 read output
+        // store as 16-byte runs (the strided per-value form spent most of
+        // the kernel on 2-byte stores).  Same expressions, same values.
+        for (int v = tid; v < wide / 8; v += 256) {
+            const int j0 = v * 8;
+            const int b = j0 / hidden;
+            const float inv = rsqrtf(rms_sum[b * 256] / (float)hidden + 1.0e-6f);
+            const uint4 rv = ((const uint4*)xsb)[v];
+            const uint4 wv = *(const uint4*)(norm_weight + j0);
+            const uint4 qv = *(const uint4*)(read_norm_weight + j0);
+            const unsigned int rw[4] = {rv.x, rv.y, rv.z, rv.w};
+            const unsigned int ww[4] = {wv.x, wv.y, wv.z, wv.w};
+            const unsigned int qw[4] = {qv.x, qv.y, qv.z, qv.w};
+            unsigned int ow[4];
+            _Float16 oq[8];
 #pragma unroll
-    for (int b = 0; b < branches; ++b) {
-        const float inv = rsqrtf(rms_sum[b * 256] / (float)hidden + 1.0e-6f);
+            for (int e = 0; e < 8; ++e) {
+                const int sh = (e & 1) ? 0 : 16;
+                const float x = __uint_as_float((rw[e >> 1] << sh) & 0xFFFF0000u);
+                const float w = __uint_as_float((ww[e >> 1] << sh) & 0xFFFF0000u);
+                const float q = __uint_as_float((qw[e >> 1] << sh) & 0xFFFF0000u);
+                const unsigned int nb =
+                    __float_as_uint(bf16_to_f32(bf16_round(x * inv * (1.0f + w)))) >> 16;
+                ow[e >> 1] = (e & 1) ? (ow[e >> 1] | (nb << 16)) : nb;
+                oq[e] = (_Float16)bf16_to_f32(bf16_round(x * inv * (1.0f + q)));
+            }
+            ((uint4*)xsb)[v] = make_uint4(ow[0], ow[1], ow[2], ow[3]);
+            *(uint4*)(normalized16 + (size_t)row * ld16 + j0) = __builtin_bit_cast(uint4, oq);
+        }
+    } else {
 #pragma unroll
-        for (int u = 0; u < U; ++u) {
-            const int j = b * hidden + tid + 256 * u;
-            if (u < per) {
-                xsb[j] = (unsigned short)(__float_as_uint(bf16_to_f32(bf16_round(
-                    raw[b][u] * inv * (1.0f + bf16_to_f32(norm_weight[j]))))) >> 16);
-                if (normalized16)
-                    normalized16[(size_t)row * ld16 + j] = (_Float16)bf16_to_f32(bf16_round(
-                        raw[b][u] * inv * (1.0f + bf16_to_f32(read_norm_weight[j]))));
+        for (int b = 0; b < branches; ++b) {
+            const float inv = rsqrtf(rms_sum[b * 256] / (float)hidden + 1.0e-6f);
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int j = b * hidden + tid + 256 * u;
+                if (u < per) {
+                    xsb[j] = (unsigned short)(__float_as_uint(bf16_to_f32(bf16_round(
+                        raw[b][u] * inv * (1.0f + bf16_to_f32(norm_weight[j]))))) >> 16);
+                    if (normalized16)
+                        normalized16[(size_t)row * ld16 + j] = (_Float16)bf16_to_f32(bf16_round(
+                            raw[b][u] * inv * (1.0f + bf16_to_f32(read_norm_weight[j]))));
+                }
             }
         }
     }
