@@ -1,6 +1,27 @@
 # Changelog
 
 ## Unreleased
+- **Qwen4 (Flash-Next): prompts past ~1638 tokens no longer fail with a PLE
+  row-prefetch error.** One prefill chunk (up to 2048 tokens) needs 16 PLE rows
+  per token, more than one 8 MiB row-staging buffer holds; `RowFetch` now
+  splits the request and stages the parts in order. This failed even at the
+  default 2048-token context.
+- **Qwen4 admits `max_seq` above 2048**, up to the model's
+  `max_position_embeddings`; 2048 stays the automatic value. gfx1151,
+  `qwen3.8-flash-next.mq4`, `max_seq` 65536, 32,765-token prompt, KV bf16,
+  MTP off: 788 tok/s prefill, 14.2 tok/s decode.
+- **Qwen4 prefill on gfx1151 is ~11% faster** (1282 → 1419 tok/s on a
+  1131-token prompt; 719 → 787 tok/s at 32k), with bit-identical logits: MoE
+  grouped gate/up and down kernels share X through LDS, padded F16 row pitches
+  for the HC and MQ6 GEMMs, fused HC read/write gate passes, a four-channel GDN
+  convolution, and the top-10 router's wave minimum no longer runs through
+  double precision.
+- **`hipfire run qwen3.8:flash-next` works with the default config.** Qwen4's
+  2048-token context is below the default `max_tokens` (4096), and the Qwen4 AR
+  route refused every such request. The Qwen4 AR route now fits an omitted
+  `max_tokens` like the other routes, and `hipfire run` without `-n` marks its
+  configured `max_tokens` as a ceiling (`max_tokens_fit`), as serve does for an
+  omitted value. An explicit `-n` is still refused when it does not fit.
 - **Qwen4 (Flash-Next) prompt-cache reuse, AR and native MTP.** A turn whose
   canonical render purely extends the processed conversation keeps the device
   state and prefills only the new suffix (`cached_tokens` > 0); edited or

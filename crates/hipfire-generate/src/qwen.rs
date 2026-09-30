@@ -7855,6 +7855,7 @@ pub fn generate_qwen4_ar(
             );
         }
     }
+    let max_tokens = crate::common::fit_max_tokens(max_tokens, plan.rendered.len() + 1, m.max_seq);
     let required = plan
         .rendered
         .len()

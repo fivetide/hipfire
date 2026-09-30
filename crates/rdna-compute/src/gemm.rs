@@ -344,7 +344,10 @@ static G12_IU4_B1_BUNDLE: LazyLock<BundleOverride> =
 static G12_IU4_B1S_BUNDLE: LazyLock<BundleOverride> =
     LazyLock::new(|| g12_iu4_bundle_override("HIPFIRE_G12_IU4_B1S_BUNDLE"));
 
-fn g12_iu4_bundle(file: &'static BundleOverride, embedded: &'static [u8]) -> HipResult<&'static [u8]> {
+fn g12_iu4_bundle(
+    file: &'static BundleOverride,
+    embedded: &'static [u8],
+) -> HipResult<&'static [u8]> {
     match file {
         Some(Ok(image)) => Ok(image),
         Some(Err(e)) => Err(hip_bridge::HipError::new(0, e)),
@@ -357,13 +360,19 @@ fn g12_iu4_b1_image() -> HipResult<&'static [u8]> {
     if *G12_IU4_B1_CONTROL {
         Ok(kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL)
     } else {
-        g12_iu4_bundle(&G12_IU4_B1_BUNDLE, kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1)
+        g12_iu4_bundle(
+            &G12_IU4_B1_BUNDLE,
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1,
+        )
     }
 }
 
 #[inline]
 fn g12_iu4_b1s_image() -> HipResult<&'static [u8]> {
-    g12_iu4_bundle(&G12_IU4_B1S_BUNDLE, kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S)
+    g12_iu4_bundle(
+        &G12_IU4_B1S_BUNDLE,
+        kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S,
+    )
 }
 /// B-1 slab activation layout (`HIPFIRE_A4_SLAB`, default on; `=0` opts
 /// out): the default gfx1201 A4 producers store each K128 block's
@@ -436,7 +445,6 @@ static G12_FP8_F2_FORCE_SMALL_N: LazyLock<bool> =
 static G12_FP8_F2_COVERAGE: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G12_FP8_ISA_COVERAGE", false));
 
-
 /// The builder's single masked b128 store cannot serve odd row quads or
 /// misaligned output pointers; hipcc `_v3` retains its b32 fallback.
 #[inline]
@@ -468,7 +476,10 @@ static GFX1100_PM_BUNDLE: LazyLock<BundleOverride> =
 
 #[inline]
 fn gfx1100_pm_image() -> HipResult<&'static [u8]> {
-    g12_iu4_bundle(&GFX1100_PM_BUNDLE, kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_GFX1100)
+    g12_iu4_bundle(
+        &GFX1100_PM_BUNDLE,
+        kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_GFX1100,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -513,7 +524,10 @@ static V2B_PM_BUNDLE: LazyLock<BundleOverride> =
 
 #[inline]
 fn v2b_pm_image() -> HipResult<&'static [u8]> {
-    g12_iu4_bundle(&V2B_PM_BUNDLE, kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151)
+    g12_iu4_bundle(
+        &V2B_PM_BUNDLE,
+        kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151,
+    )
 }
 
 /// Builder twin of a hipcc V2B entry (gfx1151 only: the V2B tile is), with
@@ -696,7 +710,11 @@ impl Gpu {
             && self.arch == "gfx1201"
             && !*G12_IU4_B1_CONTROL
             && self.g12_iu4_isa_requested()
-            && self.flags.hipcc_extra_flags.split_whitespace().any(|f| f == "-DIU4_A4_CANDIDATES=2")
+            && self
+                .flags
+                .hipcc_extra_flags
+                .split_whitespace()
+                .any(|f| f == "-DIU4_A4_CANDIDATES=2")
     }
 
     /// Whether the loader should append reciprocal planes to the AWQ scales
@@ -713,11 +731,15 @@ static A8_APF_K32: LazyLock<bool> =
 
 fn a8_module_source() -> (&'static str, &'static str) {
     if *A8_APF_K32 {
-        ("gemm_mq4g256v2_residual_mmq_i8_gfx12",
-            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_SRC)
+        (
+            "gemm_mq4g256v2_residual_mmq_i8_gfx12",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_SRC,
+        )
     } else {
-        ("gemm_mq4g256v2_residual_mmq_i8_gfx12_apf0",
-            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_APF0_SRC)
+        (
+            "gemm_mq4g256v2_residual_mmq_i8_gfx12_apf0",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_APF0_SRC,
+        )
     }
 }
 
@@ -9683,8 +9705,12 @@ impl Gpu {
             && k % 256 == 0
             && !dims.is_empty()
             && dims.len() <= 4
-            && dims.iter().all(|&m| m > 0 && m % 4 == 0 && m <= i32::MAX as usize)
-            && dims.iter().try_fold(0usize, |a, &m| a.checked_add(m))
+            && dims
+                .iter()
+                .all(|&m| m > 0 && m % 4 == 0 && m <= i32::MAX as usize)
+            && dims
+                .iter()
+                .try_fold(0usize, |a, &m| a.checked_add(m))
                 .is_some_and(|m| m <= i32::MAX as usize)
             && n <= i32::MAX as usize
             && k <= i32::MAX as usize
@@ -9722,7 +9748,9 @@ impl Gpu {
             && prepared.n == batch_size
             && prepared.k == k
             && dims == [10240, dims[1], 48, 48]
-            && [gdn.q, gdn.k].iter().all(|t| t.buf.size() >= batch_size * 16 * 128 * 2)
+            && [gdn.q, gdn.k]
+                .iter()
+                .all(|t| t.buf.size() >= batch_size * 16 * 128 * 2)
             && gdn.v.buf.size() >= batch_size * 48 * 128 * 2
             && gdn.conv_weight.buf.size() >= 10240 * 4 * 4
             && gdn.conv_state.buf.size() >= 10240 * 3 * 4
@@ -9733,7 +9761,12 @@ impl Gpu {
         self.fp8_f2_row_launch(
             &[a_qkv, a_z, a_beta, a_alpha],
             &[y_qkv, y_z, y_beta, y_alpha],
-            prepared, &dims, k, batch_size, "qkvzagdn", Some(gdn),
+            prepared,
+            &dims,
+            k,
+            batch_size,
+            "qkvzagdn",
+            Some(gdn),
         )?;
         Ok(true)
     }
@@ -9772,27 +9805,37 @@ impl Gpu {
         self.bind_thread()?;
         let silu = epi == "silu";
         if gdn.is_some() != (epi == "qkvzagdn") {
-            return Err(hip_bridge::HipError::new(0, "F2: GDN targets require the qkvzagdn epilogue"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "F2: GDN targets require the qkvzagdn epilogue",
+            ));
         }
         if !self.fp8_f2_row_active(n, k, dims, silu)
-            || prepared.n != n || prepared.k != k || prepared.scale_mode != 1
+            || prepared.n != n
+            || prepared.k != k
+            || prepared.scale_mode != 1
             || weights.len() != dims.len()
             || outputs.len() != if silu { 1 } else { dims.len() }
             || weights.iter().any(|w| w.dtype != DType::Raw)
             || weights.iter().any(|w| (w.buf.as_ptr() as usize) % 16 != 0)
             || weights.iter().zip(dims).any(|(w, &m)| {
-                m.checked_mul(k / 256).and_then(|v| v.checked_mul(136))
+                m.checked_mul(k / 256)
+                    .and_then(|v| v.checked_mul(136))
                     .is_none_or(|bytes| w.numel() < bytes)
             })
             || outputs.iter().any(|y| (y.buf.as_ptr() as usize) % 16 != 0)
         {
-            return Err(hip_bridge::HipError::new(0, "F2: invalid Row/qt44/shape/ABI admission"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "F2: invalid Row/qt44/shape/ABI admission",
+            ));
         }
         let mt: usize = dims.iter().sum();
-        let (wf_bytes, rw_bytes, ew_bytes) =
-            crate::scratch::fp8_f2_weight_extents(mt, k)
-                .ok_or_else(|| hip_bridge::HipError::new(0, "F2: workspace extent overflow"))?;
-        let needed = wf_bytes.checked_add(rw_bytes).and_then(|x| x.checked_add(ew_bytes))
+        let (wf_bytes, rw_bytes, ew_bytes) = crate::scratch::fp8_f2_weight_extents(mt, k)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "F2: workspace extent overflow"))?;
+        let needed = wf_bytes
+            .checked_add(rw_bytes)
+            .and_then(|x| x.checked_add(ew_bytes))
             .ok_or_else(|| hip_bridge::HipError::new(0, "F2: workspace extent overflow"))?;
         // The prefill route is eager-only. A future caller cannot grow/free
         // a captured workspace before the existing tape has been invalidated.
@@ -9812,34 +9855,52 @@ impl Gpu {
             "qkvzagdn" => "gemm_mq4g256v2_fp8_qkvzagdn_row_b1",
             _ => return Err(hip_bridge::HipError::new(0, "F2: unknown epilogue")),
         };
-        self.ensure_embedded_kernel(REPACK_MODULE, kernels::MQ4V2_FP8_FRAGMENT_REPACK_GFX1201, REPACK)?;
+        self.ensure_embedded_kernel(
+            REPACK_MODULE,
+            kernels::MQ4V2_FP8_FRAGMENT_REPACK_GFX1201,
+            REPACK,
+        )?;
         // `HIPFIRE_G12_FP8_F2_BUNDLE=<path>` (developer A/B of builder bundles
         // with one binary) loads the F2 bundle from a file instead of the
         // embedded image; the first F2 launch of the process fixes the module.
         if !self.functions.contains_key(symbol) {
             match hipfire_config::developer_var("HIPFIRE_G12_FP8_F2_BUNDLE") {
                 Ok(path) => {
-                    let image = std::fs::read(&path)
-                        .map_err(|e| hip_bridge::HipError::new(0, &format!("F2: bundle {path}: {e}")))?;
+                    let image = std::fs::read(&path).map_err(|e| {
+                        hip_bridge::HipError::new(0, &format!("F2: bundle {path}: {e}"))
+                    })?;
                     self.ensure_embedded_kernel(GEMM_MODULE, &image, symbol)?;
                 }
-                Err(_) => self.ensure_embedded_kernel(GEMM_MODULE, kernels::GEMM_MQ4G256V2_WMMA_FP8_GFX12_B1, symbol)?,
+                Err(_) => self.ensure_embedded_kernel(
+                    GEMM_MODULE,
+                    kernels::GEMM_MQ4G256V2_WMMA_FP8_GFX12_B1,
+                    symbol,
+                )?,
             }
         }
         if crate::scratch::scratch_will_grow(
-            self.scratch.fp8_f2_weights_bytes, self.scratch.fp8_f2_weights.is_some(), needed
+            self.scratch.fp8_f2_weights_bytes,
+            self.scratch.fp8_f2_weights.is_some(),
+            needed,
         ) {
             self.invalidate_for_scratch_growth();
         }
         let base = self.scratch.ensure_fp8_f2_weights(&self.hip, needed)?;
         let wf = base;
         let rw = (base as *mut u8).wrapping_add(wf_bytes).cast::<c_void>();
-        let ew = (base as *mut u8).wrapping_add(wf_bytes + rw_bytes).cast::<c_void>();
+        let ew = (base as *mut u8)
+            .wrapping_add(wf_bytes + rw_bytes)
+            .cast::<c_void>();
         let mut ws = [std::ptr::null_mut(); 4];
         let mut ys = [std::ptr::null_mut(); 4];
         let mut ms = [0i32; 4];
-        for (i, w) in weights.iter().enumerate() { ws[i] = w.buf.as_ptr(); ms[i] = dims[i] as i32; }
-        for (i, y) in outputs.iter().enumerate() { ys[i] = y.buf.as_ptr(); }
+        for (i, w) in weights.iter().enumerate() {
+            ws[i] = w.buf.as_ptr();
+            ms[i] = dims[i] as i32;
+        }
+        for (i, y) in outputs.iter().enumerate() {
+            ys[i] = y.buf.as_ptr();
+        }
         // Gate/up produces h into Y0. Y1 is deliberately null and untouched.
         let mut wf_arg = wf;
         let mut rw_arg = rw;
@@ -9847,27 +9908,44 @@ impl Gpu {
         let mut kv = k as i32;
         let mut nv = n as i32;
         let mut family = if silu { 1i32 } else { 0i32 };
-        let mut repack_params: Vec<*mut c_void> = ws.iter_mut().map(|p| p as *mut _ as *mut c_void).collect();
+        let mut repack_params: Vec<*mut c_void> =
+            ws.iter_mut().map(|p| p as *mut _ as *mut c_void).collect();
         repack_params.extend([
-            &mut wf_arg as *mut _ as *mut c_void, &mut rw_arg as *mut _ as *mut c_void,
+            &mut wf_arg as *mut _ as *mut c_void,
+            &mut rw_arg as *mut _ as *mut c_void,
             &mut ew_arg as *mut _ as *mut c_void,
         ]);
         repack_params.extend(ms.iter_mut().map(|v| v as *mut _ as *mut c_void));
-        repack_params.extend([&mut kv as *mut _ as *mut c_void, &mut family as *mut _ as *mut c_void]);
+        repack_params.extend([
+            &mut kv as *mut _ as *mut c_void,
+            &mut family as *mut _ as *mut c_void,
+        ]);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", REPACK, needed);
         let repack = self.launch_maybe_blob(
             REPACK,
             [(mt.div_ceil(256) * 4) as u32, (k / 256) as u32, 1],
-            [256, 1, 1], 0, &mut repack_params,
+            [256, 1, 1],
+            0,
+            &mut repack_params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                for p in ws { b.push_ptr(p); }
-                b.push_ptr(wf); b.push_ptr(rw); b.push_ptr(ew);
-                for m in ms { b.push_i32(m); }
-                b.push_i32(kv); b.push_i32(family); b
+                for p in ws {
+                    b.push_ptr(p);
+                }
+                b.push_ptr(wf);
+                b.push_ptr(rw);
+                b.push_ptr(ew);
+                for m in ms {
+                    b.push_i32(m);
+                }
+                b.push_i32(kv);
+                b.push_i32(family);
+                b
             },
         );
-        if let Some(t) = timer { t.finish(&self.hip); }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         repack?;
         let mut x8 = prepared.x_fp8;
         let mut d = prepared.row_scales;
@@ -9880,35 +9958,58 @@ impl Gpu {
         ];
         gemm_params.extend(ys.iter_mut().map(|p| p as *mut _ as *mut c_void));
         gemm_params.extend(ms.iter_mut().map(|m| m as *mut _ as *mut c_void));
-        gemm_params.extend([&mut kv as *mut _ as *mut c_void, &mut nv as *mut _ as *mut c_void]);
+        gemm_params.extend([
+            &mut kv as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ]);
         let mut gdn_ptrs = [std::ptr::null_mut(); 5];
         let (mut q_scale, mut eps) = (0f32, 0f32);
         if let Some(t) = gdn {
             gdn_ptrs = [t.conv_weight, t.conv_state, t.q, t.k, t.v].map(|x| x.buf.as_ptr());
             (q_scale, eps) = (t.q_scale, t.eps);
             gemm_params.extend(gdn_ptrs.iter_mut().map(|p| p as *mut _ as *mut c_void));
-            gemm_params.extend([&mut q_scale as *mut _ as *mut c_void, &mut eps as *mut _ as *mut c_void]);
+            gemm_params.extend([
+                &mut q_scale as *mut _ as *mut c_void,
+                &mut eps as *mut _ as *mut c_void,
+            ]);
         }
         let output_bytes = if silu && bf16_h_fp8_enabled() { 2 } else { 4 };
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", symbol, needed + n * mt * output_bytes);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemm", symbol, needed + n * mt * output_bytes);
         let result = self.launch_maybe_blob(
-            symbol, [mt.div_ceil(256) as u32, n.div_ceil(128) as u32, 1],
-            [256, 1, 1], 19_456, &mut gemm_params,
+            symbol,
+            [mt.div_ceil(256) as u32, n.div_ceil(128) as u32, 1],
+            [256, 1, 1],
+            19_456,
+            &mut gemm_params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(wf); b.push_ptr(rw); b.push_ptr(ew);
-                b.push_ptr(x8); b.push_ptr(d);
-                for p in ys { b.push_ptr(p); }
-                for m in ms { b.push_i32(m); }
-                b.push_i32(kv); b.push_i32(nv);
+                b.push_ptr(wf);
+                b.push_ptr(rw);
+                b.push_ptr(ew);
+                b.push_ptr(x8);
+                b.push_ptr(d);
+                for p in ys {
+                    b.push_ptr(p);
+                }
+                for m in ms {
+                    b.push_i32(m);
+                }
+                b.push_i32(kv);
+                b.push_i32(nv);
                 if gdn.is_some() {
-                    for p in gdn_ptrs { b.push_ptr(p); }
-                    b.push_f32(q_scale); b.push_f32(eps);
+                    for p in gdn_ptrs {
+                        b.push_ptr(p);
+                    }
+                    b.push_f32(q_scale);
+                    b.push_f32(eps);
                 }
                 b
             },
         );
-        if let Some(t) = timer { t.finish(&self.hip); }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         if result.is_ok() && *G12_FP8_F2_COVERAGE {
             eprintln!("fp8_f2_selected: symbol={symbol} n={n} k={k} dims={dims:?}");
         }
@@ -9955,14 +10056,9 @@ impl Gpu {
             && hipfire_config::developer_bool("HIPFIRE_FP8_SILU_H", true)
     }
 
-
     #[inline]
     fn fp8_v2_lds_bytes(vbm: usize, vbn: usize, vbk: usize, symfold: bool) -> u32 {
-        let metadata = if symfold {
-            vbn * 4
-        } else {
-            vbm * 4 + vbn * 8
-        };
+        let metadata = if symfold { vbn * 4 } else { vbm * 4 + vbn * 8 };
         (vbm * (vbk + 8) + vbn * (vbk + 8) + metadata) as u32
     }
     /// MQ4 v2 (qt 44) — dedicated v2 source `GEMM_QKVZA_MQ4G256V2_*_SRC`.
@@ -10010,9 +10106,8 @@ impl Gpu {
         // already-guarded uniform route above (exact gfx1201, eager, K%256)
         // plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
-        let v2 = self.flags.gfx12_mq4v2_fp8_v2
-            && self.flags.gfx12_mq4v2_fp8_qkvza
-            && batch_size >= 256;
+        let v2 =
+            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_qkvza && batch_size >= 256;
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
@@ -10240,7 +10335,11 @@ impl Gpu {
             return self.fp8_f2_row_prepared(
                 &[a_qkv, a_z, a_beta, a_alpha],
                 &[y_qkv, y_z, y_beta, y_alpha],
-                prepared, &[qkv_m, z_m, beta_m, alpha_m], k, batch_size, "qkvza",
+                prepared,
+                &[qkv_m, z_m, beta_m, alpha_m],
+                k,
+                batch_size,
+                "qkvza",
             );
         }
         // Staged-tile v2 candidate (default ON on gfx1201): geometry from
@@ -10249,9 +10348,8 @@ impl Gpu {
         // already-guarded uniform route above (exact gfx1201, eager, K%256)
         // plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
-        let v2 = self.flags.gfx12_mq4v2_fp8_v2
-            && self.flags.gfx12_mq4v2_fp8_qkvza
-            && batch_size >= 256;
+        let v2 =
+            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_qkvza && batch_size >= 256;
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
@@ -10470,9 +10568,8 @@ impl Gpu {
         // already-guarded uniform route above (exact gfx1201, eager, K%256)
         // plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
-        let v2 = self.flags.gfx12_mq4v2_fp8_v2
-            && self.flags.gfx12_mq4v2_fp8_qkv
-            && batch_size >= 256;
+        let v2 =
+            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_qkv && batch_size >= 256;
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
@@ -10687,8 +10784,13 @@ impl Gpu {
             && prepared.scale_mode == 1
         {
             return self.fp8_f2_row_prepared(
-                &[a_q, a_k, a_v], &[y_q, y_k, y_v], prepared,
-                &[q_m, k_m, v_m], k, batch_size, "qkv",
+                &[a_q, a_k, a_v],
+                &[y_q, y_k, y_v],
+                prepared,
+                &[q_m, k_m, v_m],
+                k,
+                batch_size,
+                "qkv",
             );
         }
         // Staged-tile v2 candidate (default ON on gfx1201): geometry from
@@ -10697,9 +10799,8 @@ impl Gpu {
         // already-guarded uniform route above (exact gfx1201, eager, K%256)
         // plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
-        let v2 = self.flags.gfx12_mq4v2_fp8_v2
-            && self.flags.gfx12_mq4v2_fp8_qkv
-            && batch_size >= 256;
+        let v2 =
+            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_qkv && batch_size >= 256;
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
@@ -20339,7 +20440,8 @@ impl Gpu {
             self.gemm_mq4g256v2_mmq_set_prequant_lloyd(a_v, xq, y_v, v_m, k, batch_size, c16_v)?;
             return Ok(());
         }
-        let (x_pad, tmps, n_pad) = self.pad_prefill_batch_128(x, &[q_m, k_m, v_m], batch_size, k)?;
+        let (x_pad, tmps, n_pad) =
+            self.pad_prefill_batch_128(x, &[q_m, k_m, v_m], batch_size, k)?;
         let r = (|| -> HipResult<()> {
             let xq = self.ensure_q8_1_mmq_x_v2(&x_pad, n_pad, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant_lloyd(a_q, xq, &tmps[0], q_m, k, n_pad, c16_q)?;
@@ -20385,11 +20487,12 @@ impl Gpu {
             self.gemm_mq4g256v2_mmq_set_prequant_lloyd(
                 a_gate, xq, y_gate, gate_m, k, batch_size, c16_gate,
             )?;
-            self.gemm_mq4g256v2_mmq_set_prequant_lloyd(a_up, xq, y_up, up_m, k, batch_size, c16_up)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_lloyd(
+                a_up, xq, y_up, up_m, k, batch_size, c16_up,
+            )?;
             return Ok(());
         }
-        let (x_pad, tmps, n_pad) =
-            self.pad_prefill_batch_128(x, &[gate_m, up_m], batch_size, k)?;
+        let (x_pad, tmps, n_pad) = self.pad_prefill_batch_128(x, &[gate_m, up_m], batch_size, k)?;
         let r = (|| -> HipResult<()> {
             let xq = self.ensure_q8_1_mmq_x_v2(&x_pad, n_pad, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant_lloyd(
@@ -20454,7 +20557,6 @@ impl Gpu {
         r
     }
 
-
     /// GEMM v2 tile of a symmetric MQ4V2 IU4 SET/ADD of shape (m, k, n), or
     /// `None` for X5 and its fallbacks. Both tiles take the X5 eligibility
     /// rule: symmetric fold, full M128/N128 tiles, eager column route (no
@@ -20481,9 +20583,7 @@ impl Gpu {
             return None;
         }
         match self.arch.as_str() {
-            "gfx1100"
-                if hipfire_config::developer_var("HIPFIRE_IU4_V2C").as_deref() != Ok("0") =>
-            {
+            "gfx1100" if hipfire_config::developer_var("HIPFIRE_IU4_V2C").as_deref() != Ok("0") => {
                 Some(Iu4V2Tile::V2c)
             }
             "gfx1151"
@@ -20497,7 +20597,6 @@ impl Gpu {
             _ => None,
         }
     }
-
 
     /// iu4-direct MMQ consumer for the MQ4V2 family (W4A4 prefill): reads the
     /// int4 `block_i4_128` prelude from `ensure_int4_mmq_x`, feeds weight
@@ -20596,20 +20695,12 @@ impl Gpu {
                 )
             } else {
                 let kernel_name = match (g12r, symfold, add) {
-                    (true, true, true) => {
-                        "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold_g12r"
-                    }
-                    (true, true, false) => {
-                        "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold_g12r"
-                    }
+                    (true, true, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold_g12r",
+                    (true, true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold_g12r",
                     (true, false, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_g12r",
                     (true, false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_g12r",
-                    (false, true, true) => {
-                        "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold"
-                    }
-                    (false, true, false) => {
-                        "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold"
-                    }
+                    (false, true, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold",
+                    (false, true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold",
                     (false, false, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add",
                     (false, false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set",
                 };
@@ -20636,7 +20727,11 @@ impl Gpu {
             if isa {
                 self.ensure_embedded_kernel(
                     module,
-                    if slab { g12_iu4_b1s_image()? } else { g12_iu4_b1_image()? },
+                    if slab {
+                        g12_iu4_b1s_image()?
+                    } else {
+                        g12_iu4_b1_image()?
+                    },
                     kernel_name,
                 )?;
             } else {
@@ -20714,11 +20809,9 @@ impl Gpu {
         // The default-on gfx1100 shape admits SET and ADD. Eager launches
         // use the column-adjacent wrapper; graph/replay capture uses an
         // arithmetic-identical row-major wrapper matching its recorded grid.
-        let shape_lf16 = (full || gridspec)
-            && self.arch.as_str() == "gfx1100"
-            && self.flags.gfx11_iu4_shape;
-        let use_lf16 =
-            shape_lf16 || (use_col && !add && self.arch.as_str() == "gfx1151");
+        let shape_lf16 =
+            (full || gridspec) && self.arch.as_str() == "gfx1100" && self.flags.gfx11_iu4_shape;
+        let use_lf16 = shape_lf16 || (use_col && !add && self.arch.as_str() == "gfx1151");
         // Packet loads require a 16-byte aligned base for *every* N128 tile.
         // A mixed interior/tail N grid is not eligible even when its interior
         // tiles are full; capture and non-symmetric routes remain incumbent.
@@ -20745,7 +20838,10 @@ impl Gpu {
                 (true, false) => "gemm_mq4g256v2_residual_iu4_pm_set_gfx1100",
                 (true, true) => "gemm_mq4g256v2_residual_iu4_pm_add_gfx1100",
                 (false, false) => "gemm_mq4g256v2_residual_iu4_v2c_set_gfx11",
-                (false, true) if hipfire_config::developer_var("HIPFIRE_V2C_ADDEPI").as_deref() != Ok("0") => {
+                (false, true)
+                    if hipfire_config::developer_var("HIPFIRE_V2C_ADDEPI").as_deref()
+                        != Ok("0") =>
+                {
                     "gemm_mq4g256v2_residual_iu4_v2c_add_touch_gfx11"
                 }
                 (false, true) => "gemm_mq4g256v2_residual_iu4_v2c_add_gfx11",
@@ -20890,10 +20986,23 @@ impl Gpu {
             let timer = crate::profile::begin_timer(&self.hip, "gemm", launch_name, bytes);
             // Token tile on x, row tile on y; the builder ADD folds 2^gshift
             // row tiles into x (`_add_touch_swz`'s dispatch order).
-            let gshift = match pm { Some((_, s)) => s, None => 0 };
+            let gshift = match pm {
+                Some((_, s)) => s,
+                None => 0,
+            };
             let (grid, block) = match pm {
-                Some(_) => ([((batch_size / 256) << gshift) as u32, ((m / 256) >> gshift) as u32, 1], [512, 1, 1]),
-                None => ([(batch_size / 256) as u32, (m / 256) as u32, 1], [32, 16, 1]),
+                Some(_) => (
+                    [
+                        ((batch_size / 256) << gshift) as u32,
+                        ((m / 256) >> gshift) as u32,
+                        1,
+                    ],
+                    [512, 1, 1],
+                ),
+                None => (
+                    [(batch_size / 256) as u32, (m / 256) as u32, 1],
+                    [32, 16, 1],
+                ),
             };
             let result = self.launch_maybe_blob(
                 launch_name,
@@ -20936,9 +21045,7 @@ impl Gpu {
             (true, true, false) if use_lf16 => {
                 "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_gfx1100"
             }
-            (true, true, true) => {
-                "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151"
-            }
+            (true, true, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151",
             (true, true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3",
             (true, false, true) if use_lf16 => {
                 "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151"
@@ -20946,9 +21053,7 @@ impl Gpu {
             (true, false, false) if use_lf16 => {
                 "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100"
             }
-            (true, false, true) => {
-                "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151"
-            }
+            (true, false, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151",
             (true, false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3",
             (false, _, _) => "gemm_mq4g256v2_residual_mmq_iu4",
         };
@@ -20989,28 +21094,26 @@ impl Gpu {
         } else {
             base_kernel_name
         };
-        let block = if x5 || use_lf16 { [32, 16, 1] } else { [32, 8, 1] };
+        let block = if x5 || use_lf16 {
+            [32, 16, 1]
+        } else {
+            [32, 8, 1]
+        };
         const MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4";
         const GRIDSPEC_MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4_gridspec";
         const GRIDSPEC_TAIL: &str = "gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec";
         const GRIDSPEC_SRC: &str = concat!(
             include_str!("../../../kernels/src/block_i4_128_quant.hip"),
             include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip"),
-            include_str!(
-                "../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_gridspec.gfx11.hip"
-            )
+            include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_gridspec.gfx11.hip")
         );
-        const SYMFOLD_MODULE: &str =
-            "gemm_mq4g256v2_residual_mmq_iu4_gfx11_symfold";
-        const GRIDSPEC_SYMFOLD_MODULE: &str =
-            "gemm_mq4g256v2_residual_mmq_iu4_gridspec_symfold";
+        const SYMFOLD_MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4_gfx11_symfold";
+        const GRIDSPEC_SYMFOLD_MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4_gridspec_symfold";
         const GRIDSPEC_SYMFOLD_SRC: &str = concat!(
             "#define IU4_SYMMETRIC_FOLD 1\n",
             include_str!("../../../kernels/src/block_i4_128_quant.hip"),
             include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip"),
-            include_str!(
-                "../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_gridspec.gfx11.hip"
-            )
+            include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_gridspec.gfx11.hip")
         );
         let (module, source) = if x5 {
             (
@@ -21115,24 +21218,17 @@ impl Gpu {
             } else {
                 [row_tiles as u32, batch_tiles as u32, 1]
             };
-            self.launch_maybe_blob(
-                kernel_name,
-                grid,
-                block,
-                shared_mem,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(a_ptr);
-                    b.push_ptr(xq_ptr);
-                    b.push_ptr(y_ptr);
-                    b.push_i32(m_val);
-                    b.push_i32(k_val);
-                    b.push_i32(n_val);
-                    b.push_i32(add_val);
-                    b
-                },
-            )
+            self.launch_maybe_blob(kernel_name, grid, block, shared_mem, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            })
         };
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -21166,13 +21262,22 @@ impl Gpu {
 
     /// Gfx1201 A8 MQ4v2 SET/ADD. Xq is [K/128, N] of 136-byte blocks.
     fn gemm_mq4g256v2_mmq_prequant_i8(
-        &mut self, a: &GpuTensor, xq: *mut c_void, y: &GpuTensor,
-        m: usize, k: usize, n: usize, add: bool,
+        &mut self,
+        a: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        add: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.flush_residual_fold()?;
         if self.arch != "gfx1201" || !self.mq4v2_symmetric || k == 0 || k % 256 != 0 {
-            return Err(hip_bridge::HipError::new(1, "A8 MMQ requires symmetric MQ4v2 and gfx1201 K%256=0"));
+            return Err(hip_bridge::HipError::new(
+                1,
+                "A8 MMQ requires symmetric MQ4v2 and gfx1201 K%256=0",
+            ));
         }
         let kernel = if add {
             "gemm_mq4g256v2_residual_mmq_i8_full_add"
@@ -21189,43 +21294,72 @@ impl Gpu {
         let mut nv = n as i32;
         let mut av = i32::from(add);
         let mut params: Vec<*mut c_void> = vec![
-            &mut ap as *mut _ as *mut c_void, &mut xp as *mut _ as *mut c_void,
-            &mut yp as *mut _ as *mut c_void, &mut mv as *mut _ as *mut c_void,
-            &mut kv as *mut _ as *mut c_void, &mut nv as *mut _ as *mut c_void,
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mv as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
             &mut av as *mut _ as *mut c_void,
         ];
         let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + n * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
         let result = self.launch_maybe_blob(
-            kernel, [m.div_ceil(128) as u32, n.div_ceil(128) as u32, 1],
-            [256, 1, 1], 28672, &mut params,
+            kernel,
+            [m.div_ceil(128) as u32, n.div_ceil(128) as u32, 1],
+            [256, 1, 1],
+            28672,
+            &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ap); b.push_ptr(xp); b.push_ptr(yp);
-                b.push_i32(mv); b.push_i32(kv); b.push_i32(nv); b.push_i32(av); b
+                b.push_ptr(ap);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b.push_i32(av);
+                b
             },
         );
-        if let Some(t) = timer { t.finish(&self.hip); }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         result
     }
 
     pub fn gemm_mq4g256v2_mmq_set_prequant_i8(
-        &mut self, a: &GpuTensor, xq: *mut c_void, y: &GpuTensor,
-        m: usize, k: usize, n: usize,
+        &mut self,
+        a: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
     ) -> HipResult<()> {
         self.gemm_mq4g256v2_mmq_prequant_i8(a, xq, y, m, k, n, false)
     }
 
     pub fn gemm_mq4g256v2_mmq_add_prequant_i8(
-        &mut self, a: &GpuTensor, xq: *mut c_void, y: &GpuTensor,
-        m: usize, k: usize, n: usize,
+        &mut self,
+        a: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
     ) -> HipResult<()> {
         self.gemm_mq4g256v2_mmq_prequant_i8(a, xq, y, m, k, n, true)
     }
 
     pub fn gemm_mq4g256v2_residual_wmma_i8_prepared(
-        &mut self, a: &GpuTensor, prepared: &crate::scratch::Int8MmqPrepared,
-        y: &GpuTensor, m: usize, k: usize, n: usize,
+        &mut self,
+        a: &GpuTensor,
+        prepared: &crate::scratch::Int8MmqPrepared,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
     ) -> HipResult<()> {
         let xq = self.int8_mmq_prepared_ptr(prepared, k, n)?;
         self.gemm_mq4g256v2_mmq_add_prequant_i8(a, xq, y, m, k, n)
@@ -21233,20 +21367,35 @@ impl Gpu {
 
     /// Gate/up SiLU writes H directly; no intermediate gate/up tensors.
     pub fn gemm_gate_up_silu_mq4g256v2_i8_prepared(
-        &mut self, gate: &GpuTensor, up: &GpuTensor,
-        prepared: &crate::scratch::Int8MmqPrepared, h: &GpuTensor,
-        m: usize, k: usize, n: usize,
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        prepared: &crate::scratch::Int8MmqPrepared,
+        h: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
     ) -> HipResult<()> {
         let xq = self.int8_mmq_prepared_ptr(prepared, k, n)?;
         self.gemm_gate_up_silu_mq4g256v2_i8_prequant(gate, up, xq, h, m, k, n)
     }
 
     pub fn gemm_gate_up_silu_mq4g256v2_i8_prequant(
-        &mut self, gate: &GpuTensor, up: &GpuTensor, xq: *mut c_void,
-        h: &GpuTensor, m: usize, k: usize, n: usize,
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        xq: *mut c_void,
+        h: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
     ) -> HipResult<()> {
-        if self.arch != "gfx1201" || !self.mq4v2_symmetric || m == 0 || m % 128 != 0 || k % 256 != 0 {
-            return Err(hip_bridge::HipError::new(1, "A8 gate/up requires gfx1201 symmetric MQ4v2, M%128=K%256=0"));
+        if self.arch != "gfx1201" || !self.mq4v2_symmetric || m == 0 || m % 128 != 0 || k % 256 != 0
+        {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "A8 gate/up requires gfx1201 symmetric MQ4v2, M%128=K%256=0",
+            ));
         }
         self.bind_thread()?;
         self.flush_residual_fold()?;
@@ -21261,22 +21410,41 @@ impl Gpu {
         let mut kv = k as i32;
         let mut nv = n as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut gp as *mut _ as *mut c_void, &mut up as *mut _ as *mut c_void,
-            &mut xp as *mut _ as *mut c_void, &mut hp as *mut _ as *mut c_void,
-            &mut mv as *mut _ as *mut c_void, &mut kv as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut up as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut hp as *mut _ as *mut c_void,
+            &mut mv as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
             &mut nv as *mut _ as *mut c_void,
         ];
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL,
-            2 * m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + n * m * 4);
-        let result = self.launch_maybe_blob(KERNEL,
-            [(2*m).div_ceil(128) as u32, n.div_ceil(128) as u32, 1],
-            [256, 1, 1], 28672, &mut params,
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemm",
+            KERNEL,
+            2 * m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + n * m * 4,
+        );
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [(2 * m).div_ceil(128) as u32, n.div_ceil(128) as u32, 1],
+            [256, 1, 1],
+            28672,
+            &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(gp); b.push_ptr(up); b.push_ptr(xp); b.push_ptr(hp);
-                b.push_i32(mv); b.push_i32(kv); b.push_i32(nv); b
-            });
-        if let Some(t) = timer { t.finish(&self.hip); }
+                b.push_ptr(gp);
+                b.push_ptr(up);
+                b.push_ptr(xp);
+                b.push_ptr(hp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         result
     }
 
@@ -21315,7 +21483,6 @@ impl Gpu {
             None => Ok(()),
         }
     }
-
 
     /// WMMA-accelerated batched HFQ4-G256 GEMM with residual add.
     /// gfx1100+ only. 16×16 output tiles via wave32 WMMA.
@@ -31144,7 +31311,6 @@ impl Gpu {
         (z_m + 96).div_ceil(tile) * tile
     }
 
-
     /// MQ4 v2 (qt 44) — gfx11 (RDNA3/3.5) qkvza WMMA.
     /// Sister of `gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2` but with gfx11
     /// WMMA contracts (half16, w32, interleaved C). Distinct source/symbol/module
@@ -31329,7 +31495,6 @@ impl Gpu {
         result
     }
 
-
     /// C2 prepared IU4 consumer for qkvza: never launches `quantize_int4_mmq_ds128`.
     /// `x` is still required for beta/alpha small-tail f32 paths (emit_f32=true).
     pub fn gemm_qkvza_mq4g256v2_wmma_iu4_prepared(
@@ -31360,22 +31525,16 @@ impl Gpu {
             return Ok(());
         }
         if beta_m < 128 {
-            self.gemm_mq4g256v2_small_tail_set_iu4(
-                a_beta, x, xq, y_beta, beta_m, k, batch_size,
-            )?;
+            self.gemm_mq4g256v2_small_tail_set_iu4(a_beta, x, xq, y_beta, beta_m, k, batch_size)?;
         } else {
-            self.gemm_mq4g256v2_mmq_set_prequant_iu4(
-                a_beta, xq, y_beta, beta_m, k, batch_size,
-            )?;
+            self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_beta, xq, y_beta, beta_m, k, batch_size)?;
         }
         if alpha_m < 128 {
             self.gemm_mq4g256v2_small_tail_set_iu4(
                 a_alpha, x, xq, y_alpha, alpha_m, k, batch_size,
             )?;
         } else {
-            self.gemm_mq4g256v2_mmq_set_prequant_iu4(
-                a_alpha, xq, y_alpha, alpha_m, k, batch_size,
-            )?;
+            self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_alpha, xq, y_alpha, alpha_m, k, batch_size)?;
         }
         Ok(())
     }
@@ -31442,11 +31601,17 @@ impl Gpu {
             && y_qkv.buf.size() >= n * dims[0] * 4
             && y_z.buf.size() >= n * dims[1] * 4
             && [y_beta, y_alpha].iter().all(|t| t.buf.size() >= n * 48 * 4)
-            && [gdn.q, gdn.k].iter().all(|t| t.buf.size() >= n * 16 * 128 * 2)
+            && [gdn.q, gdn.k]
+                .iter()
+                .all(|t| t.buf.size() >= n * 16 * 128 * 2)
             && gdn.v.buf.size() >= n * 48 * 128 * 2
             && gdn.conv_weight.buf.size() >= dims[0] * 4 * 4
             && gdn.conv_state.buf.size() >= dims[0] * 3 * 4
-            && [a_qkv, a_z_fold, y_qkv, y_z, y_beta, y_alpha, gdn.q, gdn.k, gdn.v].into_iter().all(aligned))
+            && [
+                a_qkv, a_z_fold, y_qkv, y_z, y_beta, y_alpha, gdn.q, gdn.k, gdn.v,
+            ]
+            .into_iter()
+            .all(aligned))
         {
             return Ok(false);
         }
@@ -31474,7 +31639,8 @@ impl Gpu {
         let mut xq_ptr = xq;
         let mut outs = [y_z, y_beta, y_alpha].map(|t| t.buf.as_ptr());
         let mut ints = [dims[0] as i32, dims[1] as i32, k as i32, n as i32];
-        let mut gdn_ptrs = [gdn.conv_weight, gdn.conv_state, gdn.q, gdn.k, gdn.v, y_qkv].map(|t| t.buf.as_ptr());
+        let mut gdn_ptrs =
+            [gdn.conv_weight, gdn.conv_state, gdn.q, gdn.k, gdn.v, y_qkv].map(|t| t.buf.as_ptr());
         let mut scales = [gdn.q_scale, gdn.eps];
         let [p0, p1] = &mut ptrs;
         let [o0, o1, o2] = &mut outs;
@@ -31482,15 +31648,28 @@ impl Gpu {
         let [g0, g1, g2, g3, g4, g5] = &mut gdn_ptrs;
         let [f0, f1] = &mut scales;
         let mut params: Vec<*mut c_void> = vec![
-            p0 as *mut _ as *mut c_void, p1 as *mut _ as *mut c_void, &mut xq_ptr as *mut _ as *mut c_void,
-            o0 as *mut _ as *mut c_void, o1 as *mut _ as *mut c_void, o2 as *mut _ as *mut c_void,
-            i0 as *mut _ as *mut c_void, i1 as *mut _ as *mut c_void, i2 as *mut _ as *mut c_void, i3 as *mut _ as *mut c_void,
-            g0 as *mut _ as *mut c_void, g1 as *mut _ as *mut c_void, g2 as *mut _ as *mut c_void,
-            g3 as *mut _ as *mut c_void, g4 as *mut _ as *mut c_void, g5 as *mut _ as *mut c_void,
-            f0 as *mut _ as *mut c_void, f1 as *mut _ as *mut c_void,
+            p0 as *mut _ as *mut c_void,
+            p1 as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            o0 as *mut _ as *mut c_void,
+            o1 as *mut _ as *mut c_void,
+            o2 as *mut _ as *mut c_void,
+            i0 as *mut _ as *mut c_void,
+            i1 as *mut _ as *mut c_void,
+            i2 as *mut _ as *mut c_void,
+            i3 as *mut _ as *mut c_void,
+            g0 as *mut _ as *mut c_void,
+            g1 as *mut _ as *mut c_void,
+            g2 as *mut _ as *mut c_void,
+            g3 as *mut _ as *mut c_void,
+            g4 as *mut _ as *mut c_void,
+            g5 as *mut _ as *mut c_void,
+            f0 as *mut _ as *mut c_void,
+            f1 as *mut _ as *mut c_void,
         ];
         let row_tiles = (dims[0] + Self::iu4_gdn_fold_rows(dims[1]).0).div_ceil(128);
-        let bytes = (dims[0] + dims[1] + 96) * row_bytes + n * (dims[1] + 96) * 4 + n * (32 + 48) * 128 * 2;
+        let bytes =
+            (dims[0] + dims[1] + 96) * row_bytes + n * (dims[1] + 96) * 4 + n * (32 + 48) * 128 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", symbol, bytes);
         let blob_ptrs = (ptrs, xq, outs, ints, gdn_ptrs, scales);
         let result = self.launch_maybe_blob(
@@ -31502,12 +31681,22 @@ impl Gpu {
             || {
                 let (ptrs, xq, outs, ints, gdn_ptrs, scales) = blob_ptrs;
                 let mut b = hip_bridge::KernargBlob::new();
-                for p in ptrs { b.push_ptr(p); }
+                for p in ptrs {
+                    b.push_ptr(p);
+                }
                 b.push_ptr(xq);
-                for p in outs { b.push_ptr(p); }
-                for i in ints { b.push_i32(i); }
-                for p in gdn_ptrs { b.push_ptr(p); }
-                for f in scales { b.push_f32(f); }
+                for p in outs {
+                    b.push_ptr(p);
+                }
+                for i in ints {
+                    b.push_i32(i);
+                }
+                for p in gdn_ptrs {
+                    b.push_ptr(p);
+                }
+                for f in scales {
+                    b.push_f32(f);
+                }
                 b
             },
         );
@@ -31546,7 +31735,10 @@ impl Gpu {
             || a_z_fold.byte_size() != folded_m * row_bytes
             || y_z_fold.byte_size() < n * folded_m * 4
         {
-            return Err(hip_bridge::HipError::new(1, "invalid MQ4V2 Z beta/alpha fold layout"));
+            return Err(hip_bridge::HipError::new(
+                1,
+                "invalid MQ4V2 Z beta/alpha fold layout",
+            ));
         }
         let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
         self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, qkv_m, k, n)?;
@@ -31563,9 +31755,7 @@ impl Gpu {
         {
             return self.gemm_zba_v2b_scatter(a_z_fold, xq, y_z, y_beta, y_alpha, z_m, k, n);
         }
-        self.gemm_mq4g256v2_mmq_set_prequant_iu4(
-            a_z_fold, xq, y_z_fold, folded_m, k, n,
-        )?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_z_fold, xq, y_z_fold, folded_m, k, n)?;
         self.ensure_kernel(
             "split_mq4v2_z_betaalpha",
             kernels::SPLIT_MQ4V2_Z_BETAALPHA_SRC,
@@ -31588,10 +31778,17 @@ impl Gpu {
             &mut nv as *mut _ as *mut c_void,
         ];
         let timer = crate::profile::begin_timer(
-            &self.hip, "gemm", "split_mq4v2_z_betaalpha", n * (folded_m + z_m + 96) * 4,
+            &self.hip,
+            "gemm",
+            "split_mq4v2_z_betaalpha",
+            n * (folded_m + z_m + 96) * 4,
         );
         let result = self.launch_maybe_blob(
-            "split_mq4v2_z_betaalpha", [n as u32, 1, 1], [256, 1, 1], 0, &mut params,
+            "split_mq4v2_z_betaalpha",
+            [n as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(src);
@@ -31665,8 +31862,12 @@ impl Gpu {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(a);
                 b.push_ptr(x);
-                for p in outs { b.push_ptr(p); }
-                for i in ints { b.push_i32(i); }
+                for p in outs {
+                    b.push_ptr(p);
+                }
+                for i in ints {
+                    b.push_i32(i);
+                }
                 b
             },
         );
@@ -32579,9 +32780,7 @@ impl Gpu {
             && batch_size >= 64
         {
             let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
-            self.gemm_mq4g256v2_mmq_set_prequant_iu4(
-                a_gate, xq, y_gate, gate_m, k, batch_size,
-            )?;
+            self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_gate, xq, y_gate, gate_m, k, batch_size)?;
             self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_up, xq, y_up, up_m, k, batch_size)?;
             return Ok(());
         }
@@ -32821,8 +33020,13 @@ impl Gpu {
             && prepared.scale_mode == 1
         {
             return self.fp8_f2_row_prepared(
-                &[a_gate, a_up], &[y_gate], prepared,
-                &[gate_m, up_m], k, batch_size, "silu",
+                &[a_gate, a_up],
+                &[y_gate],
+                prepared,
+                &[gate_m, up_m],
+                k,
+                batch_size,
+                "silu",
             );
         }
         // Staged-tile v2 candidate (default ON on gfx1201): geometry from
@@ -32831,9 +33035,8 @@ impl Gpu {
         // already-guarded uniform route above (exact gfx1201, eager, K%256)
         // plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
-        let v2 = self.flags.gfx12_mq4v2_fp8_v2
-            && self.flags.gfx12_mq4v2_fp8_gateup
-            && batch_size >= 256;
+        let v2 =
+            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_gateup && batch_size >= 256;
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
@@ -33471,9 +33674,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
-        self.gemm_mq4g256v2_mmq_set_prequant_iu4(
-            a_gate, xq, y_gate, gate_m, k, batch_size,
-        )?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_gate, xq, y_gate, gate_m, k, batch_size)?;
         self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_up, xq, y_up, up_m, k, batch_size)?;
         Ok(())
     }
@@ -33501,9 +33702,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<bool> {
-        if gate_m != up_m
-            || hipfire_config::developer_var("HIPFIRE_F1LITE").as_deref() == Ok("0")
-        {
+        if gate_m != up_m || hipfire_config::developer_var("HIPFIRE_F1LITE").as_deref() == Ok("0") {
             return Ok(false);
         }
         if self.arch == "gfx1201" {
@@ -33580,7 +33779,13 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             kernel_name,
             [(batch_size / t) as u32, (2 * gate_m / t) as u32, 1],
-            if pm { [256, 1, 1] } else if v2b_pm.is_some() { [512, 1, 1] } else { [32, tile.waves(), 1] },
+            if pm {
+                [256, 1, 1]
+            } else if v2b_pm.is_some() {
+                [512, 1, 1]
+            } else {
+                [32, tile.waves(), 1]
+            },
             tile.lds_bytes(),
             &mut params,
             || {
@@ -33638,7 +33843,8 @@ impl Gpu {
         let isa = isa_requested && g12_iu4_b1_eligible(m, k, h.buf.as_ptr());
         if bf16_h_a4_enabled() && (!isa || *G12_IU4_B1_CONTROL) {
             return Err(hip_bridge::HipError::new(
-                0, "bf16 h requires the production gfx1201 IU4 b1 SiLU object",
+                0,
+                "bf16 h requires the production gfx1201 IU4 b1 SiLU object",
             ));
         }
         let slab = self.scratch.int4_mmq_slab_at(xq);
@@ -33690,7 +33896,11 @@ impl Gpu {
         if isa {
             self.ensure_embedded_kernel(
                 module,
-                if slab { g12_iu4_b1s_image()? } else { g12_iu4_b1_image()? },
+                if slab {
+                    g12_iu4_b1s_image()?
+                } else {
+                    g12_iu4_b1_image()?
+                },
                 kernel,
             )?;
         } else {
@@ -34832,12 +35042,7 @@ impl Gpu {
         }
         let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
         self.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_prepared(
-            a_raw,
-            &prepared,
-            y,
-            m,
-            k,
-            batch_size,
+            a_raw, &prepared, y, m, k, batch_size,
         )
     }
     pub fn gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_prepared(
@@ -34868,12 +35073,8 @@ impl Gpu {
                 "gemm_mq4g256v2_residual_wmma_fp8_gfx12: prepared (n,k,scale_mode) mismatch",
             ));
         }
-        if self.flags.gfx12_mq4v2_fp8_resid
-            && self.fp8_f2_row_active(batch_size, k, &[m], false)
-        {
-            return self.fp8_f2_row_prepared(
-                &[a_raw], &[y], prepared, &[m], k, batch_size, "add",
-            );
+        if self.flags.gfx12_mq4v2_fp8_resid && self.fp8_f2_row_active(batch_size, k, &[m], false) {
+            return self.fp8_f2_row_prepared(&[a_raw], &[y], prepared, &[m], k, batch_size, "add");
         }
         // Staged-tile v2 candidate (default ON on gfx1201): geometry from
         // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM128 x BN128 x BK64,
@@ -34882,9 +35083,8 @@ impl Gpu {
         // K%256) plus N>=256; the family flag stays a prerequisite and
         // smaller batches keep s2bt8/BT. Params/blob layout below is the
         // frozen v2 ABI.
-        let v2 = self.flags.gfx12_mq4v2_fp8_v2
-            && self.flags.gfx12_mq4v2_fp8_resid
-            && batch_size >= 256;
+        let v2 =
+            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_resid && batch_size >= 256;
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
@@ -35375,7 +35575,6 @@ impl Gpu {
         }
         result
     }
-
 
     /// C2 prepared IU4 residual consumer: never launches `quantize_int4_mmq_ds128`.
     /// ADD semantics (`Y += W@X`); matches `gemm_mq4g256v2_residual_wmma` IU4 branch.
