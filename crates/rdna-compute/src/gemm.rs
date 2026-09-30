@@ -25493,11 +25493,14 @@ impl Gpu {
             batch_size <= 64,
             "gemm_q8_0_batched: batch_size {batch_size} exceeds kernel MAX_BATCH=64"
         );
-        self.ensure_kernel(
-            "gemm_q8_0_batched",
-            kernels::GEMM_Q8_0_BATCHED_SRC,
-            "gemm_q8_0_batched",
-        )?;
+        // gfx11+: eight rows per workgroup share X through LDS (bitwise the
+        // per-row kernel, which re-reads X for every row).
+        let (kernel, grid, block) = if self.arch_caps.has_gfx11_plus_simt() {
+            ("gemm_q8_0_batched_lds8", m.div_ceil(8) as u32, 256u32)
+        } else {
+            ("gemm_q8_0_batched", m as u32, 32u32)
+        };
+        self.ensure_kernel("gemm_q8_0_batched", kernels::GEMM_Q8_0_BATCHED_SRC, kernel)?;
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
@@ -25522,9 +25525,9 @@ impl Gpu {
         let bytes = m.saturating_mul(k) / 32 * 34 + batch_size.saturating_mul(k) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_q8_0_batched", bytes);
         let result = self.launch_maybe_blob(
-            "gemm_q8_0_batched",
-            [m as u32, 1, 1],
-            [32, 1, 1],
+            kernel,
+            [grid, 1, 1],
+            [block, 1, 1],
             0,
             &mut params,
             || {
@@ -44584,6 +44587,73 @@ mod tests {
         assert!(!g12_iu4_b1_eligible(128, 384, aligned));
         assert!(!g12_iu4_b1_eligible(127, 512, aligned));
         assert!(!g12_iu4_b1_eligible(128, 512, 0x1004usize as *mut c_void));
+    }
+
+    /// `gemm_q8_0_batched` (the LDS-shared eight-row kernel on gfx11+) keeps
+    /// the per-row contract bit for bit: each of 32 lanes FMA-accumulates its
+    /// K lane over the groups in order, then a shfl_down tree. Rows not a
+    /// multiple of eight, a partial LDS chunk (K = 2592) and 1/5/64 batches.
+    #[test]
+    fn q8_0_batched_matches_lane_order_reference() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let (m, k) = (37usize, 2592usize);
+        let groups = k / 32;
+        let mut packed = vec![0u8; m * groups * 34];
+        let mut dq = vec![0f32; m * k];
+        for row in 0..m {
+            for g in 0..groups {
+                let base = (row * groups + g) * 34;
+                // Normal f16 scales around 2^-7..2^-6: exponent 8, 10-bit mantissa.
+                let bits = (8u16 << 10) | (((row * 7 + g) * 37 % 1024) as u16);
+                let scale = (1.0 + (bits & 0x3ff) as f32 / 1024.0) * 2f32.powi(8 - 15);
+                packed[base..base + 2].copy_from_slice(&bits.to_le_bytes());
+                for l in 0..32 {
+                    let q = (((row * 131 + g * 17 + l * 29) % 255) as i32 - 127) as i8;
+                    packed[base + 2 + l] = q as u8;
+                    dq[row * k + g * 32 + l] = scale * q as f32;
+                }
+            }
+        }
+        let weight = gpu.upload_raw(&packed, &[packed.len()]).expect("upload Q8");
+        for batch in [1usize, 5, 64] {
+            let x: Vec<f32> = (0..batch * k)
+                .map(|i| (((i * 2_654_435_761) % 2003) as f32 - 1001.0) / 997.0)
+                .collect();
+            let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("upload X");
+            let y_gpu = gpu.zeros(&[batch * m], DType::F32).expect("alloc Y");
+            gpu.gemm_q8_0_batched(&weight, &x_gpu, &y_gpu, m, k, batch)
+                .expect("gemm_q8_0_batched");
+            let y = gpu.download_f32(&y_gpu).expect("download Y");
+            for b in 0..batch {
+                for row in 0..m {
+                    let mut lanes = [0f32; 32];
+                    for (l, lane) in lanes.iter_mut().enumerate() {
+                        for g in 0..groups {
+                            let c = g * 32 + l;
+                            *lane = dq[row * k + c].mul_add(x[b * k + c], *lane);
+                        }
+                    }
+                    let mut offset = 16;
+                    while offset > 0 {
+                        for l in 0..32 - offset {
+                            lanes[l] += lanes[l + offset];
+                        }
+                        offset >>= 1;
+                    }
+                    assert_eq!(
+                        y[b * m + row].to_bits(),
+                        lanes[0].to_bits(),
+                        "batch {batch} row {b} output {row}"
+                    );
+                }
+            }
+            gpu.free_tensor(x_gpu).expect("free X");
+            gpu.free_tensor(y_gpu).expect("free Y");
+        }
+        gpu.free_tensor(weight).expect("free Q8");
     }
 
     #[test]

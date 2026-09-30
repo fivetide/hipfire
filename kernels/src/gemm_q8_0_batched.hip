@@ -70,3 +70,61 @@ extern "C" __global__ void gemm_q8_0_batched(
         }
     }
 }
+
+// gemm_q8_0_batched with eight rows per workgroup sharing X through LDS
+// (the per-row kernel re-reads all of X from memory for every output row).
+// Each 32-lane group owns one row with the per-row kernel's exact lane
+// order: every lane accumulates its K lane over the groups in ascending
+// order, then the same shfl_down tree, so every output is bitwise equal.
+// Grid: [ceil(M / 8), 1, 1].  Block: [256, 1, 1].  batch_size <= MAX_BATCH.
+#define Q8_LDS_GROUPS 4
+extern "C" __global__ __launch_bounds__(256) void gemm_q8_0_batched_lds8(
+    const unsigned char* __restrict__ A_q8,
+    const float* __restrict__ X,
+    float* __restrict__ Y,
+    int M, int K, int batch_size
+) {
+    __shared__ __align__(16) float xs[MAX_BATCH * Q8_LDS_GROUPS * 32];
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 8 + (threadIdx.x >> 5);
+    const int blocks_per_row = K / 32;
+    const unsigned char* row_data = A_q8 + (size_t)min(row, M - 1) * blocks_per_row * 34;
+
+    float sums[MAX_BATCH];
+    #pragma unroll
+    for (int b = 0; b < MAX_BATCH; b++) sums[b] = 0.0f;
+
+    for (int b0 = 0; b0 < blocks_per_row; b0 += Q8_LDS_GROUPS) {
+        const int groups = min(Q8_LDS_GROUPS, blocks_per_row - b0);
+        const int width = groups * 32;
+        __syncthreads();
+        for (int i = threadIdx.x; i < batch_size * width; i += 256) {
+            const int b = i / width, c = i - b * width;
+            xs[b * Q8_LDS_GROUPS * 32 + c] = X[(size_t)b * K + b0 * 32 + c];
+        }
+        __syncthreads();
+        for (int g = 0; g < groups; g++) {
+            const unsigned char* block = row_data + (b0 + g) * 34;
+            float d = (float)*((const _Float16*)block);
+            signed char qval = (signed char)block[2 + lane];
+            float dq = d * (float)qval;
+            #pragma unroll
+            for (int b = 0; b < MAX_BATCH; b++) {
+                if (b < batch_size) {
+                    sums[b] += dq * xs[b * Q8_LDS_GROUPS * 32 + g * 32 + lane];
+                }
+            }
+        }
+    }
+    if (row >= M) return;
+    #pragma unroll
+    for (int b = 0; b < MAX_BATCH; b++) {
+        if (b < batch_size) {
+            float s = sums[b];
+            for (int offset = 16; offset > 0; offset >>= 1)
+                s += __shfl_down(s, offset, 32);
+            if (lane == 0) Y[(size_t)b * M + row] = s;
+        }
+    }
+}
+#undef Q8_LDS_GROUPS
