@@ -4480,9 +4480,13 @@ mod ep_admission_tests {
     }
 
     fn qwen35_moe_fixture() -> PathBuf {
+        // One file per call: parallel tests sharing a path truncate each
+        // other's mmapped fixture (SIGBUS).
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
-            "hipfire-loader-qwen35-moe-admission-{}.hfq",
-            std::process::id()
+            "hipfire-loader-qwen35-moe-admission-{}-{}.hfq",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let metadata = serde_json::json!({
             "config": {
