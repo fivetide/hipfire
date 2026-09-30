@@ -1128,6 +1128,10 @@ pub struct HyperNormGate<'a> {
     pub hidden: usize,
     /// `input` holds BF16 bits (see [`Gpu::qwen4_bf16_streams`]).
     pub state_bf16: bool,
+    /// Also write the rows normalized with this (read) norm weight as F16 at
+    /// row pitch `.2`: [`hyper_norm_f16`]'s output for a hyper read of the
+    /// same streams, bitwise.
+    pub read_f16: Option<(&'a GpuTensor, &'a GpuTensor, usize)>,
 }
 
 impl HyperNormGate<'_> {
@@ -1150,6 +1154,13 @@ pub fn hyper_norm_gate(gpu: &mut Gpu, p: &HyperNormGate<'_>) -> HipResult<()> {
         || p.gate_weight.numel() < p.branches * wide
         || p.input.numel() < p.rows * wide
         || p.gates.numel() < p.rows * p.branches
+        || p.read_f16.is_some_and(|(norm, out, ld)| {
+            norm.dtype != DType::BF16
+                || norm.numel() != wide
+                || out.dtype != DType::F16
+                || ld < wide
+                || out.numel() < p.rows * ld
+        })
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
@@ -1164,6 +1175,13 @@ pub fn hyper_norm_gate(gpu: &mut Gpu, p: &HyperNormGate<'_>) -> HipResult<()> {
     args.push_ptr(p.gates.buf.as_ptr());
     args.push_i32(hidden);
     args.push_i32(i32::from(p.state_bf16));
+    let (read_norm, read_out, read_ld) = match p.read_f16 {
+        Some((norm, out, ld)) => (norm.buf.as_ptr(), out.buf.as_ptr(), ld),
+        None => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
+    };
+    args.push_ptr(read_norm);
+    args.push_ptr(read_out);
+    args.push_i32(checked_i32(read_ld, "HC norm-gate F16 pitch")?);
     args.pad_to(16);
     gpu.launch_blob_recorded(
         "hyper_norm_gate_f32",
@@ -3652,7 +3670,8 @@ mod tests {
     }
 
     /// The fused HC norm + BF16 gate projection must equal hyper_norm followed
-    /// by the multi-row BF16 GEMM bit for bit, at the production width.
+    /// by the multi-row BF16 GEMM bit for bit, at the production width, and
+    /// its F16 read output must equal hyper_norm_f16 of the same streams.
     #[test]
     fn hyper_norm_gate_is_bit_identical_to_norm_then_gemm() {
         let Some(mut gpu) = try_gpu() else {
@@ -3685,6 +3704,9 @@ mod tests {
         let norm = bf16(&mut gpu, &wave(2, wide, 0.5));
         let gate_weight = bf16(&mut gpu, &wave(3, branches * wide, 0.05));
         let fused = gpu.zeros(&[rows * branches], DType::F32).expect("fused");
+        let read_norm = bf16(&mut gpu, &wave(4, wide, 0.5));
+        let ld = wide + 64;
+        let f16_fused = gpu.zeros(&[rows * ld], DType::F16).expect("f16 fused");
         hyper_norm_gate(
             &mut gpu,
             &HyperNormGate {
@@ -3696,9 +3718,33 @@ mod tests {
                 branches,
                 hidden,
                 state_bf16: false,
+                read_f16: Some((&read_norm, &f16_fused, ld)),
             },
         )
         .expect("fused");
+        let f16_ref = gpu.zeros(&[rows * ld], DType::F16).expect("f16 ref");
+        let read_normalized = gpu.zeros(&[rows * wide], DType::F32).expect("read normalized");
+        hyper_norm_f16(
+            &mut gpu,
+            &HyperNorm {
+                input: &input,
+                norm_weight: &read_norm,
+                normalized: &read_normalized,
+                branches,
+                hidden,
+                state_bf16: false,
+            },
+            &f16_ref,
+            ld,
+            false,
+        )
+        .expect("norm f16");
+        let (x, y) = (
+            gpu.download_f16_bits(&f16_fused).expect("download"),
+            gpu.download_f16_bits(&f16_ref).expect("download"),
+        );
+        assert!(y.iter().any(|v| *v != 0), "read F16 is all zero");
+        assert_eq!(x, y, "fused read F16 differs");
         let normalized = gpu.zeros(&[rows * wide], DType::F32).expect("normalized");
         hyper_norm(
             &mut gpu,
@@ -3728,6 +3774,9 @@ mod tests {
         assert!(b.iter().any(|v| *v != 0), "gates are all zero");
         assert_eq!(a, b, "fused norm-gate differs");
         for tensor in [input, norm, gate_weight, fused, normalized, reference] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+        for tensor in [read_norm, f16_fused, f16_ref, read_normalized] {
             gpu.free_tensor(tensor).expect("free");
         }
     }
@@ -3818,6 +3867,7 @@ mod tests {
                     branches,
                     hidden,
                     state_bf16,
+                    read_f16: None,
                 },
             )
             .expect("norm-gate");

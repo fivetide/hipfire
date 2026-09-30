@@ -496,17 +496,49 @@ impl HyperReadOp<'_> {
 }
 
 pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), DispatchError> {
-    execute_hyper_read_inner(gpu, op, false, None)
+    execute_hyper_read_inner(gpu, op, false, None, None).map(|_| ())
+}
+
+/// [`execute_hyper_read`] that, on the multi-row F16 WMMA route, also writes
+/// the gates of `write` — the next hyper write of the same, unchanged
+/// streams — in the norm's pass (one read of the streams for both norms).
+/// Returns whether it did; the write then runs [`execute_hyper_write_gated`].
+pub fn execute_hyper_read_with_write_gates(
+    gpu: &mut Gpu,
+    read: &HyperReadOp<'_>,
+    write: &HyperWriteOp<'_>,
+) -> Result<bool, DispatchError> {
+    execute_hyper_read_inner(gpu, read, false, None, Some(write))
+}
+
+/// Whether `write`'s gates can come from `read`'s norm pass
+/// ([`hyper_norm_gate`] with the read's F16 output): same streams, rows and
+/// geometry, and the gate projection the fused kernel implements.
+fn write_gates_fusable(gpu: &Gpu, read: &HyperReadOp<'_>, write: &HyperWriteOp<'_>) -> bool {
+    let wide = read.branches * read.hidden;
+    gpu.arch_caps.has_gfx11_plus_simt()
+        && read.rows > 1
+        && write.rows == read.rows
+        && write.branches == read.branches
+        && write.hidden == read.hidden
+        && write.state_bf16 == read.state_bf16
+        && write.input.buf.as_ptr() == read.input.buf.as_ptr()
+        && write.block_inject.dtype == DType::BF16
+        && write.block_inject.m == write.branches
+        && write.block_inject.k == wide
+        && HyperNormGate::supports(write.branches, write.hidden)
 }
 
 /// `normalized_ready`: a preceding fused launch already wrote this read's
 /// single-row `normalized` (see [`execute_hyper_write_then_read`]).
+/// Returns whether `write_gates`' gates were written.
 fn execute_hyper_read_inner(
     gpu: &mut Gpu,
     op: &HyperReadOp<'_>,
     normalized_ready: bool,
     rotate_into: Option<&GpuTensor>,
-) -> Result<(), DispatchError> {
+    write_gates: Option<&HyperWriteOp<'_>>,
+) -> Result<bool, DispatchError> {
     let wide = checked_mul(op.branches, op.hidden, "hyper read wide")?;
     let input = view(op.input, 0, op.rows * wide);
     let normalized = view(op.normalized, 0, op.rows * wide);
@@ -542,9 +574,29 @@ fn execute_hyper_read_inner(
     let mut normalized_f16 = None;
     let ld16 = Gpu::f16_row_pitch(wide);
     let mut activated = false;
+    let mut gates_written = false;
     if f16 {
         let x16 = hip(gpu.qwen4_f16_x_scratch(op.rows * ld16))?;
-        hip(hyper_norm_f16(gpu, &norm, &x16, ld16, !wmma_read))?;
+        match write_gates.filter(|w| wmma_read && write_gates_fusable(gpu, op, w)) {
+            Some(write) => {
+                hip(hyper_norm_gate(
+                    gpu,
+                    &HyperNormGate {
+                        input: &input,
+                        norm_weight: write.norm_weight,
+                        gate_weight: write.block_inject.buf,
+                        gates: &view(write.gates, 0, op.rows * op.branches),
+                        rows: op.rows,
+                        branches: op.branches,
+                        hidden: op.hidden,
+                        state_bf16: op.state_bf16,
+                        read_f16: Some((op.norm_weight, &x16, ld16)),
+                    },
+                ))?;
+                gates_written = true;
+            }
+            None => hip(hyper_norm_f16(gpu, &norm, &x16, ld16, !wmma_read))?,
+        }
         hip(gpu.gemm_bf16_xf16_f16_wmma(
             op.input_mix_down.buf,
             &x16,
@@ -674,9 +726,11 @@ fn execute_hyper_read_inner(
             normalized_bf16,
         };
         if wmma_read {
-            return hip(hyper_read_up_wmma(gpu, &read, ld16));
+            hip(hyper_read_up_wmma(gpu, &read, ld16))?;
+        } else {
+            hip(hyper_read_up_fused(gpu, &read))?;
         }
-        return hip(hyper_read_up_fused(gpu, &read));
+        return Ok(gates_written);
     }
     project_weight(gpu, &op.input_mix_up, &low, &up, op.rows, Some(op.rotation))?;
     if let Some(rotated) = rotate_into.filter(|r| {
@@ -684,14 +738,15 @@ fn execute_hyper_read_inner(
     }) {
         // The next step rotates `mixed` into `rotated` first: write that
         // rotation here too (the step's rotate then skips).
-        return hip(gpu.hyper_read_projected_rotate(
+        hip(gpu.hyper_read_projected_rotate(
             &normalized,
             &up,
             &mixed,
             &view(rotated, 0, op.rows * op.hidden),
             op.hidden,
             op.rows,
-        ));
+        ))?;
+        return Ok(gates_written);
     }
     hip(hyper_read_projected(
         gpu,
@@ -704,7 +759,8 @@ fn execute_hyper_read_inner(
             branches: op.branches,
             hidden: op.hidden,
         },
-    ))
+    ))?;
+    Ok(gates_written)
 }
 /// Hyper-connection write: grouped normalization, branch gate projection, and
 /// in-place residual injection in the source-defined BF16 order.
@@ -775,13 +831,33 @@ impl HyperWriteOp<'_> {
 }
 
 pub fn execute_hyper_write(gpu: &mut Gpu, op: &HyperWriteOp<'_>) -> Result<(), DispatchError> {
+    execute_hyper_write_inner(gpu, op, false)
+}
+
+/// [`execute_hyper_write`] whose gates the preceding hyper read of the same
+/// streams already wrote into `op.gates` (see
+/// [`execute_hyper_read_with_write_gates`]).
+pub fn execute_hyper_write_gated(
+    gpu: &mut Gpu,
+    op: &HyperWriteOp<'_>,
+) -> Result<(), DispatchError> {
+    execute_hyper_write_inner(gpu, op, true)
+}
+
+fn execute_hyper_write_inner(
+    gpu: &mut Gpu,
+    op: &HyperWriteOp<'_>,
+    gates_ready: bool,
+) -> Result<(), DispatchError> {
     let wide = checked_mul(op.branches, op.hidden, "hyper write wide")?;
     let input = view(op.input, 0, op.rows * wide);
     let normalized = view(op.normalized, 0, op.rows * wide);
     let mixed = view(op.mixed, 0, op.rows * op.hidden);
     let gates = view(op.gates, 0, op.rows * op.branches);
     let output = view(op.output, 0, op.rows * wide);
-    hyper_write_gates(gpu, op, &input, &normalized, &gates)?;
+    if !gates_ready {
+        hyper_write_gates(gpu, op, &input, &normalized, &gates)?;
+    }
     hip(hyper_write(
         gpu,
         &HyperWrite {
@@ -890,7 +966,7 @@ pub fn execute_hyper_write_then_read(
         next_gates.as_ref(),
         clear.as_ref(),
     ))?;
-    execute_hyper_read_inner(gpu, read, true, rotate_into)?;
+    execute_hyper_read_inner(gpu, read, true, rotate_into, None)?;
     Ok(Some(next_gates.is_some()))
 }
 
@@ -924,6 +1000,7 @@ fn hyper_write_gates(
                 branches: op.branches,
                 hidden: op.hidden,
                 state_bf16: op.state_bf16,
+                read_f16: None,
             },
         ))?;
     } else {
