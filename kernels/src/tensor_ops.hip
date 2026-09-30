@@ -795,19 +795,18 @@ extern "C" __global__ void hyper_write_f32(
 }
 
 // hyper_write_f32 on BF16-stored HC streams (the Qwen4 F16 prefill route):
-// two adjacent columns per thread (one 32-bit pair of BF16 values), the same
-// expression per column, the result stored as BF16 bits.  `hidden` is even.
-// Grid [ceil(branches * hidden / 512), rows], block 256.
-extern "C" __global__ void hyper_write_bf16x2(
-    const unsigned int* input,
+// eight adjacent columns per thread (16-byte loads and store, one gate per
+// thread), the same expression per column, the result stored as BF16 bits.
+// `hidden` % 8 == 0.  Grid [ceil(branches * hidden / 2048), rows], block 256.
+extern "C" __global__ void hyper_write_bf16x8(
+    const uint4* input,
     const float* mixed,
     const float* gates,
-    unsigned int* output,
+    uint4* output,
     int branches,
     int hidden,
     int rows) {
-    const int pair = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    const int column = 2 * pair;
+    const int column = 8 * (int)(blockIdx.x * blockDim.x + threadIdx.x);
     const int row = (int)blockIdx.y;
     const int wide = branches * hidden;
     if (row >= rows || column >= wide) return;
@@ -819,14 +818,22 @@ extern "C" __global__ void hyper_write_bf16x2(
     const float gate = bf16_to_f32(bf16_round(
         2.0f * bf16_to_f32(bf16_round(
             1.0f / (1.0f + expf(-gate_scaled))))));
-    const float2 m = *(const float2*)(mixed + row * hidden + column % hidden);
-    const unsigned int w = input[(row * wide + column) >> 1];
-    const float lo = bf16_to_f32(bf16_round(gate * bf16_to_f32(bf16_round(m.x))))
-        + __uint_as_float(w << 16);
-    const float hi = bf16_to_f32(bf16_round(gate * bf16_to_f32(bf16_round(m.y))))
-        + __uint_as_float(w & 0xFFFF0000u);
-    output[(row * wide + column) >> 1] =
-        (unsigned int)bf16_round(lo).data | ((unsigned int)bf16_round(hi).data << 16);
+    const float* m = mixed + (size_t)row * hidden + column % hidden;
+    const float4 m0 = *(const float4*)m, m1 = *(const float4*)(m + 4);
+    const float mv[8] = {m0.x, m0.y, m0.z, m0.w, m1.x, m1.y, m1.z, m1.w};
+    const size_t at = ((size_t)row * wide + column) >> 3;
+    const uint4 w = input[at];
+    const unsigned int wv[4] = {w.x, w.y, w.z, w.w};
+    unsigned int ov[4];
+#pragma unroll
+    for (int p = 0; p < 4; p++) {
+        const float lo = bf16_to_f32(bf16_round(gate * bf16_to_f32(bf16_round(mv[2 * p]))))
+            + __uint_as_float(wv[p] << 16);
+        const float hi = bf16_to_f32(bf16_round(gate * bf16_to_f32(bf16_round(mv[2 * p + 1]))))
+            + __uint_as_float(wv[p] & 0xFFFF0000u);
+        ov[p] = (unsigned int)bf16_round(lo).data | ((unsigned int)bf16_round(hi).data << 16);
+    }
+    output[at] = make_uint4(ov[0], ov[1], ov[2], ov[3]);
 }
 
 // `normalized16`, when non-null, also receives each normalized value rounded
