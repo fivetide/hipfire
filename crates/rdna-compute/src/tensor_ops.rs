@@ -1038,24 +1038,29 @@ pub struct HyperNorm<'a> {
 }
 
 pub fn hyper_norm(gpu: &mut Gpu, p: &HyperNorm<'_>) -> HipResult<()> {
-    hyper_norm_impl(gpu, p, std::ptr::null_mut(), false)
+    hyper_norm_impl(gpu, p, std::ptr::null_mut(), false, 0)
 }
 
 /// [`hyper_norm`] that writes the normalized rows as F16 into
-/// `normalized_f16` (same element count), the F16 WMMA projections' input,
-/// and with `bf16_copy` also stores `normalized` as BF16 bits (the values are
-/// BF16-rounded) in the first half of its buffer: read it with
-/// `HyperReadUpFused::normalized_bf16`.  Without it `normalized` is untouched.
+/// `normalized_f16` at row pitch `ld16` elements (`>= branches * hidden`),
+/// the F16 WMMA projections' input, and with `bf16_copy` also stores
+/// `normalized` as BF16 bits (the values are BF16-rounded) in the first half
+/// of its buffer: read it with `HyperReadUpFused::normalized_bf16`.  Without
+/// it `normalized` is untouched.
 pub fn hyper_norm_f16(
     gpu: &mut Gpu,
     p: &HyperNorm<'_>,
     normalized_f16: &GpuTensor,
+    ld16: usize,
     bf16_copy: bool,
 ) -> HipResult<()> {
-    if normalized_f16.dtype != DType::F16 || normalized_f16.numel() != p.normalized.numel() {
+    let wide = checked_product(p.branches, p.hidden, "HC norm width")?;
+    let rows = p.normalized.numel() / wide.max(1);
+    if normalized_f16.dtype != DType::F16 || ld16 < wide || normalized_f16.numel() < rows * ld16 {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
-    hyper_norm_impl(gpu, p, normalized_f16.buf.as_ptr(), bf16_copy)
+    let ld16 = checked_i32(ld16, "HC norm F16 pitch")?;
+    hyper_norm_impl(gpu, p, normalized_f16.buf.as_ptr(), bf16_copy, ld16)
 }
 
 fn hyper_norm_impl(
@@ -1063,6 +1068,7 @@ fn hyper_norm_impl(
     p: &HyperNorm<'_>,
     normalized_f16: *mut std::ffi::c_void,
     bf16_copy: bool,
+    ld16: i32,
 ) -> HipResult<()> {
     ensure_f32(p.input)?;
     ensure_f32(p.normalized)?;
@@ -1097,6 +1103,7 @@ fn hyper_norm_impl(
     args.push_i32(rows_i);
     args.push_ptr(normalized_f16);
     args.push_i32(i32::from(p.state_bf16));
+    args.push_i32(ld16);
     args.pad_to(16);
     gpu.launch_blob_recorded(
         "hyper_norm_f32",
@@ -1230,11 +1237,15 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
 }
 /// [`hyper_read_up_fused`] on gfx11 BF16 WMMA; `low` is packed BF16
 /// ([`HcActivationFused::bf16_out`]) and `normalized` is
-/// [`hyper_norm_f16`]'s F16 copy (`normalized_bf16` is ignored). Not
-/// bit-exact: the logits accumulate the same exact BF16 products in WMMA's F32
-/// order, so a gate occasionally rounds one BF16 step apart; the epilogue is
-/// unchanged.
-pub fn hyper_read_up_wmma(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<()> {
+/// [`hyper_norm_f16`]'s F16 copy at row pitch `normalized_ld`
+/// (`normalized_bf16` is ignored). Not bit-exact: the logits accumulate the
+/// same exact BF16 products in WMMA's F32 order, so a gate occasionally
+/// rounds one BF16 step apart; the epilogue is unchanged.
+pub fn hyper_read_up_wmma(
+    gpu: &mut Gpu,
+    p: &HyperReadUpFused<'_>,
+    normalized_ld: usize,
+) -> HipResult<()> {
     ensure_f32(p.mixed)?;
     let wide = checked_product(4, p.hidden, "HC read width")?;
     if !gpu.arch_caps.has_wmma_w32()
@@ -1245,9 +1256,10 @@ pub fn hyper_read_up_wmma(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<
         || p.hidden % 16 != 0
         || p.low_rank % 16 != 0
         || p.low_rank > 504
+        || normalized_ld < wide
         || p.up_weight.numel() < wide * p.low_rank
         || p.low.numel() < p.rows * p.low_rank
-        || p.normalized.numel() < p.rows * wide
+        || p.normalized.numel() < p.rows * normalized_ld
         || p.mixed.numel() < p.rows * p.hidden
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
@@ -1271,6 +1283,7 @@ pub fn hyper_read_up_wmma(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<
     args.push_i32(hidden);
     args.push_i32(low_rank);
     args.push_i32(rows);
+    args.push_i32(checked_i32(normalized_ld, "HC read normalized pitch")?);
     args.pad_to(16);
     gpu.launch_blob_recorded(
         "hyper_read_up_wmma_bf16",
@@ -4008,6 +4021,7 @@ mod tests {
                     low_rank,
                     normalized_bf16: true,
                 },
+                wide,
             )
             .expect("wmma");
             // WMMA's F32 summation order may round a gate one BF16 step apart

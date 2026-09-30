@@ -27853,10 +27853,24 @@ impl Gpu {
         })
     }
 
+    /// Row pitch (elements) for an F16 WMMA GEMM operand of `k`-wide rows: a
+    /// pitch that is a multiple of 1024 bytes camps the LDS-staged GEMM's
+    /// concurrent row reads on a few DRAM channels (see
+    /// gemm_f16_x_f16_wmma_lds256.hip, ROW PITCH), so such rows get 64 more
+    /// elements.  Layout only: the GEMM sums the same K in the same order.
+    pub fn f16_row_pitch(k: usize) -> usize {
+        if k.is_multiple_of(512) {
+            k + 64
+        } else {
+            k
+        }
+    }
+
     /// `Y[b, m] = Σ_k W[m, k]·X[b, k]` for a BF16 weight through a
     /// model-lifetime F16 shadow and the LDS-staged F16 WMMA GEMM, X already
-    /// F16.  2.5-5x the BF16 multirow kernel on gfx1151.  Not bit-exact:
-    /// callers are KLD-gated (see [`Gpu::qwen4_f16_wmma_applies`]).
+    /// F16 with row pitch `ldx`.  2.5-5x the BF16 multirow kernel on gfx1151.
+    /// Not bit-exact: callers are KLD-gated (see
+    /// [`Gpu::qwen4_f16_wmma_applies`]).
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_bf16_xf16_f16_wmma(
         &mut self,
@@ -27866,12 +27880,14 @@ impl Gpu {
         m: usize,
         k: usize,
         batch_size: usize,
+        ldx: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         let w16 = self.ensure_bf16_f16_shadow(weight, m, k)?;
+        let lda = Self::f16_row_pitch(k);
         let w_view = GpuTensor {
-            buf: unsafe { DeviceBuffer::from_raw(w16, m * k * 2) },
-            shape: vec![m * k],
+            buf: unsafe { DeviceBuffer::from_raw(w16, m * lda * 2) },
+            shape: vec![m * lda],
             dtype: DType::F16,
         };
         // M < 512 (HC input_mix_down 320 x 10240, the shared-expert selector
@@ -27883,7 +27899,9 @@ impl Gpu {
             0..512 => LdsTile::new(64, 64, 32, 64, 64, false),
             512..1024 => LdsTile::new(128, 128, 32, 64, 64, false),
             _ => {
-                return self.gemm_f16_x_f16_wmma_lds_auto(&w_view, x_f16, y, None, m, k, batch_size)
+                return self.gemm_f16_x_f16_wmma_lds_auto_ld(
+                    &w_view, x_f16, y, None, m, k, batch_size, lda, ldx,
+                )
             }
         };
         self.gemm_f16_x_f16_wmma_lds_tiled_ld(
@@ -27895,8 +27913,8 @@ impl Gpu {
             k,
             batch_size,
             tile.pipelined(),
-            k,
-            k,
+            lda,
+            ldx,
         )
     }
 
@@ -27926,7 +27944,7 @@ impl Gpu {
             dtype: DType::F16,
         };
         for &(weight, y, m) in projections {
-            self.gemm_bf16_xf16_f16_wmma(weight, &x_view, y, m, k, batch_size)?;
+            self.gemm_bf16_xf16_f16_wmma(weight, &x_view, y, m, k, batch_size, k)?;
         }
         Ok(true)
     }
