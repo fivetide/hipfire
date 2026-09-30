@@ -338,12 +338,7 @@ impl Carrier for Qwen4Carrier {
                 ctx.kv_backend.as_str()
             ));
         }
-        if ctx.max_seq != 2048 {
-            return Err(format!(
-                "qwen4: max_seq must be exactly 2048 (got {})",
-                ctx.max_seq
-            ));
-        }
+        crate::admission::qwen4_max_seq_admission(ctx.max_seq)?;
         let native_mtp =
             crate::admission::qwen4_native_mtp(ctx.spec, &ctx.gpu.arch, ctx.path, ctx.pp, 1)?;
         self.admit_options(

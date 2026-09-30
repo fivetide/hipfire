@@ -110,8 +110,19 @@ pub struct SourceAdmissionOptions {
     pub pflash: bool,
 }
 
-/// Qwen4 state is sized for exactly this many tokens.
-const QWEN4_MAX_SEQ: usize = 2048;
+/// Smallest admitted Qwen4 context, and the automatic one.  Longer contexts
+/// are admitted up to the model's `max_position_embeddings`.
+const QWEN4_MIN_MAX_SEQ: usize = 2048;
+
+/// Refuse a Qwen4 context below [`QWEN4_MIN_MAX_SEQ`].
+pub(crate) fn qwen4_max_seq_admission(max_seq: usize) -> Result<(), String> {
+    if max_seq < QWEN4_MIN_MAX_SEQ {
+        return Err(format!(
+            "qwen4: max_seq must be at least {QWEN4_MIN_MAX_SEQ} (got {max_seq})"
+        ));
+    }
+    Ok(())
+}
 
 /// Return whether a per-load adaptive-KV value requests the active controller.
 /// The CLI schema default is `Some("off")`, which must remain ordinary AR.
@@ -808,10 +819,9 @@ pub fn admit_source_with_options(
     if let Some(refusal) = flux_arch_refusal(arch_id, gpu_arch) {
         return Err(refusal);
     }
-    // Qwen4 state is sized for exactly QWEN4_MAX_SEQ tokens; an omitted
-    // (automatic) request means that bound.
+    // An omitted (automatic) Qwen4 context is the smallest admitted one.
     let max_seq = if arch_id == QWEN4_ARCH_ID && max_seq == 0 {
-        QWEN4_MAX_SEQ
+        QWEN4_MIN_MAX_SEQ
     } else {
         max_seq
     };
@@ -821,22 +831,24 @@ pub fn admit_source_with_options(
         // Arch 16 is an executable local-path carrier, but only after its
         // complete source-only boundary succeeds. Keep this before vision/head
         // handling so every refusal remains pre-allocation.
-        if max_seq != QWEN4_MAX_SEQ {
-            return Err(format!(
-                "qwen4: max_seq must be exactly {QWEN4_MAX_SEQ} (got {max_seq})"
-            ));
-        }
+        qwen4_max_seq_admission(max_seq)?;
         hipfire_runtime::kv_mode::resolve_qwen4(hints.kv_mode.unwrap_or(""), 256)?;
         let native_mtp = qwen4_native_mtp(options.spec, gpu_arch, path, pp, tp)?;
         crate::carrier_for(arch_id)
             .ok_or_else(|| "no carrier for qwen4".to_string())?
             .admit_options(draft_path, options)?;
-        admit_qwen4_source(
+        let admitted = admit_qwen4_source(
             &source,
             hipfire_arch_qwen4::EffectiveMesh::new(pp, tp, 1),
             InputModality::Text,
             native_mtp,
         )?;
+        let positions = admitted.config.max_position_embeddings;
+        if max_seq > positions {
+            return Err(format!(
+                "qwen4: max_seq {max_seq} exceeds max_position_embeddings {positions}"
+            ));
+        }
         (EffectiveTopology::Single, Some(resolve_carrier(&source)?))
     } else if tp > 1 {
         // Expert-parallel admission (HFQ-only). Mirrors
