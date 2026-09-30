@@ -2354,6 +2354,71 @@ static __device__ void indexed_attention_select_threshold(
     }
 }
 
+// Block scores of up to eight consecutive query rows (index_heads == 4,
+// index_dim % 4 == 0, index_dim <= 128): each pooled key row is read once for
+// the eight rows instead of once per row.  Every (row, block) score is
+// indexed_attention_select_score4_f32's exact arithmetic (per-head serial
+// d-order dots, heads summed in order).  Row r scores blocks below its own
+// visible count into scores[r * score_stride + block].
+// Grid [ceil(block_count / 256), ceil(rows / 8)], block 256.
+extern "C" __global__ __launch_bounds__(256) void indexed_attention_select_scores_rows8_f32(
+    const float* query,
+    const float* pooled,
+    float* scores,
+    int rows,
+    int query_row_stride,
+    int block_count,
+    int index_dim,
+    int compress,
+    int position_start,
+    int score_stride) {
+    __shared__ __align__(16) float qs[8 * 4 * 128];
+    const int row0 = (int)blockIdx.y * 8;
+    const int nrows = min(8, rows - row0);
+    const int width = 4 * index_dim;
+    for (int i = (int)threadIdx.x; i < nrows * width; i += 256) {
+        const int r = i / width;
+        qs[r * 4 * 128 + (i - r * width) / index_dim * 128 + (i - r * width) % index_dim] =
+            query[(row0 + r) * query_row_stride + (i - r * width)];
+    }
+    __syncthreads();
+    const int block = (int)blockIdx.x * 256 + (int)threadIdx.x;
+    if (block >= block_count) return;
+    const float4* p4 = reinterpret_cast<const float4*>(pooled + block * index_dim);
+    float dot[8][4];
+#pragma unroll
+    for (int r = 0; r < 8; ++r)
+#pragma unroll
+        for (int h = 0; h < 4; ++h) dot[r][h] = 0.0f;
+    for (int d4 = 0; d4 < index_dim / 4; ++d4) {
+        const float4 p = p4[d4];
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+#pragma unroll
+            for (int h = 0; h < 4; ++h) {
+                const float4 a = *reinterpret_cast<const float4*>(qs + r * 4 * 128 + h * 128 + d4 * 4);
+                dot[r][h] += a.x * p.x;
+                dot[r][h] += a.y * p.y;
+                dot[r][h] += a.z * p.z;
+                dot[r][h] += a.w * p.w;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        if (r >= nrows) break;
+        int visible_blocks = (position_start + row0 + r + 1) / compress;
+        if (block >= visible_blocks) continue;
+        float score = 0.0f;
+#pragma unroll
+        for (int h = 0; h < 4; ++h) score += fmaxf(dot[r][h] / sqrtf((float)index_dim), 0.0f);
+        scores[(row0 + r) * score_stride + block] = score;
+    }
+}
+
+// `precomputed` (nullable): the rows' block scores from
+// indexed_attention_select_scores_rows8_f32 (row stride `score_stride`),
+// copied instead of recomputed; the selection is unchanged.
 extern "C" __global__ void indexed_attention_select_f32_batched(
     const float* query,
     const float* pooled,
@@ -2367,7 +2432,9 @@ extern "C" __global__ void indexed_attention_select_f32_batched(
     int compress,
     int position_start,
     int capacity,
-    int* mirror) {
+    int* mirror,
+    const float* precomputed,
+    int score_stride) {
     int row = (int)blockIdx.x;
     if (row >= rows) return;
     // The persistent selection is the final row's.
@@ -2389,8 +2456,10 @@ extern "C" __global__ void indexed_attention_select_f32_batched(
         for (int block = (int)threadIdx.x;
              block < row_block_count;
              block += (int)blockDim.x) {
-            scores[block] = indexed_attention_select_score4_f32(
-                row_query, pooled, block, index_heads, index_dim);
+            scores[block] = precomputed
+                ? precomputed[row * score_stride + block]
+                : indexed_attention_select_score4_f32(
+                      row_query, pooled, block, index_heads, index_dim);
         }
     }
     __syncthreads();
