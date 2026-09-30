@@ -1524,9 +1524,22 @@ fn gated_delta_conv_batched_impl(
     let history_rows = checked_i32(p.history_rows, "GDN batched convolution history rows")?;
     let kernel_size = checked_i32(p.kernel_size, "GDN batched convolution kernel width")?;
     let start_cursor = checked_i32(p.start_cursor, "GDN batched convolution cursor")?;
-    let grid = blocks(p.channels)?;
-    let row_grid = checked_u32(p.rows.div_ceil(16), "GDN batched convolution row grid")?;
-    let kernel = "gated_delta_conv_bf16_f32_batched_k4";
+    // BF16 in and out: four channels per thread, eight rows per block row.
+    let x4 = input_bf16 && output_bf16 && p.channels % 4 == 0;
+    let (grid, rows_per_block) = if x4 {
+        (checked_u32(p.channels.div_ceil(1024), "GDN batched convolution grid")?, 8)
+    } else {
+        (blocks(p.channels)?, 16)
+    };
+    let row_grid = checked_u32(
+        p.rows.div_ceil(rows_per_block),
+        "GDN batched convolution row grid",
+    )?;
+    let kernel = if x4 {
+        "gated_delta_conv_bf16x4_batched_k4"
+    } else {
+        "gated_delta_conv_bf16_f32_batched_k4"
+    };
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
     for tensor in [p.input, p.kernel, p.history, p.output, p.next_history] {
@@ -1534,12 +1547,16 @@ fn gated_delta_conv_batched_impl(
     }
     args.push_i32(rows);
     args.push_i32(channels);
-    args.push_i32(history_rows);
-    args.push_i32(kernel_size);
+    if !x4 {
+        args.push_i32(history_rows);
+        args.push_i32(kernel_size);
+    }
     args.push_i32(start_cursor);
     let start_cursor_offset = args.len() - 4;
-    args.push_i32(i32::from(output_bf16));
-    args.push_i32(i32::from(input_bf16));
+    if !x4 {
+        args.push_i32(i32::from(output_bf16));
+        args.push_i32(i32::from(input_bf16));
+    }
     let (param_elements, param_heads) = match params {
         Some(q) => {
             for tensor in [q.a, q.b, q.a_log, q.dt_bias, q.gate, q.beta] {
@@ -1557,7 +1574,9 @@ fn gated_delta_conv_batched_impl(
     args.push_i32(checked_i32(param_elements, "GDN batched parameter extent")?);
     args.push_i32(checked_i32(param_heads, "GDN batched parameter heads")?);
     args.pad_to(16);
-    let param_grid = checked_u32(param_elements.div_ceil(256), "GDN batched parameter grid")?;
+    // The x4 kernel spreads the parameter blocks over every block row.
+    let param_span = if x4 { 256 * row_grid as usize } else { 256 };
+    let param_grid = checked_u32(param_elements.div_ceil(param_span), "GDN batched parameter grid")?;
     // `start_cursor` is `start_position % history_rows` for the chunk (the
     // kernel advances the ring per row from there), so the declared binding
     // re-derives it at the replay position.
@@ -3662,7 +3681,79 @@ mod tests {
                 bits(&gpu, &hist_b),
                 "rows {rows}: history"
             );
-            for tensor in [input, hist_a, out_a, hist_b, out_b] {
+            // BF16 in and out with the gate parameters fused (the four-channel
+            // kernel): the per-row outputs' BF16 bits, and the standalone
+            // parameter kernel's gate and beta.
+            let rne = |v: f32| -> [u8; 2] {
+                let u = v.to_bits();
+                (((u + 0x7FFF + ((u >> 16) & 1)) >> 16) as u16).to_le_bytes()
+            };
+            let in_bits: Vec<u8> = wave(3 + rows, rows * channels, 3.0)
+                .into_iter()
+                .flat_map(rne)
+                .collect();
+            let mut input_bf16 = gpu.upload_raw(&in_bits, &[in_bits.len()]).expect("bf16 input");
+            input_bf16.dtype = DType::BF16;
+            input_bf16.shape = vec![rows * channels];
+            let mut out_c = gpu.zeros(&[rows * channels / 2], DType::F32).expect("bf16 out");
+            out_c.dtype = DType::BF16;
+            out_c.shape = vec![rows * channels];
+            let hist_c = gpu.upload_f32(&history, &[history.len()]).expect("hist");
+            let heads = 5usize;
+            let pa = gpu.upload_f32(&wave(7, rows * heads, 4.0), &[rows * heads]).expect("a");
+            let pb = gpu.upload_f32(&wave(8, rows * heads, 4.0), &[rows * heads]).expect("b");
+            let head_bits: Vec<u8> = wave(9, 2 * heads, 1.0).into_iter().flat_map(rne).collect();
+            let mut a_log = gpu.upload_raw(&head_bits[..2 * heads], &[2 * heads]).expect("a_log");
+            a_log.dtype = DType::BF16;
+            a_log.shape = vec![heads];
+            let mut dt_bias = gpu.upload_raw(&head_bits[2 * heads..], &[2 * heads]).expect("dt");
+            dt_bias.dtype = DType::BF16;
+            dt_bias.shape = vec![heads];
+            let [gate_c, beta_c, gate_d, beta_d] = [(); 4]
+                .map(|()| gpu.zeros(&[rows * heads], DType::F32).expect("params"));
+            let params = |gate, beta| GatedDeltaParamsBatched {
+                a: &pa,
+                b: &pb,
+                a_log: &a_log,
+                dt_bias: &dt_bias,
+                gate,
+                beta,
+                rows,
+                heads,
+            };
+            gated_delta_conv_params_batched(
+                &mut gpu,
+                &GatedDeltaConvBatched {
+                    input: &input_bf16,
+                    kernel: &kernel,
+                    history: &hist_c,
+                    output: &out_c,
+                    next_history: &hist_c,
+                    rows,
+                    channels,
+                    history_rows: 3,
+                    kernel_size: 4,
+                    start_cursor,
+                },
+                &params(&gate_c, &beta_c),
+            )
+            .expect("bf16 conv");
+            gated_delta_params_batched(&mut gpu, &params(&gate_d, &beta_d)).expect("params");
+            out_c.dtype = DType::F32;
+            out_c.shape = vec![rows * channels / 2];
+            let got: Vec<u32> = bits(&gpu, &out_c)
+                .iter()
+                .flat_map(|w| [w & 0xFFFF, w >> 16])
+                .collect();
+            let want: Vec<u32> = bits(&gpu, &out_b).iter().map(|w| w >> 16).collect();
+            assert_eq!(got, want, "rows {rows}: bf16 output");
+            assert_eq!(bits(&gpu, &hist_c), bits(&gpu, &hist_b), "rows {rows}: bf16 history");
+            assert_eq!(bits(&gpu, &gate_c), bits(&gpu, &gate_d), "rows {rows}: gate");
+            assert_eq!(bits(&gpu, &beta_c), bits(&gpu, &beta_d), "rows {rows}: beta");
+            for tensor in [
+                input, hist_a, out_a, hist_b, out_b, input_bf16, out_c, hist_c, pa, pb, a_log,
+                dt_bias, gate_c, beta_c, gate_d, beta_d,
+            ] {
                 gpu.free_tensor(tensor).expect("free");
             }
         }
