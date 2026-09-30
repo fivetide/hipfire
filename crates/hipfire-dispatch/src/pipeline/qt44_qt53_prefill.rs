@@ -393,10 +393,12 @@ pub(crate) fn gate_up(
     require_geometry(p)?;
     if use_path2 && gateup_bf16(gpu, p) {
         let x_f16 = if gateup_rotates_f16(gpu, p, use_path2) {
+            // The grouped kernel reads packed rows (x_row * K).
             Some(hip(gpu.rotate_x_mq_batched_f16(
                 p.x_norm_batch,
                 p.gate_up_k,
                 p.batch_size,
+                p.gate_up_k,
             ))?)
         } else {
             None

@@ -577,13 +577,14 @@ GEN_RESID_BT(6, 8)
 // chunk of that tile into LDS once and all read it from there.  Every wave's
 // A operand (decode_tile_split), B operand bytes, WMMA sequence and epilogue
 // are the BT kernel's, so results are bitwise identical to it.
-// Grid: [ceil(M/(16*RW)), ceil(N/(16*BV))]. Block: [32*RW].
+// Grid: [ceil(M/(16*RW)), ceil(N/(16*BV))]. Block: [32*RW].  X rows are `ldx`
+// halves apart (>= K; see Gpu::f16_row_pitch).
 // ---------------------------------------------------------------------------
 template <int BITS, int BV, int RW, bool OVERWRITE, bool OUT_BF16 = false>
 __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
                                               const _Float16* __restrict__ X,
                                               float* __restrict__ Y,
-                                              int M, int K, int N) {
+                                              int M, int K, int N, int ldx) {
     constexpr int GROUP_BYTES = 8 + 32 * BITS;
     constexpr int TOK = 16 * BV;
     constexpr int CK = 64;              // K per LDS chunk: four K-tiles
@@ -619,7 +620,7 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
 #define XL_FOR8(F) F(0) F(1) F(2) F(3) F(4) F(5) F(6) F(7)
 #define XL_OFF(I) \
     const int xo##I = ((batch_start + I * (NT / VPT) + tid / VPT < N) \
-        ? (batch_start + I * (NT / VPT) + tid / VPT) : 0) * K + (tid % VPT) * 8;
+        ? (batch_start + I * (NT / VPT) + tid / VPT) : 0) * ldx + (tid % VPT) * 8;
     XL_FOR8(XL_OFF)
 #undef XL_OFF
     _Float16* lds0 = xs + (tid / VPT) * STRIDE + (tid % VPT) * 8;
@@ -751,8 +752,8 @@ extern "C" __launch_bounds__(128, 1) __global__ void
 gemm_mq6g256v2_residual_wmma_gfx11_bt8_x4(const char* __restrict__ A,
                                           const _Float16* __restrict__ X,
                                           float* __restrict__ Y,
-                                          int M, int K, int N) {
-    resid_bt_xlds<6, 8, 4, false>(A, X, Y, M, K, N);
+                                          int M, int K, int N, int ldx) {
+    resid_bt_xlds<6, 8, 4, false>(A, X, Y, M, K, N, ldx);
 }
 
 // Y = W·X (the memset + residual pair in one launch).
@@ -760,8 +761,8 @@ extern "C" __launch_bounds__(128, 1) __global__ void
 gemm_mq6g256v2_wmma_gfx11_bt8_x4(const char* __restrict__ A,
                                  const _Float16* __restrict__ X,
                                  float* __restrict__ Y,
-                                 int M, int K, int N) {
-    resid_bt_xlds<6, 8, 4, true>(A, X, Y, M, K, N);
+                                 int M, int K, int N, int ldx) {
+    resid_bt_xlds<6, 8, 4, true>(A, X, Y, M, K, N, ldx);
 }
 
 // Y = W·X stored as BF16 bits (Y is [N, M] BF16).
@@ -769,8 +770,8 @@ extern "C" __launch_bounds__(128, 1) __global__ void
 gemm_mq6g256v2_wmma_gfx11_bt8_x4_bf16out(const char* __restrict__ A,
                                          const _Float16* __restrict__ X,
                                          float* __restrict__ Y,
-                                         int M, int K, int N) {
-    resid_bt_xlds<6, 8, 4, true, true>(A, X, Y, M, K, N);
+                                         int M, int K, int N, int ldx) {
+    resid_bt_xlds<6, 8, 4, true, true>(A, X, Y, M, K, N, ldx);
 }
 
 #endif // __GFX11__

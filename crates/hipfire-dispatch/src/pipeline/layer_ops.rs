@@ -152,11 +152,12 @@ pub fn project_weights(
         if done[i] || !shared(weight, gpu) {
             continue;
         }
-        let x_f16 = hip(gpu.rotate_x_mq_batched_f16(input, weight.k, rows))?;
+        let ld = Gpu::f16_row_pitch(weight.k);
+        let x_f16 = hip(gpu.rotate_x_mq_batched_f16(input, weight.k, rows, ld))?;
         for j in i..projections.len() {
             let (w, out) = projections[j];
             if !done[j] && w.k == weight.k && shared(w, gpu) {
-                hip(gpu.gemm_mq6g256v2_xf16(w.buf, &x_f16, out, w.m, w.k, rows))?;
+                hip(gpu.gemm_mq6g256v2_xf16(w.buf, &x_f16, out, w.m, w.k, rows, ld))?;
                 done[j] = true;
             }
         }

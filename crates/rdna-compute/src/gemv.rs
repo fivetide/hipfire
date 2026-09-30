@@ -5604,15 +5604,17 @@ impl Gpu {
     /// Batched `rotate_x_mq`. Grid.y is the batch dim.
     /// `rotate_x_mq_batched` into the shared FP16 X scratch (gfx11 wave32):
     /// the rotated rows rounded to F16 as `convert_f32_to_f16` would, for the
-    /// MQ WMMA GEMMs' `*_xf16` entries.  Valid until the next FP16 conversion.
-    /// `x` is F32 or BF16.
+    /// MQ WMMA GEMMs' `*_xf16` entries, at row pitch `ldo` (>= k) elements.
+    /// Valid until the next FP16 conversion.  `x` is F32 or BF16.
     pub fn rotate_x_mq_batched_f16(
         &mut self,
         x: &GpuTensor,
         k: usize,
         batch_size: usize,
+        ldo: usize,
     ) -> HipResult<GpuTensor> {
         self.bind_thread()?;
+        assert!(ldo >= k, "rotate_x_mq_batched_f16: pitch {ldo} < K {k}");
         let func = if x.dtype == DType::BF16 {
             "mq_rotate_x_bf16_f16"
         } else {
@@ -5620,18 +5622,20 @@ impl Gpu {
         };
         self.ensure_kernel("mq_rotate_x", kernels::GEMV_MQ4G256_SRC, func)?;
         self.ensure_mq_signs()?;
-        let out = self.qwen4_f16_x_scratch(k * batch_size)?;
+        let out = self.qwen4_f16_x_scratch(ldo * batch_size)?;
         let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let xp = x.buf.as_ptr();
         let op = out.buf.as_ptr();
         let kv = k as i32;
+        let ldv = ldo as i32;
         let mut params: Vec<*mut c_void> = vec![
             &xp as *const _ as *mut c_void,
             &op as *const _ as *mut c_void,
             &s1 as *const _ as *mut c_void,
             &s2 as *const _ as *mut c_void,
             &kv as *const _ as *mut c_void,
+            &ldv as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             func,
@@ -5646,6 +5650,7 @@ impl Gpu {
                 b.push_ptr(s1);
                 b.push_ptr(s2);
                 b.push_i32(kv);
+                b.push_i32(ldv);
                 b
             },
         )?;

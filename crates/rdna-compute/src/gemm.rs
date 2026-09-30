@@ -37538,9 +37538,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
         overwrite: bool,
-        // X already converted to F16 (e.g. by `rotate_x_mq_batched_f16`);
-        // `None` converts `x` here.
-        x_f16: Option<*mut c_void>,
+        // X already converted to F16 (e.g. by `rotate_x_mq_batched_f16`) with
+        // its row pitch; `None` converts `x` here (packed).
+        x_f16: Option<(*mut c_void, usize)>,
     ) -> HipResult<()> {
         let func_name: &'static str = match (bits, batch_tile) {
             (2, 4) => "gemm_mq2g256v2_residual_wmma_gfx11_bt4",
@@ -37601,16 +37601,24 @@ impl Gpu {
             "gemm_mqv2_wmma_gfx1100_bt"
         };
         self.ensure_kernel(module, kernels::GEMM_MQV2_WMMA_GFX11_BT_SRC, func_name)?;
-        let x_f16_ptr = match x_f16 {
-            Some(ptr) => ptr,
-            None => self.ensure_fp16_x(x, batch_size * k)?,
+        let (x_f16_ptr, ldx) = match x_f16 {
+            Some(x16) => x16,
+            None => (self.ensure_fp16_x(x, batch_size * k)?, k),
         };
+        // Only the X-LDS kernels take a pitch; the others read packed rows.
+        if ldx != k && !xlds {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "mqv2_wmma_gfx11_bt: padded X needs the gfx1151 MQ6 BT8 X-LDS kernel",
+            ));
+        }
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x_f16_ptr;
         let mut y_ptr = y.buf.as_ptr();
         let mut m_val = m as i32;
         let mut k_val = k as i32;
         let mut bs_val = batch_size as i32;
+        let mut ldx_val = ldx as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut a_ptr as *mut _ as *mut c_void,
             &mut x_ptr as *mut _ as *mut c_void,
@@ -37619,6 +37627,9 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
             &mut bs_val as *mut _ as *mut c_void,
         ];
+        if xlds {
+            params.push(&mut ldx_val as *mut _ as *mut c_void);
+        }
         let row_tiles = m.div_ceil(rows_per_block);
         let n_tile = 16 * batch_tile;
         let batch_tiles = batch_size.div_ceil(n_tile);
@@ -37639,6 +37650,9 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(bs_val);
+                if xlds {
+                    b.push_i32(ldx_val);
+                }
                 b
             },
         );
@@ -40117,8 +40131,8 @@ impl Gpu {
     }
 
     /// [`Gpu::gemm_mq6g256v2`] on the gfx1151 BT8 route with X already rotated
-    /// and converted to F16 (`x_f16`, `[batch_size × k]`): the bytes the F32
-    /// entry produces, without its conversion pass.
+    /// and converted to F16 (`x_f16`, `batch_size` rows of `k` at pitch `ldx`):
+    /// the bytes the F32 entry produces, without its conversion pass.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_mq6g256v2_xf16(
         &mut self,
@@ -40128,10 +40142,11 @@ impl Gpu {
         m: usize,
         k: usize,
         batch_size: usize,
+        ldx: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let ptr = x_f16.buf.as_ptr();
-        self.mqv2_wmma_gfx11_bt(6, 8, a_raw, x_f16, y, m, k, batch_size, true, Some(ptr))
+        let x16 = (x_f16.buf.as_ptr(), ldx);
+        self.mqv2_wmma_gfx11_bt(6, 8, a_raw, x_f16, y, m, k, batch_size, true, Some(x16))
     }
 
     pub fn gemm_mq6g256v2(
@@ -44942,11 +44957,13 @@ mod tests {
             let want_y = gpu.zeros(&[N * M], DType::F32).expect("y");
             gpu.gemm_mq6g256v2(&a, &rot, &want_y, M, K, N)
                 .expect("f32 path");
+            // A padded pitch must not change a byte.
+            let ld = K + 64;
             let x16 = gpu
-                .rotate_x_mq_batched_f16(&x_gpu, K, N)
+                .rotate_x_mq_batched_f16(&x_gpu, K, N, ld)
                 .expect("rotate f16");
             let got_y = gpu.zeros(&[N * M], DType::F32).expect("y");
-            gpu.gemm_mq6g256v2_xf16(&a, &x16, &got_y, M, K, N)
+            gpu.gemm_mq6g256v2_xf16(&a, &x16, &got_y, M, K, N, ld)
                 .expect("f16 path");
             let want = gpu.download_f32(&want_y).expect("want");
             let got = gpu.download_f32(&got_y).expect("got");
