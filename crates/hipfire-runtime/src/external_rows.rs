@@ -1055,15 +1055,19 @@ const FETCH_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Owns one request's rows until the request either commits or aborts.
 ///
 /// [`RowFetch::begin`] starts a fresh epoch, [`RowFetch::prefetch`] enqueues
-/// the rows, and [`RowFetch::wait`] turns the ticket into the lease.  Immutable
-/// page-cache entries belong to the [`RowStore`] and survive an abort; this
-/// guard only owns the exact ticket and completed lease of its epoch.  Dropping
-/// it without [`RowFetch::complete`] aborts.
+/// the rows, and [`RowFetch::stage_into`] copies them, in request order, into
+/// the caller's upload buffer.  A request larger than one staging buffer
+/// ([`RowStore::max_rows_per_prefetch`]) is split into consecutive tickets;
+/// each part's lease is returned as soon as it is copied, which frees the
+/// staging buffer the reader needs for the next part.  Immutable page-cache
+/// entries belong to the [`RowStore`] and survive an abort; this guard only
+/// owns the exact tickets of its epoch.  Dropping it without
+/// [`RowFetch::complete`] aborts.
 pub struct RowFetch<'a> {
     store: &'a RowStore,
     epoch: u64,
-    ticket: Option<RowTicket>,
-    lease: Option<RowLease>,
+    tickets: VecDeque<RowTicket>,
+    staged: bool,
     armed: bool,
 }
 
@@ -1081,8 +1085,8 @@ impl<'a> RowFetch<'a> {
         Ok(Self {
             store,
             epoch,
-            ticket: None,
-            lease: None,
+            tickets: VecDeque::new(),
+            staged: false,
             armed: true,
         })
     }
@@ -1092,41 +1096,64 @@ impl<'a> RowFetch<'a> {
     }
 
     /// Enqueue this request's rows.  Call once, as soon as the ids are known.
-    pub fn prefetch(&mut self, row_ids: Vec<u64>) -> Result<(), RowStoreError> {
-        debug_assert!(self.ticket.is_none() && self.lease.is_none());
-        self.ticket = Some(self.store.prefetch(self.epoch, row_ids)?);
+    pub fn prefetch(&mut self, mut row_ids: Vec<u64>) -> Result<(), RowStoreError> {
+        debug_assert!(self.tickets.is_empty() && !self.staged);
+        let max_rows = self.store.max_rows_per_prefetch();
+        while row_ids.len() > max_rows {
+            let rest = row_ids.split_off(max_rows);
+            self.tickets
+                .push_back(self.store.prefetch(self.epoch, row_ids)?);
+            row_ids = rest;
+        }
+        self.tickets
+            .push_back(self.store.prefetch(self.epoch, row_ids)?);
         Ok(())
     }
 
-    /// The completed lease, if [`Self::wait`] has already produced it.
-    pub fn lease(&self) -> Option<&RowLease> {
-        self.lease.as_ref()
+    /// Whether [`Self::stage_into`] has already copied the rows.
+    pub const fn is_staged(&self) -> bool {
+        self.staged
     }
 
-    /// Block until the prefetched rows are complete and return the lease.
-    pub fn wait(&mut self) -> Result<&RowLease, RowStoreError> {
-        if self.lease.is_none() {
-            let ticket = self
-                .ticket
-                .as_ref()
-                .ok_or_else(|| RowStoreError::InvalidLease {
-                    reason: "rows awaited before they were prefetched".to_string(),
-                })?;
-            let lease = self.store.wait_completed_lease(ticket)?;
-            // `wait_completed_lease` marks the ticket consumed.  Drop that
-            // handle before retaining the lease so the only live owner is
-            // explicit.
-            self.ticket = None;
-            self.lease = Some(lease);
+    /// Block until each prefetched part is complete and copy it, in request
+    /// order, to the front of `destination`.  Returns the bytes written.
+    pub fn stage_into(&mut self, destination: &mut [u8]) -> Result<usize, RowStoreError> {
+        if self.tickets.is_empty() {
+            return Err(RowStoreError::InvalidLease {
+                reason: "rows staged before they were prefetched".to_string(),
+            });
         }
-        Ok(self.lease.as_ref().expect("lease installed above"))
+        let capacity = destination.len();
+        let mut staged = 0usize;
+        while let Some(ticket) = self.tickets.pop_front() {
+            let lease = self.store.wait_completed_lease(&ticket)?;
+            let end = staged + lease.as_bytes()?.len();
+            let part =
+                destination
+                    .get_mut(staged..end)
+                    .ok_or_else(|| RowStoreError::InvalidLease {
+                        reason: format!(
+                            "staging destination has {capacity} bytes, rows need at least {end}"
+                        ),
+                    })?;
+            lease.stage_into(part)?;
+            staged = end;
+        }
+        self.staged = true;
+        Ok(staged)
     }
 
-    /// Release the ticket and lease after the request committed.
+    /// Re-check the epoch after the caller's device upload of the staged
+    /// bytes, so a reset racing the upload is reported instead of publishing
+    /// stale rows.
+    pub fn validate_after_upload(&self) -> Result<(), RowStoreError> {
+        self.store.inner.validate_lease_epoch(self.epoch)
+    }
+
+    /// Release the tickets after the request committed.
     pub fn complete(&mut self) {
         self.armed = false;
-        drop(self.ticket.take());
-        drop(self.lease.take());
+        self.tickets.clear();
     }
 
     /// Cancel outstanding work and drain the store into a fresh epoch.  Returns
@@ -1139,7 +1166,7 @@ impl<'a> RowFetch<'a> {
         // issue a second reset against a later epoch.
         self.armed = false;
         let mut errors = Vec::new();
-        if let Some(ticket) = self.ticket.take() {
+        for ticket in self.tickets.drain(..) {
             if let Err(error) = self.store.cancel(&ticket) {
                 // wait_completed_lease marks a ticket consumed before waiting;
                 // source-read and cancellation errors therefore legitimately
@@ -1153,11 +1180,7 @@ impl<'a> RowFetch<'a> {
                     errors.push(format!("cancel epoch {} ticket: {error}", self.epoch));
                 }
             }
-            drop(ticket);
         }
-        // A lease holds one of the bounded staging buffers.  It must be
-        // returned before reset_epoch waits for readers/leases to drain.
-        drop(self.lease.take());
         let next_epoch = match self.store.reset_epoch(FETCH_CLEANUP_TIMEOUT) {
             Ok(next) => Some(next),
             Err(error) => {
@@ -2420,6 +2443,37 @@ mod tests {
         assert_eq!(full.locate_row(63).unwrap().shard, 0);
         assert_eq!(full.locate_row(64).unwrap().shard, 1);
         assert!(full.unload().unwrap().is_clean());
+        assert!(rows.unload().unwrap().is_clean());
+    }
+
+    /// A request larger than one staging buffer (a 2048-token Qwen4 prefill
+    /// chunk needs 32768 rows) is split into tickets and staged back
+    /// contiguously in request order.  Three parts also need each part's
+    /// staging buffer back before the reader can take the next one.
+    #[test]
+    fn row_fetch_splits_requests_larger_than_one_staging_buffer() {
+        let source = Arc::new(MemoryRowSource {
+            shards: rows_source(2, 64),
+            reads: AtomicUsize::new(0),
+            fail: None,
+        });
+        let rows = RowStore::from_test_source(metadata(128), 64, source).unwrap();
+        let max_rows = rows.max_rows_per_prefetch() as u64;
+        let ids: Vec<u64> = (0..2 * max_rows + 7).map(|i| (i * 7) % 32).collect();
+        let mut fetch = RowFetch::begin(&rows).unwrap();
+        fetch.prefetch(ids.clone()).unwrap();
+        let mut staged = vec![0u8; ids.len() * ROW_BYTES + ROW_BYTES];
+        assert_eq!(
+            fetch.stage_into(&mut staged).unwrap(),
+            ids.len() * ROW_BYTES
+        );
+        assert!(fetch.is_staged());
+        for (row, &id) in staged.chunks_exact(ROW_BYTES).zip(&ids) {
+            assert_eq!(u64::from(u16::from_le_bytes([row[0], row[1]])), id);
+        }
+        fetch.validate_after_upload().unwrap();
+        fetch.complete();
+        drop(fetch);
         assert!(rows.unload().unwrap().is_clean());
     }
 

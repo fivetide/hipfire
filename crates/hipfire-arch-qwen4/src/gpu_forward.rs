@@ -103,17 +103,16 @@ impl Qwen4OutputPolicy {
 #[derive(Clone, Copy)]
 pub(crate) enum Qwen4ProfilePhase {
     MoeSeal,
+    /// Waiting for the PLE row reads and copying them to the host upload buffer.
     PleWait,
-    PleStage,
     PleUpload,
     PleApply,
 }
 
 impl Qwen4ProfilePhase {
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 4] = [
         Self::MoeSeal,
         Self::PleWait,
-        Self::PleStage,
         Self::PleUpload,
         Self::PleApply,
     ];
@@ -122,7 +121,6 @@ impl Qwen4ProfilePhase {
         match self {
             Self::MoeSeal => "moe_seal",
             Self::PleWait => "ple_wait",
-            Self::PleStage => "ple_stage",
             Self::PleUpload => "ple_upload",
             Self::PleApply => "ple_apply",
         }
@@ -2310,7 +2308,7 @@ impl Qwen4GpuForward {
             let vocab = config.vocab_size;
             let read_token = &mut device_read;
             let mut stage_ple = |gpu: &mut Gpu| -> Result<(), Qwen4GpuForwardError> {
-                if ple.lease().is_some() {
+                if ple.is_staged() {
                     return Ok(());
                 }
                 if device_token.is_some() {
@@ -2336,18 +2334,10 @@ impl Qwen4GpuForward {
                 }
 
                 let wait_started = qwen4_profile_start();
-                let lease_result = ple.wait();
+                let stage_result = ple.stage_into(host_ple_bytes);
                 qwen4_profile_record(Qwen4ProfilePhase::PleWait, wait_started);
-                let lease =
-                    lease_result.map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
-                let upload_len = lease
-                    .as_bytes()
-                    .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?
-                    .len();
-                let stage_started = qwen4_profile_start();
-                let stage_result = lease.stage_into(&mut host_ple_bytes[..upload_len]);
-                qwen4_profile_record(Qwen4ProfilePhase::PleStage, stage_started);
-                stage_result.map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
+                let upload_len =
+                    stage_result.map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
                 let upload_started = qwen4_profile_start();
                 // After a device-token readback the host has synchronized past
                 // the previous forward's upload, so the staging buffer is free.
@@ -2359,8 +2349,7 @@ impl Qwen4GpuForward {
                 };
                 qwen4_profile_record(Qwen4ProfilePhase::PleUpload, upload_started);
                 upload_result?;
-                lease
-                    .validate_after_upload()
+                ple.validate_after_upload()
                     .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
                 let apply_started = qwen4_profile_start();
                 gpu.grouped_gather_convert_bf16(
