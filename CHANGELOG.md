@@ -1,7 +1,7 @@
 # Changelog
 
 ## Unreleased
-
+- **gfx1151: fix garbage output on Qwen3.5-family prompts that prefill through the GDN chunk scan with a partial last chunk.** The `gdn_chunk_scan_gfx1151` twin let clang sink its final output WMMAs into the `tok < rows` store branch. WMMA then ran with the tail lanes masked off, so the valid rows of a partial 16-row block read undefined operands (off by ~5e3, or NaN). Full 64-row chunks were unaffected. A 291-token prompt on qwen3.8-27b decoded `MENTS` under AR and MTP alike; `HIPFIRE_GFX1151_GDN_SCAN=0` was the workaround. An empty `asm volatile` pin now keeps the WMMAs at full EXEC, and the twin is again byte-identical to `gdn_chunk_scan` for every tail length. Regression test: `crates/rdna-compute/tests/gdn_chunk_scan_tail.rs` (ignored; GPU).
 - Qwen4 raw-I64 PLE metadata records are HFQM qt=54 (qt=52 is MQ4G256V2L).
   The published `qwen3.8:flash-next` and `qwen3.8:flash-next-mq6q8-pleq8`
   files were re-tagged in place (payloads unchanged) and re-pinned; the loader
