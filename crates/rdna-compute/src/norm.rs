@@ -45,7 +45,7 @@ pub fn restore_gdn_requant_frame_checkpoint(frame: u32) {
 /// roundtrip (PARO drift-echo correctness, ~1.8× slower batched). Strictly OFF
 /// for MQ4/HFQ; opt in via `HIPFIRE_DN_REQUANT_PER_TOKEN=1` for PARO checkpoints
 /// (shisa-ai A3B). For n_tokens==1 (AR decode / DFlash draft) both are identical.
-fn dn_requant_per_token() -> bool {
+pub(crate) fn dn_requant_per_token() -> bool {
     // Truthy (non-empty, non-"0") predicate preserved verbatim from the
     // cached form; only the process-global cache is gone (the snapshot is
     // the cache now).
@@ -112,14 +112,14 @@ impl Gpu {
         let x_ptr = x.buf.as_ptr();
         let w_ptr = weight.buf.as_ptr();
         let out_ptr = out.buf.as_ptr();
-        // gfx1201 decode (one row): n/256 workgroups, each recomputing the
+        // gfx1201 / gfx1151 / gfx1100 decode (one row): n/256 workgroups, each recomputing the
         // row's rms (bit-identical). Other workgroups still read x while one
         // writes, so `out` must not overlap `x`. Batched rows keep one
         // workgroup per row: the split re-reads every row n/256 times.
         let row_bytes = n as usize * 4;
         let disjoint = (x_ptr as usize).saturating_add(row_bytes) <= out_ptr as usize
             || (out_ptr as usize).saturating_add(row_bytes) <= x_ptr as usize;
-        let rowsplit = self.flags.g12_dec_norm_enabled()
+        let rowsplit = self.flags.dec_norm_grids_enabled()
             && batch == 1
             && n > 256
             && n % 256 == 0
@@ -1069,7 +1069,7 @@ impl Gpu {
         } else {
             "rope_partial_halfsplit"
         };
-        // gfx1201 decode: one workgroup per head instead of one wave looping
+        // gfx1201/gfx1151 decode: one workgroup per head instead of one wave looping
         // over all heads (bit-identical; each workgroup owns its head).
         let headgrid = !legacy && self.flags.g12_dec_norm_enabled();
         let (src, entry, cache_key) = if headgrid {
@@ -1153,17 +1153,24 @@ impl Gpu {
             ));
         }
         let (module, src, kernel) = if n_heads == 24 {
-            if !self.arch_caps.is_gfx1100() {
+            if self.arch_caps.is_gfx1100() {
+                (
+                    "qwen36_27b_fa_prep_gfx1100",
+                    kernels::qwen36_27b_fa_prep_gfx1100_src(),
+                    "qwen36_27b_fa_prep_gfx1100",
+                )
+            } else if self.arch_caps.is_gfx1201() {
+                (
+                    "qwen36_27b_fa_prep_gfx1201",
+                    kernels::qwen36_27b_fa_prep_gfx1201_src(),
+                    "qwen36_27b_fa_prep_gfx1201",
+                )
+            } else {
                 return Err(hip_bridge::HipError::new(
                     1,
-                    "24Q/4K fused FA prep is certified only on gfx1100",
+                    "24Q/4K fused FA prep is certified only on gfx1100 and gfx1201",
                 ));
             }
-            (
-                "qwen36_27b_fa_prep_gfx1100",
-                kernels::qwen36_27b_fa_prep_gfx1100_src(),
-                "qwen36_27b_fa_prep_gfx1100",
-            )
         } else if self.arch_caps.is_gfx1201() {
             (
                 "qwen35_fa_prep_gfx1201",

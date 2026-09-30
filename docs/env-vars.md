@@ -117,6 +117,10 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_DFLASH_CKPT_RESUME` / `HIPFIRE_CACHE_CKPT_*` | checkpointing | Qwen DFlash and MTP divergent-render resume |
 | `HIPFIRE_SPEC_WINDOW_ROLLBACK` | on unless `0` | Enables retained pre-window repair for strict-prefix speculative terminals; `0` keeps the conservative reset path. |
 | `HIPFIRE_DFLASH_VERIFY_PM4` | **unset / off**; `1` opts in | Retained-PM4 route for the fixed B=16 DFlash2 chain target-verify forward. Admitted only on exact gfx1201, single GPU, dense recurrent Qwen3.5-family target, Q8 KV + Q8 DeltaNet state, DFlash2 selector + dynamic-conv draft, `target_layer_ids == [5,19,33,47,61]`, no DDTree. Every other configuration reports a specific `disabled` reason and runs the unchanged HIP/HipGraph path. |
+| `HIPFIRE_DN_SNAPSHOT_BULK_OFF` | **unset**; `1` opts out | DeltaNet snapshot save/restore as one descriptor-driven byte-copy launch each (`dflash_state_bulk_copy_gfx1100`, pure byte copy) instead of one `hipMemcpy` per tensor. Default on exact gfx1100 and exact gfx1201 (railgun E0 port); DFlash and MTP share the snapshot. `1` restores the memcpy loops. |
+| `HIPFIRE_GDN_REPLAY_ML_OFF` | **unset**; `1` opts out | Exact gfx1201: the DFlash/MTP GDN tape replay runs every LinearAttention layer in two launches (`dflash_gdn_replay_pre_ml` + `gated_delta_net_q8_fast_ml`, byte-identical) instead of 4 launches per layer. Q8 state with the fast (single-end requant) kernel only; declines while a Redline recording is open. `1` restores the per-layer launches. |
+| `HIPFIRE_SELECT_REGRID_OFF` | **unset**; `1` opts out | Exact gfx1201: `topk_values_batched_f32` (DFlash2 selector) and `argmax_f32_batched` run 1024-thread rows with wave32 reductions (`select_regrid.hip`, byte-identical including ties; tie rows rerun the shipping top-K body). `1` restores the shipping one-block-per-row kernels. |
+| `HIPFIRE_DN_SNAPSHOT_FLIP` | **unset / off**; `1` opts in | Railgun D8, exact gfx1201 DFlash chain spec: the rollback drops the DeltaNet restore copy. On a full accept with the EF residual on and a HIP/HipGraph verify, the verify-advanced state is kept; on any shorter accept the GDN tape replay reads the pre-verify state from the snapshot and writes the live buffers (`dflash_gdn_replay_pre_ml_from` + `gated_delta_net_q8_fast_ml_from`). Byte-identical to restore + replay; the snapshot stays the pre-window state, so terminal repair is unchanged. Needs the two-launch replay (`HIPFIRE_GDN_REPLAY_ML_OFF` unset); the no-tape path and every other decline restore as before. |
 | `HIPFIRE_DRAFT_MAX` | routes to active mech window | CLI |
 | `HIPFIRE_DRAFT_F16` | on unless `0` | RuntimeConfig |
 | `HIPFIRE_NGRAM_DRAFT` | `1` forces n-gram | Loader always honors |
@@ -124,6 +128,8 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_NGRAM_LOOP_THRESHOLD` | default **0 (off)** | RuntimeConfig |
 | `HIPFIRE_NGRAM_WINDOW` | default 256 | RuntimeConfig |
 | `HIPFIRE_MTP_MODE` / `HIPFIRE_MTP_K` | auto / 3 | Config + RuntimeConfig |
+| `HIPFIRE_MTP_INCREMENTAL` | **unset**: Qwen4 MTP drafts incrementally; `0` forces batched at the full `mtp_k`, `1` forces incremental | Qwen4 MTP draft route |
+| `HIPFIRE_MTP_DRAFT_HEAD` | **`mq2r`**; `mq2`..`mq6` with optional `r` (exact top-8 Q8_0 re-scoring) | Qwen4 MTP draft-ranking copy of the LM head |
 | `HIPFIRE_QWEN35_MTP` / `HIPFIRE_QWEN35_MTP_K` | Qwen35 MTP opt-in gate | Loader — separate from DeepSeek MTP |
 | `HIPFIRE_DEEPSEEK4_SPEC_DECODE` / `HIPFIRE_DEEPSEEK4_SPEC_K` | DeepSeek MTP legacy | |
 | `HIPFIRE_DEEPSEEK4_DSPARK` / `HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD` | DSpark | |
@@ -163,6 +169,8 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_GFX12_FA_PREP_FUSED` | Exact gfx1201 FA Q/K norm and RoPE fusion (`kernel.gfx12_fa_prep_fused`); default ON only on gfx1201, `=0` restores separate launches |
 | `HIPFIRE_GFX12_FA_PREP_FP8Q` | Preconvert Q to E4M3 codes for gfx1201 Q-resident v2 attention (`kernel.gfx12_fa_prep_fp8q`); default ON only on gfx1201, `=0` retains F32 Q; requires fused prep and Q-resident v2 |
 | `HIPFIRE_FP8_DECODE_ATTN_GQA` | Exact-gfx1201 native-fp8 **decode** attention (head_dim 256, GQA group 6, tile 128, no output gate: H2): GQA-shared flash tile (one 256-thread workgroup per kv head and 128-key tile serves its six q heads, so K/V are read once) + head-dim-split reduce (`attention_flash_fp8_e4m3_tile_gqa_gfx1201` / `attention_flash_reduce_dsplit_gfx1201`); byte-identical partials and output — default ON; `=0` restores `attention_flash_fp8_e4m3_tile` + `attention_flash_q8_0_reduce` |
+| `HIPFIRE_GFX1100_DECODE_ATTN_GQA` | Exact-gfx1100 Q8_0 **decode** attention with the gated AWQ MQ-rotating epilogue (head_dim 256, GQA group 6, tile 128, full causal: H2): GQA-shared flash tile (`attention_flash_q8_0_tile_gqa_gfx1100`, one 256-thread workgroup per kv head and 128-key tile, K/V read once for the six q heads, every load issued at entry) + load-ahead reduce/gate/rotate (`attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100`, one 1024-thread workgroup per head); byte-identical partials and output — default ON; `=0` restores `attention_flash_q8_0_tile` + `attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1100` |
+| `HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA` | Exact-gfx1151 Q8_0 **decode** attention (head_dim 256, GQA group 6, tile 128, full causal, no output gate: H2): GQA-shared flash tile (one 256-thread workgroup per kv head and 128-key tile serves its six q heads, so K/V are read once) + head-dim-split reduce (`attention_flash_q8_0_tile_gqa_gfx1151` / `attention_flash_reduce_dsplit_gfx1151`); byte-identical partials and output — default ON; `=0` restores `attention_flash_q8_0_tile` + `attention_flash_q8_0_reduce` |
 | `HIPFIRE_CALIB_BF16` | Calibration-only: keep native-BF16 teachers in BF16 (`kernel.calib_force_bf16`, default off; shipped inference unaffected) |
 | `HIPFIRE_GFX12_MQ4V2_FP8_GATEUP` / `_RESID` / `_QKVZA` / `_QKV` | gfx1201 FP8-WMMA MQ4v2 prefill route — default ON on exact gfx1201 (widened prefill chunk 4096 via `prefill.chunk_rows`); `=0` on any one opts out toward the F16 path (chunk 384). `=1` forces on; launchers stay exact-gfx1201-only, so other arches are unchanged |
 | `HIPFIRE_GFX12_MQ4V2_FP8_SLABS` | Two-slab S2BT8 FP8 symbols by default; `=1` selects the single-slab symbols |
@@ -173,7 +181,8 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_GFX1151_GDN_SCAN` | Exact-gfx1151 twin of the GDN chunk scan (`gdn_chunk_scan_gfx1151`: pipelined chunk loop, K staged transposed, one value half per 256-thread workgroup; byte-identical `out` and state) — default ON; `=0` restores `gdn_chunk_scan` |
 | `HIPFIRE_GFX12_FP8_STREAM` | gfx1201 RMSNorm+rotate producer → MQ4v2 FP8 pre-pass fusion (byte-identical `prepare_mq4v2_fp8_x_f32` outputs for the qkvza/gate_up/qkv inputs; standalone pack launch disappears) — default ON on exact gfx1201 (`kernel.gfx12_fp8_stream`); `=0` opts out; other arches off |
 | `HIPFIRE_G12_NORM` | gfx1201 `_v2` RMSNorm and gated-norm int4 producers (batched sum-of-squares loads + one-reciprocal RTN codes; one wave per gated-norm group; bit-identical) — default ON on exact gfx1201 (`kernel.g12_norm`); `=0` restores the incumbent `_gfx12` symbols |
-| `HIPFIRE_G12_DEC_NORM` | gfx1201 decode norms as multi-workgroup grids (f32 AWQ RMSNorm+FWHT: K/256 workgroups, each redoing the row's reduction and rotating one group; out-of-place single-row `rmsnorm_f32`: n/256 workgroups; half-split partial RoPE: one workgroup per head; bit-identical) — default ON on exact gfx1201 (`kernel.g12_dec_norm`); `=0` restores the single-workgroup launches |
+| `HIPFIRE_G12_DEC_NORM` | gfx1201 and gfx1151 decode norms as multi-workgroup grids (f32 AWQ RMSNorm+FWHT: K/256 workgroups, each redoing the row's reduction and rotating one group; out-of-place single-row `rmsnorm_f32`: n/256 workgroups; half-split partial RoPE: one workgroup per head; bit-identical) — default ON on exact gfx1201 and exact gfx1151 (`kernel.g12_dec_norm`); `=0` restores the single-workgroup launches |
+| `HIPFIRE_GFX1100_DEC_NORM` | gfx1100 decode norms as multi-workgroup grids (the `HIPFIRE_G12_DEC_NORM` twins built for gfx1100: f32 AWQ RMSNorm+FWHT K/256 workgroups, out-of-place single-row `rmsnorm_f32` n/256 workgroups; bit-identical) — default ON on exact gfx1100 (`kernel.gfx1100_dec_norm`); `=0` restores the single-workgroup launches |
 | `HIPFIRE_G12_A4C2` | gfx1201 int4 producers search two activation scales ({5,7}, as gfx11's `-DIU4_A4_CANDIDATES=2`) instead of RTN d = amax/7; one-pass producer-layout search, bit-identical to that flag — default ON on exact gfx1201 (`kernel.g12_a4c2`; appends `-DIU4_A4_CANDIDATES=2` to the gfx1201 JIT flags); `=0` restores RTN |
 | `HIPFIRE_PREFILL_CHUNK_ROWS` | Widened ordinary-prefill chunk ceiling (`prefill.chunk_rows`; default 4096 on exact gfx1201, 512 elsewhere; explicit `HIPFIRE_PREFILL_MAX_BATCH` wins; VRAM admission may admit a smaller rung) |
 
@@ -249,6 +258,7 @@ Policy owner: [`REDLINE.md`](REDLINE.md) (**shipped / ref-pinned**). Timing is n
 | Variable | Notes |
 |---|---|
 | `HIPFIRE_REPLAY_BACKEND` | `hip` / `off` / `shadow` / `auto`. Unset may select `auto` only from the automatic product defaults in `retained_redline_default`: `mq4r_redline_default` — exact GPU arch `gfx1100`/`gfx1151`/`gfx1201` + case-insensitive `.mq4r` + pp=tp=1 (model-family agnostic; no `arch_id` gate; `gfx1200` and all other arches remain opt-in); Qwen3.5 dense (`qwen3_5`, any weight format) plain-AR decode on exact `gfx1201` with pp=tp=1 and no drafter (retained PM4; byte-identical to the HIP AR graph); and DeepSeek4 `.mq2r` AR on gfx1151. Existing LFM `.mq4` registry evidence is **not** automatically selected because it is not `.mq4r`; any usable non-default retained route is explicit opt-in and must still prove route support. The sealed LFM [`admissions.yml`](admissions.yml) row is registry evidence/admission only and does not wire runtime defaults. Runtime default ≠ Redline certification/registry admission. Built-in `hip` config profile, another explicit backend selection, `replay.backend = "hip"` or `=hip` disables the automatic default. |
+| `HIPFIRE_GFX1201_PM4_PACING` | NOP pacing of the retained gfx1201 Qwen3.5-dense decode PM4 tape (`replay.gfx1201_pm4_pacing`): `auto` (default) = one 64-body-dword `NOP` after every `DISPATCH_DIRECT`; `off`/`0` = unpaced tape; `nop:N` = N-body-dword NOP. Applied only when the Redline default admits exact gfx1201 + `qwen3_5` (not MQ4R, not MoE, not gfx11). NOPs write no register or memory, so decode is byte-identical |
 | `HIPFIRE_REPLAY_TRANSPORT` | `pm4` / AQL family |
 | `HIPFIRE_REPLAY_MANUAL_CAPTURE` | Manual capture delimiters |
 | `HIPFIRE_REPLAY_PM4_*` | PM4 research knobs — inventory |
@@ -374,7 +384,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 **Do not hand-edit rows below** except by re-running the source scan.
 **Generation method:** token scan over visible `*.rs`, `*.py`, and `*.sh`, excluding ignored/generated files.
 **Columns:** variable; up to two lexical source paths.
-**Count:** 739
+**Count:** 740
 
 | Variable | Example source path(s) |
 |---|---|
@@ -630,6 +640,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_FP16_LAYER_MAX` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_FP16_LAYER_MIN` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_FP8_DECODE_ATTN_GQA` | crates/rdna-compute/src/attention.rs |
+| `HIPFIRE_GFX1100_DECODE_ATTN_GQA` | crates/rdna-compute/src/attention.rs |
 | `HIPFIRE_FP8_SYMFOLD` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs, kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip |
 | `HIPFIRE_FP8_WMMA` | crates/rdna-compute/examples/test_gemm_hfp4g32_fp8.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_FUSED_GATE_UP_K1024` | crates/rdna-compute/src/kernels.rs |
@@ -638,6 +649,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_FUSE_QKV_BIAS_DEBUG` | crates/hipfire-dispatch/src/pipeline/steps.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_G12_NORM` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_G12_DEC_NORM` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/norm.rs, crates/rdna-compute/src/kernels.rs, kernels/src/fused_rmsnorm_mq_rotate.hip, kernels/src/rmsnorm_rowsplit.hip, kernels/src/rope_partial_halfsplit_headgrid.hip, crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_GFX1100_DEC_NORM` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/norm.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_G12_A4C2` | crates/rdna-compute/src/feature_flags.rs, kernels/src/block_i4_128_quant.hip, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_GATED_NORM_MQ_ROTATE` | crates/hipfire-arch-qwen35/src/qwen35.rs |
 | `HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL` | crates/rdna-compute/src/kernels.rs |
@@ -751,6 +763,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_GFX1151_WEIGHT_BUFFER_SIGMOID` | crates/rdna-compute/src/gemv.rs |
 | `HIPFIRE_GFX11_WEIGHT_GLOBAL_LOADS` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GFX11_WEIGHT_LOAD_POLICY` | crates/rdna-compute/src/feature_flags.rs |
+| `HIPFIRE_GFX1201_PM4_PACING` | crates/rdna-compute/src/replay.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_GFX1201_ROUTER_W64` | crates/hipfire-dispatch/src/pipeline/mod.rs |
 | `HIPFIRE_GFX12_FA2_PREFILL` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/attention.rs, crates/hipfire-dispatch/src/families/attention.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_GFX12_FA_PACKET` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/attention.rs, crates/rdna-compute/src/kernels.rs, kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip, crates/hipfire-dispatch/src/families/attention.rs, crates/hipfire-config/src/lib.rs |

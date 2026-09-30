@@ -143,9 +143,10 @@ pub fn gdn_compact_qk_div(gpu: &Gpu, dims: &HybridDims, q8_state: bool) -> Optio
         return Some(2);
     }
     // 3:1 route for the dense 27B shape: +0.45% at 512 tokens, 853 -> 805
-    // dispatches/token. `HIPFIRE_GDN_COMPACT3=0` restores explicit Q/K.
+    // dispatches/token on gfx1100; exact gfx1201 runs the same object for the
+    // same shape. `HIPFIRE_GDN_COMPACT3=0` restores explicit Q/K.
     let compact3 = *COMPACT3
-        && gpu.arch_caps.is_gfx1100()
+        && (gpu.arch_caps.is_gfx1100() || gfx1201_state_fusions(gpu))
         && q8_state
         && dims.linear_key_heads * 3 == dims.linear_value_heads
         && dims.is_dense_27b_shape();
@@ -164,7 +165,8 @@ pub fn gated_norm_mq_rotate(gpu: &Gpu, dims: &HybridDims, wo: &WeightRef<'_>) ->
         ((gpu.arch_caps.is_gfx1100() || gfx1151_radiowave(gpu) || gfx1201_state_fusions(gpu))
             && dims.dim == 2_048
             && n_v_heads == 32)
-            || (gpu.arch_caps.is_gfx1100() && dims.is_dense_27b_shape());
+            || ((gpu.arch_caps.is_gfx1100() || gfx1201_state_fusions(gpu))
+                && dims.is_dense_27b_shape());
     enabled
         && admitted_arch_shape
         && dims.linear_value_dim == 128
@@ -183,7 +185,7 @@ pub fn fused_attention_prep(gpu: &Gpu, dims: &HybridDims) -> bool {
         && dims.n_heads == 16
         && dims.n_kv_heads == 2)
         || (gfx1201_state_fusions(gpu) && dims.is_a3b_state_fusion_shape())
-        || (gpu.arch_caps.is_gfx1100()
+        || ((gpu.arch_caps.is_gfx1100() || gfx1201_state_fusions(gpu))
             && dims.is_dense_27b_shape()
             && dims.n_heads == 24
             && dims.n_kv_heads == 4);

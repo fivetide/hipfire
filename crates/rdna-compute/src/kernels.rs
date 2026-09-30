@@ -1626,6 +1626,33 @@ pub const GATED_NORM_MQ_ROTATE_AWQ_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_gfx1201\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate.gfx1100.hip")
 );
+/// Exact-gfx1201 48-head (Qwen3.6-27B, K = 6144) DeltaNet gated-norm/MQ
+/// rotation: the gfx1100 k6144 body under its own entry symbols, like the
+/// 32-head gfx1201 twins above.
+pub fn gated_norm_mq_rotate_k6144_gfx1201_src() -> &'static str {
+    static SRC: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        format!(
+            "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_k6144_gfx1201\n{}",
+            GATED_NORM_MQ_ROTATE_GFX1100_SRC.replace(
+                "if (n_heads != 32 || head_dim != 128) return;",
+                "if (n_heads != 48 || head_dim != 128) return;",
+            )
+        )
+    });
+    &SRC
+}
+pub fn gated_norm_mq_rotate_awq_k6144_gfx1201_src() -> &'static str {
+    static SRC: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        format!(
+            "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_k6144_gfx1201\n{}",
+            GATED_NORM_MQ_ROTATE_GFX1100_SRC.replace(
+                "if (n_heads != 32 || head_dim != 128) return;",
+                "if (n_heads != 48 || head_dim != 128) return;",
+            )
+        )
+    });
+    &SRC
+}
 /// gfx1201 slices-4 IU4 producer: batched gated RMSNorm + FWHT + in-register
 /// `block_i4_128` emit for the LA post-GDN `wo` input, replacing
 /// `gated_norm_f32_batched` + `rotate_x_mq[_awq]_batched` +
@@ -7432,6 +7459,33 @@ pub const ATTENTION_FLASH_FP8_E4M3_TILE_GQA_GFX1201_SRC: &str =
 /// workgroup per (head, 32-dim chunk). Same 7-arg ABI, no dynamic LDS.
 pub const ATTENTION_FLASH_REDUCE_DSPLIT_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_reduce_dsplit.gfx1201.hip");
+/// GQA-shared Q8_0 decode flash tile (`attention_flash_q8_0_tile_gqa_gfx1100`):
+/// one 256-thread workgroup per (kv head, tile) serves the six q heads of its
+/// kv head, so each K/V tile is read once. Same 13-arg ABI and byte-identical
+/// `[2+head_dim]` partials as [`ATTENTION_FLASH_Q8_0_TILE_SRC`] at head_dim 256,
+/// GQA group 6, tile 128, window 0. gfx1100 only.
+pub const ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_q8_0_tile_gqa.gfx1100.hip");
+/// Load-ahead decode reduce + gate + AWQ MQ rotation
+/// (`attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100`):
+/// byte-identical to [`ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1100_SRC`]
+/// on the same partials. Same 11-arg ABI; one 1024-thread workgroup per head,
+/// dynamic LDS 2 * max_tiles floats. gfx1100 only.
+pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_DEC_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate_dec.gfx1100.hip");
+/// GQA-shared Q8_0 decode flash tile (`attention_flash_q8_0_tile_gqa_gfx1151`):
+/// one 256-thread workgroup per (kv head, tile) serves the six q heads of its kv
+/// head, so each Q8_0 K/V tile is read once. Same 13-arg ABI and byte-identical
+/// `[2+head_dim]` partials as [`ATTENTION_FLASH_Q8_0_TILE_SRC`] at head_dim 256,
+/// GQA group 6, tile 128, window 0. gfx1151 only.
+pub const ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_q8_0_tile_gqa.gfx1151.hip");
+/// gfx1151 twin of [`ATTENTION_FLASH_REDUCE_DSPLIT_GFX1201_SRC`]
+/// (`attention_flash_reduce_dsplit_gfx1151`): byte-identical to
+/// `attention_flash_q8_0_reduce` on the same partials, one workgroup per
+/// (head, 32-dim chunk). Same 7-arg ABI, no dynamic LDS.
+pub const ATTENTION_FLASH_REDUCE_DSPLIT_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_reduce_dsplit.gfx1151.hip");
 /// Batched fp8 flash tile (`attention_flash_fp8_e4m3_tile_batched`): same TU
 /// as [`ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC`] with `HIPFIRE_KV_FP8_E4M3=1`.
 /// Same full asym ABI (cos/sin dummies, tree_bias, v_mode_bits, window,
@@ -7672,6 +7726,30 @@ pub const QWEN35_FA_PREP_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1201\n",
     include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
 );
+/// Exact-gfx1201 24Q/4K (Qwen3.6-27B) twin of `qwen36_27b_fa_prep_gfx1100`.
+/// The RoPE pair is written with explicit fmaf in the contraction the gfx1201
+/// decode chain's `rope_partial_halfsplit_f32_headgrid` compiles to
+/// (`fma(x0, cos, -(x1 * sin))`, `fma(x0, sin, x1 * cos)`); left to the
+/// compiler, this body fuses the second output as `fma(x1, cos, x0 * sin)`
+/// and differs from the unfused chain in the last bit.
+#[cfg(feature = "deltanet")]
+pub fn qwen36_27b_fa_prep_gfx1201_src() -> &'static str {
+    static SRC: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let body = QWEN35_FA_PREP_GFX1100_SRC
+            .replace("constexpr int NQ = 16;", "constexpr int NQ = 24;")
+            .replace(
+                "out[tid] = x0 * cos_a - x1 * sin_a;",
+                "out[tid] = __builtin_fmaf(x0, cos_a, -(x1 * sin_a));",
+            )
+            .replace(
+                "out[tid + HALF] = x0 * sin_a + x1 * cos_a;",
+                "out[tid + HALF] = __builtin_fmaf(x0, sin_a, x1 * cos_a);",
+            );
+        assert_eq!(body.matches("__builtin_fmaf").count(), 2);
+        format!("#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen36_27b_fa_prep_gfx1201\n{body}")
+    });
+    &SRC
+}
 
 /// 2-D spatial RoPE with precomputed per-patch cos/sin tables. Used by
 /// the dots.ocr (Qwen2-VL family) `DotsVisionTransformer` for vision

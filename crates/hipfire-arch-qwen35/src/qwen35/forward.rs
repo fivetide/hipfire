@@ -5646,6 +5646,7 @@ fn gfx1201_qwen35_a3b_state_fusion_shape(config: &Qwen35Config) -> bool {
         && config.linear_value_head_dim == 128
 }
 
+
 /// Fold the Qwen output gate plus MQ rotation into the flash-attention reduce
 /// epilogue on certified gfx1100/MQ4 shapes. Extending the existing Q8 reducer
 /// to Qwen3.6-27B's asym3 route measured +0.37% over a 512-token A/B/B/A and
