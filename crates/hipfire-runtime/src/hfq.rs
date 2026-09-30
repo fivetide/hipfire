@@ -582,7 +582,6 @@ impl HfqFile {
         self.mq4v2_symmetric
     }
 
-
     /// `open` with the REAP plan injected instead of taken from process config.
     ///
     /// Public because the process config is a START-TIME SNAPSHOT
@@ -927,7 +926,9 @@ impl HfqFile {
         let mq4v2_symmetric = serde_json::from_str::<serde_json::Value>(&metadata_json)
             .ok()
             .and_then(|metadata| metadata.get("mq4v2.symmetric").cloned())
-            .is_some_and(|marker| marker == serde_json::json!(1) || marker == serde_json::json!(true));
+            .is_some_and(|marker| {
+                marker == serde_json::json!(1) || marker == serde_json::json!(true)
+            });
 
         // Parse tensor index (follows metadata JSON)
         let mut pos = metadata_offset.checked_add(json_end).ok_or_else(|| {
@@ -1035,7 +1036,11 @@ impl HfqFile {
         }
         if mq4v2_symmetric {
             let mut sampled_groups = 0usize;
-            for tensor in tensors.iter().filter(|tensor| tensor.quant_type == 44).take(4) {
+            for tensor in tensors
+                .iter()
+                .filter(|tensor| tensor.quant_type == 44)
+                .take(4)
+            {
                 let groups = tensor.data_size / 136;
                 if groups == 0 {
                     continue;
@@ -1044,7 +1049,8 @@ impl HfqFile {
                     let header = tensor.data_offset + group * 136;
                     for half_idx in 0..2 {
                         let offset = header + half_idx * 4;
-                        let d_bits = u16::from_le_bytes(mmap[offset..offset + 2].try_into().unwrap());
+                        let d_bits =
+                            u16::from_le_bytes(mmap[offset..offset + 2].try_into().unwrap());
                         let z_bits =
                             u16::from_le_bytes(mmap[offset + 2..offset + 4].try_into().unwrap());
                         let d = half::f16::from_bits(d_bits).to_f32();
@@ -3594,18 +3600,18 @@ mod compact_qwen4_ple_tests {
     #[test]
     #[ignore = "disk-only readahead probe; set HIPFIRE_PROBE_MODEL to an HFQ artifact"]
     fn ple_window_readahead_probe() {
-        let Ok(model) = std::env::var("HIPFIRE_PROBE_MODEL") else {
+        let Ok(model) = hipfire_config::developer_var("HIPFIRE_PROBE_MODEL") else {
             println!("ple-window-probe: skipped, HIPFIRE_PROBE_MODEL is unset");
             return;
         };
-        let reads: usize = std::env::var("HIPFIRE_PROBE_READS")
+        let reads: usize = hipfire_config::developer_var("HIPFIRE_PROBE_READS")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(192);
         // Row width the reader aligns to: 320 B for today's BF16 shards, 170 B
         // for a Q8F16 shard. Offsets are multiples of this, exactly like the
         // reader's page offsets.
-        let align: u64 = std::env::var("HIPFIRE_PROBE_ALIGN")
+        let align: u64 = hipfire_config::developer_var("HIPFIRE_PROBE_ALIGN")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(320);

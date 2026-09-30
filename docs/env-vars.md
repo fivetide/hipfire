@@ -128,6 +128,8 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_NGRAM_LOOP_THRESHOLD` | default **0 (off)** | RuntimeConfig |
 | `HIPFIRE_NGRAM_WINDOW` | default 256 | RuntimeConfig |
 | `HIPFIRE_MTP_MODE` / `HIPFIRE_MTP_K` | auto / 3 | Config + RuntimeConfig |
+| `HIPFIRE_MTP_INCREMENTAL` | **unset**: Qwen4 MTP drafts incrementally; `0` forces batched at the full `mtp_k`, `1` forces incremental | Qwen4 MTP draft route |
+| `HIPFIRE_MTP_DRAFT_HEAD` | **`mq2r`**; `mq2`..`mq6` with optional `r` (exact top-8 Q8_0 re-scoring) | Qwen4 MTP draft-ranking copy of the LM head |
 | `HIPFIRE_QWEN35_MTP` / `HIPFIRE_QWEN35_MTP_K` | Qwen35 MTP opt-in gate | Loader — separate from DeepSeek MTP |
 | `HIPFIRE_DEEPSEEK4_SPEC_DECODE` / `HIPFIRE_DEEPSEEK4_SPEC_K` | DeepSeek MTP legacy | |
 | `HIPFIRE_DEEPSEEK4_DSPARK` / `HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD` | DSpark | |
