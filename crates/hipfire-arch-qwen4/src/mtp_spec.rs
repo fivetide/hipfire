@@ -12,6 +12,7 @@
 //! consumed-row count, which adds the seed.
 
 use crate::bundle::Qwen4Bundle;
+use crate::mtp_gpu::MTP_APPEND_ROWS;
 #[cfg(any(test, feature = "reference-parity"))]
 use crate::reference_mtp::{MtpError, Qwen4MtpState};
 use crate::state::Qwen4StateSnapshot;
@@ -1284,23 +1285,26 @@ impl MtpDrafter for Qwen4MtpDrafter {
             let pick = Self::bundle(target)?
                 .spec_prefill_rows(gpu, chunk)
                 .map_err(|error| error.to_string())?;
-            for (index, &token) in chunk.iter().enumerate() {
+            // The head appends the chunk's K/V rows in batches; `pending`
+            // ends holding the chunk's last hidden row, as a per-token
+            // append left it.
+            for (batch_index, batch) in chunk.chunks(MTP_APPEND_ROWS).enumerate() {
                 if abort() {
                     target.reset_recurrent(gpu)?;
                     return Err("Qwen4 native MTP prefill aborted".to_string());
                 }
+                let first_row = batch_index * MTP_APPEND_ROWS;
                 let position = start_pos
                     .checked_add(base)
-                    .and_then(|value| value.checked_add(index))
+                    .and_then(|value| value.checked_add(first_row))
                     .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
-                let bundle = Self::bundle(target)?;
-                bundle
-                    .copy_spec_hidden_row_to(gpu, index, pending)
-                    .map_err(|error| error.to_string())?;
-                bundle
-                    .mtp_append_token(gpu, token, Some(pending), position)
+                Self::bundle(target)?
+                    .mtp_append_rows(gpu, batch, first_row, position)
                     .map_err(|error| error.to_string())?;
             }
+            Self::bundle(target)?
+                .copy_spec_hidden_row_to(gpu, chunk.len() - 1, pending)
+                .map_err(|error| error.to_string())?;
             first_token = Some(pick);
         }
         let first_token = first_token.expect("non-empty MTP prefill produced no seed");

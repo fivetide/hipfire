@@ -629,6 +629,35 @@ impl Qwen4Bundle {
             .map_err(|error| BundleError::Forward(error.to_string()))
     }
 
+    /// [`Self::mtp_append_token`] for `tokens` at `position..`, whose backbone
+    /// hidden rows are the spec-hidden capture rows `first_row..` of the last
+    /// chunked prefill, in one batched MTP step (at most
+    /// [`crate::mtp_gpu::MTP_APPEND_ROWS`] tokens).
+    pub(crate) fn mtp_append_rows(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        first_row: usize,
+        position: usize,
+    ) -> Result<(), BundleError> {
+        let width = self.config.hc_count * self.config.hidden_size;
+        let source = self.spec_hidden.as_ref().ok_or_else(|| {
+            BundleError::Forward("Qwen4 spec hidden is not allocated".to_string())
+        })?;
+        let (offset, len) = (first_row * width, tokens.len() * width);
+        if offset + len > source.numel() {
+            return Err(BundleError::Forward(
+                "Qwen4 spec hidden rows are outside capture".to_string(),
+            ));
+        }
+        let hidden = source.sub_offset(offset, len);
+        self.mtp
+            .as_mut()
+            .ok_or_else(|| BundleError::Forward("Qwen4 MTP resources are not attached".into()))?
+            .append_rows(gpu, &self.weights, &self.config, tokens, &hidden, position)
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
     /// Run one native MTP token from its committed state and copy the
     /// production logits into the caller-owned F32 destination.
     pub fn mtp_forward_token_logits(
