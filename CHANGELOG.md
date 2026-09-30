@@ -1,6 +1,12 @@
 # Changelog
 
 ## Unreleased
+- **`hipfire run qwen3.8:flash-next` works with the default config.** Qwen4's
+  2048-token context is below the default `max_tokens` (4096), and the Qwen4 AR
+  route refused every such request. The Qwen4 AR route now fits an omitted
+  `max_tokens` like the other routes, and `hipfire run` without `-n` marks its
+  configured `max_tokens` as a ceiling (`max_tokens_fit`), as serve does for an
+  omitted value. An explicit `-n` is still refused when it does not fit.
 - **Qwen4 (Flash-Next) prompt-cache reuse, AR and native MTP.** A turn whose
   canonical render purely extends the processed conversation keeps the device
   state and prefills only the new suffix (`cached_tokens` > 0); edited or
