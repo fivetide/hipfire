@@ -1414,6 +1414,99 @@ extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
     }
 }
 
+// gated_delta_conv_bf16_f32_batched_k4 with BF16 input and output, four
+// channels per thread (8-byte row accesses instead of 2-byte ones); every
+// channel's arithmetic is the scalar kernel's.  The gate parameters take the
+// blocks past the channel grid on every row of the grid, not just row 0.
+// Grid [channels / 1024 + param blocks per row, ceil(rows / 8)], block 256.
+// channels % 4 == 0.
+extern "C" __global__ void gated_delta_conv_bf16x4_batched_k4(
+    const unsigned short* input,
+    const __hip_bfloat16* kernel,
+    const float* history,
+    unsigned short* output,
+    float* next_history,
+    int rows,
+    int channels,
+    int start_cursor,
+    const float* param_a,
+    const float* param_b,
+    const __hip_bfloat16* a_log,
+    const __hip_bfloat16* dt_bias,
+    float* gate,
+    float* beta,
+    int param_elements,
+    int heads) {
+    const int conv_blocks = (channels / 4 + 255) / 256;
+    if ((int)blockIdx.x >= conv_blocks) {
+        const int per_row = (int)gridDim.x - conv_blocks;
+        const int flat = ((int)blockIdx.y * per_row + (int)blockIdx.x - conv_blocks) * 256 + (int)threadIdx.x;
+        if (flat < param_elements)
+            gated_delta_params_flat(param_a, param_b, a_log, dt_bias, gate, beta, flat, heads);
+        return;
+    }
+    const int channel = ((int)blockIdx.x * 256 + (int)threadIdx.x) * 4;
+    const int r0 = (int)blockIdx.y * 8;
+    if (channel >= channels || r0 >= rows) return;
+    struct bf4 { __hip_bfloat16 v[4]; };
+    auto in = [&](int j) {
+        const uint2 u = *(const uint2*)(input + (size_t)j * channels + channel);
+        bf4 o;
+        o.v[0].data = (unsigned short)(u.x & 0xFFFFu);
+        o.v[1].data = (unsigned short)(u.x >> 16);
+        o.v[2].data = (unsigned short)(u.y & 0xFFFFu);
+        o.v[3].data = (unsigned short)(u.y >> 16);
+        return o;
+    };
+    auto x = [&](int j) {
+        if (j >= 0) return in(j);
+        const float4 h = *(const float4*)(history + ((start_cursor + j + 3) % 3) * channels + channel);
+        bf4 o;
+        o.v[0] = bf16_round(h.x);
+        o.v[1] = bf16_round(h.y);
+        o.v[2] = bf16_round(h.z);
+        o.v[3] = bf16_round(h.w);
+        return o;
+    };
+    float k[4][4];
+    for (int c = 0; c < 4; ++c)
+        for (int t = 0; t < 4; ++t) k[c][t] = bf16_to_f32(kernel[(channel + c) * 4 + t]);
+    bf4 h0 = x(r0 - 3), h1 = x(r0 - 2), h2 = x(r0 - 1);
+    bf4 tail[3];
+    if (r0 == 0) {
+        for (int s = 0; s < 3; ++s) {
+            const int j = rows - 3 + ((s - (start_cursor + rows) % 3) + 6) % 3;
+            tail[s] = x(j);
+        }
+    }
+    const int r1 = min(r0 + 8, rows);
+#pragma unroll
+    for (int r = r0; r < r0 + 8; ++r) {
+        if (r >= r1) break;
+        const bf4 current = in(r);
+        unsigned short o[4];
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            float value = k[c][3] * bf16_to_f32(current.v[c]);
+            value += k[c][0] * bf16_to_f32(h0.v[c]);
+            value += k[c][1] * bf16_to_f32(h1.v[c]);
+            value += k[c][2] * bf16_to_f32(h2.v[c]);
+            o[c] = bf16_round(value * (1.0f / (1.0f + expf(-value)))).data;
+        }
+        *(uint2*)(output + (size_t)r * channels + channel) =
+            make_uint2(o[0] | ((unsigned)o[1] << 16), o[2] | ((unsigned)o[3] << 16));
+        h0 = h1;
+        h1 = h2;
+        h2 = current;
+    }
+    if (r0 == 0) {
+        for (int s = 0; s < 3; ++s)
+            *(float4*)(next_history + s * channels + channel) = make_float4(
+                bf16_to_f32(tail[s].v[0]), bf16_to_f32(tail[s].v[1]),
+                bf16_to_f32(tail[s].v[2]), bf16_to_f32(tail[s].v[3]));
+    }
+}
+
 // Row-batched parameter expansion; source BF16 boundaries match decode.
 extern "C" __global__ void gated_delta_params_bf16_f32_batched(
     const float* a,
