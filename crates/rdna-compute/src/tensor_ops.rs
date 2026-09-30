@@ -895,11 +895,11 @@ pub fn hyper_write(gpu: &mut Gpu, p: &HyperWrite<'_>) -> HipResult<()> {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
     if p.state_bf16 {
-        // Two columns (one BF16 pair) per thread.
-        if p.hidden % 2 != 0 {
+        // Eight columns (four BF16 pairs) per thread.
+        if p.hidden % 8 != 0 {
             return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
         }
-        gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "hyper_write_bf16x2")?;
+        gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "hyper_write_bf16x8")?;
         let mut args = KernargBlob::new();
         for tensor in [p.input, p.mixed, p.gates, p.output] {
             args.push_ptr(tensor.buf.as_ptr());
@@ -909,8 +909,8 @@ pub fn hyper_write(gpu: &mut Gpu, p: &HyperWrite<'_>) -> HipResult<()> {
         args.push_i32(rows_i);
         args.pad_to(16);
         return gpu.launch_blob_recorded(
-            "hyper_write_bf16x2",
-            [blocks(wide / 2)?, grid_y, 1],
+            "hyper_write_bf16x8",
+            [blocks(wide / 8)?, grid_y, 1],
             [256, 1, 1],
             0,
             args.as_mut_slice(),
