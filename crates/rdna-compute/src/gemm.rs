@@ -27891,12 +27891,13 @@ impl Gpu {
             dtype: DType::F16,
         };
         // M < 512 (HC input_mix_down 320 x 10240, the shared-expert selector
-        // 1 x 2560): the auto tile gives too few workgroups; 64 x 64 keeps
+        // 1 x 2560): the auto tile gives too few workgroups; 64 x 64 (K stage
+        // 32: 342 vs 362 us cold at 320 x 10240) keeps
         // each output's K order.  M < 1024 (router 512, shared gate/up 640 at
         // K 2560): 128 x 128 over 128 x 256, 175 vs 213 us at 640 x 2560 x 1131;
         // every tile keeps each output's K order.
         let tile = match m {
-            0..512 => LdsTile::new(64, 64, 32, 64, 64, false),
+            0..512 => LdsTile::new(64, 64, 32, 64, 32, false),
             512..1024 => LdsTile::new(128, 128, 32, 64, 64, false),
             _ => {
                 return self.gemm_f16_x_f16_wmma_lds_auto_ld(
@@ -29086,6 +29087,7 @@ impl Gpu {
         // Short-M, long-K Qwen4 projections; see gemm_bf16_xf16_f16_wmma.
         LdsTile::new(64, 64, 32, 64, 64, false),
         LdsTile::new(64, 64, 32, 64, 64, false).pipelined(),
+        LdsTile::new(64, 64, 32, 64, 32, false).pipelined(),
     ];
 
     /// Pick a tile and dispatch it.
