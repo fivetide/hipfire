@@ -959,6 +959,9 @@ static __device__ __forceinline__ float hc_lane0_tree_sum(float v) {
 // lands in LDS and wave w < 4 replays the BF16 kernels' lane traversal
 // (lane*8, +256), four chains, (a0+a1)+(a2+a3) fold and shuffle tree for gate
 // row w, so both results are bitwise unchanged.
+// With `normalized16` non-null the block also writes the row normalized with
+// `read_norm_weight` as F16 at row pitch `ld16`: hyper_norm_f32's F16 output
+// for a hyper read of the same streams (same inverse RMS, bitwise).
 // Grid [rows], block 256, dynamic LDS (2 * hidden + 4 * 256) * 4 bytes.
 // Requires four branches, hidden % 256 == 0 and hidden <= 2560.
 // `input` is the HC streams (BF16 bits when `state_bf16`).
@@ -968,7 +971,10 @@ extern "C" __global__ __launch_bounds__(256) void hyper_norm_gate_f32(
     const unsigned short* gate_weight,
     float* gates,
     int hidden,
-    int state_bf16) {
+    int state_bf16,
+    const __hip_bfloat16* read_norm_weight,
+    _Float16* normalized16,
+    int ld16) {
     constexpr int branches = 4;
     constexpr int U = 10;
     extern __shared__ float hc_lds[];
@@ -1028,9 +1034,13 @@ extern "C" __global__ __launch_bounds__(256) void hyper_norm_gate_f32(
 #pragma unroll
         for (int u = 0; u < U; ++u) {
             const int j = b * hidden + tid + 256 * u;
-            if (u < per)
+            if (u < per) {
                 xsb[j] = (unsigned short)(__float_as_uint(bf16_to_f32(bf16_round(
                     raw[b][u] * inv * (1.0f + bf16_to_f32(norm_weight[j]))))) >> 16);
+                if (normalized16)
+                    normalized16[(size_t)row * ld16 + j] = (_Float16)bf16_to_f32(bf16_round(
+                        raw[b][u] * inv * (1.0f + bf16_to_f32(read_norm_weight[j]))));
+            }
         }
     }
     __syncthreads();
