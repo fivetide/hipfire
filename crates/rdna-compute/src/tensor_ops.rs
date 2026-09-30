@@ -2638,6 +2638,9 @@ fn indexed_attention_select_batch_impl(
 /// Score-scratch budget of [`indexed_attention_select_rows8`]: rows are
 /// selected in groups whose scores fit it.
 const QSA_SELECT_SCORE_SCRATCH_BYTES: usize = 64 << 20;
+/// `indexed_attention_select_from_scores` holds the chosen blocks in 512 LDS
+/// entries; larger budgets select through the batched kernel.
+const QSA_SELECT_FROM_SCORES_MAX_BUDGET: usize = 512;
 
 /// [`indexed_attention_select_batch_impl`]'s live route: row groups of
 /// `indexed_attention_select_scores_rows8_f32` scores, each followed by the
@@ -2658,6 +2661,7 @@ fn indexed_attention_select_rows8(
     for kernel in [
         "indexed_attention_select_scores_rows8_f32",
         "indexed_attention_select_f32_batched",
+        "indexed_attention_select_from_scores",
     ] {
         gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     }
@@ -2698,6 +2702,35 @@ fn indexed_attention_select_rows8(
             args.as_mut_slice(),
             crate::dispatch::ReplayLaunchBindings::default(),
         )?;
+        // The persistent selection is the final row's: the last group's.
+        let last = g0 + n == p.rows;
+        let mirror_ptr = mirror
+            .filter(|_| last)
+            .map_or(std::ptr::null_mut(), |m| m.buf.as_ptr());
+        if p.budget_blocks <= QSA_SELECT_FROM_SCORES_MAX_BUDGET {
+            let mut args = KernargBlob::new();
+            args.push_ptr(scores);
+            args.push_i32(block_count);
+            args.push_ptr(selected);
+            args.push_i32(rows);
+            args.push_i32(block_count);
+            args.push_i32(checked_i32(p.budget_blocks, "QSA batch select budget")?);
+            args.push_i32(checked_i32(p.compress, "QSA batch select compress")?);
+            args.push_i32(position_start);
+            args.push_i32(checked_i32(p.capacity, "QSA batch select capacity")?);
+            args.push_ptr(mirror_ptr);
+            args.pad_to(16);
+            gpu.launch_blob_recorded(
+                "indexed_attention_select_from_scores",
+                [rows as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                args.as_mut_slice(),
+                crate::dispatch::ReplayLaunchBindings::default(),
+            )?;
+            g0 += n;
+            continue;
+        }
         let mut args = KernargBlob::new();
         args.push_ptr(query);
         args.push_ptr(p.pooled.buf.as_ptr());
@@ -2710,13 +2743,7 @@ fn indexed_attention_select_rows8(
         }
         args.push_i32(position_start);
         args.push_i32(checked_i32(p.capacity, "QSA batch select capacity")?);
-        // The persistent selection is the final row's: the last group's.
-        let last = g0 + n == p.rows;
-        args.push_ptr(
-            mirror
-                .filter(|_| last)
-                .map_or(std::ptr::null_mut(), |m| m.buf.as_ptr()),
-        );
+        args.push_ptr(mirror_ptr);
         args.push_ptr(scores);
         args.push_i32(block_count);
         args.pad_to(16);
