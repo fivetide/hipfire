@@ -3258,7 +3258,12 @@ impl Gpu {
     }
 
     /// Re-quantize f32 activations for the gfx1201 A8 MMQ consumer.
-    pub fn ensure_int8_mmq_x(&mut self, x: &GpuTensor, n: usize, k: usize) -> HipResult<*mut c_void> {
+    pub fn ensure_int8_mmq_x(
+        &mut self,
+        x: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
         let needed = crate::scratch::int8_mmq_x_needed(k, n);
         if crate::scratch::scratch_will_grow(
             self.scratch.int8_mmq_x_scratch_bytes,
@@ -3268,15 +3273,28 @@ impl Gpu {
             self.invalidate_for_scratch_growth();
         }
         self.scratch.ensure_int8_mmq_x(
-            &self.hip, &mut self.compiler, &mut self.modules, &mut self.functions,
-            self.active_stream.as_ref(), &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode, self.flags.force_blob_path, &mut self.replay,
-            self.device_id, x, n, k,
+            &self.hip,
+            &mut self.compiler,
+            &mut self.modules,
+            &mut self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            self.graphs.capture_mode,
+            self.flags.force_blob_path,
+            &mut self.replay,
+            self.device_id,
+            x,
+            n,
+            k,
         )
     }
 
     /// Reserve (without launching the quantizer) for a fused A8 producer.
-    pub fn reserve_int8_mmq(&mut self, k: usize, n: usize) -> HipResult<crate::scratch::Int8MmqReservation> {
+    pub fn reserve_int8_mmq(
+        &mut self,
+        k: usize,
+        n: usize,
+    ) -> HipResult<crate::scratch::Int8MmqReservation> {
         if k != 0 && n != 0 && k % 256 == 0 {
             let needed = crate::scratch::int8_mmq_x_needed(k, n);
             if crate::scratch::scratch_will_grow(
@@ -3291,7 +3309,10 @@ impl Gpu {
     }
 
     pub fn int8_mmq_prepared_ptr(
-        &self, prepared: &crate::scratch::Int8MmqPrepared, k: usize, n: usize,
+        &self,
+        prepared: &crate::scratch::Int8MmqPrepared,
+        k: usize,
+        n: usize,
     ) -> HipResult<*mut c_void> {
         let (generation, ptr) = self.scratch.int8_mmq_live();
         prepared.checked_ptr(generation, ptr, k, n)
@@ -3302,7 +3323,9 @@ impl Gpu {
             && self.mq4v2_symmetric
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && n >= 64 && k > 0 && k % 256 == 0
+            && n >= 64
+            && k > 0
+            && k % 256 == 0
     }
 
     /// True when the portable producer-sidecar route is live for this call:
@@ -3712,7 +3735,9 @@ impl Gpu {
             if self.functions.contains_key(func_name) {
                 continue;
             }
-            let obj_path = self.compiler.compile_for_symbol(module_name, source, func_name)?;
+            let obj_path = self
+                .compiler
+                .compile_for_symbol(module_name, source, func_name)?;
             let obj_path_str = obj_path.to_str().unwrap().to_string();
             if !self.modules.contains_key(module_name) {
                 let module = crate::scratch::module_load_or_recompile(
