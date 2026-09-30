@@ -830,9 +830,9 @@ extern "C" __global__ void hyper_write_bf16x2(
 }
 
 // `normalized16`, when non-null, also receives each normalized value rounded
-// to F16 (RNE, as convert_f32_to_f16) for the F16 WMMA projection, and
-// `normalized`, when non-null, then holds the (already BF16-rounded) values
-// as BF16 bits.
+// to F16 (RNE, as convert_f32_to_f16) for the F16 WMMA projection, at row
+// pitch `ld16` elements, and `normalized`, when non-null, then holds the
+// (already BF16-rounded) values as BF16 bits.
 template <typename T>
 static __device__ __forceinline__ void hyper_norm_rows(
     const T* input,
@@ -841,7 +841,8 @@ static __device__ __forceinline__ void hyper_norm_rows(
     int branches,
     int hidden,
     int rows,
-    _Float16* normalized16) {
+    _Float16* normalized16,
+    int ld16) {
     const int branch = (int)blockIdx.x;
     const int row = (int)blockIdx.y;
     if (branch >= branches || row >= rows) return;
@@ -903,7 +904,7 @@ static __device__ __forceinline__ void hyper_norm_rows(
             const float value = bf16_to_f32(bf16_round(
                 bf16_to_f32(bf16_round(raw[u])) * inv * (1.0f + weight[u])));
             if (normalized16) {
-                normalized16[column] = (_Float16)value;
+                normalized16[(size_t)row * ld16 + branch * hidden + j] = (_Float16)value;
                 if (normalized)
                     ((unsigned short*)normalized)[column] =
                         (unsigned short)(__float_as_uint(value) >> 16);
@@ -923,13 +924,14 @@ extern "C" __global__ void hyper_norm_f32(
     int hidden,
     int rows,
     _Float16* normalized16,
-    int state_bf16) {
+    int state_bf16,
+    int ld16) {
     if (state_bf16)
         hyper_norm_rows((const unsigned short*)input, norm_weight, normalized, branches, hidden,
-                        rows, normalized16);
+                        rows, normalized16, ld16);
     else
         hyper_norm_rows((const float*)input, norm_weight, normalized, branches, hidden, rows,
-                        normalized16);
+                        normalized16, ld16);
 }
 // Lane 0 of `v += __shfl_down(v, off, 32)` for off = 16..1, with the
 // partners moved by permlanex16 / row DPP on gfx11/gfx12 (same additions and

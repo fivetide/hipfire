@@ -3558,8 +3558,9 @@ impl Gpu {
 
     /// Model-lifetime F16 shadow of a BF16 `[M × K]` weight, keyed on its
     /// device pointer (weights are immutable after load); freed with the other
-    /// shadows on unload.  BF16 -> F16 rounds (and flushes values below the F16
-    /// range): callers must be accuracy-gated.
+    /// shadows on unload.  Rows are stored at [`Gpu::f16_row_pitch`]`(k)`.
+    /// BF16 -> F16 rounds (and flushes values below the F16 range): callers
+    /// must be accuracy-gated.
     pub(crate) fn ensure_bf16_f16_shadow(
         &mut self,
         weight: &GpuTensor,
@@ -3571,7 +3572,8 @@ impl Gpu {
             return Ok(shadow.buf.as_ptr());
         }
         let n = m * k;
-        let fp16 = self.alloc_tensor(&[n], DType::F16)?;
+        let ld = Self::f16_row_pitch(k);
+        let fp16 = self.alloc_tensor(&[m * ld], DType::F16)?;
         self.ensure_kernel(
             "gemm_bf16_xf32_multirow",
             kernels::GEMM_BF16_XF32_MULTIROW_SRC,
@@ -3581,10 +3583,14 @@ impl Gpu {
         let op = fp16.buf.as_ptr();
         let nv =
             i32::try_from(n).map_err(|_| hip_bridge::HipError::new(0, "BF16 shadow too large"))?;
+        let kv = k as i32;
+        let ldv = ld as i32;
         let mut params = [
             &ip as *const _ as *mut c_void,
             &op as *const _ as *mut c_void,
             &nv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &ldv as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             "convert_bf16_to_f16",
@@ -3597,6 +3603,8 @@ impl Gpu {
                 b.push_ptr(ip);
                 b.push_ptr(op);
                 b.push_i32(nv);
+                b.push_i32(kv);
+                b.push_i32(ldv);
                 b
             },
         )?;

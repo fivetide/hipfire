@@ -539,10 +539,11 @@ fn execute_hyper_read_inner(
         && gpu.qwen4_f16_wmma_applies(op.input_mix_down.buf, op.input_mix_down.k, op.rows);
     let wmma_read = f16 && op.low_rank % 16 == 0 && op.low_rank <= 504 && op.hidden % 16 == 0;
     let mut normalized_f16 = None;
+    let ld16 = Gpu::f16_row_pitch(wide);
     let mut activated = false;
     if f16 {
-        let x16 = hip(gpu.qwen4_f16_x_scratch(op.rows * wide))?;
-        hip(hyper_norm_f16(gpu, &norm, &x16, !wmma_read))?;
+        let x16 = hip(gpu.qwen4_f16_x_scratch(op.rows * ld16))?;
+        hip(hyper_norm_f16(gpu, &norm, &x16, ld16, !wmma_read))?;
         hip(gpu.gemm_bf16_xf16_f16_wmma(
             op.input_mix_down.buf,
             &x16,
@@ -550,6 +551,7 @@ fn execute_hyper_read_inner(
             op.input_mix_down.m,
             op.input_mix_down.k,
             op.rows,
+            ld16,
         ))?;
         normalized_f16 = Some(x16);
     } else if gpu.arch_caps.has_gfx11_plus_simt()
@@ -671,7 +673,7 @@ fn execute_hyper_read_inner(
             normalized_bf16,
         };
         if wmma_read {
-            return hip(hyper_read_up_wmma(gpu, &read));
+            return hip(hyper_read_up_wmma(gpu, &read, ld16));
         }
         return hip(hyper_read_up_fused(gpu, &read));
     }
