@@ -1979,9 +1979,10 @@ pub fn execute_indexed_attention(
     // active lengths stay scalars. Measured bit-identical to the position-derived
     // shapes with no throughput delta (docs/design/qwen4-program-retained-pm4.md).
     if complete > 0 {
-        // Decode pools only the block its row completes (earlier blocks hold
-        // the same kernel's output for unchanged raw keys).
-        let pool = if op.rows == 1 {
+        // Decode and few-row verify pool only the blocks their rows complete
+        // (earlier blocks hold the same kernel's output for unchanged raw
+        // keys; a rolled-back block starts at or after `position_start`).
+        let pool = if op.rows <= 8 {
             indexed_attention_pool_rope_incremental
         } else {
             indexed_attention_pool_rope
