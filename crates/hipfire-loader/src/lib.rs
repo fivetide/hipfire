@@ -4587,7 +4587,7 @@ mod ep_admission_tests {
             &candidate, 1, admission::KvBackendRequest::Explicit(hipfire_runtime::kv_backend::KvBackend::Vmm),
             "gfx1100", &mut active, &mut effects,
         ).unwrap_err();
-        assert!(refusal.contains("vmm") && refusal.contains("contiguous"));
+        assert!(refusal.contains("vmm") && refusal.contains("legacy"));
         assert_eq!(effects, LoadEffects::default());
         assert_eq!(active.request(), before);
         let _ = std::fs::remove_file(candidate);
