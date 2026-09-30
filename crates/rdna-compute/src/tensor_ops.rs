@@ -3745,6 +3745,52 @@ mod tests {
         );
         assert!(y.iter().any(|v| *v != 0), "read F16 is all zero");
         assert_eq!(x, y, "fused read F16 differs");
+        // The same streams as BF16 bits (the F16 prefill route) take the
+        // vectorized normalization pass: same gates, same F16 output.
+        let input_values = gpu.download_f32(&input).expect("download");
+        let mut stream_bytes: Vec<u8> = input_values
+            .iter()
+            .flat_map(|v| {
+                let u = v.to_bits();
+                (((u + 0x7FFF + ((u >> 16) & 1)) >> 16) as u16).to_le_bytes()
+            })
+            .collect();
+        stream_bytes.resize(rows * wide * 4, 0);
+        let mut bf16_streams = gpu
+            .upload_raw(&stream_bytes, &[stream_bytes.len()])
+            .expect("bf16 streams");
+        bf16_streams.dtype = DType::F32;
+        bf16_streams.shape = vec![rows * wide];
+        let gates_bf16 = gpu.zeros(&[rows * branches], DType::F32).expect("gates bf16");
+        let f16_bf16 = gpu.zeros(&[rows * ld], DType::F16).expect("f16 bf16");
+        hyper_norm_gate(
+            &mut gpu,
+            &HyperNormGate {
+                input: &bf16_streams,
+                norm_weight: &norm,
+                gate_weight: &gate_weight,
+                gates: &gates_bf16,
+                rows,
+                branches,
+                hidden,
+                state_bf16: true,
+                read_f16: Some((&read_norm, &f16_bf16, ld)),
+            },
+        )
+        .expect("fused bf16");
+        assert_eq!(
+            gpu.download_f16_bits(&f16_bf16).expect("download"),
+            y,
+            "BF16-stream read F16 differs"
+        );
+        assert_eq!(
+            gpu.download_f32(&gates_bf16).expect("download").iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            gpu.download_f32(&fused).expect("download").iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "BF16-stream gates differ"
+        );
+        for tensor in [bf16_streams, gates_bf16, f16_bf16] {
+            gpu.free_tensor(tensor).expect("free");
+        }
         let normalized = gpu.zeros(&[rows * wide], DType::F32).expect("normalized");
         hyper_norm(
             &mut gpu,
