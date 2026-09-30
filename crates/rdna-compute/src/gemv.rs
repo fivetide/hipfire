@@ -186,7 +186,7 @@ fn awq_norm_kernel() -> (&'static str, &'static str, u32) {
     )
 }
 
-/// `HIPFIRE_G12_DEC_NORM` twin of [`awq_norm_kernel`]: launched with one
+/// `HIPFIRE_G12_DEC_NORM` / `HIPFIRE_GFX1100_DEC_NORM` twin of [`awq_norm_kernel`]: launched with one
 /// workgroup per 256-group (grid K/256) instead of one workgroup per row.
 fn awq_norm_dec_kernel() -> (&'static str, &'static str, u32) {
     (
@@ -2774,9 +2774,9 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_mq_signs()?;
-        // gfx1201 decode: K/256 workgroups, each redoing the row's reduction
+        // gfx1201 / gfx1151 / gfx1100 decode: K/256 workgroups, each redoing the row's reduction
         // and rotating one group (bit-identical to the one-workgroup launch).
-        let group_grid = self.flags.g12_dec_norm_enabled() && k % 256 == 0;
+        let group_grid = self.flags.dec_norm_grids_enabled() && k % 256 == 0;
         let (module, source, shared_mem) =
             if group_grid { awq_norm_dec_kernel() } else { awq_norm_kernel() };
         self.ensure_kernel(module, source, module)?;
@@ -4783,24 +4783,33 @@ impl Gpu {
         }
         self.ensure_mq_signs()?;
         let (module, src, kernel) = if n_heads == 48 {
-            if !self.arch_caps.is_gfx1100() {
-                return Err(hip_bridge::HipError::new(
-                    1,
-                    "48-head gated norm/MQ rotation is certified only on gfx1100",
-                ));
-            }
-            if awq_scale.is_some() {
-                (
+            match (self.arch_caps.is_gfx1100(), self.arch_caps.is_gfx1201(), awq_scale.is_some()) {
+                (true, _, true) => (
                     "gated_norm_mq_rotate_awq_k6144_gfx1100",
                     kernels::gated_norm_mq_rotate_awq_k6144_gfx1100_src(),
                     "gated_norm_mq_rotate_awq_k6144_gfx1100",
-                )
-            } else {
-                (
+                ),
+                (true, _, false) => (
                     "gated_norm_mq_rotate_k6144_gfx1100",
                     kernels::gated_norm_mq_rotate_k6144_gfx1100_src(),
                     "gated_norm_mq_rotate_k6144_gfx1100",
-                )
+                ),
+                (false, true, true) => (
+                    "gated_norm_mq_rotate_awq_k6144_gfx1201",
+                    kernels::gated_norm_mq_rotate_awq_k6144_gfx1201_src(),
+                    "gated_norm_mq_rotate_awq_k6144_gfx1201",
+                ),
+                (false, true, false) => (
+                    "gated_norm_mq_rotate_k6144_gfx1201",
+                    kernels::gated_norm_mq_rotate_k6144_gfx1201_src(),
+                    "gated_norm_mq_rotate_k6144_gfx1201",
+                ),
+                (false, false, _) => {
+                    return Err(hip_bridge::HipError::new(
+                        1,
+                        "48-head gated norm/MQ rotation is certified only on gfx1100 and gfx1201",
+                    ));
+                }
             }
         } else if self.arch_caps.is_gfx1201() {
             if awq_scale.is_some() {

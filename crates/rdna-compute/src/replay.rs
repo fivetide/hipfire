@@ -24,7 +24,7 @@ use radiowave::{CodeObjectCertification, KernelArgumentAccess, MutableReadCache}
 use redline_dispatch::aql::{
     load_symbols, BatchFencePolicy, Executable, FenceScope, Gfx10DispatchInitiatorPolicy,
     Gfx10Pm4CommandBuffer, Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy,
-    Gfx11DispatchInterleave, Gfx12Pm4CommandBuffer, Gfx12RmwAcquirePolicy, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming,
+    Gfx11DispatchInterleave, Gfx12DispatchPacing, Gfx12Pm4CommandBuffer, Gfx12RmwAcquirePolicy, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming,
     GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry,
     PhasedMultiQueuePm4Ib, QueuePolicy, Quiescence, RecordedDispatch, Runtime,
     SingleQueueBatchGraph, SingleQueuePm4Ib,
@@ -1197,7 +1197,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "gated_norm_mq_rotate_gfx1100"
         | "gated_norm_mq_rotate_k6144_gfx1100"
         | "gated_norm_mq_rotate_gfx1151"
-        | "gated_norm_mq_rotate_gfx1201" => Some(vec![
+        | "gated_norm_mq_rotate_gfx1201"
+        | "gated_norm_mq_rotate_k6144_gfx1201" => Some(vec![
             read(0),
             read(8),
             read(16),
@@ -1205,10 +1206,21 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(32),
             write(40),
         ]),
+        // AWQ twin: x, z, weight, awq_scale, signs1, signs2, x_rot.
+        "gated_norm_mq_rotate_awq_k6144_gfx1201" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            read(40),
+            write(48),
+        ]),
         "qwen35_fa_prep_gfx1100"
         | "qwen36_27b_fa_prep_gfx1100"
         | "qwen35_fa_prep_gfx1151"
-        | "qwen35_fa_prep_gfx1201" => Some(vec![
+        | "qwen35_fa_prep_gfx1201"
+        | "qwen36_27b_fa_prep_gfx1201" => Some(vec![
             read(0),
             write(8),
             write(16),
@@ -1315,14 +1327,18 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             read(48),
         ]),
-        // The gfx1201 GQA fp8 decode tile and head-dim-split reduce keep their
-        // reference twins' 13/7-argument ABIs and pointer effects.
-        "attention_flash_q8_0_tile" | "attention_flash_fp8_e4m3_tile_gqa_gfx1201" => {
+        // The gfx1201 GQA fp8, gfx1100 GQA Q8_0 and gfx1151 GQA Q8_0 decode
+        // tiles and the head-dim-split reduces keep their reference twins'
+        // 13/7-argument ABIs and pointer effects.
+        "attention_flash_q8_0_tile"
+        | "attention_flash_fp8_e4m3_tile_gqa_gfx1201"
+        | "attention_flash_q8_0_tile_gqa_gfx1100"
+        | "attention_flash_q8_0_tile_gqa_gfx1151" => {
             Some(vec![read(0), read(8), read(16), write(24), read(32)])
         }
-        "attention_flash_q8_0_reduce" | "attention_flash_reduce_dsplit_gfx1201" => {
-            Some(vec![read(0), write(8), read(24)])
-        }
+        "attention_flash_q8_0_reduce"
+        | "attention_flash_reduce_dsplit_gfx1201"
+        | "attention_flash_reduce_dsplit_gfx1151" => Some(vec![read(0), write(8), read(24)]),
         "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201" => Some(vec![
@@ -1687,6 +1703,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "gemma4_ple_gelu_mul_strided_f32" => Some(48),
         "attention_flash_q8_0_reduce"
         | "attention_flash_reduce_dsplit_gfx1201"
+        | "attention_flash_reduce_dsplit_gfx1151"
         | "fused_rmsnorm_mq_rotate"
         | "fused_rmsnorm_mq_rotate_vecsum"
         | "fused_rmsnorm_mq_rotate_vecsum_sign_const"
@@ -1725,10 +1742,12 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gated_norm_mq_rotate_k6144_gfx1100"
         | "gated_norm_mq_rotate_gfx1151"
         | "gated_norm_mq_rotate_gfx1201"
+        | "gated_norm_mq_rotate_k6144_gfx1201"
         | "qwen35_fa_prep_gfx1100"
         | "qwen36_27b_fa_prep_gfx1100"
         | "qwen35_fa_prep_gfx1151"
         | "qwen35_fa_prep_gfx1201"
+        | "qwen36_27b_fa_prep_gfx1201"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201"
@@ -1740,6 +1759,9 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
         "attention_flash_q8_0_tile"
         | "attention_flash_fp8_e4m3_tile_gqa_gfx1201"
+        | "gated_norm_mq_rotate_awq_k6144_gfx1201"
+        | "attention_flash_q8_0_tile_gqa_gfx1100"
+        | "attention_flash_q8_0_tile_gqa_gfx1151"
         | "fused_qkv_hfq4g256"
         | "fused_qkv_mq4g256v2"
         | "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100"
@@ -3708,6 +3730,39 @@ pub fn dispatch_profile_enabled() -> bool {
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
+/// Default NOP pacing of the retained gfx1201 Qwen3.5-dense decode tape.
+const GFX1201_DEFAULT_PM4_PACING: Gfx12DispatchPacing = Gfx12DispatchPacing::PostDispatchNop(64);
+
+/// `HIPFIRE_GFX1201_PM4_PACING` (`replay.gfx1201_pm4_pacing`): unset or
+/// `auto` selects the default, `0`/`off` disables pacing and `nop:N` emits an
+/// N-body-dword NOP after every dispatch. An unparseable value keeps the
+/// default.
+pub fn gfx1201_pm4_pacing_from_config() -> Gfx12DispatchPacing {
+    let value = hipfire_config::process_value("HIPFIRE_GFX1201_PM4_PACING");
+    parse_gfx1201_pm4_pacing(value.as_deref()).unwrap_or_else(|reason| {
+        eprintln!("[redline] ignoring HIPFIRE_GFX1201_PM4_PACING: {reason}");
+        GFX1201_DEFAULT_PM4_PACING
+    })
+}
+
+fn parse_gfx1201_pm4_pacing(value: Option<&str>) -> Result<Gfx12DispatchPacing, String> {
+    let value = value.map(str::trim).unwrap_or("auto");
+    let count = |text: &str| {
+        text.parse::<u32>()
+            .ok()
+            .filter(|dwords| (1..=0x4000).contains(dwords))
+            .ok_or_else(|| format!("{value:?}: dword count must be 1..=16384"))
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "" | "auto" => Ok(GFX1201_DEFAULT_PM4_PACING),
+        "0" | "off" | "false" | "none" => Ok(Gfx12DispatchPacing::None),
+        other => match other.split_once(':') {
+            Some(("nop", dwords)) => count(dwords).map(Gfx12DispatchPacing::PostDispatchNop),
+            _ => Err(format!("{value:?}: expected auto, off or nop:N")),
+        },
+    }
+}
+
 /// Summarise per-dispatch spans so a slow machine reports a distribution
 /// rather than a single throughput number.
 ///
@@ -4419,6 +4474,8 @@ pub struct ReplayController {
     pm4_wait_policy: Pm4WaitPolicy,
     pm4_register_policy: Pm4RegisterPolicy,
     pm4_queue_policy: QueuePolicy,
+    /// NOP pacing for the single-queue gfx12 tape; set by the daemon on load.
+    pm4_gfx12_dispatch_pacing: Gfx12DispatchPacing,
     state: ReplayState,
     recorded: Vec<RecordedHipLaunch>,
     certified_speedups: Vec<f64>,
@@ -4517,6 +4574,7 @@ impl ReplayController {
             pm4_wait_policy: Pm4WaitPolicy::from_config(),
             pm4_register_policy: Pm4RegisterPolicy::from_config(),
             pm4_queue_policy: pm4_queue_policy_from_config(),
+            pm4_gfx12_dispatch_pacing: Gfx12DispatchPacing::None,
             state,
             recorded: Vec::new(),
             certified_speedups: Vec::new(),
@@ -4720,6 +4778,12 @@ impl ReplayController {
 
     pub fn pm4_queue_policy(&self) -> QueuePolicy {
         self.pm4_queue_policy
+    }
+
+    /// Pace the next single-queue gfx12 PM4 preparation (ignored on gfx10/11,
+    /// multi-queue tapes and the per-dispatch profile).
+    pub fn set_pm4_gfx12_dispatch_pacing(&mut self, pacing: Gfx12DispatchPacing) {
+        self.pm4_gfx12_dispatch_pacing = pacing;
     }
 
     pub fn prepared_pm4_shape(&self) -> Option<(usize, usize)> {
@@ -5484,6 +5548,14 @@ impl ReplayController {
                 resource_limits_policy,
                 dependency_mode,
             );
+            let pacing = if dispatch_profile {
+                Gfx12DispatchPacing::None
+            } else {
+                self.pm4_gfx12_dispatch_pacing
+            };
+            if let Pm4Commands::Gfx12(gfx12) = &mut commands {
+                gfx12.set_dispatch_pacing(pacing);
+            }
             // Sentinel epoch 0 before entry acquire: every immutable replay
             // re-submits this prefix so a stale prior epoch cannot satisfy the
             // next run (ABA).
@@ -5576,6 +5648,16 @@ impl ReplayController {
                 commands.populate_dispatch_span_boundaries(&mut dispatch_boundaries)?;
             }
             let command_dwords = commands.len_dwords();
+            if let Pm4Commands::Gfx12(gfx12) = &commands {
+                if pacing != Gfx12DispatchPacing::None {
+                    eprintln!(
+                        "[redline] gfx12 PM4 dispatch pacing {pacing:?}: dispatches={prefix} \
+                         nop_dwords={} ({:.1}/dispatch) command_dwords={command_dwords}",
+                        gfx12.pacing_dwords(),
+                        gfx12.pacing_dwords() as f64 / prefix as f64,
+                    );
+                }
+            }
             if reorder_window.is_some() {
                 eprintln!(
                     "[redline] single-IB schedule stats arch={}: \
@@ -7106,10 +7188,13 @@ mod tests {
         "gated_norm_mq_rotate_k6144_gfx1100",
         "gated_norm_mq_rotate_gfx1151",
         "gated_norm_mq_rotate_gfx1201",
+        "gated_norm_mq_rotate_k6144_gfx1201",
+        "gated_norm_mq_rotate_awq_k6144_gfx1201",
         "qwen35_fa_prep_gfx1100",
         "qwen36_27b_fa_prep_gfx1100",
         "qwen35_fa_prep_gfx1151",
         "qwen35_fa_prep_gfx1201",
+        "qwen36_27b_fa_prep_gfx1201",
         "mq_rotate_x",
         "gemv_hfq4g256_residual",
         "gemv_hfq4g256_residual_cpol_rt",
@@ -7766,56 +7851,118 @@ mod tests {
     }
 
     #[test]
-    fn gfx1201_fp8_decode_attention_pair_keeps_padded_replay_contract() {
-        // Launcher order: q, k, v, partials, pos, then 8 scalars.
-        let tile = "attention_flash_fp8_e4m3_tile_gqa_gfx1201";
+    fn gqa_decode_attention_pairs_keep_padded_replay_contract() {
+        for (tile, reduce) in [
+            (
+                "attention_flash_fp8_e4m3_tile_gqa_gfx1201",
+                "attention_flash_reduce_dsplit_gfx1201",
+            ),
+            (
+                "attention_flash_q8_0_tile_gqa_gfx1151",
+                "attention_flash_reduce_dsplit_gfx1151",
+            ),
+        ] {
+            // Launcher order: q, k, v, partials, pos, then 8 scalars.
+            let mut blob = hip_bridge::KernargBlob::new();
+            for _ in 0..5 {
+                blob.push_ptr(std::ptr::null());
+            }
+            for _ in 0..4 {
+                blob.push_i32(0);
+            }
+            blob.push_f32(0.0);
+            for _ in 0..3 {
+                blob.push_i32(0);
+            }
+            blob.pad_to(16);
+            assert_eq!(expected_kernarg_bytes(tile), Some(blob.len()), "{tile}");
+            let effects = pointer_effects(tile).expect("GQA tile contract");
+            let modes: Vec<_> = effects.iter().map(|e| (e.offset, e.mode)).collect();
+            assert_eq!(
+                modes,
+                vec![
+                    (0, RecordedAccessMode::Read),
+                    (8, RecordedAccessMode::Read),
+                    (16, RecordedAccessMode::Read),
+                    (24, RecordedAccessMode::Write),
+                    (32, RecordedAccessMode::Read),
+                ],
+                "{tile}"
+            );
+
+            // Launcher order: partials, out, n_heads, head_dim, pos, tile, max_tiles.
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(std::ptr::null());
+            blob.push_ptr(std::ptr::null());
+            blob.push_i32(0);
+            blob.push_i32(0);
+            blob.push_ptr(std::ptr::null());
+            blob.push_i32(0);
+            blob.push_i32(0);
+            blob.pad_to(16);
+            assert_eq!(expected_kernarg_bytes(reduce), Some(blob.len()), "{reduce}");
+            let effects = pointer_effects(reduce).expect("dsplit reduce contract");
+            let modes: Vec<_> = effects.iter().map(|e| (e.offset, e.mode)).collect();
+            assert_eq!(
+                modes,
+                vec![
+                    (0, RecordedAccessMode::Read),
+                    (8, RecordedAccessMode::Write),
+                    (24, RecordedAccessMode::Read),
+                ],
+                "{reduce}"
+            );
+        }
+    }
+
+    #[test]
+    fn gfx1201_qwen36_27b_decode_fusions_keep_padded_replay_contract() {
+        use RecordedAccessMode::{Read, Write};
+        // Gated norm/MQ rotation launcher: x, z, weight, [awq_scale], signs1,
+        // signs2, x_rot, then n_heads, head_dim, eps.
+        for (kernel, awq) in [
+            ("gated_norm_mq_rotate_k6144_gfx1201", false),
+            ("gated_norm_mq_rotate_awq_k6144_gfx1201", true),
+        ] {
+            let pointers = if awq { 7 } else { 6 };
+            let mut blob = hip_bridge::KernargBlob::new();
+            for _ in 0..pointers {
+                blob.push_ptr(std::ptr::null());
+            }
+            blob.push_i32(0);
+            blob.push_i32(0);
+            blob.push_f32(0.0);
+            blob.pad_to(16);
+            assert_eq!(expected_kernarg_bytes(kernel), Some(blob.len()), "{kernel}");
+            let modes: Vec<_> = pointer_effects(kernel)
+                .expect("gated norm/MQ rotation contract")
+                .iter()
+                .map(|e| (e.offset, e.mode))
+                .collect();
+            let mut expected: Vec<_> = (0..pointers - 1).map(|i| (i * 8, Read)).collect();
+            expected.push(((pointers - 1) * 8, Write));
+            assert_eq!(modes, expected, "{kernel}");
+        }
+
+        // FA prep launcher: q_interleaved, q, gate, k, q_weight, k_weight,
+        // pos, then eps and freq_base.
+        let prep = "qwen36_27b_fa_prep_gfx1201";
         let mut blob = hip_bridge::KernargBlob::new();
-        for _ in 0..5 {
+        for _ in 0..7 {
             blob.push_ptr(std::ptr::null());
         }
-        for _ in 0..4 {
-            blob.push_i32(0);
-        }
         blob.push_f32(0.0);
-        for _ in 0..3 {
-            blob.push_i32(0);
-        }
+        blob.push_f32(0.0);
         blob.pad_to(16);
-        assert_eq!(expected_kernarg_bytes(tile), Some(blob.len()));
-        let effects = pointer_effects(tile).expect("GQA tile contract");
-        let modes: Vec<_> = effects.iter().map(|e| (e.offset, e.mode)).collect();
+        assert_eq!(expected_kernarg_bytes(prep), Some(blob.len()));
+        let modes: Vec<_> = pointer_effects(prep)
+            .expect("FA prep contract")
+            .iter()
+            .map(|e| (e.offset, e.mode))
+            .collect();
         assert_eq!(
             modes,
-            vec![
-                (0, RecordedAccessMode::Read),
-                (8, RecordedAccessMode::Read),
-                (16, RecordedAccessMode::Read),
-                (24, RecordedAccessMode::Write),
-                (32, RecordedAccessMode::Read),
-            ]
-        );
-
-        // Launcher order: partials, out, n_heads, head_dim, pos, tile, max_tiles.
-        let reduce = "attention_flash_reduce_dsplit_gfx1201";
-        let mut blob = hip_bridge::KernargBlob::new();
-        blob.push_ptr(std::ptr::null());
-        blob.push_ptr(std::ptr::null());
-        blob.push_i32(0);
-        blob.push_i32(0);
-        blob.push_ptr(std::ptr::null());
-        blob.push_i32(0);
-        blob.push_i32(0);
-        blob.pad_to(16);
-        assert_eq!(expected_kernarg_bytes(reduce), Some(blob.len()));
-        let effects = pointer_effects(reduce).expect("dsplit reduce contract");
-        let modes: Vec<_> = effects.iter().map(|e| (e.offset, e.mode)).collect();
-        assert_eq!(
-            modes,
-            vec![
-                (0, RecordedAccessMode::Read),
-                (8, RecordedAccessMode::Write),
-                (24, RecordedAccessMode::Read),
-            ]
+            vec![(0, Read), (8, Write), (16, Write), (24, Write), (32, Read), (40, Read), (48, Read)]
         );
     }
 
@@ -10755,5 +10902,23 @@ mod tests {
         assert!(line.contains("command_dwords=8"));
         drop(report);
         let _ = std::mem::size_of::<PreparedPm4Replay>();
+    }
+
+    #[test]
+    fn gfx1201_pm4_pacing_parses_opt_out_sizes_and_rejects_bad_values() {
+        use Gfx12DispatchPacing::PostDispatchNop;
+        for (value, want) in [
+            (None, Ok(GFX1201_DEFAULT_PM4_PACING)),
+            (Some("auto"), Ok(GFX1201_DEFAULT_PM4_PACING)),
+            (Some("0"), Ok(Gfx12DispatchPacing::None)),
+            (Some(" OFF "), Ok(Gfx12DispatchPacing::None)),
+            (Some("nop:128"), Ok(PostDispatchNop(128))),
+            (Some("nop:16384"), Ok(PostDispatchNop(16384))),
+        ] {
+            assert_eq!(parse_gfx1201_pm4_pacing(value), want, "{value:?}");
+        }
+        for bad in ["nop:0", "nop:16385", "align:64", "64", "pad:8"] {
+            assert!(parse_gfx1201_pm4_pacing(Some(bad)).is_err(), "{bad}");
+        }
     }
 }

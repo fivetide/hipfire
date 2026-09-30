@@ -2251,7 +2251,16 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         "HIPFIRE_G12_DEC_NORM",
-        "Launch the gfx1201 decode norms as multi-workgroup grids (default on exact gfx1201; set to false or HIPFIRE_G12_DEC_NORM=0 to restore the single-workgroup launches; f32 AWQ RMSNorm+FWHT K/256 workgroups, out-of-place rmsnorm_f32 n/256 workgroups per row, half-split partial RoPE one workgroup per head, bit-identical)."
+        "Launch the gfx1201 and gfx1151 decode norms as multi-workgroup grids (default on exact gfx1201 and exact gfx1151; set to false or HIPFIRE_G12_DEC_NORM=0 to restore the single-workgroup launches; f32 AWQ RMSNorm+FWHT K/256 workgroups, out-of-place rmsnorm_f32 n/256 workgroups per row, half-split partial RoPE one workgroup per head, bit-identical)."
+    ),
+    process_bool_field!(
+        "kernel.gfx1100_dec_norm",
+        "gfx1100_dec_norm",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX1100_DEC_NORM",
+        "Launch the gfx1100 decode norms as multi-workgroup grids (default on exact gfx1100; set to false or HIPFIRE_GFX1100_DEC_NORM=0 to restore the single-workgroup launches; f32 AWQ RMSNorm+FWHT K/256 workgroups, out-of-place rmsnorm_f32 n/256 workgroups per row, bit-identical)."
     ),
     process_bool_field!(
         "kernel.g12_a4c2",
@@ -3148,6 +3157,16 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         "HIPFIRE_REPLAY_PM4_GFX11_VMEM_ACQUIRE",
         "Enable Radiowave-classified VMEM acquires on gfx11; auto selects gfx1151."
+    ),
+    process_field!(
+        "replay.gfx1201_pm4_pacing",
+        "gfx1201_pm4_pacing",
+        Replay,
+        DefaultValue::String("auto"),
+        ValueRule::String,
+        false,
+        "HIPFIRE_GFX1201_PM4_PACING",
+        "NOP pacing of the retained gfx1201 Qwen3.5-dense decode PM4 tape: auto (default: a 64-dword NOP after every dispatch), off/0, or nop:N (N-dword NOP after every dispatch). NOPs write no register or memory; decode is bit-identical."
     ),
     diagnostic_field!(
         "diagnostic.replay.gfx1151_initiator",
