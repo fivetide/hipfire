@@ -408,8 +408,10 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_wmma_gfx1151_x8_bf16out(
     __shared__ __align__(16) unsigned int a_lds[8][2 * 16 * 17];
     __shared__ __align__(16) _Float16 xs[4 * 16 * 72];
     unsigned int* my_lds = a_lds[tid >> 5];
-    if (run >= 3)
-        moe_down_wmma_tiles_x8<4, true>(A, sorted_slot_index, X_src, Y_grouped, M, K, m_total, tid, slot_start, my_lds, xs, run);
+    if (run == 4)
+        moe_down_wmma_tiles_x8<4, true>(A, sorted_slot_index, X_src, Y_grouped, M, K, m_total, tid, slot_start, my_lds, xs, 4);
+    else if (run == 3)
+        moe_down_wmma_tiles_x8<3, true>(A, sorted_slot_index, X_src, Y_grouped, M, K, m_total, tid, slot_start, my_lds, xs, 3);
     else if (run == 2)
         moe_down_wmma_tiles_x8<2, true>(A, sorted_slot_index, X_src, Y_grouped, M, K, m_total, tid, slot_start, my_lds, xs, 2);
     else

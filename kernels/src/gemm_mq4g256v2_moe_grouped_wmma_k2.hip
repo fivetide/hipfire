@@ -489,8 +489,10 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out_x4(
     }
     unsigned int* my_lds = lds + wave * 16 * 34;
     _Float16* xs = (_Float16*)(lds + 4 * 16 * 34);
-    if (run >= 3)
-        moe_grouped_wmma_k2_tiles_x4<4, true, true>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, slot_start, my_lds, xs, run);
+    if (run == 4)
+        moe_grouped_wmma_k2_tiles_x4<4, true, true>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, slot_start, my_lds, xs, 4);
+    else if (run == 3)
+        moe_grouped_wmma_k2_tiles_x4<3, true, true>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, slot_start, my_lds, xs, 3);
     else
         moe_grouped_wmma_k2_tiles_x4<2, true, true>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, slot_start, my_lds, xs, 2);
 }
