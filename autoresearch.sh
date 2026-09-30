@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Prompt-processing (prefill) throughput for Qwen3.8-Flash-Next (qwen4, the
-# qwen3.8-flash-next.mq4 pin) on gfx1151 through the native daemon protocol,
-# gated on the prefill-route KLD against the BF16-source teacher.
+# Long-context prefill + MTP decode throughput for Qwen3.8-Flash-Next (qwen4,
+# the qwen3.8-flash-next.mq4 pin) on gfx1151 through the native daemon protocol,
+# gated on the prefill-route KLD of the first 2048 tokens against the
+# BF16-source teacher.
 #
-# Perf: fresh daemon, load (max_seq 2048, kv bf16, mtp off, graph off, prompt cache
-# off), 1 warmup + RUNS measured greedy generates of a committed 1131-token
-# prompt, max_tokens 16. Metric = median daemon prefill tok/s
-# (prefill_tokens / prefill_ms).
+# Perf: fresh daemon, load (max_seq 65536, mtp on, graph off, prompt cache off),
+# 1 warmup + RUNS measured greedy generates of a committed ~32k-token prompt,
+# max_tokens MAX_TOKENS. Metric = geomean(median prefill tok/s, median decode tok/s).
 # Guards (non-zero exit on violation):
 #   - every run prefills the whole prompt; greedy ids identical across runs and
 #     the leading MIN_MATCH match REF_IDS (garbage guard; KLD decides quality);
 #   - prefill-route KLD (qwen4_kld eval: production forward_chunk, all-row
-#     logits, KLD_CHUNKS x 512 tokens of wikitext-2) must not exceed KLD_MAX.
+#     logits, KLD_CHUNKS x 512 = 2048 tokens of wikitext-2) must not exceed KLD_MAX.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -27,16 +27,18 @@ import hashlib, json, os, re, select, statistics, subprocess, sys, time
 
 MODEL = os.path.expanduser("~/.hipfire/models/qwen3.8-flash-next.mq4.hfq")
 KLD_REF = "/home/bjoern/hipfire-qwen4-kld/.codeinsight+research/qwen4-kld/source-teacher/bf16src-wt2-c512x32.kldref"
-KLD_CHUNKS = 32
-# Session baseline prefill-route KLD; a candidate above it fails (fixed, per the goal).
-KLD_MAX = 0.074318  # baseline 79cd899fb, prefill logits sha256 6d43722e...
-PROMPT_PATH = "benchmarks/prompts/glimmer_prefill_1024.txt"
-PROMPT_MD5 = "0ee8f86ada3683eda452bc294ec824a9"
+KLD_CHUNKS = 4  # first 2048 tokens
+# Segment baseline prefill-route KLD; a candidate above it fails (fixed, per the goal).
+KLD_MAX = 0.083874  # segment-2 baseline, 4 chunks, prefill logits sha256 7670240f...
+PROMPT_PATH = "benchmarks/prompts/qwen4_longcode_32k.txt"
+PROMPT_MD5 = "70ffb7d29325a2e2fa032b0911592c6b"
+MIN_PREFILL = 31900
+MAX_SEQ = 65536
 RUNS = int(os.environ.get("AR_RUNS", "3"))
-MAX_TOKENS = 16
-# Greedy ids at baseline (text: "The text you provided contains a repeated block of prose followed by a Python function definition").
-REF_IDS = [760, 1414, 488, 3766, 5435, 264, 11173, 2424, 314, 58655, 7854, 539, 264, 12654, 709, 7044]
-MIN_MATCH = 4  # leading tokens that must match REF_IDS (garbage guard)
+MAX_TOKENS = 256
+# Greedy ids at baseline (text: "Based on the provided source code and design notes, here is a summary of the **Helix**").
+REF_IDS = [27775, 383, 279, 3766, 2450, 1970, 321, 2790, 8129, 11, 1532, 369, 264, 11782, 314, 279]
+MIN_MATCH = 16  # leading tokens that must match REF_IDS (garbage guard)
 
 ENV = dict(os.environ, HIPFIRE_EMIT_TOKEN_IDS="1", HIPFIRE_GRAPH="0",
            HIPFIRE_AR_GRAPH="0", HIPFIRE_CASK_OFF="1", HIPFIRE_DPM_WARMUP_SECS="10",
@@ -99,7 +101,7 @@ def read_until(stop, seconds):
 def generate(gid):
     send({"type": "generate", "id": gid, "prompt": prompt, "temperature": 0.0,
           "max_tokens": MAX_TOKENS, "max_think_tokens": 1, "attempt_id": 1})
-    evs = read_until({"commit_ready", "done", "error"}, 900)
+    evs = read_until({"commit_ready", "done", "error"}, 1800)
     errs = [e for e in evs if e.get("type") == "error"]
     if errs:
         raise RuntimeError(f"generate error: {errs}")
@@ -110,7 +112,7 @@ def generate(gid):
 try:
     t0 = time.time()
     send({"type": "load", "model": MODEL,
-          "params": {"max_seq": 2048, "kv_mode": "bf16", "mtp_mode": "off"}})
+          "params": {"max_seq": MAX_SEQ, "mtp_mode": "on"}})
     loaded = read_until({"loaded", "load_error", "error"}, 1800)
     if loaded[-1].get("type") != "loaded":
         raise RuntimeError(f"load failed: {loaded[-1]}")
@@ -134,7 +136,7 @@ print(f"done={ {k: v for k, v in rows[-1][0].items() if not isinstance(v, (list,
 print(f"prefill_tokens={[d['prefill_tokens'] for d, _, _ in rows]} samples_pp={[round(x, 2) for x in pp]}")
 print(f"text={rows[-1][2]!r}")
 print(f"ids={ids}")
-if any(d["prefill_tokens"] < 1100 for d, _, _ in rows):
+if any(d["prefill_tokens"] < MIN_PREFILL for d, _, _ in rows):
     print("FAIL: a run did not prefill the whole prompt (prompt cache hit?)"); sys.exit(1)
 if len(ids) < MIN_MATCH:
     print(f"FAIL: only {len(ids)} tokens generated"); sys.exit(1)
@@ -159,12 +161,14 @@ if rc != 0 or not m:
     print(tail[-3000:]); print("FAIL: qwen4_kld eval"); sys.exit(1)
 kld, nll, top1, sha = float(m.group(1)), float(m.group(2)), float(m.group(3)), m.group(4)
 print(f"prefill_logits_sha256={sha}")
+print(f"METRIC score={(statistics.median(pp) * statistics.median(dec)) ** 0.5:.3f}")
 print(f"METRIC prefill_tok_s={statistics.median(pp):.2f}")
 print(f"METRIC ttft_ms={statistics.median(ttft):.1f}")
 print(f"METRIC prefill_kld={kld:.6f}")
 print(f"METRIC prefill_nll={nll:.6f}")
 print(f"METRIC prefill_top1={top1:.4f}")
 print(f"METRIC decode_tok_s={statistics.median(dec):.2f}")
+print(f"samples_dec={[round(x, 2) for x in dec]}")
 print(f"METRIC token_match={match}")
 print(f"METRIC load_s={load_s:.1f}")
 if KLD_MAX is not None and kld > KLD_MAX:

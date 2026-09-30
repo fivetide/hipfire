@@ -241,7 +241,9 @@ impl Qwen4Bundle {
                 "Qwen4 forward chunk capacity is zero".to_string(),
             ));
         }
-        let max_chunk = max_chunk.min(QWEN4_PREFILL_CHUNK_CAP);
+        // One chunk's PLE rows are one row-store prefetch.
+        let ple_chunk_cap = self.ple_rows.max_rows_per_prefetch() / crate::ple::PLE_HEAD_COUNT;
+        let max_chunk = max_chunk.min(QWEN4_PREFILL_CHUNK_CAP).min(ple_chunk_cap);
         self.weights
             .requant_from_env(gpu)
             .map_err(BundleError::Forward)?;
