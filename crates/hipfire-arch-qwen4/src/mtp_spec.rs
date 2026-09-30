@@ -346,7 +346,12 @@ impl SpecTarget for Qwen4Bundle {
             }
             let end = (offset + max_chunk).min(tokens.len());
             let picks = self
-                .spec_forward_rows(gpu, &tokens[offset..end], false)
+                .spec_forward_rows_with_output(
+                    gpu,
+                    &tokens[offset..end],
+                    false,
+                    crate::gpu_forward::Qwen4OutputRows::Final,
+                )
                 .map_err(|error| error.to_string())?;
             last_argmax = picks.last().copied();
             offset = end;

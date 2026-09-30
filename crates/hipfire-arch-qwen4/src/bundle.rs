@@ -70,6 +70,10 @@ impl AttachedWeightStore {
 }
 
 /// Published Qwen4 architecture owner.
+/// Logit rows of the spec scratch: an MTP verify window (at most the draft
+/// depth + 1 rows) or a final prefill row; longer blocks emit their final row.
+const SPEC_LOGIT_ROWS: usize = 16;
+
 pub struct Qwen4Bundle {
     pub config: Qwen4Config,
     pub weights: Qwen4Weights,
@@ -248,6 +252,7 @@ impl Qwen4Bundle {
         let forward = Qwen4GpuForward::new(gpu, self, max_chunk)
             .map_err(|error| BundleError::Forward(error.to_string()))?;
         let logits_len = max_chunk
+            .min(SPEC_LOGIT_ROWS)
             .checked_mul(self.config.vocab_size)
             .ok_or_else(|| BundleError::Forward("spec logit scratch overflow".to_string()))?;
         let spec_logits = match gpu.zeros(&[logits_len], rdna_compute::DType::F32) {
@@ -356,7 +361,7 @@ impl Qwen4Bundle {
             .ok_or_else(|| BundleError::Forward("Qwen4 prefill produced no argmax".into()))
     }
 
-    fn spec_forward_rows_with_output(
+    pub(crate) fn spec_forward_rows_with_output(
         &mut self,
         gpu: &mut Gpu,
         tokens: &[u32],
@@ -384,6 +389,11 @@ impl Qwen4Bundle {
         }
         let vocab = self.config.vocab_size;
         let output_count = output_rows.count(tokens.len());
+        if output_count > SPEC_LOGIT_ROWS {
+            return Err(BundleError::Forward(format!(
+                "Qwen4 spec forward requests {output_count} logit rows; at most {SPEC_LOGIT_ROWS}"
+            )));
+        }
         let logits_len = output_count
             .checked_mul(vocab)
             .ok_or_else(|| BundleError::Forward("Qwen4 spec logits overflow".to_string()))?;
