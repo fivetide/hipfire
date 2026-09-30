@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Qwen3.5/3.6/3.8 layers run as engine `Step`s end to end. The prefill layer
+  bodies (dense and MoE, including PARO) moved into `hipfire_dispatch`
+  unchanged, bit-exact. Decode with DFlash hidden capture and vision (mrope)
+  steps now uses the same step program as plain decode, so the qwen35
+  `HIPFIRE_FORWARD_LOWERED=0` hand path is gone. The MTP layer runs as
+  `[GatedAttention, SwigluFfn | Moe]`, and MoE MTP experts load as a sealed
+  trunk MoE layer. These routes now take the trunk's MQ4 fusions:
+  - Ornith MTP battery tau is unchanged within noise (1 of 5 turns diverges at
+    token 3).
+  - Qwen3.5-9B DFlash battery is byte-identical; 1 of 5 chain turns diverges
+    late.
+  - Qwen3.8-27B vision answers are byte-identical.
+
+- PARO A3B checkpoints (z-lab Qwen3.5-35B-A3B-PARO, shisa Qwen3.6-35B-A3B-PARO)
+  load again: expert-group validation no longer requires one shape across a
+  layer's PARO rotation sidecars.
+
 - Qwen4 raw-I64 PLE metadata records are HFQM qt=54 (qt=52 is MQ4G256V2L).
   The published `qwen3.8:flash-next` and `qwen3.8:flash-next-mq6q8-pleq8`
   files were re-tagged in place (payloads unchanged) and re-pinned; the loader
