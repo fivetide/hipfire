@@ -1276,12 +1276,20 @@ impl MtpDrafter for Qwen4MtpDrafter {
         // Each prompt token selects with its own query and the pooled keys
         // visible at that position, regardless of target prefill chunking.
         let chunk_rows = self.prefill_rows.max(1);
-        for (chunk_index, chunk) in fill_tokens.chunks(chunk_rows).enumerate() {
+        let budget = Self::bundle(target)?.config.indexer_budget;
+        let mut base = 0usize;
+        while base < fill_tokens.len() {
             if abort() {
                 target.reset_recurrent(gpu)?;
                 return Err("Qwen4 native MTP prefill aborted".to_string());
             }
-            let base = chunk_index * chunk_rows;
+            let rows = crate::gpu_forward::prefill_chunk_rows(
+                budget,
+                start_pos + base,
+                fill_tokens.len() - base,
+                chunk_rows,
+            );
+            let chunk = &fill_tokens[base..base + rows];
             let pick = Self::bundle(target)?
                 .spec_prefill_rows(gpu, chunk)
                 .map_err(|error| error.to_string())?;
@@ -1306,6 +1314,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 .copy_spec_hidden_row_to(gpu, chunk.len() - 1, pending)
                 .map_err(|error| error.to_string())?;
             first_token = Some(pick);
+            base += rows;
         }
         let first_token = first_token.expect("non-empty MTP prefill produced no seed");
         self.aligned_at = Self::aligned_position(target);

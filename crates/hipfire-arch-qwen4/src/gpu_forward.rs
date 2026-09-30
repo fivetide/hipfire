@@ -61,7 +61,24 @@ const EPSILON: f32 = 1.0e-6;
 /// prompt-sized grouped MoE buffers.  Every chunk re-streams all expert
 /// weights, so the cap equals the Qwen4 contract's 2048-token `max_seq`:
 /// a prompt is one chunk (1131 tokens: 3 chunks at 512 were 8% slower).
-pub(crate) const QWEN4_PREFILL_CHUNK_CAP: usize = 2048;
+pub(crate) const QWEN4_PREFILL_CHUNK_CAP: usize = 4096;
+
+/// Rows of the next prefill chunk at `position` with `remaining` tokens: at
+/// most `max_chunk`, and a chunk starting inside the QSA index budget ends at
+/// it, so every row of that chunk selects its whole causal window and the
+/// chunk takes the dense attention route.
+pub(crate) fn prefill_chunk_rows(
+    indexer_budget: usize,
+    position: usize,
+    remaining: usize,
+    max_chunk: usize,
+) -> usize {
+    let rows = remaining.min(max_chunk);
+    match indexer_budget.checked_sub(position) {
+        Some(to_budget) if to_budget > 0 => rows.min(to_budget),
+        _ => rows,
+    }
+}
 const QWEN4_STEP_INLINE_CAPACITY: usize = 384;
 const QWEN4_QSA_INLINE_CAPACITY: usize = 12;
 
@@ -1640,10 +1657,19 @@ impl Qwen4GpuForward {
         )?;
         let vocab = bundle.config.vocab_size;
         let max_chunk = self.scratch.max_chunk;
+        let (start, budget) = (bundle.state.position, bundle.config.indexer_budget);
+        let chunk_rows = |offset: usize| {
+            prefill_chunk_rows(budget, start + offset, tokens.len() - offset, max_chunk)
+        };
         let preflight_rows = if output_rows == Qwen4OutputRows::Final {
-            (tokens.len() - 1) % max_chunk + 1
+            let (mut offset, mut last) = (0, 0);
+            while offset < tokens.len() {
+                last = chunk_rows(offset);
+                offset += last;
+            }
+            last
         } else {
-            tokens.len().min(max_chunk)
+            chunk_rows(0)
         };
         let preflight_output_rows = output_rows.count(preflight_rows);
         let preflight_logits = logits.sub_offset(0, preflight_output_rows * vocab);
@@ -1656,7 +1682,7 @@ impl Qwen4GpuForward {
         let capture_width = wide_hidden_capture.map(|_| program_dims(&bundle.config).wide());
         let mut offset = 0usize;
         while offset < tokens.len() {
-            let rows = (tokens.len() - offset).min(max_chunk);
+            let rows = chunk_rows(offset);
             let final_chunk = offset + rows == tokens.len();
             let selected_rows = output_rows.count(rows);
             let logits_offset = if output_rows == Qwen4OutputRows::All {
