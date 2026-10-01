@@ -1,6 +1,19 @@
 # Changelog
 
 ## Unreleased
+- **Qwen4 (Flash-Next): native MTP now runs sampled (temperature > 0)
+  requests; they used to fall back to AR.** Drafts stay the head's argmax.
+  Each verify row's target token is drawn with the AR sampler, in row order,
+  up to the row where acceptance ends, and a draft is accepted only when it
+  equals that draw (SpecInfer naive sampling). Every emitted token is one
+  draw from the target, and the sampler RNG advances exactly as under AR.
+  Seeded sampled MTP emits AR's exact token ids: 24/24 runs on the interleaved
+  route (`HIPFIRE_MTP_INCREMENTAL=1`) and 23/24 on the default route (2
+  prompts × T=0.7/top_p=0.95 and T=1.0 × 6 seeds × 128 tokens; the miss is the
+  residual below). Greedy requests are unchanged. Requests with non-neutral
+  repeat/presence/frequency penalties still run AR. On gfx1151, single runs,
+  `max_seq` 2048, decode went from 34.1 (AR) to 63.4 tok/s on a code prompt
+  at T=0.7, and from 32.9 to 46.2 tok/s on a prose prompt.
 - **Qwen4 (Flash-Next): an MTP verify of 2–8 rows is again bitwise the
   single-row decode, so greedy MTP once more emits AR's tokens.** Since the Q8
   GDN state became the default (v0.4.0, `7289862bf`, merged into this branch

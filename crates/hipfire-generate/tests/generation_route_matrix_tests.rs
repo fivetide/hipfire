@@ -388,7 +388,7 @@ fn route_matrix_tools_absent_and_present() {
 }
 
 #[test]
-fn qwen4_native_mtp_route_requires_explicit_greedy_request() {
+fn qwen4_native_mtp_route_admits_greedy_and_verifiable_sampled_requests() {
     let mtp = GenerationRouteInputs {
         arch_id: 16,
         has_speculator: true,
@@ -400,8 +400,9 @@ fn qwen4_native_mtp_route_requires_explicit_greedy_request() {
 
     // Greedy argmax ignores top_p/top_k/min_p, and serve forwards top_p/top_k
     // whenever the client or the registry sets one, so their presence must
-    // keep a greedy request on native MTP.
-    for greedy in [
+    // keep a greedy request on native MTP. A sampled request stays on it when
+    // the drafter verifies by target draws.
+    for admitted in [
         GenerationRouteInputs {
             user_explicit_sampling: true,
             ..mtp
@@ -410,11 +411,18 @@ fn qwen4_native_mtp_route_requires_explicit_greedy_request() {
             min_p: Some(0.1),
             ..mtp
         },
+        GenerationRouteInputs {
+            temp: 0.7,
+            user_explicit_sampling: true,
+            min_p: Some(0.05),
+            supports_temp_swor: true,
+            ..mtp
+        },
     ] {
         assert_eq!(
-            select_generation_route(&greedy),
+            select_generation_route(&admitted),
             GenerationRoute::Qwen4Spec,
-            "greedy Qwen4 request with argmax-neutral sampler fields must use native MTP: {greedy:?}"
+            "Qwen4 request the MTP verify reproduces must use native MTP: {admitted:?}"
         );
     }
 
@@ -423,6 +431,12 @@ fn qwen4_native_mtp_route_requires_explicit_greedy_request() {
         GenerationRouteInputs {
             temp: 0.7,
             user_explicit_sampling: true,
+            ..mtp
+        },
+        GenerationRouteInputs {
+            temp: 0.7,
+            nonneutral_penalties: true,
+            supports_temp_swor: true,
             ..mtp
         },
         GenerationRouteInputs {
@@ -453,7 +467,7 @@ fn qwen4_native_mtp_route_requires_explicit_greedy_request() {
         assert_eq!(
             select_generation_route(&refused),
             GenerationRoute::Qwen4Ar,
-            "Qwen4 native MTP must refuse non-greedy or non-explicit inputs: {refused:?}"
+            "Qwen4 native MTP must refuse inputs its verify cannot reproduce: {refused:?}"
         );
     }
 }

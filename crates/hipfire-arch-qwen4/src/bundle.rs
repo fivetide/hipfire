@@ -558,6 +558,22 @@ impl Qwen4Bundle {
             .map_err(BundleError::Hip)
     }
 
+    /// Host copy of the first `rows` logit rows the last spec forward wrote.
+    pub(crate) fn spec_logits_host(&self, gpu: &Gpu, rows: usize) -> Result<Vec<f32>, BundleError> {
+        if rows > SPEC_LOGIT_ROWS {
+            return Err(BundleError::Forward(format!(
+                "Qwen4 spec logits hold at most {SPEC_LOGIT_ROWS} rows, {rows} requested"
+            )));
+        }
+        let len = rows * self.config.vocab_size;
+        let logits = self
+            .spec_logits
+            .as_ref()
+            .ok_or_else(|| BundleError::Forward("Qwen4 spec logits are not attached".to_string()))?
+            .sub_offset(0, len);
+        gpu.download_f32(&logits).map_err(BundleError::Hip)
+    }
+
     /// Keep the first `keep` rows of the armed `tokens.len()`-row verify the
     /// active snapshot ticket brackets, without re-running them; the ticket
     /// stays active for the caller's commit or restore.
