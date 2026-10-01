@@ -1,6 +1,19 @@
 # Changelog
 
 ## Unreleased
+- **Qwen4 (Flash-Next): an MTP verify of 2–8 rows is again bitwise the
+  single-row decode, so greedy MTP once more emits AR's tokens.** Since the Q8
+  GDN state became the default (v0.4.0, `7289862bf`, merged into this branch
+  in `d685aae24`), the persistent few-row GDN kernel requantized the state once
+  per launch, while decode requantizes after every token. Rows after the first
+  therefore saw a different state: their logits were off by up to ~1.9
+  (`qwen4_rows`), and greedy MTP left AR's ids within 16–83 tokens. The
+  kernel now requantizes after every row with that row's position, so rows
+  2..8 are bitwise again. The chunked prefill scan (≥512 rows) is unchanged.
+  A 167-token prefill (persistent route) costs 1.6% more (447 → 455 ms).
+  Remaining residual: in 1 of 24 sampled runs, one row deep in a batched
+  verify differed from decode by ~1e-6 relative. It reproduces offline with
+  that exact token sequence and the Q8 state only. The cause is not found.
 - **Qwen4 long context on gfx1151: 32k-token prompt at `max_seq` 65536 with
   MTP goes from 628 to 1490 tok/s prefill and 29.2 to 53.7 tok/s decode.**
   QSA block selection picks its top blocks with a radix select over block

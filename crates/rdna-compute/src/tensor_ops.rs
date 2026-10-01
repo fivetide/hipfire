@@ -5554,6 +5554,19 @@ mod tests {
             gpu.free_tensor(out).expect("free");
             values
         };
+        // The persistent route requantizes after every row with that row's
+        // position, so it is the decode route bit for bit: an MTP verify of
+        // these rows must produce decode's outputs and leave decode's state.
+        let rows_state = fresh_slot(&mut gpu);
+        let rows_out = batch(&mut gpu, &rows_state, None, rows);
+        let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&rows_out), bits(&q8_out), "Q8 persistent outputs differ from decode");
+        assert_eq!(
+            bytes(&gpu, &rows_state),
+            bytes(&gpu, &q8_state),
+            "Q8 persistent state differs from decode"
+        );
+        gpu.free_tensor(rows_state).expect("free");
         // Digest of every Q8 state this test writes: equal across processes
         // (the multi-process stress compares it).
         let mut digest = 0xcbf2_9ce4_8422_2325u64;

@@ -32,10 +32,13 @@ static __device__ __forceinline__ __hip_bfloat16 bf16_add(
 // (gated_delta_net_q8_fast.hip). Per value head, 128 rows of 128 signed
 // bytes (row = value channel, byte = key channel), then, after every head's
 // codes, one F32 scale per row (`value_heads * 128`). A row dequantizes as
-// scale * code. A launch requantizes each row once, after its last token, by
-// the row's absmax with Qwen3.5's stochastic rounding (floor(x * 127 / absmax
-// + u), u uniform in [0, 1) from an LCG seeded by head, row, key channel and
-// frame), so repeated decay does not bias the stored state.
+// scale * code. Every token requantizes each row, by the row's absmax with
+// Qwen3.5's stochastic rounding (floor(x * 127 / absmax + u), u uniform in
+// [0, 1) from an LCG seeded by head, row, key channel and the token's
+// position `frame`), so repeated decay does not bias the stored state. The
+// few-row persistent route does the same per row, which keeps an MTP verify
+// bitwise the single-row decode route; only the chunked prefill scan
+// requantizes once, after its last token.
 static __device__ __forceinline__ signed char* gdn_q8_row(void* slot, int head, int row) {
     return reinterpret_cast<signed char*>(slot) + ((size_t)head * 128 + row) * 128;
 }
@@ -397,8 +400,9 @@ __device__ __forceinline__ void gdn_lds_barrier() {
 // it); a separate instantiation so the plain route's register allocation is
 // unchanged.
 // `kQ8`: `state` and the `row_states` slots are Q8 GDN state slots (see
-// gdn_q8_row) and `frame` seeds the final requantization; the recurrence
-// runs on the dequantized F32 values.
+// gdn_q8_row) and `frame` is the last row's position; the recurrence runs on
+// the dequantized F32 values, requantized after every row with that row's
+// position as a decode step would.
 template <bool kCapture, bool kQ8 = false>
 __device__ __forceinline__ void gated_delta_step_persistent256_body(
     const float* projection,
@@ -443,17 +447,19 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
     __shared__ float handoff_out[128];
 
     float state_half[64];
+    // kQ8: the codes and scale of the state after the latest row.
+    int4 packed[4];
+    signed char* const codes = reinterpret_cast<signed char*>(packed);
+    float row_scale = 0.0f;
+    __shared__ float peak_half[2][128];
     if constexpr (kQ8) {
         const int4* codes4 =
             reinterpret_cast<const int4*>(gdn_q8_row(state, value_head, value_index) + kd_base);
-        const float scale =
-            gdn_q8_scales(state, value_heads)[value_head * 128 + value_index];
-        int4 packed[4];
+        row_scale = gdn_q8_scales(state, value_heads)[value_head * 128 + value_index];
         #pragma unroll
         for (int i = 0; i < 4; ++i) packed[i] = codes4[i];
-        const signed char* codes = reinterpret_cast<const signed char*>(packed);
         #pragma unroll
-        for (int kd = 0; kd < 64; ++kd) state_half[kd] = scale * (float)codes[kd];
+        for (int kd = 0; kd < 64; ++kd) state_half[kd] = row_scale * (float)codes[kd];
     } else {
         #pragma unroll
         for (int kd = 0; kd < 64; ++kd) {
@@ -607,37 +613,40 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
                 }
                 output[row * value_width + value_head * 128 + value_index] = out;
             }
+            if constexpr (kQ8) {
+                // Requantize as a decode step at this row's position does:
+                // the row's absmax spans both halves (exchange the half
+                // peaks), and the next row decays the dequantized codes.
+                float peak = 0.0f;
+                #pragma unroll
+                for (int kd = 0; kd < 64; ++kd) peak = fmaxf(peak, fabsf(state_half[kd]));
+                peak_half[half][value_index] = peak;
+                gdn_lds_barrier();
+                peak = fmaxf(peak_half[0][value_index], peak_half[1][value_index]);
+                const float inv = gdn_q8_inv(peak);
+                row_scale = gdn_q8_scale(peak);
+                const unsigned int row_frame = frame - (unsigned int)(rows - 1 - row);
+                #pragma unroll
+                for (int kd = 0; kd < 64; ++kd) {
+                    codes[kd] = gdn_q8_round(state_half[kd], inv, value_head, value_index,
+                                             kd_base + kd, row_frame);
+                    state_half[kd] = row_scale * (float)codes[kd];
+                }
+            }
         }
     }
 
     if constexpr (kQ8) {
-        // The row's absmax spans both halves: exchange the half peaks.
-        __shared__ float peak_half[2][128];
-        float peak = 0.0f;
-        #pragma unroll
-        for (int kd = 0; kd < 64; ++kd) peak = fmaxf(peak, fabsf(state_half[kd]));
-        peak_half[half][value_index] = peak;
-        gdn_lds_barrier();
-        peak = fmaxf(peak_half[0][value_index], peak_half[1][value_index]);
-        const float inv = gdn_q8_inv(peak);
         void* const final_slot = kCapture
             ? reinterpret_cast<signed char*>(row_states)
                   + (size_t)(rows - 1) * gdn_q8_slot_bytes(value_heads)
             : state;
-        int4 packed[4];
-        signed char* codes = reinterpret_cast<signed char*>(packed);
-        #pragma unroll
-        for (int kd = 0; kd < 64; ++kd) {
-            codes[kd] = gdn_q8_round(state_half[kd], inv, value_head, value_index,
-                                     kd_base + kd, frame);
-        }
         int4* dst =
             reinterpret_cast<int4*>(gdn_q8_row(final_slot, value_head, value_index) + kd_base);
         #pragma unroll
         for (int i = 0; i < 4; ++i) dst[i] = packed[i];
         if (half == 0) {
-            gdn_q8_scales(final_slot, value_heads)[value_head * 128 + value_index] =
-                gdn_q8_scale(peak);
+            gdn_q8_scales(final_slot, value_heads)[value_head * 128 + value_index] = row_scale;
         }
         return;
     }
