@@ -79,7 +79,9 @@ extern "C" __global__ void gemm_q8_0_batched(
 // Grid: [ceil(M / 8), ceil(batch_size / MAX_BATCH), 1]: grid.y takes the
 // batch in MAX_BATCH-row tiles, each exactly a per-tile launch.  Block 256.
 #define Q8_LDS_GROUPS 4
-extern "C" __global__ __launch_bounds__(256) void gemm_q8_0_batched_lds8(
+// RPW weight rows per wave: every X value read from LDS feeds RPW FMAs.
+template <int RPW>
+__device__ __forceinline__ void gemm_q8_0_batched_lds_body(
     const unsigned char* __restrict__ A_q8,
     const float* __restrict__ X,
     float* __restrict__ Y,
@@ -90,13 +92,18 @@ extern "C" __global__ __launch_bounds__(256) void gemm_q8_0_batched_lds8(
     batch_size = min(batch_size - (int)blockIdx.y * MAX_BATCH, MAX_BATCH);
     __shared__ __align__(16) float xs[MAX_BATCH * Q8_LDS_GROUPS * 32];
     const int lane = threadIdx.x & 31;
-    const int row = blockIdx.x * 8 + (threadIdx.x >> 5);
+    const int row0 = (blockIdx.x * 8 + (threadIdx.x >> 5)) * RPW;
     const int blocks_per_row = K / 32;
-    const unsigned char* row_data = A_q8 + (size_t)min(row, M - 1) * blocks_per_row * 34;
+    const unsigned char* row_data[RPW];
+#pragma unroll
+    for (int r = 0; r < RPW; r++)
+        row_data[r] = A_q8 + (size_t)min(row0 + r, M - 1) * blocks_per_row * 34;
 
-    float sums[MAX_BATCH];
-    #pragma unroll
-    for (int b = 0; b < MAX_BATCH; b++) sums[b] = 0.0f;
+    float sums[RPW][MAX_BATCH];
+#pragma unroll
+    for (int r = 0; r < RPW; r++)
+#pragma unroll
+        for (int b = 0; b < MAX_BATCH; b++) sums[r][b] = 0.0f;
 
     for (int b0 = 0; b0 < blocks_per_row; b0 += Q8_LDS_GROUPS) {
         const int groups = min(Q8_LDS_GROUPS, blocks_per_row - b0);
@@ -114,27 +121,47 @@ extern "C" __global__ __launch_bounds__(256) void gemm_q8_0_batched_lds8(
         }
         __syncthreads();
         for (int g = 0; g < groups; g++) {
-            const unsigned char* block = row_data + (b0 + g) * 34;
-            float d = (float)*((const _Float16*)block);
-            signed char qval = (signed char)block[2 + lane];
-            float dq = d * (float)qval;
-            #pragma unroll
+            float dq[RPW];
+#pragma unroll
+            for (int r = 0; r < RPW; r++) {
+                const unsigned char* block = row_data[r] + (b0 + g) * 34;
+                dq[r] = (float)*((const _Float16*)block) * (float)(signed char)block[2 + lane];
+            }
+#pragma unroll
             for (int b = 0; b < MAX_BATCH; b++) {
                 if (b < batch_size) {
-                    sums[b] += dq * xs[b * Q8_LDS_GROUPS * 32 + g * 32 + lane];
+                    const float x = xs[b * Q8_LDS_GROUPS * 32 + g * 32 + lane];
+#pragma unroll
+                    for (int r = 0; r < RPW; r++) sums[r][b] += dq[r] * x;
                 }
             }
         }
     }
-    if (row >= M) return;
-    #pragma unroll
-    for (int b = 0; b < MAX_BATCH; b++) {
-        if (b < batch_size) {
-            float s = sums[b];
-            for (int offset = 16; offset > 0; offset >>= 1)
-                s += __shfl_down(s, offset, 32);
-            if (lane == 0) Y[(size_t)b * M + row] = s;
+#pragma unroll
+    for (int r = 0; r < RPW; r++) {
+        if (row0 + r >= M) break;
+#pragma unroll
+        for (int b = 0; b < MAX_BATCH; b++) {
+            if (b < batch_size) {
+                float s = sums[r][b];
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    s += __shfl_down(s, offset, 32);
+                if (lane == 0) Y[(size_t)b * M + row0 + r] = s;
+            }
         }
     }
+}
+
+extern "C" __global__ __launch_bounds__(256) void gemm_q8_0_batched_lds8(
+    const unsigned char* __restrict__ A_q8, const float* __restrict__ X,
+    float* __restrict__ Y, int M, int K, int batch_size) {
+    gemm_q8_0_batched_lds_body<1>(A_q8, X, Y, M, K, batch_size);
+}
+
+// Two rows per wave (sixteen per workgroup); grid [ceil(M / 16), batch tiles].
+extern "C" __global__ __launch_bounds__(256) void gemm_q8_0_batched_lds16(
+    const unsigned char* __restrict__ A_q8, const float* __restrict__ X,
+    float* __restrict__ Y, int M, int K, int batch_size) {
+    gemm_q8_0_batched_lds_body<2>(A_q8, X, Y, M, K, batch_size);
 }
 #undef Q8_LDS_GROUPS

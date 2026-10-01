@@ -25501,7 +25501,7 @@ impl Gpu {
             "gemm_q8_0_batched: batch_size {batch_size} exceeds kernel MAX_BATCH=64"
         );
         let (kernel, grid, block) = if lds8 {
-            ("gemm_q8_0_batched_lds8", [m.div_ceil(8) as u32, batch_size.div_ceil(64) as u32], 256u32)
+            ("gemm_q8_0_batched_lds16", [m.div_ceil(16) as u32, batch_size.div_ceil(64) as u32], 256u32)
         } else {
             ("gemm_q8_0_batched", [m as u32, 1], 32u32)
         };
