@@ -2566,7 +2566,7 @@ fn indexed_attention_select_batch_impl(
             }
             _ => ("indexed_attention_select_f32_batched_serial", [1, 1, 1], 0),
         };
-    // Live launches with the pinned index geometry score eight rows per pooled
+    // Live launches with the pinned index geometry score 8 or 16 rows per pooled
     // key read into the shared F16 X scratch, then select from those scores.
     if kernel_name == "indexed_attention_select_f32_batched"
         && !gpu.replay.is_recording()
@@ -2643,7 +2643,7 @@ const QSA_SELECT_SCORE_SCRATCH_BYTES: usize = 64 << 20;
 const QSA_SELECT_FROM_SCORES_MAX_BUDGET: usize = 512;
 
 /// [`indexed_attention_select_batch_impl`]'s live route: row groups of
-/// `indexed_attention_select_scores_rows8_f32` scores, each followed by the
+/// `indexed_attention_select_scores_rows{8,16}_f32` scores, each followed by the
 /// batched selection reading them. Selection bytes are unchanged.
 fn indexed_attention_select_rows8(
     gpu: &mut Gpu,
@@ -2652,14 +2652,21 @@ fn indexed_attention_select_rows8(
     shared_mem: u32,
 ) -> HipResult<bool> {
     let stride = p.block_count;
-    let group = (QSA_SELECT_SCORE_SCRATCH_BYTES / (stride * 4) / 8 * 8)
-        .max(8)
+    // Prefill scores sixteen rows per pooled-key read; decode and few-row
+    // verify keep eight (the sixteen-row kernel costs them more than it saves).
+    let (score_kernel, score_rows) = if p.rows > 8 {
+        ("indexed_attention_select_scores_rows16_f32", 16)
+    } else {
+        ("indexed_attention_select_scores_rows8_f32", 8)
+    };
+    let group = (QSA_SELECT_SCORE_SCRATCH_BYTES / (stride * 4) / 16 * 16)
+        .max(16)
         .min(p.rows);
     let scores = gpu
         .scratch
         .fp16_x_scratch_writable(&gpu.hip, group * stride * 2)?;
     for kernel in [
-        "indexed_attention_select_scores_rows8_f32",
+        score_kernel,
         "indexed_attention_select_f32_batched",
         "indexed_attention_select_from_scores",
     ] {
@@ -2694,10 +2701,10 @@ fn indexed_attention_select_rows8(
         args.push_i32(block_count);
         args.pad_to(16);
         gpu.launch_blob_recorded(
-            "indexed_attention_select_scores_rows8_f32",
+            score_kernel,
             [
                 block_tiles,
-                checked_u32(n.div_ceil(8), "QSA select row groups")?,
+                checked_u32(n.div_ceil(score_rows), "QSA select row groups")?,
                 1,
             ],
             [256, 1, 1],
@@ -5850,10 +5857,12 @@ mod tests {
         for &compress in &[2usize, 4, 8] {
             for &index_dim in &[8usize, 128] {
                 for &index_heads in &[1usize, 4] {
-                    for &rows in &[1usize, 5] {
+                    // 37 rows: three sixteen-row scoring groups, the last
+                    // partial, each row with its own visible block count.
+                    for &rows in &[1usize, 5, 37] {
                         // `(position_start + rows) / compress` must equal the
                         // wrapper's declared block count.
-                        if rows > compress - 1 {
+                        if rows < 37 && rows > compress - 1 {
                             continue;
                         }
                         // Rows of at least two budgets take the threshold
@@ -5870,6 +5879,14 @@ mod tests {
                                 {
                                     continue;
                                 }
+                                // Many rows: the pinned geometry, smaller budgets.
+                                if rows == 37
+                                    && (!pinned
+                                        || budget_blocks > 64
+                                        || block_count * compress + compress - 1 < rows)
+                                {
+                                    continue;
+                                }
                                 for ties in [false, true] {
                                     let case = SelectCase {
                                         compress,
@@ -5879,7 +5896,11 @@ mod tests {
                                         block_count,
                                         budget_blocks,
                                         capacity: budget_blocks * compress + compress - 1,
-                                        position_start: block_count * compress,
+                                        position_start: if rows < compress {
+                                            block_count * compress
+                                        } else {
+                                            block_count * compress + compress - 1 - rows
+                                        },
                                     };
                                     let pooled: Vec<f32> = (0..block_count * index_dim + index_dim)
                                         .map(|_| if ties { next().round() } else { next() })
