@@ -29522,6 +29522,7 @@ impl Gpu {
         // Short-M, long-K Qwen4 projections; see gemm_bf16_xf16_f16_wmma.
         LdsTile::new(64, 64, 32, 64, 64, false),
         LdsTile::new(64, 64, 32, 64, 64, false).pipelined(),
+        LdsTile::new(64, 64, 32, 64, 32, false),
         LdsTile::new(64, 64, 32, 64, 32, false).pipelined(),
     ];
 

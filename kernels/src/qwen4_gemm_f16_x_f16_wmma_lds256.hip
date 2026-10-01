@@ -1182,7 +1182,9 @@ WLDS_KERNEL(gemm_wmma_lds_128_256_64_64_k32_p,  128, 256, 4, 4, 32, false, true)
 WLDS_KERNEL(gemm_wmma_lds_64_64_32_64_k64,       64,  64, 2, 4, 64, false, false)
 WLDS_KERNEL(gemm_wmma_lds_64_64_32_64_k64_p,     64,  64, 2, 4, 64, false, true)
 // KS 32: the same tile and K order at half the LDS per stage, 362 -> 342 us
-// cold at 320 x 10240 x 1131 (bitwise).
+// cold at 320 x 10240 x 1131 (bitwise). The plain form is the pipelining
+// kill switch's twin (HIPFIRE_FLUX_GEMM_PIPE=0).
+WLDS_KERNEL(gemm_wmma_lds_64_64_32_64_k32,       64,  64, 2, 4, 32, false, false)
 WLDS_KERNEL(gemm_wmma_lds_64_64_32_64_k32_p,     64,  64, 2, 4, 32, false, true)
 
 // --- Fused-epilogue instantiations ------------------------------------------
