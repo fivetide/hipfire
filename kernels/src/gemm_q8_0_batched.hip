@@ -76,7 +76,8 @@ extern "C" __global__ void gemm_q8_0_batched(
 // Each 32-lane group owns one row with the per-row kernel's exact lane
 // order: every lane accumulates its K lane over the groups in ascending
 // order, then the same shfl_down tree, so every output is bitwise equal.
-// Grid: [ceil(M / 8), 1, 1].  Block: [256, 1, 1].  batch_size <= MAX_BATCH.
+// Grid: [ceil(M / 8), ceil(batch_size / MAX_BATCH), 1]: grid.y takes the
+// batch in MAX_BATCH-row tiles, each exactly a per-tile launch.  Block 256.
 #define Q8_LDS_GROUPS 4
 extern "C" __global__ __launch_bounds__(256) void gemm_q8_0_batched_lds8(
     const unsigned char* __restrict__ A_q8,
@@ -84,6 +85,9 @@ extern "C" __global__ __launch_bounds__(256) void gemm_q8_0_batched_lds8(
     float* __restrict__ Y,
     int M, int K, int batch_size
 ) {
+    X += (size_t)blockIdx.y * MAX_BATCH * K;
+    Y += (size_t)blockIdx.y * MAX_BATCH * M;
+    batch_size = min(batch_size - (int)blockIdx.y * MAX_BATCH, MAX_BATCH);
     __shared__ __align__(16) float xs[MAX_BATCH * Q8_LDS_GROUPS * 32];
     const int lane = threadIdx.x & 31;
     const int row = blockIdx.x * 8 + (threadIdx.x >> 5);
@@ -98,9 +102,15 @@ extern "C" __global__ __launch_bounds__(256) void gemm_q8_0_batched_lds8(
         const int groups = min(Q8_LDS_GROUPS, blocks_per_row - b0);
         const int width = groups * 32;
         __syncthreads();
-        for (int i = threadIdx.x; i < batch_size * width; i += 256) {
-            const int b = i / width, c = i - b * width;
-            xs[b * Q8_LDS_GROUPS * 32 + c] = X[(size_t)b * K + b0 * 32 + c];
+        // 32 float4 per row chunk: thread t copies vector t % 32 of rows
+        // t / 32, t / 32 + 8, ... (no per-element division).
+        {
+            const int v = threadIdx.x & 31;
+            if (v * 4 < width) {
+                for (int b = threadIdx.x >> 5; b < batch_size; b += 8)
+                    *(float4*)(xs + b * Q8_LDS_GROUPS * 32 + v * 4) =
+                        *(const float4*)(X + (size_t)b * K + b0 * 32 + v * 4);
+            }
         }
         __syncthreads();
         for (int g = 0; g < groups; g++) {

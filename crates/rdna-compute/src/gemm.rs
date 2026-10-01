@@ -25492,16 +25492,18 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // gfx11+: eight rows per workgroup share X through LDS (bitwise the
+        // per-row kernel, which re-reads X for every row), and grid.y covers
+        // any batch in 64-row tiles.
+        let lds8 = self.arch_caps.has_gfx11_plus_simt();
         assert!(
-            batch_size <= 64,
+            lds8 || batch_size <= 64,
             "gemm_q8_0_batched: batch_size {batch_size} exceeds kernel MAX_BATCH=64"
         );
-        // gfx11+: eight rows per workgroup share X through LDS (bitwise the
-        // per-row kernel, which re-reads X for every row).
-        let (kernel, grid, block) = if self.arch_caps.has_gfx11_plus_simt() {
-            ("gemm_q8_0_batched_lds8", m.div_ceil(8) as u32, 256u32)
+        let (kernel, grid, block) = if lds8 {
+            ("gemm_q8_0_batched_lds8", [m.div_ceil(8) as u32, batch_size.div_ceil(64) as u32], 256u32)
         } else {
-            ("gemm_q8_0_batched", m as u32, 32u32)
+            ("gemm_q8_0_batched", [m as u32, 1], 32u32)
         };
         self.ensure_kernel("gemm_q8_0_batched", kernels::GEMM_Q8_0_BATCHED_SRC, kernel)?;
 
@@ -25529,7 +25531,7 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_q8_0_batched", bytes);
         let result = self.launch_maybe_blob(
             kernel,
-            [grid, 1, 1],
+            [grid[0], grid[1], 1],
             [block, 1, 1],
             0,
             &mut params,
@@ -25676,6 +25678,10 @@ impl Gpu {
             return self.gemv_q8_0_staged_rows(a_raw, x, y, m, k, n);
         }
         self.bind_thread()?;
+        if self.arch_caps.has_gfx11_plus_simt() {
+            // One launch: the LDS kernel tiles the batch over grid.y.
+            return self.gemm_q8_0_batched(a_raw, x, y, m, k, n);
+        }
         const MAX_BATCH: usize = 64;
         let mut off = 0;
         while off < n {
@@ -44677,7 +44683,8 @@ mod tests {
     /// `gemm_q8_0_batched` (the LDS-shared eight-row kernel on gfx11+) keeps
     /// the per-row contract bit for bit: each of 32 lanes FMA-accumulates its
     /// K lane over the groups in order, then a shfl_down tree. Rows not a
-    /// multiple of eight, a partial LDS chunk (K = 2592) and 1/5/64 batches.
+    /// multiple of eight, a partial LDS chunk (K = 2592) and 1/5/64 batches,
+    /// plus 150 (three grid.y batch tiles, the last partial).
     #[test]
     fn q8_0_batched_matches_lane_order_reference() {
         let Ok(mut gpu) = Gpu::init() else {
@@ -44703,7 +44710,7 @@ mod tests {
             }
         }
         let weight = gpu.upload_raw(&packed, &[packed.len()]).expect("upload Q8");
-        for batch in [1usize, 5, 64] {
+        for batch in [1usize, 5, 64, 150] {
             let x: Vec<f32> = (0..batch * k)
                 .map(|i| (((i * 2_654_435_761) % 2003) as f32 - 1001.0) / 997.0)
                 .collect();
