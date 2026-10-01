@@ -1295,6 +1295,16 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 chunk_rows,
             );
             let chunk = &fill_tokens[base..base + rows];
+            let next_rows = crate::gpu_forward::prefill_chunk_rows(
+                budget,
+                start_pos + base + rows,
+                fill_tokens.len() - base - rows,
+                chunk_rows,
+            );
+            if next_rows > 0 {
+                Self::bundle(target)?
+                    .ple_readahead(&fill_tokens[base..base + rows + next_rows], rows);
+            }
             let pick = Self::bundle(target)?
                 .spec_prefill_rows(gpu, chunk)
                 .map_err(|error| error.to_string())?;

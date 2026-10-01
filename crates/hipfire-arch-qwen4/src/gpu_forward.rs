@@ -1684,6 +1684,10 @@ impl Qwen4GpuForward {
         while offset < tokens.len() {
             let rows = chunk_rows(offset);
             let final_chunk = offset + rows == tokens.len();
+            if !final_chunk {
+                let next = chunk_rows(offset + rows);
+                bundle.ple_readahead(&tokens[offset..offset + rows + next], rows);
+            }
             let selected_rows = output_rows.count(rows);
             let logits_offset = if output_rows == Qwen4OutputRows::All {
                 offset

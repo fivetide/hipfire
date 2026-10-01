@@ -332,6 +332,17 @@ impl Qwen4Bundle {
         Ok(())
     }
 
+    /// Start OS readahead of the PLE rows of `tokens[skip..]`, where `tokens`
+    /// continue from the current position and `tokens[..skip]` is the chunk
+    /// about to run: the next chunk then finds its rows in the page cache
+    /// instead of stalling on cold reads (one chunk ahead, so the hints do not
+    /// queue ahead of the running chunk's own reads).
+    pub(crate) fn ple_readahead(&self, tokens: &[u32], skip: usize) {
+        let mut ids = self.state.ple_history.row_ids(&self.ple_metadata, tokens);
+        ids.drain(..(skip * crate::ple::PLE_HEAD_COUNT).min(ids.len()));
+        self.ple_rows.readahead(ids);
+    }
+
     /// Rows the attached forward can process in one chunked call.  The MTP
     /// prefill uses this to batch a whole prompt chunk through the shared
     /// forward instead of one single-row forward per prompt token.
