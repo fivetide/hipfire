@@ -7,10 +7,10 @@
   up to the row where acceptance ends, and a draft is accepted only when it
   equals that draw (SpecInfer naive sampling). Every emitted token is one
   draw from the target, and the sampler RNG advances exactly as under AR.
-  Seeded sampled MTP emits AR's exact token ids: 24/24 runs on the interleaved
-  route (`HIPFIRE_MTP_INCREMENTAL=1`) and 23/24 on the default route (2
-  prompts × T=0.7/top_p=0.95 and T=1.0 × 6 seeds × 128 tokens; the miss is the
-  residual below). Greedy requests are unchanged. Requests with non-neutral
+  Seeded sampled MTP emits AR's exact token ids: 26/26 runs on the default
+  route (2 prompts × greedy, T=0.7/top_p=0.95 and T=1.0 × 6 seeds × 128
+  tokens), and on both forced routes in `qwen4_seeded_sampled_mtp_matches_ar`.
+  Greedy requests are unchanged. Requests with non-neutral
   repeat/presence/frequency penalties still run AR. On gfx1151, single runs,
   `max_seq` 2048, decode went from 34.1 (AR) to 63.4 tok/s on a code prompt
   at T=0.7, and from 32.9 to 46.2 tok/s on a prose prompt.
@@ -24,9 +24,16 @@
   kernel now requantizes after every row with that row's position, so rows
   2..8 are bitwise again. The chunked prefill scan (≥512 rows) is unchanged.
   A 167-token prefill (persistent route) costs 1.6% more (447 → 455 ms).
-  Remaining residual: in 1 of 24 sampled runs, one row deep in a batched
-  verify differed from decode by ~1e-6 relative. It reproduces offline with
-  that exact token sequence and the Q8 state only. The cause is not found.
+- **Qwen4 (Flash-Next): two HC projections no longer change their sum order
+  between one row and a 2–8-row verify.** Decode runs the final HC read's
+  BF16 down projection and the HC write gate projection through
+  `gemv_bf16_xf32_k4`, while 2–8 rows went through the multi-row GEMM and the
+  fused `hyper_norm_gate`. The results differed in the last F32 bit. Because the
+  values are BF16-rounded downstream, this only rarely reached a verify row's
+  logits (~1e-6 relative): in 1 of 24 seeded sampled MTP runs it flipped a draw at token 89.
+  Rows 2–8 now run the one-row kernel per row; a 3-row window followed by a
+  4-row window (the triggering shape) is bitwise again over 127 replayed rows.
+  MTP decode on a code prompt is unchanged (62.6 → 63.0 tok/s median).
 - **Qwen4 long context on gfx1151: 32k-token prompt at `max_seq` 65536 with
   MTP goes from 628 to 1490 tok/s prefill and 29.2 to 53.7 tok/s decode.**
   QSA block selection picks its top blocks with a radix select over block

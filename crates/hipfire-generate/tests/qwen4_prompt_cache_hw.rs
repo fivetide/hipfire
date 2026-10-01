@@ -317,11 +317,10 @@ fn qwen4_ar_prompt_cache_reuses_prefix() {
     assert!(cached.iter().all(|&c| c == 0), "cache disabled: {cached:?}");
 }
 
-/// Seeded sampled MTP must emit seeded AR's exact tokens: every emitted token
-/// is one draw from the shared sampler RNG on the same logits.  The
-/// interleaved route is forced: its single-row verify is AR's decode forward
-/// by construction, while the batched few-row verify has a rare Q8-state
-/// residual (see CHANGELOG).
+/// Seeded sampled MTP must emit seeded AR's exact tokens on both verify
+/// routes: every emitted token is one draw from the shared sampler RNG, and
+/// a 2..8-row verify forward is bitwise the single-row decode. The code case
+/// is a batched-verify row that once rounded the final HC read differently.
 #[test]
 #[ignore = "requires real HIP GPU + HIPFIRE_QWEN4_CACHE_MODEL (qwen3.8-flash-next) + release daemon"]
 fn qwen4_seeded_sampled_mtp_matches_ar() {
@@ -330,22 +329,29 @@ fn qwen4_seeded_sampled_mtp_matches_ar() {
         return;
     };
     let model = model.to_string_lossy().into_owned();
-    let prompt = "Write a short story opening about a lighthouse keeper who finds a strange object on the beach.";
-    let messages = [serde_json::json!({ "role": "user", "content": prompt })];
-    let run = |mtp: bool| -> Vec<String> {
+    let prose = "Write a short story opening about a lighthouse keeper who finds a strange object on the beach.";
+    let code = "Write a Python function that merges two sorted lists into one sorted list, with a docstring and two example calls.";
+    let cases: Vec<(&str, f64, u64)> = (1..=4u64)
+        .map(|seed| (prose, 0.7, seed))
+        .chain([(code, 1.0, 6)])
+        .collect();
+    let run = |mtp: bool, incremental: &str| -> Vec<String> {
         let mut s = Session::spawn(&[
             ("HIPFIRE_QWEN_PROMPT_CACHE", "0"),
-            ("HIPFIRE_MTP_INCREMENTAL", "1"),
+            ("HIPFIRE_MTP_INCREMENTAL", incremental),
         ]);
         load(&mut s, &model, mtp, "load");
         let mut texts = Vec::new();
-        for seed in 1..=4u64 {
-            let context = format!("mtp={mtp} seed={seed}");
-            let sampling = serde_json::json!({ "temperature": 0.7, "top_p": 0.95, "seed": seed });
+        for (index, &(prompt, temperature, seed)) in cases.iter().enumerate() {
+            let context = format!("mtp={mtp} incremental={incremental} case={index}");
+            let messages = [serde_json::json!({ "role": "user", "content": prompt })];
+            let sampling =
+                serde_json::json!({ "temperature": temperature, "top_p": 0.95, "seed": seed });
+            let attempt = index as u64 + 1;
             let (done, text) = turn(
                 &mut s,
-                &format!("q4s-{seed}"),
-                seed,
+                &format!("q4s-{index}"),
+                attempt,
                 &messages,
                 &sampling,
                 &context,
@@ -357,5 +363,7 @@ fn qwen4_seeded_sampled_mtp_matches_ar() {
         s.close("unload");
         texts
     };
-    assert_eq!(run(true), run(false));
+    let ar = run(false, "1");
+    assert_eq!(run(true, "1"), ar, "interleaved verify");
+    assert_eq!(run(true, "0"), ar, "batched verify");
 }
