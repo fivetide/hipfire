@@ -25501,7 +25501,11 @@ impl Gpu {
             "gemm_q8_0_batched: batch_size {batch_size} exceeds kernel MAX_BATCH=64"
         );
         let (kernel, grid, block) = if lds8 {
-            ("gemm_q8_0_batched_lds16", [m.div_ceil(16) as u32, batch_size.div_ceil(64) as u32], 256u32)
+            (
+                "gemm_q8_0_batched_lds16",
+                [m.div_ceil(16) as u32, batch_size.div_ceil(64) as u32],
+                256u32,
+            )
         } else {
             ("gemm_q8_0_batched", [m as u32, 1], 32u32)
         };
@@ -44641,7 +44645,9 @@ mod tests {
                 *byte = (next() >> 24) as u8;
             }
         }
-        let weight = gpu.upload_raw(&packed, &[packed.len()]).expect("upload MQ6");
+        let weight = gpu
+            .upload_raw(&packed, &[packed.len()])
+            .expect("upload MQ6");
         let x: Vec<f32> = (0..n * k)
             .map(|_| ((next() >> 8) as f32 / 16_777_216.0) - 0.5)
             .collect();
@@ -44671,7 +44677,8 @@ mod tests {
             .zip(&halves)
             .position(|(a, b)| a.to_bits() != b.to_bits());
         assert_eq!(
-            differing, 0,
+            differing,
+            0,
             "x8 differs from x4 in {differing} outputs; first at column {:?} row {:?}",
             first.map(|i| i / m),
             first.map(|i| i % m)
