@@ -1,6 +1,22 @@
 # Changelog
 
 ## Unreleased
+- **Qwen4 long context on gfx1151: 32k-token prompt at `max_seq` 65536 with
+  MTP goes from 628 to 1490 tok/s prefill and 29.2 to 53.7 tok/s decode.**
+  QSA block selection picks its top blocks with a bitwise threshold / radix
+  select instead of an all-pairs rank. Scores come eight query rows per
+  pooled-key read. Few-row verify pools only the blocks it completes. The
+  MTP head appends prompt K/V 256 rows per step. Q8 batched GEMM rows share X
+  through LDS. Prefill chunks grow to 8192 rows, and the first chunk ends at
+  the 2048-token index budget, so it stays on the dense route. Spec logit
+  scratch is bounded to 16 rows. The next chunk's PLE rows are read ahead
+  (`posix_fadvise`), which cuts a fresh daemon's first 32k prefill from
+  28.5 s to 26.7 s. Sparse attention past the budget runs in F16 WMMA, the
+  same rounding as the dense route. It is not bit-exact: greedy ids at 32k
+  diverge from the exact F32 kernel after 105 tokens, the text stays
+  coherent, and first-2048-token KLD is unchanged (0.083874).
+  `HIPFIRE_QWEN4_F16_WMMA=0` keeps the exact kernels. All other changes are
+  bit-identical.
 - **Qwen4 (Flash-Next): prompts past ~1638 tokens no longer fail with a PLE
   row-prefetch error.** One prefill chunk (up to 2048 tokens) needs 16 PLE rows
   per token, more than one 8 MiB row-staging buffer holds; `RowFetch` now
