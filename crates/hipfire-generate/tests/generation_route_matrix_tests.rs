@@ -398,14 +398,31 @@ fn qwen4_native_mtp_route_requires_explicit_greedy_request() {
     };
     assert_eq!(select_generation_route(&mtp), GenerationRoute::Qwen4Spec);
 
-    for refused in [
-        GenerationRouteInputs { temp: 0.7, ..mtp },
+    // Greedy argmax ignores top_p/top_k/min_p, and serve forwards top_p/top_k
+    // whenever the client or the registry sets one, so their presence must
+    // keep a greedy request on native MTP.
+    for greedy in [
         GenerationRouteInputs {
             user_explicit_sampling: true,
             ..mtp
         },
         GenerationRouteInputs {
             min_p: Some(0.1),
+            ..mtp
+        },
+    ] {
+        assert_eq!(
+            select_generation_route(&greedy),
+            GenerationRoute::Qwen4Spec,
+            "greedy Qwen4 request with argmax-neutral sampler fields must use native MTP: {greedy:?}"
+        );
+    }
+
+    for refused in [
+        GenerationRouteInputs { temp: 0.7, ..mtp },
+        GenerationRouteInputs {
+            temp: 0.7,
+            user_explicit_sampling: true,
             ..mtp
         },
         GenerationRouteInputs {
@@ -1036,4 +1053,15 @@ fn route_cancel_releases_start_latch_and_claims_once() {
     );
     clear_terminal_control();
     set_active_attempt_id(0);
+}
+
+/// VL and pipeline-parallel `done` carry `finish_reason`: a budget that runs
+/// out is `length`, a terminator (even on the last budget token) is `stop`.
+#[test]
+fn vl_and_pp_done_report_length_on_budget_exhaustion() {
+    assert_eq!(length_or_stop(16, 16, false), "length");
+    assert_eq!(length_or_stop(16, 16, true), "stop");
+    assert_eq!(length_or_stop(5, 16, true), "stop");
+    // Early exit without a terminator (loop guard / forced EOS) is a stop.
+    assert_eq!(length_or_stop(5, 16, false), "stop");
 }

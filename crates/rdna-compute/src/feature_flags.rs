@@ -125,6 +125,8 @@ pub struct FeatureFlags {
     /// at compile time. Opt-in until exact shadow and tg128 gates promote it.
     pub rdna3_hfq4_moe_gate_up_k2048: bool,
     pub mmq_override: Option<bool>,
+    /// Experimental PR #616 packed prefill for uniform MQ4 and MQ4V2.
+    pub packed_mq4_prefill: bool,
     pub mmq_min_batch: Option<usize>,
     pub fp16_disabled: bool,
     pub fp16_layer_min: Option<usize>,
@@ -328,6 +330,16 @@ pub struct FeatureFlags {
     /// on exact gfx1201; `=0` restores the v1 Q-resident kernel. Only
     /// consulted where `attn_qresident` selects the Q-resident route.
     pub attn_qresident_v2: bool,
+    /// VerifyAttn (`HIPFIRE_VERIFY_ATTN`, `kernel.verify_attn`): the
+    /// GQA-shared split-K twin of the batched flash tile + reduce for
+    /// speculative-verify-sized batches (1..=32 rows, non-tree), on gfx1100
+    /// also of the multi-row R4/R8 Q8 tile, and on gfx1151 the
+    /// context-parallel twin of the single-slot WMMA flash prefill. Default ON
+    /// on exact gfx1201, gfx1100 and gfx1151; `=0` opts out to
+    /// `attention_flash_*_tile_batched`, `attention_flash_q8_0_rows{4,8}_d8`
+    /// and `attention_q8_0_flash_prefill_wmma`. Byte-identical output; any
+    /// byte difference kills it.
+    pub verify_attn: bool,
     /// Exact gfx1201 FA deinterleave, Q/K norm and RoPE fusion.
     /// `HIPFIRE_GFX12_FA_PREP_FUSED=0` restores the original chain.
     pub gfx12_fa_prep_fused: bool,
@@ -667,6 +679,7 @@ impl FeatureFlags {
                 Some("1") | Some("on") => Some(true),
                 _ => None,
             },
+            packed_mq4_prefill: value("HIPFIRE_GFX1100_PACKED_MQ4_PREFILL").as_deref() == Ok("1"),
             mmq_min_batch: parse_usize("HIPFIRE_MMQ_MIN_BATCH"),
             fp16_disabled: value("HIPFIRE_FP16").map_or(false, |v| v == "0"),
             fp16_layer_min: parse_usize("HIPFIRE_FP16_LAYER_MIN"),
@@ -775,6 +788,8 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             attn_qresident_v2: parse_bool("HIPFIRE_ATTN_QRESIDENT_V2")
                 .unwrap_or(arch == "gfx1201"),
+            verify_attn: parse_bool("HIPFIRE_VERIFY_ATTN")
+                .unwrap_or(matches!(arch, "gfx1201" | "gfx1100" | "gfx1151")),
             gfx12_fa_prep_fused: parse_bool("HIPFIRE_GFX12_FA_PREP_FUSED")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_fa_prep_fp8q: parse_bool("HIPFIRE_GFX12_FA_PREP_FP8Q")
@@ -1086,6 +1101,7 @@ impl FeatureFlags {
             rdna3_hfq4_lm_head_k2048: false,
             rdna3_hfq4_moe_gate_up_k2048: false,
             mmq_override: None,
+            packed_mq4_prefill: false,
             mmq_min_batch: None,
             fp16_disabled: false,
             fp16_layer_min: None,
@@ -1154,6 +1170,7 @@ impl FeatureFlags {
             gfx12_fa_packet: false,
             attn_qresident: false,
             attn_qresident_v2: false,
+            verify_attn: false,
             gfx12_fa_prep_fused: false,
             gfx12_fa_prep_fp8q: false,
             gfx11_q8_fa2_wide: false,

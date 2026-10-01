@@ -684,7 +684,14 @@ impl Gpu {
         up: &GpuTensor,
         out: &GpuTensor,
     ) -> HipResult<()> {
-        self.silu_mul_launch("silu_mul_f32", gate, up, out)
+        self.silu_mul_launch(
+            "silu_mul",
+            kernels::SILU_MUL_SRC,
+            "silu_mul_f32",
+            gate,
+            up,
+            out,
+        )
     }
 
     /// [`Gpu::silu_mul_f32`] of BF16-round-tripped gate and up, the result
@@ -696,18 +703,27 @@ impl Gpu {
         up: &GpuTensor,
         out: &GpuTensor,
     ) -> HipResult<()> {
-        self.silu_mul_launch("silu_mul_bf16_rt_f32", gate, up, out)
+        self.silu_mul_launch(
+            "qwen4_silu_mul",
+            kernels::QWEN4_SILU_MUL_SRC,
+            "silu_mul_bf16_rt_f32",
+            gate,
+            up,
+            out,
+        )
     }
 
     fn silu_mul_launch(
         &mut self,
+        module: &str,
+        source: &str,
         kernel: &'static str,
         gate: &GpuTensor,
         up: &GpuTensor,
         out: &GpuTensor,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("silu_mul", kernels::SILU_MUL_SRC, kernel)?;
+        self.ensure_kernel(module, source, kernel)?;
 
         let n = gate.numel() as i32;
         let mut gate_ptr = gate.buf.as_ptr();
@@ -755,7 +771,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         const KERNEL: &str = "shared_expert_activation_bf16_f32";
-        self.ensure_kernel("silu_mul", kernels::SILU_MUL_SRC, KERNEL)?;
+        self.ensure_kernel("qwen4_silu_mul", kernels::QWEN4_SILU_MUL_SRC, KERNEL)?;
         let n = gate.numel() as i32;
         let selectors = selectors as i32;
         let gate_ptr = gate.buf.as_ptr();
@@ -2077,8 +2093,8 @@ impl Gpu {
             hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: extent exceeds i32")
         })?;
         self.ensure_kernel(
-            "bf16_round_trip",
-            kernels::BF16_ROUND_TRIP_SRC,
+            "qwen4_bf16_round_trip",
+            kernels::QWEN4_BF16_ROUND_TRIP_SRC,
             "bf16_round_trip_f32_strided",
         )?;
         let xp = x.buf.as_ptr();

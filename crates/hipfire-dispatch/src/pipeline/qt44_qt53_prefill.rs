@@ -11,7 +11,7 @@
 
 use super::layer_ops::hip;
 use crate::families::gemv::WeightRef;
-use crate::families::moe::MoePrefillParams;
+use crate::families::moe::{MoePrefillParams, MoeRouteCapability};
 use crate::types::DispatchError;
 use rdna_compute::moe::SharedExpertActivation;
 use rdna_compute::tensor_ops::{bf16_scaled_add_batched, Bf16ScaledAddBatched};
@@ -342,6 +342,24 @@ pub(crate) fn shared_down(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(),
     Ok(())
 }
 
+/// Whether path 2 takes the opt-in symmetric IU4 arm (fn-moe-sym): the layer's
+/// experts were verified symmetric at load (the policy says so), the recipe
+/// keeps the BF16 boundaries the kernels implement, the activation is F32,
+/// and the device admits it (`HIPFIRE_QWEN4_MOE_SYM_IU4=1`, gfx1151 or gfx1201, >= 512
+/// rows, C2 producers). It replaces scatter, gate/up, unscatter/rotation and
+/// down; the combine reads its BF16 rows like the F16 WMMA arm's.
+fn sym_iu4(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
+    use_path2
+        && p
+            .route_policy
+            .is_some_and(|policy| policy.capability == MoeRouteCapability::Qt44Qt53GroupedSymmetric)
+        && p.recipe.bf16_round_trip()
+        && p.x_norm_batch.dtype == DType::F32
+        && p.down_k == p.mi
+        && gpu.qwen4_moe_sym_iu4_applies(p.batch_size)
+}
+
+/// Path-2 grouping (the stage runs on path 2 only).
 pub(crate) fn scatter(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
@@ -349,6 +367,19 @@ pub(crate) fn scatter(
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
     let total_slots = p.batch_size * p.k_top;
+    if sym_iu4(gpu, p, true) {
+        return hip(gpu.moe_scatter_stable_top10(
+            p.topk_indices,
+            p.expert_token_counts,
+            p.expert_offsets,
+            p.sorted_slot_index,
+            p.expert_tile_ids,
+            p.inverse_perm,
+            total_slots,
+            p.n_exp,
+            grouped_rows,
+        ));
+    }
     hip(gpu.moe_scatter_fused_top10(
         p.topk_indices,
         p.expert_token_counts,
@@ -384,6 +415,13 @@ fn gateup_silu(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
     gateup_bf16(gpu, p) && down_wmma(gpu, p) && p.mi % 128 == 0
 }
 
+/// Whether this layer's routed experts live in host-mapped memory (spilled
+/// past the VRAM budget); the symmetric IU4 GEMMs then take a wider expert-run
+/// tile. A layer's experts share one residency, so expert 0 decides.
+fn experts_host_mapped(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
+    p.routed_experts.get(0).is_some_and(|(gate_up, _)| gpu.host_located(gate_up.buf))
+}
+
 pub(crate) fn gate_up(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
@@ -391,6 +429,22 @@ pub(crate) fn gate_up(
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
+    if sym_iu4(gpu, p, use_path2) {
+        let xq = hip(gpu.qwen4_moe_rotate256_i4(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
+        return hip(gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
+            p.expert_gate_up_ptrs,
+            p.expert_tile_ids,
+            p.sorted_slot_index,
+            &xq,
+            p.y_gate_up_grouped,
+            2 * p.mi,
+            p.gate_up_k,
+            p.k_top,
+            grouped_rows,
+            p.batch_size,
+            experts_host_mapped(gpu, p),
+        ));
+    }
     if use_path2 && gateup_bf16(gpu, p) {
         let x_f16 = if gateup_rotates_f16(gpu, p, use_path2) {
             // The grouped kernel reads packed rows (x_row * K).
@@ -469,6 +523,10 @@ pub(crate) fn unscatter(
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
+    // Symmetric IU4: SiLU in the gate/up epilogue, rotation + A4 in `down`.
+    if sym_iu4(gpu, p, true) {
+        return Ok(());
+    }
     // SiLU in the gate/up epilogue, unscatter + rotation in the down stage.
     if gateup_silu(gpu, p) {
         return Ok(());
@@ -532,7 +590,10 @@ pub(crate) fn unscatter(
 /// Whether path 2's F32 unscatter also applies the down's 128-wide rotation
 /// (in the same launch), leaving [`activation`] nothing to do.
 fn unscatter_rotates(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
-    !gateup_bf16(gpu, p) && !down_wmma(gpu, p) && p.mi.is_multiple_of(128)
+    !sym_iu4(gpu, p, true)
+        && !gateup_bf16(gpu, p)
+        && !down_wmma(gpu, p)
+        && p.mi.is_multiple_of(128)
 }
 
 /// Whether path 2's fused unscatter launch also runs the BF16 shared expert
@@ -562,9 +623,9 @@ pub(crate) fn activation(
             hip(gpu.bf16_round_trip_f32(p.rot_batch))?;
         }
     }
-    // The F16 WMMA down rotates straight to F16 itself (see `down`); the F32
-    // unscatter may already have rotated.
-    if use_path2 && (down_wmma(gpu, p) || unscatter_rotates(gpu, p)) {
+    // The F16 WMMA and symmetric IU4 downs rotate the grouped rows themselves
+    // (see `down`); the F32 unscatter may already have rotated.
+    if use_path2 && (sym_iu4(gpu, p, use_path2) || down_wmma(gpu, p) || unscatter_rotates(gpu, p)) {
         return Ok(());
     }
     hip(gpu.rotate_x_mq_128_v2(p.rot_batch, p.rot_batch, p.mi, total_slots))
@@ -588,6 +649,30 @@ pub(crate) fn down(
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
     let total_slots = p.batch_size * p.k_top;
+    if sym_iu4(gpu, p, use_path2) {
+        // Grouped BF16 SwiGLU rows -> FWHT128 -> compact flat-slot A4 ->
+        // grouped IU4 down, BF16 per grouped row for the BF16-input combine.
+        let xq = hip(gpu.qwen4_moe_rotate128_i4(
+            p.y_gate_up_grouped,
+            p.sorted_slot_index,
+            p.down_k,
+            grouped_rows,
+            total_slots,
+        ))?;
+        return hip(gpu.gemm_qwen4_moe_down_iu4_sym(
+            p.expert_down_ptrs,
+            p.expert_tile_ids,
+            p.sorted_slot_index,
+            &xq,
+            p.y_down_grouped,
+            p.down_m,
+            p.down_k,
+            1,
+            grouped_rows,
+            total_slots,
+            experts_host_mapped(gpu, p),
+        ));
+    }
     if indexed_down(gpu, p, use_path2) {
         return down(gpu, p, false, grouped_rows);
     }
@@ -662,9 +747,10 @@ pub(crate) fn combine(
     if indexed_down(gpu, p, use_path2) {
         return combine(gpu, p, false, grouped_rows);
     }
-    if use_path2 && down_wmma(gpu, p) {
-        // The rank order goes to `down_expanded`: unused on this route until
-        // the shared down, which runs after the combine.
+    if use_path2 && (down_wmma(gpu, p) || sym_iu4(gpu, p, use_path2)) {
+        // Both downs store BF16 grouped rows. The rank order goes to
+        // `down_expanded`: unused on this route until the shared down, which
+        // runs after the combine.
         hip(gpu.moe_down_combine_grouped_top10_bf16in(
             p.y_down_grouped,
             p.inverse_perm,

@@ -319,6 +319,110 @@ enum FfnGateOutput {
     A8H,
 }
 
+fn packed_mq4_down_admitted(
+    packed_admitted: bool,
+    separate: bool,
+    residual: bool,
+    down: (DType, usize, usize),
+    hidden_dim: usize,
+) -> bool {
+    packed_admitted && separate && residual
+        && down.0 == DType::MQ4G256
+        && (down.1, down.2) == (5120, 17408)
+        && hidden_dim == down.2
+}
+
+/// Only consume separate F32 gate/up planes; never reinterpret a prepared H
+/// plane or add a residual to a tensor-parallel partial output.
+fn try_packed_mq4_down(
+    gpu: &mut Gpu,
+    down: &WeightTensor,
+    pbs: &PrefillBatchScratch,
+    hidden_dim: usize,
+    n: usize,
+    epilogue: &BatchEpilogue<'_>,
+    h_source: FfnGateOutput,
+) -> HipResult<bool> {
+    if !packed_mq4_down_admitted(
+        !pbs.lean && gpu.packed_mq4_admitted(down.m, down.k, n),
+        h_source == FfnGateOutput::Separate,
+        matches!(epilogue, BatchEpilogue::Residual),
+        (down.gpu_dtype, down.m, down.k), hidden_dim,
+    ) {
+        return Ok(false);
+    }
+    gpu.flush_residual_fold()?;
+    fused_silu_mul_rotate_mq_batched_for(
+        gpu, down, &pbs.gate_ffn_batch, &pbs.up_batch,
+        &pbs.ffn_hidden_batch, hidden_dim, n,
+    )?;
+    run_residual_gemm_key(gpu, hipfire_dispatch::types::KernelKey::GemmMq4PackedResidual,
+        &down.buf, down.gpu_dtype, &pbs.ffn_hidden_batch, &pbs.x_batch,
+        down.m, down.k, n)?;
+    Ok(true)
+}
+
+/// Uniform MQ4G256 (v1) only; the explicit packed opt-in leaves all native
+/// routes unchanged when disabled. MQ4V2 (qt44, e.g. mq4-xts) keeps the landed
+/// gfx1100 builder V2C / IU4 routes: packed was not measured faster there.
+/// Lloyd and mixed wire formats are excluded.
+fn packed_mq4_ffn_gate_up_admitted(
+    packed_admitted: bool,
+    gate: (DType, usize, usize),
+    up: (DType, usize, usize),
+    n: usize,
+) -> bool {
+    packed_admitted
+        && gate.0 == DType::MQ4G256
+        && (gate.1, gate.2) == (17_408, 5_120)
+        && up == gate
+        && n > 0
+        && n % 256 == 0
+}
+
+/// Runs before native prepared producers: explicitly emit AWQ-aware rotated
+/// F32 input, never reuse a potentially unwritten F32 plane from an A8/IU4/FP8
+/// producer. Output remains separate F32 planes with no residual epilogue.
+fn try_packed_mq4_ffn_gate_up(
+    gpu: &mut Gpu,
+    gate: &WeightTensor,
+    up: &WeightTensor,
+    norm: &GpuTensor,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+) -> HipResult<bool> {
+    if !packed_mq4_ffn_gate_up_admitted(
+        !pbs.lean && gpu.packed_mq4_admitted(gate.m, gate.k, n),
+        (gate.gpu_dtype, gate.m, gate.k),
+        (up.gpu_dtype, up.m, up.k),
+        n,
+    ) {
+        return Ok(false);
+    }
+    gpu.flush_residual_fold()?;
+    let separate_awq_inputs = gate.awq_scale.is_some() || up.awq_scale.is_some();
+    for (index, (weight, output)) in [
+        (gate, &pbs.gate_ffn_batch),
+        (up, &pbs.up_batch),
+    ].into_iter().enumerate() {
+        // Sidecars are per-weight and may differ (or exist on only one side).
+        // Reuse the rotated input only when neither projection carries AWQ.
+        if index == 0 || separate_awq_inputs {
+            fused_rmsnorm_rotate_mq_batched_for(
+                gpu, &pbs.x_batch, norm, weight, &pbs.x_rot_batch,
+                weight.k, config.norm_eps, n,
+            )?;
+        }
+        run_plain_gemm_key(
+            gpu, hipfire_dispatch::types::KernelKey::GemmMq4Packed,
+            &weight.buf, weight.gpu_dtype, &pbs.x_rot_batch, output,
+            weight.m, weight.k, n,
+        )?;
+    }
+    Ok(true)
+}
+
 /// F1-lite: true when this FFN may fold SwiGLU into the gate/up GEMM, i.e.
 /// the down projection would take the AWQ IU4 SwiGLU producer
 /// ([`try_iu4_silu_prepared`] with an AWQ scale: uniform MQ4G256V2, `Residual`
@@ -1365,6 +1469,10 @@ fn prefill_chunk_rows_requested(gpu: &Gpu) -> usize {
 }
 
 fn dense_layers_are_all_mq4v2(weights: &Qwen35Weights) -> bool {
+    dense_layers_have_projection_dtype(weights, DType::MQ4G256V2)
+}
+
+fn dense_layers_have_projection_dtype(weights: &Qwen35Weights, dtype: DType) -> bool {
     !weights.layers.is_empty()
         && weights.layers.iter().all(|layer| match layer {
             LayerWeights::DeltaNet(layer) => [
@@ -1378,7 +1486,7 @@ fn dense_layers_are_all_mq4v2(weights: &Qwen35Weights) -> bool {
                 &layer.w_down,
             ]
             .iter()
-            .all(|weight| weight.gpu_dtype == DType::MQ4G256V2),
+            .all(|weight| weight.gpu_dtype == dtype),
             LayerWeights::FullAttn(layer) => [
                 &layer.wq,
                 &layer.wk,
@@ -1389,9 +1497,38 @@ fn dense_layers_are_all_mq4v2(weights: &Qwen35Weights) -> bool {
                 &layer.w_down,
             ]
             .iter()
-            .all(|weight| weight.gpu_dtype == DType::MQ4G256V2),
+            .all(|weight| weight.gpu_dtype == dtype),
             LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => false,
         })
+}
+
+fn native_mq4_widened_requested() -> bool {
+    hipfire_config::developer_var("HIPFIRE_GFX1100_MQ4_WIDE_PREFILL")
+        .ok().as_deref() == Some("1")
+}
+
+/// Separately admitted native MQ4 route: no V2 producer or lean PBS contract.
+/// Large projections use default MMQ or opt-in packed FFN (the same 144-byte
+/// activation scratch slot); small tails keep bounded FP16/ksplit fallback.
+fn native_mq4_widened_route(gpu: &Gpu, weights: &Qwen35Weights) -> bool {
+    native_mq4_widened_requested()
+        && dense_layers_have_projection_dtype(weights, DType::MQ4G256)
+        && native_mq4_widened_flags_admitted(&gpu.arch, &gpu.flags, gpu.mmq_screen.enabled)
+}
+
+fn native_mq4_widened_flags_admitted(
+    arch: &str, flags: &rdna_compute::FeatureFlags, screen: bool,
+) -> bool {
+    arch == "gfx1100"
+        && !flags.fp16_disabled
+        && !flags.rocblas_all_archs
+        && !flags.gemv_dp4a.unwrap_or(false)
+        && flags.mmq_override.is_none()
+        && flags.mmq_min_batch.is_none()
+        && !screen
+        && !flags.qkvza_split_tail
+        && !flags.mw16
+        && flags.wo_wmma_variant.is_none()
 }
 
 fn prefill_max_batch_for_model(gpu: &Gpu, weights: &Qwen35Weights) -> usize {
@@ -1522,13 +1659,16 @@ fn ordinary_prefill_static_ceiling(
     if !widened_dense_shape_admitted(config) {
         return None;
     }
-    if !dense_layers_are_all_mq4v2(weights) {
+    let native_mq4 = native_mq4_widened_route(gpu, weights);
+    if !dense_layers_are_all_mq4v2(weights) && !native_mq4 {
         return None;
     }
     // gfx1201 keeps all four FP8 projection routes. gfx11 substitutes the
     // existing IU4 K16 projection route; its full-attention layers remain on
     // Q8 FA2 because the packet kernel and FP8 KV format are gfx1201-only.
-    let projection_route_admitted = if gpu.arch == "gfx1201" {
+    let projection_route_admitted = if native_mq4 {
+        true
+    } else if gpu.arch == "gfx1201" {
         gpu.flags.gfx12_mq4v2_fp8_gateup
             && gpu.flags.gfx12_mq4v2_fp8_resid
             && gpu.flags.gfx12_mq4v2_fp8_qkvza
@@ -1716,7 +1856,7 @@ pub fn vmm_kv_token_bytes(
     } else {
         match pair.k() {
             KvMode::Fp8 => head + 2,
-            KvMode::Bf16 => head.checked_mul(2)?,
+            KvMode::Bf16 | KvMode::F16 => head.checked_mul(2)?,
             KvMode::Q8 => head / 32 * 34,
             KvMode::Asym2 | KvMode::Fwht2 => head / 4 + 4,
             KvMode::Asym3 | KvMode::Fwht3 => head * 3 / 8 + 4,
@@ -1742,7 +1882,37 @@ pub fn vmm_kv_token_bytes(
 /// Larger PBS buffers are allocated lazily and admitted per request from free
 /// VRAM *after mapped KV*, not subtracted from the lifetime context bound.
 pub fn minimum_prefill_reservation_bytes(config: &Qwen35Config, arch: &str) -> Option<usize> {
-    dense_prefill_reservation_bytes(config, WIDENED_COMMIT_ROWS, arch)
+    let base = dense_prefill_reservation_bytes(config, WIDENED_COMMIT_ROWS, arch)?;
+    // The loader has not classified all projection tensors yet. Under the
+    // explicit experimental MQ4 opt-ins, conservatively reserve their prelude
+    // too; the default V2/other-format reservation remains unchanged.
+    let packed = hipfire_config::developer_var("HIPFIRE_GFX1100_PACKED_MQ4_PREFILL")
+        .ok().as_deref() == Some("1");
+    if arch == "gfx1100" && (native_mq4_widened_requested() || packed) {
+        base.checked_add(native_mq4_projection_deficit(config, WIDENED_COMMIT_ROWS, 0, 0, 0)?)
+    } else {
+        Some(base)
+    }
+}
+
+/// Large rows use the shared 144-byte Q8_1 MMQ slot. A non-power-of-two
+/// request may leave a 2..127 row FP16 tail even under a wide ceiling;
+/// account for that slot and the four deterministic residual partials too.
+fn native_mq4_projection_deficit(
+    config: &Qwen35Config,
+    rows: usize,
+    live_mmq: usize,
+    live_f16: usize,
+    live_partials: usize,
+) -> Option<usize> {
+    let mmq = config.hidden_dim.checked_add(127)?.checked_div(128)?
+        .checked_mul(144)?.checked_mul(rows)?;
+    let tail = rows.min(127);
+    let f16 = tail.checked_mul(config.hidden_dim)?.checked_mul(2)?;
+    let partials = tail.checked_mul(config.dim)?.checked_mul(4)?.checked_mul(4)?;
+    mmq.saturating_sub(live_mmq)
+        .checked_add(f16.saturating_sub(live_f16))?
+        .checked_add(partials.saturating_sub(live_partials))
 }
 
 fn dense_prefill_reservation_bytes(
@@ -1857,6 +2027,7 @@ fn memory_admitted_rung(
     kv_cache: &llama::KvCache,
     perf_rows: usize,
     lean: bool,
+    native_mq4: bool,
     cached: Option<&PrefillBatchScratch>,
 ) -> HipResult<usize> {
     if perf_rows <= WIDENED_COMMIT_ROWS {
@@ -1907,7 +2078,14 @@ fn memory_admitted_rung(
             dense_prefill_allocation_bytes(config, rung)
         }
         .unwrap_or(usize::MAX);
-        let projection_deficit = if fp8_projection {
+        let projection_deficit = if native_mq4 {
+            native_mq4_projection_deficit(
+                config, rung,
+                gpu.scratch.q8_1_mmq_x_scratch_bytes,
+                gpu.scratch.fp16_x_scratch_bytes,
+                gpu.scratch.ksplit_det_partials_bytes,
+            ).unwrap_or(usize::MAX)
+        } else if fp8_projection {
             let x_need = rung.checked_mul(config.hidden_dim).unwrap_or(usize::MAX);
             let sums_need = rung
                 .checked_mul(fp8_groups)
@@ -1991,7 +2169,9 @@ fn ordinary_prefill_chunk_limit_with_cache(
         return Ok(perf.min(legacy));
     }
     let lean = lean_pbs_requested() && lean_pbs_route(gpu, weights, config, perf);
-    let mut admitted = memory_admitted_rung(gpu, config, kv_cache, perf, lean, cached)?;
+    let mut admitted = memory_admitted_rung(
+        gpu, config, kv_cache, perf, lean, native_mq4_widened_route(gpu, weights), cached,
+    )?;
     if let Some(p) = pbs {
         admitted = admitted.min(p.max_batch);
     }
@@ -2020,6 +2200,25 @@ pub(crate) fn next_exact_prefill_chunk_len(remaining: usize, ceiling: usize) -> 
         chunk -= MIN_BATCH;
     }
     Some(chunk)
+}
+
+/// Coalesce only complete legacy 512-row chunks for packed FFN. Preserve
+/// the legacy irregular tail (including 511+2 for a singleton remainder),
+/// so changing the ceiling does not change which rows use packed quantization.
+fn next_packed_prefill_chunk_len(remaining: usize, ceiling: usize) -> Option<usize> {
+    if ceiling <= WIDENED_COMMIT_ROWS {
+        return next_prefill_chunk_len(remaining, ceiling);
+    }
+    let mut full = remaining / WIDENED_COMMIT_ROWS;
+    if remaining % WIDENED_COMMIT_ROWS == 1 {
+        full = full.saturating_sub(1);
+    }
+    let merged = full.min(ceiling / WIDENED_COMMIT_ROWS) * WIDENED_COMMIT_ROWS;
+    if merged > 0 {
+        Some(merged)
+    } else {
+        next_prefill_chunk_len(remaining, WIDENED_COMMIT_ROWS)
+    }
 }
 ///
 /// Serve-caller outer chunk under a widened ceiling. Keep a short final region
@@ -3039,7 +3238,13 @@ fn forward_prefill_batch_with_pbs_opts_inner(
             let remaining = n - chunk_start;
             // Widened grouping keeps an odd tail attached to the largest
             // admitted chunk so its GEMMs use the padded multi-row route.
-            let chunk_n = if wide {
+            let chunk_n = if wide
+                && gpu.arch == "gfx1100"
+                && gpu.flags.packed_mq4_prefill
+                && dense_layers_have_projection_dtype(weights, DType::MQ4G256)
+            {
+                next_packed_prefill_chunk_len(remaining, chunk_batch)
+            } else if wide {
                 next_exact_prefill_chunk_len(remaining, chunk_batch)
             } else {
                 next_prefill_chunk_len(remaining, chunk_batch)
@@ -6186,7 +6391,7 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
 /// post-attention/down hooks.
 ///
 /// True only for the frozen fixture route: chain (non-tree) verify on exact
-/// gfx1100, the slice kill switch clear, an MQ4G256V2 residual consumer, a
+/// gfx1100 or exact gfx1201, the slice kill switch clear, an MQ4G256V2 residual consumer, a
 /// `Residual` epilogue, and a verify-block batch `1 <= n <= 16`. Every false
 /// keeps the pre-change path byte-for-byte.
 fn s4_residual_fast(
@@ -6198,7 +6403,7 @@ fn s4_residual_fast(
 ) -> bool {
     fusion == DflashFusionCtx::ChainVerify
         && !gpu.flags.mq_f16_residual_off
-        && gpu.arch_caps.is_gfx1100()
+        && gpu.arch_caps.supports_dflash_f16_residual_fusions()
         && w_dtype == DType::MQ4G256V2
         && matches!(epilogue, BatchEpilogue::Residual)
         && (1..=16).contains(&n)
@@ -7023,6 +7228,11 @@ fn batch_chunk_delta_net_ffn_gate_up(
     f1lite: bool,
 ) -> HipResult<FfnGateOutput> {
     let _ = fusion;
+    if try_packed_mq4_ffn_gate_up(
+        gpu, &layer.w_gate, &layer.w_up, &layer.ffn_norm, config, pbs, n,
+    )? {
+        return Ok(FfnGateOutput::Separate);
+    }
     // S3-f16-projection-inputs fast path: exact-FP16 FFN gate/up inputs.
     // gate/up share the pre-rotation input, so both must be MQ4G256V2.
     if mq_f16_projection_fast_route(gpu, fusion, n, dim)
@@ -7465,6 +7675,9 @@ fn batch_chunk_delta_net_ffn_down(
     fusion: DflashFusionCtx,
     h_source: FfnGateOutput,
 ) -> HipResult<()> {
+    if try_packed_mq4_down(gpu, &layer.w_down, pbs, hidden_dim, n, &epilogue, h_source)? {
+        return Ok(());
+    }
     // S4: one silu*up+FWHT+F16 producer + direct-F16 residual GEMM instead
     // of fused_silu_mul_rotate_mq_batched + convert.
     if h_source == FfnGateOutput::Separate
@@ -8619,21 +8832,27 @@ fn batch_chunk_full_attn_output_projection(
     Ok(())
 }
 
-/// Context length past which an admitted gfx1100/gfx1201 Q8 small-batch attend step
-/// leaves the batched masked FA kernel for the multi-row tile. Measured with
-/// the Qwen3.8-27B verify shape (`bench_flash_rows`, tile 128). The conservative
-/// 4k boundary is retained across both measured architectures.
+/// Context length past which an admitted Q8 small-batch attend step leaves
+/// the batched masked FA kernel for the multi-row tile. Measured with the
+/// Qwen3.8-27B verify shape (`bench_flash_rows`, tile 128); gfx1100 and
+/// gfx1201 keep the conservative 4k boundary by default. gfx1151 is opt-in:
+/// it takes the route only when `HIPFIRE_FA_PERTOKEN_MIN_CTX` is set.
 /// `HIPFIRE_FA_PERTOKEN_MIN_CTX` overrides; `0` disables the route.
-pub(crate) fn fa_pertoken_min_ctx() -> Option<usize> {
-    use std::sync::OnceLock;
-    static MIN_CTX: OnceLock<Option<usize>> = OnceLock::new();
-    *MIN_CTX.get_or_init(|| {
-        let v = hipfire_config::developer_var("HIPFIRE_FA_PERTOKEN_MIN_CTX")
+pub(crate) fn fa_pertoken_min_ctx(arch: &str) -> Option<usize> {
+    static EXPLICIT: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_FA_PERTOKEN_MIN_CTX")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4_096);
-        (v > 0).then_some(v)
-    })
+    });
+    fa_pertoken_min_ctx_for(arch, *EXPLICIT)
+}
+
+fn fa_pertoken_min_ctx_for(arch: &str, explicit: Option<usize>) -> Option<usize> {
+    match explicit {
+        Some(v) => (v > 0).then_some(v),
+        None if arch == "gfx1151" => None,
+        None => Some(4_096),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8649,7 +8868,7 @@ fn q8_multirow_attn_admitted(
     capture_mode: bool,
     replay_recording: bool,
 ) -> bool {
-    matches!(arch, "gfx1100" | "gfx1201")
+    matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
         && quant_q8
         && matches!(head_dim, 128 | 256)
         && (4..=32).contains(&n)
@@ -8779,7 +8998,7 @@ fn batch_chunk_fa_attend(
             && stride == WIDENED_COMMIT_ROWS
             && (64..=8192).contains(&n)
             && (n <= WIDENED_COMMIT_ROWS || n % WIDENED_COMMIT_ROWS == 0)
-            && (64..=32768).contains(&max_ctx_len)
+            && gpu.fa2_gfx11_ctx_admitted(max_ctx_len)
             && start_pos.checked_add(n) == Some(max_ctx_len)
             && max_ctx_len <= kv_cache.physical_cap
             && tree_verify.is_none();
@@ -8865,7 +9084,9 @@ fn batch_chunk_fa_attend(
         );
     }
     if multirow {
-        debug_assert!(gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201());
+        debug_assert!(
+            gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201()
+        );
         debug_assert!(kv_cache.quant_q8);
         debug_assert!(matches!(config.head_dim, 128 | 256));
         gpu.kv_cache_write_q8_0_batched(
@@ -9242,6 +9463,11 @@ fn batch_chunk_full_attn_ffn_gate_up(
     f1lite: bool,
 ) -> HipResult<FfnGateOutput> {
     let _ = fusion;
+    if try_packed_mq4_ffn_gate_up(
+        gpu, &layer.w_gate, &layer.w_up, &layer.ffn_norm, config, pbs, n,
+    )? {
+        return Ok(FfnGateOutput::Separate);
+    }
     // S3-f16-projection-inputs fast path: exact-FP16 FA-FFN gate/up inputs.
     if mq_f16_projection_fast_route(gpu, fusion, n, dim)
         && layer.w_gate.gpu_dtype == DType::MQ4G256V2
@@ -9679,6 +9905,9 @@ fn batch_chunk_full_attn_ffn_down(
     fusion: DflashFusionCtx,
     h_source: FfnGateOutput,
 ) -> HipResult<()> {
+    if try_packed_mq4_down(gpu, &layer.w_down, pbs, hidden_dim, n, &epilogue, h_source)? {
+        return Ok(());
+    }
     // S4: one silu*up+FWHT+F16 producer + direct-F16 residual GEMM instead
     // of fused_silu_mul_rotate_mq_batched + convert.
     if h_source == FfnGateOutput::Separate
@@ -11608,7 +11837,7 @@ fn fa_pair_env_admitted(
         return false;
     }
     // Same window the second half would see through ingress/dispatch.
-    if !(64..=32768).contains(&max_ctx_end) {
+    if !gpu.fa2_gfx11_ctx_admitted(max_ctx_end) {
         return false;
     }
     if !gpu.flags.gfx11_fa2_prefill {
@@ -12005,13 +12234,13 @@ fn forward_prefill_chunk_pair(
             _ => true,
         });
     // Merge only when both halves take the plain dispatch route. Multirow
-    // is never admitted on gfx1151 (arch gate above it); the per-half
+    // never admits a 512-row half (its window is 4..=32 rows); the per-half
     // fallback below keeps this fail-closed if that ever changes.
     let multirow_common = (
         gpu.arch_caps.arch(),
         kv_cache.quant_q8,
         config.head_dim,
-        fa_pertoken_min_ctx(),
+        fa_pertoken_min_ctx(gpu.arch_caps.arch()),
         gpu.graphs.capture_mode,
         gpu.replay.is_recording(),
     );
@@ -12705,7 +12934,7 @@ pub(crate) fn forward_batch_chunk_impl(
         config.head_dim,
         n,
         start_pos + n,
-        fa_pertoken_min_ctx(),
+        fa_pertoken_min_ctx(gpu.arch_caps.arch()),
         tree_verify.is_some(),
         batch_semantics.is_independent(),
         gpu.graphs.capture_mode,
@@ -13617,8 +13846,56 @@ mod tests {
     use rdna_compute::DType;
 
     #[test]
-    fn q8_multirow_attn_admits_only_measured_arch_shapes() {
-        for arch in ["gfx1100", "gfx1201"] {
+    fn packed_mq4_ffn_gate_up_route_is_exact_and_opt_in() {
+        let shape = (DType::MQ4G256, 17_408, 5_120);
+        let v2 = (DType::MQ4G256V2, 17_408, 5_120);
+        for n in [256, 512, 768] {
+            assert!(packed_mq4_ffn_gate_up_admitted(true, shape, shape, n));
+            // MQ4V2 keeps the landed V2C / IU4 routes.
+            assert!(!packed_mq4_ffn_gate_up_admitted(true, v2, v2, n));
+            assert!(!packed_mq4_ffn_gate_up_admitted(false, shape, shape, n));
+            assert!(!packed_mq4_ffn_gate_up_admitted(false, v2, v2, n));
+            assert!(!packed_mq4_ffn_gate_up_admitted(true, shape, v2, n));
+            assert!(!packed_mq4_ffn_gate_up_admitted(true, v2, shape, n));
+        }
+        for n in [0, 1, 128, 255, 257] {
+            assert!(!packed_mq4_ffn_gate_up_admitted(true, shape, shape, n));
+            assert!(!packed_mq4_ffn_gate_up_admitted(true, v2, v2, n));
+        }
+        for rejected in [
+            (DType::MQ4G256V2Lloyd, 17_408, 5_120),
+            (DType::MQ4G256Lloyd, 17_408, 5_120),
+            (DType::HFQ4G256, 17_408, 5_120),
+            (DType::Q8_0, 17_408, 5_120),
+            (DType::MQ4G256, 8_704, 5_120),
+            (DType::MQ4G256, 17_408, 2_560),
+        ] {
+            assert!(!packed_mq4_ffn_gate_up_admitted(true, rejected, shape, 256));
+            assert!(!packed_mq4_ffn_gate_up_admitted(true, shape, rejected, 256));
+            assert!(!packed_mq4_ffn_gate_up_admitted(true, rejected, rejected, 256));
+        }
+    }
+
+    #[test]
+    fn packed_mq4_down_refuses_prepared_partial_and_nonuniform_inputs() {
+        assert!(!packed_mq4_down_admitted(true, true, true, (DType::MQ4G256V2, 5120, 17408), 17408));
+        for dtype in [DType::MQ4G256] {
+            let shape = (dtype, 5120, 17408);
+            assert!(packed_mq4_down_admitted(true, true, true, shape, 17408));
+            assert!(!packed_mq4_down_admitted(false, true, true, shape, 17408));
+            assert!(!packed_mq4_down_admitted(true, false, true, shape, 17408));
+            assert!(!packed_mq4_down_admitted(true, true, false, shape, 17408));
+            assert!(!packed_mq4_down_admitted(true, true, true, shape, 8704));
+            assert!(!packed_mq4_down_admitted(true, true, true, (dtype, 2560, 17408), 17408));
+        }
+        for dtype in [DType::MQ4G256V2Lloyd, DType::MQ4G256Lloyd, DType::HFQ4G256, DType::Q8_0] {
+            assert!(!packed_mq4_down_admitted(true, true, true, (dtype, 5120, 17408), 17408));
+        }
+    }
+
+    #[test]
+    fn q8_multirow_attn_admits_only_explicit_arch_shapes() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             for head_dim in [128, 256] {
                 for n in [4, 8, 32] {
                     assert!(q8_multirow_attn_admitted(
@@ -13770,31 +14047,25 @@ mod tests {
 
     #[test]
     fn q8_multirow_attn_rejects_replay_recording_on_supported_arches() {
-        for arch in ["gfx1100", "gfx1201"] {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             assert!(q8_multirow_attn_admitted(
-                arch,
-                true,
-                256,
-                8,
-                8192,
-                Some(4096),
-                false,
-                false,
-                false,
-                false,
+                arch, true, 256, 8, 8192, Some(4096), false, false, false, false,
             ));
             assert!(!q8_multirow_attn_admitted(
-                arch,
-                true,
-                256,
-                8,
-                8192,
-                Some(4096),
-                false,
-                false,
-                false,
-                true,
+                arch, true, 256, 8, 8192, Some(4096), false, false, false, true,
             ));
+        }
+    }
+
+    #[test]
+    fn fa_pertoken_min_ctx_is_opt_in_on_gfx1151_only() {
+        for arch in ["gfx1100", "gfx1201"] {
+            assert_eq!(fa_pertoken_min_ctx_for(arch, None), Some(4096));
+        }
+        assert_eq!(fa_pertoken_min_ctx_for("gfx1151", None), None);
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            assert_eq!(fa_pertoken_min_ctx_for(arch, Some(8192)), Some(8192));
+            assert_eq!(fa_pertoken_min_ctx_for(arch, Some(0)), None);
         }
     }
 
@@ -15198,6 +15469,35 @@ mod tests {
     }
 
     #[test]
+    fn packed_widening_preserves_legacy_commits_and_quant_routes() {
+        fn plan(mut rows: usize, ceiling: usize) -> Vec<(usize, bool)> {
+            let mut out = Vec::new();
+            while rows > 0 {
+                let n = next_packed_prefill_chunk_len(rows, ceiling).unwrap();
+                assert!(n >= 2 && n <= ceiling);
+                let packed = n % 256 == 0;
+                let mut left = n;
+                while left > 0 {
+                    let segment = left.min(512);
+                    out.push((segment, packed));
+                    left -= segment;
+                }
+                rows -= n;
+            }
+            out
+        }
+        assert_eq!(next_packed_prefill_chunk_len(4097, 4096), Some(3584));
+        assert_eq!(next_packed_prefill_chunk_len(513, 4096), Some(511));
+        assert_eq!(next_packed_prefill_chunk_len(1, 4096), None);
+        for rows in 2..=16385 {
+            let base = plan(rows, 512);
+            for ceiling in [1024, 2048, 4096, 8192] {
+                assert_eq!(plan(rows, ceiling), base, "rows={rows} ceiling={ceiling}");
+            }
+        }
+    }
+
+    #[test]
     fn widened_direct_flattened_commits_equal_legacy_schedule() {
         fn schedule(mut remaining: usize, ceiling: usize, exact: bool) -> Vec<usize> {
             let mut chunks = Vec::new();
@@ -15277,6 +15577,7 @@ mod tests {
         Qwen35Config {
             dim: 5120,
             n_layers: 64,
+            i_gpu_start: 0,
             vocab_size: 152064,
             norm_eps: 1e-6,
             eos_token: 2,
@@ -15326,6 +15627,50 @@ mod tests {
             vmm_kv_token_bytes(&config, KvPair::Split(KvMode::Fwht3, VMode::Lloyd3), false),
             Some(12_800)
         );
+    }
+
+    #[test]
+    fn native_mq4_wide_rejects_unaudited_dispatch_overrides() {
+        let make = || rdna_compute::FeatureFlags::for_test("gfx1100");
+        assert!(native_mq4_widened_flags_admitted("gfx1100", &make(), false));
+        assert!(!native_mq4_widened_flags_admitted("gfx1201", &make(), false));
+        assert!(!native_mq4_widened_flags_admitted("gfx1100", &make(), true));
+        let mut variants = Vec::new();
+        let mut f = make(); f.fp16_disabled = true; variants.push(f);
+        let mut f = make(); f.rocblas_all_archs = true; variants.push(f);
+        let mut f = make(); f.gemv_dp4a = Some(true); variants.push(f);
+        let mut f = make(); f.mmq_override = Some(false); variants.push(f);
+        let mut f = make(); f.mmq_min_batch = Some(2048); variants.push(f);
+        let mut f = make(); f.qkvza_split_tail = true; variants.push(f);
+        let mut f = make(); f.mw16 = true; variants.push(f);
+        let mut f = make(); f.wo_wmma_variant = Some("k4".into()); variants.push(f);
+        // Packed FFN shares the budgeted MMQ slot and keeps native tails.
+        let mut packed = make();
+        packed.packed_mq4_prefill = true;
+        assert!(native_mq4_widened_flags_admitted("gfx1100", &packed, false));
+        packed.mmq_override = Some(false);
+        assert!(!native_mq4_widened_flags_admitted("gfx1100", &packed, false));
+        for f in variants {
+            assert!(!native_mq4_widened_flags_admitted("gfx1100", &f, false));
+        }
+    }
+
+    #[test]
+    fn native_mq4_wide_scratch_counts_mmq_and_small_tail() {
+        let config = widened_test_config();
+        let mmq = 8192 * 136 * 144;
+        let f16 = 127 * 17408 * 2;
+        let partials = 127 * 5120 * 4 * 4;
+        assert_eq!(mmq, 153 * 1024 * 1024);
+        assert_eq!(native_mq4_projection_deficit(&config, 8192, 0, 0, 0),
+                   Some(mmq + f16 + partials));
+        assert_eq!(native_mq4_projection_deficit(&config, 8192, mmq, f16, partials), Some(0));
+        assert_eq!(native_mq4_projection_deficit(&config, 8192, mmq + 1, 0, partials), Some(f16));
+        assert_eq!(native_mq4_projection_deficit(&config, usize::MAX, 0, 0, 0), None);
+        for rows in [512, 1024, 2048, 4096, 8192] {
+            assert_eq!(native_mq4_projection_deficit(&config, rows, 0, 0, 0),
+                       Some(rows * 19584 + f16 + partials));
+        }
     }
 
     #[test]

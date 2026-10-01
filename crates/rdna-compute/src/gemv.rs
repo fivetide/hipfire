@@ -2337,15 +2337,18 @@ impl Gpu {
             .ensure_mq_signs_128(&self.hip, &mut self.pool, self.device_id)
     }
 
-    /// MagnumQuant GEMV: FWHT-rotated HFQ4-G256. Rotates x per group via ds_swizzle,
-    /// then standard 4-bit dot product. signs1/signs2 are the FWHT sign tables (256 floats each).
+    /// MagnumQuant GEMV: FWHT-rotated HFQ4-G256.
+    ///
+    /// `x` must be **pre-rotated** — one `mq_rotate_x` pass over x, not per row —
+    /// because the kernel's inner loop is the plain HFQ4-G256 dot product and does
+    /// no rotation of its own. (The sign tables belong to `mq_rotate_x`, not here:
+    /// passing them as kernargs shifted `m`/`k` out of their slots, which is why
+    /// this wrapper's callers saw an all-zero result.)
     pub fn gemv_mq4g256(
         &mut self,
         a_raw: &GpuTensor,
         x: &GpuTensor,
         y: &GpuTensor,
-        signs1: &GpuTensor,
-        signs2: &GpuTensor,
         m: usize,
         k: usize,
     ) -> HipResult<()> {
@@ -2355,16 +2358,12 @@ impl Gpu {
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
         let mut y_ptr = y.buf.as_ptr();
-        let mut s1_ptr = signs1.buf.as_ptr();
-        let mut s2_ptr = signs2.buf.as_ptr();
         let mut m_val = m as i32;
         let mut k_val = k as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut a_ptr as *mut _ as *mut c_void,
             &mut x_ptr as *mut _ as *mut c_void,
             &mut y_ptr as *mut _ as *mut c_void,
-            &mut s1_ptr as *mut _ as *mut c_void,
-            &mut s2_ptr as *mut _ as *mut c_void,
             &mut m_val as *mut _ as *mut c_void,
             &mut k_val as *mut _ as *mut c_void,
         ];
@@ -5592,7 +5591,7 @@ impl Gpu {
         }
         self.bind_thread()?;
         const FUNC: &str = "hyper_read_projected_rotate_f32";
-        self.ensure_kernel("mq_rotate_x", kernels::GEMV_MQ4G256_SRC, FUNC)?;
+        self.ensure_kernel("qwen4_gemv_mq4g256", kernels::QWEN4_GEMV_MQ4G256_SRC, FUNC)?;
         self.ensure_mq_signs()?;
         let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
@@ -5716,7 +5715,7 @@ impl Gpu {
         } else {
             "mq_rotate_x_f16"
         };
-        self.ensure_kernel("mq_rotate_x", kernels::GEMV_MQ4G256_SRC, func)?;
+        self.ensure_kernel("qwen4_gemv_mq4g256", kernels::QWEN4_GEMV_MQ4G256_SRC, func)?;
         self.ensure_mq_signs()?;
         let out = self.qwen4_f16_x_scratch(ldo * batch_size)?;
         let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
@@ -15677,7 +15676,7 @@ impl Gpu {
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched",
-            kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_BATCHED_SRC,
+            kernels::gemv_mq4g256v2_moe_gate_up_k8_indexed_batched_src(self.arch_caps.is_gfx1151()),
             "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched",
         )?;
         let pp = expert_ptrs.buf.as_ptr();
@@ -17437,7 +17436,7 @@ impl Gpu {
         // four per block (132 -> 218 GB/s against gemv_q8_0_wide).
         if self.arch_caps.is_gfx1151() && k == 320 {
             const FUNC: &str = "gemv_q8_0_k320_staged";
-            self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, FUNC)?;
+            self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, FUNC)?;
             let mut params = [
                 &a_ptr as *const _ as *mut c_void,
                 &x_ptr as *const _ as *mut c_void,
@@ -17464,7 +17463,11 @@ impl Gpu {
         // math on rows staged through LDS, four per block (bitwise).
         if self.arch_caps.is_gfx1151() && k == 640 {
             const FUNC: &str = "gemv_q8_0_wide_k640_staged";
-            self.ensure_kernel("gemv_q8_0_wide", kernels::GEMV_Q8_0_WIDE_SRC, FUNC)?;
+            self.ensure_kernel(
+                "qwen4_gemv_q8_0_wide",
+                kernels::QWEN4_GEMV_Q8_0_WIDE_SRC,
+                FUNC,
+            )?;
             let mut params = [
                 &a_ptr as *const _ as *mut c_void,
                 &x_ptr as *const _ as *mut c_void,
@@ -17517,7 +17520,7 @@ impl Gpu {
         // values; 226 -> 241 GB/s on the Qwen4 LM head).
         if self.arch_caps.is_gfx1151() && k == 2560 {
             const FUNC: &str = "gemv_q8_0_k2560_staged";
-            self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, FUNC)?;
+            self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, FUNC)?;
             let mut params = [
                 &a_ptr as *const _ as *mut c_void,
                 &x_ptr as *const _ as *mut c_void,
@@ -17578,7 +17581,7 @@ impl Gpu {
         }
         self.bind_thread()?;
         const FUNC: &str = "gemv_q8_0_k2560_staged_pair";
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, FUNC)?;
+        self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, FUNC)?;
         let p0 = a0.buf.as_ptr();
         let p1 = a1.buf.as_ptr();
         let xp = x.buf.as_ptr();
@@ -17900,7 +17903,7 @@ impl Gpu {
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_bf16_xf32",
-            kernels::GEMV_BF16_XF32_SRC,
+            kernels::gemv_bf16_xf32_src(self.arch_caps.is_gfx1151()),
             "gemv_bf16_xf32",
         )?;
 
@@ -17959,8 +17962,8 @@ impl Gpu {
         }
         self.bind_thread()?;
         self.ensure_kernel(
-            "gemv_bf16_xf32",
-            kernels::GEMV_BF16_XF32_SRC,
+            "qwen4_gemv_bf16_xf32",
+            kernels::QWEN4_GEMV_BF16_XF32_SRC,
             "gemv_bf16_xf32_k4",
         )?;
         self.launch_gemv_split("gemv_bf16_xf32_k4", 128, weight, x, y, m, k, hc_act_scale)
@@ -17984,7 +17987,11 @@ impl Gpu {
             ));
         }
         self.bind_thread()?;
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "gemv_q8_0_k8")?;
+        self.ensure_kernel(
+            "qwen4_gemv_q8_0",
+            kernels::QWEN4_GEMV_Q8_0_SRC,
+            "gemv_q8_0_k8",
+        )?;
         self.launch_gemv_split("gemv_q8_0_k8", 256, weight, x, y, m, k, hc_act_scale)
     }
 
@@ -18021,7 +18028,7 @@ impl Gpu {
         }
         self.bind_thread()?;
         let func = FUNCS[rows - 2];
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, func)?;
+        self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, func)?;
         let w_ptr = weight.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -18075,8 +18082,8 @@ impl Gpu {
         let chunk = n.div_ceil(GROUPS);
         let (module, src, rescore) = match head.dtype {
             DType::Q8_0 => (
-                "gemv_q8_0",
-                kernels::GEMV_Q8_0_SRC,
+                "qwen4_gemv_q8_0",
+                kernels::QWEN4_GEMV_Q8_0_SRC,
                 "topk8_rescore_q8_0_k2560",
             ),
             DType::MQ6G256V2 => (
@@ -18095,7 +18102,11 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(1, "topk8_rescore_k2560 shape"));
         }
         self.bind_thread()?;
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "topk8_partial_f32")?;
+        self.ensure_kernel(
+            "qwen4_gemv_q8_0",
+            kernels::QWEN4_GEMV_Q8_0_SRC,
+            "topk8_partial_f32",
+        )?;
         self.ensure_kernel(module, src, rescore)?;
         let v_ptr = logits.buf.as_ptr();
         let pv_ptr = partial.buf.as_ptr();
@@ -18187,7 +18198,11 @@ impl Gpu {
         if k != 2560 && k != 320 {
             // gemv_q8_0's small-K wide kernel, per row.
             const FUNC: &str = "gemv_q8_0_wide_rows";
-            self.ensure_kernel("gemv_q8_0_wide", kernels::GEMV_Q8_0_WIDE_SRC, FUNC)?;
+            self.ensure_kernel(
+                "qwen4_gemv_q8_0_wide",
+                kernels::QWEN4_GEMV_Q8_0_WIDE_SRC,
+                FUNC,
+            )?;
             let a_ptr = a_raw.buf.as_ptr();
             let x_ptr = x.buf.as_ptr();
             let y_ptr = y.buf.as_ptr();
@@ -18223,7 +18238,7 @@ impl Gpu {
         } else {
             ("gemv_q8_0_k320_staged_rows", m.div_ceil(2) as u32, 64u32)
         };
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, func)?;
+        self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, func)?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -18262,7 +18277,11 @@ impl Gpu {
             ));
         }
         self.bind_thread()?;
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "quantize_bf16_q8_0")?;
+        self.ensure_kernel(
+            "qwen4_gemv_q8_0",
+            kernels::QWEN4_GEMV_Q8_0_SRC,
+            "quantize_bf16_q8_0",
+        )?;
         let blocks = (m * k / 32) as i32;
         let out = self.alloc_tensor(&[m * k / 32 * 34], DType::Q8_0)?;
         let w_ptr = weight.buf.as_ptr();
@@ -18293,6 +18312,26 @@ impl Gpu {
                 Err(error)
             }
         }
+    }
+
+    /// `(F32 scratch, packed output)` bytes [`Self::requant_g256`] allocates
+    /// for an `[m, k]` weight; `None` for a non-MQ-G256-V2 target. The
+    /// scratch goes back to the device (not the pool) when the requant
+    /// returns, so only the packed output stays allocated.
+    pub fn requant_g256_bytes(m: usize, k: usize, target: DType) -> Option<(usize, usize)> {
+        let bits = match target {
+            DType::MQ2G256V2 => 2,
+            DType::MQ3G256V2 => 3,
+            DType::MQ4G256V2 => 4,
+            DType::MQ5G256V2 => 5,
+            DType::MQ6G256V2 => 6,
+            _ => return None,
+        };
+        let n = m.checked_mul(k)?;
+        Some((
+            n.checked_mul(std::mem::size_of::<f32>())?,
+            (n / 256).checked_mul(8 + 32 * bits)?,
+        ))
     }
 
     /// Requantize a row-major `[m, k]` weight into an MQ{2,3,4,5,6}G256V2
@@ -18334,10 +18373,13 @@ impl Gpu {
         if m == 0 || !k.is_multiple_of(256) {
             return bad("needs m > 0 and K % 256 == 0");
         }
+        let Some((_, out_bytes)) = Self::requant_g256_bytes(m, k, target) else {
+            return bad("weight size overflows");
+        };
         self.bind_thread()?;
         let n = m * k;
         let values = self.alloc_tensor(&[n], DType::F32)?;
-        let out = self.alloc_tensor(&[n / 256 * (8 + 32 * bits as usize)], target)?;
+        let out = self.alloc_tensor(&[out_bytes], target)?;
         let run = |gpu: &mut Self,
                    func: &str,
                    src: &GpuTensor,
@@ -18376,7 +18418,10 @@ impl Gpu {
             run(self, "requant_pack_mqg256v2", &values, &out, n / 128, bits)?;
             self.hip.device_synchronize()
         })();
-        let freed = self.free_tensor(values);
+        // Back to the device, not the pool: a pooled vocab x hidden F32
+        // scratch (2.5 GB for a 248k x 2560 head) sits in a size bucket no
+        // later allocation reuses.
+        let freed = self.release_tensor_immediate(values);
         match result.and(freed) {
             Ok(()) => Ok(out),
             Err(error) => {
@@ -18448,7 +18493,11 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         const FUNC: &str = "gemv_bf16_xf32_bf16_scaled_add";
-        self.ensure_kernel("gemv_bf16_xf32", kernels::GEMV_BF16_XF32_SRC, FUNC)?;
+        self.ensure_kernel(
+            "qwen4_gemv_bf16_xf32",
+            kernels::QWEN4_GEMV_BF16_XF32_SRC,
+            FUNC,
+        )?;
         let w_ptr = weight.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let r_ptr = residual.buf.as_ptr();
@@ -18486,8 +18535,8 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
-            "gemv_bf16_xf32",
-            kernels::GEMV_BF16_XF32_SRC,
+            "qwen4_gemv_bf16_xf32",
+            kernels::QWEN4_GEMV_BF16_XF32_SRC,
             "gemv_bf16_xf32_x4",
         )?;
         let w = parts.map(|(w, _, _)| w.buf.as_ptr());
@@ -18633,7 +18682,11 @@ impl Gpu {
         }
         let func = FUNCS[rows - 2];
         self.bind_thread()?;
-        self.ensure_kernel("gemv_bf16_xf32", kernels::GEMV_BF16_XF32_SRC, func)?;
+        self.ensure_kernel(
+            "qwen4_gemv_bf16_xf32",
+            kernels::QWEN4_GEMV_BF16_XF32_SRC,
+            func,
+        )?;
         let w = parts.map(|(w, _, _)| w.buf.as_ptr());
         let y = parts.map(|(_, y, _)| y.buf.as_ptr());
         let m = parts.map(|(_, _, m)| m as i32);
@@ -20392,10 +20445,11 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (v2_src, v2_module) =
-            kernels::gemv_mq6g256v2_for_arch(&self.arch_caps, self.flags.rdna2_variant);
-        let module_v2 = format!("{}_mq6v2", v2_module);
-        self.ensure_kernel(&module_v2, v2_src, "gemv_mq6g256v2_x4")?;
+        self.ensure_kernel(
+            "qwen4_gemv_mq6g256v2",
+            kernels::QWEN4_GEMV_MQ6G256V2_SRC,
+            "gemv_mq6g256v2_x4",
+        )?;
         let a = parts.map(|(w, _, _)| w.buf.as_ptr());
         let y = parts.map(|(_, y, _)| y.buf.as_ptr());
         let m = parts.map(|(_, _, m)| m as i32);

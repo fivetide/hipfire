@@ -22,6 +22,7 @@ use hipfire_runtime::external_rows::{RowEncoding, RowStore, RowStoreError};
 use hipfire_runtime::model_source::{SourceFormat, SourceRangeDescriptor};
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
 use hipfire_runtime::weight_store::{WeightLoadTransaction, WeightStoreError};
+use crate::state::Qwen4StateFormat;
 use rdna_compute::{Gpu, GpuTensor};
 use std::fmt;
 use std::time::Duration;
@@ -103,7 +104,8 @@ pub struct Qwen4Bundle {
 
 impl Qwen4Bundle {
     /// Assemble a complete Single bundle using metadata parsed from the
-    /// artifact's canonical `qwen4_ple` object.
+    /// artifact's canonical `qwen4_ple` object. `state_format` is the request
+    /// state's storage ([`crate::resolve_state_format`]).
     pub fn assemble(
         config: Qwen4Config,
         transaction: WeightLoadTransaction,
@@ -111,8 +113,17 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         max_seq_len: usize,
         metadata: PleHashMetadata,
+        state_format: Qwen4StateFormat,
     ) -> Result<Self, BundleError> {
-        Self::assemble_with_metadata(config, transaction, placements, gpu, max_seq_len, metadata)
+        Self::assemble_with_metadata(
+            config,
+            transaction,
+            placements,
+            gpu,
+            max_seq_len,
+            metadata,
+            state_format,
+        )
     }
 
     /// Assemble with validated metadata read from the artifact's exact I64
@@ -125,6 +136,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         max_seq_len: usize,
         metadata: PleHashMetadata,
+        state_format: Qwen4StateFormat,
     ) -> Result<Self, BundleError> {
         let weights = match Qwen4Weights::assemble(&mut transaction, &config, placements) {
             Ok(weights) => weights,
@@ -155,7 +167,7 @@ impl Qwen4Bundle {
                 ));
             }
         };
-        let mut state = match Qwen4State::new(gpu, &config, max_seq_len) {
+        let mut state = match Qwen4State::new(gpu, &config, max_seq_len, state_format) {
             Ok(state) => state,
             Err(error) => {
                 // `unload` consumes the reader and joins its worker even on a
@@ -245,7 +257,31 @@ impl Qwen4Bundle {
                 "Qwen4 forward chunk capacity is zero".to_string(),
             ));
         }
+        // A chunk's PLE prefetch may exceed one row-store staging buffer:
+        // RowFetch splits it into consecutive tickets, so the chunk is not
+        // capped by the staging capacity.
         let max_chunk = max_chunk.min(QWEN4_PREFILL_CHUNK_CAP);
+        // The gathered QSA prefill attention (HIPFIRE_QWEN4_QSA_WMMA_GATHER)
+        // converts the cache rows it reads into its own scratch: reserve it
+        // for the whole context now, before any capture or record, so a
+        // later longer prefill never grows (and frees) it. A no-op when the
+        // route is off for this arch and state format.
+        if let Some(qsa) = self.state.qsa.first() {
+            let reserved = rdna_compute::tensor_ops::reserve_qsa_gathered_wmma_scratch(
+                gpu,
+                qsa.format,
+                self.config.num_key_value_heads,
+                qsa.full_capacity,
+            )
+            .map_err(BundleError::Hip)?;
+            if reserved > 0 {
+                eprintln!(
+                    "  qwen4 QSA gather scratch: {} MiB reserved for {} context tokens",
+                    reserved >> 20,
+                    qsa.full_capacity
+                );
+            }
+        }
         self.weights
             .requant_from_env(gpu)
             .map_err(BundleError::Forward)?;
@@ -341,6 +377,19 @@ impl Qwen4Bundle {
         let mut ids = self.state.ple_history.row_ids(&self.ple_metadata, tokens);
         ids.drain(..(skip * crate::ple::PLE_HEAD_COUNT).min(ids.len()));
         self.ple_rows.readahead(ids);
+    }
+
+    /// Install (or clear) the QSA parity observer on the attached forward.
+    #[cfg(feature = "reference-parity")]
+    pub fn set_qsa_tap(
+        &mut self,
+        tap: Option<crate::gpu_forward::Qwen4QsaTap>,
+    ) -> Result<(), BundleError> {
+        let forward = self.execution.as_mut().ok_or_else(|| {
+            BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+        })?;
+        forward.qsa_tap = tap;
+        Ok(())
     }
 
     /// Rows the attached forward can process in one chunked call.  The MTP
@@ -1147,7 +1196,7 @@ fn ple_descriptors(
                 row_bytes,
                 valid_rows,
             } => (row_bytes, valid_rows),
-            WeightResidency::Resident => {
+            WeightResidency::Resident | WeightResidency::HostMapped => {
                 return Err(BundleError::Weights(WeightError::DescriptorMismatch(
                     entry.name.clone(),
                 )))

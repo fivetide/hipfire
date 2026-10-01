@@ -23,15 +23,16 @@ use rdna_compute::tensor_ops::{
     hyper_norm_f16, hyper_norm_gate, hyper_read_projected, hyper_read_up_fused, hyper_read_up_wmma,
     hyper_write, hyper_write_norm, indexed_attention_attention, indexed_attention_attention_batch,
     indexed_attention_cache_append_batch, indexed_attention_decode_prologue,
-    indexed_attention_norm_rope_batch, indexed_attention_pool_rope,
+    indexed_attention_index_key_append_batch, indexed_attention_norm_rope_batch,
     indexed_attention_pool_rope_incremental, indexed_attention_reuse_selection,
     indexed_attention_select_batch_mirrored, scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv,
     GatedDeltaConvBatched, GatedDeltaGate, GatedDeltaGateBatched, GatedDeltaParams,
-    GatedDeltaParamsBatched, GatedDeltaStep, GatedDeltaStepBatched, HcActivationFused,
+    GatedDeltaParamsBatched, GatedDeltaStep, GatedDeltaStepBatched, GdnStateFormat, HcActivationFused,
     HyperNextGates, HyperNorm, HyperNormGate, HyperReadProjected, HyperReadUpFused, HyperWrite,
     IndexedAttentionAttention, IndexedAttentionAttentionBatch, IndexedAttentionCacheAppendBatch,
-    IndexedAttentionDecodePrologue, IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope,
-    IndexedAttentionReuseSelection, IndexedAttentionSelectBatch, ScaleF32,
+    IndexedAttentionDecodePrologue, IndexedAttentionIndexKeyAppendBatch,
+    IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope, IndexedAttentionReuseSelection,
+    IndexedAttentionSelectBatch, QsaKvFormat, ScaleF32,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use smallvec::SmallVec;
@@ -152,7 +153,7 @@ pub fn project_weights(
         if done[i] || !shared(weight, gpu) {
             continue;
         }
-        let ld = Gpu::f16_row_pitch(weight.k);
+        let ld = gpu.f16_row_pitch(weight.k);
         let x_f16 = hip(gpu.rotate_x_mq_batched_f16(input, weight.k, rows, ld))?;
         for j in i..projections.len() {
             let (w, out) = projections[j];
@@ -354,7 +355,8 @@ fn project_rotated(
     let result = match (weight.dtype, rows > 1) {
         (DType::BF16, false) => gpu.gemv_bf16_xf32(weight.buf, x, output, weight.m, weight.k),
         (DType::BF16, true) => {
-            // gfx1151 long prefill: the KLD-gated F16 WMMA route, else exact.
+            // Long prefill on gfx11 or gfx1201: the KLD-gated F16 WMMA route,
+            // else exact.
             match gpu.gemm_bf16_xf32_f16_wmma_qwen4(
                 &[(weight.buf, output, weight.m)],
                 x,
@@ -572,7 +574,7 @@ fn execute_hyper_read_inner(
         && gpu.qwen4_f16_wmma_applies(op.input_mix_down.buf, op.input_mix_down.k, op.rows);
     let wmma_read = f16 && op.low_rank % 16 == 0 && op.low_rank <= 504 && op.hidden % 16 == 0;
     let mut normalized_f16 = None;
-    let ld16 = Gpu::f16_row_pitch(wide);
+    let ld16 = gpu.f16_row_pitch(wide);
     let mut activated = false;
     let mut gates_written = false;
     if f16 {
@@ -1087,7 +1089,7 @@ pub struct GatedDeltaNetOp<'a> {
 
 /// Where a few-row GDN forward leaves what a later rollback to any accepted
 /// row prefix needs: the recurrent state after the last row (slot `rows - 1`
-/// of `states`, `[rows, value_heads * value_dim * key_dim]` F32, written
+/// of `states`, a `[rows]` ring of states in `recurrent`'s format, written
 /// instead of updating `recurrent`, which stays the pre-forward state), the
 /// convolution input rows (`inputs`, `[rows, qkv]` F32; every reader of the
 /// convolution history rounds it to BF16), and the recurrence inputs a
@@ -1135,10 +1137,19 @@ impl GatedDeltaNetOp<'_> {
             DType::F32,
             "gated delta projection scratch",
         )?;
+        let state_format = GdnStateFormat::of(self.recurrent).map_err(|error| {
+            DispatchError::Hip(format!("gated delta state: {error}"))
+        })?;
+        if !state_format.supports(self.key_dim, self.value_dim) {
+            return Err(DispatchError::Hip(format!(
+                "gated delta {} state needs 128x128 heads",
+                state_format.name()
+            )));
+        }
         require_tensor(
             self.recurrent,
-            checked_mul(value, self.key_dim, "gated delta state")?,
-            DType::F32,
+            state_format.state_units(self.value_heads, self.key_dim, self.value_dim),
+            state_format.dtype(),
             "gated delta state",
         )?;
         require_tensor(
@@ -1269,6 +1280,7 @@ pub fn execute_gated_delta_net(
         value_heads: op.value_heads,
         key_dim: op.key_dim,
         value_dim: op.value_dim,
+        position: op.start_position,
     };
     let chunked = persistent_batch && gated_delta_chunk_route(gpu, &dims);
     if chunked && capture.is_some() {
@@ -1433,6 +1445,7 @@ pub fn execute_gated_delta_net(
                     value_heads: op.value_heads,
                     key_dim: op.key_dim,
                     value_dim: op.value_dim,
+                    position,
                 },
                 &GatedDeltaGate {
                     recurrent_output: &recurrent_output,
@@ -1462,8 +1475,10 @@ pub fn execute_gated_delta_net(
 
 /// Borrowed cache tensors plus scalar metadata for one operation.  The
 /// architecture commits these scalar values to persistent state after the
-/// shared step list succeeds.
+/// shared step list succeeds. The K/V caches are `format`'s rows and the raw
+/// and pooled index keys its `index_dtype`.
 pub struct IndexedAttentionState<'a> {
+    pub format: QsaKvFormat,
     pub full_keys: &'a GpuTensor,
     pub full_values: &'a GpuTensor,
     pub raw_index_keys: &'a GpuTensor,
@@ -1662,24 +1677,33 @@ impl IndexedAttentionOp<'_> {
             DType::F32,
             "indexed attention projected output",
         )?;
+        let kv_row_units = self.state.format.kv_row_units(self.kv_heads, self.head_dim);
+        if !self.state.format.supports(self.kv_heads, self.head_dim) {
+            return Err(DispatchError::Hip(format!(
+                "indexed attention {} K/V does not support {} KV heads x {}",
+                self.state.format.name(),
+                self.kv_heads,
+                self.head_dim
+            )));
+        }
         require_tensor(
             self.state.full_keys,
             checked_mul(
                 self.state.full_capacity,
-                kv_width,
+                kv_row_units,
                 "indexed attention full keys",
             )?,
-            DType::F32,
+            self.state.format.kv_dtype(),
             "indexed attention full keys",
         )?;
         require_tensor(
             self.state.full_values,
             checked_mul(
                 self.state.full_capacity,
-                kv_width,
+                kv_row_units,
                 "indexed attention full values",
             )?,
-            DType::F32,
+            self.state.format.kv_dtype(),
             "indexed attention full values",
         )?;
         require_tensor(
@@ -1689,7 +1713,7 @@ impl IndexedAttentionOp<'_> {
                 index_kv_width,
                 "indexed attention raw keys",
             )?,
-            DType::F32,
+            self.state.format.index_dtype(),
             "indexed attention raw keys",
         )?;
         require_tensor(
@@ -1699,7 +1723,7 @@ impl IndexedAttentionOp<'_> {
                 index_kv_width,
                 "indexed attention pooled keys",
             )?,
-            DType::F32,
+            self.state.format.index_dtype(),
             "indexed attention pooled keys",
         )?;
         require_tensor(
@@ -1886,6 +1910,7 @@ pub fn execute_indexed_attention(
                 head_dim: op.head_dim,
                 position: initial_position,
                 rows: op.rows,
+                format: op.state.format,
             },
         ))?;
     } else {
@@ -1903,32 +1928,49 @@ pub fn execute_indexed_attention(
                 rotary_dim: op.index_dim.min(64),
             },
         ))?;
-        hip(gpu.bf16_round_trip_f32_strided(
-            &index_batch,
-            op.rows,
-            index_q_width,
-            index_width,
-            index_kv_width,
-        ))?;
-        let index_k_batch = view(
-            &index_batch,
-            index_q_width,
-            op.rows * index_width - index_q_width,
-        );
-        // The destination row offset travels as a scalar (`= position *
-        // index_kv_width`) against the base tensor, and the recorder declares it, so
-        // the tape keeps a position-independent pointer and replay re-derives the
-        // offset for its own position instead of replaying the capture-position row.
-        hip(gpu.copy_rows_strided_f32(
-            &index_k_batch,
-            op.state.raw_index_keys,
-            op.rows,
-            index_kv_width,
-            index_width,
-            index_kv_width,
-            initial_position * index_kv_width,
-            Some(index_kv_width),
-        ))?;
+        if op.state.format.index_dtype() == DType::BF16 {
+            // Round in place and append into the BF16 arena, as the decode
+            // prologue does.
+            hip(indexed_attention_index_key_append_batch(
+                gpu,
+                &IndexedAttentionIndexKeyAppendBatch {
+                    index_rows: &index_batch,
+                    raw_index_keys: op.state.raw_index_keys,
+                    rows: op.rows,
+                    index_q_width,
+                    index_kv_width,
+                    position_start: initial_position,
+                },
+            ))?;
+        } else {
+            hip(gpu.bf16_round_trip_f32_strided(
+                &index_batch,
+                op.rows,
+                index_q_width,
+                index_width,
+                index_kv_width,
+            ))?;
+            let index_k_batch = view(
+                &index_batch,
+                index_q_width,
+                op.rows * index_width - index_q_width,
+            );
+            // The destination row offset travels as a scalar (`= position *
+            // index_kv_width`) against the base tensor, and the recorder declares it,
+            // so the tape keeps a position-independent pointer and replay
+            // re-derives the offset for its own position instead of replaying the
+            // capture-position row.
+            hip(gpu.copy_rows_strided_f32(
+                &index_k_batch,
+                op.state.raw_index_keys,
+                op.rows,
+                index_kv_width,
+                index_width,
+                index_kv_width,
+                initial_position * index_kv_width,
+                Some(index_kv_width),
+            ))?;
+        }
         // AppendOnly never projected Q; its scratch holds no rows to rotate.
         if !matches!(op.mode, IndexedAttentionMode::AppendOnly) {
             hip(indexed_attention_norm_rope_batch(
@@ -1969,7 +2011,9 @@ pub fn execute_indexed_attention(
                 full_values: op.state.full_values,
                 rows: op.rows,
                 position_start: initial_position,
-                kv_width,
+                kv_heads: op.kv_heads,
+                head_dim: op.head_dim,
+                format: op.state.format,
             },
         ))?;
     }
@@ -1979,15 +2023,12 @@ pub fn execute_indexed_attention(
     // active lengths stay scalars. Measured bit-identical to the position-derived
     // shapes with no throughput delta (docs/design/qwen4-program-retained-pm4.md).
     if complete > 0 {
-        // Decode and few-row verify pool only the blocks their rows complete
-        // (earlier blocks hold the same kernel's output for unchanged raw
-        // keys; a rolled-back block starts at or after `position_start`).
-        let pool = if op.rows <= 8 {
-            indexed_attention_pool_rope_incremental
-        } else {
-            indexed_attention_pool_rope
-        };
-        hip(pool(
+        // Pool only the blocks this launch's rows complete: blocks below
+        // `position / compress` hold the same kernel's output for raw keys no
+        // later row rewrites (a rollback rewinds to a position, and the block
+        // containing it is re-pooled). Re-pooling the whole prefix every
+        // prefill chunk was quadratic in the context.
+        hip(indexed_attention_pool_rope_incremental(
             gpu,
             &IndexedAttentionPoolRope {
                 raw_keys: op.state.raw_index_keys,
@@ -2034,6 +2075,7 @@ pub fn execute_indexed_attention(
                 head_dim: op.head_dim,
                 selected_len,
                 full_capacity: op.state.full_capacity,
+                format: op.state.format,
             },
         ))?;
         return project_weight(
@@ -2085,6 +2127,7 @@ pub fn execute_indexed_attention(
             compress: op.compress,
             capacity: op.state.selected_capacity,
             full_capacity: op.state.full_capacity,
+            format: op.state.format,
             shape_selected: op.state.selected_capacity,
         },
     ))?;
@@ -2796,6 +2839,7 @@ mod tests {
             k_norm: t,
             output: weight,
             state: IndexedAttentionState {
+                format: QsaKvFormat::F32,
                 full_keys: t,
                 full_values: t,
                 raw_index_keys: t,

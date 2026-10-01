@@ -295,10 +295,20 @@ pub(crate) fn dense_ref<'a>(
 /// The admitted Qwen4 grouped route is declared by this architecture
 /// constructor and consumed as data by shared sealing/lowering.  The shared
 /// expert's formats are those of the bound weights: BF16, or the Q8_0 decode
-/// copies (`Qwen4GpuForward::decode_q8`).
-fn qwen4_route_policy(config: &Qwen4Config, shared: &MoeSharedWeights<'_>) -> MoeRoutePolicy {
+/// copies (`Qwen4GpuForward::decode_q8`). `symmetric` (a prefill chunk over
+/// a layer whose expert headers were verified symmetric) declares the
+/// symmetric variant the opt-in IU4 arm requires.
+fn qwen4_route_policy(
+    config: &Qwen4Config,
+    shared: &MoeSharedWeights<'_>,
+    symmetric: bool,
+) -> MoeRoutePolicy {
     MoeRoutePolicy {
-        capability: MoeRouteCapability::Qt44Qt53Grouped,
+        capability: if symmetric {
+            MoeRouteCapability::Qt44Qt53GroupedSymmetric
+        } else {
+            MoeRouteCapability::Qt44Qt53Grouped
+        },
         geometry: MoeRouteGeometry {
             experts: config.num_experts,
             top_k: config.num_experts_per_tok,
@@ -488,7 +498,11 @@ fn layer_desc<'a>(
         mlp_hyper: hyper_desc(weights, &layer.mlp_hyper)?,
         attention,
         moe: Qwen4MoeBinding {
-            route_policy: qwen4_route_policy(config, &shared),
+            route_policy: qwen4_route_policy(
+                config,
+                &shared,
+                moe.symmetric && rows >= rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
+            ),
             table: &moe.table,
             cache: &moe.cache,
             routed_experts: moe,
@@ -563,6 +577,12 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     /// body records them.
     expert_gate_up_entries: Vec<usize>,
     expert_down_entries: Vec<usize>,
+    /// Every routed QT44 gate/up and QT53 down header behind the two tables
+    /// satisfies `zp == -8*sc`, checked on the device once after load
+    /// ([`Self::verify_symmetric`]); only then may this layer declare
+    /// [`MoeRouteCapability::Qt44Qt53GroupedSymmetric`]. False unless the
+    /// opt-in route was requested.
+    symmetric: bool,
 }
 
 impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
@@ -798,7 +818,45 @@ impl Qwen4MoeLayerRuntime {
             expert_down_ptrs,
             expert_gate_up_entries: gate_entries,
             expert_down_entries: down_entries,
+            symmetric: false,
         })
+    }
+
+    /// Check every routed expert header of this layer for the symmetric grid
+    /// the IU4 route needs and record the verdict. QT44 gate/up and QT53
+    /// down only; one asymmetric or non-finite header refuses the layer.
+    fn verify_symmetric(
+        &mut self,
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+    ) -> Result<bool, Qwen4GpuForwardError> {
+        let formats = self.experts.iter().all(|expert| {
+            expert.gate_up.dtype == DType::MQ4G256V2 && expert.down.dtype == DType::MQ4G128V2
+        });
+        self.symmetric = formats
+            && gpu.qwen4_moe_sym_check(
+                &self.expert_gate_up_ptrs,
+                2 * config.moe_intermediate_size,
+                config.hidden_size,
+                config.num_experts,
+                136,
+            )?
+            && gpu.qwen4_moe_sym_check(
+                &self.expert_down_ptrs,
+                config.hidden_size,
+                config.moe_intermediate_size,
+                config.num_experts,
+                68,
+            )?;
+        Ok(self.symmetric)
+    }
+
+    /// Device bytes [`Self::from_moe`] allocates: the gate/up and down
+    /// pointer tables, one device pointer per expert each.
+    pub(crate) fn device_bytes(config: &Qwen4Config) -> Option<usize> {
+        config
+            .num_experts
+            .checked_mul(2 * std::mem::size_of::<u64>())
     }
 
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
@@ -884,7 +942,8 @@ pub(crate) fn seal_moe_decode<'a>(
             bf16_round_trip: true,
             shared_after_combine: true,
         },
-        route_policy: Some(qwen4_route_policy(config, &shared)),
+        // Single-token decode/MTP binding: never the symmetric IU4 prefill arm.
+        route_policy: Some(qwen4_route_policy(config, &shared, false)),
         normalization: MoeNormalization::Provided,
         batch_size: 1,
         hidden: config.hidden_size,
@@ -1360,6 +1419,14 @@ fn layer_scratch<'a>(
     }
 }
 
+/// Parity-harness observer run after each QSA layer's step on the ordinary HIP
+/// route: `(gpu, qsa_slot, op)`, with the op's scratch and state holding that
+/// layer's inputs, selection and attention output for the forward's rows.
+/// Only `reference-parity` builds can install one ([`Qwen4Bundle::set_qsa_tap`]);
+/// a forward with a tap never records or replays a retained body.
+pub type Qwen4QsaTap =
+    Box<dyn FnMut(&mut Gpu, usize, &IndexedAttentionOp<'_>) -> Result<(), String> + Send>;
+
 /// Reusable production forward owner.  Construct it once per assembled bundle
 /// and use `forward_token`/`forward_chunk` repeatedly; both methods share the
 /// exact same chunk implementation.
@@ -1378,6 +1445,10 @@ pub struct Qwen4GpuForward {
     /// over 32 chunks). Prefill keeps the BF16 source for its WMMA routes and
     /// the exact multi-row arms short prompts take.
     decode_q8: Vec<GpuTensor>,
+    /// `HIPFIRE_QWEN4_ROUTE_TRACE`: routed expert ids per layer of every
+    /// single-token HIP forward, for expert-cache sizing. `None` when unset.
+    route_trace: Option<RouteTrace>,
+    pub(crate) qsa_tap: Option<Qwen4QsaTap>,
 }
 
 /// An event after a forward's device argmax and a stream independent of the
@@ -1385,6 +1456,19 @@ pub struct Qwen4GpuForward {
 struct TokenReadback {
     stream: hip_bridge::Stream,
     event: hip_bridge::Event,
+}
+
+/// Environment knob naming the routing-trace output file (appended).
+pub const ROUTE_TRACE_ENV: &str = "HIPFIRE_QWEN4_ROUTE_TRACE";
+
+/// Routing trace sink: one text line per single-token forward holding
+/// `position` then `num_hidden_layers * num_experts_per_tok` expert ids in
+/// layer order. Each layer's top-K ids are copied device-to-device right after
+/// its MoE step, so tracing splits the step list at MoE barriers only.
+struct RouteTrace {
+    device: GpuTensor,
+    host: Vec<u8>,
+    out: std::io::BufWriter<std::fs::File>,
 }
 
 impl Qwen4GpuForward {
@@ -1397,6 +1481,7 @@ impl Qwen4GpuForward {
             Qwen4GpuForwardScratch::new(gpu, &bundle.config, max_chunk)?;
         let mut moe = Vec::with_capacity(bundle.config.num_hidden_layers);
         let mut decode_q8 = Vec::new();
+        let mut route_trace = None;
         let result = (|| {
             for layer in &bundle.weights.layer_refs {
                 moe.push(Qwen4MoeLayerRuntime::new(
@@ -1405,6 +1490,29 @@ impl Qwen4GpuForward {
                     layer,
                     &bundle.config,
                 )?);
+            }
+            // Opt-in symmetric IU4 MoE (`HIPFIRE_QWEN4_MOE_SYM_IU4=1`): verify
+            // each layer's final expert headers once, before any capture, and
+            // size the route's scratch for the chunk cap. Nothing runs (and no
+            // new module loads) unless the route was requested.
+            if gpu.qwen4_moe_sym_iu4_requested() {
+                let mut verified = 0usize;
+                for layer in &mut moe {
+                    verified += usize::from(layer.verify_symmetric(gpu, &bundle.config)?);
+                }
+                eprintln!(
+                    "  qwen4 symmetric IU4 MoE: {verified}/{} layers verified symmetric",
+                    moe.len()
+                );
+                if verified > 0 {
+                    gpu.reserve_qwen4_moe_sym(
+                        max_chunk,
+                        bundle.config.num_experts_per_tok,
+                        bundle.config.num_experts,
+                        bundle.config.hidden_size,
+                        bundle.config.moe_intermediate_size,
+                    )?;
+                }
             }
             let sources = bundle
                 .weights
@@ -1433,6 +1541,20 @@ impl Qwen4GpuForward {
                     decode_q8.push(gpu.quantize_bf16_q8_0(weight.buf, weight.m, weight.k)?);
                 }
             }
+            if let Ok(path) = hipfire_config::developer_var(ROUTE_TRACE_ENV) {
+                let slots = bundle.config.num_hidden_layers * bundle.config.num_experts_per_tok;
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .map_err(|error| invalid(format!("{ROUTE_TRACE_ENV}={path}: {error}")))?;
+                route_trace = Some(RouteTrace {
+                    device: gpu.alloc_tensor(&[slots], DType::F32)?,
+                    host: vec![0u8; slots * 4],
+                    out: std::io::BufWriter::new(file),
+                });
+                eprintln!("  qwen4 routing trace -> {path}");
+            }
             Ok::<(), Qwen4GpuForwardError>(())
         })();
         if let Err(error) = result {
@@ -1441,6 +1563,9 @@ impl Qwen4GpuForward {
             }
             for tensor in decode_q8 {
                 let _ = gpu.free_tensor(tensor);
+            }
+            if let Some(trace) = route_trace {
+                let _ = gpu.free_tensor(trace.device);
             }
             let _ = scratch.free_gpu(gpu);
             return Err(error);
@@ -1452,6 +1577,8 @@ impl Qwen4GpuForward {
             token_readback: None,
             moe,
             decode_q8,
+            route_trace,
+            qsa_tap: None,
         })
     }
 
@@ -1461,9 +1588,15 @@ impl Qwen4GpuForward {
             moe,
             token_readback,
             decode_q8,
+            route_trace,
             ..
         } = self;
         let mut first = scratch.free_gpu(gpu);
+        if let Some(trace) = route_trace {
+            if let Err(error) = gpu.free_tensor(trace.device) {
+                first.get_or_insert(error);
+            }
+        }
         for tensor in decode_q8 {
             if let Err(error) = gpu.free_tensor(tensor) {
                 first.get_or_insert(error);
@@ -1488,6 +1621,32 @@ impl Qwen4GpuForward {
             }
         }
         first.map_or(Ok(()), Err)
+    }
+
+    /// Append the traced forward's routed expert ids (see [`RouteTrace`]).
+    /// Synchronizes the device: tracing is a measurement mode.
+    fn write_route_trace(
+        &mut self,
+        gpu: &mut Gpu,
+        position: usize,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        use std::io::Write;
+        let Some(trace) = self.route_trace.as_mut() else {
+            return Ok(());
+        };
+        gpu.hip.device_synchronize()?;
+        gpu.hip.memcpy_dtoh(&mut trace.host, &trace.device.buf)?;
+        let mut line = position.to_string();
+        for id in trace.host.chunks_exact(4) {
+            line.push(' ');
+            line.push_str(&i32::from_ne_bytes([id[0], id[1], id[2], id[3]]).to_string());
+        }
+        line.push('\n');
+        trace
+            .out
+            .write_all(line.as_bytes())
+            .and_then(|_| trace.out.flush())
+            .map_err(|error| invalid(format!("{ROUTE_TRACE_ENV}: {error}")))
     }
 
     fn validate_request(
@@ -2055,6 +2214,7 @@ impl Qwen4GpuForward {
                         k_norm: weights.k_norm,
                         output: weights.output,
                         state: IndexedAttentionState {
+                            format: state.format,
                             full_keys: &state.full_keys,
                             full_values: &state.full_values,
                             raw_index_keys: &state.raw_index_keys,
@@ -2291,7 +2451,7 @@ impl Qwen4GpuForward {
         let mut device_read: Option<u32> = None;
         let mut diagnostic_capture = false;
         let mut launched_before = 0u64;
-        let mut effects_before = (0u64, 0u64, 0u64, 0u64);
+        let mut traced = false;
         let attempt = (|| -> Result<
             SmallVec<[(usize, usize, usize, usize, usize, usize); QWEN4_QSA_INLINE_CAPACITY]>,
             Qwen4GpuForwardError,
@@ -2411,7 +2571,8 @@ impl Qwen4GpuForward {
             //
             // Eligible only for a plain single-token continuation: the wide-hidden
             // capture is the speculative-verify shape and must never enter the tape.
-            let eligible = n == 1 && wide_hidden_capture.is_none();
+            let eligible =
+                n == 1 && wide_hidden_capture.is_none() && self.qsa_tap.is_none();
             gpu.replay.set_forward_eligible(eligible);
             // A manual shadow controller states the executor directly: one prepared
             // tape is compared across the exact-kernarg HIP oracle, the retained
@@ -2437,13 +2598,11 @@ impl Qwen4GpuForward {
                     }
                     RetainedBodyAction::Arm { diagnostic } => {
                         diagnostic_capture = diagnostic;
+                        // The fused GDN rotation's arrival counters are zeroed once,
+                        // on first use; materialize them before the window opens so
+                        // that memset is not state the tape would have to replay.
+                        rdna_compute::tensor_ops::ensure_gdn_pair_counters(gpu)?;
                         launched_before = hip_bridge::launch_counters::launch_kernel::count();
-                        effects_before = (
-                            hip_bridge::launch_counters::memcpy_htod::count(),
-                            hip_bridge::launch_counters::memcpy_dtod::count(),
-                            hip_bridge::launch_counters::memcpy_dtoh::count(),
-                            hip_bridge::launch_counters::memset::count(),
-                        );
                         gpu.replay
                             .begin_auto_capture_if_armed()
                             .map_err(|reason| invalid(reason))?;
@@ -2509,13 +2668,63 @@ impl Qwen4GpuForward {
                         ))
                     })
                 };
-                match ple_split {
-                    Some(split) => {
-                        execute(gpu, &steps[..split])?;
-                        stage_ple(gpu)?;
-                        execute(gpu, &steps[split..])?;
+                if let Some(tap) = self.qsa_tap.as_mut() {
+                    // Parity tap: run up to and including each QSA step, then
+                    // let the observer read that layer's scratch and state.
+                    let mut start = 0;
+                    let mut qsa_slot = 0;
+                    for (index, step) in steps.iter().enumerate() {
+                        if ple_split == Some(index) {
+                            execute(gpu, &steps[start..index])?;
+                            stage_ple(gpu)?;
+                            start = index;
+                        }
+                        if let Step::IndexedAttention(op) = step {
+                            execute(gpu, &steps[start..=index])?;
+                            start = index + 1;
+                            tap(gpu, qsa_slot, op).map_err(invalid)?;
+                            qsa_slot += 1;
+                        }
                     }
-                    None => execute(gpu, &steps)?,
+                    execute(gpu, &steps[start..])?;
+                } else {
+                    let trace = self.route_trace.as_ref().filter(|_| n == 1);
+                    match (ple_split, trace) {
+                        (split, Some(trace)) => {
+                            let k = config.num_experts_per_tok;
+                            let mut start = 0usize;
+                            let mut layer = 0usize;
+                            for index in 0..steps.len() {
+                                if split == Some(index) {
+                                    if start < index {
+                                        execute(gpu, &steps[start..index])?;
+                                    }
+                                    stage_ple(gpu)?;
+                                    start = index;
+                                }
+                                if matches!(steps[index], Step::Moe(_)) {
+                                    execute(gpu, &steps[start..=index])?;
+                                    start = index + 1;
+                                    gpu.copy_d2d(
+                                        &self.scratch.moe_topk_indices,
+                                        &trace.device.sub_offset(layer * k, k),
+                                        k * std::mem::size_of::<i32>(),
+                                    )?;
+                                    layer += 1;
+                                }
+                            }
+                            if start < steps.len() {
+                                execute(gpu, &steps[start..])?;
+                            }
+                            traced = true;
+                        }
+                        (Some(split), None) => {
+                            execute(gpu, &steps[..split])?;
+                            stage_ple(gpu)?;
+                            execute(gpu, &steps[split..])?;
+                        }
+                        (None, None) => execute(gpu, &steps)?,
+                    }
                 }
             }
 
@@ -2624,7 +2833,10 @@ impl Qwen4GpuForward {
                 // that knows both ends of one recorded body, so the window can never
                 // outlive the forward that opened it.
                 if gpu.replay.should_auto_finalize_capture() {
-                    finish_qwen4_capture(gpu, diagnostic_capture, launched_before, effects_before);
+                    finish_qwen4_capture(gpu, diagnostic_capture, launched_before);
+                }
+                if traced {
+                    self.write_route_trace(gpu, next_position)?;
                 }
                 Ok(())
             }
@@ -2652,19 +2864,9 @@ impl Qwen4GpuForward {
 ///
 /// Prepare failure after a successful HIP warmup poisons the route (sticky
 /// fallback) rather than failing the request that already produced output.
-fn finish_qwen4_capture(
-    gpu: &mut Gpu,
-    diagnostic_capture: bool,
-    launched_before: u64,
-    effects_before: (u64, u64, u64, u64),
-) {
+fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool, launched_before: u64) {
     let launched = hip_bridge::launch_counters::launch_kernel::count();
-    let effects = (
-        hip_bridge::launch_counters::memcpy_htod::count().saturating_sub(effects_before.0),
-        hip_bridge::launch_counters::memcpy_dtod::count().saturating_sub(effects_before.1),
-        hip_bridge::launch_counters::memcpy_dtoh::count().saturating_sub(effects_before.2),
-        hip_bridge::launch_counters::memset::count().saturating_sub(effects_before.3),
-    );
+    let effects = gpu.replay.capture_window_effects();
     let summary = gpu.replay.capture_summary();
     let recorded = summary.launch_count;
     let computed = launched.saturating_sub(launched_before) as usize;
@@ -2675,7 +2877,7 @@ fn finish_qwen4_capture(
     );
     eprintln!(
         "[redline] qwen4 capture census: effects inside window — htod={} dtod={} dtoh={} memset={}",
-        effects.0, effects.1, effects.2, effects.3
+        effects.htod, effects.dtod, effects.dtoh, effects.memset
     );
     if computed != recorded {
         eprintln!(
@@ -2683,11 +2885,11 @@ fn finish_qwen4_capture(
              (#397-style truncated tape)"
         );
     }
-    if effects.1 > 0 || effects.2 > 0 || effects.3 > 0 {
+    if !effects.replayable() {
         eprintln!(
             "[redline] qwen4 capture census: effect-incomplete — {} device copy(ies), {} readback(s) \
-             and {} memset(s) inside the window are state the tape cannot replay",
-            effects.1, effects.2, effects.3
+             and {} memset(s) inside the window are state the tape cannot replay; prepare refuses it",
+            effects.dtod, effects.dtoh, effects.memset
         );
     }
     if diagnostic_capture {

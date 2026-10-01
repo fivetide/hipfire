@@ -107,13 +107,14 @@ fn is_load(class: MemClass) -> bool {
     )
 }
 
-/// Memory classes the replay tracks. Atomics/image/sample rows have no M1
-/// table rows; anything else decodable is replayed.
+/// Memory classes the replay tracks. Image/sample rows and flat atomics have
+/// no table rows; anything else decodable is replayed.
 fn is_tracked(class: MemClass) -> bool {
     matches!(
         class,
         MemClass::VmemLoad
             | MemClass::VmemStore
+            | MemClass::VmemAtomic { .. }
             | MemClass::DsLoad
             | MemClass::DsStore
             | MemClass::SmemLoad
@@ -215,16 +216,14 @@ fn counter_at(index: usize) -> Counter {
     }
 }
 
-/// Unit weight per counter from the table row (`Km:2` → 2 on Km).
+/// Unit weight per counter from the table row (`Km:2` → 2 on Km), for the
+/// instruction's return form (`@rtn` / `@nortn` rules).
 fn unit_weights(inst: &Inst, arch: Arch) -> [u8; N] {
     let mut units = [0u8; N];
     let Some(row) = crate::isa::lookup(arch, inst.op, inst.form) else {
         return units;
     };
-    for pair in row.counter.split(',') {
-        let Some((counter, weight)) = pair.split_once(':') else {
-            continue;
-        };
+    for (counter, weight) in row.counter_rules(crate::isa::atomic_returns(arch, &inst.mods.cpol)) {
         let slot = match counter {
             "Load" => Counter::Load,
             "Store" => Counter::Store,
@@ -273,8 +272,19 @@ fn join_states(a: &WaitState, b: &WaitState) -> WaitState {
             }
         }
     }
-    let mut pending: Vec<PendingEvent> = merged.into_values().collect();
-    pending.sort_by_key(|event| event.id.0);
+    // Both paths pending the same events in the same order: that order is
+    // the issue order on every reaching path, so keep it. Otherwise fall
+    // back to first-issue order, which can misplace a load re-issued by a
+    // later loop iteration.
+    let same_order = a.pending.len() == b.pending.len()
+        && a.pending.iter().zip(&b.pending).all(|(x, y)| x.id == y.id);
+    let pending: Vec<PendingEvent> = if same_order {
+        a.pending.iter().map(|event| merged.remove(&event.id).expect("joined event")).collect()
+    } else {
+        let mut pending: Vec<PendingEvent> = merged.into_values().collect();
+        pending.sort_by_key(|event| event.id.0);
+        pending
+    };
     WaitState { pending }
 }
 
@@ -725,11 +735,11 @@ mod c5_tests {
     use crate::operand::{ImmField, Modifiers, Operand, VmemToken};
     use crate::passes::cfg::build_blocks;
     use crate::provenance::Provenance;
-    use crate::reg::{Kind, RegRef};
+    use crate::reg::{Kind, RegRef, RegSet};
     use crate::state::ObligationKind;
-    use crate::wait::Counter;
+    use crate::wait::{Counter, CounterSet, EventId, PendingEvent, WaitState, N};
 
-    use super::{census, replay};
+    use super::{census, join_states, replay};
 
     fn table(name: &str) -> (Opcode, Form) {
         let row = crate::isa::gfx12().iter().find(|row| row.name == name).expect(name);
@@ -838,6 +848,28 @@ mod c5_tests {
             assert!(replay(&mixed, arch).unwrap().obligations.iter()
                 .any(|obligation| obligation.rule_id == "wait-raw-ds-load"),
                 "{arch:?}: SMEM makes partial lgkmcnt unable to prove LDS retirement");
+        }
+    }
+
+    /// gfx11 GLOBAL atomics: the returning (GLC) form's destination is
+    /// pending on vmcnt; the non-returning form locks its sources on vscnt,
+    /// which `vmcnt(0)` does not retire.
+    #[test]
+    fn gfx11_global_atomic_counts_on_vmcnt_only_when_returning() {
+        for arch in [Arch::Gfx1100, Arch::Gfx1151] {
+            let dec = |words: &[u32]| crate::codec::gfx11::decode(arch, words).unwrap().0;
+            let rules = |insts: Vec<Inst>| replay(&body_of(insts), arch).unwrap().obligations
+                .into_iter().map(|o| o.rule_id).collect::<Vec<_>>();
+            let add_rtn = || dec(&[0xdcd6_4000, 0x0204_020a]); // global_atomic_add_u32 v2, v10, v2, s[4:5] glc
+            let swap = || dec(&[0xdcce_0000, 0x0000_0000]); // global_atomic_swap_b32 v0, v0, s[0:1]
+            let vmcnt0 = || dec(&[0xbf89_03f7]);
+            let vscnt0 = || dec(&[0xbc7c_0000]);
+            let read_v2 = || dec(&[0x7e04_0502]); // v_readfirstlane_b32 s2, v2
+            let write_v0 = || dec(&[0x7e00_0280]); // v_mov_b32_e32 v0, 0
+            assert_eq!(rules(vec![add_rtn(), read_v2()]), ["wait-raw-vmem-atomic"], "{arch:?}");
+            assert!(rules(vec![add_rtn(), vmcnt0(), read_v2()]).is_empty(), "{arch:?}");
+            assert_eq!(rules(vec![swap(), vmcnt0(), write_v0()]), ["wait-war-vmem-store"], "{arch:?}");
+            assert!(rules(vec![swap(), vscnt0(), write_v0()]).is_empty(), "{arch:?}");
         }
     }
 
@@ -1215,5 +1247,27 @@ mod c5_tests {
         let replay = replay(&body, Arch::Gfx1201).unwrap();
         assert!(replay.obligations.iter().any(|o| o.rule_id == "wait-raw-vmem-load" && o.insts == [consumer]),
             "{:?}", replay.obligations);
+    }
+
+    /// Two paths pending the same loads in the same order join in that order:
+    /// a load re-issued by a later loop iteration (larger first-issue id, but
+    /// older) must stay ahead of this iteration's load, so a partial wait
+    /// retires it first. Disagreeing paths fall back to first-issue order.
+    #[test]
+    fn join_keeps_a_common_issue_order() {
+        let load = |id: u64| {
+            let mut counters = CounterSet::default();
+            counters.insert(Counter::Load);
+            PendingEvent {
+                id: EventId(id), inst: crate::cfg::InstId(id as usize), counters, units: [1; N],
+                satisfied: CounterSet::default(), class: MemClass::VmemLoad, defs: RegSet(Vec::new()),
+                src_locks: RegSet(Vec::new()), in_order_type: crate::effects::OrderType::Load,
+            }
+        };
+        let ids = |s: &WaitState| s.pending.iter().map(|e| e.id.0).collect::<Vec<_>>();
+        let path = WaitState { pending: vec![load(7), load(3)] };
+        assert_eq!(ids(&join_states(&path, &path.clone())), [7, 3]);
+        let other = WaitState { pending: vec![load(3), load(7)] };
+        assert_eq!(ids(&join_states(&path, &other)), [3, 7]);
     }
 }
