@@ -3257,7 +3257,9 @@ pub fn indexed_attention_attention_batch(
 enum QsaAttentionRoutes {
     /// The per-head kernels (the exact reference).
     Exact,
-    /// Plus the bitwise-equal grouped hg12/hg4 kernels.
+    /// Plus the bitwise-equal grouped hg12/hg4 kernels (the tests' reference
+    /// for those kernels; production always admits F16).
+    #[cfg_attr(not(test), allow(dead_code))]
     Grouped,
     /// Plus the dense and sparse F16 WMMA routes (KLD-gated).
     F16,
