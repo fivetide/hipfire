@@ -34,6 +34,9 @@ pub(crate) static QWEN4_F16_WMMA: std::sync::LazyLock<bool> = std::sync::LazyLoc
 /// Tokens from which the F16 WMMA arms are used (measured on gfx1151; the MoE gate/up
 /// arm is slower below ~450; the others break even or win).
 pub(crate) const QWEN4_F16_WMMA_MIN_TOKENS: usize = 512;
+/// Rows from which the gfx1151 MQ6 BT8 X-LDS GEMM shares each X chunk across
+/// eight row tiles (`_x8`) instead of four.
+const MQ6_XLDS_X8_MIN_ROWS: usize = 1024;
 
 /// One instantiation of the parameterised LDS-staged WMMA GEMM
 /// (`kernels/src/gemm_f16_x_f16_wmma_lds256.hip`).
@@ -25489,15 +25492,20 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // gfx11+: eight rows per workgroup share X through LDS (bitwise the
+        // per-row kernel, which re-reads X for every row), and grid.y covers
+        // any batch in 64-row tiles.
+        let lds8 = self.arch_caps.has_gfx11_plus_simt();
         assert!(
-            batch_size <= 64,
+            lds8 || batch_size <= 64,
             "gemm_q8_0_batched: batch_size {batch_size} exceeds kernel MAX_BATCH=64"
         );
-        self.ensure_kernel(
-            "gemm_q8_0_batched",
-            kernels::GEMM_Q8_0_BATCHED_SRC,
-            "gemm_q8_0_batched",
-        )?;
+        let (kernel, grid, block) = if lds8 {
+            ("gemm_q8_0_batched_lds16", [m.div_ceil(16) as u32, batch_size.div_ceil(64) as u32], 256u32)
+        } else {
+            ("gemm_q8_0_batched", [m as u32, 1], 32u32)
+        };
+        self.ensure_kernel("gemm_q8_0_batched", kernels::GEMM_Q8_0_BATCHED_SRC, kernel)?;
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
@@ -25522,9 +25530,9 @@ impl Gpu {
         let bytes = m.saturating_mul(k) / 32 * 34 + batch_size.saturating_mul(k) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_q8_0_batched", bytes);
         let result = self.launch_maybe_blob(
-            "gemm_q8_0_batched",
-            [m as u32, 1, 1],
-            [32, 1, 1],
+            kernel,
+            [grid[0], grid[1], 1],
+            [block, 1, 1],
             0,
             &mut params,
             || {
@@ -25670,6 +25678,10 @@ impl Gpu {
             return self.gemv_q8_0_staged_rows(a_raw, x, y, m, k, n);
         }
         self.bind_thread()?;
+        if self.arch_caps.has_gfx11_plus_simt() {
+            // One launch: the LDS kernel tiles the batch over grid.y.
+            return self.gemm_q8_0_batched(a_raw, x, y, m, k, n);
+        }
         const MAX_BATCH: usize = 64;
         let mut off = 0;
         while off < n {
@@ -37768,15 +37780,23 @@ impl Gpu {
         // MQ6 BT8: four row tiles share each X chunk through LDS (bitwise
         // identical to BT8; the BT8 X re-reads were the bottleneck on gfx1151).
         let xlds = bits == 6 && batch_tile == 8;
-        let (func_name, rows_per_block, block) = match (xlds, overwrite) {
-            (true, false) => ("gemm_mq6g256v2_residual_wmma_gfx11_bt8_x4", 64, 128),
+        // Prefill-sized N: eight row tiles share each X chunk (x8, bitwise
+        // the x4 kernels); X traffic is M / rows-per-block re-reads of X.
+        let x8 = batch_size >= MQ6_XLDS_X8_MIN_ROWS;
+        let (func_name, rows_per_block, block) = match (xlds, overwrite, x8) {
+            (true, false, false) => ("gemm_mq6g256v2_residual_wmma_gfx11_bt8_x4", 64, 128),
+            (true, false, true) => ("gemm_mq6g256v2_residual_wmma_gfx11_bt8_x8", 128, 256),
             // A BF16 `y` takes the values rounded to BF16 (RNE) as BF16 bits.
-            (true, true) if y.dtype == DType::BF16 => {
+            (true, true, false) if y.dtype == DType::BF16 => {
                 ("gemm_mq6g256v2_wmma_gfx11_bt8_x4_bf16out", 64, 128)
             }
-            (true, true) => ("gemm_mq6g256v2_wmma_gfx11_bt8_x4", 64, 128),
-            (false, false) => (func_name, 16, 32),
-            (false, true) => {
+            (true, true, true) if y.dtype == DType::BF16 => {
+                ("gemm_mq6g256v2_wmma_gfx11_bt8_x8_bf16out", 128, 256)
+            }
+            (true, true, false) => ("gemm_mq6g256v2_wmma_gfx11_bt8_x4", 64, 128),
+            (true, true, true) => ("gemm_mq6g256v2_wmma_gfx11_bt8_x8", 128, 256),
+            (false, false, _) => (func_name, 16, 32),
+            (false, true, _) => {
                 return Err(hip_bridge::HipError::new(
                     1,
                     "mqv2_wmma_gfx11_bt: overwrite needs the gfx1151 MQ6 BT8 kernel",
@@ -44584,6 +44604,148 @@ mod tests {
         assert!(!g12_iu4_b1_eligible(128, 384, aligned));
         assert!(!g12_iu4_b1_eligible(127, 512, aligned));
         assert!(!g12_iu4_b1_eligible(128, 512, 0x1004usize as *mut c_void));
+    }
+
+    /// The gfx1151 MQ6 BT8 X-LDS GEMM switches from four to eight row tiles
+    /// per workgroup at MQ6_XLDS_X8_MIN_ROWS. Output columns depend only on
+    /// their own X row, so one call over N rows (x8) must equal two calls over
+    /// N/2 rows (x4) bit for bit. M is not a multiple of 128 (row tail).
+    #[test]
+    fn mq6_xlds_x8_matches_x4() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if gpu.arch != "gfx1151" {
+            eprintln!("skip: the X-LDS kernels are gfx1151");
+            return;
+        }
+        let (m, k) = (200usize, 512usize);
+        let n = MQ6_XLDS_X8_MIN_ROWS + 76;
+        let groups = k / 256;
+        let gb = crate::dispatch::MQ6G256V2_GROUP_BYTES;
+        let mut packed = vec![0u8; m * groups * gb];
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state
+        };
+        for g in 0..m * groups {
+            let base = g * gb;
+            // Two (scale, zero-point) F16 pairs in normal range, then codes.
+            for h in 0..4 {
+                let bits = (13u16 << 10) | ((next() >> 22) as u16 & 0x3ff);
+                packed[base + 2 * h..base + 2 * h + 2].copy_from_slice(&bits.to_le_bytes());
+            }
+            for byte in &mut packed[base + 8..base + gb] {
+                *byte = (next() >> 24) as u8;
+            }
+        }
+        let weight = gpu.upload_raw(&packed, &[packed.len()]).expect("upload MQ6");
+        let x: Vec<f32> = (0..n * k)
+            .map(|_| ((next() >> 8) as f32 / 16_777_216.0) - 0.5)
+            .collect();
+        // One X allocation, distinct views: the F16 conversion of X is
+        // cached by source pointer.
+        let x_gpu = gpu.upload_f32(&x, &[n * k]).expect("upload X");
+        let run = |gpu: &mut Gpu, rows: usize, offset: usize| {
+            let x_view = x_gpu.sub_offset(offset * k, rows * k);
+            let y_gpu = gpu.zeros(&[rows * m], DType::F32).expect("alloc Y");
+            gpu.gemm_mqv2_residual_wmma_gfx11_bt(6, 8, &weight, &x_view, &y_gpu, m, k, rows)
+                .expect("MQ6 BT8");
+            let y = gpu.download_f32(&y_gpu).expect("download Y");
+            gpu.free_tensor(y_gpu).expect("free Y");
+            y
+        };
+        let full = run(&mut gpu, n, 0);
+        let mut halves = run(&mut gpu, n / 2, 0);
+        halves.extend(run(&mut gpu, n / 2, n / 2));
+        assert!(full.iter().any(|v| *v != 0.0), "output is all zero");
+        let differing = full
+            .iter()
+            .zip(&halves)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let first = full
+            .iter()
+            .zip(&halves)
+            .position(|(a, b)| a.to_bits() != b.to_bits());
+        assert_eq!(
+            differing, 0,
+            "x8 differs from x4 in {differing} outputs; first at column {:?} row {:?}",
+            first.map(|i| i / m),
+            first.map(|i| i % m)
+        );
+        gpu.free_tensor(x_gpu).expect("free X");
+        gpu.free_tensor(weight).expect("free MQ6");
+    }
+
+    /// `gemm_q8_0_batched` (the LDS-shared eight-row kernel on gfx11+) keeps
+    /// the per-row contract bit for bit: each of 32 lanes FMA-accumulates its
+    /// K lane over the groups in order, then a shfl_down tree. Rows not a
+    /// multiple of eight, a partial LDS chunk (K = 2592) and 1/5/64 batches,
+    /// plus 150 (three grid.y batch tiles, the last partial).
+    #[test]
+    fn q8_0_batched_matches_lane_order_reference() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let (m, k) = (37usize, 2592usize);
+        let groups = k / 32;
+        let mut packed = vec![0u8; m * groups * 34];
+        let mut dq = vec![0f32; m * k];
+        for row in 0..m {
+            for g in 0..groups {
+                let base = (row * groups + g) * 34;
+                // Normal f16 scales around 2^-7..2^-6: exponent 8, 10-bit mantissa.
+                let bits = (8u16 << 10) | (((row * 7 + g) * 37 % 1024) as u16);
+                let scale = (1.0 + (bits & 0x3ff) as f32 / 1024.0) * 2f32.powi(8 - 15);
+                packed[base..base + 2].copy_from_slice(&bits.to_le_bytes());
+                for l in 0..32 {
+                    let q = (((row * 131 + g * 17 + l * 29) % 255) as i32 - 127) as i8;
+                    packed[base + 2 + l] = q as u8;
+                    dq[row * k + g * 32 + l] = scale * q as f32;
+                }
+            }
+        }
+        let weight = gpu.upload_raw(&packed, &[packed.len()]).expect("upload Q8");
+        for batch in [1usize, 5, 64, 150] {
+            let x: Vec<f32> = (0..batch * k)
+                .map(|i| (((i * 2_654_435_761) % 2003) as f32 - 1001.0) / 997.0)
+                .collect();
+            let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("upload X");
+            let y_gpu = gpu.zeros(&[batch * m], DType::F32).expect("alloc Y");
+            gpu.gemm_q8_0_batched(&weight, &x_gpu, &y_gpu, m, k, batch)
+                .expect("gemm_q8_0_batched");
+            let y = gpu.download_f32(&y_gpu).expect("download Y");
+            for b in 0..batch {
+                for row in 0..m {
+                    let mut lanes = [0f32; 32];
+                    for (l, lane) in lanes.iter_mut().enumerate() {
+                        for g in 0..groups {
+                            let c = g * 32 + l;
+                            *lane = dq[row * k + c].mul_add(x[b * k + c], *lane);
+                        }
+                    }
+                    let mut offset = 16;
+                    while offset > 0 {
+                        for l in 0..32 - offset {
+                            lanes[l] += lanes[l + offset];
+                        }
+                        offset >>= 1;
+                    }
+                    assert_eq!(
+                        y[b * m + row].to_bits(),
+                        lanes[0].to_bits(),
+                        "batch {batch} row {b} output {row}"
+                    );
+                }
+            }
+            gpu.free_tensor(x_gpu).expect("free X");
+            gpu.free_tensor(y_gpu).expect("free Y");
+        }
+        gpu.free_tensor(weight).expect("free Q8");
     }
 
     #[test]

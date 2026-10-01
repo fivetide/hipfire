@@ -70,6 +70,10 @@ impl AttachedWeightStore {
 }
 
 /// Published Qwen4 architecture owner.
+/// Logit rows of the spec scratch: an MTP verify window (at most the draft
+/// depth + 1 rows) or a final prefill row; longer blocks emit their final row.
+const SPEC_LOGIT_ROWS: usize = 16;
+
 pub struct Qwen4Bundle {
     pub config: Qwen4Config,
     pub weights: Qwen4Weights,
@@ -248,6 +252,7 @@ impl Qwen4Bundle {
         let forward = Qwen4GpuForward::new(gpu, self, max_chunk)
             .map_err(|error| BundleError::Forward(error.to_string()))?;
         let logits_len = max_chunk
+            .min(SPEC_LOGIT_ROWS)
             .checked_mul(self.config.vocab_size)
             .ok_or_else(|| BundleError::Forward("spec logit scratch overflow".to_string()))?;
         let spec_logits = match gpu.zeros(&[logits_len], rdna_compute::DType::F32) {
@@ -327,6 +332,17 @@ impl Qwen4Bundle {
         Ok(())
     }
 
+    /// Start OS readahead of the PLE rows of `tokens[skip..]`, where `tokens`
+    /// continue from the current position and `tokens[..skip]` is the chunk
+    /// about to run: the next chunk then finds its rows in the page cache
+    /// instead of stalling on cold reads (one chunk ahead, so the hints do not
+    /// queue ahead of the running chunk's own reads).
+    pub(crate) fn ple_readahead(&self, tokens: &[u32], skip: usize) {
+        let mut ids = self.state.ple_history.row_ids(&self.ple_metadata, tokens);
+        ids.drain(..(skip * crate::ple::PLE_HEAD_COUNT).min(ids.len()));
+        self.ple_rows.readahead(ids);
+    }
+
     /// Rows the attached forward can process in one chunked call.  The MTP
     /// prefill uses this to batch a whole prompt chunk through the shared
     /// forward instead of one single-row forward per prompt token.
@@ -356,7 +372,7 @@ impl Qwen4Bundle {
             .ok_or_else(|| BundleError::Forward("Qwen4 prefill produced no argmax".into()))
     }
 
-    fn spec_forward_rows_with_output(
+    pub(crate) fn spec_forward_rows_with_output(
         &mut self,
         gpu: &mut Gpu,
         tokens: &[u32],
@@ -384,6 +400,11 @@ impl Qwen4Bundle {
         }
         let vocab = self.config.vocab_size;
         let output_count = output_rows.count(tokens.len());
+        if output_count > SPEC_LOGIT_ROWS {
+            return Err(BundleError::Forward(format!(
+                "Qwen4 spec forward requests {output_count} logit rows; at most {SPEC_LOGIT_ROWS}"
+            )));
+        }
         let logits_len = output_count
             .checked_mul(vocab)
             .ok_or_else(|| BundleError::Forward("Qwen4 spec logits overflow".to_string()))?;
@@ -626,6 +647,35 @@ impl Qwen4Bundle {
                 MtpStep::Append,
             )
             .map(|_| ())
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// [`Self::mtp_append_token`] for `tokens` at `position..`, whose backbone
+    /// hidden rows are the spec-hidden capture rows `first_row..` of the last
+    /// chunked prefill, in one batched MTP step (at most
+    /// [`crate::mtp_gpu::MTP_APPEND_ROWS`] tokens).
+    pub(crate) fn mtp_append_rows(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        first_row: usize,
+        position: usize,
+    ) -> Result<(), BundleError> {
+        let width = self.config.hc_count * self.config.hidden_size;
+        let source = self.spec_hidden.as_ref().ok_or_else(|| {
+            BundleError::Forward("Qwen4 spec hidden is not allocated".to_string())
+        })?;
+        let (offset, len) = (first_row * width, tokens.len() * width);
+        if offset + len > source.numel() {
+            return Err(BundleError::Forward(
+                "Qwen4 spec hidden rows are outside capture".to_string(),
+            ));
+        }
+        let hidden = source.sub_offset(offset, len);
+        self.mtp
+            .as_mut()
+            .ok_or_else(|| BundleError::Forward("Qwen4 MTP resources are not attached".into()))?
+            .append_rows(gpu, &self.weights, &self.config, tokens, &hidden, position)
             .map_err(|error| BundleError::Forward(error.to_string()))
     }
 

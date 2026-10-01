@@ -1929,20 +1929,23 @@ pub fn execute_indexed_attention(
             initial_position * index_kv_width,
             Some(index_kv_width),
         ))?;
-        hip(indexed_attention_norm_rope_batch(
-            gpu,
-            &IndexedAttentionNormRopeBatch {
-                values: &qgate_batch,
-                norm: op.q_norm,
-                rows: op.rows,
-                row_stride: 2 * q_width,
-                heads: op.heads,
-                head_dim: op.head_dim,
-                head_stride: 2 * op.head_dim,
-                position_start: initial_position,
-                rotary_dim: op.head_dim.min(64),
-            },
-        ))?;
+        // AppendOnly never projected Q; its scratch holds no rows to rotate.
+        if !matches!(op.mode, IndexedAttentionMode::AppendOnly) {
+            hip(indexed_attention_norm_rope_batch(
+                gpu,
+                &IndexedAttentionNormRopeBatch {
+                    values: &qgate_batch,
+                    norm: op.q_norm,
+                    rows: op.rows,
+                    row_stride: 2 * q_width,
+                    heads: op.heads,
+                    head_dim: op.head_dim,
+                    head_stride: 2 * op.head_dim,
+                    position_start: initial_position,
+                    rotary_dim: op.head_dim.min(64),
+                },
+            ))?;
+        }
         hip(indexed_attention_norm_rope_batch(
             gpu,
             &IndexedAttentionNormRopeBatch {
@@ -1976,9 +1979,10 @@ pub fn execute_indexed_attention(
     // active lengths stay scalars. Measured bit-identical to the position-derived
     // shapes with no throughput delta (docs/design/qwen4-program-retained-pm4.md).
     if complete > 0 {
-        // Decode pools only the block its row completes (earlier blocks hold
-        // the same kernel's output for unchanged raw keys).
-        let pool = if op.rows == 1 {
+        // Decode and few-row verify pool only the blocks their rows complete
+        // (earlier blocks hold the same kernel's output for unchanged raw
+        // keys; a rolled-back block starts at or after `position_start`).
+        let pool = if op.rows <= 8 {
             indexed_attention_pool_rope_incremental
         } else {
             indexed_attention_pool_rope
@@ -2469,40 +2473,50 @@ pub fn execute_project(gpu: &mut Gpu, op: &ProjectOp<'_>) -> Result<(), Dispatch
     project_weight(gpu, &op.weight, op.input, op.output, op.rows, op.rotation)
 }
 
-/// `output[r] = rows_input[r] + row` for every one of `rows` rows of `width`.
+/// `output[r] = rows_input[r] + row[r / group]` for every one of `rows` rows
+/// of `width`: each `row` entry is shared by `group` consecutive rows.
 pub struct BroadcastAddOp<'a> {
     pub rows_input: &'a GpuTensor,
     pub row: &'a GpuTensor,
     pub output: &'a GpuTensor,
     pub rows: usize,
     pub width: usize,
+    pub group: usize,
 }
 
 impl BroadcastAddOp<'_> {
     pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
-        if self.rows == 0 || self.width == 0 {
+        if self.rows == 0 || self.width == 0 || self.group == 0 {
             return Err(DispatchError::Hip(
                 "broadcast add has empty geometry".into(),
+            ));
+        }
+        if !self.rows.is_multiple_of(self.group) {
+            return Err(DispatchError::Hip(
+                "broadcast add rows are not a multiple of the group".into(),
             ));
         }
         let elements = checked_mul(self.rows, self.width, "broadcast add rows")?;
         require_tensor(self.rows_input, elements, DType::F32, "broadcast add input")?;
         require_tensor(self.output, elements, DType::F32, "broadcast add output")?;
-        require_tensor(self.row, self.width, DType::F32, "broadcast add row")
+        require_tensor(
+            self.row,
+            self.rows / self.group * self.width,
+            DType::F32,
+            "broadcast add row",
+        )
     }
 }
 
 pub fn execute_broadcast_add(gpu: &mut Gpu, op: &BroadcastAddOp<'_>) -> Result<(), DispatchError> {
-    let row = view(op.row, 0, op.width);
-    for r in 0..op.rows {
-        let offset = r * op.width;
-        hip(gpu.add_f32(
-            &view(op.rows_input, offset, op.width),
-            &row,
-            &view(op.output, offset, op.width),
-        ))?;
-    }
-    Ok(())
+    hip(gpu.add_broadcast_rows_f32(
+        op.rows_input,
+        op.row,
+        op.output,
+        op.rows,
+        op.width,
+        op.group,
+    ))
 }
 
 /// Final hyper read uses the same operation contract as a regular read; this

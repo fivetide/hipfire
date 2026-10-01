@@ -12,6 +12,7 @@
 //! consumed-row count, which adds the seed.
 
 use crate::bundle::Qwen4Bundle;
+use crate::mtp_gpu::MTP_APPEND_ROWS;
 #[cfg(any(test, feature = "reference-parity"))]
 use crate::reference_mtp::{MtpError, Qwen4MtpState};
 use crate::state::Qwen4StateSnapshot;
@@ -345,7 +346,12 @@ impl SpecTarget for Qwen4Bundle {
             }
             let end = (offset + max_chunk).min(tokens.len());
             let picks = self
-                .spec_forward_rows(gpu, &tokens[offset..end], false)
+                .spec_forward_rows_with_output(
+                    gpu,
+                    &tokens[offset..end],
+                    false,
+                    crate::gpu_forward::Qwen4OutputRows::Final,
+                )
                 .map_err(|error| error.to_string())?;
             last_argmax = picks.last().copied();
             offset = end;
@@ -1275,33 +1281,55 @@ impl MtpDrafter for Qwen4MtpDrafter {
         // Each prompt token selects with its own query and the pooled keys
         // visible at that position, regardless of target prefill chunking.
         let chunk_rows = self.prefill_rows.max(1);
-        for (chunk_index, chunk) in fill_tokens.chunks(chunk_rows).enumerate() {
+        let budget = Self::bundle(target)?.config.indexer_budget;
+        let mut base = 0usize;
+        while base < fill_tokens.len() {
             if abort() {
                 target.reset_recurrent(gpu)?;
                 return Err("Qwen4 native MTP prefill aborted".to_string());
             }
-            let base = chunk_index * chunk_rows;
+            let rows = crate::gpu_forward::prefill_chunk_rows(
+                budget,
+                start_pos + base,
+                fill_tokens.len() - base,
+                chunk_rows,
+            );
+            let chunk = &fill_tokens[base..base + rows];
+            let next_rows = crate::gpu_forward::prefill_chunk_rows(
+                budget,
+                start_pos + base + rows,
+                fill_tokens.len() - base - rows,
+                chunk_rows,
+            );
+            if next_rows > 0 {
+                Self::bundle(target)?
+                    .ple_readahead(&fill_tokens[base..base + rows + next_rows], rows);
+            }
             let pick = Self::bundle(target)?
                 .spec_prefill_rows(gpu, chunk)
                 .map_err(|error| error.to_string())?;
-            for (index, &token) in chunk.iter().enumerate() {
+            // The head appends the chunk's K/V rows in batches; `pending`
+            // ends holding the chunk's last hidden row, as a per-token
+            // append left it.
+            for (batch_index, batch) in chunk.chunks(MTP_APPEND_ROWS).enumerate() {
                 if abort() {
                     target.reset_recurrent(gpu)?;
                     return Err("Qwen4 native MTP prefill aborted".to_string());
                 }
+                let first_row = batch_index * MTP_APPEND_ROWS;
                 let position = start_pos
                     .checked_add(base)
-                    .and_then(|value| value.checked_add(index))
+                    .and_then(|value| value.checked_add(first_row))
                     .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
-                let bundle = Self::bundle(target)?;
-                bundle
-                    .copy_spec_hidden_row_to(gpu, index, pending)
-                    .map_err(|error| error.to_string())?;
-                bundle
-                    .mtp_append_token(gpu, token, Some(pending), position)
+                Self::bundle(target)?
+                    .mtp_append_rows(gpu, batch, first_row, position)
                     .map_err(|error| error.to_string())?;
             }
+            Self::bundle(target)?
+                .copy_spec_hidden_row_to(gpu, chunk.len() - 1, pending)
+                .map_err(|error| error.to_string())?;
             first_token = Some(pick);
+            base += rows;
         }
         let first_token = first_token.expect("non-empty MTP prefill produced no seed");
         self.aligned_at = Self::aligned_position(target);

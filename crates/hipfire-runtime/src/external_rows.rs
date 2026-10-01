@@ -53,6 +53,8 @@ const PARALLEL_READERS: usize = 16;
 /// Byte budget of one coalesced read or one staging buffer.  The effective
 /// size is rounded down to a whole number of decoded rows.
 const STAGING_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+/// Rows per request-ordered segment of [`RowStore::readahead`].
+const READAHEAD_SEGMENT_ROWS: usize = 16 * 1024;
 /// At most two staging buffers exist: one completed output and one read buffer.
 pub const MAX_STAGING_BUFFERS: usize = 2;
 /// Bounded queue of request ids.  A completed request also occupies one ticket
@@ -1016,6 +1018,40 @@ impl RowStore {
         self.inner.locate_row(row)
     }
 
+    /// Best-effort OS readahead of `row_ids`' source bytes, issued from a
+    /// detached thread: rows a request will fetch much later (a long prompt's
+    /// later chunks) then come from the page cache instead of stalling each
+    /// chunk on cold reads. Unknown rows are skipped; nothing is cached here.
+    pub fn readahead(&self, row_ids: Vec<u64>) {
+        let inner = self.inner.clone();
+        std::thread::spawn(move || {
+            let row_bytes = inner.encoded_row_bytes as u64;
+            // Segments in request order, so the earliest-needed rows are
+            // queued first; within a segment, one hint per run of rows less
+            // than a 4 KiB page apart.
+            for segment in row_ids.chunks(READAHEAD_SEGMENT_ROWS) {
+                let mut rows: Vec<(usize, u64)> = segment
+                    .iter()
+                    .filter_map(|&row| inner.locate_row(row).ok())
+                    .map(|location| (location.shard, location.local_row as u64 * row_bytes))
+                    .collect();
+                rows.sort_unstable();
+                rows.dedup();
+                let mut i = 0;
+                while i < rows.len() {
+                    let (shard, start) = rows[i];
+                    let mut end = start + row_bytes;
+                    i += 1;
+                    while i < rows.len() && rows[i].0 == shard && rows[i].1 <= end + 4096 {
+                        end = rows[i].1 + row_bytes;
+                        i += 1;
+                    }
+                    inner.source.advise_willneed(shard, start, end - start);
+                }
+            }
+        });
+    }
+
     fn plan_rows(
         &self,
         row_ids: &[u64],
@@ -1941,6 +1977,8 @@ fn worker_loop(weak: Weak<RowStoreInner>) {
 
 trait PositionalRowSource: Send + Sync {
     fn read_at(&self, shard: usize, local_offset: u64, dst: &mut [u8]) -> Result<(), SourceError>;
+    /// Best-effort OS readahead hint for `len` bytes at `local_offset`.
+    fn advise_willneed(&self, _shard: usize, _local_offset: u64, _len: u64) {}
 }
 
 struct DescriptorRowSource {
@@ -1964,6 +2002,14 @@ impl PositionalRowSource for DescriptorRowSource {
                     length: local_offset,
                 })?;
         descriptor.read_exact_at(absolute, dst)
+    }
+
+    fn advise_willneed(&self, shard: usize, local_offset: u64, len: u64) {
+        if let Some(descriptor) = self.descriptors.get(shard) {
+            descriptor
+                .reader()
+                .advise_willneed(descriptor.offset.saturating_add(local_offset), len);
+        }
     }
 }
 

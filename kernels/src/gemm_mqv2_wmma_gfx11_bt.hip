@@ -616,12 +616,13 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
     // Slot i covers token i * (NT / VPT) + tid / VPT, so its LDS offset is
     // lds0 plus a compile-time constant.  Named scalars, not an array: the
     // array stays in scratch because SROA runs before the loops unroll.
-    static_assert(VECS == 8, "staging is written out for eight slots");
-#define XL_FOR8(F) F(0) F(1) F(2) F(3) F(4) F(5) F(6) F(7)
+    // RW 4 stages eight slots per thread, RW 8 four.
+    static_assert(VECS == 8 || VECS == 4, "staging is written out for four or eight slots");
+#define XL_FOR8(F) F(0) F(1) F(2) F(3) if constexpr (VECS == 8) { F(4) F(5) F(6) F(7) }
 #define XL_OFF(I) \
     const int xo##I = ((batch_start + I * (NT / VPT) + tid / VPT < N) \
         ? (batch_start + I * (NT / VPT) + tid / VPT) : 0) * ldx + (tid % VPT) * 8;
-    XL_FOR8(XL_OFF)
+    XL_OFF(0) XL_OFF(1) XL_OFF(2) XL_OFF(3) XL_OFF(4) XL_OFF(5) XL_OFF(6) XL_OFF(7)
 #undef XL_OFF
     _Float16* lds0 = xs + (tid / VPT) * STRIDE + (tid % VPT) * 8;
 #define XL_LOAD(I) st##I = *(const uint4*)(X + xo##I + cn * CK);
@@ -629,7 +630,7 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
     // The barriers order LDS only: __syncthreads would also wait for the
     // in-flight next-chunk X and payload loads (WGP-mode workgroup fence).
 #define XL_BARRIER() asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory")
-    uint4 st0, st1, st2, st3, st4, st5, st6, st7;
+    uint4 st0, st1, st2, st3, st4 = {}, st5 = {}, st6 = {}, st7 = {};
     {
         const int cn = 0;
         XL_FOR8(XL_LOAD)
@@ -772,6 +773,32 @@ gemm_mq6g256v2_wmma_gfx11_bt8_x4_bf16out(const char* __restrict__ A,
                                          float* __restrict__ Y,
                                          int M, int K, int N, int ldx) {
     resid_bt_xlds<6, 8, 4, true, true>(A, X, Y, M, K, N, ldx);
+}
+
+// The x4 kernels with eight row tiles (128 rows) per workgroup: each X chunk
+// is fetched once for twice the rows (prefill-sized N).  Bitwise the x4 ones.
+extern "C" __launch_bounds__(256, 1) __global__ void
+gemm_mq6g256v2_residual_wmma_gfx11_bt8_x8(const char* __restrict__ A,
+                                          const _Float16* __restrict__ X,
+                                          float* __restrict__ Y,
+                                          int M, int K, int N, int ldx) {
+    resid_bt_xlds<6, 8, 8, false>(A, X, Y, M, K, N, ldx);
+}
+
+extern "C" __launch_bounds__(256, 1) __global__ void
+gemm_mq6g256v2_wmma_gfx11_bt8_x8(const char* __restrict__ A,
+                                 const _Float16* __restrict__ X,
+                                 float* __restrict__ Y,
+                                 int M, int K, int N, int ldx) {
+    resid_bt_xlds<6, 8, 8, true>(A, X, Y, M, K, N, ldx);
+}
+
+extern "C" __launch_bounds__(256, 1) __global__ void
+gemm_mq6g256v2_wmma_gfx11_bt8_x8_bf16out(const char* __restrict__ A,
+                                         const _Float16* __restrict__ X,
+                                         float* __restrict__ Y,
+                                         int M, int K, int N, int ldx) {
+    resid_bt_xlds<6, 8, 8, true, true>(A, X, Y, M, K, N, ldx);
 }
 
 #endif // __GFX11__
