@@ -31,11 +31,12 @@ pub mod batched;
 pub mod batched_attention;
 #[cfg(feature = "deltanet")]
 pub mod batched_deltanet;
+pub(crate) mod draft_head;
 #[cfg(feature = "deltanet")]
 pub mod hybrid;
-pub(crate) mod draft_head;
 pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState};
 pub(crate) mod layer_ops;
+pub mod sandwich;
 pub(crate) mod steps;
 pub use layer_ops::{
     execute_argmax, execute_broadcast_add, execute_clear, execute_embedding, execute_final_hyper,

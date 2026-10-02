@@ -113,6 +113,16 @@ pub enum Step<'a> {
     /// Dense SwiGLU FFN sublayer.
     #[cfg(feature = "deltanet")]
     SwigluFfn(crate::pipeline::hybrid::SwigluFfnOp<'a>),
+    /// Sandwich-norm attention sublayer.
+    SandwichAttention(crate::pipeline::sandwich::SandwichAttentionOp<'a>),
+    /// Sandwich-norm gated MLP sublayer.
+    SandwichMlp(crate::pipeline::sandwich::SandwichMlpOp<'a>),
+    /// Sandwich-norm per-layer-input branch.
+    PerLayerInput(crate::pipeline::sandwich::PerLayerInputOp<'a>),
+    /// In-place scalar multiply.
+    Scale(crate::pipeline::sandwich::ScaleOp<'a>),
+    /// In-place final-logit soft cap.
+    Softcap(crate::pipeline::sandwich::SoftcapOp<'a>),
     /// Complete validated MoE program; granular operands come from its shared lowerer.
     Moe(sealed_moe::SealedMoeCall<'a>),
     /// Validated granular MoE stage; the sealed call is still the public authority.
@@ -144,7 +154,12 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         | Step::Project(_)
         | Step::BroadcastAdd(_)
         | Step::Moe(_)
-        | Step::MoeStage(..) => None,
+        | Step::MoeStage(..)
+        | Step::SandwichAttention(_)
+        | Step::SandwichMlp(_)
+        | Step::PerLayerInput(_)
+        | Step::Scale(_)
+        | Step::Softcap(_) => None,
         #[cfg(feature = "deltanet")]
         Step::DeltaNetMixer(_) | Step::GatedAttention(_) | Step::SwigluFfn(_) => None,
     }
@@ -1429,6 +1444,13 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         Step::BroadcastAdd(op) => crate::pipeline::layer_ops::execute_broadcast_add(gpu, op),
         Step::Moe(call) => sealed_moe::execute_sealed(gpu, call),
         Step::MoeStage(op, stage) => op.execute_stage(gpu, *stage),
+        Step::SandwichAttention(op) => {
+            crate::pipeline::sandwich::execute_sandwich_attention(gpu, ctx, op)
+        }
+        Step::SandwichMlp(op) => crate::pipeline::sandwich::execute_sandwich_mlp(gpu, ctx, op),
+        Step::PerLayerInput(op) => crate::pipeline::sandwich::execute_per_layer_input(gpu, ctx, op),
+        Step::Scale(op) => crate::pipeline::sandwich::execute_scale(gpu, op),
+        Step::Softcap(op) => crate::pipeline::sandwich::execute_softcap(gpu, op),
         #[cfg(feature = "deltanet")]
         Step::DeltaNetMixer(op) => crate::pipeline::hybrid::execute_deltanet_mixer(gpu, ctx, op),
         #[cfg(feature = "deltanet")]
