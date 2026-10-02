@@ -34,9 +34,10 @@ const INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC: &str =
 const INDEXED_ATTENTION_SELECT_EXACT_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_select_exact.hip");
 /// `HIPFIRE_QWEN4_QSA_WMMA_GATHER` (on unless `0`) routes QSA prefill
-/// attention chunks (rows >= QWEN4_F16_WMMA_MIN_TOKENS) that the full-window
-/// dense route does not take through the gathered F16 WMMA kernels: gfx1151 on
-/// the F32 state, gfx1201 on the fp8 state.  Not bit-exact against the hg4
+/// attention chunks that the full-window dense route does not take through
+/// the gathered F16 WMMA kernels: gfx1151 on the F32 state from
+/// QSA_ATTENTION_HG12_MIN_ROWS rows, gfx1201 on the fp8 state from
+/// QWEN4_F16_WMMA_MIN_TOKENS rows.  Not bit-exact against the hg4
 /// kernel; admitted because its error against an f64 reference is no worse
 /// than BF16 storage of Q/K/V/P.  `0` keeps every launch of the incumbent
 /// route.  Read once.
@@ -4140,7 +4141,9 @@ fn indexed_attention_attention_batch_impl(
             ),
         ));
     }
-    // The gathered route is an explicit opt-in, so it goes before the sparse one.
+    // Gathered first: on the F32 state it covers every row count the sparse
+    // route takes, at equal KLD and no slower; sparse remains the route on
+    // other gfx11 parts and with HIPFIRE_QWEN4_QSA_WMMA_GATHER=0.
     if allow_f16 && qsa_gathered_wmma_applies(gpu, p) {
         return qsa_gathered_wmma(gpu, p, end_position, max_selected);
     }
@@ -4514,13 +4517,22 @@ pub fn reserve_qsa_gathered_wmma_scratch(
 
 /// Whether the gathered F16 WMMA attention applies (checked after the dense
 /// route): the route is enabled for the state format
-/// ([`qsa_gathered_wmma_enabled`]), >= QWEN4_F16_WMMA_MIN_TOKENS rows, no
-/// recorder or capture, head_dim 256 with at most 16 query heads per KV head,
-/// and a token list that fits the LDS budget.  With
-/// `HIPFIRE_QWEN4_QSA_WMMA_GATHER=0` every launch is the incumbent's.
+/// ([`qsa_gathered_wmma_enabled`]), enough rows, no recorder or capture,
+/// head_dim 256 with at most 16 query heads per KV head, and a token list
+/// that fits the LDS budget.  With `HIPFIRE_QWEN4_QSA_WMMA_GATHER=0` every
+/// launch is the incumbent's.
 fn qsa_gathered_wmma_applies(gpu: &Gpu, p: &IndexedAttentionAttentionBatch<'_>) -> bool {
+    let min_rows = match p.format {
+        // gfx1151: also the sparse route's 16..511-row chunks (prompt-cache
+        // suffixes, short tails). Against the exact kernels, gathered KLD
+        // matched sparse (paired over 10 samples at 4K-16K context) and each
+        // chunk ran 0-2% faster.
+        QsaKvFormat::F32 => QSA_ATTENTION_HG12_MIN_ROWS,
+        // gfx1201 has no sparse route; its small chunks keep the exact kernels.
+        QsaKvFormat::Fp8 => crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS,
+    };
     qsa_gathered_wmma_enabled(gpu, p.format)
-        && p.rows >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+        && p.rows >= min_rows
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
         && p.head_dim == 256

@@ -1,6 +1,15 @@
 # Changelog
 
 ## Unreleased
+- **Qwen4 (Flash-Next) on gfx1151: past-budget QSA chunks of 16-511 rows
+  run on the gathered F16 WMMA kernel instead of the sparse one.** Both round
+  Q, K, V and the probabilities to F16. Against the exact kernels, KLD was
+  the same (paired over 10 WikiText-2 samples at 4K-16K context: sparse
+  mean 0.0314, gathered 0.0254, t = 1.36), and each chunk was 0-2% faster
+  (16 rows: 143 -> 140 ms; 256 rows: 646 -> 638 ms at 16K). This covers
+  prompt-cache suffixes and short tails. `HIPFIRE_QWEN4_QSA_WMMA_GATHER=0`
+  returns them, and the >= 512-row chunks, to the sparse kernel. gfx1201
+  keeps the exact kernels below 512 rows.
 - **Qwen4 (Flash-Next): native MTP now runs sampled (temperature > 0)
   requests; they used to fall back to AR.** Drafts stay the head's argmax.
   Each verify row's target token is drawn with the AR sampler, in row order,
