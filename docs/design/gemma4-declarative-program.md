@@ -89,14 +89,18 @@ Projections, the final norm and the LM head reuse `Gemv` and
   routes; 26B
   `redline_daemon_harness.py --pm4 --skip-prefill` shadow exact (1083
   launches, was 1263; tape hash `249f24e5f39d425d`, was `0909f3792962c37d`).
+- `serve_harness.py --thinking off --sampling greedy --compare-transcript`
+  against the pre-port daemon: 12B battery and chain, E4B battery
+  `transcript_byte_identical=true`; 26B battery coherent (no runaway, empty or
+  attractor turns), turn 2 diverges.
 
 ## Progress
 
 | Piece | State | Commit |
 |---|---|---|
 | Eager decode + batched prefill/verify + E-series PLE as `[SandwichAttention, SandwichMlp, PerLayerInput?, Scale?]` (`program.rs`, dispatch `sandwich.rs`); hand arms deleted | landed; bitwise | `30b55f753` |
-| MoE decode (`ParallelMoeMlp`), lowered decode on the shared program; super-op facade (`lower_variant`, `Gemma4Bindings`) and lowered hand arms deleted; unsupported expert formats refuse at load | landed; 26B byte-identical with the two non-bitwise fusions off, coherent with them on | (this commit) |
-| EAGLE draft head as one step list (`Gemv` pre-projection, query-only `[SandwichAttention, SandwichMlp, Scale?]` blocks over the target's last slot, norm, `lm_head`, post-projection) | landed; EAGLE text and per-prompt tau identical | (this commit) |
+| MoE decode (`ParallelMoeMlp`), lowered decode on the shared program; super-op facade (`lower_variant`, `Gemma4Bindings`) and lowered hand arms deleted; unsupported expert formats refuse at load | landed; 26B byte-identical with the two non-bitwise fusions off, coherent with them on | `287e67d5b` |
+| EAGLE draft head as one step list (`Gemv` pre-projection, query-only `[SandwichAttention, SandwichMlp, Scale?]` blocks over the target's last slot, norm, `lm_head`, post-projection) | landed; EAGLE text and per-prompt tau identical | `287e67d5b` |
 
 ## Remaining
 
