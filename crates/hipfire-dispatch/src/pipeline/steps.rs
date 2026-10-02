@@ -109,6 +109,8 @@ pub enum Step<'a> {
     SandwichAttention(crate::pipeline::sandwich::SandwichAttentionOp<'a>),
     /// Sandwich-norm gated MLP sublayer.
     SandwichMlp(crate::pipeline::sandwich::SandwichMlpOp<'a>),
+    /// Parallel dense + routed-expert MLP sublayer.
+    ParallelMoeMlp(crate::pipeline::sandwich::ParallelMoeMlpOp<'a>),
     /// Sandwich-norm per-layer-input branch.
     PerLayerInput(crate::pipeline::sandwich::PerLayerInputOp<'a>),
     /// In-place scalar multiply.
@@ -149,6 +151,7 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         | Step::MoeStage(..)
         | Step::SandwichAttention(_)
         | Step::SandwichMlp(_)
+        | Step::ParallelMoeMlp(_)
         | Step::PerLayerInput(_)
         | Step::Scale(_)
         | Step::Softcap(_) => None,
@@ -1505,6 +1508,9 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             crate::pipeline::sandwich::execute_sandwich_attention(gpu, ctx, op)
         }
         Step::SandwichMlp(op) => crate::pipeline::sandwich::execute_sandwich_mlp(gpu, ctx, op),
+        Step::ParallelMoeMlp(op) => {
+            crate::pipeline::sandwich::execute_parallel_moe_mlp(gpu, ctx, op)
+        }
         Step::PerLayerInput(op) => crate::pipeline::sandwich::execute_per_layer_input(gpu, ctx, op),
         Step::Scale(op) => crate::pipeline::sandwich::execute_scale(gpu, op),
         Step::Softcap(op) => crate::pipeline::sandwich::execute_softcap(gpu, op),

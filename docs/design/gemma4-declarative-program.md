@@ -77,9 +77,34 @@ Projections, the final norm and the LM head reuse `Gemv` and
 - EAGLE drafter: tau parity and coherent text; greedy EAGLE output equals AR
   output where it did before.
 - Redline: the 26B shadow oracle (`redline_shadow_gemma4`) stays exact.
+  Residual and K=V copies are `copy_f32_buffer` launches, not D2D memcpys,
+  so the retained recorder sees them; a memcpy there made PM4 replay inexact.
+- Measured (gfx1151, pre-port daemon `8a6c4710`): every 12B/E2B/E4B row
+  bitwise; 26B with `HIPFIRE_GEMMA4_FUSED_QK_ROPE=0
+  HIPFIRE_GEMMA4_FUSED_POSTNORM=0` byte-identical, default 2 of 5 prompts
+  identical and 3 diverging late, coherent; EAGLE per-prompt tau
+  3.368/3.459/2.667/3.447/3.514 before and after; the 12B lowered opt-in
+  route (`HIPFIRE_BATCHED_PREFILL=1`) byte-identical with every
+  `HIPFIRE_GEMMA4_FUSED_*` knob at 0, since it too now takes the eager fused
+  routes; 26B
+  `redline_daemon_harness.py --pm4 --skip-prefill` shadow exact (1083
+  launches, was 1263; tape hash `249f24e5f39d425d`, was `0909f3792962c37d`).
 
 ## Progress
 
 | Piece | State | Commit |
 |---|---|---|
-| Eager decode + batched prefill/verify + E-series PLE as `[SandwichAttention, SandwichMlp, PerLayerInput?, Scale?]` (`program.rs`, dispatch `sandwich.rs`); hand arms deleted | landed; bitwise | (this commit) |
+| Eager decode + batched prefill/verify + E-series PLE as `[SandwichAttention, SandwichMlp, PerLayerInput?, Scale?]` (`program.rs`, dispatch `sandwich.rs`); hand arms deleted | landed; bitwise | `30b55f753` |
+| MoE decode (`ParallelMoeMlp`), lowered decode on the shared program; super-op facade (`lower_variant`, `Gemma4Bindings`) and lowered hand arms deleted; unsupported expert formats refuse at load | landed; 26B byte-identical with the two non-bitwise fusions off, coherent with them on | (this commit) |
+| EAGLE draft head as one step list (`Gemv` pre-projection, query-only `[SandwichAttention, SandwichMlp, Scale?]` blocks over the target's last slot, norm, `lm_head`, post-projection) | landed; EAGLE text and per-prompt tau identical | (this commit) |
+
+## Remaining
+
+- `lowered::forward_prefill_batch` (the tool-only batched prefill used by
+  `calib_sweep`, `eval_hipfire`, the KLD reference builders and the lowered
+  examples) still runs hand-written layer bodies. It carries the calibration
+  activation taps (`run_prefill_gemm`), BF16/WMMA prefill GEMM routes and
+  batched asym3 / per-token ring attention that the serve program does not.
+  Porting it needs a decision on where calibration taps live in dispatch.
+- Two weight stacks remain (`gemma4.rs` eager, `lowered.rs` MoE / batched
+  opt-in) with duplicate config and loaders; both bind to the same program.

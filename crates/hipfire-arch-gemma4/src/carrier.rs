@@ -118,6 +118,27 @@ fn append_cleanup_context(op_err: String, cleanup: Result<(), String>) -> String
     }
 }
 
+/// Refuse MoE checkpoints whose expert formats have no indexed device kernel
+/// pair (the routed-expert step is capture-safe and never falls back to a
+/// host loop).
+fn unsupported_expert_formats(weights: &lowered::Gemma4Weights) -> Option<String> {
+    weights.layers.iter().find_map(|layer| {
+        let moe = match layer {
+            lowered::LayerWeights::Sliding(l) => l.moe.as_ref(),
+            lowered::LayerWeights::Full(l) => l.moe.as_ref(),
+        }?;
+        let expert = moe.experts.first()?;
+        let (gate_up, down) = (expert.gate_up_proj.gpu_dtype, expert.down_proj.gpu_dtype);
+        (!hipfire_dispatch::pipeline::sandwich::RoutedExperts::supports(gate_up, down)).then(|| {
+            format!(
+                "gemma4 MoE: expert formats gate_up={gate_up:?} down={down:?} have no indexed \
+                 kernel; requantize experts to MQ4G256/HFQ4G256/HFQ6G256/Q8_0 gate_up with \
+                 Q8_0/HFQ4G128 down"
+            )
+        })
+    })
+}
+
 fn free_lowered_weights(weights: lowered::Gemma4Weights, gpu: &mut Gpu) {
     weights.free_gpu(gpu);
 }
@@ -253,6 +274,10 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
         // On any later error free every completed earlier owner in reverse.
         let weights = lowered::load_weights(&mut hfq2, &lcfg, ctx.gpu)
             .map_err(|e| format!("gemma4 (lowered) load_weights: {e:?}"))?;
+        if let Some(e) = unsupported_expert_formats(&weights) {
+            free_lowered_weights(weights, ctx.gpu);
+            return Err(e);
+        }
         let scratch = match lowered::Gemma4Scratch::new(ctx.gpu, &lcfg, ctx.max_seq) {
             Ok(v) => v,
             Err(e) => {

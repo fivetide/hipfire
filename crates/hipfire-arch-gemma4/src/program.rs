@@ -4,47 +4,354 @@
 
 //! Declarative Gemma 4 decoder-layer program.
 //!
-//! Each layer is `[SandwichAttention, SandwichMlp, PerLayerInput?, Scale?]`:
-//! the per-layer-input branch exists on E-series checkpoints, the scale step
-//! when the learned layer scalar is not 1. This module only binds resident
-//! weights, KV storage and scratch to the shared
-//! `hipfire_dispatch::pipeline::sandwich` operations; route selection and
-//! executor bodies live in dispatch. The same program serves single-token
-//! decode (`rows == 1`) and batched prefill / verify (`rows > 1`).
+//! Each layer is
+//! `[SandwichAttention, SandwichMlp | ParallelMoeMlp, PerLayerInput?, Scale?]`:
+//! MoE checkpoints run the parallel dense+expert block, E-series checkpoints
+//! add the per-layer-input branch, and the scale step exists when the learned
+//! layer scalar is not 1. This module only binds resident weights, KV storage
+//! and scratch to the shared `hipfire_dispatch::pipeline::sandwich`
+//! operations; route selection and executor bodies live in dispatch. The same
+//! program serves single-token decode (`rows == 1`) and batched prefill /
+//! verify (`rows > 1`), for both weight stacks (`gemma4` and `lowered`).
 
 use crate::config::{Gemma4Config, LayerType, RopeType};
-use crate::gemma4::{Gemma4State, LayerWeights, PerLayerBranchWeights};
+use crate::gemma4::{self, PerLayerBranchWeights};
+use crate::lowered;
+use hip_bridge::DeviceBuffer;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::pipeline::sandwich::{
-    Activation, PerLayerInputOp, Rope, RopeKind, SandwichAttentionOp, SandwichKv, SandwichMlpOp,
-    SandwichStream, ScaleOp, SoftcapOp,
+    Activation, KvProjection, ParallelMoeMlpOp, PerLayerInputOp, Rope, RopeKind, RoutedExperts,
+    RoutedScratch, SandwichAttentionOp, SandwichKv, SandwichMlpOp, SandwichStream, ScaleOp,
+    SoftcapOp,
 };
 use hipfire_dispatch::pipeline::{GemvInput, Step};
 use hipfire_dispatch::types::RotationPlan;
 use hipfire_runtime::llama::{KvCache, KvCacheExt, WeightTensor};
 use rdna_compute::GpuTensor;
 
-/// The typed RoPE of one layer type.
-pub(crate) fn layer_rope(cfg: &Gemma4Config, layer_type: LayerType) -> Rope {
-    match layer_type {
-        LayerType::Sliding => Rope {
-            kind: RopeKind::RotateHalf,
-            theta: cfg.sliding_rope_theta,
-        },
-        LayerType::Full => {
-            let head_dim = cfg.full_head_dim;
-            let rot_pairs = match cfg.full_rope_type {
-                RopeType::Proportional => {
-                    ((head_dim as f32) * cfg.full_partial_rotary_factor * 0.5) as usize
-                }
-                RopeType::Default => head_dim / 2,
-            };
-            Rope {
-                kind: RopeKind::PartialHalved { rot_pairs },
-                theta: cfg.full_rope_theta,
-            }
+/// Attention geometry of one layer type.
+#[derive(Clone, Copy)]
+pub(crate) struct AttnGeometry {
+    pub head_dim: usize,
+    pub n_kv_heads: usize,
+    /// Sliding window; `0` = full causal.
+    pub window: usize,
+    pub rope: Rope,
+}
+
+/// Model geometry the program reads; built from either config type.
+#[derive(Clone, Copy)]
+pub(crate) struct Geometry {
+    pub dim: usize,
+    pub eps: f32,
+    pub n_heads: usize,
+    pub n_layers: usize,
+    pub vocab: usize,
+    pub softcap: f32,
+    /// Per-layer-input width (E-series); `0` without PLE.
+    pub ple_width: usize,
+    /// Routed experts per token and per-expert FFN width (MoE checkpoints).
+    pub moe_top_k: usize,
+    pub moe_hidden: usize,
+    pub sliding: AttnGeometry,
+    pub full: AttnGeometry,
+}
+
+fn full_rope(head_dim: usize, rope_type: RopeType, factor: f32, theta: f32) -> Rope {
+    let rot_pairs = match rope_type {
+        RopeType::Proportional => ((head_dim as f32) * factor * 0.5) as usize,
+        RopeType::Default => head_dim / 2,
+    };
+    Rope {
+        kind: RopeKind::PartialHalved { rot_pairs },
+        theta,
+    }
+}
+
+impl Geometry {
+    pub fn eager(cfg: &Gemma4Config) -> Self {
+        Self {
+            dim: cfg.dim,
+            eps: cfg.norm_eps,
+            n_heads: cfg.n_heads,
+            n_layers: cfg.n_layers,
+            vocab: cfg.vocab_size,
+            softcap: cfg.final_logit_softcapping,
+            ple_width: cfg.hidden_size_per_layer_input,
+            moe_top_k: 0,
+            moe_hidden: 0,
+            sliding: AttnGeometry {
+                head_dim: cfg.sliding_head_dim,
+                n_kv_heads: cfg.sliding_n_kv_heads,
+                window: cfg.sliding_window,
+                rope: Rope {
+                    kind: RopeKind::RotateHalf,
+                    theta: cfg.sliding_rope_theta,
+                },
+            },
+            full: AttnGeometry {
+                head_dim: cfg.full_head_dim,
+                n_kv_heads: cfg.full_n_kv_heads,
+                window: 0,
+                rope: full_rope(
+                    cfg.full_head_dim,
+                    cfg.full_rope_type,
+                    cfg.full_partial_rotary_factor,
+                    cfg.full_rope_theta,
+                ),
+            },
         }
     }
+
+    /// The arch-22 draft head's blocks (no softcap; the head is bound
+    /// separately).
+    pub fn drafter(cfg: &crate::drafter::Gemma4DrafterConfig) -> Self {
+        Self {
+            dim: cfg.hidden,
+            eps: cfg.norm_eps,
+            n_heads: cfg.n_heads,
+            n_layers: cfg.n_layers,
+            vocab: cfg.vocab_size,
+            softcap: 0.0,
+            ple_width: 0,
+            moe_top_k: 0,
+            moe_hidden: 0,
+            sliding: AttnGeometry {
+                head_dim: cfg.sliding_head_dim,
+                n_kv_heads: cfg.sliding_n_kv_heads,
+                window: cfg.sliding_window,
+                rope: Rope {
+                    kind: RopeKind::RotateHalf,
+                    theta: cfg.sliding_rope_theta,
+                },
+            },
+            full: AttnGeometry {
+                head_dim: cfg.full_head_dim,
+                n_kv_heads: cfg.full_n_kv_heads,
+                window: 0,
+                rope: full_rope(
+                    cfg.full_head_dim,
+                    cfg.full_rope_type,
+                    cfg.full_partial_rotary_factor,
+                    cfg.full_rope_theta,
+                ),
+            },
+        }
+    }
+
+    pub fn lowered(cfg: &lowered::Gemma4Config) -> Self {
+        let rope_type = match cfg.full_rope_type {
+            lowered::RopeType::Default => RopeType::Default,
+            lowered::RopeType::Proportional => RopeType::Proportional,
+        };
+        Self {
+            dim: cfg.dim,
+            eps: cfg.norm_eps,
+            n_heads: cfg.n_heads,
+            n_layers: cfg.n_layers,
+            vocab: cfg.vocab_size,
+            softcap: cfg.final_logit_softcapping,
+            ple_width: 0,
+            moe_top_k: cfg.top_k_experts,
+            moe_hidden: cfg.moe_intermediate_size,
+            sliding: AttnGeometry {
+                head_dim: cfg.sliding_head_dim,
+                n_kv_heads: cfg.sliding_n_kv_heads,
+                window: cfg.sliding_window,
+                rope: Rope {
+                    kind: RopeKind::RotateHalf,
+                    theta: cfg.sliding_rope_theta,
+                },
+            },
+            full: AttnGeometry {
+                head_dim: cfg.full_head_dim,
+                n_kv_heads: cfg.full_n_kv_heads,
+                window: 0,
+                rope: full_rope(
+                    cfg.full_head_dim,
+                    rope_type,
+                    cfg.full_partial_rotary_factor,
+                    cfg.full_rope_theta,
+                ),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LayerKvWeights<'a> {
+    k: &'a WeightTensor,
+    v: Option<&'a WeightTensor>,
+    k_norm: &'a GpuTensor,
+}
+
+/// Per-layer weights the program binds, from any Gemma 4 weight stack.
+pub(crate) struct LayerRefs<'a> {
+    layer_type: LayerType,
+    input_norm: &'a GpuTensor,
+    post_attn_norm: &'a GpuTensor,
+    pre_ffn_norm: &'a GpuTensor,
+    post_ffn_norm: &'a GpuTensor,
+    layer_scalar: f32,
+    q: &'a WeightTensor,
+    q_norm: &'a GpuTensor,
+    /// Own K projection, V projection (`None` = K=V) and K norm; `None` on
+    /// query-only layers that read another layer's cache.
+    kv: Option<LayerKvWeights<'a>>,
+    o: &'a WeightTensor,
+    gate: &'a WeightTensor,
+    up: &'a WeightTensor,
+    down: &'a WeightTensor,
+    ffn_hidden_dim: usize,
+    per_layer: Option<&'a PerLayerBranchWeights>,
+    moe: Option<&'a lowered::MoeLayerExtras>,
+}
+
+impl<'a> LayerRefs<'a> {
+    pub fn eager(layer: &'a gemma4::LayerWeights) -> Self {
+        match layer {
+            gemma4::LayerWeights::Sliding(l) => Self {
+                layer_type: LayerType::Sliding,
+                input_norm: &l.input_layernorm,
+                post_attn_norm: &l.post_attention_layernorm,
+                pre_ffn_norm: &l.pre_feedforward_layernorm,
+                post_ffn_norm: &l.post_feedforward_layernorm,
+                layer_scalar: l.layer_scalar_host,
+                q: &l.q_proj,
+                q_norm: &l.q_norm,
+                kv: Some(LayerKvWeights {
+                    k: &l.k_proj,
+                    v: Some(&l.v_proj),
+                    k_norm: &l.k_norm,
+                }),
+                o: &l.o_proj,
+                gate: &l.gate_proj,
+                up: &l.up_proj,
+                down: &l.down_proj,
+                ffn_hidden_dim: l.ffn_hidden_dim,
+                per_layer: l.per_layer.as_ref(),
+                moe: None,
+            },
+            gemma4::LayerWeights::Full(l) => Self {
+                layer_type: LayerType::Full,
+                input_norm: &l.input_layernorm,
+                post_attn_norm: &l.post_attention_layernorm,
+                pre_ffn_norm: &l.pre_feedforward_layernorm,
+                post_ffn_norm: &l.post_feedforward_layernorm,
+                layer_scalar: l.layer_scalar_host,
+                q: &l.q_proj,
+                q_norm: &l.q_norm,
+                kv: Some(LayerKvWeights {
+                    k: &l.k_proj,
+                    v: l.v_proj.as_ref(),
+                    k_norm: &l.k_norm,
+                }),
+                o: &l.o_proj,
+                gate: &l.gate_proj,
+                up: &l.up_proj,
+                down: &l.down_proj,
+                ffn_hidden_dim: l.ffn_hidden_dim,
+                per_layer: l.per_layer.as_ref(),
+                moe: None,
+            },
+        }
+    }
+
+    /// `hidden_dim` is the lowered config's dense FFN width.
+    pub fn lowered(layer: &'a lowered::LayerWeights, hidden_dim: usize) -> Self {
+        match layer {
+            lowered::LayerWeights::Sliding(l) => Self {
+                layer_type: LayerType::Sliding,
+                input_norm: &l.input_layernorm,
+                post_attn_norm: &l.post_attention_layernorm,
+                pre_ffn_norm: &l.pre_feedforward_layernorm,
+                post_ffn_norm: &l.post_feedforward_layernorm,
+                layer_scalar: l.layer_scalar_host,
+                q: &l.q_proj,
+                q_norm: &l.q_norm,
+                kv: Some(LayerKvWeights {
+                    k: &l.k_proj,
+                    v: Some(&l.v_proj),
+                    k_norm: &l.k_norm,
+                }),
+                o: &l.o_proj,
+                gate: &l.gate_proj,
+                up: &l.up_proj,
+                down: &l.down_proj,
+                ffn_hidden_dim: hidden_dim,
+                per_layer: None,
+                moe: l.moe.as_ref(),
+            },
+            lowered::LayerWeights::Full(l) => Self {
+                layer_type: LayerType::Full,
+                input_norm: &l.input_layernorm,
+                post_attn_norm: &l.post_attention_layernorm,
+                pre_ffn_norm: &l.pre_feedforward_layernorm,
+                post_ffn_norm: &l.post_feedforward_layernorm,
+                layer_scalar: l.layer_scalar_host,
+                q: &l.q_proj,
+                q_norm: &l.q_norm,
+                kv: Some(LayerKvWeights {
+                    k: &l.k_proj,
+                    v: None,
+                    k_norm: &l.k_norm,
+                }),
+                o: &l.o_proj,
+                gate: &l.gate_proj,
+                up: &l.up_proj,
+                down: &l.down_proj,
+                ffn_hidden_dim: hidden_dim,
+                per_layer: None,
+                moe: l.moe.as_ref(),
+            },
+        }
+    }
+}
+
+impl<'a> LayerRefs<'a> {
+    /// A draft-head block: query-only attention over the target's cache.
+    pub fn drafter(
+        layer: &'a crate::drafter::DrafterLayerWeights,
+        layer_type: LayerType,
+        hidden_dim: usize,
+    ) -> Self {
+        Self {
+            layer_type,
+            input_norm: &layer.input_layernorm,
+            post_attn_norm: &layer.post_attention_layernorm,
+            pre_ffn_norm: &layer.pre_feedforward_layernorm,
+            post_ffn_norm: &layer.post_feedforward_layernorm,
+            layer_scalar: layer.layer_scalar_host,
+            q: &layer.q_proj,
+            q_norm: &layer.q_norm,
+            kv: None,
+            o: &layer.o_proj,
+            gate: &layer.gate_proj,
+            up: &layer.up_proj,
+            down: &layer.down_proj,
+            ffn_hidden_dim: hidden_dim,
+            per_layer: None,
+            moe: None,
+        }
+    }
+}
+
+/// Resident buffers every layer of a forward shares.
+pub(crate) struct Resident<'a> {
+    pub kv_sliding: &'a KvCache,
+    pub kv_full: &'a KvCache,
+    /// Device position scalar (`rows == 1`).
+    pub pos_buf: &'a DeviceBuffer,
+    /// Ones vector of the larger head dim (weight-less V norm).
+    pub v_norm_ones: &'a GpuTensor,
+    pub flash_partials: &'a GpuTensor,
+}
+
+/// Which cache slot a layer attends, and whether it writes its own row.
+#[derive(Clone, Copy)]
+pub(crate) struct LayerKv {
+    pub slot: usize,
+    pub writes: bool,
 }
 
 /// Per-layer-input scratch; present on E-series checkpoints.
@@ -72,11 +379,12 @@ pub(crate) struct LayerScratch<'a> {
     pub act: &'a GpuTensor,
     pub mlp_out: &'a GpuTensor,
     pub ple: Option<PleScratch<'a>>,
+    pub moe: Option<RoutedScratch<'a>>,
 }
 
 impl<'a> LayerScratch<'a> {
-    /// The resident single-row scratch of `state`.
-    pub fn decode(state: &'a Gemma4State) -> Self {
+    /// The resident single-row scratch of the eager state.
+    pub fn eager(state: &'a gemma4::Gemma4State) -> Self {
         let ple = match (
             &state.ple_projection_all,
             &state.ple_gate,
@@ -106,14 +414,48 @@ impl<'a> LayerScratch<'a> {
             act: &state.ffn_hidden,
             mlp_out: &state.ffn_out,
             ple,
+            moe: None,
+        }
+    }
+
+    /// The resident single-row scratch of the lowered state.
+    pub fn lowered(s: &'a lowered::Gemma4Scratch, moe: bool) -> Self {
+        Self {
+            x: &s.x,
+            residual: &s.residual,
+            normed: &s.tmp,
+            attn_rot: &s.x_rot,
+            mlp_rot: &s.x_rot,
+            q: &s.q,
+            k: &s.k,
+            v: &s.v,
+            attn_out: &s.attn_out,
+            gate: &s.gate_ffn,
+            up: &s.up_ffn,
+            act: &s.ffn_hidden,
+            mlp_out: &s.ffn_out,
+            ple: None,
+            moe: moe.then_some(RoutedScratch {
+                input: &s.moe_pre2,
+                input_rot: &s.moe_pre2_rot,
+                router_in: &s.moe_router_in,
+                router_logits: &s.moe_router_logits,
+                topk_indices: &s.moe_topk_indices,
+                topk_weights: &s.moe_topk_weights,
+                gate: &s.moe_expert_gate_batch,
+                up: &s.moe_expert_up_batch,
+                act: &s.moe_expert_hidden_batch,
+                out: &s.moe_cur_moe,
+                dense_normed: &s.moe_cur_mlp,
+            }),
         }
     }
 }
 
 /// Binding of one forward over `rows` consecutive positions from `position`.
 pub(crate) struct ProgramBinding<'a> {
-    pub cfg: &'a Gemma4Config,
-    pub state: &'a Gemma4State,
+    pub geo: Geometry,
+    pub resident: Resident<'a>,
     pub rows: usize,
     pub position: usize,
     /// Per-row i32 positions (`rows > 1`).
@@ -121,143 +463,62 @@ pub(crate) struct ProgramBinding<'a> {
     pub scratch: LayerScratch<'a>,
 }
 
-struct LayerRefs<'a> {
-    input_norm: &'a GpuTensor,
-    post_attn_norm: &'a GpuTensor,
-    pre_ffn_norm: &'a GpuTensor,
-    post_ffn_norm: &'a GpuTensor,
-    layer_scalar: f32,
-    q: &'a WeightTensor,
-    k: &'a WeightTensor,
-    v: Option<&'a WeightTensor>,
-    o: &'a WeightTensor,
-    q_norm: &'a GpuTensor,
-    k_norm: &'a GpuTensor,
-    gate: &'a WeightTensor,
-    up: &'a WeightTensor,
-    down: &'a WeightTensor,
-    ffn_hidden_dim: usize,
-    per_layer: Option<&'a PerLayerBranchWeights>,
-}
-
-fn layer_refs(layer: &LayerWeights) -> LayerRefs<'_> {
-    match layer {
-        LayerWeights::Sliding(l) => LayerRefs {
-            input_norm: &l.input_layernorm,
-            post_attn_norm: &l.post_attention_layernorm,
-            pre_ffn_norm: &l.pre_feedforward_layernorm,
-            post_ffn_norm: &l.post_feedforward_layernorm,
-            layer_scalar: l.layer_scalar_host,
-            q: &l.q_proj,
-            k: &l.k_proj,
-            v: Some(&l.v_proj),
-            o: &l.o_proj,
-            q_norm: &l.q_norm,
-            k_norm: &l.k_norm,
-            gate: &l.gate_proj,
-            up: &l.up_proj,
-            down: &l.down_proj,
-            ffn_hidden_dim: l.ffn_hidden_dim,
-            per_layer: l.per_layer.as_ref(),
-        },
-        LayerWeights::Full(l) => LayerRefs {
-            input_norm: &l.input_layernorm,
-            post_attn_norm: &l.post_attention_layernorm,
-            pre_ffn_norm: &l.pre_feedforward_layernorm,
-            post_ffn_norm: &l.post_feedforward_layernorm,
-            layer_scalar: l.layer_scalar_host,
-            q: &l.q_proj,
-            k: &l.k_proj,
-            v: l.v_proj.as_ref(),
-            o: &l.o_proj,
-            q_norm: &l.q_norm,
-            k_norm: &l.k_norm,
-            gate: &l.gate_proj,
-            up: &l.up_proj,
-            down: &l.down_proj,
-            ffn_hidden_dim: l.ffn_hidden_dim,
-            per_layer: l.per_layer.as_ref(),
-        },
-    }
-}
-
 impl<'a> ProgramBinding<'a> {
     fn stream(&self) -> SandwichStream<'a> {
         SandwichStream {
             rows: self.rows,
-            hidden: self.cfg.dim,
-            eps: self.cfg.norm_eps,
+            hidden: self.geo.dim,
+            eps: self.geo.eps,
             x: self.scratch.x,
             residual: self.scratch.residual,
             normed: self.scratch.normed,
         }
     }
 
-    /// Append the steps of `layer_idx` to `steps`.
+    /// Append the steps of `layer_idx` to `steps`. A layer writes its own
+    /// cache rows iff it has K/V weights and `kv_slot.writes`.
     pub fn layer(
         &self,
         layer_idx: usize,
-        layer: &'a LayerWeights,
+        w: LayerRefs<'a>,
+        kv_slot: LayerKv,
         steps: &mut Vec<Step<'a>>,
     ) -> Result<(), String> {
-        let cfg = self.cfg;
-        let st = self.state;
+        let geo = &self.geo;
+        let r = &self.resident;
         let sc = &self.scratch;
-        let layer_type = cfg.layer_types[layer_idx];
-        if !matches!(
-            (layer_type, layer),
-            (LayerType::Sliding, LayerWeights::Sliding(_))
-                | (LayerType::Full, LayerWeights::Full(_))
-        ) {
-            return Err(format!("gemma4 layer {layer_idx} type/weights mismatch"));
-        }
-        let shared = match cfg.kv_shared_source_layer_idx(layer_idx) {
-            Some(source) => Some(st.kv_slot_for_layer[source]),
-            None if cfg.is_kv_shared_layer(layer_idx) => {
-                return Err(format!(
-                    "gemma4 layer {layer_idx}: missing same-type KV sharing source"
-                ));
-            }
-            None => None,
+        let (kv, attn): (&KvCache, _) = match w.layer_type {
+            LayerType::Sliding => (r.kv_sliding, geo.sliding),
+            LayerType::Full => (r.kv_full, geo.full),
         };
-        let (kv, head_dim, n_kv_heads, window): (&KvCache, _, _, _) = match layer_type {
-            LayerType::Sliding => (
-                &st.kv_sliding,
-                cfg.sliding_head_dim,
-                cfg.sliding_n_kv_heads,
-                cfg.sliding_window,
-            ),
-            LayerType::Full => (&st.kv_full, cfg.full_head_dim, cfg.full_n_kv_heads, 0),
-        };
-        let w = layer_refs(layer);
-        let slot = shared.unwrap_or(st.kv_slot_for_layer[layer_idx]);
-        let writes = shared.is_none();
+        let kv_weights = w.kv.filter(|_| kv_slot.writes);
         steps.push(Step::SandwichAttention(SandwichAttentionOp {
             stream: self.stream(),
             position: self.position,
-            n_heads: cfg.n_heads,
-            n_kv_heads,
-            head_dim,
+            n_heads: geo.n_heads,
+            n_kv_heads: attn.n_kv_heads,
+            head_dim: attn.head_dim,
             input_norm: w.input_norm,
             wq: w.q.dispatch_ref(),
-            wk: writes.then(|| w.k.dispatch_ref()),
-            wv: w.v.filter(|_| writes).map(WeightTensor::dispatch_ref),
             q_norm: w.q_norm,
-            k_norm: w.k_norm,
-            v_norm: Some(&st.v_norm_ones),
-            q_scale: (head_dim as f32).sqrt(),
-            rope: layer_rope(cfg, layer_type),
+            kv_proj: kv_weights.map(|kv| KvProjection {
+                wk: kv.k.dispatch_ref(),
+                wv: kv.v.map(WeightTensor::dispatch_ref),
+                k_norm: kv.k_norm,
+                v_norm: Some(r.v_norm_ones),
+            }),
+            q_scale: (attn.head_dim as f32).sqrt(),
+            rope: attn.rope,
             kv: SandwichKv {
                 tier: kv.tier_inputs(),
-                k_cache: &kv.k_gpu[slot],
-                v_cache: &kv.v_gpu[slot],
+                k_cache: &kv.k_gpu[kv_slot.slot],
+                v_cache: &kv.v_gpu[kv_slot.slot],
                 physical_cap: kv.physical_cap,
                 givens_cos: kv.givens_cos.as_ref(),
                 givens_sin: kv.givens_sin.as_ref(),
-                window,
-                write: writes,
+                window: attn.window,
             },
-            pos_buf: &st.pos_buf,
+            pos_buf: r.pos_buf,
             positions: self.positions,
             wo: w.o.dispatch_ref(),
             post_norm: w.post_attn_norm,
@@ -266,9 +527,9 @@ impl<'a> ProgramBinding<'a> {
             k: sc.k,
             v: sc.v,
             attn_out: sc.attn_out,
-            flash_partials: &st.q8_flash_partials,
+            flash_partials: r.flash_partials,
         }));
-        steps.push(Step::SandwichMlp(SandwichMlpOp {
+        let mlp = SandwichMlpOp {
             stream: self.stream(),
             pre_norm: w.pre_ffn_norm,
             w_gate: w.gate.dispatch_ref(),
@@ -282,8 +543,41 @@ impl<'a> ProgramBinding<'a> {
             up: sc.up,
             act: sc.act,
             out: sc.mlp_out,
-        }));
-        if let Some(ple) = w.per_layer.filter(|_| cfg.hidden_size_per_layer_input != 0) {
+        };
+        match w.moe {
+            None => steps.push(Step::SandwichMlp(mlp)),
+            Some(moe) => {
+                let scratch = sc
+                    .moe
+                    .as_ref()
+                    .ok_or_else(|| format!("gemma4 layer {layer_idx}: missing MoE scratch"))?;
+                let expert = moe
+                    .experts
+                    .first()
+                    .ok_or_else(|| format!("gemma4 layer {layer_idx}: MoE layer has no experts"))?;
+                steps.push(Step::ParallelMoeMlp(ParallelMoeMlpOp {
+                    mlp,
+                    dense_post_norm: &moe.post_feedforward_layernorm_1,
+                    experts: RoutedExperts {
+                        pre_norm: &moe.pre_feedforward_layernorm_2,
+                        router_norm: &moe.router_scale,
+                        router_input_scale: 1.0 / (geo.dim as f32).sqrt(),
+                        router: moe.router_proj.dispatch_ref(),
+                        n_experts: moe.experts.len(),
+                        top_k: geo.moe_top_k,
+                        hidden_dim: geo.moe_hidden,
+                        gate_up_dtype: expert.gate_up_proj.gpu_dtype,
+                        down_dtype: expert.down_proj.gpu_dtype,
+                        gate_up_ptrs: &moe.experts_gate_up_ptrs,
+                        down_ptrs: &moe.experts_down_ptrs,
+                        per_expert_scale: &moe.per_expert_scale,
+                        post_norm: &moe.post_feedforward_layernorm_2,
+                    },
+                    scratch: RoutedScratch { ..*scratch },
+                }));
+            }
+        }
+        if let Some(ple) = w.per_layer.filter(|_| geo.ple_width != 0) {
             let s = sc
                 .ple
                 .as_ref()
@@ -291,8 +585,8 @@ impl<'a> ProgramBinding<'a> {
             steps.push(Step::PerLayerInput(PerLayerInputOp {
                 stream: self.stream(),
                 layer: layer_idx,
-                layer_width: cfg.hidden_size_per_layer_input,
-                n_layers: cfg.n_layers,
+                layer_width: geo.ple_width,
+                n_layers: geo.n_layers,
                 inputs: s.inputs,
                 w_gate: ple.input_gate.dispatch_ref(),
                 w_proj: ple.projection.dispatch_ref(),
@@ -312,11 +606,31 @@ impl<'a> ProgramBinding<'a> {
     }
 }
 
+/// KV slot and write ownership of every eager layer (E-series KV sharing).
+pub(crate) fn eager_layer_kv(
+    cfg: &Gemma4Config,
+    state: &gemma4::Gemma4State,
+    layer_idx: usize,
+) -> Result<LayerKv, String> {
+    match cfg.kv_shared_source_layer_idx(layer_idx) {
+        Some(source) => Ok(LayerKv {
+            slot: state.kv_slot_for_layer[source],
+            writes: false,
+        }),
+        None if !cfg.is_kv_shared_layer(layer_idx) => Ok(LayerKv {
+            slot: state.kv_slot_for_layer[layer_idx],
+            writes: true,
+        }),
+        None => Err(format!(
+            "gemma4 layer {layer_idx}: missing same-type KV sharing source"
+        )),
+    }
+}
+
 /// Final norm, tied LM head and logit soft cap of one row `x` into `logits`.
 /// `lm_head` is the caller-held `weights.lm_head.dispatch_ref()`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn head<'a>(
-    cfg: &Gemma4Config,
+    geo: &Geometry,
     final_norm: &'a GpuTensor,
     lm_head: &'a WeightRef<'a>,
     x: &'a GpuTensor,
@@ -330,8 +644,8 @@ pub(crate) fn head<'a>(
         x_plain: normed,
         out: normed,
         awq_scale: None,
-        k: cfg.dim,
-        eps: cfg.norm_eps,
+        k: geo.dim,
+        eps: geo.eps,
         rotation: RotationPlan::None,
     });
     steps.push(Step::Gemv {
@@ -339,11 +653,11 @@ pub(crate) fn head<'a>(
         input: GemvInput::Raw(normed),
         out: logits,
     });
-    if cfg.final_logit_softcapping > 0.0 {
+    if geo.softcap > 0.0 {
         steps.push(Step::Softcap(SoftcapOp {
             logits,
-            n: cfg.vocab_size,
-            cap: cfg.final_logit_softcapping,
+            n: geo.vocab,
+            cap: geo.softcap,
         }));
     }
 }

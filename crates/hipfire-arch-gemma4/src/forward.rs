@@ -56,7 +56,9 @@
 
 use crate::config::Gemma4Config;
 use crate::gemma4::{Gemma4State, Gemma4Weights, LayerWeights, GEMMA4_FORWARD_BATCH_MAX};
-use crate::program::{head, LayerScratch, PleScratch, ProgramBinding};
+use crate::program::{
+    eager_layer_kv, head, Geometry, LayerRefs, LayerScratch, PleScratch, ProgramBinding, Resident,
+};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::execute_steps;
 use hipfire_runtime::llama::{weight_gemv, WeightTensor};
@@ -475,6 +477,16 @@ fn prepare_per_layer_inputs_batched(
         .map_err(|e| format!("gemma4 forward_batch ple combine scale: {e:?}"))
 }
 
+fn eager_resident(state: &Gemma4State) -> Resident<'_> {
+    Resident {
+        kv_sliding: &state.kv_sliding,
+        kv_full: &state.kv_full,
+        pos_buf: &state.pos_buf,
+        v_norm_ones: &state.v_norm_ones,
+        flash_partials: &state.q8_flash_partials,
+    }
+}
+
 fn decode_step_body(
     cfg: &Gemma4Config,
     weights: &Gemma4Weights,
@@ -507,14 +519,19 @@ fn decode_step_body(
     for layer_idx in 0..cfg.n_layers {
         steps.clear();
         let binding = ProgramBinding {
-            cfg,
-            state,
+            geo: Geometry::eager(cfg),
+            resident: eager_resident(state),
             rows: 1,
             position: position as usize,
             positions: None,
-            scratch: LayerScratch::decode(state),
+            scratch: LayerScratch::eager(state),
         };
-        binding.layer(layer_idx, &weights.layers[layer_idx], &mut steps)?;
+        binding.layer(
+            layer_idx,
+            LayerRefs::eager(&weights.layers[layer_idx]),
+            eager_layer_kv(cfg, state, layer_idx)?,
+            &mut steps,
+        )?;
         execute_steps(gpu, &ctx, &steps).map_err(|e| format!("gemma4 L{layer_idx}: {e}"))?;
         if let Some(cap) = capture.as_deref_mut() {
             let h = gpu
@@ -530,7 +547,7 @@ fn decode_step_body(
     let lm_head = weights.lm_head.dispatch_ref();
     let mut head_steps = Vec::with_capacity(3);
     head(
-        cfg,
+        &Geometry::eager(cfg),
         &weights.final_norm,
         &lm_head,
         &state.x,
@@ -860,8 +877,8 @@ pub fn forward_batch_spec(
         _ => None,
     };
     let binding = ProgramBinding {
-        cfg,
-        state,
+        geo: Geometry::eager(cfg),
+        resident: eager_resident(state),
         rows: b,
         position: start_pos,
         positions: Some(&pos_array),
@@ -880,11 +897,17 @@ pub fn forward_batch_spec(
             act: &ffn_hidden,
             mlp_out: &ffn_out,
             ple,
+            moe: None,
         },
     };
     let mut steps = Vec::with_capacity(4 * cfg.n_layers);
     for (layer_idx, layer) in weights.layers.iter().enumerate() {
-        binding.layer(layer_idx, layer, &mut steps)?;
+        binding.layer(
+            layer_idx,
+            LayerRefs::eager(layer),
+            eager_layer_kv(cfg, state, layer_idx)?,
+            &mut steps,
+        )?;
     }
     execute_steps(gpu, &ctx, &steps).map_err(|e| format!("gemma4 forward_batch: {e}"))?;
     drop(steps);
