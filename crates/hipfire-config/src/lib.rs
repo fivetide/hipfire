@@ -2150,7 +2150,7 @@ pub static FIELDS: &[ConfigField] = &[
         ValueRule::Integer { min: 2, max: 1048576 },
         false,
         "HIPFIRE_PREFILL_CHUNK_ROWS",
-        "Widened ordinary-prefill chunk ceiling in rows (arch default 8192 on exact gfx1100/gfx1151/gfx1201, 512 elsewhere; HIPFIRE_PREFILL_MAX_BATCH overrides; per-device VRAM admission may select a smaller rung)."
+        "Widened ordinary-prefill chunk ceiling in rows (arch default 8192 on exact gfx1100/gfx1151/gfx1201, 512 elsewhere; HIPFIRE_PREFILL_MAX_BATCH overrides; per-device VRAM admission may select a smaller rung). Qwen4 (Flash-Next) rounds it down to 256 rows; its default is 8192 on exact gfx1151, 4096 on exact gfx1201, 1536 elsewhere."
     ),
     process_bool_field!(
         "speculation.draft_f16",
@@ -3840,7 +3840,7 @@ pub fn is_unified_memory_arch(arch: &str) -> bool {
 }
 
 /// Whether `arch` is a recognized discrete-VRAM GPU.
-fn is_discrete_memory_arch(arch: &str) -> bool {
+pub fn is_discrete_memory_arch(arch: &str) -> bool {
     DISCRETE_MEMORY_ARCHS
         .iter()
         .any(|known| arch.eq_ignore_ascii_case(known))

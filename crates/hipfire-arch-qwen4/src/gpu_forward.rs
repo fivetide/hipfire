@@ -30,7 +30,7 @@ use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::moe::{
     MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoeRecipe, MoeRouteCapability,
     MoeRouteFormats, MoeRouteGeometry, MoeRoutePolicy, MoeSharedDecode, MoeSharedDtypes,
-    MoeSharedWeights, RoutedExpertWeights,
+    MoeSharedWeights, MoeStageTables, RoutedExpertWeights,
 };
 use hipfire_dispatch::pipeline::sealed_moe::{
     retained_body_action, specialized_sealed_moe_retained_admission, RetainedBodyAction,
@@ -54,14 +54,77 @@ use std::fmt;
 use std::time::Instant;
 
 const EPSILON: f32 = 1.0e-6;
-/// Maximum number of rows resident in the reusable Qwen4 forward scratch.
+/// Default rows of one Qwen4 prefill chunk (the reusable forward scratch).
 ///
 /// Public serving calls may receive longer prompts; the forward owner tiles
 /// those requests over this bounded capacity instead of allocating
-/// prompt-sized grouped MoE buffers.  Every chunk re-streams all expert
-/// weights (1131 tokens: 3 chunks at 512 were 8% slower than one; a 32k
-/// prompt at 64k context: 4096-row chunks 5% faster than 2048).
-pub(crate) const QWEN4_PREFILL_CHUNK_CAP: usize = 8192;
+/// prompt-sized grouped MoE buffers.  Every chunk re-streams all routed
+/// expert weights, so pp throughput rises with the chunk until another
+/// kernel's shape envelope ends.  Measured against the earlier 1536-row
+/// chunk: gfx1151 pp8192 +10.2% at 8192 rows (resident experts).  On
+/// gfx1201 under `auto` expert placement the larger chunk costs VRAM expert
+/// layers, so the rung is the fastest pp8192 within 3% of the 2048-row
+/// rung's tg64: 4096 rows (14 layers at max_seq 66,560) measured pp8192
+/// +14.1% over 2048 rows (16 layers) at -2.9% tg64; 8192 rows (11 layers)
+/// measured +22.6% at -6.9% tg64.  Other architectures keep the measured
+/// 1536.
+pub fn qwen4_prefill_chunk_default(arch: &str) -> usize {
+    match arch {
+        "gfx1151" => 8192,
+        "gfx1201" => 4096,
+        _ => 1536,
+    }
+}
+
+/// Requested prefill chunk ceiling: `prefill.chunk_rows`
+/// (`HIPFIRE_PREFILL_CHUNK_ROWS`) rounded down to whole 256-row GEMM tiles,
+/// else [`qwen4_prefill_chunk_default`]; never above `max_seq`.  Load-time
+/// admission ([`qwen4_prefill_chunk_rungs`]) may still pick a smaller rung.
+pub fn qwen4_prefill_chunk_requested(arch: &str, max_seq: usize) -> usize {
+    hipfire_config::developer_var("HIPFIRE_PREFILL_CHUNK_ROWS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|rows| rows / 256 * 256)
+        .filter(|&rows| rows >= 256)
+        .unwrap_or_else(|| qwen4_prefill_chunk_default(arch))
+        .min(max_seq)
+}
+
+/// Chunk rungs admission tries, largest first: `requested`, then each
+/// smaller default rung down to 1536 (or `requested` itself when smaller).
+pub(crate) fn qwen4_prefill_chunk_rungs(requested: usize) -> impl Iterator<Item = usize> {
+    std::iter::once(requested).chain(
+        [4096, 2048, 1536]
+            .into_iter()
+            .filter(move |&rows| rows < requested),
+    )
+}
+
+/// Rows of the speculative logit and argmax buffers.  Only verify blocks
+/// return every row's argmax (native MTP verifies at most `K + 1 = 11`
+/// rows; block drafters on the shared `SpecTarget` contract get the rest);
+/// prompt advances and MTP prefill read their final row only.  A
+/// chunk-sized buffer cost `vocab * 4` bytes per chunk row.
+pub(crate) const QWEN4_SPEC_VERIFY_ROWS: usize = 64;
+
+pub(crate) fn qwen4_spec_logit_rows(max_chunk: usize) -> usize {
+    QWEN4_SPEC_VERIFY_ROWS.min(max_chunk)
+}
+
+/// Device bytes of the forward resources that scale with the chunk: the
+/// reusable scratch for `rows` rows plus the speculative logits and argmax.
+/// Load admission and the auto expert placement reserve size against this.
+pub fn qwen4_forward_device_bytes(config: &Qwen4Config, rows: usize) -> Option<u64> {
+    let scratch = Qwen4GpuForwardScratch::device_bytes(config, rows).ok()?;
+    let spec = qwen4_spec_logit_rows(rows)
+        .checked_mul(config.vocab_size.checked_mul(4)?.checked_add(4)?)?;
+    scratch.checked_add(spec as u64)
+}
+
+/// Free device memory a chunk rung must leave beside its chunk-sized
+/// resources for the kernels' lazily sized workspaces (333-347 MiB at
+/// pp8192 on gfx1201, measured as load-time free minus prefill-time free).
+pub(crate) const QWEN4_FORWARD_HEADROOM_BYTES: u64 = 1 << 30;
 
 /// Rows of the next prefill chunk at `position` with `remaining` tokens: at
 /// most `max_chunk`, and a chunk starting inside the QSA index budget ends at
@@ -81,6 +144,12 @@ pub(crate) fn prefill_chunk_rows(
 }
 const QWEN4_STEP_INLINE_CAPACITY: usize = 384;
 const QWEN4_QSA_INLINE_CAPACITY: usize = 12;
+
+/// K3 measured 56.7 GB/s: a 1,336,934,400-byte layer copy takes 23.6 ms.
+/// Smaller chunks (notably 1536 rows) expose DMA: keep the mapped path.
+/// The existing HIPFIRE_PREFILL_CHUNK_ROWS policy activates this once its
+/// branch lands; do not bypass the current 2048-row scratch cap here.
+const QWEN4_EXPERT_STAGE_MIN_ROWS: usize = 4096;
 
 /// Which rows of a batched Qwen4 prefill write language-model logits.
 ///
@@ -455,6 +524,7 @@ fn ple_desc<'a>(
 
 /// `decode_q8` / `rows`: the forward's Q8_0 decode copies and row count; a
 /// one-row forward binds this layer's shared-expert copies.
+#[allow(clippy::too_many_arguments)]
 fn layer_desc<'a>(
     weights: &'a Qwen4Weights,
     layer: &Qwen4LayerWeights,
@@ -462,6 +532,7 @@ fn layer_desc<'a>(
     config: &Qwen4Config,
     decode_q8: &'a [GpuTensor],
     rows: usize,
+    stage: Option<&'a Qwen4ExpertStage>,
 ) -> Result<Qwen4LayerDescription<'a>, Qwen4GpuForwardError> {
     let attention = match layer.kind {
         LayerType::LinearAttention => Qwen4AttentionWeights::Linear(gdn_desc(
@@ -517,6 +588,18 @@ fn layer_desc<'a>(
             experts_all_gate_up_mq4: moe.experts_all_gate_up_mq4,
             expert_gate_up_ptrs: &moe.expert_gate_up_ptrs,
             expert_down_ptrs: &moe.expert_down_ptrs,
+            expert_stage_ptrs: moe
+                .stage_tables
+                .as_ref()
+                .zip(stage)
+                .map(|(tables, stage)| {
+                    let parity = layer.layer % 2;
+                    MoeStageTables {
+                        gate_up: &tables[parity][0],
+                        down: &tables[parity][1],
+                        free: &stage.free[parity],
+                    }
+                }),
             expert_gate_up_entries: &moe.expert_gate_up_entries,
             expert_down_entries: &moe.expert_down_entries,
             layer_idx: layer.layer as u16,
@@ -549,6 +632,10 @@ impl RoutedExpertWeights for ExpertViewSet<'_> {
     fn immutable_identity(&self) -> Option<u64> {
         Some(self.identity)
     }
+
+    fn host_mapped(&self) -> bool {
+        self.experts.first().is_some_and(|expert| expert.gate_up.host_mapped)
+    }
 }
 
 /// Source of [`Qwen4MoeLayerRuntime::identity`].
@@ -572,6 +659,9 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     experts_all_gate_up_mq4: bool,
     expert_gate_up_ptrs: GpuTensor,
     expert_down_ptrs: GpuTensor,
+    /// Two static gate/up + down table pairs, one per VRAM-stage parity.
+    /// None for resident layers. These never replace the bound mapped tables.
+    stage_tables: Option<[[GpuTensor; 2]; 2]>,
     /// Host entries the two tables above were uploaded from. Kept so dispatch can
     /// prove the table contents name the live expert tensors before a retained
     /// body records them.
@@ -598,6 +688,10 @@ impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
 
     fn immutable_identity(&self) -> Option<u64> {
         Some(self.identity)
+    }
+
+    fn host_mapped(&self) -> bool {
+        self.experts.first().is_some_and(|expert| expert.gate_up.host_mapped)
     }
 }
 
@@ -818,6 +912,7 @@ impl Qwen4MoeLayerRuntime {
             expert_down_ptrs,
             expert_gate_up_entries: gate_entries,
             expert_down_entries: down_entries,
+            stage_tables: None,
             symmetric: false,
         })
     }
@@ -861,11 +956,204 @@ impl Qwen4MoeLayerRuntime {
 
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
         let mut first = None;
+        if let Some(tables) = self.stage_tables {
+            for tensor in tables.into_iter().flatten() {
+                if let Err(error) = gpu.free_tensor(tensor) {
+                    first.get_or_insert(error);
+                }
+            }
+        }
         for tensor in [self.expert_gate_up_ptrs, self.expert_down_ptrs] {
             if let Err(error) = gpu.free_tensor(tensor) {
                 if first.is_none() {
                     first = Some(error);
                 }
+            }
+        }
+        first
+    }
+}
+
+/// Routing-independent, pinned-host DMA pipeline. Every fork and join uses
+/// recorded events, including the initial fork from the capture-origin stream.
+struct Qwen4ExpertStage {
+    buffers: Vec<GpuTensor>,
+    copy_stream: hip_bridge::Stream,
+    ready: Vec<hip_bridge::Event>,
+    free: Vec<hip_bridge::Event>,
+}
+
+impl Qwen4ExpertStage {
+    fn new(
+        gpu: &mut Gpu,
+        bundle: &Qwen4Bundle,
+        moe: &mut [Qwen4MoeLayerRuntime],
+    ) -> Result<Option<Self>, Qwen4GpuForwardError> {
+        if !rdna_compute::gemm::qwen4_expert_stage_requested()
+            || !moe.iter().any(RoutedExpertWeights::host_mapped)
+        {
+            return Ok(None);
+        }
+        let config = &bundle.config;
+        // G2's stage layout is the frozen Flash-Next QT44/QT53 geometry.
+        // Other quantized artifacts keep their existing mapped path.
+        if config.num_experts != 512
+            || config.hidden_size != 2560
+            || config.moe_intermediate_size != 640
+            || moe.iter().any(|layer| {
+                layer.host_mapped()
+                    && layer.experts.iter().any(|expert| {
+                        expert.gate_up.tensor.dtype != DType::MQ4G256V2
+                            || expert.down.tensor.dtype != DType::MQ4G128V2
+                    })
+            })
+        {
+            return Ok(None);
+        }
+        gpu.ensure_capture_stream()?;
+        let mut stage = Self {
+            buffers: Vec::with_capacity(2),
+            copy_stream: gpu.hip.stream_create_non_blocking()?,
+            ready: Vec::with_capacity(2),
+            free: Vec::with_capacity(2),
+        };
+        let result = (|| {
+            for _ in 0..2 {
+                stage.buffers.push(gpu.alloc_tensor(
+                    &[rdna_compute::gemm::QWEN4_EXPERT_STAGE_LAYER_BYTES],
+                    DType::Raw,
+                )?);
+                stage.ready.push(
+                    gpu.hip
+                        .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?,
+                );
+                stage.free.push(
+                    gpu.hip
+                        .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?,
+                );
+            }
+            for (layer_idx, layer) in moe.iter_mut().enumerate() {
+                if !layer.host_mapped() {
+                    continue;
+                }
+                // Fetch host addresses only from owning tensors. Borrowed
+                // expert views must never be re-tagged as HostMapped (G1).
+                let weights = &bundle.weights.layer_refs[layer_idx].moe;
+                for source in [&weights.experts_gate_up, &weights.experts_down] {
+                    let owner = bundle.weights.resident(source)?;
+                    if gpu.host_bytes(owner).is_none() {
+                        return Err(invalid("G2 host expert owner has no pinned host bytes"));
+                    }
+                }
+                let mut tables = Vec::with_capacity(4);
+                let table_result = (|| {
+                    for buffer in &stage.buffers {
+                        let base = buffer.buf.as_ptr() as usize;
+                        for (offset, bytes) in [
+                            (0, 1_740_800),
+                            (rdna_compute::gemm::QWEN4_EXPERT_STAGE_GATE_UP_BYTES, 870_400),
+                        ] {
+                            let tensor = gpu.alloc_tensor(&[2 * config.num_experts], DType::F32)?;
+                            tables.push(tensor);
+                            let entries = (0..config.num_experts)
+                                .flat_map(|expert| (base + offset + expert * bytes).to_ne_bytes())
+                                .collect::<Vec<_>>();
+                            gpu.memcpy_htod_auto(
+                                &tables.last().expect("table just allocated").buf,
+                                &entries,
+                            )?;
+                        }
+                    }
+                    Ok::<(), Qwen4GpuForwardError>(())
+                })();
+                if let Err(error) = table_result {
+                    for tensor in tables {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    return Err(error);
+                }
+                let down1 = tables.pop().expect("four tables");
+                let gate1 = tables.pop().expect("four tables");
+                let down0 = tables.pop().expect("four tables");
+                let gate0 = tables.pop().expect("four tables");
+                layer.stage_tables = Some([[gate0, down0], [gate1, down1]]);
+            }
+            Ok::<(), Qwen4GpuForwardError>(())
+        })();
+        if let Err(error) = result {
+            let _ = stage.free_gpu(gpu);
+            return Err(error);
+        }
+        Ok(Some(stage))
+    }
+
+    fn enqueue_layer(
+        &self,
+        gpu: &Gpu,
+        bundle: &Qwen4Bundle,
+        layer: usize,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        let parity = layer % 2;
+        gpu.hip
+            .stream_wait_event(&self.copy_stream, &self.free[parity])?;
+        let weights = &bundle.weights.layer_refs[layer].moe;
+        let gate_owner = bundle.weights.resident(&weights.experts_gate_up)?;
+        let down_owner = bundle.weights.resident(&weights.experts_down)?;
+        let gate = gpu
+            .host_bytes(gate_owner)
+            .ok_or_else(|| invalid("G2 gate/up pinned owner missing"))?;
+        let down = gpu
+            .host_bytes(down_owner)
+            .ok_or_else(|| invalid("G2 down pinned owner missing"))?;
+        let gate_bytes = rdna_compute::gemm::QWEN4_EXPERT_STAGE_GATE_UP_BYTES;
+        let down_bytes = rdna_compute::gemm::QWEN4_EXPERT_STAGE_DOWN_BYTES;
+        // Raw subviews stay Borrowed; only the stage buffers above are owners.
+        let gate_dst = self.buffers[parity].sub_offset(0, gate_bytes);
+        let down_dst = self.buffers[parity].sub_offset(gate_bytes, down_bytes);
+        gpu.hip
+            .memcpy_htod_async(&gate_dst.buf, &gate[..gate_bytes], &self.copy_stream)?;
+        gpu.hip
+            .memcpy_htod_async(&down_dst.buf, &down[..down_bytes], &self.copy_stream)?;
+        gpu.hip
+            .event_record(&self.ready[parity], Some(&self.copy_stream))?;
+        Ok(())
+    }
+
+    fn begin(
+        &self,
+        gpu: &Gpu,
+        bundle: &Qwen4Bundle,
+        moe: &[Qwen4MoeLayerRuntime],
+    ) -> Result<(), Qwen4GpuForwardError> {
+        for parity in 0..2 {
+            // Records belong to THIS forward/capture, not an earlier execution.
+            // This forks the secondary stream into the graph and orders stage
+            // reuse after the previous forward on the same compute stream.
+            gpu.hip
+                .event_record(&self.free[parity], gpu.active_stream.as_ref())?;
+            if let Some(layer) = (parity..moe.len())
+                .step_by(2)
+                .find(|&layer| moe[layer].stage_tables.is_some())
+            {
+                self.enqueue_layer(gpu, bundle, layer)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
+        let mut first = gpu.hip.stream_synchronize(&self.copy_stream).err();
+        if let Err(error) = gpu.hip.stream_destroy(self.copy_stream) {
+            first.get_or_insert(error);
+        }
+        for event in self.ready.into_iter().chain(self.free) {
+            if let Err(error) = gpu.hip.event_destroy(event) {
+                first.get_or_insert(error);
+            }
+        }
+        for buffer in self.buffers {
+            if let Err(error) = gpu.free_tensor(buffer) {
+                first.get_or_insert(error);
             }
         }
         first
@@ -1067,15 +1355,15 @@ pub struct Qwen4GpuForwardScratch {
 }
 
 impl Qwen4GpuForwardScratch {
-    pub fn new(
-        gpu: &mut Gpu,
+    /// Every device allocation of a `max_chunk`-row scratch as
+    /// `(elements, dtype)` in field order, plus the host PLE staging bytes.
+    fn plan(
         config: &Qwen4Config,
         max_chunk: usize,
-    ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
+    ) -> Result<(Vec<(usize, DType)>, usize), Qwen4GpuForwardError> {
         if max_chunk == 0 {
             return Err(invalid("max_chunk is zero"));
         }
-        let max_chunk = max_chunk.min(QWEN4_PREFILL_CHUNK_CAP);
         let dims = program_dims(config);
         let layout = Qwen4ScratchLayout::for_rows(dims, max_chunk)
             .map_err(|error| invalid(error.to_string()))?;
@@ -1119,10 +1407,9 @@ impl Qwen4GpuForwardScratch {
         let tile_i32_bytes = (grouped_bound / 16)
             .checked_mul(i32_bytes)
             .ok_or_else(|| invalid("MoE grouped tile scratch overflow"))?;
-        let mut allocated = Vec::new();
+        let mut plan = Vec::new();
         let mut alloc = |shape: &[usize], dtype: DType| -> Result<(), Qwen4GpuForwardError> {
-            let tensor = gpu.zeros(shape, dtype)?;
-            allocated.push(tensor);
+            plan.push((shape.iter().product::<usize>(), dtype));
             Ok(())
         };
         let result = (|| {
@@ -1219,11 +1506,39 @@ impl Qwen4GpuForwardScratch {
             alloc(&[config.vocab_size], DType::F32)?;
             Ok::<(), Qwen4GpuForwardError>(())
         })();
-        if let Err(error) = result {
-            for tensor in allocated {
-                let _ = gpu.free_tensor(tensor);
+        result?;
+        Ok((plan, max_ple_bytes))
+    }
+
+    /// Device bytes [`Self::new`] allocates for `max_chunk` rows.
+    pub(crate) fn device_bytes(
+        config: &Qwen4Config,
+        max_chunk: usize,
+    ) -> Result<u64, Qwen4GpuForwardError> {
+        let (plan, _) = Self::plan(config, max_chunk)?;
+        Ok(plan
+            .iter()
+            .map(|&(elements, dtype)| (elements * dtype.size()) as u64)
+            .sum())
+    }
+
+    pub fn new(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        max_chunk: usize,
+    ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
+        let (plan, max_ple_bytes) = Self::plan(config, max_chunk)?;
+        let mut allocated = Vec::with_capacity(plan.len());
+        for &(elements, dtype) in &plan {
+            match gpu.zeros(&[elements], dtype) {
+                Ok(tensor) => allocated.push(tensor),
+                Err(error) => {
+                    for tensor in allocated {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    return Err(error.into());
+                }
             }
-            return Err(error);
         }
         let mut next = || allocated.remove(0);
         Ok((
@@ -1437,6 +1752,7 @@ pub struct Qwen4GpuForward {
     /// Device-argmax token readback (`forward_token_or_argmax`), once used.
     token_readback: Option<TokenReadback>,
     moe: Vec<Qwen4MoeLayerRuntime>,
+    expert_stage: Option<Qwen4ExpertStage>,
     /// `DECODE_Q8_PER_LAYER` per layer [HC attn down, attn up, mlp down, mlp
     /// up, shared gate, up, down]: BF16 matrices requantized to Q8_0 for
     /// single-token forwards (gfx1151). Batch-1 decode streams every weight
@@ -1482,6 +1798,7 @@ impl Qwen4GpuForward {
         let mut moe = Vec::with_capacity(bundle.config.num_hidden_layers);
         let mut decode_q8 = Vec::new();
         let mut route_trace = None;
+        let mut expert_stage = None;
         let result = (|| {
             for layer in &bundle.weights.layer_refs {
                 moe.push(Qwen4MoeLayerRuntime::new(
@@ -1514,6 +1831,7 @@ impl Qwen4GpuForward {
                     )?;
                 }
             }
+            expert_stage = Qwen4ExpertStage::new(gpu, bundle, &mut moe)?;
             let sources = bundle
                 .weights
                 .layer_refs
@@ -1558,6 +1876,9 @@ impl Qwen4GpuForward {
             Ok::<(), Qwen4GpuForwardError>(())
         })();
         if let Err(error) = result {
+            if let Some(stage) = expert_stage {
+                let _ = stage.free_gpu(gpu);
+            }
             for layer in moe {
                 let _ = layer.free_gpu(gpu);
             }
@@ -1571,6 +1892,7 @@ impl Qwen4GpuForward {
             return Err(error);
         }
         Ok(Self {
+            expert_stage,
             scratch,
             host_token_bytes,
             host_ple_bytes,
@@ -1586,12 +1908,22 @@ impl Qwen4GpuForward {
         let Qwen4GpuForward {
             scratch,
             moe,
+            expert_stage,
             token_readback,
             decode_q8,
             route_trace,
             ..
         } = self;
+        // Drain both streams before releasing stage tables, events or scratch.
+        if expert_stage.is_some() {
+            gpu.hip.device_synchronize()?;
+        }
         let mut first = scratch.free_gpu(gpu);
+        if let Some(stage) = expert_stage {
+            if let Some(error) = stage.free_gpu(gpu) {
+                first.get_or_insert(error);
+            }
+        }
         if let Some(trace) = route_trace {
             if let Err(error) = gpu.free_tensor(trace.device) {
                 first.get_or_insert(error);
@@ -1905,8 +2237,37 @@ impl Qwen4GpuForward {
         Ok(())
     }
 
+    /// Every forward runs with [`Gpu::qwen4_scope`] set, which admits the
+    /// Qwen4-only MQ6 X-LDS defaults (U2/U3); the previous value is restored.
     #[allow(clippy::too_many_arguments)]
     fn forward_chunk_inner(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        argmax_of: Option<&GpuTensor>,
+        logits: &GpuTensor,
+        top1: Option<&GpuTensor>,
+        wide_hidden_capture: Option<&GpuTensor>,
+        output_policy: Qwen4OutputPolicy,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        let scope = std::mem::replace(&mut gpu.qwen4_scope, true);
+        let result = self.forward_chunk_scoped(
+            bundle,
+            gpu,
+            tokens,
+            argmax_of,
+            logits,
+            top1,
+            wide_hidden_capture,
+            output_policy,
+        );
+        gpu.qwen4_scope = scope;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_chunk_scoped(
         &mut self,
         bundle: &mut Qwen4Bundle,
         gpu: &mut Gpu,
@@ -2056,6 +2417,13 @@ impl Qwen4GpuForward {
                 "Qwen4 generic layer program inline capacity exhausted",
             ));
         }
+        // Decode, small chunks and MTP's wide-hidden verify keep mapped reads.
+        // The parity observer also keeps its historical unsplit transport.
+        let expert_stage = self.expert_stage.as_ref().filter(|_| {
+            n >= QWEN4_EXPERT_STAGE_MIN_ROWS
+                && wide_hidden_capture.is_none()
+                && self.qsa_tap.is_none()
+        });
         let ctx = DispatchCtx::new(gpu);
         let mut steps: SmallVec<[Step<'_>; QWEN4_STEP_INLINE_CAPACITY]> = SmallVec::new();
         let mut gdn_slot = 0usize;
@@ -2107,6 +2475,7 @@ impl Qwen4GpuForward {
                 &config,
                 &self.decode_q8,
                 n,
+                expert_stage,
             )?;
             let attn_read = &description.attn_hyper.read;
             if steps.len() >= QWEN4_STEP_INLINE_CAPACITY {
@@ -2353,6 +2722,10 @@ impl Qwen4GpuForward {
                 ));
             }
         }
+        // Start the first two host-layer copies before embedding/layer work.
+        if let Some(stage) = expert_stage {
+            stage.begin(gpu, bundle, &self.moe)?;
+        }
         // A HIP body: no retained tape records or routes this forward.
         let hip_body =
             n == 1 && matches!(gpu.replay.state(), ReplayState::Hip | ReplayState::Fallback);
@@ -2571,8 +2944,10 @@ impl Qwen4GpuForward {
             //
             // Eligible only for a plain single-token continuation: the wide-hidden
             // capture is the speculative-verify shape and must never enter the tape.
-            let eligible =
-                n == 1 && wide_hidden_capture.is_none() && self.qsa_tap.is_none();
+            let eligible = n == 1
+                && wide_hidden_capture.is_none()
+                && self.qsa_tap.is_none()
+                && !hipfire_dispatch::pipeline::qsa_projection_hook_installed();
             gpu.replay.set_forward_eligible(eligible);
             // A manual shadow controller states the executor directly: one prepared
             // tape is compared across the exact-kernarg HIP oracle, the retained
@@ -2661,6 +3036,9 @@ impl Qwen4GpuForward {
             };
 
             if !routed {
+                // Parity harness only: a QSA projection hook counts slots from
+                // each forward's first QSA step (no-op with no hook installed).
+                hipfire_dispatch::pipeline::reset_qsa_projection_slot();
                 let execute = |gpu: &mut Gpu, steps: &[Step<'_>]| {
                     execute_validated_steps(gpu, &ctx, steps).map_err(|error| {
                         Qwen4GpuForwardError::Dispatch(format!(
@@ -2687,6 +3065,42 @@ impl Qwen4GpuForward {
                         }
                     }
                     execute(gpu, &steps[start..])?;
+                } else if let Some(stage) = expert_stage {
+                    let mut start = 0usize;
+                    let mut layer = 0usize;
+                    for (index, step) in steps.iter().enumerate() {
+                        if ple_split == Some(index) {
+                            execute(gpu, &steps[start..index])?;
+                            stage_ple(gpu)?;
+                            start = index;
+                        }
+                        if matches!(step, Step::Moe(_)) {
+                            execute(gpu, &steps[start..index])?;
+                            if self.moe[layer].stage_tables.is_some() {
+                                let compute = gpu
+                                    .active_stream
+                                    .as_ref()
+                                    .ok_or_else(|| invalid("G2 compute stream missing"))?;
+                                gpu.hip.stream_wait_event(compute, &stage.ready[layer % 2])?;
+                            }
+                            execute(gpu, &steps[index..=index])?;
+                            start = index + 1;
+                            // Down recorded free before combine. Refill this
+                            // parity for L+2; no routing results are involved.
+                            if self.moe[layer].stage_tables.is_some() {
+                                if let Some(next) = (layer + 2..self.moe.len())
+                                    .step_by(2)
+                                    .find(|&next| self.moe[next].stage_tables.is_some())
+                                {
+                                    stage.enqueue_layer(gpu, bundle, next)?;
+                                }
+                            }
+                            layer += 1;
+                        }
+                    }
+                    execute(gpu, &steps[start..])?;
+                    // Every issued copy has a ready wait on the origin stream:
+                    // the secondary stream is fully joined before capture ends.
                 } else {
                     let trace = self.route_trace.as_ref().filter(|_| n == 1);
                     match (ple_split, trace) {

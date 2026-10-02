@@ -19,21 +19,28 @@ use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency
 /// the largest `N` that fits the card's free VRAM. Unset keeps every expert
 /// resident where they fit ([`resolve_expert_vram_layers`]) and is `auto`
 /// otherwise. Set, it also keeps host memory out of reclaim from before the
-/// HIP runtime loads (hip-bridge owns the name).
+/// HIP runtime loads (hip-bridge owns the name), as a process about to load
+/// a Qwen4 model on a discrete GPU does unset
+/// ([`keeps_host_memory_out_of_reclaim`]).
 pub const EXPERT_VRAM_LAYERS_ENV: &str = hip_bridge::QWEN4_EXPERT_VRAM_LAYERS_ENV;
 
 /// VRAM left free by `auto` beyond the resident non-expert weights: forward
 /// scratch, KV and state for [`AUTO_VRAM_RESERVE_MAX_SEQ`] tokens plus
-/// headroom, without native MTP. Measured on a gfx1201 R9700 at N=16: every
-/// context-sized buffer is allocated at load, and a 32,700-token prefill
-/// plus decode at that context peaked at 6,199 MiB beyond the non-expert and
-/// expert weights, 457 MiB under this reserve. [`auto_vram_reserve`] adds
-/// what a longer context and native MTP take; a shorter one keeps it.
+/// headroom, without native MTP. Measured on a gfx1201 R9700 at N=16 with a
+/// [`AUTO_VRAM_RESERVE_CHUNK`]-row prefill chunk: every context-sized buffer
+/// is allocated at load, and a 32,700-token prefill plus decode at that
+/// context peaked at 6,199 MiB beyond the non-expert and expert weights,
+/// 457 MiB under this reserve. [`auto_vram_reserve`] adds what a longer
+/// context, a different chunk and native MTP take; a shorter context keeps it.
 pub const AUTO_VRAM_RESERVE_BYTES: u64 = 6656 << 20;
 
 /// Context [`AUTO_VRAM_RESERVE_BYTES`] was measured at (`hipfire run`'s
 /// legacy-KV `max_seq`).
 pub const AUTO_VRAM_RESERVE_MAX_SEQ: usize = 32768;
+
+/// Prefill chunk [`AUTO_VRAM_RESERVE_BYTES`] was measured at; its forward
+/// scratch then carried speculative logits and argmax for every chunk row.
+pub const AUTO_VRAM_RESERVE_CHUNK: usize = 1536;
 
 /// Host RAM that must remain available after the pinned experts are placed.
 pub const HOST_RAM_HEADROOM_BYTES: u64 = 4 << 30;
@@ -80,6 +87,22 @@ pub fn fits_fully_resident(free_vram: u64, non_expert_bytes: u64, expert_bytes: 
         .checked_add(expert_bytes)
         .and_then(|bytes| bytes.checked_add(reserve))
         .is_some_and(|need| need <= free_vram)
+}
+
+/// Whether a process about to load the model with HFQ `arch_id` on the GPUs
+/// `device_archs` (every card it may use) keeps host memory out of reclaim
+/// before the HIP runtime loads (`hip_bridge::keep_host_memory_out_of_reclaim`),
+/// as an explicit [`EXPERT_VRAM_LAYERS_ENV`] does: a Qwen4 model on discrete
+/// GPUs. It rests on those static facts, not on the placement the load
+/// resolves: unset, that depends on the free VRAM and the reserve at load
+/// time, after the runtime has read the switches, and the upload of tens of
+/// GB out of the mapped file needs them under host-memory pressure whatever
+/// the placement. Unified memory never host-maps experts, and an
+/// unrecognized arch keeps ROCm's defaults.
+pub fn keeps_host_memory_out_of_reclaim(arch_id: u32, device_archs: &[&str]) -> bool {
+    arch_id == crate::ARCH_ID
+        && !device_archs.is_empty()
+        && device_archs.iter().all(|arch| hipfire_config::is_discrete_memory_arch(arch))
 }
 
 /// Bytes of every routed expert payload (trunk and MTP layers).
@@ -149,15 +172,19 @@ pub fn language_head_dtype(weights: &[WeightEntry]) -> Option<rdna_compute::DTyp
 }
 
 /// VRAM `auto` leaves free beyond the non-expert weights for a load at
-/// `max_seq`: [`AUTO_VRAM_RESERVE_BYTES`], the trunk QSA arenas' growth in
-/// `qsa_format` past [`AUTO_VRAM_RESERVE_MAX_SEQ`], `mtp_bytes` when a
+/// `max_seq` with a `chunk_rows` prefill chunk: [`AUTO_VRAM_RESERVE_BYTES`],
+/// the trunk QSA arenas' growth in `qsa_format` past
+/// [`AUTO_VRAM_RESERVE_MAX_SEQ`], the chunk-sized forward resources' change
+/// from the measured [`AUTO_VRAM_RESERVE_CHUNK`] layout, `mtp_bytes` when a
 /// native MTP speculator attaches (`mtp_spec::native_mtp_device_bytes`), and
 /// `gather_bytes` when the gathered QSA prefill attention reserves its
 /// context-sized scratch at load
-/// (`rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes`).
+/// (`rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes`). G2's
+/// opt-in full-layer staging adds two expert layers' worth of device bytes.
 pub fn auto_vram_reserve(
     config: &Qwen4Config,
     max_seq: usize,
+    chunk_rows: usize,
     qsa_format: rdna_compute::tensor_ops::QsaKvFormat,
     mtp_bytes: Option<u64>,
     gather_bytes: Option<u64>,
@@ -170,10 +197,30 @@ pub fn auto_vram_reserve(
             .ok_or_else(|| format!("QSA context state for max_seq {seq} overflows"))
     };
     let context = arena(max_seq)?.saturating_sub(arena(AUTO_VRAM_RESERVE_MAX_SEQ)?);
+    let overflow = || format!("forward resources for a {chunk_rows}-row chunk overflow");
+    let measured =
+        crate::gpu_forward::Qwen4GpuForwardScratch::device_bytes(config, AUTO_VRAM_RESERVE_CHUNK)
+            .ok()
+            .and_then(|scratch| {
+                let spec =
+                    AUTO_VRAM_RESERVE_CHUNK.checked_mul(config.vocab_size.checked_mul(4)? + 4)?;
+                scratch.checked_add(spec as u64)
+            })
+            .ok_or_else(overflow)?;
+    let forward =
+        crate::gpu_forward::qwen4_forward_device_bytes(config, chunk_rows).ok_or_else(overflow)?;
+    let stage_bytes = if rdna_compute::gemm::qwen4_expert_stage_requested() {
+        rdna_compute::gemm::QWEN4_EXPERT_STAGE_BYTES
+    } else {
+        0
+    };
     AUTO_VRAM_RESERVE_BYTES
         .checked_add(context)
+        .and_then(|bytes| bytes.checked_add(forward))
+        .and_then(|bytes| bytes.checked_sub(measured))
         .and_then(|bytes| bytes.checked_add(mtp_bytes.unwrap_or(0)))
         .and_then(|bytes| bytes.checked_add(gather_bytes.unwrap_or(0)))
+        .and_then(|bytes| bytes.checked_add(stage_bytes))
         .ok_or_else(|| "auto expert VRAM reserve overflows".to_string())
 }
 
@@ -468,33 +515,68 @@ mod tests {
         // 5.364 GB; one trunk layer's routed experts 1.3369 GB.
         let free = 32548u64 << 20;
         let config = crate::config::compact_test_config();
-        let reserve =
-            auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, F32, None, None).unwrap();
-        assert_eq!(reserve, AUTO_VRAM_RESERVE_BYTES);
-        assert_eq!(auto_vram_layers(free, 5_364_000_000, 1_336_900_000, 48, reserve), 16);
+        let reserve = |chunk| {
+            auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, chunk, F32, None, None).unwrap()
+        };
+        // G2's opt-in staging reserves two expert layers' worth more.
+        let staged = if rdna_compute::gemm::qwen4_expert_stage_requested() { 2 } else { 0 };
+        // Verify-sized spec logits free 1472 logit rows of the measured
+        // 1536-row layout: one layer past the measured N = 16 fits.
+        let measured_chunk = reserve(AUTO_VRAM_RESERVE_CHUNK);
+        assert_eq!(
+            auto_vram_layers(free, 5_364_000_000, 1_336_900_000, 48, measured_chunk),
+            17 - staged
+        );
+        // gfx1201's 4096-row chunk spends that and one layer more on
+        // forward scratch.
+        let reserve = reserve(crate::gpu_forward::qwen4_prefill_chunk_default("gfx1201"));
+        assert!(reserve > measured_chunk);
+        assert_eq!(
+            auto_vram_layers(free, 5_364_000_000, 1_336_900_000, 48, reserve),
+            15 - staged
+        );
         // A card that holds everything keeps every layer resident.
         assert_eq!(
             auto_vram_layers(u64::MAX / 2, 5_364_000_000, 1_336_900_000, 48, reserve),
             48
         );
         // No room past the reserve places every expert in host RAM.
-        assert_eq!(auto_vram_layers(8 << 30, 5_364_000_000, 1_336_900_000, 48, reserve), 0);
+        assert_eq!(
+            auto_vram_layers(8 << 30, 5_364_000_000, 1_336_900_000, 48, reserve),
+            0
+        );
     }
 
     #[test]
     fn native_mtp_and_longer_context_grow_the_reserve() {
         let config = crate::config::compact_test_config();
-        let base = auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, F32, None, None).unwrap();
+        let base = auto_vram_reserve(
+            &config,
+            AUTO_VRAM_RESERVE_MAX_SEQ,
+            AUTO_VRAM_RESERVE_CHUNK,
+            F32,
+            None,
+            None,
+        )
+        .unwrap();
         let mtp = crate::mtp_spec::native_mtp_device_bytes(
             &config,
             AUTO_VRAM_RESERVE_MAX_SEQ,
+            AUTO_VRAM_RESERVE_CHUNK,
             3,
             DType::MQ6G256V2,
             true,
         )
         .unwrap();
-        let with_mtp =
-            auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, F32, Some(mtp), None).unwrap();
+        let with_mtp = auto_vram_reserve(
+            &config,
+            AUTO_VRAM_RESERVE_MAX_SEQ,
+            AUTO_VRAM_RESERVE_CHUNK,
+            F32,
+            Some(mtp),
+            None,
+        )
+        .unwrap();
         assert_eq!(with_mtp - base, mtp);
         // The gathered QSA attention's context-sized scratch is charged on
         // top when that route reserves it at load.
@@ -503,8 +585,15 @@ mod tests {
             AUTO_VRAM_RESERVE_MAX_SEQ,
         )
         .unwrap() as u64;
-        let with_gather =
-            auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, F32, None, Some(gather)).unwrap();
+        let with_gather = auto_vram_reserve(
+            &config,
+            AUTO_VRAM_RESERVE_MAX_SEQ,
+            AUTO_VRAM_RESERVE_CHUNK,
+            F32,
+            None,
+            Some(gather),
+        )
+        .unwrap();
         assert_eq!(with_gather - base, gather);
         // The draft head's F32 requant scratch (vocab x hidden x 4) goes back
         // to the device at attach, before the first request allocates its
@@ -522,6 +611,7 @@ mod tests {
             crate::mtp_spec::native_mtp_device_bytes(
                 &config,
                 AUTO_VRAM_RESERVE_MAX_SEQ,
+                AUTO_VRAM_RESERVE_CHUNK,
                 max_k,
                 DType::MQ6G256V2,
                 row_capture,
@@ -545,21 +635,36 @@ mod tests {
         // A context past the measured one adds the trunk QSA arenas' growth
         // in the load's QSA format: fp8 K/V grows less than the F32 state.
         let growth = |format| {
-            let long =
-                auto_vram_reserve(&config, 4 * AUTO_VRAM_RESERVE_MAX_SEQ, format, None, None)
-                    .unwrap();
-            let arena = (config.qsa_context_arena_bytes(4 * AUTO_VRAM_RESERVE_MAX_SEQ, format).unwrap()
-                - config.qsa_context_arena_bytes(AUTO_VRAM_RESERVE_MAX_SEQ, format).unwrap())
+            let long = auto_vram_reserve(
+                &config,
+                4 * AUTO_VRAM_RESERVE_MAX_SEQ,
+                AUTO_VRAM_RESERVE_CHUNK,
+                format,
+                None,
+                None,
+            )
+            .unwrap();
+            let arena = (config
+                .qsa_context_arena_bytes(4 * AUTO_VRAM_RESERVE_MAX_SEQ, format)
+                .unwrap()
+                - config
+                    .qsa_context_arena_bytes(AUTO_VRAM_RESERVE_MAX_SEQ, format)
+                    .unwrap())
                 * config.n_full_layers();
             assert_eq!(long - base, arena as u64);
             long - base
         };
         assert!(growth(QsaKvFormat::Fp8) < growth(F32));
         // A shorter context keeps the measured reserve.
-        assert_eq!(
-            auto_vram_reserve(&config, 2048, QsaKvFormat::Fp8, None, None).unwrap(),
-            base
+        let short = auto_vram_reserve(
+            &config,
+            2048,
+            AUTO_VRAM_RESERVE_CHUNK,
+            QsaKvFormat::Fp8,
+            None,
+            None,
         );
+        assert_eq!(short.unwrap(), base);
     }
 
     #[test]
@@ -681,5 +786,19 @@ mod tests {
             let resolved = resolve_expert_vram_layers(Some(policy), || panic!("explicit consulted the fit"));
             assert_eq!(resolved, Ok(Some(policy)));
         }
+    }
+
+    #[test]
+    fn only_qwen4_on_discrete_gpus_keeps_host_memory_out_of_reclaim() {
+        assert!(keeps_host_memory_out_of_reclaim(crate::ARCH_ID, &["gfx1201"]));
+        assert!(keeps_host_memory_out_of_reclaim(crate::ARCH_ID, &["gfx1100", "gfx942"]));
+        // Another model on the same card (arch 5: the Qwen3.5-family trunk).
+        assert!(!keeps_host_memory_out_of_reclaim(5, &["gfx1201"]));
+        // Unified memory, alone or beside a discrete card ROCr also exposes.
+        assert!(!keeps_host_memory_out_of_reclaim(crate::ARCH_ID, &["gfx1151"]));
+        assert!(!keeps_host_memory_out_of_reclaim(crate::ARCH_ID, &["gfx1100", "gfx1151"]));
+        // No card known, or one whose memory kind is not known.
+        assert!(!keeps_host_memory_out_of_reclaim(crate::ARCH_ID, &[]));
+        assert!(!keeps_host_memory_out_of_reclaim(crate::ARCH_ID, &["gfx90a"]));
     }
 }

@@ -217,6 +217,26 @@ impl Carrier for Qwen2Carrier {
 
 // ─── Qwen4Carrier ────────────────────────────────────────────────────
 
+/// Keep host memory out of reclaim before the HIP runtime loads, in a process
+/// about to load the HFQ model at `model`, when that is a Qwen4 model on
+/// discrete GPUs (`expert_residency::keeps_host_memory_out_of_reclaim`). The
+/// daemon calls it once device visibility is installed and before its first
+/// HIP call: the runtime reads the switches once, when it loads. A file that
+/// is not an HFQ container, or cards the KFD topology cannot name, keep
+/// ROCm's defaults.
+pub fn prepare_host_memory_for(model: &std::path::Path) {
+    let Ok(arch_id) = hipfire_runtime::hfq::HfqFile::probe_arch_id(model) else {
+        return;
+    };
+    let Some(devices) = hipfire_config::devices::startup_devices() else {
+        return;
+    };
+    let archs = devices.iter().map(|device| device.arch.as_str()).collect::<Vec<_>>();
+    if hipfire_arch_qwen4::expert_residency::keeps_host_memory_out_of_reclaim(arch_id, &archs) {
+        hip_bridge::keep_host_memory_out_of_reclaim(&format!("Qwen4 model on {}", archs.join(",")));
+    }
+}
+
 /// Executable local-path Qwen4 carrier.  Distribution/product admission stays
 /// outside this registry; this route only makes an already admitted HFQM
 /// artifact loadable.
@@ -428,6 +448,8 @@ impl Carrier for Qwen4Carrier {
                 .map_err(|error| format!("qwen4: VRAM query: {error}"))?;
             let (non_expert, layer_experts) = residency::resident_split(&manifest.weights, bytes_of)
                 .map_err(|error| format!("qwen4: {error}"))?;
+            let chunk_rows =
+                hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&ctx.gpu.arch, ctx.max_seq);
             // Every placement host-maps at least the MTP layer's routed
             // experts, so the head is still attached after it only where the
             // host-mapped policy keeps it (an explicit `--spec mtp`); only
@@ -441,6 +463,7 @@ impl Carrier for Qwen4Carrier {
                     hipfire_arch_qwen4::mtp_spec::native_mtp_device_bytes(
                         &config,
                         ctx.max_seq,
+                        chunk_rows,
                         max_k,
                         head,
                         row_capture,
@@ -465,7 +488,7 @@ impl Carrier for Qwen4Carrier {
                 })
                 .transpose()?;
             let reserve =
-                residency::auto_vram_reserve(&config, ctx.max_seq, qsa_format, mtp_bytes, gather_bytes)
+                residency::auto_vram_reserve(&config, ctx.max_seq, chunk_rows, qsa_format, mtp_bytes, gather_bytes)
                     .map_err(|error| format!("qwen4: {error}"))?;
             Ok((free as u64, non_expert, layer_experts, reserve, mtp_bytes, gather_bytes))
         };
@@ -511,6 +534,16 @@ impl Carrier for Qwen4Carrier {
                 (None, Some(_)) => format!("{} unset, auto", residency::EXPERT_VRAM_LAYERS_ENV),
             }
         );
+        // Host memory is kept out of reclaim only by a process started for a
+        // Qwen4 model (`prepare_host_memory_for`) or with the placement set;
+        // one started for another model (serve switching models) can no
+        // longer, its runtime having read the switches.
+        if !use_ranges && std::env::var_os("HSA_USERPTR_FOR_PAGED_MEM").is_none() {
+            eprintln!(
+                "  qwen4: host memory the GPU reads stays in reclaim (this process started for another model), so host-memory pressure can stall the load; start it for this model or with {} set",
+                residency::EXPERT_VRAM_LAYERS_ENV
+            );
+        }
         if let Some(policy) = placement {
             if use_ranges {
                 return Err(format!(
@@ -529,8 +562,16 @@ impl Carrier for Qwen4Carrier {
                     let gather_note = gather_bytes
                         .map(|bytes| format!(", {} MiB QSA gather scratch", bytes / MIB))
                         .unwrap_or_default();
+                    let stage_note = if rdna_compute::gemm::qwen4_expert_stage_requested() {
+                        format!(
+                            ", {} MiB expert DMA stages",
+                            rdna_compute::gemm::QWEN4_EXPERT_STAGE_BYTES / MIB
+                        )
+                    } else {
+                        String::new()
+                    };
                     eprintln!(
-                        "  qwen4 auto expert placement: {} MiB free, {} MiB non-expert weights, {} MiB reserved ({} MiB native MTP{gather_note}), {} MiB per expert layer",
+                        "  qwen4 auto expert placement: {} MiB free, {} MiB non-expert weights, {} MiB reserved ({} MiB native MTP{gather_note}{stage_note}), {} MiB per expert layer",
                         free / MIB,
                         non_expert / MIB,
                         reserve / MIB,

@@ -10,7 +10,10 @@
 //! local may outlive publication as a second owner.
 
 use crate::config::Qwen4Config;
-use crate::gpu_forward::{Qwen4GpuForward, Qwen4OutputRows, QWEN4_PREFILL_CHUNK_CAP};
+use crate::gpu_forward::{
+    qwen4_forward_device_bytes, qwen4_prefill_chunk_requested, qwen4_prefill_chunk_rungs,
+    qwen4_spec_logit_rows, Qwen4GpuForward, Qwen4OutputRows, QWEN4_FORWARD_HEADROOM_BYTES,
+};
 use crate::mtp_gpu::{MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
 use crate::ple::PleHashMetadata;
 use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
@@ -71,10 +74,6 @@ impl AttachedWeightStore {
 }
 
 /// Published Qwen4 architecture owner.
-/// Logit rows of the spec scratch: an MTP verify window (at most the draft
-/// depth + 1 rows) or a final prefill row; longer blocks emit their final row.
-const SPEC_LOGIT_ROWS: usize = 16;
-
 pub struct Qwen4Bundle {
     pub config: Qwen4Config,
     pub weights: Qwen4Weights,
@@ -155,7 +154,16 @@ impl Qwen4Bundle {
                 return Err(cleanup_bundle_failure(error, weight_result, cleanup));
             }
         };
-        let ple_rows = match RowStore::new("qwen4-ple-reader", descriptors, metadata.valid_rows()) {
+        // One prefill chunk prefetches `rows * PLE_HEAD_COUNT` n-gram rows in
+        // a single row-store request, so staging holds the requested chunk.
+        let staging_rows =
+            qwen4_prefill_chunk_requested(&gpu.arch, max_seq_len) * crate::ple::PLE_HEAD_COUNT;
+        let ple_rows = match RowStore::with_staging_rows(
+            "qwen4-ple-reader",
+            descriptors,
+            metadata.valid_rows(),
+            staging_rows,
+        ) {
             Ok(rows) => rows,
             Err(error) => {
                 let weight_result = weights.free_gpu(gpu);
@@ -260,7 +268,7 @@ impl Qwen4Bundle {
         // A chunk's PLE prefetch may exceed one row-store staging buffer:
         // RowFetch splits it into consecutive tickets, so the chunk is not
         // capped by the staging capacity.
-        let max_chunk = max_chunk.min(QWEN4_PREFILL_CHUNK_CAP);
+        let requested = qwen4_prefill_chunk_requested(&gpu.arch, max_chunk);
         // The gathered QSA prefill attention (HIPFIRE_QWEN4_QSA_WMMA_GATHER)
         // converts the cache rows it reads into its own scratch: reserve it
         // for the whole context now, before any capture or record, so a
@@ -285,10 +293,22 @@ impl Qwen4Bundle {
         self.weights
             .requant_from_env(gpu)
             .map_err(BundleError::Forward)?;
+        // The largest rung whose chunk-sized resources fit the free device
+        // memory beside the kernels' lazily sized workspaces; the smallest
+        // rung is attempted regardless and fails at allocation if it must.
+        let (free, _) = gpu.hip.get_vram_info().map_err(BundleError::Hip)?;
+        let max_chunk = qwen4_prefill_chunk_rungs(requested)
+            .find(|&rows| {
+                qwen4_forward_device_bytes(&self.config, rows)
+                    .and_then(|bytes| bytes.checked_add(QWEN4_FORWARD_HEADROOM_BYTES))
+                    .is_some_and(|bytes| bytes <= free as u64)
+            })
+            .unwrap_or_else(|| requested.min(1536));
+        eprintln!("  qwen4 prefill chunk: {max_chunk} rows (requested {requested})");
         let forward = Qwen4GpuForward::new(gpu, self, max_chunk)
             .map_err(|error| BundleError::Forward(error.to_string()))?;
-        let logits_len = max_chunk
-            .min(SPEC_LOGIT_ROWS)
+        let spec_rows = qwen4_spec_logit_rows(max_chunk);
+        let logits_len = spec_rows
             .checked_mul(self.config.vocab_size)
             .ok_or_else(|| BundleError::Forward("spec logit scratch overflow".to_string()))?;
         let spec_logits = match gpu.zeros(&[logits_len], rdna_compute::DType::F32) {
@@ -298,7 +318,7 @@ impl Qwen4Bundle {
                 return Err(BundleError::Hip(error));
             }
         };
-        let top1_len = match max_chunk.checked_mul(std::mem::size_of::<i32>()) {
+        let top1_len = match spec_rows.checked_mul(std::mem::size_of::<i32>()) {
             Some(len) => len,
             None => {
                 let _ = gpu.free_tensor(spec_logits);
@@ -392,6 +412,26 @@ impl Qwen4Bundle {
         Ok(())
     }
 
+    /// Install (or clear) the QSA projection hook of this thread's forward:
+    /// `(gpu, qsa_slot, op)` right after each QSA step's projections, i.e. on
+    /// the raw projected index row / query + gate / K / V rows before the
+    /// prologue (the step's cache and pool are still pre-step). Same contract
+    /// as [`Self::set_qsa_tap`]: a forward with a hook never records or replays a
+    /// retained body, and with none installed nothing runs or allocates.
+    #[cfg(feature = "reference-parity")]
+    pub fn set_qsa_projection_hook(
+        &mut self,
+        hook: Option<hipfire_dispatch::pipeline::QsaProjectionHook>,
+    ) -> Result<(), BundleError> {
+        if self.execution.is_none() {
+            return Err(BundleError::Forward(
+                "Qwen4 forward resources are not attached".to_string(),
+            ));
+        }
+        hipfire_dispatch::pipeline::set_qsa_projection_hook(hook);
+        Ok(())
+    }
+
     /// Rows the attached forward can process in one chunked call.  The MTP
     /// prefill uses this to batch a whole prompt chunk through the shared
     /// forward instead of one single-row forward per prompt token.
@@ -410,12 +450,15 @@ impl Qwen4Bundle {
         self.spec_forward_rows_with_output(gpu, tokens, capture_hidden, Qwen4OutputRows::All)
     }
 
+    /// Final-row argmax of one forward over `tokens`: prompt fills and
+    /// advances, which read no other row's logits.
     pub(crate) fn spec_prefill_rows(
         &mut self,
         gpu: &mut Gpu,
         tokens: &[u32],
+        capture_hidden: bool,
     ) -> Result<u32, BundleError> {
-        self.spec_forward_rows_with_output(gpu, tokens, true, Qwen4OutputRows::Final)?
+        self.spec_forward_rows_with_output(gpu, tokens, capture_hidden, Qwen4OutputRows::Final)?
             .into_iter()
             .next()
             .ok_or_else(|| BundleError::Forward("Qwen4 prefill produced no argmax".into()))
@@ -449,9 +492,10 @@ impl Qwen4Bundle {
         }
         let vocab = self.config.vocab_size;
         let output_count = output_rows.count(tokens.len());
-        if output_count > SPEC_LOGIT_ROWS {
+        let spec_rows = qwen4_spec_logit_rows(max_chunk);
+        if output_count > spec_rows {
             return Err(BundleError::Forward(format!(
-                "Qwen4 spec forward requests {output_count} logit rows; at most {SPEC_LOGIT_ROWS}"
+                "Qwen4 spec block of {output_count} output rows exceeds the {spec_rows}-row verify capacity"
             )));
         }
         let logits_len = output_count
@@ -560,17 +604,16 @@ impl Qwen4Bundle {
 
     /// Host copy of the first `rows` logit rows the last spec forward wrote.
     pub(crate) fn spec_logits_host(&self, gpu: &Gpu, rows: usize) -> Result<Vec<f32>, BundleError> {
-        if rows > SPEC_LOGIT_ROWS {
+        let spec_logits = self.spec_logits.as_ref().ok_or_else(|| {
+            BundleError::Forward("Qwen4 spec logits are not attached".to_string())
+        })?;
+        let capacity = spec_logits.numel() / self.config.vocab_size;
+        if rows > capacity {
             return Err(BundleError::Forward(format!(
-                "Qwen4 spec logits hold at most {SPEC_LOGIT_ROWS} rows, {rows} requested"
+                "Qwen4 spec logits hold at most {capacity} rows, {rows} requested"
             )));
         }
-        let len = rows * self.config.vocab_size;
-        let logits = self
-            .spec_logits
-            .as_ref()
-            .ok_or_else(|| BundleError::Forward("Qwen4 spec logits are not attached".to_string()))?
-            .sub_offset(0, len);
+        let logits = spec_logits.sub_offset(0, rows * self.config.vocab_size);
         gpu.download_f32(&logits).map_err(BundleError::Hip)
     }
 

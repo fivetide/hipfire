@@ -389,15 +389,12 @@ impl SpecTarget for Qwen4Bundle {
                 return Ok(SpecAdvance::Aborted);
             }
             let end = (offset + max_chunk).min(tokens.len());
-            let picks = self
-                .spec_forward_rows_with_output(
-                    gpu,
-                    &tokens[offset..end],
-                    false,
-                    crate::gpu_forward::Qwen4OutputRows::Final,
-                )
+            // Only the final row's argmax is returned, so each chunk writes
+            // one logit row instead of one per chunk row.
+            let pick = self
+                .spec_prefill_rows(gpu, &tokens[offset..end], false)
                 .map_err(|error| error.to_string())?;
-            last_argmax = picks.last().copied();
+            last_argmax = Some(pick);
             offset = end;
         }
         if self.state.position != end_pos {
@@ -1346,7 +1343,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     .ple_readahead(&fill_tokens[base..base + rows + next_rows], rows);
             }
             let mut pick = [Self::bundle(target)?
-                .spec_prefill_rows(gpu, chunk)
+                .spec_prefill_rows(gpu, chunk, true)
                 .map_err(|error| error.to_string())?];
             if base + rows == fill_tokens.len() {
                 let bundle = Self::bundle(target)?;
@@ -1503,16 +1500,18 @@ pub fn native_mtp_row_capture(gpu: &Gpu, config: &crate::Qwen4Config) -> bool {
         && config.linear_conv_kernel_dim == 4
 }
 
-/// Device bytes native MTP adds to a load at `max_seq` with drafts of up to
-/// `max_k` tokens and the language head stored as `head_dtype`: what the
-/// attached head (`Qwen4MtpGpu`) keeps, plus the larger of its build scratch
-/// (released at attach) and what the first speculative request allocates
-/// after it — the verify hidden rows (`max_k + 1` rows or one forward chunk,
-/// whichever is larger), the pending and row hidden carries, and, where
-/// [`native_mtp_row_capture`], the `max_k + 1`-row GDN capture.
+/// Device bytes native MTP adds to a load at `max_seq` with a `chunk_rows`
+/// prefill chunk, drafts of up to `max_k` tokens and the language head
+/// stored as `head_dtype`: what the attached head (`Qwen4MtpGpu`) keeps,
+/// plus the larger of its build scratch (released at attach) and what the
+/// first speculative request allocates after it — the verify hidden rows
+/// (`max_k + 1` rows or one forward chunk, whichever is larger), the pending
+/// and row hidden carries, and, where [`native_mtp_row_capture`], the
+/// `max_k + 1`-row GDN capture.
 pub fn native_mtp_device_bytes(
     config: &crate::Qwen4Config,
     max_seq: usize,
+    chunk_rows: usize,
     max_k: usize,
     head_dtype: rdna_compute::DType,
     row_capture: bool,
@@ -1522,7 +1521,7 @@ pub fn native_mtp_device_bytes(
         .hc_count
         .checked_mul(config.hidden_size)?
         .checked_mul(std::mem::size_of::<f32>())?;
-    let verify_rows = rows.max(max_seq.min(crate::gpu_forward::QWEN4_PREFILL_CHUNK_CAP));
+    let verify_rows = rows.max(max_seq.min(chunk_rows));
     let capture = if row_capture {
         crate::state::Qwen4State::row_capture_bytes(config, rows)?
     } else {

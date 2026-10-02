@@ -2168,6 +2168,23 @@ pub(crate) fn execute_sealed(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<
     moe_program::execute(gpu, call)
 }
 
+/// [`execute_sealed`] for a call that directly follows `Step::Clear(clear)`
+/// (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`): the zero fill is either taken over by
+/// the combine or launched here, first.  With the HC write `hc` (whose gates
+/// are ready; `HIPFIRE_QWEN4_HC_FUSE` >= 3) offered to the shared down, returns
+/// whether that stage carried the write; see
+/// [`moe_program::execute_after_clear`].
+pub(crate) fn execute_sealed_after_clear(
+    gpu: &mut Gpu,
+    call: &SealedMoeCall<'_>,
+    clear: &super::layer_ops::ClearOp<'_>,
+    hc: Option<&super::layer_ops::HyperWriteOp<'_>>,
+) -> Result<bool, DispatchError> {
+    call.validate_for_gpu(gpu)?;
+    call.note_retained_route_identity(gpu)?;
+    moe_program::execute_after_clear(gpu, call, clear, hc)
+}
+
 impl SealedMoeCall<'_> {
     /// Latch this launch's pointer mapping into the retained tape.
     ///
@@ -6493,6 +6510,7 @@ mod tests {
             x_rot_batch: &s.x_rot_batch,
             expert_gate_up_ptrs: gate_up_ptrs,
             expert_down_ptrs: down_ptrs,
+            expert_stage_ptrs: None,
             routed_experts: routed,
             expert_down_awq_ptrs: None,
             expert_dtype_tags: None,
