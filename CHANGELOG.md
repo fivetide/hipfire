@@ -380,6 +380,22 @@
     - **gfx1151 Q8_0 decode attention: GQA-shared flash tile + head-dim-split reduce.** On exact gfx1151, Q8_0 KV, head_dim 256, GQA group 6, tile 128, full causal and no output gate (H2 decode), `attention_flash_q8_0_tile_gqa_gfx1151` replaces `attention_flash_q8_0_tile`: one 256-thread workgroup per (kv head, tile) serves the six q heads, so each Q8_0 K/V tile is read once, and the whole tile's Q, V rows and K codes/scales are issued at entry; each 16-lane row reproduces the reference lanes' dequant (`scale * code`, one rounding), fma leaf order and xor-16…1 add tree, softmax and in-order V accumulation. `attention_flash_reduce_dsplit_gfx1151` (the gfx1201 head-dim-split reduce, renamed) replaces `attention_flash_q8_0_reduce`. The tile grid is capped at 512 tiles with a tile loop. Redline's replay tables type both kernels with their reference twins' 13/7-argument ABIs and pointer effects. Standalone on the Halo, the tile + reduce pair at seq 517 / 8,197 / 32,773: 45.77 → 22.56 / 200.62 → 120.59 / 663.24 → 401.71 µs. The outputs are byte-identical to beta's objects on real H2 decode activations (seq C+1…C+4 for C = 512/8,192/32,768, full-attention layers 0/7/15: 36/36 captures, 3 poisons, graph and eager grids, whole buffer + guards, a one-K-code-byte negative control detected in all 36, 200× serial and 200× under a one-CU mask, 60 s soak). H2 tg128, same binary, four fresh processes per arm, ABBA then BAAB: off → on 14.974 → 15.079 / 14.459 → 14.698 / 13.108 → 13.777 tok/s (+0.70 %/+1.65 %/+5.10 %; ABBA +0.106/+0.242/+0.671, BAAB +0.099/+0.233/+0.663 tok/s), every on process ahead of every off process; pp8192 1,154.90 → 1,154.25 tok/s, within noise (halves +38.35 / −8.30).
     - **Both levers together** (same binary, both opt-outs vs defaults, four fresh processes per arm, ABBA then BAAB): 14.853 → 15.080 / 14.346 → 14.699 / 13.014 → 13.778 tok/s at ctx 512/8,192/32,768 (+1.53 %/+2.46 %/+5.87 %; ABBA +0.225/+0.352/+0.761, BAAB +0.230/+0.355/+0.768 tok/s), every on process ahead of every off process; pp8192 1,152.2 → 1,156.6 tok/s, within noise (halves +7.55 / −0.95). Checks: 256-step greedy logits equal beta at ctx 512/8,192/32,768 (synthetic and WikiText-2 primes, every step's whole logits + hidden, final KV arena + DeltaNet), with the opt-out arm (both levers off) also equal to beta; one continuous 32,788-step greedy decode (positions 512 … 33,299) is byte-identical to beta at every step; the Halo KLD pins `c1056943…` (WT2) / `04f06883…` (code24) are unchanged.
 
+- Gemma 4 layers run as engine `Step`s: 12B dense, E2B/E4B, the 26B-A4B MoE
+  and the EAGLE draft head (`gemma-4-*-assistant`) all execute
+  `[SandwichAttention, SandwichMlp | ParallelMoeMlp, PerLayerInput?, Scale?]`
+  from `hipfire_dispatch`; dense and E-series batched prefill and EAGLE verify
+  run the same program with `rows > 1`. The Gemma 4 super-op path and its
+  `HIPFIRE_FORWARD_LOWERED` hand arms are gone.
+  - 12B, E2B and E4B decode, batched prefill and EAGLE verify are
+    byte-identical, logits included; EAGLE tau is unchanged.
+  - The 26B-A4B now takes the 12B's fused qk-norm+RoPE and post-norm+residual
+    kernels. Greedy text stays coherent and can diverge late; with
+    `HIPFIRE_GEMMA4_FUSED_QK_ROPE=0 HIPFIRE_GEMMA4_FUSED_POSTNORM=0` it is
+    byte-identical to before. The 12B `HIPFIRE_BATCHED_PREFILL=1` route takes
+    the same fusions (byte-identical with every `HIPFIRE_GEMMA4_FUSED_*` at 0).
+  - A MoE checkpoint whose expert formats have no indexed kernel pair now
+    refuses to load instead of running a host-side expert loop.
+
 - Qwen3.5/3.6/3.8 layers run as engine `Step`s end to end. The prefill layer
   bodies (dense and MoE, including PARO) moved into `hipfire_dispatch`
   unchanged, bit-exact. Decode with DFlash hidden capture and vision (mrope)

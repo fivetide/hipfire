@@ -223,28 +223,20 @@ pub struct SandwichStream<'a> {
 }
 
 impl SandwichStream<'_> {
-    fn bytes(&self) -> usize {
-        self.rows * self.hidden * 4
+    fn len(&self) -> usize {
+        self.rows * self.hidden
     }
 
+    /// Copies are kernel launches so hipGraph capture and the retained-replay
+    /// recorder both see them (a D2D memcpy is invisible to Redline PM4).
     fn save_residual(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
-        if self.rows == 1 {
-            gpu.memcpy_dtod_auto(&self.residual.buf, &self.x.buf, self.bytes())
-        } else {
-            gpu.hip
-                .memcpy_dtod_at(&self.residual.buf, 0, &self.x.buf, 0, self.bytes())
-        }
-        .map_err(hip)
+        gpu.copy_f32_buffer(self.residual, self.x, self.len())
+            .map_err(hip)
     }
 
     fn restore_residual(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
-        if self.rows == 1 {
-            gpu.memcpy_dtod_auto(&self.x.buf, &self.residual.buf, self.bytes())
-        } else {
-            gpu.hip
-                .memcpy_dtod_at(&self.x.buf, 0, &self.residual.buf, 0, self.bytes())
-        }
-        .map_err(hip)
+        gpu.copy_f32_buffer(self.x, self.residual, self.len())
+            .map_err(hip)
     }
 
     fn norm(
@@ -304,9 +296,9 @@ impl Rope {
     }
 }
 
-/// The K/V cache one attention sublayer reads, and whether it writes the
-/// current rows first. `write == false` reads another layer's populated cache
-/// (KV sharing, draft heads).
+/// The K/V cache one attention sublayer reads. A sublayer with its own
+/// [`KvProjection`] writes the current rows first; a query-only sublayer reads
+/// another layer's populated cache (KV sharing, draft heads).
 pub struct SandwichKv<'a> {
     pub tier: KvTierInputs,
     pub k_cache: &'a GpuTensor,
@@ -316,15 +308,23 @@ pub struct SandwichKv<'a> {
     pub givens_sin: Option<&'a GpuTensor>,
     /// Sliding window; `0` = full causal.
     pub window: usize,
-    pub write: bool,
+}
+
+/// K/V projections of an attention sublayer that writes its own cache rows.
+pub struct KvProjection<'a> {
+    pub wk: WeightRef<'a>,
+    /// `None` takes V from the pre-norm K (K=V).
+    pub wv: Option<WeightRef<'a>>,
+    pub k_norm: &'a GpuTensor,
+    /// Weight-less V RMSNorm, bound as a ones vector of `head_dim`.
+    pub v_norm: Option<&'a GpuTensor>,
 }
 
 /// Attention sublayer:
 /// `x = residual + post_norm(o(attend(rope(q_norm(q)), rope(k_norm(k)), v_norm(v))))`
 /// over `input_norm(x)`.
 ///
-/// `wk == None` projects only Q and attends a cache it does not write.
-/// `wv == None` with `wk` present takes V from the pre-norm K (K=V).
+/// `kv_proj == None` projects only Q and attends a cache it does not write.
 /// Row `r` sits at absolute position `position + r`.
 pub struct SandwichAttentionOp<'a> {
     pub stream: SandwichStream<'a>,
@@ -334,12 +334,8 @@ pub struct SandwichAttentionOp<'a> {
     pub head_dim: usize,
     pub input_norm: &'a GpuTensor,
     pub wq: WeightRef<'a>,
-    pub wk: Option<WeightRef<'a>>,
-    pub wv: Option<WeightRef<'a>>,
     pub q_norm: &'a GpuTensor,
-    pub k_norm: &'a GpuTensor,
-    /// Weight-less V RMSNorm, bound as a ones vector of `head_dim`.
-    pub v_norm: Option<&'a GpuTensor>,
+    pub kv_proj: Option<KvProjection<'a>>,
     /// Q multiplier applied after q_norm (sets the softmax scale against the
     /// kernel's `1/sqrt(head_dim)`).
     pub q_scale: f32,
@@ -361,16 +357,24 @@ pub struct SandwichAttentionOp<'a> {
 }
 
 impl SandwichAttentionOp<'_> {
+    fn wk(&self) -> Option<&WeightRef<'_>> {
+        self.kv_proj.as_ref().map(|p| &p.wk)
+    }
+
+    fn wv(&self) -> Option<&WeightRef<'_>> {
+        self.kv_proj.as_ref().and_then(|p| p.wv.as_ref())
+    }
+
     fn projections(&self) -> [Option<(&WeightRef<'_>, &GpuTensor)>; 3] {
         [
             Some((&self.wq, self.q)),
-            self.wk.as_ref().map(|w| (w, self.k)),
-            self.wv.as_ref().map(|w| (w, self.v)),
+            self.wk().map(|w| (w, self.k)),
+            self.wv().map(|w| (w, self.v)),
         ]
     }
 
-    fn kv_bytes(&self) -> usize {
-        self.stream.rows * self.n_kv_heads * self.head_dim * 4
+    fn kv_len(&self) -> usize {
+        self.stream.rows * self.n_kv_heads * self.head_dim
     }
 
     /// `input_norm(x)` → Q, K, V projections (V from K when K=V).
@@ -383,7 +387,7 @@ impl SandwichAttentionOp<'_> {
             .projections()
             .iter()
             .flatten()
-            .all(|(w, _)| w.dtype == DType::MQ4G256);
+            .all(|(w, _)| w.dtype == DType::MQ4G256 && w.awq_scale.is_none());
         if ROUTES.attn_norm && all_mq4 {
             gpu.fused_rmsnorm_rotate_mq(s.x, self.input_norm, self.x_rot, s.hidden, s.eps)
                 .map_err(hip)?;
@@ -392,7 +396,7 @@ impl SandwichAttentionOp<'_> {
             }
         } else {
             s.norm(gpu, s.x, self.input_norm, s.normed)?;
-            match &self.wk {
+            match self.wk() {
                 Some(wk)
                     if ROUTES.q8_qk && self.wq.dtype == DType::Q8_0 && wk.dtype == DType::Q8_0 =>
                 {
@@ -414,12 +418,12 @@ impl SandwichAttentionOp<'_> {
                 }
                 None => gemv(gpu, ctx, &self.wq, s.normed, self.q)?,
             }
-            if let Some(wv) = &self.wv {
+            if let Some(wv) = self.wv() {
                 gemv(gpu, ctx, wv, s.normed, self.v)?;
             }
         }
-        if self.wk.is_some() && self.wv.is_none() {
-            gpu.memcpy_dtod_auto(&self.v.buf, &self.k.buf, self.kv_bytes())
+        if self.wk().is_some() && self.wv().is_none() {
+            gpu.copy_f32_buffer(self.v, self.k, self.kv_len())
                 .map_err(hip)?;
         }
         Ok(())
@@ -430,7 +434,7 @@ impl SandwichAttentionOp<'_> {
         let rows = s.rows;
         s.norm(gpu, s.x, self.input_norm, s.normed)?;
         let mut v_projected = false;
-        match (&self.wk, &self.wv) {
+        match (self.wk(), self.wv()) {
             (Some(wk), Some(wv)) if q8_fused_prefill(gpu, &[&self.wq, wk, wv]) => {
                 fused_projection(
                     gpu,
@@ -465,9 +469,8 @@ impl SandwichAttentionOp<'_> {
                 }
             }
         }
-        if self.wk.is_some() && !v_projected {
-            gpu.hip
-                .memcpy_dtod_at(&self.v.buf, 0, &self.k.buf, 0, self.kv_bytes())
+        if self.wk().is_some() && !v_projected {
+            gpu.copy_f32_buffer(self.v, self.k, self.kv_len())
                 .map_err(hip)?;
         }
         Ok(())
@@ -478,20 +481,17 @@ impl SandwichAttentionOp<'_> {
         let eps = self.stream.eps;
         let rows = self.stream.rows;
         let (n_heads, n_kv, hd) = (self.n_heads, self.n_kv_heads, self.head_dim);
-        let writes_k = self.wk.is_some();
-        if writes_k {
-            if let Some(ones) = self.v_norm {
-                gpu.rmsnorm_batched(self.v, ones, self.v, rows * n_kv, hd, eps)
-                    .map_err(hip)?;
-            }
+        if let Some(ones) = self.kv_proj.as_ref().and_then(|p| p.v_norm) {
+            gpu.rmsnorm_batched(self.v, ones, self.v, rows * n_kv, hd, eps)
+                .map_err(hip)?;
         }
-        if rows == 1 && writes_k && ROUTES.qk_norm_rope {
+        if let (1, Some(p), true) = (rows, &self.kv_proj, ROUTES.qk_norm_rope) {
             return gpu
                 .fused_gemma4_qk_norm_rope_f32(
                     self.q,
                     self.k,
                     self.q_norm,
-                    self.k_norm,
+                    p.k_norm,
                     self.pos_buf,
                     n_heads,
                     n_kv,
@@ -505,12 +505,12 @@ impl SandwichAttentionOp<'_> {
         }
         gpu.rmsnorm_batched(self.q, self.q_norm, self.q, rows * n_heads, hd, eps)
             .map_err(hip)?;
-        if writes_k {
-            gpu.rmsnorm_batched(self.k, self.k_norm, self.k, rows * n_kv, hd, eps)
+        if let Some(p) = &self.kv_proj {
+            gpu.rmsnorm_batched(self.k, p.k_norm, self.k, rows * n_kv, hd, eps)
                 .map_err(hip)?;
         }
         scale(gpu, self.q, self.q_scale)?;
-        let rope_kv = if writes_k { n_kv } else { 0 };
+        let rope_kv = if self.kv_proj.is_some() { n_kv } else { 0 };
         let theta = self.rope.theta;
         match (self.rope.kind, rows) {
             (RopeKind::RotateHalf, 1) => {
@@ -597,7 +597,7 @@ impl SandwichAttentionOp<'_> {
             output_awq_scale: None,
             output: self.attn_out,
         };
-        if kv.write {
+        if self.kv_proj.is_some() {
             ATTENTION.run_attention(ctx, gpu, &plan, &io)
         } else {
             ATTENTION.run_attend_only(ctx, gpu, &plan, &io)
@@ -616,7 +616,7 @@ impl SandwichAttentionOp<'_> {
         let positions = self.positions()?;
         let (n_heads, n_kv, hd) = (self.n_heads, self.n_kv_heads, self.head_dim);
         let seq_len = self.position + rows;
-        if kv.write {
+        if self.kv_proj.is_some() {
             gpu.kv_cache_write_q8_0_batched(kv.k_cache, self.k, positions, n_kv, hd, rows)
                 .map_err(hip)?;
             gpu.kv_cache_write_q8_0_batched(kv.v_cache, self.v, positions, n_kv, hd, rows)
@@ -688,11 +688,6 @@ pub fn execute_sandwich_attention(
     ctx: &DispatchCtx,
     op: &SandwichAttentionOp<'_>,
 ) -> Result<(), DispatchError> {
-    if op.wk.is_none() && op.kv.write {
-        return Err(DispatchError::Hip(
-            "sandwich attention: a Q-only layer cannot write its KV row".into(),
-        ));
-    }
     let s = op.stream;
     s.save_residual(gpu)?;
     op.project(gpu, ctx)?;
@@ -733,6 +728,16 @@ pub struct SandwichMlpOp<'a> {
 }
 
 pub fn execute_sandwich_mlp(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    op: &SandwichMlpOp<'_>,
+) -> Result<(), DispatchError> {
+    dense_mlp(gpu, ctx, op)?;
+    op.stream.post_norm_residual(gpu, op.out, op.post_norm)
+}
+
+/// Residual save, then `out = down(act(gate(n)) * up(n))`, `n = pre_norm(x)`.
+fn dense_mlp(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
     op: &SandwichMlpOp<'_>,
@@ -788,7 +793,193 @@ pub fn execute_sandwich_mlp(
     } else {
         gemm_rows(gpu, &op.w_down, op.act, op.out, op.x_rot, rows)?;
     }
-    s.post_norm_residual(gpu, op.out, op.post_norm)
+    Ok(())
+}
+
+/// Routed-expert half of a parallel dense+MoE block.
+pub struct RoutedExperts<'a> {
+    /// Norm of the residual stream feeding the experts.
+    pub pre_norm: &'a GpuTensor,
+    /// Router input norm weight; the normed input is scaled by
+    /// `router_input_scale` before the router projection.
+    pub router_norm: &'a GpuTensor,
+    pub router_input_scale: f32,
+    pub router: WeightRef<'a>,
+    pub n_experts: usize,
+    pub top_k: usize,
+    /// Per-expert FFN width.
+    pub hidden_dim: usize,
+    pub gate_up_dtype: DType,
+    pub down_dtype: DType,
+    /// `[n_experts]` device pointers to each expert's fused gate/up weight.
+    pub gate_up_ptrs: &'a GpuTensor,
+    /// `[n_experts]` device pointers to each expert's down weight.
+    pub down_ptrs: &'a GpuTensor,
+    /// `[n_experts]` learned scale applied to each expert's output.
+    pub per_expert_scale: &'a GpuTensor,
+    /// Norm of the combined expert output.
+    pub post_norm: &'a GpuTensor,
+}
+
+impl RoutedExperts<'_> {
+    /// Expert formats with an indexed device-resident kernel pair.
+    pub fn supports(gate_up: DType, down: DType) -> bool {
+        matches!(
+            gate_up,
+            DType::MQ4G256 | DType::HFQ4G256 | DType::HFQ6G256 | DType::Q8_0
+        ) && matches!(down, DType::Q8_0 | DType::HFQ4G128)
+    }
+}
+
+/// Scratch of one routed-expert pass.
+#[derive(Clone, Copy)]
+pub struct RoutedScratch<'a> {
+    /// `pre_norm(residual)`, and its FWHT rotation for MagnumQuant experts.
+    pub input: &'a GpuTensor,
+    pub input_rot: &'a GpuTensor,
+    pub router_in: &'a GpuTensor,
+    pub router_logits: &'a GpuTensor,
+    pub topk_indices: &'a GpuTensor,
+    pub topk_weights: &'a GpuTensor,
+    /// `[top_k, hidden_dim]` each.
+    pub gate: &'a GpuTensor,
+    pub up: &'a GpuTensor,
+    pub act: &'a GpuTensor,
+    /// Weighted sum of the selected experts.
+    pub out: &'a GpuTensor,
+    /// `dense_post_norm(dense MLP output)`.
+    pub dense_normed: &'a GpuTensor,
+}
+
+/// Parallel dense+MoE MLP sublayer:
+/// `x = residual + post_norm(dense_post_norm(mlp(n)) + experts.post_norm(moe(r)))`
+/// with `n = mlp.pre_norm(x)` and `r = experts.pre_norm(x)`; the router reads
+/// `router_norm(x) * router_input_scale`. `mlp.post_norm` is the block's final
+/// post-norm.
+pub struct ParallelMoeMlpOp<'a> {
+    pub mlp: SandwichMlpOp<'a>,
+    pub dense_post_norm: &'a GpuTensor,
+    pub experts: RoutedExperts<'a>,
+    pub scratch: RoutedScratch<'a>,
+}
+
+pub fn execute_parallel_moe_mlp(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    op: &ParallelMoeMlpOp<'_>,
+) -> Result<(), DispatchError> {
+    let mlp = &op.mlp;
+    let s = mlp.stream;
+    let e = &op.experts;
+    let r = &op.scratch;
+    if s.rows != 1 {
+        return Err(DispatchError::Hip(format!(
+            "parallel MoE MLP rows={} has no batched executor",
+            s.rows
+        )));
+    }
+    if e.top_k != 8 {
+        return Err(DispatchError::Hip(format!(
+            "parallel MoE MLP: top_k={} unsupported (indexed kernels are k=8)",
+            e.top_k
+        )));
+    }
+    if !RoutedExperts::supports(e.gate_up_dtype, e.down_dtype) {
+        return Err(DispatchError::Hip(format!(
+            "parallel MoE MLP: expert formats gate_up={:?} down={:?} have no indexed kernel",
+            e.gate_up_dtype, e.down_dtype
+        )));
+    }
+    dense_mlp(gpu, ctx, mlp)?;
+    s.norm(gpu, mlp.out, op.dense_post_norm, r.dense_normed)?;
+
+    // Router over the post-attention residual stream.
+    s.norm(gpu, s.residual, e.pre_norm, r.input)?;
+    s.norm(gpu, s.residual, e.router_norm, r.router_in)?;
+    scale(gpu, r.router_in, e.router_input_scale)?;
+    gemv(gpu, ctx, &e.router, r.router_in, r.router_logits)?;
+    gpu.moe_softmax_topk_renorm_k8(
+        r.router_logits,
+        r.topk_indices,
+        r.topk_weights,
+        e.n_experts,
+        true,
+    )
+    .map_err(hip)?;
+
+    // Q8 down accumulates atomically; HFQ4G128 down assigns.
+    gpu.zero_f32(r.out).map_err(hip)?;
+    let (hidden, mi, k) = (s.hidden, e.hidden_dim, e.top_k);
+    match e.gate_up_dtype {
+        DType::MQ4G256 => {
+            gpu.rotate_x_mq(r.input, r.input_rot, hidden).map_err(hip)?;
+            gpu.gemv_mq4g256_moe_gate_up_k8_indexed(
+                e.gate_up_ptrs,
+                r.topk_indices,
+                r.input_rot,
+                r.gate,
+                r.up,
+                2 * mi,
+                hidden,
+            )
+            .map_err(hip)?;
+        }
+        DType::HFQ4G256 | DType::HFQ6G256 => crate::pipeline::run_uniform_moe_gate_up(
+            gpu,
+            e.gate_up_dtype,
+            e.gate_up_ptrs,
+            r.topk_indices,
+            r.input,
+            r.gate,
+            r.up,
+            2 * mi,
+            hidden,
+            k,
+        )?,
+        _ => gpu
+            .gemv_q8_0_moe_gate_up_k8_indexed(
+                e.gate_up_ptrs,
+                r.topk_indices,
+                r.input,
+                r.gate,
+                r.up,
+                2 * mi,
+                hidden,
+            )
+            .map_err(hip)?,
+    }
+    gpu.gelu_tanh_f32(r.gate, r.act, k * mi).map_err(hip)?;
+    gpu.mul_f32(r.act, r.up, r.act).map_err(hip)?;
+    if e.down_dtype == DType::Q8_0 {
+        gpu.gemv_q8_0_moe_down_residual_scaled_k8_indexed(
+            e.down_ptrs,
+            r.topk_indices,
+            r.topk_weights,
+            e.per_expert_scale,
+            r.act,
+            r.out,
+            hidden,
+            mi,
+        )
+    } else {
+        gpu.gemv_hfq4g128_moe_down_residual_scaled_k8_indexed(
+            e.down_ptrs,
+            r.topk_indices,
+            r.topk_weights,
+            e.per_expert_scale,
+            r.act,
+            r.out,
+            hidden,
+            mi,
+        )
+    }
+    .map_err(hip)?;
+    s.norm(gpu, r.out, e.post_norm, r.out)?;
+
+    gpu.add_f32(r.dense_normed, r.out, s.normed).map_err(hip)?;
+    s.norm(gpu, s.normed, mlp.post_norm, s.normed)?;
+    s.restore_residual(gpu)?;
+    gpu.add_inplace_f32(s.x, s.normed).map_err(hip)
 }
 
 /// Per-layer-input branch:
