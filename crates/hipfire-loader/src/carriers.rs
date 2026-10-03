@@ -2860,15 +2860,6 @@ impl Carrier for MapleCarrier {
 
 // ─── Gemma4Carrier ───────────────────────────────────────────────────
 
-fn gemma4_use_lowered(
-    enable_moe_block: bool,
-    want_batched: bool,
-    has_drafter: bool,
-    is_e_series: bool,
-) -> bool {
-    enable_moe_block || (want_batched && !has_drafter && !is_e_series)
-}
-
 fn gemma4_validate_drafter_route(is_e_series: bool, has_drafter: bool) -> Result<(), String> {
     if is_e_series && has_drafter {
         return Err(
@@ -3799,19 +3790,7 @@ impl Carrier for FluxDiffusionCarrier {
 
 #[cfg(test)]
 mod gemma4_route_tests {
-    use super::{gemma4_use_lowered, gemma4_validate_drafter_route};
-
-    #[test]
-    fn e_series_never_enters_dense_lowered_prefill() {
-        assert!(!gemma4_use_lowered(false, true, false, true));
-    }
-
-    #[test]
-    fn dense_opt_in_and_moe_keep_existing_routes() {
-        assert!(gemma4_use_lowered(false, true, false, false));
-        assert!(!gemma4_use_lowered(false, true, true, false));
-        assert!(gemma4_use_lowered(true, false, false, false));
-    }
+    use super::gemma4_validate_drafter_route;
 
     #[test]
     fn e_series_drafter_fails_closed() {

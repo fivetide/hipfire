@@ -57,6 +57,15 @@ fn batched_fusion_arch(arch: &str) -> bool {
     matches!(arch, "gfx1100" | "gfx1201")
 }
 
+/// True while a calibration collector is armed. Routes that never
+/// materialize a projection's unrotated input (fused norm+FWHT) step aside so
+/// every projection reaches its `maybe_capture_activation` tap.
+fn capturing(gpu: &Gpu) -> bool {
+    gpu.active_capture.is_some()
+}
+
+/// `y = W x` for one row. Taps the calibration collector with the unrotated
+/// input.
 fn gemv(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
@@ -64,6 +73,10 @@ fn gemv(
     x: &GpuTensor,
     y: &GpuTensor,
 ) -> Result<(), DispatchError> {
+    if w.dtype == DType::BF16 {
+        return gemm_rows(gpu, ctx, w, x, y, x, 1);
+    }
+    gpu.maybe_capture_activation(w.buf, x, 1, w.k);
     GEMV.run_auto(ctx, gpu, w, x, y)
 }
 
@@ -105,15 +118,26 @@ fn rotate_x_mq_rows(
 }
 
 /// `y[rows, m] = x[rows, k] · Wᵀ`. MagnumQuant weights rotate `x` into
-/// `x_rot` (`[rows, k]`) first.
+/// `x_rot` (`[rows, k]`) first. Formats without a batched kernel run one
+/// GEMV per row. Taps the calibration collector with the unrotated input.
 pub fn gemm_rows(
     gpu: &mut Gpu,
+    ctx: &DispatchCtx,
     w: &WeightRef,
     x: &GpuTensor,
     y: &GpuTensor,
     x_rot: &GpuTensor,
     rows: usize,
 ) -> Result<(), DispatchError> {
+    if !supports_batched_projection(w.dtype) {
+        for row in 0..rows {
+            let x_row = x.sub_offset(row * w.k, w.k);
+            let y_row = y.sub_offset(row * w.m, w.m);
+            gemv(gpu, ctx, w, &x_row, &y_row)?;
+        }
+        return Ok(());
+    }
+    gpu.maybe_capture_activation(w.buf, x, rows, w.k);
     match w.dtype {
         DType::F32 => gpu
             .gemm_f32_batched(w.buf, x, y, w.m, w.k, rows)
@@ -134,9 +158,33 @@ pub fn gemm_rows(
             gpu.gemm_mq6g256_batched_lmhead(w.buf, x_rot, y, w.m, w.k, rows)
                 .map_err(hip)
         }
-        other => Err(DispatchError::Hip(format!(
-            "sandwich: dtype {other:?} has no batched projection kernel"
-        ))),
+        // BF16 teachers (calibration): stage the F32 input to BF16 for the
+        // MFMA GEMM, which resolves only where the arch has one.
+        // ponytail: per-call staging buffer; hold one in scratch if BF16
+        // calibration ever becomes throughput-bound.
+        DType::BF16 => {
+            let n = rows * w.k;
+            let staged = gpu.alloc_tensor(&[n], DType::BF16).map_err(hip)?;
+            let run = gpu
+                .convert_f32_to_bf16(x, &staged, n)
+                .map_err(hip)
+                .and_then(|_| {
+                    GEMM.run_key(
+                        KernelKey::GemmBf16Mfma,
+                        ctx,
+                        gpu,
+                        &GemmParams {
+                            w,
+                            x: &staged,
+                            y,
+                            batch_size: rows,
+                        },
+                    )
+                });
+            gpu.free_tensor(staged).map_err(hip)?;
+            run
+        }
+        other => unreachable!("{other:?} is not a batched projection format"),
     }
 }
 
@@ -144,7 +192,7 @@ pub fn gemm_rows(
 pub fn supports_batched_projection(dtype: DType) -> bool {
     matches!(
         dtype,
-        DType::F32 | DType::Q8_0 | DType::MQ4G256 | DType::HFQ4G256 | DType::MQ6G256
+        DType::F32 | DType::BF16 | DType::Q8_0 | DType::MQ4G256 | DType::HFQ4G256 | DType::MQ6G256
     )
 }
 
@@ -170,7 +218,7 @@ fn fused_projection(
             m: &m,
             k: weights[0].k,
             rot_scratch: &[],
-            batch_size: Some(rows),
+            batch_size: (rows > 1).then_some(rows),
         },
     )
 }
@@ -377,7 +425,7 @@ impl SandwichAttentionOp<'_> {
             .iter()
             .flatten()
             .all(|(w, _)| w.dtype == DType::MQ4G256 && w.awq_scale.is_none());
-        if all_mq4 {
+        if all_mq4 && !capturing(gpu) {
             gpu.fused_rmsnorm_rotate_mq(s.x, self.input_norm, self.x_rot, s.hidden, s.eps)
                 .map_err(hip)?;
             for (w, out) in self.projections().iter().flatten() {
@@ -387,17 +435,15 @@ impl SandwichAttentionOp<'_> {
             s.norm(gpu, s.x, self.input_norm, s.normed)?;
             match self.wk() {
                 Some(wk) if self.wq.dtype == DType::Q8_0 && wk.dtype == DType::Q8_0 => {
-                    gpu.fused_gate_up_q8_0(
-                        self.wq.buf,
-                        wk.buf,
+                    fused_projection(
+                        gpu,
+                        ctx,
+                        KernelKey::FusedGateUpQ8_0,
+                        &[&self.wq, wk],
                         s.normed,
-                        self.q,
-                        self.k,
-                        self.wq.m,
-                        wk.m,
-                        self.wq.k,
-                    )
-                    .map_err(hip)?;
+                        &[self.q, self.k],
+                        1,
+                    )?;
                 }
                 Some(wk) => {
                     gemv(gpu, ctx, &self.wq, s.normed, self.q)?;
@@ -446,12 +492,12 @@ impl SandwichAttentionOp<'_> {
                 )?;
             }
             (wk, wv) => {
-                gemm_rows(gpu, &self.wq, s.normed, self.q, self.x_rot, rows)?;
+                gemm_rows(gpu, ctx, &self.wq, s.normed, self.q, self.x_rot, rows)?;
                 if let Some(wk) = wk {
-                    gemm_rows(gpu, wk, s.normed, self.k, self.x_rot, rows)?;
+                    gemm_rows(gpu, ctx, wk, s.normed, self.k, self.x_rot, rows)?;
                 }
                 if let (Some(_), Some(wv)) = (wk, wv) {
-                    gemm_rows(gpu, wv, s.normed, self.v, self.x_rot, rows)?;
+                    gemm_rows(gpu, ctx, wv, s.normed, self.v, self.x_rot, rows)?;
                     v_projected = true;
                 }
             }
@@ -683,7 +729,7 @@ pub fn execute_sandwich_attention(
     if s.rows == 1 {
         gemv(gpu, ctx, &op.wo, op.attn_out, s.normed)?;
     } else {
-        gemm_rows(gpu, &op.wo, op.attn_out, s.normed, op.x_rot, s.rows)?;
+        gemm_rows(gpu, ctx, &op.wo, op.attn_out, s.normed, op.x_rot, s.rows)?;
     }
     s.post_norm_residual(gpu, s.normed, op.post_norm)
 }
@@ -745,10 +791,13 @@ fn dense_mlp(
                 rows,
             )?;
         } else {
-            gemm_rows(gpu, &op.w_gate, s.normed, op.gate, op.x_rot, rows)?;
-            gemm_rows(gpu, &op.w_up, s.normed, op.up, op.x_rot, rows)?;
+            gemm_rows(gpu, ctx, &op.w_gate, s.normed, op.gate, op.x_rot, rows)?;
+            gemm_rows(gpu, ctx, &op.w_up, s.normed, op.up, op.x_rot, rows)?;
         }
-    } else if op.w_gate.dtype == DType::MQ4G256 && op.w_up.dtype == DType::MQ4G256 {
+    } else if op.w_gate.dtype == DType::MQ4G256
+        && op.w_up.dtype == DType::MQ4G256
+        && !capturing(gpu)
+    {
         gpu.fused_rmsnorm_rotate_mq(s.x, op.pre_norm, op.x_rot, s.hidden, s.eps)
             .map_err(hip)?;
         gpu.fused_gate_up_hfq4g256(
@@ -777,7 +826,7 @@ fn dense_mlp(
     if rows == 1 {
         gemv(gpu, ctx, &op.w_down, op.act, op.out)?;
     } else {
-        gemm_rows(gpu, &op.w_down, op.act, op.out, op.x_rot, rows)?;
+        gemm_rows(gpu, ctx, &op.w_down, op.act, op.out, op.x_rot, rows)?;
     }
     Ok(())
 }
@@ -858,12 +907,6 @@ pub fn execute_parallel_moe_mlp(
     let s = mlp.stream;
     let e = &op.experts;
     let r = &op.scratch;
-    if s.rows != 1 {
-        return Err(DispatchError::Hip(format!(
-            "parallel MoE MLP rows={} has no batched executor",
-            s.rows
-        )));
-    }
     if e.top_k != 8 {
         return Err(DispatchError::Hip(format!(
             "parallel MoE MLP: top_k={} unsupported (indexed kernels are k=8)",
@@ -877,11 +920,42 @@ pub fn execute_parallel_moe_mlp(
         )));
     }
     dense_mlp(gpu, ctx, mlp)?;
-    s.norm(gpu, mlp.out, op.dense_post_norm, r.dense_normed)?;
+    if s.rows == 1 {
+        s.norm(gpu, mlp.out, op.dense_post_norm, r.dense_normed)?;
+        routed_row(gpu, ctx, e, r, s.residual, s.hidden, s.eps)?;
+        gpu.add_f32(r.dense_normed, r.out, s.normed).map_err(hip)?;
+        s.norm(gpu, s.normed, mlp.post_norm, s.normed)?;
+    } else {
+        // The indexed expert kernels are single-row: route row by row and
+        // accumulate into the normed dense output.
+        s.norm(gpu, mlp.out, op.dense_post_norm, mlp.out)?;
+        for row in 0..s.rows {
+            let residual = s.residual.sub_offset(row * s.hidden, s.hidden);
+            routed_row(gpu, ctx, e, r, &residual, s.hidden, s.eps)?;
+            let out = mlp.out.sub_offset(row * s.hidden, s.hidden);
+            gpu.add_inplace_f32(&out, r.out).map_err(hip)?;
+        }
+        s.norm(gpu, mlp.out, mlp.post_norm, s.normed)?;
+    }
+    s.restore_residual(gpu)?;
+    gpu.add_inplace_f32(s.x, s.normed).map_err(hip)
+}
 
-    // Router over the post-attention residual stream.
-    s.norm(gpu, s.residual, e.pre_norm, r.input)?;
-    s.norm(gpu, s.residual, e.router_norm, r.router_in)?;
+/// `r.out = experts.post_norm(moe(pre_norm(residual)))` for one row; the
+/// router reads `router_norm(residual) * router_input_scale`.
+fn routed_row(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    e: &RoutedExperts<'_>,
+    r: &RoutedScratch<'_>,
+    residual: &GpuTensor,
+    hidden: usize,
+    eps: f32,
+) -> Result<(), DispatchError> {
+    gpu.rmsnorm_f32(residual, e.pre_norm, r.input, eps)
+        .map_err(hip)?;
+    gpu.rmsnorm_f32(residual, e.router_norm, r.router_in, eps)
+        .map_err(hip)?;
     scale(gpu, r.router_in, e.router_input_scale)?;
     gemv(gpu, ctx, &e.router, r.router_in, r.router_logits)?;
     gpu.moe_softmax_topk_renorm_k8(
@@ -895,7 +969,7 @@ pub fn execute_parallel_moe_mlp(
 
     // Q8 down accumulates atomically; HFQ4G128 down assigns.
     gpu.zero_f32(r.out).map_err(hip)?;
-    let (hidden, mi, k) = (s.hidden, e.hidden_dim, e.top_k);
+    let (mi, k) = (e.hidden_dim, e.top_k);
     match e.gate_up_dtype {
         DType::MQ4G256 => {
             gpu.rotate_x_mq(r.input, r.input_rot, hidden).map_err(hip)?;
@@ -960,12 +1034,7 @@ pub fn execute_parallel_moe_mlp(
         )
     }
     .map_err(hip)?;
-    s.norm(gpu, r.out, e.post_norm, r.out)?;
-
-    gpu.add_f32(r.dense_normed, r.out, s.normed).map_err(hip)?;
-    s.norm(gpu, s.normed, mlp.post_norm, s.normed)?;
-    s.restore_residual(gpu)?;
-    gpu.add_inplace_f32(s.x, s.normed).map_err(hip)
+    gpu.rmsnorm_f32(r.out, e.post_norm, r.out, eps).map_err(hip)
 }
 
 /// Per-layer-input branch:

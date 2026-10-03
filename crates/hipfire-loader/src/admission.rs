@@ -1177,7 +1177,7 @@ pub fn admit_source_with_options(
         // Gemma 4 lowered min-context: refuse before teardown/alloc so a
         // small max_seq leaves the prior model serving. Eager stays exempt.
         if matches!(arch_id, 13 | 22) {
-            let use_lowered = hipfire_arch_gemma4::gemma4_source_uses_lowered(hfq, false);
+            let use_lowered = hipfire_arch_gemma4::gemma4_source_uses_lowered(hfq);
             hipfire_arch_gemma4::gemma4_context_admission(effective_seq, use_lowered)?;
         }
     }
