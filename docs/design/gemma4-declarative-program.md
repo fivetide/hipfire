@@ -80,12 +80,12 @@ Projections, the final norm and the LM head reuse `Gemv` and
   Residual and K=V copies are `copy_f32_buffer` launches, not D2D memcpys,
   so the retained recorder sees them; a memcpy there made PM4 replay inexact.
 - Measured (gfx1151, pre-port daemon `8a6c4710`): every 12B/E2B/E4B row
-  bitwise; 26B with `HIPFIRE_GEMMA4_FUSED_QK_ROPE=0
-  HIPFIRE_GEMMA4_FUSED_POSTNORM=0` byte-identical, default 2 of 5 prompts
-  identical and 3 diverging late, coherent; EAGLE per-prompt tau
+  bitwise; 26B with the fused qk-norm+RoPE and post-norm routes off
+  byte-identical (measured before those switches were removed), with them on
+  2 of 5 prompts identical and 3 diverging late, coherent; EAGLE per-prompt tau
   3.368/3.459/2.667/3.447/3.514 before and after; the 12B lowered opt-in
   route (`HIPFIRE_BATCHED_PREFILL=1`) byte-identical with every
-  `HIPFIRE_GEMMA4_FUSED_*` knob at 0, since it too now takes the eager fused
+  fusion off, since it too now takes the eager fused
   routes; 26B
   `redline_daemon_harness.py --pm4 --skip-prefill` shadow exact (1083
   launches, was 1263; tape hash `249f24e5f39d425d`, was `0909f3792962c37d`).
