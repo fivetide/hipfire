@@ -61,8 +61,19 @@ Projections, the final norm and the LM head reuse `Gemv` and
 3. **EAGLE/MTP drafter.** The drafter block is `[SandwichAttention(q-only,
    write: None, target KV), SandwichMlp, Scale]`; pre/post projection and head
    are `Gemv` steps.
-4. **Deletion.** `lowered.rs` super-op facade, hand arms, duplicate
-   config/weights/loader; calibration tools move to the shared batched program.
+4. **Deletion.** `lowered.rs` super-op facade and hand arms; calibration
+   tools move to the shared batched program.
+
+## Calibration taps
+
+Calibration records each projection's unrotated input through
+`Gpu::maybe_capture_activation`. The sandwich projection helpers (`gemv`,
+`gemm_rows`) and the fused-QKV family fire it, so tools need no
+per-architecture tap. While a collector is armed, the `rows == 1` fusions that
+never materialize the unrotated input (fused norm+FWHT feeding prerotated
+GEMVs) step aside; the other fusions tap their shared input. `gemm_rows`
+stages BF16 teacher inputs for the MFMA GEMM and runs formats without a
+batched kernel one GEMV per row.
 
 ## Gates per slice
 
@@ -83,16 +94,22 @@ Projections, the final norm and the LM head reuse `Gemv` and
   bitwise; 26B with the fused qk-norm+RoPE and post-norm routes off
   byte-identical (measured before those switches were removed), with them on
   2 of 5 prompts identical and 3 diverging late, coherent; EAGLE per-prompt tau
-  3.368/3.459/2.667/3.447/3.514 before and after; the 12B lowered opt-in
-  route (`HIPFIRE_BATCHED_PREFILL=1`) byte-identical with every
-  fusion off, since it too now takes the eager fused
-  routes; 26B
+  3.368/3.459/2.667/3.447/3.514 before and after; 26B
   `redline_daemon_harness.py --pm4 --skip-prefill` shadow exact (1083
   launches, was 1263; tape hash `249f24e5f39d425d`, was `0909f3792962c37d`).
 - `serve_harness.py --thinking off --sampling greedy --compare-transcript`
   against the pre-port daemon: 12B battery and chain, E4B battery
   `transcript_byte_identical=true`; 26B battery coherent (no runaway, empty or
   attractor turns), turn 2 diverges.
+- Calibration tools on the program (gfx1151, `gemma4-12b.mq4`):
+  `prefill_parity_gemma4` (725-token prompt) batched vs per-token same argmax
+  and identical 24-token continuation on the 12B (8x faster prefill) and the
+  26B-A4B q8-experts MoE (2.4x); `calib_sweep` coverage 328/328, Hessian
+  consistency 0, q/k/(v) and gate/up identity PASS; `eval_hipfire` prefill vs
+  per-token scoring within 0.3% KLD. After the port the serve gates above
+  still hold: 12B/E2B/E4B tokens and top-16 logits bitwise, EAGLE tau
+  unchanged, 26B text identical to the first port, Redline shadow exact with
+  the same tape hash `249f24e5f39d425d`.
 
 ## Progress
 
@@ -101,14 +118,10 @@ Projections, the final norm and the LM head reuse `Gemv` and
 | Eager decode + batched prefill/verify + E-series PLE as `[SandwichAttention, SandwichMlp, PerLayerInput?, Scale?]` (`program.rs`, dispatch `sandwich.rs`); hand arms deleted | landed; bitwise | `30b55f753` |
 | MoE decode (`ParallelMoeMlp`), lowered decode on the shared program; super-op facade (`lower_variant`, `Gemma4Bindings`) and lowered hand arms deleted; unsupported expert formats refuse at load | landed; 26B byte-identical with the two non-bitwise fusions off, coherent with them on | `287e67d5b` |
 | EAGLE draft head as one step list (`Gemv` pre-projection, query-only `[SandwichAttention, SandwichMlp, Scale?]` blocks over the target's last slot, norm, `lm_head`, post-projection) | landed; EAGLE text and per-prompt tau identical | `287e67d5b` |
+| Calibration tools (`calib_sweep`, `eval_hipfire`, `prefill_parity_gemma4`) on the batched program; dispatch-owned calibration taps; batched `ParallelMoeMlp`; old batched prefill, `HIPFIRE_BATCHED_PREFILL`/`HIPFIRE_WMMA_PREFILL` deleted | landed; tool parity above | (this commit) |
 
 ## Remaining
 
-- `lowered::forward_prefill_batch` (the tool-only batched prefill used by
-  `calib_sweep`, `eval_hipfire`, the KLD reference builders and the lowered
-  examples) still runs hand-written layer bodies. It carries the calibration
-  activation taps (`run_prefill_gemm`), BF16/WMMA prefill GEMM routes and
-  batched asym3 / per-token ring attention that the serve program does not.
-  Porting it needs a decision on where calibration taps live in dispatch.
-- Two weight stacks remain (`gemma4.rs` eager, `lowered.rs` MoE / batched
-  opt-in) with duplicate config and loaders; both bind to the same program.
+- Two weight stacks remain (`gemma4.rs` eager for dense/E-series/EAGLE,
+  `lowered.rs` for MoE) with duplicate config and loaders; both bind to the
+  same program.
