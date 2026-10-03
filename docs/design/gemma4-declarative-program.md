@@ -118,7 +118,7 @@ batched kernel one GEMV per row.
 | Eager decode + batched prefill/verify + E-series PLE as `[SandwichAttention, SandwichMlp, PerLayerInput?, Scale?]` (`program.rs`, dispatch `sandwich.rs`); hand arms deleted | landed; bitwise | `30b55f753` |
 | MoE decode (`ParallelMoeMlp`), lowered decode on the shared program; super-op facade (`lower_variant`, `Gemma4Bindings`) and lowered hand arms deleted; unsupported expert formats refuse at load | landed; 26B byte-identical with the two non-bitwise fusions off, coherent with them on | `287e67d5b` |
 | EAGLE draft head as one step list (`Gemv` pre-projection, query-only `[SandwichAttention, SandwichMlp, Scale?]` blocks over the target's last slot, norm, `lm_head`, post-projection) | landed; EAGLE text and per-prompt tau identical | `287e67d5b` |
-| Calibration tools (`calib_sweep`, `eval_hipfire`, `prefill_parity_gemma4`) on the batched program; dispatch-owned calibration taps; batched `ParallelMoeMlp`; old batched prefill, `HIPFIRE_BATCHED_PREFILL`/`HIPFIRE_WMMA_PREFILL` deleted | landed; tool parity above | (this commit) |
+| Calibration tools (`calib_sweep`, `eval_hipfire`, `prefill_parity_gemma4`) on the batched program; dispatch-owned calibration taps; batched `ParallelMoeMlp`; old batched prefill, `HIPFIRE_BATCHED_PREFILL`/`HIPFIRE_WMMA_PREFILL` deleted | landed; tool parity above | `e89080332` |
 
 ## Remaining
 
