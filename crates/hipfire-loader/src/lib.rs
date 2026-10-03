@@ -974,12 +974,6 @@ pub fn gemma4_eagle_spec_len(spec: Option<u64>) -> Result<usize, String> {
     }
 }
 
-/// Env opt-in for the gemma4 batched/WMMA prefill
-/// (`HIPFIRE_BATCHED_PREFILL=1` / `HIPFIRE_WMMA_PREFILL=1`).
-pub fn gemma4_batched_prefill_optin(_gpu: &Gpu) -> bool {
-    gemma4::lowered::batched_prefill_enabled() || gemma4::lowered::wmma_prefill_enabled()
-}
-
 // ─── LoadedModel ──────────────────────────────────────────────────────
 
 pub struct LoadedModel {

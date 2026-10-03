@@ -389,8 +389,15 @@
   - 12B, E2B and E4B decode, batched prefill and EAGLE verify are
     byte-identical, logits included; EAGLE tau is unchanged.
   - The 26B-A4B now takes the 12B's fused qk-norm+RoPE and post-norm+residual
-    kernels. Greedy text stays coherent and can diverge late. The 12B
-    `HIPFIRE_BATCHED_PREFILL=1` route takes the same fusions.
+    kernels. Greedy text stays coherent and can diverge late.
+  - `calib_sweep`, `eval_hipfire` and `prefill_parity_gemma4` prefill Gemma 4
+    through the same program (`lowered::forward_prefill_batch`, 64-row
+    chunks, Q8 KV). The dispatch sandwich projections feed the calibration
+    collector, so any architecture on these steps calibrates without
+    per-architecture taps. Gemma calibration and KLD numbers move: the tools
+    now use the serve kernels. The 26B-A4B MoE block runs batched too.
+  - `HIPFIRE_BATCHED_PREFILL` and `HIPFIRE_WMMA_PREFILL` are removed; dense
+    Gemma 4 always loads on the eager stack, MoE on the lowered one.
   - The `HIPFIRE_GEMMA4_FUSED_{FFN,QK,QK_ROPE,POSTNORM,ATTN_NORM}` developer
     switches are removed; the fused routes are always on.
   - A MoE checkpoint whose expert formats have no indexed kernel pair now
