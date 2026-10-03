@@ -193,6 +193,47 @@
 - **PM text front end and LDS bound check for the fused A4 epilogue:** `parse_line` reads `ds_swizzle_b32 … offset:swizzle(SWAP,n)` (`0x1F | n << 10`, pinned against `llvm-mc`), and `pm_check::lds_bounds` evaluates `v_xor_b32_e32` in the entry block.
 
 ### Internal & CI
+- Gemma 4 layers run as engine `Step`s: 12B dense, E2B/E4B, the 26B-A4B MoE
+  and the EAGLE draft head (`gemma-4-*-assistant`) all execute
+  `[SandwichAttention, SandwichMlp | ParallelMoeMlp, PerLayerInput?, Scale?]`
+  from `hipfire_dispatch`; dense and E-series batched prefill and EAGLE verify
+  run the same program with `rows > 1`. The Gemma 4 super-op path and its
+  `HIPFIRE_FORWARD_LOWERED` hand arms are gone.
+  - 12B, E2B and E4B decode, batched prefill and EAGLE verify are
+    byte-identical, logits included; EAGLE tau is unchanged.
+  - The 26B-A4B now takes the 12B's fused qk-norm+RoPE and post-norm+residual
+    kernels. Greedy text stays coherent and can diverge late.
+  - `calib_sweep`, `eval_hipfire` and `prefill_parity_gemma4` prefill Gemma 4
+    through the same program (`lowered::forward_prefill_batch`, 64-row
+    chunks, Q8 KV). The dispatch sandwich projections feed the calibration
+    collector, so any architecture on these steps calibrates without
+    per-architecture taps. Gemma calibration and KLD numbers move: the tools
+    now use the serve kernels. The 26B-A4B MoE block runs batched too.
+  - `HIPFIRE_BATCHED_PREFILL` and `HIPFIRE_WMMA_PREFILL` are removed; dense
+    Gemma 4 always loads on the eager stack, MoE on the lowered one.
+  - The `HIPFIRE_GEMMA4_FUSED_{FFN,QK,QK_ROPE,POSTNORM,ATTN_NORM,PROJ}` developer
+    switches are removed; the fused routes are always on. The debug switches
+    `HIPFIRE_GEMMA4_{BASELINE_ATTN,ATTN_VERIFY,GEMM_VERIFY}` and
+    `HIPFIRE_MOE_{BYPASS,BUCKETED}` are removed with their hand-written paths.
+  - A MoE checkpoint whose expert formats have no indexed kernel pair now
+    refuses to load instead of running a host-side expert loop.
+
+- Qwen3.5/3.6/3.8 layers run as engine `Step`s end to end. The prefill layer
+  bodies (dense and MoE, including PARO) moved into `hipfire_dispatch`
+  unchanged, bit-exact. Decode with DFlash hidden capture and vision (mrope)
+  steps now uses the same step program as plain decode, so the qwen35
+  `HIPFIRE_FORWARD_LOWERED=0` hand path is gone. The MTP layer runs as
+  `[GatedAttention, SwigluFfn | Moe]`, and MoE MTP experts load as a sealed
+  trunk MoE layer. These routes now take the trunk's MQ4 fusions:
+  - Ornith MTP battery tau is unchanged within noise (1 of 5 turns diverges at
+    token 3).
+  - Qwen3.5-9B DFlash battery is byte-identical; 1 of 5 chain turns diverges
+    late.
+  - Qwen3.8-27B vision answers are byte-identical.
+
+- PARO A3B checkpoints (z-lab Qwen3.5-35B-A3B-PARO, shisa Qwen3.6-35B-A3B-PARO)
+  load again: expert-group validation no longer requires one shape across a
+  layer's PARO rotation sidecars.
 - Registry: the parked `qwen3.8:27b-mq4l*` tags are dropped (never published); `registry/pending/` is removed.
 - The experimental MW16 GEMM route (`kernel.mw16` / `HIPFIRE_MW16`, default off) is removed together with its call-site predicates and tests; the live F16 mw16 kernels stay. Kernel packs are unchanged.
 - **Perf: Qwen AR (and the generic AR and secondary AR loops) and the DFlash/MTP spec emitter append each token's bytes to one buffer instead of re-decoding the whole generated history every token.** The think-budget scans read that buffer too. `Tokenizer::decode_token_bytes_into` is the per-token decode; `decode_bytes` is built on it.
@@ -379,46 +420,6 @@
     - **gfx1151 decode norms as multi-workgroup grids.** `kernel.g12_dec_norm` now defaults on for exact gfx1151 too: the f32 AWQ RMSNorm+FWHT producer before every MQ4 input projection runs `fused_rmsnorm_mq_rotate_awq_g12dec` on grid K/256, the out-of-place single-row `rmsnorm_f32` (n > 256) runs `rmsnorm_f32_rowsplit` on n/256 workgroups, and the half-split partial RoPE runs `rope_partial_halfsplit_f32_headgrid` with one workgroup per head. Same sources as gfx1201; the outputs are byte-identical on real H2 decode activations at ctx 512/8,192/32,768 (whole buffer + guards, 3 poisons, negative controls detected, 200× serial and 200× under a one-CU mask, RoPE positions 0…262,144). Standalone on the Halo: AWQ K = 5,120 5.96 → 3.16 µs, `rmsnorm_f32` n = 5,120 6.77 → 2.49 µs, RoPE 5.08 → 2.20 µs. H2 tg128, same binary, four fresh processes per arm, ABBA then BAAB, `hipfire bench --pp 8192 --ctx 512,8192,32768 --tg 128 --backend noslots --workload stateless`, graph on, Q8 KV: off → on 14.958 → 15.079 / 14.583 → 14.700 / 13.678 → 13.779 tok/s at ctx 512/8,192/32,768 (+0.81 %/+0.80 %/+0.74 %; ABBA +0.116/+0.113/+0.100, BAAB +0.121/+0.115/+0.100 tok/s), every on process ahead of every off process; pp8192 1,162.45 → 1,157.55 tok/s, within noise (halves +36.65 / −42.70).
     - **gfx1151 Q8_0 decode attention: GQA-shared flash tile + head-dim-split reduce.** On exact gfx1151, Q8_0 KV, head_dim 256, GQA group 6, tile 128, full causal and no output gate (H2 decode), `attention_flash_q8_0_tile_gqa_gfx1151` replaces `attention_flash_q8_0_tile`: one 256-thread workgroup per (kv head, tile) serves the six q heads, so each Q8_0 K/V tile is read once, and the whole tile's Q, V rows and K codes/scales are issued at entry; each 16-lane row reproduces the reference lanes' dequant (`scale * code`, one rounding), fma leaf order and xor-16…1 add tree, softmax and in-order V accumulation. `attention_flash_reduce_dsplit_gfx1151` (the gfx1201 head-dim-split reduce, renamed) replaces `attention_flash_q8_0_reduce`. The tile grid is capped at 512 tiles with a tile loop. Redline's replay tables type both kernels with their reference twins' 13/7-argument ABIs and pointer effects. Standalone on the Halo, the tile + reduce pair at seq 517 / 8,197 / 32,773: 45.77 → 22.56 / 200.62 → 120.59 / 663.24 → 401.71 µs. The outputs are byte-identical to beta's objects on real H2 decode activations (seq C+1…C+4 for C = 512/8,192/32,768, full-attention layers 0/7/15: 36/36 captures, 3 poisons, graph and eager grids, whole buffer + guards, a one-K-code-byte negative control detected in all 36, 200× serial and 200× under a one-CU mask, 60 s soak). H2 tg128, same binary, four fresh processes per arm, ABBA then BAAB: off → on 14.974 → 15.079 / 14.459 → 14.698 / 13.108 → 13.777 tok/s (+0.70 %/+1.65 %/+5.10 %; ABBA +0.106/+0.242/+0.671, BAAB +0.099/+0.233/+0.663 tok/s), every on process ahead of every off process; pp8192 1,154.90 → 1,154.25 tok/s, within noise (halves +38.35 / −8.30).
     - **Both levers together** (same binary, both opt-outs vs defaults, four fresh processes per arm, ABBA then BAAB): 14.853 → 15.080 / 14.346 → 14.699 / 13.014 → 13.778 tok/s at ctx 512/8,192/32,768 (+1.53 %/+2.46 %/+5.87 %; ABBA +0.225/+0.352/+0.761, BAAB +0.230/+0.355/+0.768 tok/s), every on process ahead of every off process; pp8192 1,152.2 → 1,156.6 tok/s, within noise (halves +7.55 / −0.95). Checks: 256-step greedy logits equal beta at ctx 512/8,192/32,768 (synthetic and WikiText-2 primes, every step's whole logits + hidden, final KV arena + DeltaNet), with the opt-out arm (both levers off) also equal to beta; one continuous 32,788-step greedy decode (positions 512 … 33,299) is byte-identical to beta at every step; the Halo KLD pins `c1056943…` (WT2) / `04f06883…` (code24) are unchanged.
-
-- Gemma 4 layers run as engine `Step`s: 12B dense, E2B/E4B, the 26B-A4B MoE
-  and the EAGLE draft head (`gemma-4-*-assistant`) all execute
-  `[SandwichAttention, SandwichMlp | ParallelMoeMlp, PerLayerInput?, Scale?]`
-  from `hipfire_dispatch`; dense and E-series batched prefill and EAGLE verify
-  run the same program with `rows > 1`. The Gemma 4 super-op path and its
-  `HIPFIRE_FORWARD_LOWERED` hand arms are gone.
-  - 12B, E2B and E4B decode, batched prefill and EAGLE verify are
-    byte-identical, logits included; EAGLE tau is unchanged.
-  - The 26B-A4B now takes the 12B's fused qk-norm+RoPE and post-norm+residual
-    kernels. Greedy text stays coherent and can diverge late.
-  - `calib_sweep`, `eval_hipfire` and `prefill_parity_gemma4` prefill Gemma 4
-    through the same program (`lowered::forward_prefill_batch`, 64-row
-    chunks, Q8 KV). The dispatch sandwich projections feed the calibration
-    collector, so any architecture on these steps calibrates without
-    per-architecture taps. Gemma calibration and KLD numbers move: the tools
-    now use the serve kernels. The 26B-A4B MoE block runs batched too.
-  - `HIPFIRE_BATCHED_PREFILL` and `HIPFIRE_WMMA_PREFILL` are removed; dense
-    Gemma 4 always loads on the eager stack, MoE on the lowered one.
-  - The `HIPFIRE_GEMMA4_FUSED_{FFN,QK,QK_ROPE,POSTNORM,ATTN_NORM}` developer
-    switches are removed; the fused routes are always on.
-  - A MoE checkpoint whose expert formats have no indexed kernel pair now
-    refuses to load instead of running a host-side expert loop.
-
-- Qwen3.5/3.6/3.8 layers run as engine `Step`s end to end. The prefill layer
-  bodies (dense and MoE, including PARO) moved into `hipfire_dispatch`
-  unchanged, bit-exact. Decode with DFlash hidden capture and vision (mrope)
-  steps now uses the same step program as plain decode, so the qwen35
-  `HIPFIRE_FORWARD_LOWERED=0` hand path is gone. The MTP layer runs as
-  `[GatedAttention, SwigluFfn | Moe]`, and MoE MTP experts load as a sealed
-  trunk MoE layer. These routes now take the trunk's MQ4 fusions:
-  - Ornith MTP battery tau is unchanged within noise (1 of 5 turns diverges at
-    token 3).
-  - Qwen3.5-9B DFlash battery is byte-identical; 1 of 5 chain turns diverges
-    late.
-  - Qwen3.8-27B vision answers are byte-identical.
-
-- PARO A3B checkpoints (z-lab Qwen3.5-35B-A3B-PARO, shisa Qwen3.6-35B-A3B-PARO)
-  load again: expert-group validation no longer requires one shape across a
-  layer's PARO rotation sidecars.
 
 - Qwen4 raw-I64 PLE metadata records are HFQM qt=54 (qt=52 is MQ4G256V2L).
   The published `qwen3.8:flash-next` and `qwen3.8:flash-next-mq6q8-pleq8`
