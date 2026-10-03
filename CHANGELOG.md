@@ -389,10 +389,10 @@
   - 12B, E2B and E4B decode, batched prefill and EAGLE verify are
     byte-identical, logits included; EAGLE tau is unchanged.
   - The 26B-A4B now takes the 12B's fused qk-norm+RoPE and post-norm+residual
-    kernels. Greedy text stays coherent and can diverge late; with
-    `HIPFIRE_GEMMA4_FUSED_QK_ROPE=0 HIPFIRE_GEMMA4_FUSED_POSTNORM=0` it is
-    byte-identical to before. The 12B `HIPFIRE_BATCHED_PREFILL=1` route takes
-    the same fusions (byte-identical with every `HIPFIRE_GEMMA4_FUSED_*` at 0).
+    kernels. Greedy text stays coherent and can diverge late. The 12B
+    `HIPFIRE_BATCHED_PREFILL=1` route takes the same fusions.
+  - The `HIPFIRE_GEMMA4_FUSED_{FFN,QK,QK_ROPE,POSTNORM,ATTN_NORM}` developer
+    switches are removed; the fused routes are always on.
   - A MoE checkpoint whose expert formats have no indexed kernel pair now
     refuses to load instead of running a host-side expert loop.
 

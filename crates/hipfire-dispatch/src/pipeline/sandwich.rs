@@ -35,39 +35,15 @@ fn hip_dbg(e: impl std::fmt::Debug) -> DispatchError {
     DispatchError::Hip(format!("{e:?}"))
 }
 
-/// Developer route switches. Each fused route is on unless its variable is
-/// `0`/`off`/`false`. `HIPFIRE_GEMMA4_EAGLE=1` (greedy EAGLE) additionally
-/// turns off the fusions that are not byte-identical to their unfused form,
-/// so batched verify and single-row decode share one arithmetic.
-struct Routes {
-    attn_norm: bool,
-    q8_qk: bool,
-    qk_norm_rope: bool,
-    post_norm: bool,
-    gate_up: bool,
-    /// Batched Q8 GEMMs use the unchunked scalar kernel (decode's arithmetic).
-    strict_q8_gemm: bool,
-}
-
-static ROUTES: LazyLock<Routes> = LazyLock::new(|| {
-    let on = |name: &str| {
-        !matches!(
-            hipfire_config::developer_var(name).ok().as_deref(),
-            Some("0") | Some("off") | Some("false")
-        )
-    };
-    let strict = hipfire_config::developer_var("HIPFIRE_GEMMA4_EAGLE")
+/// Greedy EAGLE (`HIPFIRE_GEMMA4_EAGLE=1`) turns off the fusions that are not
+/// byte-identical to their unfused form and keeps batched Q8 GEMMs on the
+/// unchunked scalar kernel, so batched verify and single-row decode share one
+/// arithmetic.
+static EAGLE_STRICT: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_GEMMA4_EAGLE")
         .ok()
         .as_deref()
-        == Some("1");
-    Routes {
-        attn_norm: on("HIPFIRE_GEMMA4_FUSED_ATTN_NORM"),
-        q8_qk: on("HIPFIRE_GEMMA4_FUSED_QK"),
-        qk_norm_rope: !strict && on("HIPFIRE_GEMMA4_FUSED_QK_ROPE"),
-        post_norm: !strict && on("HIPFIRE_GEMMA4_FUSED_POSTNORM"),
-        gate_up: on("HIPFIRE_GEMMA4_FUSED_FFN"),
-        strict_q8_gemm: strict,
-    }
+        == Some("1")
 });
 
 static GEMV: LazyLock<GemvFamily> = LazyLock::new(GemvFamily::new);
@@ -127,7 +103,7 @@ pub fn gemm_rows(
         DType::F32 => gpu
             .gemm_f32_batched(w.buf, x, y, w.m, w.k, rows)
             .map_err(hip),
-        DType::Q8_0 if ROUTES.strict_q8_gemm => gpu
+        DType::Q8_0 if *EAGLE_STRICT => gpu
             .gemm_q8_0_batched(w.buf, x, y, w.m, w.k, rows)
             .map_err(hip),
         DType::Q8_0 => gpu
@@ -261,7 +237,7 @@ impl SandwichStream<'_> {
         out: &GpuTensor,
         post_norm: &GpuTensor,
     ) -> Result<(), DispatchError> {
-        if self.rows == 1 && ROUTES.post_norm {
+        if self.rows == 1 && !*EAGLE_STRICT {
             return gpu
                 .rmsnorm_residual_add_f32(out, post_norm, self.residual, self.x, self.eps)
                 .map_err(hip);
@@ -388,7 +364,7 @@ impl SandwichAttentionOp<'_> {
             .iter()
             .flatten()
             .all(|(w, _)| w.dtype == DType::MQ4G256 && w.awq_scale.is_none());
-        if ROUTES.attn_norm && all_mq4 {
+        if all_mq4 {
             gpu.fused_rmsnorm_rotate_mq(s.x, self.input_norm, self.x_rot, s.hidden, s.eps)
                 .map_err(hip)?;
             for (w, out) in self.projections().iter().flatten() {
@@ -397,9 +373,7 @@ impl SandwichAttentionOp<'_> {
         } else {
             s.norm(gpu, s.x, self.input_norm, s.normed)?;
             match self.wk() {
-                Some(wk)
-                    if ROUTES.q8_qk && self.wq.dtype == DType::Q8_0 && wk.dtype == DType::Q8_0 =>
-                {
+                Some(wk) if self.wq.dtype == DType::Q8_0 && wk.dtype == DType::Q8_0 => {
                     gpu.fused_gate_up_q8_0(
                         self.wq.buf,
                         wk.buf,
@@ -485,7 +459,7 @@ impl SandwichAttentionOp<'_> {
             gpu.rmsnorm_batched(self.v, ones, self.v, rows * n_kv, hd, eps)
                 .map_err(hip)?;
         }
-        if let (1, Some(p), true) = (rows, &self.kv_proj, ROUTES.qk_norm_rope) {
+        if let (1, Some(p), true) = (rows, &self.kv_proj, !*EAGLE_STRICT) {
             return gpu
                 .fused_gemma4_qk_norm_rope_f32(
                     self.q,
@@ -761,8 +735,7 @@ fn dense_mlp(
             gemm_rows(gpu, &op.w_gate, s.normed, op.gate, op.x_rot, rows)?;
             gemm_rows(gpu, &op.w_up, s.normed, op.up, op.x_rot, rows)?;
         }
-    } else if ROUTES.gate_up && op.w_gate.dtype == DType::MQ4G256 && op.w_up.dtype == DType::MQ4G256
-    {
+    } else if op.w_gate.dtype == DType::MQ4G256 && op.w_up.dtype == DType::MQ4G256 {
         gpu.fused_rmsnorm_rotate_mq(s.x, op.pre_norm, op.x_rot, s.hidden, s.eps)
             .map_err(hip)?;
         gpu.fused_gate_up_hfq4g256(
