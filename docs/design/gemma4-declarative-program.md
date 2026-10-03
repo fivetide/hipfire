@@ -110,6 +110,12 @@ batched kernel one GEMV per row.
   still hold: 12B/E2B/E4B tokens and top-16 logits bitwise, EAGLE tau
   unchanged, 26B text identical to the first port, Redline shadow exact with
   the same tape hash `249f24e5f39d425d`.
+- KLD against a BF16 reference (`google/gemma-4-12B-it` `--format oracle`,
+  pre-port `build_kld_ref_native_gemma4`, WT2 test, 8 x 512, top-256, ref md5
+  `ea5e297378c7ff692013af63d8411323`), candidate `gemma4-12b.mq4`, Q8 KV:
+  per-token scoring 0.7338 pre-port vs 0.7335 now; prefill scoring 0.8150 vs
+  0.8242 (prefill wall 160 s vs 110 s). The pre-port `eval_hipfire` needed
+  the Gemma-branch fix to score at all.
 
 ## Progress
 
