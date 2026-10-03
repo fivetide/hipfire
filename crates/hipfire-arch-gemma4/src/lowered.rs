@@ -1889,7 +1889,11 @@ pub fn gemma4_flash_partials_len_for_config(max_seq: usize, config: &Gemma4Confi
 /// and the Q8 decode tile (`q8_flash_tile_size`) for the full tier at `max_seq`
 /// and the sliding ring at `min(sliding_window, max_seq)`. The Q8 tile can be
 /// smaller than 128 (tile32 on gfx1100 up to 8K), which needs more partials.
-pub fn gemma4_decode_flash_partials_len(arch: &str, config: &Gemma4Config, max_seq: usize) -> usize {
+pub fn gemma4_decode_flash_partials_len(
+    arch: &str,
+    config: &Gemma4Config,
+    max_seq: usize,
+) -> usize {
     let q8_len = |n_kv_heads: usize, head_dim: usize, cap: usize| {
         let tile = rdna_compute::attention::q8_flash_tile_size(
             arch,
@@ -1902,8 +1906,16 @@ pub fn gemma4_decode_flash_partials_len(arch: &str, config: &Gemma4Config, max_s
     };
     let sliding_cap = config.sliding_window.min(max_seq);
     gemma4_flash_partials_len_for_config(max_seq, config)
-        .max(q8_len(config.full_n_kv_heads, config.full_head_dim, max_seq))
-        .max(q8_len(config.sliding_n_kv_heads, config.sliding_head_dim, sliding_cap))
+        .max(q8_len(
+            config.full_n_kv_heads,
+            config.full_head_dim,
+            max_seq,
+        ))
+        .max(q8_len(
+            config.sliding_n_kv_heads,
+            config.sliding_head_dim,
+            sliding_cap,
+        ))
 }
 
 /// Per-decode scratch, sized once at model-load time against the MAX of
@@ -2860,17 +2872,30 @@ fn lowered_graph_binding(
     projection!(weights.lm_head);
     mix(weights.embd_format as u64);
     for v in [
-        config.dim, config.n_layers, config.vocab_size, config.n_heads,
-        config.sliding_head_dim, config.sliding_n_kv_heads, config.sliding_window,
-        config.full_head_dim, config.full_n_kv_heads, config.hidden_dim,
-        config.enable_moe_block as usize, config.moe_intermediate_size,
-        config.num_experts, config.top_k_experts, config.attention_k_eq_v as usize,
+        config.dim,
+        config.n_layers,
+        config.vocab_size,
+        config.n_heads,
+        config.sliding_head_dim,
+        config.sliding_n_kv_heads,
+        config.sliding_window,
+        config.full_head_dim,
+        config.full_n_kv_heads,
+        config.hidden_dim,
+        config.enable_moe_block as usize,
+        config.moe_intermediate_size,
+        config.num_experts,
+        config.top_k_experts,
+        config.attention_k_eq_v as usize,
     ] {
         mix(v as u64);
     }
     for v in [
-        config.norm_eps, config.sliding_rope_theta, config.full_rope_theta,
-        config.full_partial_rotary_factor, config.final_logit_softcapping,
+        config.norm_eps,
+        config.sliding_rope_theta,
+        config.full_rope_theta,
+        config.full_partial_rotary_factor,
+        config.final_logit_softcapping,
     ] {
         mix(v.to_bits() as u64);
     }
@@ -2881,9 +2906,13 @@ fn lowered_graph_binding(
         ($lw:expr) => {{
             let lw = $lw;
             tensors!(
-                lw.input_layernorm, lw.post_attention_layernorm,
-                lw.pre_feedforward_layernorm, lw.post_feedforward_layernorm,
-                lw.layer_scalar, lw.q_norm, lw.k_norm,
+                lw.input_layernorm,
+                lw.post_attention_layernorm,
+                lw.pre_feedforward_layernorm,
+                lw.post_feedforward_layernorm,
+                lw.layer_scalar,
+                lw.q_norm,
+                lw.k_norm,
             );
             mix(lw.layer_scalar_host.to_bits() as u64);
             projection!(lw.q_proj);
@@ -2896,10 +2925,15 @@ fn lowered_graph_binding(
             if let Some(m) = &lw.moe {
                 projection!(m.router_proj);
                 tensors!(
-                    m.router_scale, m.per_expert_scale,
-                    m.pre_feedforward_layernorm_2, m.post_feedforward_layernorm_1,
-                    m.post_feedforward_layernorm_2, m.experts_gate_up_pool,
-                    m.experts_down_pool, m.experts_gate_up_ptrs, m.experts_down_ptrs,
+                    m.router_scale,
+                    m.per_expert_scale,
+                    m.pre_feedforward_layernorm_2,
+                    m.post_feedforward_layernorm_1,
+                    m.post_feedforward_layernorm_2,
+                    m.experts_gate_up_pool,
+                    m.experts_down_pool,
+                    m.experts_gate_up_ptrs,
+                    m.experts_down_ptrs,
                 );
                 if let Some(first) = m.experts.first() {
                     projection!(first.gate_up_proj);
@@ -2923,9 +2957,14 @@ fn lowered_graph_binding(
     }
     for kv in [kv_sliding, kv_full] {
         for v in [
-            kv.max_seq, kv.physical_cap, kv.compact_offset,
-            kv.quant_q8 as usize, kv.quant_asym3 as usize, kv.quant_fwht as usize,
-            kv.quant_asym4 as usize, kv.quant_asym2 as usize,
+            kv.max_seq,
+            kv.physical_cap,
+            kv.compact_offset,
+            kv.quant_q8 as usize,
+            kv.quant_asym3 as usize,
+            kv.quant_fwht as usize,
+            kv.quant_asym4 as usize,
+            kv.quant_asym2 as usize,
             kv.v_mode_bits() as usize,
         ] {
             mix(v as u64);
@@ -2939,13 +2978,34 @@ fn lowered_graph_binding(
     }
     mix(s.pos_buf.as_ptr() as u64);
     tensors!(
-        s.x, s.residual, s.tmp, s.q, s.k, s.v, s.attn_out,
-        s.gate_ffn, s.up_ffn, s.ffn_hidden, s.ffn_out, s.logits,
-        s.flash_partials, s.v_norm_ones_full, s.moe_cur_mlp, s.moe_pre2,
-        s.moe_router_in, s.moe_router_logits, s.moe_topk_indices,
-        s.moe_topk_weights, s.moe_cur_moe, s.moe_expert_gate_up,
-        s.moe_expert_hidden, s.moe_expert_out, s.moe_pre2_rot,
-        s.moe_expert_gate_batch, s.moe_expert_up_batch, s.moe_expert_hidden_batch,
+        s.x,
+        s.residual,
+        s.tmp,
+        s.q,
+        s.k,
+        s.v,
+        s.attn_out,
+        s.gate_ffn,
+        s.up_ffn,
+        s.ffn_hidden,
+        s.ffn_out,
+        s.logits,
+        s.flash_partials,
+        s.v_norm_ones_full,
+        s.moe_cur_mlp,
+        s.moe_pre2,
+        s.moe_router_in,
+        s.moe_router_logits,
+        s.moe_topk_indices,
+        s.moe_topk_weights,
+        s.moe_cur_moe,
+        s.moe_expert_gate_up,
+        s.moe_expert_hidden,
+        s.moe_expert_out,
+        s.moe_pre2_rot,
+        s.moe_expert_gate_batch,
+        s.moe_expert_up_batch,
+        s.moe_expert_hidden_batch,
     );
     h.max(1)
 }
@@ -3028,31 +3088,38 @@ pub fn forward_scratch(
         && gpu.graphs.graph_exec.is_some()
     {
         gpu.hip.stream_write_value32(
-            gpu.active_stream.as_ref().unwrap(), &scratch.pos_buf, pos as u32, 0,
+            gpu.active_stream.as_ref().unwrap(),
+            &scratch.pos_buf,
+            pos as u32,
+            0,
         )?;
-        if let Err(e) = gpu.graphs.graph_launch(
-            &gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap(),
-        ) {
+        if let Err(e) =
+            gpu.graphs
+                .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
+        {
             gpu.graphs.graph_destroy(&gpu.hip, gpu.device_id);
             return Err(e);
         }
     } else if use_graph && !gpu.graphs.ar_forward_kernel_dirty {
-        gpu.hip.memcpy_htod(&scratch.pos_buf, &(pos as i32).to_ne_bytes())?;
+        gpu.hip
+            .memcpy_htod(&scratch.pos_buf, &(pos as i32).to_ne_bytes())?;
         gpu.graphs.drop_captured_graph(&gpu.hip, gpu.device_id);
         if let Err(e) = gpu.graphs.begin_graph_capture(
-            &gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap(),
+            &gpu.hip,
+            gpu.device_id,
+            gpu.active_stream.as_ref().unwrap(),
         ) {
             gpu.graphs.capture_mode = false;
             gpu.graphs.graph_destroy(&gpu.hip, gpu.device_id);
             return Err(e);
         }
-        let body = forward_scratch_inner(
-            gpu, weights, config, pos, kv_sliding, kv_full, scratch,
-        );
+        let body = forward_scratch_inner(gpu, weights, config, pos, kv_sliding, kv_full, scratch);
         // Always close capture, including a failing body, before dropping its
         // blobs. Captured work is never launched when either phase fails.
         let end = gpu.graphs.end_graph_capture(
-            &gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap(),
+            &gpu.hip,
+            gpu.device_id,
+            gpu.active_stream.as_ref().unwrap(),
         );
         if let Err(e) = body.and(end) {
             gpu.graphs.capture_mode = false;
@@ -3060,9 +3127,10 @@ pub fn forward_scratch(
             return Err(e);
         }
         gpu.graphs.ar_forward_binding = binding;
-        if let Err(e) = gpu.graphs.graph_launch(
-            &gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap(),
-        ) {
+        if let Err(e) =
+            gpu.graphs
+                .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
+        {
             gpu.graphs.graph_destroy(&gpu.hip, gpu.device_id);
             return Err(e);
         }
@@ -3075,7 +3143,8 @@ pub fn forward_scratch(
         if !use_graph && gpu.graphs.graph_exec.is_some() {
             gpu.graphs.graph_destroy(&gpu.hip, gpu.device_id);
         }
-        gpu.hip.memcpy_htod(&scratch.pos_buf, &(pos as i32).to_ne_bytes())?;
+        gpu.hip
+            .memcpy_htod(&scratch.pos_buf, &(pos as i32).to_ne_bytes())?;
         forward_scratch_inner(gpu, weights, config, pos, kv_sliding, kv_full, scratch)?;
         // A successful direct call JITs the same body before capture.
         if use_graph {

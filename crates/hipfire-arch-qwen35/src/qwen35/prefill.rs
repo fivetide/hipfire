@@ -624,7 +624,9 @@ fn dense_layers_have_projection_dtype(weights: &Qwen35Weights, dtype: DType) -> 
 
 fn native_mq4_widened_requested() -> bool {
     hipfire_config::developer_var("HIPFIRE_GFX1100_MQ4_WIDE_PREFILL")
-        .ok().as_deref() == Some("1")
+        .ok()
+        .as_deref()
+        == Some("1")
 }
 
 /// Separately admitted native MQ4 route: no V2 producer or lean PBS contract.
@@ -637,7 +639,9 @@ fn native_mq4_widened_route(gpu: &Gpu, weights: &Qwen35Weights) -> bool {
 }
 
 fn native_mq4_widened_flags_admitted(
-    arch: &str, flags: &rdna_compute::FeatureFlags, screen: bool,
+    arch: &str,
+    flags: &rdna_compute::FeatureFlags,
+    screen: bool,
 ) -> bool {
     arch == "gfx1100"
         && !flags.fp16_disabled
@@ -1006,9 +1010,17 @@ pub fn minimum_prefill_reservation_bytes(config: &Qwen35Config, arch: &str) -> O
     // explicit experimental MQ4 opt-ins, conservatively reserve their prelude
     // too; the default V2/other-format reservation remains unchanged.
     let packed = hipfire_config::developer_var("HIPFIRE_GFX1100_PACKED_MQ4_PREFILL")
-        .ok().as_deref() == Some("1");
+        .ok()
+        .as_deref()
+        == Some("1");
     if arch == "gfx1100" && (native_mq4_widened_requested() || packed) {
-        base.checked_add(native_mq4_projection_deficit(config, WIDENED_COMMIT_ROWS, 0, 0, 0)?)
+        base.checked_add(native_mq4_projection_deficit(
+            config,
+            WIDENED_COMMIT_ROWS,
+            0,
+            0,
+            0,
+        )?)
     } else {
         Some(base)
     }
@@ -1024,11 +1036,18 @@ fn native_mq4_projection_deficit(
     live_f16: usize,
     live_partials: usize,
 ) -> Option<usize> {
-    let mmq = config.hidden_dim.checked_add(127)?.checked_div(128)?
-        .checked_mul(144)?.checked_mul(rows)?;
+    let mmq = config
+        .hidden_dim
+        .checked_add(127)?
+        .checked_div(128)?
+        .checked_mul(144)?
+        .checked_mul(rows)?;
     let tail = rows.min(127);
     let f16 = tail.checked_mul(config.hidden_dim)?.checked_mul(2)?;
-    let partials = tail.checked_mul(config.dim)?.checked_mul(4)?.checked_mul(4)?;
+    let partials = tail
+        .checked_mul(config.dim)?
+        .checked_mul(4)?
+        .checked_mul(4)?;
     mmq.saturating_sub(live_mmq)
         .checked_add(f16.saturating_sub(live_f16))?
         .checked_add(partials.saturating_sub(live_partials))
@@ -1199,11 +1218,13 @@ fn memory_admitted_rung(
         .unwrap_or(usize::MAX);
         let projection_deficit = if native_mq4 {
             native_mq4_projection_deficit(
-                config, rung,
+                config,
+                rung,
                 gpu.scratch.q8_1_mmq_x_scratch_bytes,
                 gpu.scratch.fp16_x_scratch_bytes,
                 gpu.scratch.ksplit_det_partials_bytes,
-            ).unwrap_or(usize::MAX)
+            )
+            .unwrap_or(usize::MAX)
         } else if fp8_projection {
             let x_need = rung.checked_mul(config.hidden_dim).unwrap_or(usize::MAX);
             let sums_need = rung
@@ -1289,7 +1310,13 @@ fn ordinary_prefill_chunk_limit_with_cache(
     }
     let lean = lean_pbs_requested() && lean_pbs_route(gpu, weights, config, perf);
     let mut admitted = memory_admitted_rung(
-        gpu, config, kv_cache, perf, lean, native_mq4_widened_route(gpu, weights), cached,
+        gpu,
+        config,
+        kv_cache,
+        perf,
+        lean,
+        native_mq4_widened_route(gpu, weights),
+        cached,
     )?;
     if let Some(p) = pbs {
         admitted = admitted.min(p.max_batch);
@@ -6607,10 +6634,28 @@ mod tests {
     fn q8_multirow_attn_rejects_replay_recording_on_supported_arches() {
         for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             assert!(q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, false,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                false,
             ));
             assert!(!q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, true,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                true,
             ));
         }
     }
@@ -8191,22 +8236,42 @@ mod tests {
     fn native_mq4_wide_rejects_unaudited_dispatch_overrides() {
         let make = || rdna_compute::FeatureFlags::for_test("gfx1100");
         assert!(native_mq4_widened_flags_admitted("gfx1100", &make(), false));
-        assert!(!native_mq4_widened_flags_admitted("gfx1201", &make(), false));
+        assert!(!native_mq4_widened_flags_admitted(
+            "gfx1201",
+            &make(),
+            false
+        ));
         assert!(!native_mq4_widened_flags_admitted("gfx1100", &make(), true));
         let mut variants = Vec::new();
-        let mut f = make(); f.fp16_disabled = true; variants.push(f);
-        let mut f = make(); f.rocblas_all_archs = true; variants.push(f);
-        let mut f = make(); f.gemv_dp4a = Some(true); variants.push(f);
-        let mut f = make(); f.mmq_override = Some(false); variants.push(f);
-        let mut f = make(); f.mmq_min_batch = Some(2048); variants.push(f);
-        let mut f = make(); f.qkvza_split_tail = true; variants.push(f);
-        let mut f = make(); f.wo_wmma_variant = Some("k4".into()); variants.push(f);
+        let mut f = make();
+        f.fp16_disabled = true;
+        variants.push(f);
+        let mut f = make();
+        f.rocblas_all_archs = true;
+        variants.push(f);
+        let mut f = make();
+        f.gemv_dp4a = Some(true);
+        variants.push(f);
+        let mut f = make();
+        f.mmq_override = Some(false);
+        variants.push(f);
+        let mut f = make();
+        f.mmq_min_batch = Some(2048);
+        variants.push(f);
+        let mut f = make();
+        f.qkvza_split_tail = true;
+        variants.push(f);
+        let mut f = make();
+        f.wo_wmma_variant = Some("k4".into());
+        variants.push(f);
         // Packed FFN shares the budgeted MMQ slot and keeps native tails.
         let mut packed = make();
         packed.packed_mq4_prefill = true;
         assert!(native_mq4_widened_flags_admitted("gfx1100", &packed, false));
         packed.mmq_override = Some(false);
-        assert!(!native_mq4_widened_flags_admitted("gfx1100", &packed, false));
+        assert!(!native_mq4_widened_flags_admitted(
+            "gfx1100", &packed, false
+        ));
         for f in variants {
             assert!(!native_mq4_widened_flags_admitted("gfx1100", &f, false));
         }
@@ -8219,14 +8284,27 @@ mod tests {
         let f16 = 127 * 17408 * 2;
         let partials = 127 * 5120 * 4 * 4;
         assert_eq!(mmq, 153 * 1024 * 1024);
-        assert_eq!(native_mq4_projection_deficit(&config, 8192, 0, 0, 0),
-                   Some(mmq + f16 + partials));
-        assert_eq!(native_mq4_projection_deficit(&config, 8192, mmq, f16, partials), Some(0));
-        assert_eq!(native_mq4_projection_deficit(&config, 8192, mmq + 1, 0, partials), Some(f16));
-        assert_eq!(native_mq4_projection_deficit(&config, usize::MAX, 0, 0, 0), None);
+        assert_eq!(
+            native_mq4_projection_deficit(&config, 8192, 0, 0, 0),
+            Some(mmq + f16 + partials)
+        );
+        assert_eq!(
+            native_mq4_projection_deficit(&config, 8192, mmq, f16, partials),
+            Some(0)
+        );
+        assert_eq!(
+            native_mq4_projection_deficit(&config, 8192, mmq + 1, 0, partials),
+            Some(f16)
+        );
+        assert_eq!(
+            native_mq4_projection_deficit(&config, usize::MAX, 0, 0, 0),
+            None
+        );
         for rows in [512, 1024, 2048, 4096, 8192] {
-            assert_eq!(native_mq4_projection_deficit(&config, rows, 0, 0, 0),
-                       Some(rows * 19584 + f16 + partials));
+            assert_eq!(
+                native_mq4_projection_deficit(&config, rows, 0, 0, 0),
+                Some(rows * 19584 + f16 + partials)
+            );
         }
     }
 
