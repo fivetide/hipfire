@@ -40,12 +40,11 @@
 //!
 //!   * `HIPFIRE_GEMMA4_GRAPH` (default ON; set =0 to disable) — hipGraph
 //!     48-layer body + lm_head (`decode_step_with_graph`). +2.6%.
-//!   * `HIPFIRE_GEMMA4_FUSED_FFN` (default ON) — fold pre-FFN rmsnorm+FWHT into
-//!     one launch then gate+up into one (`fused_rmsnorm_rotate_mq` +
-//!     `fused_gate_up_hfq4g256`; MQ4G256 bytes are HFQ4G256-compatible given a
-//!     pre-rotated input). +1.0–1.2%.
-//!   * `HIPFIRE_GEMMA4_FUSED_QK` (default ON) — fuse the Q8 q+k projections into
-//!     one launch (`fused_gate_up_q8_0`, shared rmsnorm input). +1.1%.
+//!   * fused FFN — fold pre-FFN rmsnorm+FWHT into one launch then gate+up into
+//!     one (`fused_rmsnorm_rotate_mq` + `fused_gate_up_hfq4g256`; MQ4G256 bytes
+//!     are HFQ4G256-compatible given a pre-rotated input). +1.0–1.2%.
+//!   * fused Q8 q+k projections in one launch (`fused_gate_up_q8_0`, shared
+//!     rmsnorm input). +1.1%.
 //!
 //! Full stack: 46.8 → 50.7 tok/s (+8.3%). The 70–75 tok/s target is NOT
 //! reachable via fusion/graph alone — it would require reading ~40% fewer
