@@ -27,7 +27,7 @@ use hipfire_dispatch::pipeline::sandwich::{
 use hipfire_dispatch::pipeline::{GemvInput, Step};
 use hipfire_dispatch::types::RotationPlan;
 use hipfire_runtime::llama::{KvCache, KvCacheExt, WeightTensor};
-use rdna_compute::GpuTensor;
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Attention geometry of one layer type.
 #[derive(Clone, Copy)]
@@ -435,19 +435,182 @@ impl<'a> LayerScratch<'a> {
             act: &s.ffn_hidden,
             mlp_out: &s.ffn_out,
             ple: None,
-            moe: moe.then_some(RoutedScratch {
-                input: &s.moe_pre2,
-                input_rot: &s.moe_pre2_rot,
-                router_in: &s.moe_router_in,
-                router_logits: &s.moe_router_logits,
-                topk_indices: &s.moe_topk_indices,
-                topk_weights: &s.moe_topk_weights,
-                gate: &s.moe_expert_gate_batch,
-                up: &s.moe_expert_up_batch,
-                act: &s.moe_expert_hidden_batch,
-                out: &s.moe_cur_moe,
-                dense_normed: &s.moe_cur_mlp,
-            }),
+            moe: moe.then(|| routed_scratch(s)),
+        }
+    }
+}
+
+/// Flash-attention partials for `rows` query rows over a Q8 cache of
+/// `max_seq` positions, sized for the larger attention geometry.
+pub(crate) fn q8_flash_partials_len(
+    gpu: &Gpu,
+    geo: &Geometry,
+    max_seq: usize,
+    rows: usize,
+) -> usize {
+    [geo.sliding, geo.full]
+        .into_iter()
+        .map(|a| {
+            let tile = rdna_compute::attention::q8_flash_tile_size(
+                &gpu.arch,
+                geo.n_heads,
+                a.n_kv_heads,
+                a.head_dim,
+                max_seq,
+            );
+            rows * geo.n_heads * max_seq.div_ceil(tile) * (2 + a.head_dim)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The lowered state's single-row routed-expert scratch; batched forwards
+/// route row by row through it.
+pub(crate) fn routed_scratch(s: &lowered::Gemma4Scratch) -> RoutedScratch<'_> {
+    RoutedScratch {
+        input: &s.moe_pre2,
+        input_rot: &s.moe_pre2_rot,
+        router_in: &s.moe_router_in,
+        router_logits: &s.moe_router_logits,
+        topk_indices: &s.moe_topk_indices,
+        topk_weights: &s.moe_topk_weights,
+        gate: &s.moe_expert_gate_batch,
+        up: &s.moe_expert_up_batch,
+        act: &s.moe_expert_hidden_batch,
+        out: &s.moe_cur_moe,
+        dense_normed: &s.moe_cur_mlp,
+    }
+}
+
+/// Owner of one batched forward's buffers; frees them on drop.
+pub(crate) struct RowBuffers {
+    gpu: *mut Gpu,
+    tensors: Vec<GpuTensor>,
+}
+
+impl RowBuffers {
+    pub fn new(gpu: &mut Gpu) -> Self {
+        Self {
+            gpu,
+            tensors: Vec::with_capacity(24),
+        }
+    }
+
+    /// An F32 `[n]` buffer owned until drop; the returned view aliases it.
+    pub fn alloc(&mut self, n: usize, label: &str) -> Result<GpuTensor, String> {
+        // SAFETY: a RowBuffers lives inside one forward call and the Gpu
+        // reference it was built from outlives it.
+        let gpu = unsafe { &mut *self.gpu };
+        let tensor = gpu
+            .alloc_tensor(&[n], DType::F32)
+            .map_err(|e| format!("gemma4 batch alloc {label}: {e:?}"))?;
+        let view = GpuTensor {
+            // SAFETY: the owning tensor stays in this ledger until every view
+            // has dropped and the ledger frees it exactly once.
+            buf: unsafe { tensor.buf.alias() },
+            shape: tensor.shape.clone(),
+            dtype: tensor.dtype,
+        };
+        self.tensors.push(tensor);
+        Ok(view)
+    }
+}
+
+impl Drop for RowBuffers {
+    fn drop(&mut self) {
+        // SAFETY: see new().
+        let gpu = unsafe { &mut *self.gpu };
+        for tensor in self.tensors.drain(..) {
+            gpu.free_tensor(tensor).ok();
+        }
+    }
+}
+
+/// Activations of one `rows`-row forward at positions
+/// `[start_pos, start_pos + rows)`.
+pub(crate) struct RowActivations {
+    pub x: GpuTensor,
+    residual: GpuTensor,
+    normed: GpuTensor,
+    /// FWHT scratch for attention projections (`o_proj` reads `max_q`).
+    pub attn_rot: GpuTensor,
+    mlp_rot: GpuTensor,
+    q: GpuTensor,
+    k: GpuTensor,
+    v: GpuTensor,
+    attn_out: GpuTensor,
+    gate: GpuTensor,
+    up: GpuTensor,
+    act: GpuTensor,
+    mlp_out: GpuTensor,
+    /// `[rows]` i32 absolute positions.
+    pub positions: GpuTensor,
+}
+
+/// Widest activation rows a layer program touches.
+#[derive(Clone, Copy)]
+pub(crate) struct RowWidths {
+    pub dim: usize,
+    pub max_q: usize,
+    pub max_kv: usize,
+    pub ffn: usize,
+}
+
+impl RowActivations {
+    pub fn new(
+        bufs: &mut RowBuffers,
+        gpu: &mut Gpu,
+        rows: usize,
+        start_pos: usize,
+        w: RowWidths,
+    ) -> Result<Self, String> {
+        let mut alloc = |n: usize, label: &str| bufs.alloc(rows * n, label);
+        let acts = Self {
+            x: alloc(w.dim, "x")?,
+            residual: alloc(w.dim, "residual")?,
+            normed: alloc(w.dim, "normed")?,
+            attn_rot: alloc(w.max_q.max(w.dim), "attn_rot")?,
+            mlp_rot: alloc(w.ffn.max(w.dim), "mlp_rot")?,
+            q: alloc(w.max_q, "q")?,
+            k: alloc(w.max_kv, "k")?,
+            v: alloc(w.max_kv, "v")?,
+            attn_out: alloc(w.max_q, "attn_out")?,
+            gate: alloc(w.ffn, "gate")?,
+            up: alloc(w.ffn, "up")?,
+            act: alloc(w.ffn, "act")?,
+            mlp_out: alloc(w.dim, "mlp_out")?,
+            positions: alloc(1, "positions")?,
+        };
+        let bytes: Vec<u8> = (start_pos..start_pos + rows)
+            .flat_map(|p| (p as i32).to_ne_bytes())
+            .collect();
+        gpu.hip
+            .memcpy_htod(&acts.positions.buf, &bytes)
+            .map_err(|e| format!("gemma4 batch htod positions: {e:?}"))?;
+        Ok(acts)
+    }
+
+    pub fn scratch<'a>(
+        &'a self,
+        ple: Option<PleScratch<'a>>,
+        moe: Option<RoutedScratch<'a>>,
+    ) -> LayerScratch<'a> {
+        LayerScratch {
+            x: &self.x,
+            residual: &self.residual,
+            normed: &self.normed,
+            attn_rot: &self.attn_rot,
+            mlp_rot: &self.mlp_rot,
+            q: &self.q,
+            k: &self.k,
+            v: &self.v,
+            attn_out: &self.attn_out,
+            gate: &self.gate,
+            up: &self.up,
+            act: &self.act,
+            mlp_out: &self.mlp_out,
+            ple,
+            moe,
         }
     }
 }

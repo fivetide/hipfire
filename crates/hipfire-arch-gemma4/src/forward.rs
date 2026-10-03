@@ -57,6 +57,7 @@ use crate::config::Gemma4Config;
 use crate::gemma4::{Gemma4State, Gemma4Weights, LayerWeights, GEMMA4_FORWARD_BATCH_MAX};
 use crate::program::{
     eager_layer_kv, head, Geometry, LayerRefs, LayerScratch, PleScratch, ProgramBinding, Resident,
+    RowActivations, RowBuffers, RowWidths,
 };
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::execute_steps;
@@ -439,8 +440,10 @@ fn prepare_per_layer_inputs_batched(
         && b > 1
         && ple.model_projection.gpu_dtype == DType::Q8_0
     {
+        let ctx = DispatchCtx::new(gpu);
         hipfire_dispatch::pipeline::sandwich::gemm_rows(
             gpu,
+            &ctx,
             &ple.model_projection.dispatch_ref(),
             x,
             projection_all,
@@ -608,48 +611,6 @@ pub fn supports_batched_prefill(weights: &Gemma4Weights) -> bool {
     })
 }
 
-struct BatchScratchLedger {
-    gpu: *mut Gpu,
-    tensors: Vec<GpuTensor>,
-}
-
-impl BatchScratchLedger {
-    fn new(gpu: &mut Gpu) -> Self {
-        Self {
-            gpu,
-            tensors: Vec::with_capacity(24),
-        }
-    }
-
-    fn alloc(&mut self, n: usize, label: &str) -> Result<GpuTensor, String> {
-        // SAFETY: the ledger is scoped inside forward_batch_spec and the Gpu
-        // reference outlives it. No access occurs after the function returns.
-        let gpu = unsafe { &mut *self.gpu };
-        let tensor = gpu
-            .alloc_tensor(&[n], DType::F32)
-            .map_err(|e| format!("gemma4 forward_batch alloc {label}: {e:?}"))?;
-        let view = GpuTensor {
-            // SAFETY: the owning tensor remains in this ledger until all views
-            // have dropped and the ledger frees it exactly once.
-            buf: unsafe { tensor.buf.alias() },
-            shape: tensor.shape.clone(),
-            dtype: tensor.dtype,
-        };
-        self.tensors.push(tensor);
-        Ok(view)
-    }
-}
-
-impl Drop for BatchScratchLedger {
-    fn drop(&mut self) {
-        // SAFETY: see new(); the ledger cannot outlive forward_batch_spec's Gpu.
-        let gpu = unsafe { &mut *self.gpu };
-        for tensor in self.tensors.drain(..) {
-            gpu.free_tensor(tensor).ok();
-        }
-    }
-}
-
 /// argmax over a logits row (spec-decode greedy per-position prediction).
 fn argmax_f32_row(v: &[f32]) -> u32 {
     let mut bi = 0u32;
@@ -741,61 +702,22 @@ pub fn forward_batch_spec(
     // seq_len after this batch = absolute positions [start_pos, start_pos+B).
     checked_batch_seq_len(start_pos, b, state.max_seq)?;
 
-    let mut scratch = BatchScratchLedger::new(gpu);
-    let mut alloc = |_g: &mut Gpu, n: usize, label: &str| scratch.alloc(n, label);
-
-    // ── Batched scratch (per call; verify is not the hot per-kernel loop). ──
-    let x = alloc(gpu, b * dim, "x")?;
-    let residual = alloc(gpu, b * dim, "residual")?;
-    let nrm = alloc(gpu, b * dim, "nrm")?; // rmsnorm output / shared proj input
-                                           // x_rot is the SHARED FWHT-rotate scratch for every projection in the layer
-                                           // (proj_gemm_batched rotates b*w.k floats into it). The largest w.k is the
-                                           // o_proj on FULL attention layers: k = n_heads*full_head_dim (= max_q here),
-                                           // which exceeds dim. Size for the max so the o_proj rotation can't OOB-write.
-    let x_rot = alloc(gpu, b * max_q.max(dim), "x_rot")?; // FWHT scratch (MQ4 proj path)
-    let q = alloc(gpu, b * max_q, "q")?;
-    let k = alloc(gpu, b * max_kv, "k")?;
-    let v = alloc(gpu, b * max_kv, "v")?;
-    let attn_out = alloc(gpu, b * max_q, "attn_out")?;
-    let gate_ffn = alloc(gpu, b * ffn_hd, "gate_ffn")?;
-    let up_ffn = alloc(gpu, b * ffn_hd, "up_ffn")?;
-    let ffn_hidden = alloc(gpu, b * ffn_hd, "ffn_hidden")?;
-    let ffn_out = alloc(gpu, b * dim, "ffn_out")?;
-    // FFN rotation scratch must hold B*ffn_hd for the down_proj input.
-    let ffn_rot = alloc(gpu, b * ffn_hd, "ffn_rot")?;
-    let ple_token_inputs = if ple_dim != 0 {
-        Some(alloc(gpu, b * ple_packed, "ple_token_inputs")?)
-    } else {
-        None
+    let mut bufs = RowBuffers::new(gpu);
+    let widths = RowWidths {
+        dim,
+        max_q,
+        max_kv,
+        ffn: ffn_hd,
     };
-    let ple_projection_all = if ple_dim != 0 {
-        Some(alloc(gpu, b * ple_packed, "ple_projection_all")?)
-    } else {
-        None
-    };
-    let ple_gate = if ple_dim != 0 {
-        Some(alloc(gpu, b * ple_dim, "ple_gate")?)
-    } else {
-        None
-    };
-    let ple_hidden = if ple_dim != 0 {
-        Some(alloc(gpu, b * ple_dim, "ple_hidden")?)
-    } else {
-        None
-    };
-    let ple_out = if ple_dim != 0 {
-        Some(alloc(gpu, b * dim, "ple_out")?)
-    } else {
-        None
-    };
-
-    // positions [B] i32 (kernels read this buffer as i32).
-    let pos_data: Vec<i32> = (0..b).map(|i| (start_pos + i) as i32).collect();
-    let pos_bytes: Vec<u8> = pos_data.iter().flat_map(|p| p.to_ne_bytes()).collect();
-    let pos_array = alloc(gpu, b, "pos_array")?;
-    gpu.hip
-        .memcpy_htod(&pos_array.buf, &pos_bytes)
-        .map_err(|e| format!("gemma4 forward_batch htod pos: {e:?}"))?;
+    let acts = RowActivations::new(&mut bufs, gpu, b, start_pos, widths)?;
+    let (x, x_rot) = (&acts.x, &acts.attn_rot);
+    let mut ple_buf =
+        |n: usize, label: &str| (ple_dim != 0).then(|| bufs.alloc(n, label)).transpose();
+    let ple_token_inputs = ple_buf(b * ple_packed, "ple_token_inputs")?;
+    let ple_projection_all = ple_buf(b * ple_packed, "ple_projection_all")?;
+    let ple_gate = ple_buf(b * ple_dim, "ple_gate")?;
+    let ple_hidden = ple_buf(b * ple_dim, "ple_hidden")?;
+    let ple_out = ple_buf(b * dim, "ple_out")?;
 
     let batched_embedding_requested = supports_gemma4_batched_prefill_arch(&gpu.arch)
         && gpu.flags.gemma4_batched_embedding_prefill
@@ -810,7 +732,7 @@ pub fn forward_batch_spec(
         let token_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(token_data.as_ptr() as *const u8, token_data.len() * 4)
         };
-        let token_ids = alloc(gpu, b, "token_ids")?;
+        let token_ids = bufs.alloc(b, "token_ids")?;
         gpu.hip
             .memcpy_htod(&token_ids.buf, token_bytes)
             .map_err(|e| format!("gemma4 forward_batch htod token ids: {e:?}"))?;
@@ -825,7 +747,7 @@ pub fn forward_batch_spec(
             gpu,
             weights.embd_format,
             &weights.embed_tokens,
-            &x,
+            x,
             token_ids,
             b,
             dim,
@@ -835,7 +757,7 @@ pub fn forward_batch_spec(
         false
     };
     if !batched_embedding {
-        let x_single = alloc(gpu, dim, "x_single")?;
+        let x_single = bufs.alloc(dim, "x_single")?;
         for (i, &tok) in tokens.iter().enumerate() {
             embed_lookup_row(cfg, weights, gpu, &x_single, tok)?;
             gpu.hip
@@ -844,7 +766,7 @@ pub fn forward_batch_spec(
         }
     }
     // √dim scale on the whole [B*dim] buffer (uniform — matches eager scale_f32).
-    gpu.scale_f32(&x, cfg.embed_scale)
+    gpu.scale_f32(x, cfg.embed_scale)
         .map_err(|e| format!("gemma4 forward_batch embed scale: {e:?}"))?;
     if ple_dim != 0 {
         prepare_per_layer_inputs_batched(
@@ -853,8 +775,8 @@ pub fn forward_batch_spec(
             gpu,
             tokens,
             token_ids.as_ref(),
-            &x,
-            &x_rot,
+            x,
+            x_rot,
             ple_token_inputs.as_ref().unwrap(),
             ple_projection_all.as_ref().unwrap(),
         )?;
@@ -880,24 +802,8 @@ pub fn forward_batch_spec(
         resident: eager_resident(state),
         rows: b,
         position: start_pos,
-        positions: Some(&pos_array),
-        scratch: LayerScratch {
-            x: &x,
-            residual: &residual,
-            normed: &nrm,
-            attn_rot: &x_rot,
-            mlp_rot: &ffn_rot,
-            q: &q,
-            k: &k,
-            v: &v,
-            attn_out: &attn_out,
-            gate: &gate_ffn,
-            up: &up_ffn,
-            act: &ffn_hidden,
-            mlp_out: &ffn_out,
-            ple,
-            moe: None,
-        },
+        positions: Some(&acts.positions),
+        scratch: acts.scratch(ple, None),
     };
     let mut steps = Vec::with_capacity(4 * cfg.n_layers);
     for (layer_idx, layer) in weights.layers.iter().enumerate() {
@@ -935,14 +841,14 @@ pub fn forward_batch_spec(
         let local_hidden = if want_hidden {
             None
         } else {
-            Some(alloc(gpu, b * dim, "spec_normed")?)
+            Some(bufs.alloc(b * dim, "spec_normed")?)
         };
         let normed_hidden: &GpuTensor = match per_token_hidden_out {
             Some(h) => h,
             None => local_hidden.as_ref().unwrap(),
         };
         // Batched final RMSNorm over all B rows.
-        gpu.rmsnorm_batched(&x, &weights.final_norm, normed_hidden, b, dim, eps)
+        gpu.rmsnorm_batched(x, &weights.final_norm, normed_hidden, b, dim, eps)
             .map_err(|e| format!("gemma4 forward_batch_spec final rmsnorm: {e:?}"))?;
 
         if let Some(out) = per_pos_argmax_out {
@@ -961,7 +867,7 @@ pub fn forward_batch_spec(
                 // Softcap is SKIPPED: it's a strictly-monotonic per-element map
                 // (tanh-scaled), so argmax(softcap(z)) == argmax(z). The accept
                 // decision is an argmax, so this is bit-exact in the decision.
-                let logits_b = alloc(gpu, b * vocab, "spec_logits_b")?;
+                let logits_b = bufs.alloc(b * vocab, "spec_logits_b")?;
                 let lm_result = if eagle_strict_enabled() {
                     gpu.gemm_q8_0_batched(
                         &weights.lm_head.buf,
@@ -984,7 +890,7 @@ pub fn forward_batch_spec(
                 lm_result
                     .map_err(|e| format!("gemma4 forward_batch_spec batched lm_head: {e:?}"))?;
                 // GPU per-row argmax over [B, vocab]; only B indices land on PCIe.
-                let idx_buf = alloc(gpu, b, "spec_argmax_idx")?;
+                let idx_buf = bufs.alloc(b, "spec_argmax_idx")?;
                 gpu.argmax_f32_batched(&logits_b, &idx_buf, vocab, b)
                     .map_err(|e| format!("gemma4 forward_batch_spec batched argmax: {e:?}"))?;
                 let mut idx_i32 = vec![0i32; b];
@@ -1026,7 +932,7 @@ pub fn forward_batch_spec(
 
     // ── Final RMSNorm + tied lm_head on the LAST row only (verify needs the
     //    last position's logits). ──
-    let x_last = alloc(gpu, dim, "x_last")?;
+    let x_last = bufs.alloc(dim, "x_last")?;
     gpu.hip
         .memcpy_dtod_at(&x_last.buf, 0, &x.buf, (b - 1) * dim * 4, dim * 4)
         .map_err(|e| format!("gemma4 forward_batch last copy: {e:?}"))?;
