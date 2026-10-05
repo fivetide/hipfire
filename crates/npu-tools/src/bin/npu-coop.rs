@@ -355,6 +355,9 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
     let mut insts_host = pd.insts.clone();
     let mut cmd = dev.cmd_bo()?;
     let ring_gpu = ring_sh.gpu();
+    // One in-order stream per slot: run j's A copy -> publish/poll -> C read stays ordered (and gates reuse of its
+    // slot arenas), while the other slots' copies overlap the NPU's GEMM of run j.
+    let streams = (0..r_slots).map(|_| rt.stream()).collect::<Result<Vec<_>, _>>()?;
     // Poll cap per publish kernel (>= ~1 us per uncached load): a stalled round's S kernels x (free wait + done poll)
     // stay within about half the timeout, so the CPU rescue still runs inside it.
     let max_iters = (cfg.timeout_ms * 1000 / (4 * s_runs as u64)).clamp(1000, u32::MAX as u64) as u32;
@@ -377,17 +380,18 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
         let npu_seq = ctx.submit(&mut cmd, &insts, &[a_sh.bo(), &b_bo, c_sh.bo(), ring_sh.bo()])?;
         for (j, p) in plans.iter().enumerate() {
             let seq = seq0 + j as u32;
+            let st = Some(&streams[p.slot]);
             if gemm {
                 let mut a = coop_gpu::copy_args(a_sh.gpu() + p.a_off, src_a.ptr() + (set_of(r, j) * a_bytes) as u64, (a_bytes / 16) as u64, (COPY_BLOCKS * coop_gpu::COPY_BLOCK) as u64);
-                rt.launch(&f_copy, COPY_BLOCKS, coop_gpu::COPY_BLOCK, &mut a)?;
+                rt.launch_on(st, &f_copy, COPY_BLOCKS, coop_gpu::COPY_BLOCK, &mut a)?;
             }
             let wait_free = seq as usize > r_slots;
             let mut a = coop_gpu::publish_args(ring_gpu + layout.slot_line(p.slot) as u64, ring_gpu + layout.done_line(p.slot) as u64,
                 stats.ptr() + (j * coop_gpu::PUBLISH_RECORD_BYTES) as u64, seq, if wait_free { seq - r_slots as u32 } else { 0 }, max_iters, wait_free);
-            rt.launch(&f_pub, 1, coop_gpu::LANE_BLOCK, &mut a)?;
+            rt.launch_on(st, &f_pub, 1, coop_gpu::LANE_BLOCK, &mut a)?;
             if gemm {
                 let mut a = coop_gpu::copy_args(readback.ptr() + (j * c_bytes) as u64, c_sh.gpu() + p.c_off, (c_bytes / 16) as u64, (COPY_BLOCKS * coop_gpu::COPY_BLOCK) as u64);
-                rt.launch(&f_copy, COPY_BLOCKS, coop_gpu::COPY_BLOCK, &mut a)?;
+                rt.launch_on(st, &f_copy, COPY_BLOCKS, coop_gpu::COPY_BLOCK, &mut a)?;
             }
         }
         rt.synchronize()?;
