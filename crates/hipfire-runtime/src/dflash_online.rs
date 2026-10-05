@@ -202,9 +202,9 @@ impl Ngrams {
         for q in self.upto.max(1)..known.len() {
             self.add(known, q);
         }
-        for q in self.upto..known.len() {
-            if known[q] != NONE {
-                self.occ.entry(known[q]).or_default().push(q);
+        for (q, &t) in known.iter().enumerate().skip(self.upto) {
+            if t != NONE {
+                self.occ.entry(t).or_default().push(q);
             }
         }
         self.upto = known.len().max(self.upto);
@@ -286,9 +286,10 @@ impl Learner {
         let g: [f32; K] = std::array::from_fn(|j| e[j] / sum - (j == y) as u32 as f32);
         let gs: f32 = (0..K).map(|j| g[j] * (vals[j] - vals[0])).sum();
         adagrad(&mut self.scale[b], &mut self.g_scale[b], gs, self.hp.lr);
-        for k in 0..NF {
+        let (w, gw) = (&mut self.w[b], &mut self.gw[b]);
+        for (k, (wk, gk_acc)) in w.iter_mut().zip(gw.iter_mut()).enumerate() {
             let gk: f32 = (0..K).map(|j| g[j] * f[j][k]).sum();
-            adagrad(&mut self.w[b][k], &mut self.gw[b][k], gk, self.hp.lr);
+            adagrad(wk, gk_acc, gk, self.hp.lr);
         }
     }
 }
@@ -656,7 +657,7 @@ impl OnlineDraftTuner {
             self.finalize(&c);
         }
         self.stats.observe_ns += t0.elapsed().as_nanos() as u64;
-        if self.stats.cycles % 64 == 0 {
+        if self.stats.cycles.is_multiple_of(64) {
             self.report("running");
         }
     }
