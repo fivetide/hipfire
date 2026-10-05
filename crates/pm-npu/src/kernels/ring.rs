@@ -235,7 +235,7 @@ impl PersistentDesign {
 pub fn persistent_v9(m: usize, n: usize, k: usize, ring: RingLayout, slots: &[SlotPlan], seq0: u32, neg: Option<Neg>)
     -> PersistentDesign
 {
-    build(gemm_array::design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast), true, false, false, ring, slots, seq0, neg)
+    build(gemm_array::design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast), Some(Bodies::Full), ring, slots, seq0, neg)
 }
 
 /// [`persistent_v9`] with the same arguments, operand offsets, patch inventory (exactly [`PatchKind::PollSeq`] and
@@ -248,7 +248,7 @@ pub fn persistent_v9(m: usize, n: usize, k: usize, ring: RingLayout, slots: &[Sl
 pub fn persistent_v9_lean(m: usize, n: usize, k: usize, ring: RingLayout, slots: &[SlotPlan], seq0: u32, neg: Option<Neg>)
     -> PersistentDesign
 {
-    build(gemm_array::design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast), true, true, false, ring, slots, seq0, neg)
+    build(gemm_array::design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast), Some(Bodies::Lean), ring, slots, seq0, neg)
 }
 
 /// Which body each run of a persistent V9 submission executes.
@@ -270,13 +270,12 @@ pub fn persistent_with(design: ArrayDesign, ring: RingLayout, slots: &[SlotPlan]
     -> PersistentDesign
 {
     assert_eq!(design.variant, gemm_array::Variant::V9, "the ring's spare BDs and lean repairs are V9's");
-    let (lean, lean_first) = match bodies { Bodies::Full => (false, false), Bodies::Lean => (true, false), Bodies::LeanFirst => (true, true) };
-    build(design, true, lean, lean_first, ring, slots, seq0, None)
+    build(design, Some(bodies), ring, slots, seq0, None)
 }
 
 /// Poll + DONE only (no GEMM, no body) on the `512x512x64` V9 image: measures the protocol.
 pub fn empty_persistent(ring: RingLayout, slots: &[SlotPlan], seq0: u32) -> PersistentDesign {
-    build(gemm_array::design_v9(512, 512, 64, V8_DEFAULT_EPILOGUE, Control::Fast), false, false, false, ring, slots, seq0, None)
+    build(gemm_array::design_v9(512, 512, 64, V8_DEFAULT_EPILOGUE, Control::Fast), None, ring, slots, seq0, None)
 }
 
 fn check_seq_range(seq0: u32, runs: usize) {
@@ -296,7 +295,8 @@ fn reset_release(txn: &mut Txn, loc: Location, direction: crate::dma::Direction,
     txn.mask_write(ctrl, 0, 2);
 }
 
-fn build(mut design: ArrayDesign, gemm: bool, lean: bool, lean_first: bool, ring: RingLayout, slots: &[SlotPlan], seq0: u32, neg: Option<Neg>)
+/// `body`: `None` = protocol only (no GEMM body).
+fn build(mut design: ArrayDesign, body: Option<Bodies>, ring: RingLayout, slots: &[SlotPlan], seq0: u32, neg: Option<Neg>)
     -> PersistentDesign
 {
     ring.check();
@@ -304,7 +304,7 @@ fn build(mut design: ArrayDesign, gemm: bool, lean: bool, lean_first: bool, ring
     check_seq_range(seq0, slots.len());
     if let Some(Neg::SkipDone(i)) = neg { assert!(i < slots.len(), "SkipDone({i}) but {} runs", slots.len()); }
     if let Some(Neg::SkipLeanRequeue(i)) = neg {
-        assert!(lean && i >= 1 && i < slots.len(),
+        assert!(body == Some(Bodies::Lean) && i >= 1 && i < slots.len(),
             "SkipLeanRequeue({i}) needs a lean run: persistent_v9_lean with 1 <= i < {} runs", slots.len());
     }
     for s in slots {
@@ -353,9 +353,9 @@ fn build(mut design: ArrayDesign, gemm: bool, lean: bool, lean_first: bool, ring
         txn.write32(shim_bd(SHIM_BD_P) + 4 * 7, drain_tail);
         txn.mask_poll(x_addr, SENTINEL, 0xFFFF_FFFF);
         // BODY.
-        if gemm {
+        if let Some(body) = body {
             let arena = [plan.a_off, plan.b_off, plan.c_off];
-            if lean && (i > 0 || lean_first) {
+            if body == Bodies::LeanFirst || (body == Bodies::Lean && i > 0) {
                 let forced: &[(u32, crate::dma::Direction, u32)] =
                     if matches!(neg, Some(Neg::SkipLeanRequeue(skip)) if skip == i) { &[] } else { &LEAN_FORCED };
                 design.append_lean_run_body(&mut txn, arena, forced)
@@ -490,13 +490,13 @@ mod tests {
         let r = RingLayout { nslots: 2 };
         let p = plans(3, 2);
         let full = empty_persistent(r, &p, 1);
-        let skip = build(gemm_array::design_v9(512, 512, 64, V8_DEFAULT_EPILOGUE, Control::Fast), false, false, r, &p, 1,
+        let skip = build(gemm_array::design_v9(512, 512, 64, V8_DEFAULT_EPILOGUE, Control::Fast), None, r, &p, 1,
             Some(Neg::SkipDone(1)));
         assert_eq!(skip.patch_sites.len(), 5);
         assert!(!skip.patch_sites.iter().any(|s| s.1 == PatchKind::DoneSeq(1)));
         assert!(skip.patch_sites.iter().any(|s| s.1 == PatchKind::PollSeq(1)));
         // SkipSeqPatch is host-only: the builder output is the normal one.
-        let host = build(gemm_array::design_v9(512, 512, 64, V8_DEFAULT_EPILOGUE, Control::Fast), false, false, r, &p, 1,
+        let host = build(gemm_array::design_v9(512, 512, 64, V8_DEFAULT_EPILOGUE, Control::Fast), None, r, &p, 1,
             Some(Neg::SkipSeqPatch));
         assert_eq!((host.insts.clone(), host.patch_sites.clone()), (full.insts.clone(), full.patch_sites.clone()));
     }
