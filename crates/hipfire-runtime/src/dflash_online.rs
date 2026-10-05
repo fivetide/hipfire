@@ -298,6 +298,30 @@ impl Learner {
     }
 }
 
+/// Host top-`K` per row of `rows × vocab` logits, in the top-K kernel's
+/// layout (`rows × K` ids and values) — for drafters whose logits are already
+/// on the host (generic DFlash).
+pub fn top_k_rows(logits: &[f32], vocab: usize, rows: usize) -> (Vec<u32>, Vec<f32>) {
+    let mut ids = Vec::with_capacity(rows * K);
+    let mut vals = Vec::with_capacity(rows * K);
+    for row in logits.chunks_exact(vocab).take(rows) {
+        // Descending (value, id) list; a candidate enters only if it beats the
+        // current K-th, so the scan is one compare per logit.
+        let mut top: Vec<(f32, u32)> = Vec::with_capacity(K + 1);
+        for (i, &x) in row.iter().enumerate() {
+            if top.len() == K && x <= top[K - 1].0 {
+                continue;
+            }
+            let at = top.partition_point(|&(v, _)| v >= x);
+            top.insert(at, (x, i as u32));
+            top.truncate(K);
+        }
+        ids.extend(top.iter().map(|t| t.1));
+        vals.extend(top.iter().map(|t| t.0));
+    }
+    (ids, vals)
+}
+
 pub struct OnlineDraftTuner {
     pub mode: Mode,
     /// Known emitted tokens by absolute position (`NONE` = unknown).
