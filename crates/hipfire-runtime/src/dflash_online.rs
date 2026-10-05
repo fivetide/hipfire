@@ -78,6 +78,12 @@ pub struct Hyper {
     /// Suffix-match length at which a continuation outside the draft top-K
     /// replaces the last candidate (0 = never inject).
     pub inject: f32,
+    /// Keep the learner's weights across requests. Only the structural
+    /// weights carry; session text statistics (n-grams, suffix history)
+    /// always reset, so no request's text leaks into another's proposals.
+    /// Short requests otherwise never leave the cold start (replay, first 32
+    /// cycles: x1.018 cold vs x1.058 carried).
+    pub carry: bool,
 }
 
 impl Default for Hyper {
@@ -87,6 +93,7 @@ impl Default for Hyper {
             acc0: 1.0,
             margin: 0.0,
             inject: 4.0,
+            carry: true,
         }
     }
 }
@@ -102,6 +109,7 @@ impl Hyper {
                 "acc0" => h.acc0 = v,
                 "margin" => h.margin = v,
                 "inject" => h.inject = v,
+                "carry" => h.carry = v != 0.0,
                 _ => return Err(format!("unknown hp `{k}`")),
             }
         }
@@ -382,7 +390,8 @@ impl OnlineDraftTuner {
         }
     }
 
-    /// New request: forget the session (no cross-request learning).
+    /// New request: forget the session text; the weights carry unless
+    /// `Hyper::carry` is off.
     pub fn reset(&mut self) {
         self.report("request end");
         self.dump_record(b'R', &[], &[]);
@@ -390,7 +399,9 @@ impl OnlineDraftTuner {
         self.ngrams = Ngrams::default();
         self.pending.clear();
         self.stats = Stats::default();
-        self.learner = Learner::new(self.learner.hp.clone());
+        if !self.learner.hp.carry {
+            self.learner = Learner::new(self.learner.hp.clone());
+        }
     }
 
     fn tok(&self, p: isize) -> u32 {
