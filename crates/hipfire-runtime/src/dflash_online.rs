@@ -42,7 +42,7 @@ const ORDERS: usize = 3;
 /// Dense features: rank one-hots (3), per order (MLE, seen), recency, depth·gap,
 /// suffix-match length, injected-candidate flag, equals chain token 1 / 2 back,
 /// equals the previous row's top-1 / the next row's top-1 / top-2.
-const NF: usize = 12 + 2 * ORDERS;
+const NF: usize = 15 + 2 * ORDERS;
 const RECENT: usize = 64;
 /// Longest suffix match considered, and occurrences of the nearest token scanned.
 const MAXM: usize = 32;
@@ -230,6 +230,20 @@ fn neighbors(ids: &[[u32; K]], r: usize) -> [u32; 3] {
 
 /// Row-depth buckets with separate weights: row 0, rows 1..=3, rows 4+.
 const BUCKETS: usize = 3;
+fn row_probs(ids: &[[u32; K]], vals: &[[f32; K]]) -> Vec<[(u32, f32); K]> {
+    ids.iter()
+        .zip(vals)
+        .map(|(i, v)| {
+            let e: [f32; K] = std::array::from_fn(|j| (v[j] - v[0]).exp());
+            let z: f32 = e.iter().sum();
+            std::array::from_fn(|j| (i[j], e[j] / z))
+        })
+        .collect()
+}
+fn nb_probs(p: &[[(u32, f32); K]], r: usize) -> [&[(u32, f32)]; 3] {
+    let get = |i: Option<usize>| i.and_then(|i| p.get(i)).map_or(&[][..], |x| &x[..]);
+    [get(r.checked_sub(1)), get(Some(r + 1)), get(Some(r + 2))]
+}
 fn bucket(row: usize) -> usize {
     match row {
         0 => 0,
@@ -508,6 +522,7 @@ impl OnlineDraftTuner {
         row: usize,
         injected: bool,
         nb: [u32; 3],
+        nbp: [&[(u32, f32)]; 3],
     ) -> [[f32; NF]; K] {
         let ng = &self.ngrams;
         let prev: &[u32; ORDERS] = ctx[..ORDERS].try_into().unwrap();
@@ -555,6 +570,9 @@ impl OnlineDraftTuner {
             for (i, &n) in nb.iter().enumerate() {
                 f[9 + 2 * ORDERS + i] = (v == n) as u32 as f32;
             }
+            for (i, row) in nbp.iter().enumerate() {
+                f[12 + 2 * ORDERS + i] = row.iter().find(|(t, _)| *t == v).map_or(0.0, |x| x.1);
+            }
             f
         })
     }
@@ -600,6 +618,7 @@ impl OnlineDraftTuner {
             let mut row_ids = cyc.ids[r];
             let row_vals = cyc.vals[r];
             let nb = neighbors(&cyc.ids, r);
+            let probs = row_probs(&cyc.ids, &cyc.vals);
             let mut injected = false;
             let pick = if self.mode == Mode::On {
                 // Proposal chain: the rows before this one are assumed accepted.
@@ -630,7 +649,7 @@ impl OnlineDraftTuner {
                         }
                     }
                 }
-                let f = self.features(start, &ctx, &row_ids, &row_vals, r, injected, nb);
+                let f = self.features(start, &ctx, &row_ids, &row_vals, r, injected, nb, nb_probs(&probs, r));
                 self.learner.pick(r, &row_vals, &f)
             } else {
                 0
@@ -707,6 +726,7 @@ impl OnlineDraftTuner {
                 r,
                 c.injected[r],
                 neighbors(&c.ids, r),
+                nb_probs(&row_probs(&c.ids, &c.vals), r),
             );
             self.learner.train(r, &c.vals[r], &f, y);
             if y != 0 {
