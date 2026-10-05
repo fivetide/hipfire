@@ -35,9 +35,13 @@ use std::collections::{HashMap, VecDeque};
 pub const K: usize = 16;
 /// n-gram context orders (bigram .. 4-gram).
 const ORDERS: usize = 3;
-/// Dense features: rank one-hots (3), per order (MLE, seen), recency, depth·gap.
-const NF: usize = 5 + 2 * ORDERS;
+/// Dense features: rank one-hots (3), per order (MLE, seen), recency, depth·gap,
+/// suffix-match length, injected-candidate flag.
+const NF: usize = 7 + 2 * ORDERS;
 const RECENT: usize = 64;
+/// Longest suffix match considered, and occurrences of the nearest token scanned.
+const MAXM: usize = 32;
+const MAX_OCC: usize = 64;
 const NONE: u32 = u32::MAX;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -70,6 +74,9 @@ pub struct Hyper {
     pub acc0: f32,
     /// Minimum score lead over the argmax candidate required to override it.
     pub margin: f32,
+    /// Suffix-match length at which a continuation outside the draft top-K
+    /// replaces the last candidate (0 = never inject).
+    pub inject: f32,
 }
 
 impl Default for Hyper {
@@ -78,6 +85,7 @@ impl Default for Hyper {
             lr: 0.2,
             acc0: 1.0,
             margin: 0.0,
+            inject: 4.0,
         }
     }
 }
@@ -92,6 +100,7 @@ impl Hyper {
                 "lr" => h.lr = v,
                 "acc0" => h.acc0 = v,
                 "margin" => h.margin = v,
+                "inject" => h.inject = v,
                 _ => return Err(format!("unknown hp `{k}`")),
             }
         }
@@ -114,6 +123,8 @@ struct Cycle {
     ranks: Vec<Option<u8>>,
     /// Candidate index the tuner proposed per row.
     picked: Vec<u8>,
+    /// Row had a suffix-match continuation injected as candidate `K-1`.
+    injected: Vec<bool>,
 }
 
 #[derive(Default)]
@@ -136,6 +147,8 @@ struct Ngrams {
     /// `[order-1]`: (context, next) and context counts, keyed by hash.
     next: [HashMap<u64, u32>; ORDERS],
     ctx: [HashMap<u64, u32>; ORDERS],
+    /// Positions of each token, ascending.
+    occ: HashMap<u32, Vec<usize>>,
     /// Positions `< upto` have their n-grams ending there counted.
     upto: usize,
 }
@@ -174,17 +187,33 @@ impl Ngrams {
         for q in self.upto.max(1)..known.len() {
             self.add(known, q);
         }
+        for q in self.upto..known.len() {
+            if known[q] != NONE {
+                self.occ.entry(known[q]).or_default().push(q);
+            }
+        }
         self.upto = known.len().max(self.upto);
     }
 }
 
-/// Dense re-ranker: `score_j = scale·(l_j − l_0) + w·f_j`, Adagrad.
+/// Row-depth buckets with separate weights: row 0, rows 1..=3, rows 4+.
+const BUCKETS: usize = 3;
+fn bucket(row: usize) -> usize {
+    match row {
+        0 => 0,
+        1..=3 => 1,
+        _ => 2,
+    }
+}
+
+/// Dense re-ranker: `score_j = scale·(l_j − l_0) + w·f_j`, Adagrad, one
+/// weight set per row-depth bucket.
 struct Learner {
     hp: Hyper,
-    scale: f32,
-    g_scale: f32,
-    w: [f32; NF],
-    gw: [f32; NF],
+    scale: [f32; BUCKETS],
+    g_scale: [f32; BUCKETS],
+    w: [[f32; NF]; BUCKETS],
+    gw: [[f32; NF]; BUCKETS],
 }
 
 fn adagrad(p: &mut f32, acc: &mut f32, g: f32, lr: f32) {
@@ -195,37 +224,38 @@ fn adagrad(p: &mut f32, acc: &mut f32, g: f32, lr: f32) {
 impl Learner {
     fn new(hp: Hyper) -> Self {
         Self {
-            scale: 1.0,
-            g_scale: hp.acc0,
-            w: [0.0; NF],
-            gw: [hp.acc0; NF],
+            scale: [1.0; BUCKETS],
+            g_scale: [hp.acc0; BUCKETS],
+            w: [[0.0; NF]; BUCKETS],
+            gw: [[hp.acc0; NF]; BUCKETS],
             hp,
         }
     }
 
-    fn scores(&self, vals: &[f32; K], f: &[[f32; NF]; K]) -> [f32; K] {
+    fn scores(&self, b: usize, vals: &[f32; K], f: &[[f32; NF]; K]) -> [f32; K] {
         std::array::from_fn(|j| {
-            self.scale * (vals[j] - vals[0]) + self.w.iter().zip(&f[j]).map(|(w, x)| w * x).sum::<f32>()
+            self.scale[b] * (vals[j] - vals[0]) + self.w[b].iter().zip(&f[j]).map(|(w, x)| w * x).sum::<f32>()
         })
     }
 
-    fn pick(&self, vals: &[f32; K], f: &[[f32; NF]; K]) -> usize {
-        let s = self.scores(vals, f);
+    fn pick(&self, row: usize, vals: &[f32; K], f: &[[f32; NF]; K]) -> usize {
+        let s = self.scores(bucket(row), vals, f);
         let best = (0..K).fold(0, |b, j| if s[j] > s[b] { j } else { b });
         if s[best] - s[0] > self.hp.margin { best } else { 0 }
     }
 
-    fn train(&mut self, vals: &[f32; K], f: &[[f32; NF]; K], y: usize) {
-        let s = self.scores(vals, f);
+    fn train(&mut self, row: usize, vals: &[f32; K], f: &[[f32; NF]; K], y: usize) {
+        let b = bucket(row);
+        let s = self.scores(b, vals, f);
         let m = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let e: [f32; K] = std::array::from_fn(|j| (s[j] - m).exp());
         let sum: f32 = e.iter().sum();
         let g: [f32; K] = std::array::from_fn(|j| e[j] / sum - (j == y) as u32 as f32);
         let gs: f32 = (0..K).map(|j| g[j] * (vals[j] - vals[0])).sum();
-        adagrad(&mut self.scale, &mut self.g_scale, gs, self.hp.lr);
+        adagrad(&mut self.scale[b], &mut self.g_scale[b], gs, self.hp.lr);
         for k in 0..NF {
             let gk: f32 = (0..K).map(|j| g[j] * f[j][k]).sum();
-            adagrad(&mut self.w[k], &mut self.gw[k], gk, self.hp.lr);
+            adagrad(&mut self.w[b][k], &mut self.gw[b][k], gk, self.hp.lr);
         }
     }
 }
@@ -358,21 +388,50 @@ impl OnlineDraftTuner {
         c
     }
 
+    /// Continuations of the context `ctx` (nearest token first) seen in the
+    /// stream as of `start`: `(next token, matched suffix length)`, longest
+    /// match per token, most recent occurrences first.
+    fn suffix_matches(&self, start: usize, ctx: &[u32]) -> Vec<(u32, usize)> {
+        let mut out: Vec<(u32, usize)> = Vec::new();
+        let Some(occ) = self.ngrams.occ.get(&ctx[0]).filter(|_| ctx[0] != NONE) else {
+            return out;
+        };
+        for &q in occ.iter().rev().filter(|&&q| q < start).take(MAX_OCC) {
+            let u = self.known[q + 1];
+            if u == NONE {
+                continue;
+            }
+            let mut l = 1;
+            while l < ctx.len() && l <= q && ctx[l] != NONE && self.known[q - l] == ctx[l] {
+                l += 1;
+            }
+            match out.iter_mut().find(|(t, _)| *t == u) {
+                Some(e) => e.1 = e.1.max(l),
+                None => out.push((u, l)),
+            }
+        }
+        out
+    }
+
     /// Dense features for the K candidates of a row predicting position
-    /// `start + 1 + row` given the preceding tokens `prev` (nearest first),
+    /// `start + 1 + row` given the preceding tokens `ctx` (nearest first),
     /// using the session statistics as of `start` (no peeking past the seed).
+    #[allow(clippy::too_many_arguments)]
     fn features(
         &self,
         start: usize,
-        prev: &[u32; ORDERS],
+        ctx: &[u32; MAXM],
         ids: &[u32; K],
         vals: &[f32; K],
         row: usize,
+        injected: bool,
     ) -> [[f32; NF]; K] {
         let ng = &self.ngrams;
+        let prev: &[u32; ORDERS] = ctx[..ORDERS].try_into().unwrap();
         let recent_lo = (start + 1).saturating_sub(RECENT);
         let recent_hi = (start + 1).min(self.known.len());
         let depth = row as f32 / K as f32;
+        let sfx = self.suffix_matches(start, ctx);
         std::array::from_fn(|j| {
             let v = ids[j];
             let mut f = [0f32; NF];
@@ -396,6 +455,10 @@ impl OnlineDraftTuner {
                 f[3 + 2 * ORDERS] = 1.0;
             }
             f[4 + 2 * ORDERS] = (vals[j] - vals[0]) * depth;
+            if let Some(&(_, l)) = sfx.iter().find(|(t, _)| *t == v) {
+                f[5 + 2 * ORDERS] = ((1 + l) as f32).ln() / ((1 + MAXM) as f32).ln();
+            }
+            f[6 + 2 * ORDERS] = (injected && j == K - 1) as u32 as f32;
             f
         })
     }
@@ -416,28 +479,43 @@ impl OnlineDraftTuner {
             vals: Vec::with_capacity(rows),
             ranks: vec![None; rows],
             picked: Vec::with_capacity(rows),
+            injected: Vec::with_capacity(rows),
         };
         let mut out: Vec<u32> = Vec::with_capacity(rows);
         for r in 0..rows {
             let mut order: [usize; K] = std::array::from_fn(|j| j);
             let v = &vals[r * K..(r + 1) * K];
             order.sort_by(|&a, &b| v[b].total_cmp(&v[a]).then(a.cmp(&b)));
-            let row_ids: [u32; K] = std::array::from_fn(|j| ids[r * K + order[j]]);
+            let mut row_ids: [u32; K] = std::array::from_fn(|j| ids[r * K + order[j]]);
             let row_vals: [f32; K] = std::array::from_fn(|j| v[order[j]]);
+            let mut injected = false;
             let pick = if self.mode == Mode::On {
                 // Proposal chain: the rows before this one are assumed accepted.
                 let p = (start + 1 + r) as isize;
-                let prev: [u32; ORDERS] = std::array::from_fn(|k| {
+                let ctx: [u32; MAXM] = std::array::from_fn(|k| {
                     let q = p - 1 - k as isize;
                     if q > start as isize { out[q as usize - start - 1] } else { self.tok(q) }
                 });
-                let f = self.features(start, &prev, &row_ids, &row_vals, r);
-                self.learner.pick(&row_vals, &f)
+                if self.learner.hp.inject > 0.0 {
+                    let best = self
+                        .suffix_matches(start, &ctx)
+                        .into_iter()
+                        .fold(None, |b: Option<(u32, usize)>, m| if b.is_none_or(|b| m.1 > b.1) { Some(m) } else { b });
+                    if let Some((u, l)) = best {
+                        if l as f32 >= self.learner.hp.inject && !row_ids.contains(&u) {
+                            row_ids[K - 1] = u;
+                            injected = true;
+                        }
+                    }
+                }
+                let f = self.features(start, &ctx, &row_ids, &row_vals, r, injected);
+                self.learner.pick(r, &row_vals, &f)
             } else {
                 0
             };
             out.push(row_ids[pick]);
             cyc.picked.push(pick as u8);
+            cyc.injected.push(injected);
             cyc.ids.push(row_ids);
             cyc.vals.push(row_vals);
         }
@@ -489,9 +567,9 @@ impl OnlineDraftTuner {
                 break;
             }
             let p = (c.start + 1 + r) as isize;
-            let prev: [u32; ORDERS] = std::array::from_fn(|k| self.tok(p - 1 - k as isize));
-            let f = self.features(c.start, &prev, &c.ids[r], &c.vals[r], r);
-            self.learner.train(&c.vals[r], &f, y);
+            let ctx: [u32; MAXM] = std::array::from_fn(|k| self.tok(p - 1 - k as isize));
+            let f = self.features(c.start, &ctx, &c.ids[r], &c.vals[r], r, c.injected[r]);
+            self.learner.train(r, &c.vals[r], &f, y);
             if y != 0 {
                 break;
             }
@@ -537,7 +615,7 @@ impl OnlineDraftTuner {
             .collect();
         let l = &self.learner;
         eprintln!(
-            "[dflash-online] {tag}: mode={:?} cycles={} tau={:.3} finalized={} picked_tau={:.3} overrides={}/{} oracle[{}] scale={:.3} w={:.2?}",
+            "[dflash-online] {tag}: mode={:?} cycles={} tau={:.3} finalized={} picked_tau={:.3} overrides={}/{} oracle[{}] scale={:.3?} w={:.2?}",
             self.mode,
             s.cycles,
             s.accepted as f64 / s.cycles as f64,
