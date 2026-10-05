@@ -51,8 +51,10 @@ fn main() {
                 }
                 b'L' => {
                     let (start, seed, rows, ids) = prop.take().expect("L record without P");
-                    let vals: Vec<f32> =
-                        u32s(&b, &mut o, ids.len()).into_iter().map(f32::from_bits).collect();
+                    let vals: Vec<f32> = u32s(&b, &mut o, ids.len())
+                        .into_iter()
+                        .map(f32::from_bits)
+                        .collect();
                     t.propose(start, seed, &ids, &vals, rows);
                 }
                 b'O' => {
@@ -70,5 +72,8 @@ fn main() {
         ratios.push(pick / base);
     }
     let geo = (ratios.iter().map(|r| r.ln()).sum::<f64>() / ratios.len().max(1) as f64).exp();
-    println!("GEOMEAN picked/argmax tau over {} sessions: {geo:.4} (hp: {hyper:?})", ratios.len());
+    println!(
+        "GEOMEAN picked/argmax tau over {} sessions: {geo:.4} (hp: {hyper:?})",
+        ratios.len()
+    );
 }

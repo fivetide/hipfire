@@ -161,8 +161,9 @@ struct Ngrams {
 
 /// Hash of the context `prev[..k]` (`prev[0]` = nearest token).
 fn ctx_hash(prev: &[u32]) -> u64 {
-    prev.iter()
-        .fold(0xcbf2_9ce4_8422_2325u64, |h, &t| (h ^ t as u64).wrapping_mul(0x0100_0000_01b3))
+    prev.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &t| {
+        (h ^ t as u64).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 fn next_hash(ctx: u64, v: u32) -> u64 {
     ctx.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ v as u64
@@ -208,7 +209,11 @@ impl Ngrams {
 fn neighbors(ids: &[[u32; K]], r: usize) -> [u32; 3] {
     let prev = r.checked_sub(1).map_or(NONE, |p| ids[p][0]);
     let next = ids.get(r + 1);
-    [prev, next.map_or(NONE, |n| n[0]), next.map_or(NONE, |n| n[1])]
+    [
+        prev,
+        next.map_or(NONE, |n| n[0]),
+        next.map_or(NONE, |n| n[1]),
+    ]
 }
 
 /// Row-depth buckets with separate weights: row 0, rows 1..=3, rows 4+.
@@ -249,14 +254,19 @@ impl Learner {
 
     fn scores(&self, b: usize, vals: &[f32; K], f: &[[f32; NF]; K]) -> [f32; K] {
         std::array::from_fn(|j| {
-            self.scale[b] * (vals[j] - vals[0]) + self.w[b].iter().zip(&f[j]).map(|(w, x)| w * x).sum::<f32>()
+            self.scale[b] * (vals[j] - vals[0])
+                + self.w[b].iter().zip(&f[j]).map(|(w, x)| w * x).sum::<f32>()
         })
     }
 
     fn pick(&self, row: usize, vals: &[f32; K], f: &[[f32; NF]; K]) -> usize {
         let s = self.scores(bucket(row), vals, f);
         let best = (0..K).fold(0, |b, j| if s[j] > s[b] { j } else { b });
-        if s[best] - s[0] > self.hp.margin { best } else { 0 }
+        if s[best] - s[0] > self.hp.margin {
+            best
+        } else {
+            0
+        }
     }
 
     fn train(&mut self, row: usize, vals: &[f32; K], f: &[[f32; NF]; K], y: usize) {
@@ -465,8 +475,16 @@ impl OnlineDraftTuner {
                     break;
                 }
                 let c = ctx_hash(&prev[..=k]);
-                let n = ng.next[k].get(&next_hash(c, v)).copied().unwrap_or(0).saturating_sub(late[k][0]);
-                let d = ng.ctx[k].get(&c).copied().unwrap_or(0).saturating_sub(late[k][1]);
+                let n = ng.next[k]
+                    .get(&next_hash(c, v))
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(late[k][0]);
+                let d = ng.ctx[k]
+                    .get(&c)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(late[k][1]);
                 if n > 0 {
                     f[3 + 2 * k] = n as f32 / d as f32;
                     f[4 + 2 * k] = 1.0;
@@ -491,9 +509,20 @@ impl OnlineDraftTuner {
 
     /// Choose the proposal for each row from its top-K.
     /// `ids`/`vals` are `rows × K` row-major as produced by the top-K kernel.
-    pub fn propose(&mut self, start: usize, seed: u32, ids: &[u32], vals: &[f32], rows: usize) -> Vec<u32> {
+    pub fn propose(
+        &mut self,
+        start: usize,
+        seed: u32,
+        ids: &[u32],
+        vals: &[f32],
+        rows: usize,
+    ) -> Vec<u32> {
         self.dump_record(b'P', &[start as u64, seed as u64, rows as u64], ids);
-        self.dump_record(b'L', &[], &vals.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+        self.dump_record(
+            b'L',
+            &[],
+            &vals.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        );
         if self.known.len() <= start {
             self.known.resize(start + 1, NONE);
         }
@@ -525,13 +554,23 @@ impl OnlineDraftTuner {
                 let p = (start + 1 + r) as isize;
                 let ctx: [u32; MAXM] = std::array::from_fn(|k| {
                     let q = p - 1 - k as isize;
-                    if q > start as isize { out[q as usize - start - 1] } else { self.tok(q) }
+                    if q > start as isize {
+                        out[q as usize - start - 1]
+                    } else {
+                        self.tok(q)
+                    }
                 });
                 if self.learner.hp.inject > 0.0 {
-                    let best = self
-                        .suffix_matches(start, &ctx)
-                        .into_iter()
-                        .fold(None, |b: Option<(u32, usize)>, m| if b.is_none_or(|b| m.1 > b.1) { Some(m) } else { b });
+                    let best = self.suffix_matches(start, &ctx).into_iter().fold(
+                        None,
+                        |b: Option<(u32, usize)>, m| {
+                            if b.is_none_or(|b| m.1 > b.1) {
+                                Some(m)
+                            } else {
+                                b
+                            }
+                        },
+                    );
                     if let Some((u, l)) = best {
                         if l as f32 >= self.learner.hp.inject && !row_ids.contains(&u) {
                             row_ids[K - 1] = u;
@@ -557,7 +596,15 @@ impl OnlineDraftTuner {
     /// plus the bonus) and train on every pending row they label.
     pub fn observe(&mut self, start: usize, committed_after_seed: &[u32], accepted: usize) {
         let t0 = std::time::Instant::now();
-        self.dump_record(b'O', &[start as u64, accepted as u64, committed_after_seed.len() as u64], committed_after_seed);
+        self.dump_record(
+            b'O',
+            &[
+                start as u64,
+                accepted as u64,
+                committed_after_seed.len() as u64,
+            ],
+            committed_after_seed,
+        );
         self.stats.cycles += 1;
         self.stats.accepted += accepted as u64;
         // A rewind invalidates everything past the seed.
@@ -600,7 +647,15 @@ impl OnlineDraftTuner {
             }
             let p = (c.start + 1 + r) as isize;
             let ctx: [u32; MAXM] = std::array::from_fn(|k| self.tok(p - 1 - k as isize));
-            let f = self.features(c.start, &ctx, &c.ids[r], &c.vals[r], r, c.injected[r], neighbors(&c.ids, r));
+            let f = self.features(
+                c.start,
+                &ctx,
+                &c.ids[r],
+                &c.vals[r],
+                r,
+                c.injected[r],
+                neighbors(&c.ids, r),
+            );
             self.learner.train(r, &c.vals[r], &f, y);
             if y != 0 {
                 break;
@@ -630,7 +685,11 @@ impl OnlineDraftTuner {
     pub fn summary(&self) -> (u64, f64, f64) {
         let s = &self.stats;
         let f = s.finalized.max(1) as f64;
-        (s.finalized, s.oracle[0] as f64 / f, s.picked_prefix as f64 / f)
+        (
+            s.finalized,
+            s.oracle[0] as f64 / f,
+            s.picked_prefix as f64 / f,
+        )
     }
 
     pub fn report(&self, tag: &str) {
