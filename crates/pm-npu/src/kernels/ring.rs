@@ -243,7 +243,7 @@ pub fn persistent_v9(m: usize, n: usize, k: usize, ring: RingLayout, slots: &[Sl
 /// `1..` use the lean body ([`ArrayDesign::append_lean_run_body`]) with the memtile channels that the POLL / DONE tasks
 /// clobber (column 0 S2MM4 and MM2S0) forced through reset + requeue (module documentation, "Lean bodies").
 /// Every submission built by this function starts with a full body, so it is valid for the first submit after the PDI
-/// and for any submit after a completed submit of the same design; [`persistent_v9_lean_rearm`] is the lean-first form.
+/// and for any submit after a completed submit of the same design; [`persistent_with`] builds the lean-first form.
 /// `Neg::SkipLeanRequeue(i)` (1 <= i < runs) omits only the forced repairs of lean run `i`.
 pub fn persistent_v9_lean(m: usize, n: usize, k: usize, ring: RingLayout, slots: &[SlotPlan], seq0: u32, neg: Option<Neg>)
     -> PersistentDesign
@@ -251,14 +251,27 @@ pub fn persistent_v9_lean(m: usize, n: usize, k: usize, ring: RingLayout, slots:
     build(gemm_array::design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast), true, true, false, ring, slots, seq0, neg)
 }
 
-/// [`persistent_v9_lean`] with run 0 lean too (no full body at all): the re-arm form, valid ONLY directly after a
-/// completed [`persistent_v9_lean`] / [`persistent_v9_lean_rearm`] submission of the same shape on the same hardware
-/// context (the array is still configured and every channel is where a completed lean run leaves it). Saves one full
-/// re-initialisation of the array per re-armed submission. Same patch inventory as [`persistent_v9_lean`].
-pub fn persistent_v9_lean_rearm(m: usize, n: usize, k: usize, ring: RingLayout, slots: &[SlotPlan], seq0: u32)
+/// Which body each run of a persistent V9 submission executes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bodies {
+    /// Every run the full body ([`persistent_v9`]).
+    Full,
+    /// Run 0 full, runs `1..` lean ([`persistent_v9_lean`]).
+    Lean,
+    /// Every run lean, run 0 too: the re-arm form, valid ONLY directly after a completed lean submission of the same
+    /// design on the same hardware context (the array is still configured and every channel is where a completed lean
+    /// run leaves it). Saves one full re-initialisation of the array per re-armed submission.
+    LeanFirst,
+}
+
+/// Persistent ring of an explicit V9 `design` (e.g. [`ArrayDesign::with_a_repeat`]); same patch inventory and ring
+/// protocol as [`persistent_v9`].
+pub fn persistent_with(design: ArrayDesign, ring: RingLayout, slots: &[SlotPlan], seq0: u32, bodies: Bodies)
     -> PersistentDesign
 {
-    build(gemm_array::design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast), true, true, true, ring, slots, seq0, None)
+    assert_eq!(design.variant, gemm_array::Variant::V9, "the ring's spare BDs and lean repairs are V9's");
+    let (lean, lean_first) = match bodies { Bodies::Full => (false, false), Bodies::Lean => (true, false), Bodies::LeanFirst => (true, true) };
+    build(design, true, lean, lean_first, ring, slots, seq0, None)
 }
 
 /// Poll + DONE only (no GEMM, no body) on the `512x512x64` V9 image: measures the protocol.

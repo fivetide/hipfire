@@ -20,9 +20,10 @@
 //! NPU mapping) must pass. B (weights) is an NPU shmem BO; GPU-only buffers (A sources, C readback, publish records)
 //! are `hipMalloc` device memory.
 //!
-//! NPU: ONE persistent command of `S` runs (`persistent_v9_lean`, run 0 full, runs 1.. lean; rounds after the first
-//! submit `persistent_v9_lean_rearm`, every run lean; `--mode empty`: `empty_persistent`, poll + done only), run `j` on
-//! slot `j % R` with fixed slot arenas; seq of (round r, run j) is `1 + r*S + j`; rounds re-arm with `patch_seq`
+//! NPU: ONE persistent command of `S` runs of the A-repeat V9 (`ArrayDesign::with_a_repeat`: the A arena holds each
+//! run's A once, the shim replays it per N-wave) (`persistent_with`, `Bodies::Lean`: run 0 full, runs 1.. lean; rounds
+//! after the first `Bodies::LeanFirst`, every run lean; `--mode empty`: `empty_persistent`, poll + done only), run `j`
+//! on slot `j % R` with fixed slot arenas; seq of (round r, run j) is `1 + r*S + j`; rounds re-arm with `patch_seq`
 //! (needs `S % R == 0`).
 //!
 //! GPU work per run j, all enqueued before the round's wait on two in-order streams (`coop_publish` doubles as a wait,
@@ -60,7 +61,7 @@ use npu_tools::coop_gpu::{self, PublishRecord};
 use railgun::npu::hip_runtime::{HipFunction, HipMemoryKind, HipRuntime, HostRegistration};
 use pm_npu::kernels::gemm_array::{apply_epilogue, design_v9, ArrayDesign, V8_DEFAULT_EPILOGUE};
 use pm_npu::kernels::gemm_core::Control;
-use pm_npu::kernels::ring::{empty_persistent, patch_seq, persistent_v9_lean, persistent_v9_lean_rearm, RingLayout, SlotPlan, DONE_MAGIC};
+use pm_npu::kernels::ring::{empty_persistent, patch_seq, persistent_with, Bodies, RingLayout, SlotPlan, DONE_MAGIC};
 use railgun::npu::{clflush, Bo, Device, HwCtx, ERT_STATE_COMPLETED};
 use std::time::{Duration, Instant};
 
@@ -281,7 +282,10 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
     let (m, n, k) = if gemm { (cfg.m, cfg.n, cfg.k) } else { (512, 512, 64) };
     let (s_runs, r_slots) = (cfg.slots, cfg.nslots);
     let layout = RingLayout { nslots: r_slots };
-    let d = design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast);
+    // The GPU writes each run's A once: the A-repeat V9 replays it per N-wave from the shim (gemm_array
+    // `with_a_repeat`), instead of the default packing that replicates A NW times in the shared arena.
+    let v9 = || design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast).with_a_repeat();
+    let d = v9();
     let (a_bytes, c_bytes) = (d.args[0].bytes, d.args[2].bytes);
     let a_stride = a_bytes.div_ceil(4096) * 4096;
     let c_stride = c_bytes.div_ceil(4096) * 4096;
@@ -289,7 +293,7 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
         let s = j % r_slots;
         if gemm { SlotPlan { slot: s, a_off: (s * a_stride) as u64, b_off: 0, c_off: (s * c_stride) as u64 } } else { SlotPlan { slot: s, a_off: 0, b_off: 0, c_off: 0 } }
     }).collect();
-    let pd = if gemm { persistent_v9_lean(m, n, k, layout, &plans, 1, None) } else { empty_persistent(layout, &plans, 1) };
+    let pd = if gemm { persistent_with(v9(), layout, &plans, 1, Bodies::Lean) } else { empty_persistent(layout, &plans, 1) };
     if pd.patch_sites.len() != 2 * s_runs { return Err(format!("{} patch sites, expected {}", pd.patch_sites.len(), 2 * s_runs)); }
     if gemm && pd.pdi != d.pdi { return Err("persistent PDI != design_v9 PDI".into()); }
     let set_of = |r: usize, j: usize| ((r * s_runs + j) / r_slots) % SETS;
@@ -359,7 +363,7 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
     let mut insts = dev.dev_bo(&pd.insts)?;
     let mut insts_host = pd.insts.clone();
     // Rounds after the first (gemm): lean-first stream, the array is still configured by the previous round.
-    let rearm = gemm.then(|| persistent_v9_lean_rearm(m, n, k, layout, &plans, 1));
+    let rearm = gemm.then(|| persistent_with(v9(), layout, &plans, 1, Bodies::LeanFirst));
     let mut insts_rearm = match &rearm { Some(p) => Some((dev.dev_bo(&p.insts)?, p.insts.clone())), None => None };
     let mut cmd = dev.cmd_bo()?;
     let ring_gpu = ring_sh.gpu();

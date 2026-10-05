@@ -330,7 +330,7 @@ fn lean_rounds(m:usize,n:usize,k:usize,gold:&[Golden],nslots:usize,s:usize,round
         if round>0 {
             let (fl,ff)=(rig_shape(m,n,k,nslots,s,base,seq0,None,true),rig_shape(m,n,k,nslots,s,base,seq0,None,false));
             if rearm {
-                let fr=persistent_v9_lean_rearm(m,n,k,l0.layout,&fl.plans,seq0);
+                let fr=persistent_with(gemm_array::design_v9(m,n,k,gemm_array::V8_DEFAULT_EPILOGUE,Control::Fast),l0.layout,&fl.plans,seq0,Bodies::LeanFirst);
                 assert_bytes(&fr.pdi,&l0.d.pdi,&format!("{what}: rearm ring loads the same PDI"));
                 assert_eq!(declared_words(&fr,s).len(),dl.len());
                 if round>1 {patch_seq(&mut lean_insts,&fr.patch_sites,seq0);assert_bytes(&lean_insts,&fr.insts,&format!("{what}: patched rearm stream != from-scratch rearm build"));}
@@ -372,6 +372,47 @@ fn lean_ring_matrix(m:usize,n:usize,k:usize) {
 #[test] fn lean_ring_512x512x128() {lean_ring_matrix(512,512,128)}
 #[test] fn lean_ring_1024x512x128() {lean_ring_matrix(1024,512,128)}
 #[test] fn lean_ring_512x512x64_all_odd_parity() {lean_ring_matrix(512,512,64)}
+
+/// `ArrayDesign::with_a_repeat` ring (host A = each `mw` tile once, the shim task replays it `NW` times): round 0
+/// lean (full run 0), later rounds lean-first, against the A-repeat full-body ring under the same schedule. Every run is
+/// CPU + eager exact, the eager C equals the default (replicated-A) V9's, and the lean ring's arguments and retained
+/// array state equal the full-body ring's after every round.
+fn a_repeat_rounds(m:usize,n:usize,k:usize) {
+    let (nslots,s,rounds)=(2,2,3);
+    let layout=RingLayout {nslots};
+    let v9=|arep:bool| {let d=gemm_array::design_v9(m,n,k,INT8,Control::Fast);if arep {d.with_a_repeat()} else {d}};
+    let rig_of=|base:usize,seq0:u32,bodies:Bodies|->Rig {
+        let eager=v9(true);let (a,b,c)=(eager.args[0].bytes,eager.args[1].bytes,eager.args[2].bytes);
+        let plans=plans(base,s,nslots,a,b,c);
+        let d=persistent_with(v9(true),layout,&plans,seq0,bodies);
+        Rig {m,n,k,layout,eager,d,plans,cb:c,used:nslots}
+    };
+    let plain=v9(false);
+    let (l0,f0)=(rig_of(0,1,Bodies::Lean),rig_of(0,1,Bodies::Full));
+    assert_eq!(l0.d.pdi,plain.pdi,"A repeat keeps the PDI");
+    assert_eq!(l0.eager.args[0].bytes*n.div_ceil(512),plain.args[0].bytes,"A repeat holds 1/NW of the replicated A");
+    let gold=goldens(&l0,s*rounds);
+    for (g,i) in gold.iter().zip(0..) {
+        let (a,b)=matrices(m,n,k,0xc001d00d+i as u32*7919);let [ap,bp]=plain.pack_in(&a,&b);
+        let mut args=vec![ap,bp,vec![POISON;plain.args[2].bytes]];
+        Config::from_pdi(&plain.pdi).unwrap().submit(&plain.insts,&mut args).unwrap();
+        assert_bytes(&g.eager_c,&args[2],"A-repeat eager C != default V9 eager C");
+    }
+    let (mut args_l,mut args_f)=(fresh_args(&l0),fresh_args(&f0));
+    let (mut sim_l,mut sim_f)=(Config::from_pdi(&l0.d.pdi).unwrap(),Config::from_pdi(&f0.d.pdi).unwrap());
+    for round in 0..rounds {
+        let (base,seq0)=(round*s,1+(round*s) as u32);
+        let (rl,rf)=(rig_of(base,seq0,if round==0 {Bodies::Lean} else {Bodies::LeanFirst}),rig_of(base,seq0,Bodies::Full));
+        let mut p=Producer::new(&rl,&gold,base,s,0,vec![],&args_l);run(&mut sim_l,&rl.d.insts,&mut args_l,&mut p);p.finish(&args_l);
+        let mut pf=Producer::new(&rf,&gold,base,s,0,vec![],&args_f);run(&mut sim_f,&rf.d.insts,&mut args_f,&mut pf);pf.finish(&args_f);
+        for (r,args) in [(&rl,&args_l),(&rf,&args_f)] {check_outputs(r,&gold,args,base+s);check_done_lines(r.layout,args,base+s,&[]);}
+        for a in 0..4 {assert_bytes(&args_l[a],&args_f[a],&format!("{m}x{n}x{k} round {round}: lean arg{a} != full arg{a}"));}
+        assert!(sim_l.state_snapshot()==sim_f.state_snapshot(),"{m}x{n}x{k} round {round}: A-repeat lean ring state != full ring");
+        eprintln!("PASS A-repeat ring {m}x{n}x{k} round {round}: exact, state == full ring; A {} B vs {} B",l0.eager.args[0].bytes,plain.args[0].bytes);
+    }
+}
+#[test] fn a_repeat_ring_512x1280x128() {a_repeat_rounds(512,1280,128)}
+#[test] fn a_repeat_ring_1024x1280x64_two_m_waves() {a_repeat_rounds(1024,1280,64)}
 
 /// What a run of a (possibly broken) lean ring did wrong, judged against the CPU/eager goldens and the full-body ring state.
 #[derive(Debug)] #[allow(dead_code)]
