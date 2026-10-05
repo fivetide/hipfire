@@ -2020,6 +2020,11 @@ impl ArrayDesign {
         emit_dynamic_body(txn, &self.geo, self.variant.per_column_sync(), arena_base);
     }
 
+    /// Memtile BD `id` is used by this design's descriptors in some column.
+    pub(crate) fn uses_memtile_bd(&self, id: u32) -> bool {
+        (0..self.geo.topo.cols as u32).any(|col| memtile_descriptors(self.geo.topo, col).iter().any(|&(b, _)| b == id))
+    }
+
     /// V9 only: host A holds each `mw` tile once (`1/NW` of the default packing, which replicates A for every N-wave)
     /// and the shim A task replays it `NW` times. The NPU receives the identical A stream, so C, the PDI and every
     /// memtile / core descriptor are unchanged; `args[0]`, [`ArrayDesign::pack_in`] and the shim tasks change.

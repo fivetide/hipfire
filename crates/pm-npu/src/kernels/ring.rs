@@ -264,12 +264,13 @@ pub enum Bodies {
     LeanFirst,
 }
 
-/// Persistent ring of an explicit V9 `design` (e.g. [`ArrayDesign::with_a_repeat`]); same patch inventory and ring
+/// Persistent ring of an explicit V9 or G80 `design` (e.g. [`ArrayDesign::with_a_repeat`]); same patch inventory and ring
 /// protocol as [`persistent_v9`].
 pub fn persistent_with(design: ArrayDesign, ring: RingLayout, slots: &[SlotPlan], seq0: u32, bodies: Bodies)
     -> PersistentDesign
 {
-    assert_eq!(design.variant, gemm_array::Variant::V9, "the ring's spare BDs and lean repairs are V9's");
+    assert!(matches!(design.variant, gemm_array::Variant::V9 | gemm_array::Variant::G80),
+        "the ring is derived for the V9 / G80 pair designs, not {}", design.variant);
     build(design, Some(bodies), ring, slots, seq0, None)
 }
 
@@ -314,6 +315,7 @@ fn build(mut design: ArrayDesign, body: Option<Bodies>, ring: RingLayout, slots:
     let spare = gemm_array::v9_spare_memtile_bds(false);
     assert!(spare.len() >= 2, "no spare even-bank memtile BDs: {spare:?}");
     let (q_bd, dq_bd) = (spare[0], spare[1]);
+    assert!(!design.uses_memtile_bd(q_bd) && !design.uses_memtile_bd(dq_bd), "ring spare memtile BDs {q_bd}/{dq_bd} collide with {}", design.variant);
     assert!(q_bd < 24 && dq_bd < 24);
 
     let (shim, mem) = (Location::new(0, 0), Location::new(0, 1));
