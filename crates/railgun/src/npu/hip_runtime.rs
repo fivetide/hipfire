@@ -785,9 +785,17 @@ impl HipRuntime {
 
     /// `hipEventRecord` on the null stream.
     pub fn record(&self, event: &HipEvent) -> Result<(), String> {
+        self.record_on(event, None)
+    }
+
+    /// `hipEventRecord` on `stream` (`None`: the null stream).
+    pub fn record_on(&self, event: &HipEvent, stream: Option<&HipStream>) -> Result<(), String> {
         self.owns(&event.shared, "record event")?;
+        if let Some(st) = stream { self.owns(&st.shared, "record stream")?; }
         let s = &*self.shared;
-        s.check("hipEventRecord", "hipEventRecord", unsafe { (s.gpu.event_record)(event.handle, core::ptr::null_mut()) })
+        s.check("hipEventRecord", "hipEventRecord", unsafe {
+            (s.gpu.event_record)(event.handle, stream.map_or(core::ptr::null_mut(), |st| st.handle))
+        })
     }
 
     /// `hipEventSynchronize(end)` then `hipEventElapsedTime(start, end)` in milliseconds.
