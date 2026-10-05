@@ -1534,12 +1534,13 @@ pub(crate) fn build_cdo(topo: Topo, programs: [&[u8]; 2], start: bool) -> Cdo {
 }
 
 /// Shim BDs (DDR-patched), token controller id and finite shim tasks for every shim of the topology.
-fn emit_shim(txn: &mut Txn, geo: &Geometry) { emit_shim_at(txn, geo, [0; 3], true) }
+fn emit_shim(txn: &mut Txn, geo: &Geometry) { emit_shim_at(txn, geo, [0; 3], true, false) }
 
 /// [`emit_shim`] with every DDR patch advanced by `base[arg]` bytes (the arena offset of that run in args 0..=2).
 /// `!bd_words`: the shim BD words and S2MM controller ids written by an earlier body of the SAME design are still in
 /// place, so only the DDR patches and tasks are emitted (the patch rewrites the one address word that differs).
-fn emit_shim_at(txn: &mut Txn, geo: &Geometry, base: [u64; 3], bd_words: bool) {
+/// `skip_b`: no B stream at all (B resident in the memtile, G80 B-resident lean body).
+fn emit_shim_at(txn: &mut Txn, geo: &Geometry, base: [u64; 3], bd_words: bool, skip_b: bool) {
     let topo = geo.topo;
     let kc = geo.kc;
     for col in 0..topo.cols {
@@ -1579,6 +1580,7 @@ fn emit_shim_at(txn: &mut Txn, geo: &Geometry, base: [u64; 3], bd_words: bool) {
             if topo.has_a(col as u32) { s.push((2, 0, a_off, geo.waves * kc * A_BYTES / 4, Mm2s, 1, false)); }
             s
         };
+        let streams: Vec<_> = streams.into_iter().filter(|s| !(skip_b && s.1 == 1)).collect();
         for &(id, arg, offset, words, ..) in &streams {
             if bd_words { Bd::new(0, words as u32).emit_txn(shim, id, txn); }
             txn.ddr_patch(Bd::address(shim, id) + 4, arg, offset as u64 + base[arg as usize]);
@@ -1665,7 +1667,7 @@ fn emit_dynamic_body(txn: &mut Txn, geo: &Geometry, per_column_sync: bool, base:
             if tile.kind() == TileType::Compute { task.enable_txn(tile, txn); }
         }
     }
-    emit_shim_at(txn, geo, base, true);
+    emit_shim_at(txn, geo, base, true, false);
     // 6. cores last, then wait for the C token(s).
     for &tile in &cores { txn.mask_write(tile.address(regs::core::CORE_CONTROL), 1, 1); }
     emit_sync(txn, topo, per_column_sync);

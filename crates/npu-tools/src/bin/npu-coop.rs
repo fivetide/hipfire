@@ -289,6 +289,8 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
     // NPU design: G80 (128x80 core, N = 1280 exactly, K <= 2560; the faster exact gate_up design) where the shape fits,
     // else the A-repeat V9: the GPU writes each run's A once and the shim replays it per N-wave (gemm_array
     // `with_a_repeat`), instead of the default packing that replicates A NW times in the shared arena.
+    // Every run multiplies the same B (shared weights, as in chunked prefill through one layer): on G80 the lean runs
+    // keep it resident in the memtile instead of refilling it from DDR (ring `b_shared`).
     let g80 = n == 1280 && k % 64 == 0 && k <= 2560;
     let v9 = || if g80 { design_g80(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast) }
         else { design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast).with_a_repeat() };
@@ -300,7 +302,7 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
         let s = j % r_slots;
         if gemm { SlotPlan { slot: s, a_off: (s * a_stride) as u64, b_off: 0, c_off: (s * c_stride) as u64 } } else { SlotPlan { slot: s, a_off: 0, b_off: 0, c_off: 0 } }
     }).collect();
-    let pd = if gemm { persistent_with(v9(), layout, &plans, 1, Bodies::Lean) } else { empty_persistent(layout, &plans, 1) };
+    let pd = if gemm { persistent_with(v9(), layout, &plans, 1, Bodies::Lean, g80) } else { empty_persistent(layout, &plans, 1) };
     if pd.patch_sites.len() != 2 * s_runs { return Err(format!("{} patch sites, expected {}", pd.patch_sites.len(), 2 * s_runs)); }
     if gemm && pd.pdi != d.pdi { return Err("persistent PDI != eager design PDI".into()); }
     let set_of = |r: usize, j: usize| ((r * s_runs + j) / r_slots) % SETS;
@@ -372,7 +374,7 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
     let insts = dev.dev_bo(&pd.insts)?;
     // Rounds after the first: gemm the lean-first stream (the array is still configured by the previous round), empty
     // the same protocol stream. Two retained copies, so round r+1 is re-armed and queued while round r runs.
-    let rearm = gemm.then(|| persistent_with(v9(), layout, &plans, 1, Bodies::LeanFirst));
+    let rearm = gemm.then(|| persistent_with(v9(), layout, &plans, 1, Bodies::LeanFirst, g80));
     let rearm_src = rearm.as_ref().unwrap_or(&pd);
     let mut rearm_bos = [(dev.dev_bo(&rearm_src.insts)?, rearm_src.insts.clone()), (dev.dev_bo(&rearm_src.insts)?, rearm_src.insts.clone())];
     let mut cmds = [dev.cmd_bo()?, dev.cmd_bo()?];

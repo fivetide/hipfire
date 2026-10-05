@@ -330,7 +330,7 @@ fn lean_rounds(m:usize,n:usize,k:usize,gold:&[Golden],nslots:usize,s:usize,round
         if round>0 {
             let (fl,ff)=(rig_shape(m,n,k,nslots,s,base,seq0,None,true),rig_shape(m,n,k,nslots,s,base,seq0,None,false));
             if rearm {
-                let fr=persistent_with(gemm_array::design_v9(m,n,k,gemm_array::V8_DEFAULT_EPILOGUE,Control::Fast),l0.layout,&fl.plans,seq0,Bodies::LeanFirst);
+                let fr=persistent_with(gemm_array::design_v9(m,n,k,gemm_array::V8_DEFAULT_EPILOGUE,Control::Fast),l0.layout,&fl.plans,seq0,Bodies::LeanFirst,false);
                 assert_bytes(&fr.pdi,&l0.d.pdi,&format!("{what}: rearm ring loads the same PDI"));
                 assert_eq!(declared_words(&fr,s).len(),dl.len());
                 if round>1 {patch_seq(&mut lean_insts,&fr.patch_sites,seq0);assert_bytes(&lean_insts,&fr.insts,&format!("{what}: patched rearm stream != from-scratch rearm build"));}
@@ -382,7 +382,7 @@ fn design_rounds(m:usize,n:usize,k:usize,what:&str,design:&dyn Fn()->ArrayDesign
     let rig_of=|base:usize,seq0:u32,bodies:Bodies|->Rig {
         let eager=design();let (a,b,c)=(eager.args[0].bytes,eager.args[1].bytes,eager.args[2].bytes);
         let plans=plans(base,s,nslots,a,b,c);
-        let d=persistent_with(design(),layout,&plans,seq0,bodies);
+        let d=persistent_with(design(),layout,&plans,seq0,bodies,false);
         Rig {m,n,k,layout,eager,d,plans,cb:c,used:nslots}
     };
     let (l0,f0)=(rig_of(0,1,Bodies::Lean),rig_of(0,1,Bodies::Full));
@@ -420,6 +420,43 @@ fn a_repeat_rounds(m:usize,n:usize,k:usize) {
 #[test] fn a_repeat_ring_512x1280x128() {a_repeat_rounds(512,1280,128)}
 #[test] fn a_repeat_ring_1024x1280x64_two_m_waves() {a_repeat_rounds(1024,1280,64)}
 #[test] fn g80_ring_512x1280x128() {design_rounds(512,1280,128,"G80",&||pm_npu::kernels::gemm_g80::design_g80(512,1280,128,INT8,Control::Fast));}
+
+/// G80 B-resident ring (`persistent_with(.., b_shared = true)`): every run shares one B; run 0 of round 0 fills it from
+/// DDR, every later run keeps it in the memtile. From run 2 on the host B is poison, so an exact C proves the lean
+/// runs read the resident B and nothing from DDR.
+#[test] fn g80_b_resident_ring_512x1280x128() {
+    let (m,n,k,nslots,s,rounds)=(512,1280,128,2,2,3);
+    let layout=RingLayout {nslots};
+    let design=||pm_npu::kernels::gemm_g80::design_g80(m,n,k,INT8,Control::Fast);
+    let eager=design();
+    let (ab,bb,cb)=(eager.args[0].bytes,eager.args[1].bytes,eager.args[2].bytes);
+    let plans_of=|base:usize|->Vec<SlotPlan> {(0..s).map(|i|{let slot=(base+i)%nslots;SlotPlan {slot,a_off:(slot*ab) as u64,b_off:0,c_off:(slot*cb) as u64}}).collect()};
+    let rig_of=|base:usize,seq0:u32,bodies:Bodies|->Rig {
+        let plans=plans_of(base);
+        Rig {m,n,k,layout,eager:design(),d:persistent_with(design(),layout,&plans,seq0,bodies,true),plans,cb,used:nslots}
+    };
+    let (_,b)=matrices(m,n,k,0xb0b);
+    let r0=rig_of(0,1,Bodies::Lean);
+    let gold:Vec<Golden>=(0..s*rounds).map(|g|{
+        let (a,_)=matrices(m,n,k,0xc001d00d+g as u32*7919);
+        let [ap,bp]=eager.pack_in(&a,&b);
+        let mut args=vec![ap.clone(),bp.clone(),vec![POISON;cb]];
+        Config::from_pdi(&eager.pdi).unwrap().submit(&eager.insts,&mut args).unwrap();
+        let reference=eager.reference(&a,&b);assert_eq!(eager.unpack_out(&args[2]),reference);
+        // Only run 0 reads B from DDR. Run 1's operands are written while run 0 runs (same bytes); from run 2 on (slot of
+        // run 0 reused, so run 0 is done) the producer writes poison there.
+        Golden {a:ap,b:if g<2 {bp} else {vec![0x5a;bb]},eager_c:args.swap_remove(2),reference}
+    }).collect();
+    let mut args=fresh_args(&r0);let mut sim=Config::from_pdi(&r0.d.pdi).unwrap();
+    for round in 0..rounds {
+        let (base,seq0)=(round*s,1+(round*s) as u32);
+        let r=if round==0 {rig_of(0,1,Bodies::Lean)} else {rig_of(base,seq0,Bodies::LeanFirst)};
+        let mut p=Producer::new(&r,&gold,base,s,0,vec![],&args);run(&mut sim,&r.d.insts,&mut args,&mut p);p.finish(&args);
+        check_outputs(&r,&gold,&args,base+s);check_done_lines(r.layout,&args,base+s,&[]);
+        if round>0 {assert!(args[1].iter().all(|&x|x==0x5a),"host B is poison");}
+        eprintln!("PASS G80 B-resident ring round {round}: exact with poisoned host B");
+    }
+}
 
 /// What a run of a (possibly broken) lean ring did wrong, judged against the CPU/eager goldens and the full-body ring state.
 #[derive(Debug)] #[allow(dead_code)]
