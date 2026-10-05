@@ -24,27 +24,31 @@
 //! `empty_persistent`, poll + done only), run `j` on slot `j % R` with fixed slot arenas; seq of (round r, run j) is
 //! `1 + r*S + j`; rounds re-arm with `patch_seq` (needs `S % R == 0`).
 //!
-//! GPU stream per run j, all enqueued before the round's wait (null stream, in order):
-//! 1. gemm: `coop_copy` A source (operand set `((r*S + j) / R) % 2`, device memory) -> A arena slot (GPU-produced A;
-//!    every reuse of a slot gets the other set, so a stale A cannot pass);
-//! 2. `coop_publish`: wait done(slot) == seq - R (slot free; skipped while seq <= R), store seq (store glc slc dlc +
-//!    vscnt 0, the WRITE_DATA-with-confirm equivalent), poll done(slot) == seq with a realtime stamp before every load;
-//! 3. gemm: `coop_copy` C arena slot -> device readback (the GPU reads the NPU's C).
+//! GPU work per run j, all enqueued before the round's wait on two in-order streams (`coop_publish` doubles as a wait,
+//! `v` stored to a scratch line while polling `addr == v`, and as a store, polling its own line):
+//! * producer: wait consumed(slot) == seq - R (slot released; skipped while seq <= R); gemm: `coop_copy` A source
+//!   (operand set `((r*S + j) / R) % 2`, device memory) -> A arena slot (GPU-produced A; every reuse of a slot gets the
+//!   other set, so a stale A cannot pass); store seq to the slot line (glc slc dlc + vscnt 0, the
+//!   WRITE_DATA-with-confirm equivalent). It runs up to R runs ahead, so the next seq is ready while the NPU computes.
+//! * consumer: poll done(slot) == seq (realtime stamp before every load); gemm: `coop_copy` C arena slot -> device
+//!   readback (the GPU reads the NPU's C); store seq to consumed(slot) (device memory).
 //!
-//! Latencies, GPU realtime clock (`hipDeviceAttributeWallClockRate`), p50 / min / max over all runs of all rounds:
-//! * `pub_to_done_gpu_us`: seq store complete -> done line seen by the GPU (empty mode: the whole ring mechanism,
-//!   GPU store -> NPU shim poll -> NPU done DMA -> GPU poll; gemm: includes the GEMM);
+//! Latencies, GPU realtime clock (`hipDeviceAttributeWallClockRate`), p50 / min / max over all runs of all rounds, from
+//! the consumer's done wait (it starts when the previous run's C is read, so with the producer ahead these are
+//! consumer-side wait times, not the ring round trip):
+//! * `pub_to_done_gpu_us`: consumer wait start -> done line seen by the GPU;
 //! * `done_to_gpu_obs_upper_us`: t_obs - issue time of the last poll load that missed; the done line became visible
 //!   in that window, so this bounds done -> GPU observe from above;
 //! * `poll_load_us`: issue -> return of the load that hit (one uncached load round trip, the observe floor);
-//! * `publish_store_us`: seq store issue -> store complete;
+//! * `publish_store_us`: scratch store issue -> store complete;
 //! * per-run wall time (CPU, round / S) and, gemm, useful TOPS of the whole CPU-free pipeline.
 //!
 //! Exactness (gemm): two eager `design_v9` submits (one per operand set, shared B) on the same context first, each
 //! compared with the exact closed-form CPU reference; then every run's GPU-read C (device readback) must be byte-equal
 //! to the eager C of its set, every slot of the A arena must hold the GPU-copied A bytes of the last run that used it,
-//! and round 0 / the final round are also unpacked and compared with the CPU reference directly. Every publish record
-//! must carry status ok and its seq, and every final done line seq, slot and 'DONE'. If the NPU command does not
+//! and round 0 / the final round are also unpacked and compared with the CPU reference directly. Every consumer record
+//! must carry status ok and its seq, every producer wait / publish / release kernel status ok, and every final done
+//! line seq, slot and 'DONE'. If the NPU command does not
 //! complete, the CPU rescues it (publishes the missing seqs on free slots) so the array is never
 //! left waiting, and the run FAILS. Exit 0 = PASS, 1 = FAIL, 2 = usage.
 //!
@@ -355,9 +359,16 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
     let mut insts_host = pd.insts.clone();
     let mut cmd = dev.cmd_bo()?;
     let ring_gpu = ring_sh.gpu();
-    // One in-order stream per slot: run j's A copy -> publish/poll -> C read stays ordered (and gates reuse of its
-    // slot arenas), while the other slots' copies overlap the NPU's GEMM of run j.
-    let streams = (0..r_slots).map(|_| rt.stream()).collect::<Result<Vec<_>, _>>()?;
+    // Two in-order streams. Producer: wait until the consumer released the slot (consumed[slot] == seq - R), copy A,
+    // publish seq. Consumer: wait done == seq, read C, release the slot. The producer runs up to R runs ahead, so the
+    // next seq is published while the NPU computes the current one. Both use `coop_publish`: a wait is a publish of
+    // `v` to a scratch line polling `addr == v`; a store is a publish to `addr` polling the same line (one load).
+    let (prod, cons) = (rt.stream()?, rt.stream()?);
+    let consumed = rt.allocate(r_slots * 64, None)?;
+    rt.memset(&consumed, 0)?;
+    let scratch = rt.allocate(64, None)?;
+    let aux = rt.allocate(3 * s_runs * coop_gpu::PUBLISH_RECORD_BYTES, None)?;
+    let aux_rec = |kind: usize, j: usize| aux.ptr() + ((kind * s_runs + j) * coop_gpu::PUBLISH_RECORD_BYTES) as u64;
     // Poll cap per publish kernel (>= ~1 us per uncached load): a stalled round's S kernels x (free wait + done poll)
     // stay within about half the timeout, so the CPU rescue still runs inside it.
     let max_iters = (cfg.timeout_ms * 1000 / (4 * s_runs as u64)).clamp(1000, u32::MAX as u64) as u32;
@@ -375,24 +386,30 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
         }
         if gemm { c_sh.write(0, &vec![POISON; c_sh.len]); }
         rt.memset(&stats, 0)?;
+        rt.memset(&aux, 0)?;
         rt.synchronize()?;
         let t_round = Instant::now();
         let npu_seq = ctx.submit(&mut cmd, &insts, &[a_sh.bo(), &b_bo, c_sh.bo(), ring_sh.bo()])?;
+        let publish = |st, seq_addr: u64, done_addr: u64, rec: u64, v: u32| -> Result<(), String> {
+            let mut a = coop_gpu::publish_args(seq_addr, done_addr, rec, v, 0, max_iters, false);
+            rt.launch_on(Some(st), &f_pub, 1, coop_gpu::LANE_BLOCK, &mut a)
+        };
         for (j, p) in plans.iter().enumerate() {
             let seq = seq0 + j as u32;
-            let st = Some(&streams[p.slot]);
+            let release = consumed.ptr() + (p.slot * 64) as u64;
+            if seq as usize > r_slots { publish(&prod, scratch.ptr(), release, aux_rec(0, j), seq - r_slots as u32)?; }
             if gemm {
                 let mut a = coop_gpu::copy_args(a_sh.gpu() + p.a_off, src_a.ptr() + (set_of(r, j) * a_bytes) as u64, (a_bytes / 16) as u64, (COPY_BLOCKS * coop_gpu::COPY_BLOCK) as u64);
-                rt.launch_on(st, &f_copy, COPY_BLOCKS, coop_gpu::COPY_BLOCK, &mut a)?;
+                rt.launch_on(Some(&prod), &f_copy, COPY_BLOCKS, coop_gpu::COPY_BLOCK, &mut a)?;
             }
-            let wait_free = seq as usize > r_slots;
-            let mut a = coop_gpu::publish_args(ring_gpu + layout.slot_line(p.slot) as u64, ring_gpu + layout.done_line(p.slot) as u64,
-                stats.ptr() + (j * coop_gpu::PUBLISH_RECORD_BYTES) as u64, seq, if wait_free { seq - r_slots as u32 } else { 0 }, max_iters, wait_free);
-            rt.launch_on(st, &f_pub, 1, coop_gpu::LANE_BLOCK, &mut a)?;
+            let slot_line = ring_gpu + layout.slot_line(p.slot) as u64;
+            publish(&prod, slot_line, slot_line, aux_rec(1, j), seq)?;
+            publish(&cons, scratch.ptr(), ring_gpu + layout.done_line(p.slot) as u64, stats.ptr() + (j * coop_gpu::PUBLISH_RECORD_BYTES) as u64, seq)?;
             if gemm {
                 let mut a = coop_gpu::copy_args(readback.ptr() + (j * c_bytes) as u64, c_sh.gpu() + p.c_off, (c_bytes / 16) as u64, (COPY_BLOCKS * coop_gpu::COPY_BLOCK) as u64);
-                rt.launch_on(st, &f_copy, COPY_BLOCKS, coop_gpu::COPY_BLOCK, &mut a)?;
+                rt.launch_on(Some(&cons), &f_copy, COPY_BLOCKS, coop_gpu::COPY_BLOCK, &mut a)?;
             }
+            publish(&cons, release, release, aux_rec(2, j), seq)?;
         }
         rt.synchronize()?;
         let st = ctx.wait(&cmd, npu_seq, cfg.timeout_ms);
@@ -407,6 +424,18 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
         let mut raw = vec![0u8; s_runs * coop_gpu::PUBLISH_RECORD_BYTES];
         rt.download(&stats, &mut raw)?;
         let recs: Vec<PublishRecord> = (0..s_runs).map(|j| PublishRecord::parse(&raw[j * coop_gpu::PUBLISH_RECORD_BYTES..])).collect();
+        let mut raw_aux = vec![0u8; 3 * s_runs * coop_gpu::PUBLISH_RECORD_BYTES];
+        rt.download(&aux, &mut raw_aux)?;
+        for kind in 0..3 {
+            for j in 0..s_runs {
+                if kind == 0 && seq0 as usize + j <= r_slots { continue; }
+                let rec = PublishRecord::parse(&raw_aux[(kind * s_runs + j) * coop_gpu::PUBLISH_RECORD_BYTES..]);
+                if rec.status != coop_gpu::STATUS_OK {
+                    println!("round {r} run {j}: {} kernel status {}", ["slot-free wait", "publish", "release"][kind], rec.status);
+                    all_ok = false;
+                }
+            }
+        }
         for (j, rec) in recs.iter().enumerate() {
             let seq = seq0 + j as u32;
             if rec.status != coop_gpu::STATUS_OK || rec.seq != seq || rec.last_done != seq || rec.t_obs < rec.t_pub {
