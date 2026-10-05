@@ -66,6 +66,13 @@ fn feed(path: &str, b: &[u8], t: &mut OnlineDraftTuner, max_obs: usize) {
                 t.reset();
                 obs = 0;
             }
+            b'S' => {
+                let n = u64_at(b, &mut o) as usize;
+                let prompt = u32s(b, &mut o, n);
+                if std::env::var_os("REPLAY_NO_PROMPT").is_none() {
+                    t.seed_prompt(&prompt);
+                }
+            }
             _ => panic!("{path}: bad record tag {tag} at {}", o - 1),
         }
     }

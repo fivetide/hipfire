@@ -404,6 +404,18 @@ impl OnlineDraftTuner {
         }
     }
 
+    /// Prompt tokens at absolute positions `0..prompt.len()` become the start
+    /// of the session stream (n-gram and suffix-match history only: they are
+    /// never training labels, no block drafted them).
+    pub fn seed_prompt(&mut self, prompt: &[u32]) {
+        self.dump_record(b'S', &[prompt.len() as u64], prompt);
+        self.known.clear();
+        self.known.extend_from_slice(prompt);
+        self.ngrams = Ngrams::default();
+        self.ngrams.advance(&self.known);
+        self.pending.clear();
+    }
+
     fn tok(&self, p: isize) -> u32 {
         if p < 0 {
             NONE

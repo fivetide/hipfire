@@ -654,6 +654,9 @@ impl Speculator for DflashSpeculator {
     ) -> Result<PrefillOutcome, String> {
         self.adaptive.reset();
         self.last_window = None;
+        if let Some(t) = self.df.draft_scratch.online.as_mut() {
+            t.seed_prompt(prompt_tokens);
+        }
         let slot = target
             .as_any_mut()
             .downcast_mut::<ModelSlot>()
