@@ -36,8 +36,9 @@ pub const K: usize = 16;
 /// n-gram context orders (bigram .. 4-gram).
 const ORDERS: usize = 3;
 /// Dense features: rank one-hots (3), per order (MLE, seen), recency, depth·gap,
-/// suffix-match length, injected-candidate flag.
-const NF: usize = 7 + 2 * ORDERS;
+/// suffix-match length, injected-candidate flag, equals chain token 1 / 2 back,
+/// equals the previous row's top-1 / the next row's top-1 / top-2.
+const NF: usize = 12 + 2 * ORDERS;
 const RECENT: usize = 64;
 /// Longest suffix match considered, and occurrences of the nearest token scanned.
 const MAXM: usize = 32;
@@ -139,6 +140,11 @@ struct Stats {
     /// Overrides of the argmax inside the reached prefix / and right.
     overrides: u64,
     overrides_right: u64,
+    /// Host time in `propose_from_logits` (incl. waiting for the draft
+    /// forward, top-K + D2H), its pure-host re-rank part, and `observe`.
+    propose_ns: u64,
+    rerank_ns: u64,
+    observe_ns: u64,
 }
 
 /// Session n-gram counts over the known emitted stream.
@@ -194,6 +200,15 @@ impl Ngrams {
         }
         self.upto = known.len().max(self.upto);
     }
+}
+
+/// Draft top-1 of the previous row and top-1/top-2 of the next row (`NONE`
+/// at the block edges): parallel-drafted rows often land one position early
+/// or late.
+fn neighbors(ids: &[[u32; K]], r: usize) -> [u32; 3] {
+    let prev = r.checked_sub(1).map_or(NONE, |p| ids[p][0]);
+    let next = ids.get(r + 1);
+    [prev, next.map_or(NONE, |n| n[0]), next.map_or(NONE, |n| n[1])]
 }
 
 /// Row-depth buckets with separate weights: row 0, rows 1..=3, rows 4+.
@@ -321,6 +336,7 @@ impl OnlineDraftTuner {
         start: usize,
         seed: u32,
     ) -> rdna_compute::HipResult<Vec<u32>> {
+        let t0 = std::time::Instant::now();
         if self.dev.as_ref().is_none_or(|(i, _)| i.numel() < rows * K) {
             if let Some((i, v)) = self.dev.take() {
                 gpu.free_tensor(i)?;
@@ -342,7 +358,11 @@ impl OnlineDraftTuner {
             unsafe { std::slice::from_raw_parts_mut(ids.as_mut_ptr() as *mut u8, rows * K * 4) };
         gpu.hip.memcpy_dtoh(bytes, &di.buf)?;
         let vals = gpu.download_f32(&dv)?;
-        Ok(self.propose(start, seed, &ids, &vals, rows))
+        let t1 = std::time::Instant::now();
+        let out = self.propose(start, seed, &ids, &vals, rows);
+        self.stats.rerank_ns += t1.elapsed().as_nanos() as u64;
+        self.stats.propose_ns += t0.elapsed().as_nanos() as u64;
+        Ok(out)
     }
 
     pub fn free_gpu(&mut self, gpu: &mut Gpu) {
@@ -425,6 +445,7 @@ impl OnlineDraftTuner {
         vals: &[f32; K],
         row: usize,
         injected: bool,
+        nb: [u32; 3],
     ) -> [[f32; NF]; K] {
         let ng = &self.ngrams;
         let prev: &[u32; ORDERS] = ctx[..ORDERS].try_into().unwrap();
@@ -459,6 +480,11 @@ impl OnlineDraftTuner {
                 f[5 + 2 * ORDERS] = ((1 + l) as f32).ln() / ((1 + MAXM) as f32).ln();
             }
             f[6 + 2 * ORDERS] = (injected && j == K - 1) as u32 as f32;
+            f[7 + 2 * ORDERS] = (v == ctx[0]) as u32 as f32;
+            f[8 + 2 * ORDERS] = (v == ctx[1]) as u32 as f32;
+            for (i, &n) in nb.iter().enumerate() {
+                f[9 + 2 * ORDERS + i] = (v == n) as u32 as f32;
+            }
             f
         })
     }
@@ -486,8 +512,13 @@ impl OnlineDraftTuner {
             let mut order: [usize; K] = std::array::from_fn(|j| j);
             let v = &vals[r * K..(r + 1) * K];
             order.sort_by(|&a, &b| v[b].total_cmp(&v[a]).then(a.cmp(&b)));
-            let mut row_ids: [u32; K] = std::array::from_fn(|j| ids[r * K + order[j]]);
-            let row_vals: [f32; K] = std::array::from_fn(|j| v[order[j]]);
+            cyc.ids.push(std::array::from_fn(|j| ids[r * K + order[j]]));
+            cyc.vals.push(std::array::from_fn(|j| v[order[j]]));
+        }
+        for r in 0..rows {
+            let mut row_ids = cyc.ids[r];
+            let row_vals = cyc.vals[r];
+            let nb = neighbors(&cyc.ids, r);
             let mut injected = false;
             let pick = if self.mode == Mode::On {
                 // Proposal chain: the rows before this one are assumed accepted.
@@ -508,7 +539,7 @@ impl OnlineDraftTuner {
                         }
                     }
                 }
-                let f = self.features(start, &ctx, &row_ids, &row_vals, r, injected);
+                let f = self.features(start, &ctx, &row_ids, &row_vals, r, injected, nb);
                 self.learner.pick(r, &row_vals, &f)
             } else {
                 0
@@ -516,8 +547,7 @@ impl OnlineDraftTuner {
             out.push(row_ids[pick]);
             cyc.picked.push(pick as u8);
             cyc.injected.push(injected);
-            cyc.ids.push(row_ids);
-            cyc.vals.push(row_vals);
+            cyc.ids[r] = row_ids;
         }
         self.pending.push_back(cyc);
         out
@@ -526,6 +556,7 @@ impl OnlineDraftTuner {
     /// Record the tokens committed after the seed at `start` (accepted drafts
     /// plus the bonus) and train on every pending row they label.
     pub fn observe(&mut self, start: usize, committed_after_seed: &[u32], accepted: usize) {
+        let t0 = std::time::Instant::now();
         self.dump_record(b'O', &[start as u64, accepted as u64, committed_after_seed.len() as u64], committed_after_seed);
         self.stats.cycles += 1;
         self.stats.accepted += accepted as u64;
@@ -554,6 +585,7 @@ impl OnlineDraftTuner {
             let c = self.pending.pop_front().unwrap();
             self.finalize(&c);
         }
+        self.stats.observe_ns += t0.elapsed().as_nanos() as u64;
         if self.stats.cycles % 64 == 0 {
             self.report("running");
         }
@@ -568,7 +600,7 @@ impl OnlineDraftTuner {
             }
             let p = (c.start + 1 + r) as isize;
             let ctx: [u32; MAXM] = std::array::from_fn(|k| self.tok(p - 1 - k as isize));
-            let f = self.features(c.start, &ctx, &c.ids[r], &c.vals[r], r, c.injected[r]);
+            let f = self.features(c.start, &ctx, &c.ids[r], &c.vals[r], r, c.injected[r], neighbors(&c.ids, r));
             self.learner.train(r, &c.vals[r], &f, y);
             if y != 0 {
                 break;
@@ -615,7 +647,7 @@ impl OnlineDraftTuner {
             .collect();
         let l = &self.learner;
         eprintln!(
-            "[dflash-online] {tag}: mode={:?} cycles={} tau={:.3} finalized={} picked_tau={:.3} overrides={}/{} oracle[{}] scale={:.3?} w={:.2?}",
+            "[dflash-online] {tag}: mode={:?} cycles={} tau={:.3} finalized={} picked_tau={:.3} overrides={}/{} oracle[{}] host_us/cycle[propose={:.0} rerank={:.0} observe={:.0}] scale={:.3?} w={:.2?}",
             self.mode,
             s.cycles,
             s.accepted as f64 / s.cycles as f64,
@@ -624,6 +656,9 @@ impl OnlineDraftTuner {
             s.overrides_right,
             s.overrides,
             o.join(" "),
+            s.propose_ns as f64 / 1e3 / s.cycles as f64,
+            s.rerank_ns as f64 / 1e3 / s.cycles as f64,
+            s.observe_ns as f64 / 1e3 / s.cycles as f64,
             l.scale,
             l.w,
         );
