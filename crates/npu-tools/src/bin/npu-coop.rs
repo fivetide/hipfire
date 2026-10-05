@@ -20,9 +20,10 @@
 //! NPU mapping) must pass. B (weights) is an NPU shmem BO; GPU-only buffers (A sources, C readback, publish records)
 //! are `hipMalloc` device memory.
 //!
-//! NPU: ONE persistent command of `S` runs (`persistent_v9_lean`, run 0 full, runs 1.. lean; `--mode empty`:
-//! `empty_persistent`, poll + done only), run `j` on slot `j % R` with fixed slot arenas; seq of (round r, run j) is
-//! `1 + r*S + j`; rounds re-arm with `patch_seq` (needs `S % R == 0`).
+//! NPU: ONE persistent command of `S` runs (`persistent_v9_lean`, run 0 full, runs 1.. lean; rounds after the first
+//! submit `persistent_v9_lean_rearm`, every run lean; `--mode empty`: `empty_persistent`, poll + done only), run `j` on
+//! slot `j % R` with fixed slot arenas; seq of (round r, run j) is `1 + r*S + j`; rounds re-arm with `patch_seq`
+//! (needs `S % R == 0`).
 //!
 //! GPU work per run j, all enqueued before the round's wait on two in-order streams (`coop_publish` doubles as a wait,
 //! `v` stored to a scratch line while polling `addr == v`, and as a store, polling its own line):
@@ -59,7 +60,7 @@ use npu_tools::coop_gpu::{self, PublishRecord};
 use railgun::npu::hip_runtime::{HipFunction, HipMemoryKind, HipRuntime, HostRegistration};
 use pm_npu::kernels::gemm_array::{apply_epilogue, design_v9, ArrayDesign, V8_DEFAULT_EPILOGUE};
 use pm_npu::kernels::gemm_core::Control;
-use pm_npu::kernels::ring::{empty_persistent, patch_seq, persistent_v9_lean, RingLayout, SlotPlan, DONE_MAGIC};
+use pm_npu::kernels::ring::{empty_persistent, patch_seq, persistent_v9_lean, persistent_v9_lean_rearm, RingLayout, SlotPlan, DONE_MAGIC};
 use railgun::npu::{clflush, Bo, Device, HwCtx, ERT_STATE_COMPLETED};
 use std::time::{Duration, Instant};
 
@@ -357,6 +358,9 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
     ring_sh.write(0, &img);
     let mut insts = dev.dev_bo(&pd.insts)?;
     let mut insts_host = pd.insts.clone();
+    // Rounds after the first (gemm): lean-first stream, the array is still configured by the previous round.
+    let rearm = gemm.then(|| persistent_v9_lean_rearm(m, n, k, layout, &plans, 1));
+    let mut insts_rearm = match &rearm { Some(p) => Some((dev.dev_bo(&p.insts)?, p.insts.clone())), None => None };
     let mut cmd = dev.cmd_bo()?;
     let ring_gpu = ring_sh.gpu();
     // Two in-order streams. Producer: wait until the consumer released the slot (consumed[slot] == seq - R), copy A,
@@ -380,16 +384,21 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
         let seq0 = 1 + (r * s_runs) as u32;
         if r > 0 {
             // Re-arm: only the declared seq words change; the retained BO is rewritten and flushed (untimed).
-            patch_seq(&mut insts_host, &pd.patch_sites, seq0);
-            insts.as_mut_slice()[..insts_host.len()].copy_from_slice(&insts_host);
-            insts.flush();
+            let (bo, host, sites) = match (&mut insts_rearm, &rearm) {
+                (Some((bo, host)), Some(p)) => (bo, host, &p.patch_sites),
+                _ => (&mut insts, &mut insts_host, &pd.patch_sites),
+            };
+            patch_seq(host, sites, seq0);
+            bo.as_mut_slice()[..host.len()].copy_from_slice(host);
+            bo.flush();
         }
         if gemm { c_sh.write(0, &vec![POISON; c_sh.len]); }
         rt.memset(&stats, 0)?;
         rt.memset(&aux, 0)?;
         rt.synchronize()?;
         let t_round = Instant::now();
-        let npu_seq = ctx.submit(&mut cmd, &insts, &[a_sh.bo(), &b_bo, c_sh.bo(), ring_sh.bo()])?;
+        let cur = if r > 0 { insts_rearm.as_ref().map_or(&insts, |(bo, _)| bo) } else { &insts };
+        let npu_seq = ctx.submit(&mut cmd, cur, &[a_sh.bo(), &b_bo, c_sh.bo(), ring_sh.bo()])?;
         let publish = |st, seq_addr: u64, done_addr: u64, rec: u64, v: u32| -> Result<(), String> {
             let mut a = coop_gpu::publish_args(seq_addr, done_addr, rec, v, 0, max_iters, false);
             rt.launch_on(Some(st), &f_pub, 1, coop_gpu::LANE_BLOCK, &mut a)

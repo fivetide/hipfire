@@ -235,7 +235,7 @@ impl PersistentDesign {
 pub fn persistent_v9(m: usize, n: usize, k: usize, ring: RingLayout, slots: &[SlotPlan], seq0: u32, neg: Option<Neg>)
     -> PersistentDesign
 {
-    build(gemm_array::design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast), true, false, ring, slots, seq0, neg)
+    build(gemm_array::design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast), true, false, false, ring, slots, seq0, neg)
 }
 
 /// [`persistent_v9`] with the same arguments, operand offsets, patch inventory (exactly [`PatchKind::PollSeq`] and
@@ -243,17 +243,27 @@ pub fn persistent_v9(m: usize, n: usize, k: usize, ring: RingLayout, slots: &[Sl
 /// `1..` use the lean body ([`ArrayDesign::append_lean_run_body`]) with the memtile channels that the POLL / DONE tasks
 /// clobber (column 0 S2MM4 and MM2S0) forced through reset + requeue (module documentation, "Lean bodies").
 /// Every submission built by this function starts with a full body, so it is valid for the first submit after the PDI
-/// and for any submit after a completed submit of the same design; there is no lean-first variant.
+/// and for any submit after a completed submit of the same design; [`persistent_v9_lean_rearm`] is the lean-first form.
 /// `Neg::SkipLeanRequeue(i)` (1 <= i < runs) omits only the forced repairs of lean run `i`.
 pub fn persistent_v9_lean(m: usize, n: usize, k: usize, ring: RingLayout, slots: &[SlotPlan], seq0: u32, neg: Option<Neg>)
     -> PersistentDesign
 {
-    build(gemm_array::design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast), true, true, ring, slots, seq0, neg)
+    build(gemm_array::design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast), true, true, false, ring, slots, seq0, neg)
+}
+
+/// [`persistent_v9_lean`] with run 0 lean too (no full body at all): the re-arm form, valid ONLY directly after a
+/// completed [`persistent_v9_lean`] / [`persistent_v9_lean_rearm`] submission of the same shape on the same hardware
+/// context (the array is still configured and every channel is where a completed lean run leaves it). Saves one full
+/// re-initialisation of the array per re-armed submission. Same patch inventory as [`persistent_v9_lean`].
+pub fn persistent_v9_lean_rearm(m: usize, n: usize, k: usize, ring: RingLayout, slots: &[SlotPlan], seq0: u32)
+    -> PersistentDesign
+{
+    build(gemm_array::design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast), true, true, true, ring, slots, seq0, None)
 }
 
 /// Poll + DONE only (no GEMM, no body) on the `512x512x64` V9 image: measures the protocol.
 pub fn empty_persistent(ring: RingLayout, slots: &[SlotPlan], seq0: u32) -> PersistentDesign {
-    build(gemm_array::design_v9(512, 512, 64, V8_DEFAULT_EPILOGUE, Control::Fast), false, false, ring, slots, seq0, None)
+    build(gemm_array::design_v9(512, 512, 64, V8_DEFAULT_EPILOGUE, Control::Fast), false, false, false, ring, slots, seq0, None)
 }
 
 fn check_seq_range(seq0: u32, runs: usize) {
@@ -273,7 +283,7 @@ fn reset_release(txn: &mut Txn, loc: Location, direction: crate::dma::Direction,
     txn.mask_write(ctrl, 0, 2);
 }
 
-fn build(mut design: ArrayDesign, gemm: bool, lean: bool, ring: RingLayout, slots: &[SlotPlan], seq0: u32, neg: Option<Neg>)
+fn build(mut design: ArrayDesign, gemm: bool, lean: bool, lean_first: bool, ring: RingLayout, slots: &[SlotPlan], seq0: u32, neg: Option<Neg>)
     -> PersistentDesign
 {
     ring.check();
@@ -332,7 +342,7 @@ fn build(mut design: ArrayDesign, gemm: bool, lean: bool, ring: RingLayout, slot
         // BODY.
         if gemm {
             let arena = [plan.a_off, plan.b_off, plan.c_off];
-            if lean && i > 0 {
+            if lean && (i > 0 || lean_first) {
                 let forced: &[(u32, crate::dma::Direction, u32)] =
                     if matches!(neg, Some(Neg::SkipLeanRequeue(skip)) if skip == i) { &[] } else { &LEAN_FORCED };
                 design.append_lean_run_body(&mut txn, arena, forced)

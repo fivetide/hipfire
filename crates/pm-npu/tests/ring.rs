@@ -313,10 +313,11 @@ fn declared_words(d:&PersistentDesign,runs:usize)->Vec<usize> {
 }
 /// `rounds` submissions of `s` runs each on ONE simulator + ring (round r = global runs `r*s..(r+1)*s`, seq0 = `r*s+1`), once
 /// with the lean ring and once with the full-body ring under the identical producer schedule. Later rounds re-use the first
-/// round's stream through `patch_seq`, which needs the slot of run i to repeat each round (`s % nslots == 0`).
-fn lean_rounds(m:usize,n:usize,k:usize,gold:&[Golden],nslots:usize,s:usize,rounds:usize,gap:usize) {
+/// round's stream through `patch_seq`, which needs the slot of run i to repeat each round (`s % nslots == 0`). `rearm`:
+/// rounds after the first submit the lean-first `persistent_v9_lean_rearm` stream instead.
+fn lean_rounds(m:usize,n:usize,k:usize,gold:&[Golden],nslots:usize,s:usize,rounds:usize,gap:usize,rearm:bool) {
     assert!(rounds==1 || s%nslots==0,"patch_seq keeps slots: rounds>1 needs S % nslots == 0");
-    let what=format!("{m}x{n}x{k} S={s} nslots={nslots} rounds={rounds} gap={gap}");
+    let what=format!("{m}x{n}x{k} S={s} nslots={nslots} rounds={rounds} gap={gap} rearm={rearm}");
     let (l0,f0)=(rig_shape(m,n,k,nslots,s,0,1,None,true),rig_shape(m,n,k,nslots,s,0,1,None,false));
     assert_bytes(&l0.d.pdi,&f0.d.pdi,&format!("{what}: lean and full ring load the same PDI"));
     assert!(l0.d.insts.len()<f0.d.insts.len(),"{what}: lean ring stream ({} B) is not smaller than the full-body ring ({} B)",l0.d.insts.len(),f0.d.insts.len());
@@ -328,9 +329,18 @@ fn lean_rounds(m:usize,n:usize,k:usize,gold:&[Golden],nslots:usize,s:usize,round
         let (base,seq0)=(round*s,1+(round*s) as u32);
         if round>0 {
             let (fl,ff)=(rig_shape(m,n,k,nslots,s,base,seq0,None,true),rig_shape(m,n,k,nslots,s,base,seq0,None,false));
-            assert_eq!(diff_words(&lean_insts,&fl.d.insts),dl,"{what}: lean byte diff between rounds must be exactly the declared words");
-            patch_seq(&mut lean_insts,&l0.d.patch_sites,seq0);patch_seq(&mut full_insts,&f0.d.patch_sites,seq0);
-            assert_bytes(&lean_insts,&fl.d.insts,&format!("{what}: patched lean stream != from-scratch lean build"));
+            if rearm {
+                let fr=persistent_v9_lean_rearm(m,n,k,l0.layout,&fl.plans,seq0);
+                assert_bytes(&fr.pdi,&l0.d.pdi,&format!("{what}: rearm ring loads the same PDI"));
+                assert_eq!(declared_words(&fr,s).len(),dl.len());
+                if round>1 {patch_seq(&mut lean_insts,&fr.patch_sites,seq0);assert_bytes(&lean_insts,&fr.insts,&format!("{what}: patched rearm stream != from-scratch rearm build"));}
+                lean_insts=fr.insts;
+            } else {
+                assert_eq!(diff_words(&lean_insts,&fl.d.insts),dl,"{what}: lean byte diff between rounds must be exactly the declared words");
+                patch_seq(&mut lean_insts,&l0.d.patch_sites,seq0);
+                assert_bytes(&lean_insts,&fl.d.insts,&format!("{what}: patched lean stream != from-scratch lean build"));
+            }
+            patch_seq(&mut full_insts,&f0.d.patch_sites,seq0);
             assert_bytes(&full_insts,&ff.d.insts,&format!("{what}: patched full stream != from-scratch full build"));
             assert_eq!(df,declared_words(&ff.d,s));
         }
@@ -354,8 +364,9 @@ fn lean_rounds(m:usize,n:usize,k:usize,gold:&[Golden],nslots:usize,s:usize,round
 fn lean_ring_matrix(m:usize,n:usize,k:usize) {
     let probe=rig_shape(m,n,k,2,3,0,1,None,true);let gold=goldens(&probe,8);
     for gap in [0,20_000] {
-        lean_rounds(m,n,k,&gold,2,3,1,gap);// S=3 > nslots=2: slot wrap inside one submission
-        lean_rounds(m,n,k,&gold,2,4,2,gap);// two retained rounds, second via patch_seq, wrap in each
+        lean_rounds(m,n,k,&gold,2,3,1,gap,false);// S=3 > nslots=2: slot wrap inside one submission
+        lean_rounds(m,n,k,&gold,2,4,2,gap,false);// two retained rounds, second via patch_seq, wrap in each
+        lean_rounds(m,n,k,&gold,2,2,3,gap,true);// lean-first re-arm: round 1 from scratch, round 2 via patch_seq
     }
 }
 #[test] fn lean_ring_512x512x128() {lean_ring_matrix(512,512,128)}
