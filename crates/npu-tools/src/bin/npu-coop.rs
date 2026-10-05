@@ -458,9 +458,8 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
         t_prev = now;
     }
     rt.synchronize()?;
-    for r in 0..cfg.rounds {
+    for (r, &wall_us) in round_us.iter().enumerate() {
         let seq0 = 1 + (r * s_runs) as u32;
-        let wall_us = round_us[r];
         let mut raw = vec![0u8; s_runs * coop_gpu::PUBLISH_RECORD_BYTES];
         rt.download_at(&stats, r * s_runs * coop_gpu::PUBLISH_RECORD_BYTES, &mut raw)?;
         let recs: Vec<PublishRecord> = (0..s_runs).map(|j| PublishRecord::parse(&raw[j * coop_gpu::PUBLISH_RECORD_BYTES..])).collect();
