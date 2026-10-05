@@ -746,3 +746,71 @@ impl OnlineDraftTuner {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Features recomputed at training time, after the emitted stream has
+    /// moved past the block, must equal what the proposal saw: any token at
+    /// or after the seed leaking into n-gram, suffix or recency statistics
+    /// would let the learner train on the future and inflate replay τ.
+    #[test]
+    fn training_features_match_proposal_features() {
+        let mut t = OnlineDraftTuner::new(Mode::Stats, Hyper::default());
+        let prompt: Vec<u32> = (0..40).map(|i| [7, 8, 9, 7, 8, 10][i % 6]).collect();
+        t.seed_prompt(&prompt);
+        let (start, seed) = (prompt.len(), 9u32);
+        // The truth continues the pattern, so the late positions repeat the
+        // very n-grams the rows ask about.
+        let truth = [7u32, 8, 10, 7, 8, 9];
+        let rows = truth.len();
+        let row_ids: [u32; K] = std::array::from_fn(|j| {
+            if j < 4 {
+                [7, 8, 9, 10][j]
+            } else {
+                1000 + j as u32
+            }
+        });
+        let row_vals: [f32; K] = std::array::from_fn(|j| 10.0 - j as f32);
+        let ids: Vec<u32> = (0..rows).flat_map(|_| row_ids).collect();
+        let vals: Vec<f32> = (0..rows).flat_map(|_| row_vals).collect();
+        t.propose(start, seed, &ids, &vals, rows);
+        let all_ids = vec![row_ids; rows];
+        let feats = |t: &OnlineDraftTuner| -> Vec<[[f32; NF]; K]> {
+            (0..rows)
+                .map(|r| {
+                    let p = (start + 1 + r) as isize;
+                    let ctx: [u32; MAXM] = std::array::from_fn(|k| {
+                        let q = p - 1 - k as isize;
+                        if q > start as isize {
+                            truth[q as usize - start - 1]
+                        } else {
+                            t.tok(q)
+                        }
+                    });
+                    t.features(
+                        start,
+                        &ctx,
+                        &row_ids,
+                        &row_vals,
+                        r,
+                        false,
+                        neighbors(&all_ids, r),
+                    )
+                })
+                .collect()
+        };
+        let before = feats(&t);
+        t.observe(start, &truth, rows - 1);
+        assert_eq!(
+            t.known.len(),
+            start + 1 + rows,
+            "stream advanced past the block"
+        );
+        assert_eq!(before, feats(&t));
+        // Not vacuous: row 0's context ends in the seed 9 and the prompt holds
+        // the bigram 9 -> 7, so candidate 7 has its bigram feature set.
+        assert!(before[0][0][4] > 0.0, "prompt bigram feature must fire");
+    }
+}
