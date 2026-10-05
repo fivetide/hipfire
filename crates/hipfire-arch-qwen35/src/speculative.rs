@@ -5027,7 +5027,14 @@ fn draft_dflash_block_rank(
                 &mut Vec::new(),
             )?;
         } else if let Some(tuner) = draft_scratch.online.as_mut() {
-            drafted.extend(tuner.propose_from_logits(gpu, &logits_batch, vocab, batch, position)?);
+            drafted.extend(tuner.propose_from_logits(
+                gpu,
+                &logits_batch,
+                vocab,
+                batch,
+                position,
+                seed_token,
+            )?);
         } else {
             // GPU argmax over (B-1) rows — one kernel, small D2H.
             let argmax_buf = verify_scratch.argmax.sub_offset(0, batch);

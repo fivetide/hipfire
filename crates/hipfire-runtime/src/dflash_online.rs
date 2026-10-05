@@ -2,19 +2,43 @@
 //!
 //! The drafter's greedy proposal at each block row is re-ranked among the
 //! draft's own top-K logits by a small per-request model trained online from
-//! tokens the target has already verified. A DFlash block row's draft hidden
-//! depends only on the committed context and the mask tokens, never on the
+//! tokens the target has already verified. A DFlash block row's draft logits
+//! depend only on the committed context and the mask tokens, never on the
 //! other drafted tokens, so every row is a clean supervised example once the
 //! emitted stream reaches its position: `(draft top-K at row, true token)`.
 //!
-//! Verify stays the target's greedy argmax, so output is unchanged; only the
-//! proposal (and therefore acceptance τ) moves.
+//! What the draft cannot see is its own chain: row `r` is drafted without
+//! knowing the tokens proposed at rows `< r`. The re-ranker supplies that
+//! from session statistics — n-gram continuations (orders 1..=3) of the
+//! proposed chain over the verified stream — plus a rank prior and a
+//! depth-scaled draft-logit term:
+//! `score_j = scale·(l_j − l_0) + w·f_j`, trained by Adagrad on the
+//! softmax-over-candidates cross-entropy of the rows a greedy chain actually
+//! reaches (all earlier rows correct). Features use the stream as of the
+//! block seed only, at proposal and at training time.
+//!
+//! Verify stays the target's greedy argmax, so every emitted token is the
+//! target's; only the proposal (and therefore acceptance τ) moves. (Batched
+//! verify is not bit-identical to AR, so a different acceptance pattern can
+//! still flip a near-tie — the same caveat as the adaptive block width.)
+//!
+//! Negative results (offline replay, `examples/dflash_online_replay.rs`,
+//! Qwen3.5-9B + 9B DFlash draft, gfx1151): a rank-16 LoRA on the LM head over
+//! the draft hidden, a per-token bias, and the target's stale verify argmax
+//! past the rejection all lowered or did not move τ; the LoRA only memorizes
+//! (in-sample after 4 epochs essay τ 1.10 → 1.88, online 1.10 → 0.94).
 
 use rdna_compute::{DType, Gpu, GpuTensor};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 /// Draft candidates kept per row (top-K kernel limit is 16).
 pub const K: usize = 16;
+/// n-gram context orders (bigram .. 4-gram).
+const ORDERS: usize = 3;
+/// Dense features: rank one-hots (3), per order (MLE, seen), recency, depth·gap.
+const NF: usize = 5 + 2 * ORDERS;
+const RECENT: usize = 64;
+const NONE: u32 = u32::MAX;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -37,15 +61,58 @@ impl Mode {
     }
 }
 
+/// Learner hyper-parameters. `HIPFIRE_DFLASH_ONLINE_HP="key=val,..."`
+/// overrides the defaults (developer sweeps; the replay tool takes the same string).
+#[derive(Clone, Debug)]
+pub struct Hyper {
+    pub lr: f32,
+    /// Adagrad initial accumulator: steps are ~`lr·g` until gradients accumulate.
+    pub acc0: f32,
+    /// Minimum score lead over the argmax candidate required to override it.
+    pub margin: f32,
+}
+
+impl Default for Hyper {
+    fn default() -> Self {
+        Self {
+            lr: 0.2,
+            acc0: 1.0,
+            margin: 0.0,
+        }
+    }
+}
+
+impl Hyper {
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let mut h = Self::default();
+        for kv in spec.split(',').filter(|s| !s.is_empty()) {
+            let (k, v) = kv.split_once('=').ok_or_else(|| format!("bad hp `{kv}`"))?;
+            let v = v.parse::<f32>().map_err(|e| format!("hp {k}: {e}"))?;
+            match k {
+                "lr" => h.lr = v,
+                "acc0" => h.acc0 = v,
+                "margin" => h.margin = v,
+                _ => return Err(format!("unknown hp `{k}`")),
+            }
+        }
+        Ok(h)
+    }
+
+    fn from_env() -> Self {
+        let spec = hipfire_config::developer_var("HIPFIRE_DFLASH_ONLINE_HP").unwrap_or_default();
+        Self::parse(&spec).unwrap_or_else(|e| panic!("HIPFIRE_DFLASH_ONLINE_HP: {e}"))
+    }
+}
+
 /// One drafted block awaiting labels from the emitted stream.
 struct Cycle {
-    /// Absolute position of the seed; row `i` (1-based) predicts `start + i`.
+    /// Absolute position of the seed; row `i` (0-based) predicts `start + 1 + i`.
     start: usize,
     ids: Vec<[u32; K]>,
     vals: Vec<[f32; K]>,
     /// Label rank per row in the draft top-K (`K` = absent), once known.
     ranks: Vec<Option<u8>>,
-    /// Index of the row the tuner proposed (rank among candidates) per row.
+    /// Candidate index the tuner proposed per row.
     picked: Vec<u8>,
 }
 
@@ -58,28 +125,159 @@ struct Stats {
     oracle: [u64; 5],
     /// Sum over finalized cycles of the tuner's picked-prefix length.
     picked_prefix: u64,
-    /// Rank histogram of the first row whose label is not the argmax.
-    first_miss: [u64; 6],
+    /// Overrides of the argmax inside the reached prefix / and right.
+    overrides: u64,
+    overrides_right: u64,
+}
+
+/// Session n-gram counts over the known emitted stream.
+#[derive(Default)]
+struct Ngrams {
+    /// `[order-1]`: (context, next) and context counts, keyed by hash.
+    next: [HashMap<u64, u32>; ORDERS],
+    ctx: [HashMap<u64, u32>; ORDERS],
+    /// Positions `< upto` have their n-grams ending there counted.
+    upto: usize,
+}
+
+/// Hash of the context `prev[..k]` (`prev[0]` = nearest token).
+fn ctx_hash(prev: &[u32]) -> u64 {
+    prev.iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, &t| (h ^ t as u64).wrapping_mul(0x0100_0000_01b3))
+}
+fn next_hash(ctx: u64, v: u32) -> u64 {
+    ctx.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ v as u64
+}
+
+impl Ngrams {
+    fn add(&mut self, known: &[u32], q: usize) {
+        let v = known[q];
+        if v == NONE {
+            return;
+        }
+        let mut prev = [NONE; ORDERS];
+        for k in 0..ORDERS.min(q) {
+            prev[k] = known[q - 1 - k];
+            if prev[k] == NONE {
+                break;
+            }
+            let c = ctx_hash(&prev[..=k]);
+            *self.next[k].entry(next_hash(c, v)).or_default() += 1;
+            *self.ctx[k].entry(c).or_default() += 1;
+        }
+    }
+
+    fn advance(&mut self, known: &[u32]) {
+        if self.upto > known.len() {
+            *self = Ngrams::default();
+        }
+        for q in self.upto.max(1)..known.len() {
+            self.add(known, q);
+        }
+        self.upto = known.len().max(self.upto);
+    }
+}
+
+/// Dense re-ranker: `score_j = scale·(l_j − l_0) + w·f_j`, Adagrad.
+struct Learner {
+    hp: Hyper,
+    scale: f32,
+    g_scale: f32,
+    w: [f32; NF],
+    gw: [f32; NF],
+}
+
+fn adagrad(p: &mut f32, acc: &mut f32, g: f32, lr: f32) {
+    *acc += g * g;
+    *p -= lr * g / acc.sqrt();
+}
+
+impl Learner {
+    fn new(hp: Hyper) -> Self {
+        Self {
+            scale: 1.0,
+            g_scale: hp.acc0,
+            w: [0.0; NF],
+            gw: [hp.acc0; NF],
+            hp,
+        }
+    }
+
+    fn scores(&self, vals: &[f32; K], f: &[[f32; NF]; K]) -> [f32; K] {
+        std::array::from_fn(|j| {
+            self.scale * (vals[j] - vals[0]) + self.w.iter().zip(&f[j]).map(|(w, x)| w * x).sum::<f32>()
+        })
+    }
+
+    fn pick(&self, vals: &[f32; K], f: &[[f32; NF]; K]) -> usize {
+        let s = self.scores(vals, f);
+        let best = (0..K).fold(0, |b, j| if s[j] > s[b] { j } else { b });
+        if s[best] - s[0] > self.hp.margin { best } else { 0 }
+    }
+
+    fn train(&mut self, vals: &[f32; K], f: &[[f32; NF]; K], y: usize) {
+        let s = self.scores(vals, f);
+        let m = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let e: [f32; K] = std::array::from_fn(|j| (s[j] - m).exp());
+        let sum: f32 = e.iter().sum();
+        let g: [f32; K] = std::array::from_fn(|j| e[j] / sum - (j == y) as u32 as f32);
+        let gs: f32 = (0..K).map(|j| g[j] * (vals[j] - vals[0])).sum();
+        adagrad(&mut self.scale, &mut self.g_scale, gs, self.hp.lr);
+        for k in 0..NF {
+            let gk: f32 = (0..K).map(|j| g[j] * f[j][k]).sum();
+            adagrad(&mut self.w[k], &mut self.gw[k], gk, self.hp.lr);
+        }
+    }
 }
 
 pub struct OnlineDraftTuner {
     pub mode: Mode,
-    /// Known emitted tokens by absolute position (`u32::MAX` = unknown).
+    /// Known emitted tokens by absolute position (`NONE` = unknown).
     known: Vec<u32>,
+    ngrams: Ngrams,
     pending: VecDeque<Cycle>,
     stats: Stats,
+    learner: Learner,
     /// Device top-K ids (i32 in an F32 tensor) and values, `[max_rows × K]`.
     dev: Option<(GpuTensor, GpuTensor)>,
+    /// `HIPFIRE_DFLASH_ONLINE_DUMP=<file>`: raw propose/observe records for
+    /// the offline replay example (`dflash_online_replay`).
+    dump: Option<std::io::BufWriter<std::fs::File>>,
 }
+
 impl OnlineDraftTuner {
-    pub fn from_env() -> Option<Self> {
-        Mode::from_env().map(|mode| Self {
+    pub fn new(mode: Mode, hp: Hyper) -> Self {
+        Self {
             mode,
             known: Vec::new(),
+            ngrams: Ngrams::default(),
             pending: VecDeque::new(),
             stats: Stats::default(),
+            learner: Learner::new(hp),
             dev: None,
-        })
+            dump: None,
+        }
+    }
+
+    pub fn from_env() -> Option<Self> {
+        let mut t = Self::new(Mode::from_env()?, Hyper::from_env());
+        if let Ok(path) = hipfire_config::developer_var("HIPFIRE_DFLASH_ONLINE_DUMP") {
+            let f = std::fs::File::create(&path)
+                .unwrap_or_else(|e| panic!("HIPFIRE_DFLASH_ONLINE_DUMP {path}: {e}"));
+            t.dump = Some(std::io::BufWriter::new(f));
+        }
+        Some(t)
+    }
+
+    fn dump_record(&mut self, tag: u8, head: &[u64], words: &[u32]) {
+        use std::io::Write;
+        if let Some(d) = self.dump.as_mut() {
+            let mut b = vec![tag];
+            b.extend(head.iter().flat_map(|x| x.to_le_bytes()));
+            b.extend(words.iter().flat_map(|x| x.to_le_bytes()));
+            let _ = d.write_all(&b);
+            let _ = d.flush();
+        }
     }
 
     /// Draft proposals for `rows` rows of `logits` (`[rows × vocab]`, device):
@@ -91,6 +289,7 @@ impl OnlineDraftTuner {
         vocab: usize,
         rows: usize,
         start: usize,
+        seed: u32,
     ) -> rdna_compute::HipResult<Vec<u32>> {
         if self.dev.as_ref().is_none_or(|(i, _)| i.numel() < rows * K) {
             if let Some((i, v)) = self.dev.take() {
@@ -98,19 +297,22 @@ impl OnlineDraftTuner {
                 gpu.free_tensor(v)?;
             }
             let n = rows.max(16) * K;
-            self.dev = Some((gpu.alloc_tensor(&[n], DType::F32)?, gpu.alloc_tensor(&[n], DType::F32)?));
+            self.dev = Some((
+                gpu.alloc_tensor(&[n], DType::F32)?,
+                gpu.alloc_tensor(&[n], DType::F32)?,
+            ));
         }
         let (di, dv) = self.dev.as_ref().unwrap();
         let di = di.sub_offset(0, rows * K);
         let dv = dv.sub_offset(0, rows * K);
         gpu.topk_values_batched_f32(logits, &di, &dv, vocab, K, rows)?;
-        let mut ids = vec![0i32; rows * K];
-        // SAFETY: `ids` holds exactly rows*K i32; any byte pattern is valid.
+        let mut ids = vec![0u32; rows * K];
+        // SAFETY: `ids` holds exactly rows*K u32; any byte pattern is valid.
         let bytes =
             unsafe { std::slice::from_raw_parts_mut(ids.as_mut_ptr() as *mut u8, rows * K * 4) };
         gpu.hip.memcpy_dtoh(bytes, &di.buf)?;
         let vals = gpu.download_f32(&dv)?;
-        Ok(self.propose(start, &ids, &vals, rows))
+        Ok(self.propose(start, seed, &ids, &vals, rows))
     }
 
     pub fn free_gpu(&mut self, gpu: &mut Gpu) {
@@ -123,14 +325,91 @@ impl OnlineDraftTuner {
     /// New request: forget the session (no cross-request learning).
     pub fn reset(&mut self) {
         self.report("request end");
+        self.dump_record(b'R', &[], &[]);
         self.known.clear();
+        self.ngrams = Ngrams::default();
         self.pending.clear();
         self.stats = Stats::default();
+        self.learner = Learner::new(self.learner.hp.clone());
     }
 
-    /// Choose the proposal for each row from its descending top-K.
+    fn tok(&self, p: isize) -> u32 {
+        if p < 0 {
+            NONE
+        } else {
+            self.known.get(p as usize).copied().unwrap_or(NONE)
+        }
+    }
+
+    /// Per order: (`prev[..k]` → `v`, `prev[..k]`) occurrences ending at
+    /// positions in `(start, ngrams.upto)` — those the as-of-`start` view must
+    /// not see.
+    fn late(&self, start: usize, prev: &[u32; ORDERS], v: u32) -> [[u32; 2]; ORDERS] {
+        let mut c = [[0u32; 2]; ORDERS];
+        for q in start + 1..self.ngrams.upto {
+            for k in 0..ORDERS.min(q) {
+                if self.known[q - 1 - k] != prev[k] {
+                    break;
+                }
+                c[k][1] += 1;
+                c[k][0] += (self.known[q] == v) as u32;
+            }
+        }
+        c
+    }
+
+    /// Dense features for the K candidates of a row predicting position
+    /// `start + 1 + row` given the preceding tokens `prev` (nearest first),
+    /// using the session statistics as of `start` (no peeking past the seed).
+    fn features(
+        &self,
+        start: usize,
+        prev: &[u32; ORDERS],
+        ids: &[u32; K],
+        vals: &[f32; K],
+        row: usize,
+    ) -> [[f32; NF]; K] {
+        let ng = &self.ngrams;
+        let recent_lo = (start + 1).saturating_sub(RECENT);
+        let recent_hi = (start + 1).min(self.known.len());
+        let depth = row as f32 / K as f32;
+        std::array::from_fn(|j| {
+            let v = ids[j];
+            let mut f = [0f32; NF];
+            if (1..=3).contains(&j) {
+                f[j - 1] = 1.0;
+            }
+            let late = self.late(start, prev, v);
+            for k in 0..ORDERS {
+                if prev[k] == NONE {
+                    break;
+                }
+                let c = ctx_hash(&prev[..=k]);
+                let n = ng.next[k].get(&next_hash(c, v)).copied().unwrap_or(0).saturating_sub(late[k][0]);
+                let d = ng.ctx[k].get(&c).copied().unwrap_or(0).saturating_sub(late[k][1]);
+                if n > 0 {
+                    f[3 + 2 * k] = n as f32 / d as f32;
+                    f[4 + 2 * k] = 1.0;
+                }
+            }
+            if recent_lo < recent_hi && self.known[recent_lo..recent_hi].contains(&v) {
+                f[3 + 2 * ORDERS] = 1.0;
+            }
+            f[4 + 2 * ORDERS] = (vals[j] - vals[0]) * depth;
+            f
+        })
+    }
+
+    /// Choose the proposal for each row from its top-K.
     /// `ids`/`vals` are `rows × K` row-major as produced by the top-K kernel.
-    pub fn propose(&mut self, start: usize, ids: &[i32], vals: &[f32], rows: usize) -> Vec<u32> {
+    pub fn propose(&mut self, start: usize, seed: u32, ids: &[u32], vals: &[f32], rows: usize) -> Vec<u32> {
+        self.dump_record(b'P', &[start as u64, seed as u64, rows as u64], ids);
+        self.dump_record(b'L', &[], &vals.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+        if self.known.len() <= start {
+            self.known.resize(start + 1, NONE);
+        }
+        self.known[start] = seed;
+        self.ngrams.advance(&self.known);
         let mut cyc = Cycle {
             start,
             ids: Vec::with_capacity(rows),
@@ -138,14 +417,25 @@ impl OnlineDraftTuner {
             ranks: vec![None; rows],
             picked: Vec::with_capacity(rows),
         };
-        let mut out = Vec::with_capacity(rows);
+        let mut out: Vec<u32> = Vec::with_capacity(rows);
         for r in 0..rows {
             let mut order: [usize; K] = std::array::from_fn(|j| j);
             let v = &vals[r * K..(r + 1) * K];
             order.sort_by(|&a, &b| v[b].total_cmp(&v[a]).then(a.cmp(&b)));
-            let row_ids: [u32; K] = std::array::from_fn(|j| ids[r * K + order[j]] as u32);
+            let row_ids: [u32; K] = std::array::from_fn(|j| ids[r * K + order[j]]);
             let row_vals: [f32; K] = std::array::from_fn(|j| v[order[j]]);
-            let pick = 0usize;
+            let pick = if self.mode == Mode::On {
+                // Proposal chain: the rows before this one are assumed accepted.
+                let p = (start + 1 + r) as isize;
+                let prev: [u32; ORDERS] = std::array::from_fn(|k| {
+                    let q = p - 1 - k as isize;
+                    if q > start as isize { out[q as usize - start - 1] } else { self.tok(q) }
+                });
+                let f = self.features(start, &prev, &row_ids, &row_vals, r);
+                self.learner.pick(&row_vals, &f)
+            } else {
+                0
+            };
             out.push(row_ids[pick]);
             cyc.picked.push(pick as u8);
             cyc.ids.push(row_ids);
@@ -156,8 +446,9 @@ impl OnlineDraftTuner {
     }
 
     /// Record the tokens committed after the seed at `start` (accepted drafts
-    /// plus the bonus) and resolve every pending row they label.
+    /// plus the bonus) and train on every pending row they label.
     pub fn observe(&mut self, start: usize, committed_after_seed: &[u32], accepted: usize) {
+        self.dump_record(b'O', &[start as u64, accepted as u64, committed_after_seed.len() as u64], committed_after_seed);
         self.stats.cycles += 1;
         self.stats.accepted += accepted as u64;
         // A rewind invalidates everything past the seed.
@@ -165,14 +456,15 @@ impl OnlineDraftTuner {
         self.pending.retain(|c| c.start <= start);
         let end = start + 1 + committed_after_seed.len();
         if self.known.len() < end {
-            self.known.resize(end, u32::MAX);
+            self.known.resize(end, NONE);
         }
         self.known[start + 1..end].copy_from_slice(committed_after_seed);
+        self.ngrams.advance(&self.known);
 
         while let Some(c) = self.pending.front_mut() {
             for (r, rank) in c.ranks.iter_mut().enumerate() {
                 if rank.is_none() {
-                    if let Some(&tok) = self.known.get(c.start + 1 + r).filter(|&&t| t != u32::MAX) {
+                    if let Some(&tok) = self.known.get(c.start + 1 + r).filter(|&&t| t != NONE) {
                         let pos = c.ids[r].iter().position(|&id| id == tok).unwrap_or(K);
                         *rank = Some(pos as u8);
                     }
@@ -191,30 +483,47 @@ impl OnlineDraftTuner {
 
     fn finalize(&mut self, c: &Cycle) {
         let ranks: Vec<usize> = c.ranks.iter().map(|r| r.unwrap() as usize).collect();
+        // Train the rows a greedy chain reaches: every earlier label was the argmax.
+        for (r, &y) in ranks.iter().enumerate() {
+            if y >= K {
+                break;
+            }
+            let p = (c.start + 1 + r) as isize;
+            let prev: [u32; ORDERS] = std::array::from_fn(|k| self.tok(p - 1 - k as isize));
+            let f = self.features(c.start, &prev, &c.ids[r], &c.vals[r], r);
+            self.learner.train(&c.vals[r], &f, y);
+            if y != 0 {
+                break;
+            }
+        }
         let s = &mut self.stats;
         s.finalized += 1;
         for (j, o) in s.oracle.iter_mut().enumerate() {
             *o += ranks.iter().take_while(|&&r| r < (1 << j)).count() as u64;
         }
-        s.picked_prefix += ranks
+        let prefix = ranks
             .iter()
             .zip(&c.picked)
             .take_while(|(r, p)| **r == **p as usize)
-            .count() as u64;
-        if let Some(&r) = ranks.iter().find(|&&r| r != 0) {
-            let bin = match r {
-                1 => 0,
-                2 => 1,
-                3 => 2,
-                4..=7 => 3,
-                8..=15 => 4,
-                _ => 5,
-            };
-            s.first_miss[bin] += 1;
+            .count();
+        s.picked_prefix += prefix as u64;
+        for (r, &p) in ranks.iter().zip(&c.picked).take(prefix + 1) {
+            if p != 0 {
+                s.overrides += 1;
+                s.overrides_right += (*r == p as usize) as u64;
+            }
         }
     }
 
-    fn report(&self, tag: &str) {
+    /// `(finalized cycles, argmax τ, tuner-picked τ)` at the recorded block
+    /// starts — the offline replay's figure of merit.
+    pub fn summary(&self) -> (u64, f64, f64) {
+        let s = &self.stats;
+        let f = s.finalized.max(1) as f64;
+        (s.finalized, s.oracle[0] as f64 / f, s.picked_prefix as f64 / f)
+    }
+
+    pub fn report(&self, tag: &str) {
         let s = &self.stats;
         if s.cycles == 0 {
             return;
@@ -226,15 +535,19 @@ impl OnlineDraftTuner {
             .enumerate()
             .map(|(j, &v)| format!("k{}={:.3}", 1 << j, v as f64 / f))
             .collect();
+        let l = &self.learner;
         eprintln!(
-            "[dflash-online] {tag}: mode={:?} cycles={} tau={:.3} finalized={} picked_tau={:.3} oracle[{}] first_miss_rank[1,2,3,4-7,8-15,>=16]={:?}",
+            "[dflash-online] {tag}: mode={:?} cycles={} tau={:.3} finalized={} picked_tau={:.3} overrides={}/{} oracle[{}] scale={:.3} w={:.2?}",
             self.mode,
             s.cycles,
             s.accepted as f64 / s.cycles as f64,
             s.finalized,
             s.picked_prefix as f64 / f,
+            s.overrides_right,
+            s.overrides,
             o.join(" "),
-            s.first_miss,
+            l.scale,
+            l.w,
         );
     }
 }
