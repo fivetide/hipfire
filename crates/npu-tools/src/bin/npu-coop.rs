@@ -60,7 +60,6 @@ use railgun::npu::{clflush, Bo, Device, HwCtx, ERT_STATE_COMPLETED};
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "usage: npu-coop [--mode empty|gemm|alias] [--shape M N K] [--slots S] [--nslots R] [--rounds N] [--timeout-ms T]";
-const PCI_BUS_ID: &str = "0000:bf:00.0";
 const MAX_OPC: u32 = 2048;
 const POISON: u8 = 0xA5;
 const SETS: usize = 2;
@@ -291,9 +290,10 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
     let set_of = |r: usize, j: usize| ((r * s_runs + j) / r_slots) % SETS;
 
     // ---- GPU ----
-    let rt = HipRuntime::load_for_pci(PCI_BUS_ID)?;
+    let pci = railgun::npu::fclk::igpu_pci();
+    let rt = HipRuntime::load_for_pci(&pci)?;
     let arch = rt.device_arch()?;
-    if arch != coop_gpu::ARCH { return Err(format!("device {PCI_BUS_ID} is {arch}, kernels are {}-only", coop_gpu::ARCH)); }
+    if arch != coop_gpu::ARCH { return Err(format!("device {pci} is {arch}, kernels are {}-only", coop_gpu::ARCH)); }
     let khz = rt.wall_clock_khz()?;
     let us_per_tick = 1e3 / khz as f64;
     let module = rt.load_module(coop_gpu::CODE_OBJECT)?;
@@ -317,7 +317,7 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
     let stats = rt.allocate(s_runs * coop_gpu::PUBLISH_RECORD_BYTES, None)?;
     let src_a = rt.allocate(if gemm { SETS * a_bytes } else { 16 }, None)?;
     let readback = rt.allocate(if gemm { s_runs * c_bytes } else { 16 }, None)?;
-    println!("gpu: arch={arch} pci={PCI_BUS_ID} CUs={} wall_clock={khz} kHz; ring/A/C = anon host pages {} / {} / {} B (NPU userptr BO, hipHostRegister)",
+    println!("gpu: arch={arch} pci={pci} CUs={} wall_clock={khz} kHz; ring/A/C = anon host pages {} / {} / {} B (NPU userptr BO, hipHostRegister)",
         rt.compute_units()?, ring_sh.len, a_sh.len, c_sh.len);
     let mut b_bo = dev.shmem_bo(d.args[1].bytes.max(4096))?;
     let sets: Vec<([Vec<u8>; 2], Vec<i32>)> = if gemm { (0..SETS).map(|s| operand_set(&d, m, n, k, s)).collect() } else { Vec::new() };
