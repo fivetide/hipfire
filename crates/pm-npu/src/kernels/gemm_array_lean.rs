@@ -334,6 +334,21 @@ impl ArrayDesign {
     pub fn append_lean_run_body(&self, txn: &mut Txn, arena_base: [u64; 3], extra: &[(u32, dma::Direction, u32)])
         -> Result<(), String>
     {
+        self.lean_body(txn, arena_base, extra, true)
+    }
+
+    /// [`ArrayDesign::append_lean_run_body`] that does not rewrite the shim BD words / S2MM controller ids (only DDR
+    /// patches and tasks). Valid ONLY when the previous body executed on this hardware context was a body of this SAME
+    /// design (not merely the same PDI: e.g. [`ArrayDesign::with_a_repeat`] shares the PDI but not the shim BDs).
+    pub fn append_lean_run_body_same_design(&self, txn: &mut Txn, arena_base: [u64; 3], extra: &[(u32, dma::Direction, u32)])
+        -> Result<(), String>
+    {
+        self.lean_body(txn, arena_base, extra, false)
+    }
+
+    fn lean_body(&self, txn: &mut Txn, arena_base: [u64; 3], extra: &[(u32, dma::Direction, u32)], shim_bd_words: bool)
+        -> Result<(), String>
+    {
         let plan = self.lean_plan()?;
         let geo = &self.geo;
         let topo = geo.topo;
@@ -438,7 +453,7 @@ impl ArrayDesign {
         }
         for &(loc, t) in &mem_requeues { t.emit_txn(loc, txn); }
         // 7. shim BDs / DDR patches / tokens / tasks.
-        emit_shim_at(txn, geo, arena_base);
+        emit_shim_at(txn, geo, arena_base, shim_bd_words);
         // 8. cores last, then wait for the C tokens.
         for &tile in &cores { txn.mask_write(tile.address(regs::core::CORE_CONTROL), 1, 1); }
         emit_sync(txn, topo, false);

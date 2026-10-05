@@ -1534,17 +1534,21 @@ pub(crate) fn build_cdo(topo: Topo, programs: [&[u8]; 2], start: bool) -> Cdo {
 }
 
 /// Shim BDs (DDR-patched), token controller id and finite shim tasks for every shim of the topology.
-fn emit_shim(txn: &mut Txn, geo: &Geometry) { emit_shim_at(txn, geo, [0; 3]) }
+fn emit_shim(txn: &mut Txn, geo: &Geometry) { emit_shim_at(txn, geo, [0; 3], true) }
 
 /// [`emit_shim`] with every DDR patch advanced by `base[arg]` bytes (the arena offset of that run in args 0..=2).
-fn emit_shim_at(txn: &mut Txn, geo: &Geometry, base: [u64; 3]) {
+/// `!bd_words`: the shim BD words and S2MM controller ids written by an earlier body of the SAME design are still in
+/// place, so only the DDR patches and tasks are emitted (the patch rewrites the one address word that differs).
+fn emit_shim_at(txn: &mut Txn, geo: &Geometry, base: [u64; 3], bd_words: bool) {
     let topo = geo.topo;
     let kc = geo.kc;
     for col in 0..topo.cols {
         let shim = shim_loc(col as u32);
         let (a_off, b_off, c_off) = geo.column_offsets(col);
-        txn.mask_write(shim.address(regs::shim::DMA_S2MM_0_CTRL), 0xf00, 0x1f00);
-        if topo.is_pair() { txn.mask_write(shim.address(regs::shim::DMA_S2MM_0_CTRL + 8), 0xf00, 0x1f00); }
+        if bd_words {
+            txn.mask_write(shim.address(regs::shim::DMA_S2MM_0_CTRL), 0xf00, 0x1f00);
+            if topo.is_pair() { txn.mask_write(shim.address(regs::shim::DMA_S2MM_0_CTRL + 8), 0xf00, 0x1f00); }
+        }
         // (bd id, argument, byte offset, words, direction, channel, token)
         let streams = if topo.is_pair() {
             // B MM2S0 (BD0), C rows 0,1 S2MM0 (BD1), A half MM2S1 (BD2), C rows 2,3 S2MM1 (BD3): the C argument
@@ -1576,7 +1580,7 @@ fn emit_shim_at(txn: &mut Txn, geo: &Geometry, base: [u64; 3]) {
             s
         };
         for &(id, arg, offset, words, ..) in &streams {
-            Bd::new(0, words as u32).emit_txn(shim, id, txn);
+            if bd_words { Bd::new(0, words as u32).emit_txn(shim, id, txn); }
             txn.ddr_patch(Bd::address(shim, id) + 4, arg, offset as u64 + base[arg as usize]);
         }
         for &(bd, arg, _, _, direction, channel, token) in streams.iter().rev() {
@@ -1661,7 +1665,7 @@ fn emit_dynamic_body(txn: &mut Txn, geo: &Geometry, per_column_sync: bool, base:
             if tile.kind() == TileType::Compute { task.enable_txn(tile, txn); }
         }
     }
-    emit_shim_at(txn, geo, base);
+    emit_shim_at(txn, geo, base, true);
     // 6. cores last, then wait for the C token(s).
     for &tile in &cores { txn.mask_write(tile.address(regs::core::CORE_CONTROL), 1, 1); }
     emit_sync(txn, topo, per_column_sync);

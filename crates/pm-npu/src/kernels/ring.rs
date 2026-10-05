@@ -358,7 +358,7 @@ fn build(mut design: ArrayDesign, body: Option<Bodies>, ring: RingLayout, slots:
             if body == Bodies::LeanFirst || (body == Bodies::Lean && i > 0) {
                 let forced: &[(u32, crate::dma::Direction, u32)] =
                     if matches!(neg, Some(Neg::SkipLeanRequeue(skip)) if skip == i) { &[] } else { &LEAN_FORCED };
-                design.append_lean_run_body(&mut txn, arena, forced)
+                design.append_lean_run_body_same_design(&mut txn, arena, forced)
                     .unwrap_or_else(|e| panic!("lean body of run {i}: {e}"));
             } else {
                 design.append_run_body(&mut txn, arena);
