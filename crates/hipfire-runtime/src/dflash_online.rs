@@ -25,8 +25,12 @@
 //! Negative results (offline replay, `examples/dflash_online_replay.rs`,
 //! Qwen3.5-9B + 9B DFlash draft, gfx1151): a rank-16 LoRA on the LM head over
 //! the draft hidden, a per-token bias, and the target's stale verify argmax
-//! past the rejection all lowered or did not move τ; the LoRA only memorizes
-//! (in-sample after 4 epochs essay τ 1.10 → 1.88, online 1.10 → 0.94).
+//! past the rejection all lowered or did not move τ. Within one request the
+//! LoRA only memorizes (in-sample after 4 epochs essay τ 1.10 → 1.88, online
+//! 1.10 → 0.94). With its weights carried across requests (leave-one-out over
+//! 10 sessions) a low-rate LoRA adds +0.6 pp τ (×1.062 → ×1.068), but it needs
+//! a 245 KB hidden D2H and ~1 ms of host work per cycle, loses 0.5 pp cold,
+//! and its learning rate is sharply peaked. It is not worth carrying.
 
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::{HashMap, VecDeque};
