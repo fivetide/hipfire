@@ -254,24 +254,16 @@ fn nb_probs(p: &[[(u32, f32); K]], r: usize) -> [&[(u32, f32)]; 3] {
     [get(r.checked_sub(1)), get(Some(r + 1)), get(Some(r + 2))]
 }
 
-/// Row-depth buckets with separate weights: row 0, rows 1..=3, rows 4+.
-const BUCKETS: usize = 3;
-fn bucket(row: usize) -> usize {
-    match row {
-        0 => 0,
-        1..=3 => 1,
-        _ => 2,
-    }
-}
-
-/// Dense re-ranker: `score_j = scale·(l_j − l_0) + w·f_j`, Adagrad, one
-/// weight set per row-depth bucket.
+/// Dense re-ranker: `score_j = scale·(l_j − l_0) + w·f_j`, Adagrad. One weight
+/// set for every row depth: per-depth sets learn too slowly from a cold start
+/// (own-start simulation: 3 buckets ×1.072, 2 ×1.079, 1 ×1.083); depth enters
+/// through the depth-scaled logit-gap feature.
 struct Learner {
     hp: Hyper,
-    scale: [f32; BUCKETS],
-    g_scale: [f32; BUCKETS],
-    w: [[f32; NF]; BUCKETS],
-    gw: [[f32; NF]; BUCKETS],
+    scale: f32,
+    g_scale: f32,
+    w: [f32; NF],
+    gw: [f32; NF],
 }
 
 fn adagrad(p: &mut f32, acc: &mut f32, g: f32, lr: f32) {
@@ -282,23 +274,23 @@ fn adagrad(p: &mut f32, acc: &mut f32, g: f32, lr: f32) {
 impl Learner {
     fn new(hp: Hyper) -> Self {
         Self {
-            scale: [1.0; BUCKETS],
-            g_scale: [hp.acc0; BUCKETS],
-            w: [[0.0; NF]; BUCKETS],
-            gw: [[hp.acc0; NF]; BUCKETS],
+            scale: 1.0,
+            g_scale: hp.acc0,
+            w: [0.0; NF],
+            gw: [hp.acc0; NF],
             hp,
         }
     }
 
-    fn scores(&self, b: usize, vals: &[f32; K], f: &[[f32; NF]; K]) -> [f32; K] {
+    fn scores(&self, vals: &[f32; K], f: &[[f32; NF]; K]) -> [f32; K] {
         std::array::from_fn(|j| {
-            self.scale[b] * (vals[j] - vals[0])
-                + self.w[b].iter().zip(&f[j]).map(|(w, x)| w * x).sum::<f32>()
+            self.scale * (vals[j] - vals[0])
+                + self.w.iter().zip(&f[j]).map(|(w, x)| w * x).sum::<f32>()
         })
     }
 
-    fn pick(&self, row: usize, vals: &[f32; K], f: &[[f32; NF]; K]) -> usize {
-        let s = self.scores(bucket(row), vals, f);
+    fn pick(&self, vals: &[f32; K], f: &[[f32; NF]; K]) -> usize {
+        let s = self.scores(vals, f);
         let best = (0..K).fold(0, |b, j| if s[j] > s[b] { j } else { b });
         if s[best] - s[0] > self.hp.margin {
             best
@@ -307,17 +299,15 @@ impl Learner {
         }
     }
 
-    fn train(&mut self, row: usize, vals: &[f32; K], f: &[[f32; NF]; K], y: usize) {
-        let b = bucket(row);
-        let s = self.scores(b, vals, f);
+    fn train(&mut self, vals: &[f32; K], f: &[[f32; NF]; K], y: usize) {
+        let s = self.scores(vals, f);
         let m = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let e: [f32; K] = std::array::from_fn(|j| (s[j] - m).exp());
         let sum: f32 = e.iter().sum();
         let g: [f32; K] = std::array::from_fn(|j| e[j] / sum - (j == y) as u32 as f32);
         let gs: f32 = (0..K).map(|j| g[j] * (vals[j] - vals[0])).sum();
-        adagrad(&mut self.scale[b], &mut self.g_scale[b], gs, self.hp.lr);
-        let (w, gw) = (&mut self.w[b], &mut self.gw[b]);
-        for (k, (wk, gk_acc)) in w.iter_mut().zip(gw.iter_mut()).enumerate() {
+        adagrad(&mut self.scale, &mut self.g_scale, gs, self.hp.lr);
+        for (k, (wk, gk_acc)) in self.w.iter_mut().zip(self.gw.iter_mut()).enumerate() {
             let gk: f32 = (0..K).map(|j| g[j] * f[j][k]).sum();
             adagrad(wk, gk_acc, gk, self.hp.lr);
         }
@@ -671,7 +661,7 @@ impl OnlineDraftTuner {
                     nb,
                     nb_probs(&probs, r),
                 );
-                self.learner.pick(r, &row_vals, &f)
+                self.learner.pick(&row_vals, &f)
             } else {
                 0
             };
@@ -749,7 +739,7 @@ impl OnlineDraftTuner {
                 neighbors(&c.ids, r),
                 nb_probs(&row_probs(&c.ids, &c.vals), r),
             );
-            self.learner.train(r, &c.vals[r], &f, y);
+            self.learner.train(&c.vals[r], &f, y);
             if y != 0 {
                 break;
             }
@@ -799,7 +789,7 @@ impl OnlineDraftTuner {
             .collect();
         let l = &self.learner;
         eprintln!(
-            "[dflash-online] {tag}: mode={:?} cycles={} tau={:.3} finalized={} picked_tau={:.3} overrides={}/{} oracle[{}] host_us/cycle[propose={:.0} rerank={:.0} observe={:.0}] scale={:.3?} w={:.2?}",
+            "[dflash-online] {tag}: mode={:?} cycles={} tau={:.3} finalized={} picked_tau={:.3} overrides={}/{} oracle[{}] host_us/cycle[propose={:.0} rerank={:.0} observe={:.0}] scale={:.3} w={:.2?}",
             self.mode,
             s.cycles,
             s.accepted as f64 / s.cycles as f64,
