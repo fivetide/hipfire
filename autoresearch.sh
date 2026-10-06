@@ -3,16 +3,18 @@
 #   q9: Qwen3.5-9B MQ4 + qwen35-9b-dflash-mq4 (qwen35 chain DFlash, strong draft)
 #   q8: Qwen3-8B MQ4 + qwen3-8b-dflash        (generic llama-family DFlash, weak draft)
 #
-# Primary: online_tokwin_ratio = geomean over 10 committed long prompts x 2 pairs of
-#   (tokens per verify window, tuned) / (tokens per verify window, shipping DFlash). One cold
-#   request per fresh daemon, as a server sees a new conversation. Greedy decode is deterministic
-#   per policy, so this is exact for a given build (no thermal noise); per-prompt values still
-#   move when a policy change re-rolls batched-verify near-ties, hence 20 prompts.
-#   The shipping arm (tuner unset) is cached per pair+prompt+max_tokens (it never runs tuner
-#   code); delete $C/shipping if non-tuner engine code changes.
-# Why not replay as primary: fixed-start replay of argmax sessions cannot see that longer
-#   acceptance moves later block starts onto harder positions; it overstated two changes
-#   (+5% replay, -1% online over 20 prompts). Replay stays a diagnostic.
+# Primary: sim_tokwin_ratio = geomean over both pairs of the per-pair geomean (10 committed long
+#   prompts, benchmarks/prompts/online_tune/) of tokens per verify window, tuned policy vs argmax,
+#   simulated over SWEEP dumps (HIPFIRE_DFLASH_ONLINE_TUNE=sweep: the draft's top-K recorded at
+#   every position of the greedy text). `dflash_online_replay --simulate` walks each policy with
+#   its OWN block starts (accept the longest matching prefix, start after the bonus), one cold
+#   request per session -- what a server does, minus batched-verify near-tie text flips.
+#   Validated: simulated argmax windows == shipping windows (q9 code_edit 80 == 80, all sessions
+#   within a few %); baseline policy sim q9 x1.024 / q8 x1.088 vs online x1.036 / x1.095;
+#   per-prompt online-vs-sim residual SD 2.8%. Both arms share one text, so the ratio carries no
+#   text-divergence noise (online A/B: ~+-1% per 10-prompt pair).
+# Fixed-start replay of argmax sessions is NOT used: it ignores that a policy accepting more
+#   moves later block starts onto harder positions (overstated two changes by ~5%).
 set -euo pipefail
 cd "$(dirname "$0")"
 export LD_LIBRARY_PATH=$HOME/.hipfire/rocm-merged/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
@@ -34,65 +36,43 @@ if [ ! -f "$Q8HOME/config.toml" ]; then
   { sed 's/^dflash = "off"/dflash = "on"/' "$HOME/.hipfire/config.toml"
     printf '\n[developer]\ndflash_draft = "%s"\n' "$HOME/.hipfire/models/qwen3-8b-dflash.hfq"; } >"$Q8HOME/config.toml"
 fi
-
 declare -A MODEL=([q9]=$HOME/.hipfire/models/qwen3.5-9b.mq4 [q8]=$HOME/.hipfire/models/qwen3-8b.mq4)
 declare -A HOMEDIR=([q9]="" [q8]=$Q8HOME)
-declare -A DUMPS=([q9]=$C/v3 [q8]=$C/q8)
 declare -A MAXTOK=([q9]=1536 [q8]=1024)
 
-kill -STOP 1500 2>/dev/null || true   # user's llama-server: GPU contention
-trap 'kill -CONT 1500 2>/dev/null || true' EXIT
-
 out=$(mktemp -d)
-bench() { # pair outfile-stem prompt-file mode(stats|on|off) [dump]
-  local tune=(); [ "$4" = off ] || tune=(HIPFIRE_DFLASH_ONLINE_TUNE="$4")
-  env ${HOMEDIR[$1]:+HIPFIRE_HOME=${HOMEDIR[$1]}} "${tune[@]}" ${5:+HIPFIRE_DFLASH_ONLINE_DUMP=$5} \
-    timeout --foreground 900 "$HF" bench "${MODEL[$1]}" --spec dflash --runs 1 --warmups 0 \
-    --max-tokens "${MAXTOK[$1]}" --backend noslots --workload stateless \
-    --prompt-file "$3" --json >"$2.json" 2>"$2.err" \
-    || { tail -30 "$2.err" >&2; echo "bench $1 $2 FAILED" >&2; exit 1; }
-}
-
 for pair in q9 q8; do
-  mkdir -p "${DUMPS[$pair]}" "$C/shipping/$pair"
+  mkdir -p "$C/sweep/$pair"
   dumps=()
   for f in "$P"/*.txt; do
-    n=$(basename "$f" .txt); key="$n-$(md5sum <"$f" | cut -c1-12)-${MAXTOK[$pair]}"
-    d="${DUMPS[$pair]}/$n-$(md5sum <"$f" | cut -c1-12).bin"
-    [ -s "$d" ] || bench "$pair" "$out/dump" "$f" stats "$d"
+    d="$C/sweep/$pair/$(basename "$f" .txt).bin"
+    if [ ! -s "$d" ]; then   # one-time, ~2 min per prompt
+      kill -STOP 1500 2>/dev/null || true
+      env ${HOMEDIR[$pair]:+HIPFIRE_HOME=${HOMEDIR[$pair]}} HIPFIRE_DFLASH_ONLINE_TUNE=sweep \
+        HIPFIRE_DFLASH_ONLINE_DUMP="$d" timeout --foreground 1800 "$HF" bench "${MODEL[$pair]}" \
+        --spec dflash --runs 1 --warmups 0 --max-tokens "${MAXTOK[$pair]}" --backend noslots \
+        --workload stateless --prompt-file "$f" --json >"$out/sw.json" 2>"$out/sw.err" \
+        || { kill -CONT 1500 2>/dev/null; tail -30 "$out/sw.err" >&2; exit 1; }
+      kill -CONT 1500 2>/dev/null || true
+    fi
     dumps+=("$d")
-    [ -s "$C/shipping/$pair/$key.err" ] || bench "$pair" "$C/shipping/$pair/$key" "$f" off
-    bench "$pair" "$out/$pair.$n" "$f" on
-    cp "$C/shipping/$pair/$key.err" "$out/$pair.$n.A.err"; cp "$C/shipping/$pair/$key.json" "$out/$pair.$n.A.json"
   done
-  "$REPLAY" --carry-loo "${dumps[@]}" >"$out/$pair.replay.txt"
+  "$REPLAY" --simulate "${dumps[@]}" >"$out/$pair.sim.txt"
+  cat "$out/$pair.sim.txt" >&2
 done
 
 python3 - "$out" <<'EOF'
-import json, math, os, re, sys
+import math, os, re, sys
 d = sys.argv[1]
 g = lambda xs: math.exp(sum(map(math.log, xs)) / len(xs))
-def run(stem):
-    err = open(os.path.join(d, stem + ".err")).read()
-    toks, wins = map(int, re.findall(r"decode \((\d+) tok, (\d+) windows", err)[-1])
-    return toks / wins, json.load(open(os.path.join(d, stem + ".json")))["decode_tok_s"]["median"]
-allw, alls = [], []
+pairs = []
 for pair in ("q9", "q8"):
-    w, s = [], []
-    for f in sorted(os.listdir(d)):
-        m = re.match(pair + r"\.([a-z_]+)\.err$", f)
-        if not m:
-            continue
-        n = m.group(1)
-        b, a = run(f"{pair}.{n}"), run(f"{pair}.{n}.A")
-        w.append(b[0] / a[0]); s.append(b[1] / a[1])
-        print("METRIC %s_%s_tokwin=%.4f" % (pair, n, b[0] / a[0]))
-    print("METRIC %s_tokwin_ratio=%.4f" % (pair, g(w)))
-    print("METRIC %s_tok_s_ratio=%.4f" % (pair, g(s)))
-    rep = open(os.path.join(d, pair + ".replay.txt")).read()
-    print("METRIC %s_replay=%s" % (pair, re.search(r"sessions: ([0-9.]+)", rep).group(1)))
-    allw += w; alls += s
-print("METRIC online_tokwin_ratio=%.4f" % g(allw))
-print("METRIC online_tok_s_ratio=%.4f" % g(alls))
+    t = open(os.path.join(d, pair + ".sim.txt")).read()
+    r = float(re.search(r"SIM GEOMEAN tuned/argmax tok/win over \d+ sessions: ([0-9.]+)", t).group(1))
+    pairs.append(r)
+    print("METRIC %s_sim=%.4f" % (pair, r))
+    for n, a, b in re.findall(r"/([a-z_]+)\.bin: argmax tok/win=([0-9.]+) .*? tuned tok/win=([0-9.]+)", t):
+        print("METRIC %s_sim_%s=%.4f" % (pair, n, float(b) / float(a)))
+print("METRIC sim_tokwin_ratio=%.4f" % g(pairs))
 EOF
 rm -rf "$out"
