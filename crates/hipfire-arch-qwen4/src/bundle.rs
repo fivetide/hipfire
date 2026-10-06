@@ -1366,6 +1366,11 @@ impl Qwen4Bundle {
         self.session = Some(cache);
     }
 
+    /// The attached session cache, if any.
+    pub fn session_cache(&self) -> Option<&SessionCache> {
+        self.session.as_ref()
+    }
+
     /// Run `f` with the cache taken out, so it can drive `self` as its
     /// [`SessionState`]. `None` without a cache.
     fn with_session<R>(&mut self, f: impl FnOnce(&mut SessionCache, &mut Self) -> R) -> Option<R> {

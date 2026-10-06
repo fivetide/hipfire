@@ -1336,4 +1336,24 @@ mod tests {
         .expect("shared prefix should resume");
         assert_eq!(plan.boundary, 128);
     }
+
+    #[test]
+    fn pop_lru_returns_oldest_unpinned_and_never_a_pinned_entry() {
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
+        let d = test_domain("pop");
+        for p in [128, 256, 384] {
+            pool.insert(d.clone(), p, p, HostBlob { bytes: 100 });
+        }
+        assert!(pool.pin(&d, 128, 128));
+        assert_eq!(pool.pop_lru().map(|blob| blob.bytes), Some(100));
+        assert!(
+            !pool.contains(&d, 256, 256),
+            "oldest unpinned (256) goes first"
+        );
+        assert_eq!(pool.total_bytes(), 200);
+        assert!(pool.pop_lru().is_some());
+        assert!(pool.contains(&d, 128, 128));
+        assert!(pool.pop_lru().is_none(), "only a pinned entry remains");
+        assert_eq!(pool.total_bytes(), 100);
+    }
 }
