@@ -1,8 +1,11 @@
 //! Offline replay of `HIPFIRE_DFLASH_ONLINE_DUMP` records through the online
 //! draft tuner (developer-only). Block starts and emitted text are the
 //! recorded ones, so the reported `picked τ` is the tuner's acceptance at those
-//! starts on that text — a deterministic, alignment-free estimate of the
-//! online τ (online, a longer accept moves the next block start).
+//! starts on that text. Replaying a dump of the *same* policy reproduces its
+//! online τ exactly; scoring a *different* policy on an argmax session
+//! overstates it when it accepts more, because online its later block starts
+//! land on harder positions (see the 2026-10-06 perf-checkpoint amendment).
+//! Use it to rank ideas, then confirm online.
 //! Each dump is one session; the summary covers its last request.
 //!
 //! `--first N`: score only the first N verify cycles of each session (short
