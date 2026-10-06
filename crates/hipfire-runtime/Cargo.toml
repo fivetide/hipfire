@@ -213,6 +213,13 @@ required-features = []
 name = "sample_batch_exact_oracle"
 required-features = ["lab"]
 
+# Offline replay/simulator for HIPFIRE_DFLASH_ONLINE_TUNE dumps (developer
+# research tool, no GPU). Gated (`--features lab`) to keep the
+# ungated-example ratchet flat.
+[[example]]
+name = "dflash_online_replay"
+required-features = ["lab"]
+
 # Gate F1: FA2 N=1024 vs two N=512 bit-identity oracle (throwaway; repaired positions).
 [[example]]
 name = "tmp_fa2_n1024_oracle"

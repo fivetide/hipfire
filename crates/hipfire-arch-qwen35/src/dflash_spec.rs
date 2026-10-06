@@ -954,6 +954,9 @@ impl Speculator for DflashSpeculator {
             .df
             .as_mut()
             .ok_or_else(|| SINGLETON_VACANT.to_string())?;
+        if let Some(t) = df.draft_scratch.online.as_mut() {
+            t.seed_prompt(prompt_tokens);
+        }
 
         // Mirror the daemon's pre-seed drafter setup (generate_dflash 4064-4072):
         // always clear the host hidden buffer; on a full prefill drop the draft's
@@ -1270,6 +1273,11 @@ impl Speculator for DflashSpeculator {
                 Some(&mut df.verify_pm4),
             )
         };
+        if df.ddtree.is_none() {
+            if let (Ok(r), Some(t)) = (&result, df.draft_scratch.online.as_mut()) {
+                t.observe(position, &r.committed[1..], r.accepted);
+            }
+        }
 
         let lowered = result
             .map(lower_qwen35)
@@ -1475,6 +1483,13 @@ impl Speculator for DflashSpeculator {
         // the full block; the controller re-shrinks only after a fresh
         // 8-cycle window (no cross-request stale-history shrink).
         self.adaptive.reset();
+        if let Some(t) = self
+            .df
+            .as_mut()
+            .and_then(|df| df.draft_scratch.online.as_mut())
+        {
+            t.reset();
+        }
     }
 
     fn requires_greedy(&self) -> bool {
