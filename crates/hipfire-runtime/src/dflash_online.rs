@@ -104,7 +104,7 @@ impl Default for Hyper {
             lr: 0.2,
             acc0: 1.0,
             margin: 0.0,
-            inject: 4.0,
+            inject: 1.0,
             carry: true,
         }
     }
