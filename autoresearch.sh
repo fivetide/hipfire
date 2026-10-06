@@ -3,15 +3,16 @@
 #   q9: Qwen3.5-9B MQ4 + qwen35-9b-dflash-mq4 (qwen35 chain DFlash, strong draft)
 #   q8: Qwen3-8B MQ4 + qwen3-8b-dflash        (generic llama-family DFlash, weak draft)
 #
-# Primary (deterministic): replay_tau_ratio = geomean of the two pairs' replay ratios. Per pair:
-#   geomean over the 10 committed long-session prompts (benchmarks/prompts/online_tune/) of
-#   tuner-picked tau / argmax tau on the recorded argmax session (same text and block starts,
-#   prompt-seeded; dumps made once with HIPFIRE_DFLASH_ONLINE_TUNE=stats), each session replayed
-#   after the other 9 in one tuner (--carry-loo: weights carried as in a long-running daemon,
-#   never trained on the scored session). *_cold = fresh tuner per request.
-# Online check: paired A/B (A = shipping DFlash, tuner unset; B = on), alternating order,
-#   fresh daemon per run -> geomean tau and decode tok/s ratios (texts may differ at near-ties:
-#   batched-verify numerics, so online tau is noisier than replay).
+# Primary: online_tokwin_ratio = geomean over 10 committed long prompts x 2 pairs of
+#   (tokens per verify window, tuned) / (tokens per verify window, shipping DFlash). One cold
+#   request per fresh daemon, as a server sees a new conversation. Greedy decode is deterministic
+#   per policy, so this is exact for a given build (no thermal noise); per-prompt values still
+#   move when a policy change re-rolls batched-verify near-ties, hence 20 prompts.
+#   The shipping arm (tuner unset) is cached per pair+prompt+max_tokens (it never runs tuner
+#   code); delete $C/shipping if non-tuner engine code changes.
+# Why not replay as primary: fixed-start replay of argmax sessions cannot see that longer
+#   acceptance moves later block starts onto harder positions; it overstated two changes
+#   (+5% replay, -1% online over 20 prompts). Replay stays a diagnostic.
 set -euo pipefail
 cd "$(dirname "$0")"
 export LD_LIBRARY_PATH=$HOME/.hipfire/rocm-merged/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
@@ -43,66 +44,55 @@ kill -STOP 1500 2>/dev/null || true   # user's llama-server: GPU contention
 trap 'kill -CONT 1500 2>/dev/null || true' EXIT
 
 out=$(mktemp -d)
-bench() { # pair tag prompt-file mode(stats|on|off) [dump]
+bench() { # pair outfile-stem prompt-file mode(stats|on|off) [dump]
   local tune=(); [ "$4" = off ] || tune=(HIPFIRE_DFLASH_ONLINE_TUNE="$4")
   env ${HOMEDIR[$1]:+HIPFIRE_HOME=${HOMEDIR[$1]}} "${tune[@]}" ${5:+HIPFIRE_DFLASH_ONLINE_DUMP=$5} \
     timeout --foreground 900 "$HF" bench "${MODEL[$1]}" --spec dflash --runs 1 --warmups 0 \
     --max-tokens "${MAXTOK[$1]}" --backend noslots --workload stateless \
-    --prompt-file "$3" --json >"$out/$1.$2.json" 2>"$out/$1.$2.err" \
-    || { tail -30 "$out/$1.$2.err" >&2; echo "bench $1 $2 FAILED" >&2; exit 1; }
+    --prompt-file "$3" --json >"$2.json" 2>"$2.err" \
+    || { tail -30 "$2.err" >&2; echo "bench $1 $2 FAILED" >&2; exit 1; }
 }
 
 for pair in q9 q8; do
-  mkdir -p "${DUMPS[$pair]}"
+  mkdir -p "${DUMPS[$pair]}" "$C/shipping/$pair"
   dumps=()
   for f in "$P"/*.txt; do
-    d="${DUMPS[$pair]}/$(basename "$f" .txt)-$(md5sum <"$f" | cut -c1-12).bin"
-    [ -s "$d" ] || bench "$pair" "dump-$(basename "$f" .txt)" "$f" stats "$d"
+    n=$(basename "$f" .txt); key="$n-$(md5sum <"$f" | cut -c1-12)-${MAXTOK[$pair]}"
+    d="${DUMPS[$pair]}/$n-$(md5sum <"$f" | cut -c1-12).bin"
+    [ -s "$d" ] || bench "$pair" "$out/dump" "$f" stats "$d"
     dumps+=("$d")
+    [ -s "$C/shipping/$pair/$key.err" ] || bench "$pair" "$C/shipping/$pair/$key" "$f" off
+    bench "$pair" "$out/$pair.$n" "$f" on
+    cp "$C/shipping/$pair/$key.err" "$out/$pair.$n.A.err"; cp "$C/shipping/$pair/$key.json" "$out/$pair.$n.A.json"
   done
   "$REPLAY" --carry-loo "${dumps[@]}" >"$out/$pair.replay.txt"
-  "$REPLAY" --hp carry=0 "${dumps[@]}" >"$out/$pair.replay_cold.txt"
-  cat "$out/$pair.replay.txt" >&2
 done
 
-# Online paired A/B, alternating order.
-ab=(q9:prose_letter q9:code_inventory q9:code_edit_typehints q8:mixed_tcp q8:code_inventory q8:prose_snowstorm)
-i=0
-for pn in "${ab[@]}"; do
-  pair=${pn%%:*}; n=${pn#*:}
-  if (( i % 2 == 0 )); then bench "$pair" "$n.A" "$P/$n.txt" off; bench "$pair" "$n.B" "$P/$n.txt" on
-  else bench "$pair" "$n.B" "$P/$n.txt" on; bench "$pair" "$n.A" "$P/$n.txt" off; fi
-  i=$((i + 1))
-done
-
-python3 - "$out" "${ab[@]}" <<'EOF'
+python3 - "$out" <<'EOF'
 import json, math, os, re, sys
-d, ab = sys.argv[1], sys.argv[2:]
+d = sys.argv[1]
 g = lambda xs: math.exp(sum(map(math.log, xs)) / len(xs))
-geo = lambda t: float(re.search(r"GEOMEAN picked/argmax tau over \d+ sessions: ([0-9.]+)", t).group(1))
-pairs = {}
+def run(stem):
+    err = open(os.path.join(d, stem + ".err")).read()
+    toks, wins = map(int, re.findall(r"decode \((\d+) tok, (\d+) windows", err)[-1])
+    return toks / wins, json.load(open(os.path.join(d, stem + ".json")))["decode_tok_s"]["median"]
+allw, alls = [], []
 for pair in ("q9", "q8"):
+    w, s = [], []
+    for f in sorted(os.listdir(d)):
+        m = re.match(pair + r"\.([a-z_]+)\.err$", f)
+        if not m:
+            continue
+        n = m.group(1)
+        b, a = run(f"{pair}.{n}"), run(f"{pair}.{n}.A")
+        w.append(b[0] / a[0]); s.append(b[1] / a[1])
+        print("METRIC %s_%s_tokwin=%.4f" % (pair, n, b[0] / a[0]))
+    print("METRIC %s_tokwin_ratio=%.4f" % (pair, g(w)))
+    print("METRIC %s_tok_s_ratio=%.4f" % (pair, g(s)))
     rep = open(os.path.join(d, pair + ".replay.txt")).read()
-    pairs[pair] = geo(rep)
-    print("METRIC %s_replay=%.4f" % (pair, pairs[pair]))
-    print("METRIC %s_replay_cold=%.4f" % (pair, geo(open(os.path.join(d, pair + ".replay_cold.txt")).read())))
-    for name, base, pick in re.findall(r"/([a-z_]+)-[0-9a-f]+\.bin: cycles=\d+ argmax_tau=([0-9.]+) picked_tau=([0-9.]+)", rep):
-        print("METRIC %s_replay_%s=%.4f" % (pair, name, float(pick) / float(base)))
-print("METRIC replay_tau_ratio=%.4f" % g(list(pairs.values())))
-def run(tag):
-    j = json.load(open(os.path.join(d, tag + ".json")))
-    toks = re.findall(r"decode \((\d+) tok", open(os.path.join(d, tag + ".err")).read())[-1]
-    return j["spec_tau"][-1], j["decode_tok_s"]["median"], toks
-tr, sr = {"q9": [], "q8": []}, {"q9": [], "q8": []}
-for pn in ab:
-    pair, n = pn.split(":")
-    a, b = run(f"{pair}.{n}.A"), run(f"{pair}.{n}.B")
-    tr[pair].append(b[0] / a[0]); sr[pair].append(b[1] / a[1])
-    print("METRIC %s_%s_tok_s_A=%.2f" % (pair, n, a[1])); print("METRIC %s_%s_tok_s_B=%.2f" % (pair, n, b[1]))
-    print("ASI %s_%s_tau_A_B=%.2f/%.2f tokens=%s/%s" % (pair, n, a[0], b[0], a[2], b[2]))
-for pair in ("q9", "q8"):
-    print("METRIC %s_online_tau_ratio=%.4f" % (pair, g(tr[pair])))
-    print("METRIC %s_online_tok_s_ratio=%.4f" % (pair, g(sr[pair])))
-print("METRIC online_tok_s_ratio=%.4f" % g(sr["q9"] + sr["q8"]))
+    print("METRIC %s_replay=%s" % (pair, re.search(r"sessions: ([0-9.]+)", rep).group(1)))
+    allw += w; alls += s
+print("METRIC online_tokwin_ratio=%.4f" % g(allw))
+print("METRIC online_tok_s_ratio=%.4f" % g(alls))
 EOF
 rm -rf "$out"
