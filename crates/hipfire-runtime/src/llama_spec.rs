@@ -9,9 +9,9 @@
 //! through `impl SpecTarget for LlamaBundle` (in `hipfire-arch-llama`).
 
 use crate::llama::{
-    argmax, forward_prefill_batch_capture, forward_prefill_batch_tree, forward_scratch_compute,
-    forward_scratch_embed, is_batchable_la, weight_gemv, ForwardScratch, HiddenCaptureSink,
-    KvCache, LlamaConfig, LlamaWeights, PrefillBatchScratch,
+    argmax, forward_prefill_batch_capture, forward_prefill_batch_tree, forward_scratch_embed,
+    is_batchable_la, weight_gemv, ForwardScratch, HiddenCaptureSink, KvCache, LlamaConfig,
+    LlamaWeights, PrefillBatchScratch,
 };
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
