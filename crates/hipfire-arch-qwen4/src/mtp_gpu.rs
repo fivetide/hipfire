@@ -16,19 +16,20 @@ use crate::gpu_forward::{
 };
 use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
 use crate::program::{Qwen4HyperReadWeights, Qwen4HyperWriteWeights, Qwen4QsaWeights};
+use crate::state::{meta_bytes, meta_words, state_part, whole_part};
 use crate::weights::{Qwen4Weights, WeightError};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::pipeline::{
     execute_validated_steps, validate_steps, BroadcastAddOp, ClearOp, DraftHead, DraftHeadLayout,
-    DraftHeadRequestState,
-    DraftHeadPolicy, EmbeddingOp, HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode,
-    IndexedAttentionOp, IndexedAttentionState, ProjectOp, Step,
+    DraftHeadPolicy, DraftHeadRequestState, EmbeddingOp, HyperNormOp, HyperReadOp, HyperWriteOp,
+    IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, ProjectOp, Step,
 };
 use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::kv_backend::{
     KvChunkPlan, DEFAULT_KV_CHUNK_TOKENS, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
 };
+use hipfire_runtime::session_cache::StatePart;
 use hipfire_runtime::spec::SpecGrammar;
 use rdna_compute::tensor_ops::{
     hyper_norm, hyper_read_projected, indexed_attention_append_prologue,
@@ -42,6 +43,8 @@ use std::fmt;
 const MTP_BRANCHES: usize = 4;
 /// Rows of every MTP HC read and write: one token.
 const MTP_HC_ROWS: usize = 1;
+/// Metadata words of an MTP head session snapshot: model id and the state mark.
+const MTP_SESSION_WORDS: usize = 7;
 /// Prompt rows one batched Append pass (`Qwen4MtpGpu::append_rows`) runs per
 /// launch sequence: the capacity of [`MtpAppendScratch`].
 pub(crate) const MTP_FILL_ROWS: usize = 1024;
@@ -410,9 +413,7 @@ impl AppendWidths {
                 .checked_mul(config.indexer_head_dim)?
                 .checked_add(index_kv_width)?,
             index_kv_width,
-            kv_width: config
-                .num_key_value_heads
-                .checked_mul(config.head_dim)?,
+            kv_width: config.num_key_value_heads.checked_mul(config.head_dim)?,
         })
     }
 }
@@ -595,21 +596,47 @@ impl<'a> AppendWeights<'a> {
             return Err(invalid("MTP batched append needs a Q8_0 embedding table"));
         }
         let fc_embedding = dense_ref(weights, &weights.mtp.fc_embedding)?;
-        check("fc_embedding", &fc_embedding, DType::BF16, w.hidden, w.hidden)?;
+        check(
+            "fc_embedding",
+            &fc_embedding,
+            DType::BF16,
+            w.hidden,
+            w.hidden,
+        )?;
         let fc_hidden = dense_ref(weights, &weights.mtp.fc_hidden)?;
         check("fc_hidden", &fc_hidden, DType::BF16, w.hidden, w.hidden)?;
         let hc = hyper_desc(weights, &weights.mtp.attn_hyper)?.read;
         if !w.wide.is_multiple_of(32) {
             return Err(invalid("MTP batched append HC down needs K % 32 == 0"));
         }
-        check("HC down", &hc.input_mix_down, DType::BF16, config.hc_lowrank, w.wide)?;
-        check("HC up", &hc.input_mix_up, DType::BF16, w.wide, config.hc_lowrank)?;
+        check(
+            "HC down",
+            &hc.input_mix_down,
+            DType::BF16,
+            config.hc_lowrank,
+            w.wide,
+        )?;
+        check(
+            "HC up",
+            &hc.input_mix_up,
+            DType::BF16,
+            w.wide,
+            config.hc_lowrank,
+        )?;
         let qsa = qsa_desc(weights, &weights.mtp.attention)?;
         // The tiled Q8_0 projection is the K = 2560 staged kernel.
         if w.hidden != 2560 {
-            return Err(invalid("MTP batched append Q8_0 projections need hidden 2560"));
+            return Err(invalid(
+                "MTP batched append Q8_0 projections need hidden 2560",
+            ));
         }
-        check("indexer_qk", &qsa.indexer_qk, DType::Q8_0, w.index_width, w.hidden)?;
+        check(
+            "indexer_qk",
+            &qsa.indexer_qk,
+            DType::Q8_0,
+            w.index_width,
+            w.hidden,
+        )?;
         check("k_proj", &qsa.k, DType::Q8_0, w.kv_width, w.hidden)?;
         check("v_proj", &qsa.v, DType::Q8_0, w.kv_width, w.hidden)?;
         Ok(Self {
@@ -887,9 +914,6 @@ pub struct MtpGpuState {
     generation: u64,
     model_id: u64,
     snapshot_arena: MtpGpuStateSnapshotArena,
-    /// Durable prefix-cache checkpoint (see `Qwen4State::capture_prefix`):
-    /// separate from the speculative arena; `active` = valid.
-    prefix_arena: Option<MtpGpuStateSnapshotArena>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1079,7 +1103,6 @@ impl MtpGpuState {
             generation: 0,
             model_id,
             snapshot_arena,
-            prefix_arena: None,
         })
     }
 
@@ -1176,7 +1199,6 @@ impl MtpGpuState {
 
     pub(crate) fn reset(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
         self.snapshot_arena.invalidate();
-        self.invalidate_prefix();
         for tensor in [
             &self.full_keys,
             &self.full_values,
@@ -1290,7 +1312,6 @@ impl MtpGpuState {
         if result.is_err() && consume {
             self.snapshot_arena.invalidate();
         }
-        self.retire_prefix_past_position();
         result
     }
 
@@ -1338,7 +1359,6 @@ impl MtpGpuState {
         self.pooled_len = position / compress;
         self.selected_len = self.selected_len.min(position);
         self.step_index = mark.step_index.wrapping_add(keep);
-        self.retire_prefix_past_position();
         Ok(())
     }
 
@@ -1389,97 +1409,88 @@ impl MtpGpuState {
         self.step_index = metadata.step_index;
     }
 
-    pub(crate) fn attach_prefix_arena(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
-        if self.prefix_arena.is_none() {
-            self.prefix_arena = Some(MtpGpuStateSnapshotArena::new(
-                gpu,
-                &self.selected_indices,
-                &self.selected_len_out,
-                &self.wide_hidden,
-                self.model_id,
-                self.mark(),
-            )?);
-        }
-        Ok(())
+    /// Device ranges of the state at `mark`: full K/V, raw and pooled rows
+    /// below it, then selection, device selected length and wide hidden.
+    fn session_layout(&self, mark: &MtpStateMark) -> Vec<StatePart<'_>> {
+        let rows = |tensor: &GpuTensor, capacity: usize, rows: usize| {
+            rows * (tensor.byte_size() / capacity)
+        };
+        vec![
+            state_part(
+                &self.full_keys,
+                rows(&self.full_keys, self.full_capacity, mark.full_len),
+            ),
+            state_part(
+                &self.full_values,
+                rows(&self.full_values, self.full_capacity, mark.full_len),
+            ),
+            state_part(
+                &self.raw_index_keys,
+                rows(&self.raw_index_keys, self.raw_capacity, mark.raw_len),
+            ),
+            state_part(
+                &self.pooled_keys,
+                rows(&self.pooled_keys, self.pooled_capacity, mark.pooled_len),
+            ),
+            whole_part(&self.selected_indices),
+            whole_part(&self.selected_len_out),
+            whole_part(&self.wide_hidden),
+        ]
     }
 
-    pub(crate) fn prefix_position(&self) -> Option<usize> {
-        self.prefix_arena
-            .as_ref()
-            .filter(|arena| arena.active)
-            .map(|arena| arena.mark.position)
-    }
-
-    pub(crate) fn invalidate_prefix(&mut self) {
-        if let Some(arena) = self.prefix_arena.as_mut() {
-            arena.invalidate();
-        }
-    }
-
-    fn retire_prefix_past_position(&mut self) {
-        if self.prefix_position().is_some_and(|saved| self.position < saved) {
-            self.invalidate_prefix();
-        }
-    }
-
-    /// Copy the in-place-overwritten MTP owners (selection, device selected
-    /// length, own wide hidden) and the marks incl. `step_index`.
-    pub(crate) fn capture_prefix(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
-        self.invalidate_prefix();
+    /// Session-cache capture: `MTP_SESSION_WORDS` metadata words and the
+    /// device ranges of the live state.
+    fn session_parts(&self) -> Result<(Vec<u64>, Vec<StatePart<'_>>), MtpGpuError> {
         let mark = self.mark();
         validate_mtp_mark(&mark, self)?;
-        let arena = self
-            .prefix_arena
-            .as_ref()
-            .ok_or_else(|| invalid("MTP prefix arena is not attached"))?;
-        if arena.model_id != self.model_id {
-            return Err(invalid("MTP prefix arena model mismatch"));
-        }
-        arena.validate_layout(self)?;
-        for (live, saved) in [
-            (&self.selected_indices, &arena.selected_indices),
-            (&self.selected_len_out, &arena.selected_len_out),
-            (&self.wide_hidden, &arena.wide_hidden),
-        ] {
-            gpu.copy_d2d(live, saved, live.byte_size())?;
-        }
-        let arena = self
-            .prefix_arena
-            .as_mut()
-            .ok_or_else(|| invalid("MTP prefix arena is not attached"))?;
-        arena.mark = mark;
-        arena.active = true;
-        Ok(())
+        let words = [
+            mark.full_len,
+            mark.raw_len,
+            mark.pooled_len,
+            mark.selected_len,
+            mark.position,
+            mark.step_index,
+        ]
+        .map(|value| value as u64);
+        Ok((
+            [self.model_id].into_iter().chain(words).collect(),
+            self.session_layout(&mark),
+        ))
     }
 
-    /// Restore the durable checkpoint. Like a reset it starts a new request
-    /// epoch and retires every speculative ticket; the caller resets on error.
-    pub(crate) fn restore_prefix(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
-        let arena = self
-            .prefix_arena
-            .as_ref()
-            .filter(|arena| arena.active)
-            .ok_or_else(|| invalid("MTP prefix checkpoint is not valid"))?;
-        if arena.model_id != self.model_id {
-            return Err(invalid("MTP prefix arena model mismatch"));
+    fn parse_session_mark(&self, words: &[u64]) -> Result<MtpStateMark, MtpGpuError> {
+        if words.len() != MTP_SESSION_WORDS || words[0] != self.model_id {
+            return Err(invalid("MTP session snapshot shape mismatch"));
         }
-        validate_mtp_mark(&arena.mark, self)?;
-        arena.validate_layout(self)?;
-        let mark = arena.mark;
+        let mark = MtpStateMark {
+            full_len: words[1] as usize,
+            raw_len: words[2] as usize,
+            pooled_len: words[3] as usize,
+            selected_len: words[4] as usize,
+            position: words[5] as usize,
+            step_index: words[6] as usize,
+        };
+        validate_mtp_mark(&mark, self)?;
+        Ok(mark)
+    }
+
+    /// Map the context arenas to the snapshot position and, like a reset,
+    /// start a new request epoch that retires every speculative ticket.
+    fn prepare_session_restore(
+        &mut self,
+        gpu: &mut Gpu,
+        words: &[u64],
+    ) -> Result<Vec<StatePart<'_>>, MtpGpuError> {
+        let mark = self.parse_session_mark(words)?;
+        self.ensure_mapped_capacity(gpu, mark.position)?;
         self.snapshot_arena.invalidate();
         self.request_epoch = self.request_epoch.wrapping_add(1);
         self.generation = self.generation.wrapping_add(1);
-        let arena = self
-            .prefix_arena
-            .as_ref()
-            .ok_or_else(|| invalid("MTP prefix arena is not attached"))?;
-        for (live, saved) in [
-            (&self.selected_indices, &arena.selected_indices),
-            (&self.selected_len_out, &arena.selected_len_out),
-            (&self.wide_hidden, &arena.wide_hidden),
-        ] {
-            gpu.copy_d2d(saved, live, live.byte_size())?;
-        }
+        Ok(self.session_layout(&mark))
+    }
+
+    fn finish_session_restore(&mut self, words: &[u64]) -> Result<(), MtpGpuError> {
+        let mark = self.parse_session_mark(words)?;
         self.full_len = mark.full_len;
         self.raw_len = mark.raw_len;
         self.pooled_len = mark.pooled_len;
@@ -1487,6 +1498,24 @@ impl MtpGpuState {
         self.position = mark.position;
         self.step_index = mark.step_index;
         Ok(())
+    }
+
+    /// Context-arena bytes still unmapped below capacity (0 for legacy).
+    fn context_growth_bytes(&self) -> u64 {
+        if self.backend == Qwen4KvBackend::Legacy || self.full_capacity == 0 {
+            return 0;
+        }
+        let capacity: u64 = [
+            &self.full_keys,
+            &self.full_values,
+            &self.raw_index_keys,
+            &self.pooled_keys,
+        ]
+        .iter()
+        .map(|tensor| tensor.byte_size() as u64)
+        .sum();
+        capacity * self.full_capacity.saturating_sub(self.mapped_tokens) as u64
+            / self.full_capacity as u64
     }
 
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
@@ -1499,13 +1528,9 @@ impl MtpGpuState {
             selected_len_out,
             wide_hidden,
             snapshot_arena,
-            prefix_arena,
             ..
         } = self;
         let mut first = snapshot_arena.free_gpu(gpu);
-        if let Some(error) = prefix_arena.and_then(|arena| arena.free_gpu(gpu)) {
-            first.get_or_insert(error);
-        }
         for tensor in [
             full_keys,
             full_values,
@@ -1534,8 +1559,6 @@ pub struct Qwen4MtpGpu {
     /// MQ2 copy with exact re-scoring of its top 8 drafts the Q8_0 head's own
     /// argmax at a quarter of its read; plain MQ3 loses acceptance.
     pub(crate) draft: DraftHead,
-    /// Draft policy at the durable prefix checkpoint.
-    prefix_policy: DraftHeadRequestState,
 }
 
 /// Draft-head front: tokens below this id, plus EOS and the control ids
@@ -1646,7 +1669,6 @@ impl Qwen4MtpGpu {
             moe,
             max_seq,
             draft,
-            prefix_policy: DraftHeadRequestState::default(),
         })
     }
 
@@ -1715,31 +1737,54 @@ impl Qwen4MtpGpu {
         self.state.mapped_context_bytes(gpu)
     }
 
-    pub(crate) fn attach_prefix_arena(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
-        self.state.attach_prefix_arena(gpu)
+    /// Session-cache capture of the head state plus the draft policy.
+    /// Prompt appends only `observe` (a qualifying input sets the full hold);
+    /// drafts are the only decrement, so at a prompt boundary the policy is
+    /// the canonical prompt summary.
+    pub(crate) fn session_parts(&self) -> Result<(Vec<u8>, Vec<StatePart<'_>>), MtpGpuError> {
+        let (mut words, parts) = self.state.session_parts()?;
+        let policy = self.draft.request_state();
+        words.extend([
+            u64::from(policy.full_steps),
+            u64::from(policy.margin.to_bits()),
+        ]);
+        Ok((meta_bytes(&words), parts))
     }
 
-    pub(crate) fn prefix_position(&self) -> Option<usize> {
-        self.state.prefix_position()
+    fn session_words(meta: &[u8]) -> Result<Vec<u64>, MtpGpuError> {
+        meta_words(meta)
+            .filter(|words| words.len() == MTP_SESSION_WORDS + 2)
+            .ok_or_else(|| invalid("MTP session snapshot shape mismatch"))
     }
 
-    pub(crate) fn invalidate_prefix(&mut self) {
-        self.state.invalidate_prefix();
+    pub(crate) fn prepare_session_restore(
+        &mut self,
+        gpu: &mut Gpu,
+        meta: &[u8],
+    ) -> Result<Vec<StatePart<'_>>, MtpGpuError> {
+        let words = Self::session_words(meta)?;
+        self.state
+            .prepare_session_restore(gpu, &words[..MTP_SESSION_WORDS])
     }
 
-    /// Checkpoint the head state and the draft policy. Prompt appends only
-    /// `observe` (a qualifying input sets the full hold); drafts are the only
-    /// decrement, so at a prompt boundary this is the canonical prompt summary.
-    pub(crate) fn capture_prefix(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
-        self.state.capture_prefix(gpu)?;
-        self.prefix_policy = self.draft.request_state();
+    pub(crate) fn finish_session_restore(&mut self, meta: &[u8]) -> Result<(), MtpGpuError> {
+        let words = Self::session_words(meta)?;
+        self.state
+            .finish_session_restore(&words[..MTP_SESSION_WORDS])?;
+        let policy = &words[MTP_SESSION_WORDS..];
+        self.draft.set_request_state(DraftHeadRequestState {
+            full_steps: u32::try_from(policy[0])
+                .map_err(|_| invalid("MTP session draft policy"))?,
+            margin: f32::from_bits(
+                u32::try_from(policy[1]).map_err(|_| invalid("MTP session draft policy"))?,
+            ),
+        });
         Ok(())
     }
 
-    pub(crate) fn restore_prefix(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
-        self.state.restore_prefix(gpu)?;
-        self.draft.set_request_state(self.prefix_policy);
-        Ok(())
+    /// See [`MtpGpuState::context_growth_bytes`].
+    pub(crate) fn context_growth_bytes(&self) -> u64 {
+        self.state.context_growth_bytes()
     }
     pub(crate) fn snapshot(&mut self, gpu: &mut Gpu) -> Result<MtpGpuStateSnapshot, MtpGpuError> {
         self.state.snapshot(gpu)

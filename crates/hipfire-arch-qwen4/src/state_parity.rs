@@ -2136,9 +2136,13 @@ pub fn run_mtp_fill_digest(
     max_seq: usize,
     warm_chunks: usize,
 ) -> Result<Value, String> {
+    use hipfire_runtime::arch_model::ArchModel;
+    use hipfire_runtime::session_cache::{SessionCache, SessionRoute};
     use hipfire_runtime::spec::MtpDrafter;
     let mut hfq = hipfire_runtime::hfq::HfqFile::open(model_path)
         .map_err(|error| format!("open {}: {error}", model_path.display()))?;
+    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+        .map_err(|error| format!("tokenizer: {error}"))?;
     let receipt = crate::admit_hfqm_artifact(&hfq)
         .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let config = receipt.config.clone();
@@ -2146,6 +2150,13 @@ pub fn run_mtp_fill_digest(
     let metadata = receipt.ple.clone();
     let placements = receipt.placements.clone();
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    let domain = hipfire_runtime::serve_contract::CacheDomain::for_model(
+        &hfq,
+        &tokenizer,
+        None,
+        "qwen4",
+        gpu.device_id,
+    );
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -2176,11 +2187,6 @@ pub fn run_mtp_fill_digest(
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let run = (|| -> Result<Value, String> {
-        if warm {
-            bundle
-                .attach_prefix_cache(&mut gpu)
-                .map_err(|error| format!("qwen4 prefix cache setup failed: {error}"))?;
-        }
         bundle
             .attach_forward(&mut gpu, max_seq)
             .map_err(|error| format!("qwen4 forward setup failed: {error}"))?;
@@ -2188,9 +2194,7 @@ pub fn run_mtp_fill_digest(
             .attach_mtp(&mut gpu, max_seq)
             .map_err(|error| format!("qwen4 MTP setup failed: {error}"))?;
         if warm {
-            bundle
-                .attach_prefix_cache(&mut gpu)
-                .map_err(|error| format!("qwen4 prefix cache setup failed: {error}"))?;
+            bundle.attach_session_cache(SessionCache::new(domain.clone(), u64::MAX >> 1));
         }
         map_bundle_context(&mut gpu, &mut bundle, max_seq)?;
         let vocab = config.vocab_size as u64;
@@ -2226,14 +2230,13 @@ pub fn run_mtp_fill_digest(
                 let shared = tokens(0x5eed ^ prefix_len as u64, prefix_len + 1);
                 drafter
                     .mtp_prefill(&mut gpu, &mut bundle, &shared, &shared, 0, false, &|| false)?;
-                bundle.commit_prefix();
+                bundle.session_commit();
                 let mut prompt = shared[..prefix_len].to_vec();
                 prompt.extend(tokens(0xa11 ^ length as u64, length));
-                let plan = bundle.plan_prefix(&prompt, crate::bundle::Qwen4PrefixMode::NativeMtp);
-                if plan.start_pos != prefix_len {
+                let start_pos = bundle.session_plan(&prompt, SessionRoute::Mtp);
+                if start_pos != prefix_len {
                     return Err(format!(
-                        "warm length {length}: prefix plan starts at {}, expected {prefix_len}",
-                        plan.start_pos
+                        "warm length {length}: session plan starts at {start_pos}, expected {prefix_len}"
                     ));
                 }
                 drafter.mtp_prefill(

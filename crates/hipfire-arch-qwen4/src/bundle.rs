@@ -17,14 +17,18 @@ use crate::gpu_forward::{
 use crate::kv_backend::Qwen4KvBackend;
 use crate::mtp_gpu::{MtpAppendScratch, MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
 use crate::ple::PleHashMetadata;
-use crate::state::Qwen4StateFormat;
-use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
+use crate::state::{
+    meta_bytes, meta_words, Qwen4State, Qwen4StateFormat, Qwen4StateSnapshot, StateError,
+};
 use crate::weights::{
     ple_valid_rows_for_shard, Qwen4Manifest, Qwen4Placement, Qwen4Weights, WeightError,
     PLE_ROW_WIDTH, PLE_SHARD_COUNT, PLE_SHARD_ROWS,
 };
 use hipfire_runtime::external_rows::{RowEncoding, RowStore, RowStoreError};
 use hipfire_runtime::model_source::{SourceFormat, SourceRangeDescriptor};
+use hipfire_runtime::session_cache::{
+    SessionCache, SessionRoute, SessionState, SnapshotParts, StatePart,
+};
 use hipfire_runtime::spec_sampling::{SampleSpec, SparseDist};
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
 use hipfire_runtime::weight_store::{WeightLoadTransaction, WeightStoreError};
@@ -101,77 +105,207 @@ pub struct Qwen4Bundle {
     pub(crate) spec_top1: Option<GpuTensor>,
     pub(crate) spec_hidden: Option<GpuTensor>,
     pub(crate) spec_host_top1: Vec<u8>,
-    /// Single-session prefix cache (`attach_prefix_cache`); `None` = off.
-    prefix: Option<Qwen4PrefixCache>,
+    /// Prefill snapshot cache shared by every session (`attach_session_cache`);
+    /// `None` = off.
+    session: Option<SessionCache>,
+    /// Request-state storage, part of every session snapshot's scope.
+    state_format: Qwen4StateFormat,
 }
 
-/// The Qwen4 prefix cache is on by default; `HIPFIRE_QWEN_PROMPT_CACHE=0|1`
-/// (the prompt-cache switch every Qwen family reads) overrides it.
-pub const QWEN4_PREFIX_CACHE_DEFAULT: bool = true;
-
-/// Whether a load should attach (and charge) the prefix cache.
-pub fn prefix_cache_requested() -> bool {
-    hipfire_config::developer_bool("HIPFIRE_QWEN_PROMPT_CACHE", QWEN4_PREFIX_CACHE_DEFAULT)
-}
-
-/// Device bytes [`Qwen4Bundle::attach_prefix_cache`] allocates: the target
-/// state checkpoint plus, with native MTP, the head's selection, device
-/// selected length and wide hidden. Charged by the load's VRAM reserve.
-pub fn prefix_cache_device_bytes(
+/// Device bytes of one session-cache snapshot after `p` tokens (each part
+/// rounded to the cache's 256-byte packing): GDN recurrent and conv, QSA
+/// rows below `p` plus selections, PLE conv and hyper feedback, and with
+/// native MTP the head's rows, selection and wide hidden.
+pub fn session_snapshot_bytes(
     config: &Qwen4Config,
     format: Qwen4StateFormat,
     native_mtp: bool,
+    p: usize,
 ) -> Option<u64> {
-    let target = Qwen4State::prefix_arena_bytes(config, format)?;
-    if !native_mtp {
-        return Some(target);
-    }
-    let mtp = config
-        .qsa_selected_capacity()
-        .checked_add(1)?
-        .checked_add(config.hc_count.checked_mul(config.hidden_size)?)?
+    let part = |bytes: usize| bytes.checked_next_multiple_of(256);
+    let gdn_recurrent = format.gdn.state_units(
+        config.linear_num_value_heads,
+        config.linear_key_head_dim,
+        config.linear_value_head_dim,
+    );
+    let conv_channels = (2 * config.linear_num_key_heads)
+        .checked_mul(config.linear_key_head_dim)?
+        .checked_add(
+            config
+                .linear_num_value_heads
+                .checked_mul(config.linear_value_head_dim)?,
+        )?;
+    let gdn = part(gdn_recurrent.checked_mul(format.gdn.dtype().size())?)?.checked_add(part(
+        conv_channels
+            .checked_mul(config.linear_conv_kernel_dim.saturating_sub(1))?
+            .checked_mul(4)?,
+    )?)?;
+    let compress = config.indexer_compress_ratio;
+    let raw_width = config
+        .indexer_kv_heads
+        .checked_mul(config.indexer_head_dim)?;
+    let full_width = config.num_key_value_heads.checked_mul(config.head_dim)?;
+    let kv_row = format
+        .qsa
+        .kv_row_bytes(config.num_key_value_heads, config.head_dim);
+    let raw_row = raw_width.checked_mul(format.qsa.index_dtype().size())?;
+    let selected = part(config.qsa_selected_capacity().checked_mul(4)?)?;
+    let pooled_rows = p.div_ceil(compress);
+    let qsa = 2 * part(p.checked_mul(kv_row)?)?
+        + part(p.checked_mul(raw_row)?)?
+        + part(pooled_rows.checked_mul(raw_row)?)?
+        + selected;
+    let ple = config
+        .ple_conv_history_rows()
+        .checked_mul(config.ple_embed_dim)?
+        .checked_mul(config.hc_count)?
         .checked_mul(4)?;
-    target.checked_add(u64::try_from(mtp).ok()?)
+    let feedback = config
+        .hc_count
+        .checked_mul(config.hidden_size)?
+        .checked_mul(4)?;
+    let mut total = gdn
+        .checked_mul(config.n_linear_layers())?
+        .checked_add(qsa.checked_mul(config.n_full_layers())?)?
+        .checked_add(part(ple)? + part(feedback)?)?;
+    if native_mtp {
+        // The head keeps F32 rows.
+        total = total
+            .checked_add(2 * part(p.checked_mul(full_width * 4)?)?)?
+            .checked_add(part(p.checked_mul(raw_width * 4)?)?)?
+            .checked_add(part(pooled_rows.checked_mul(raw_width * 4)?)?)?
+            .checked_add(selected + part(4)? + part(feedback)?)?;
+    }
+    u64::try_from(total).ok()
 }
 
-/// Prefill schedule a prefix checkpoint was produced under. AR and native
-/// MTP prefill run different forwards (MTP captures wide hidden rows and
-/// appends every row to the head), so a checkpoint never crosses modes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Qwen4PrefixMode {
-    Ar,
-    NativeMtp,
+impl SessionState for Qwen4Bundle {
+    fn snapshot_scope(&self, route: SessionRoute) -> Option<String> {
+        let chunk = self.spec_chunk_rows()?;
+        if route == SessionRoute::Mtp && self.mtp.is_none() {
+            return None;
+        }
+        Some(format!(
+            "qwen4/{route:?}/chunk{chunk}/{:?}",
+            self.state_format
+        ))
+    }
+
+    fn snapshot_boundaries(&self, _route: SessionRoute, after: usize, up_to: usize) -> Vec<usize> {
+        let Some(chunk) = self.spec_chunk_rows() else {
+            return Vec::new();
+        };
+        (after / chunk + 1..=up_to / chunk)
+            .map(|k| k * chunk)
+            .collect()
+    }
+
+    fn snapshot_parts(
+        &mut self,
+        _gpu: &mut Gpu,
+        route: SessionRoute,
+        position: usize,
+    ) -> Result<SnapshotParts<'_>, String> {
+        self.quiesce_ple().map_err(|e| e.to_string())?;
+        let mtp = match route {
+            SessionRoute::Ar => None,
+            SessionRoute::Mtp => Some(
+                self.mtp
+                    .as_ref()
+                    .ok_or("Qwen4 MTP resources are not attached")?,
+            ),
+        };
+        if self.state.position != position || mtp.is_some_and(|mtp| mtp.position() != position) {
+            return Err(format!("qwen4 session capture: owners not at {position}"));
+        }
+        let (target_meta, mut parts) = self.state.session_parts().map_err(|e| e.to_string())?;
+        let mut meta = meta_bytes(&[
+            (route == SessionRoute::Mtp).into(),
+            (target_meta.len() / 8) as u64,
+        ]);
+        meta.extend(target_meta);
+        if let Some(mtp) = mtp {
+            let (mtp_meta, mtp_parts) = mtp.session_parts().map_err(|e| e.to_string())?;
+            meta.extend(mtp_meta);
+            parts.extend(mtp_parts);
+        }
+        Ok(SnapshotParts { meta, parts })
+    }
+
+    fn restore_parts(
+        &mut self,
+        gpu: &mut Gpu,
+        route: SessionRoute,
+        meta: &[u8],
+    ) -> Result<Vec<StatePart<'_>>, String> {
+        self.invalidate_ple_epoch().map_err(|e| e.to_string())?;
+        let (target_meta, mtp_meta) = split_session_meta(route, meta)?;
+        let mut parts = self
+            .state
+            .prepare_session_restore(gpu, target_meta)
+            .map_err(|e| e.to_string())?;
+        if route == SessionRoute::Mtp {
+            let mtp = self
+                .mtp
+                .as_mut()
+                .ok_or("Qwen4 MTP resources are not attached")?;
+            parts.extend(
+                mtp.prepare_session_restore(gpu, mtp_meta)
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        Ok(parts)
+    }
+
+    fn finish_restore(
+        &mut self,
+        gpu: &mut Gpu,
+        route: SessionRoute,
+        meta: &[u8],
+    ) -> Result<(), String> {
+        let (target_meta, mtp_meta) = split_session_meta(route, meta)?;
+        self.state
+            .finish_session_restore(target_meta)
+            .map_err(|e| e.to_string())?;
+        match (route, self.mtp.as_mut()) {
+            (SessionRoute::Mtp, Some(mtp)) => mtp.finish_session_restore(mtp_meta),
+            // An AR prefill leaves the head cold, as a reset would.
+            (SessionRoute::Ar, Some(mtp)) => mtp.reset(gpu),
+            (_, None) => Ok(()),
+        }
+        .map_err(|e| e.to_string())
+    }
+
+    fn growth_reserve_bytes(&self) -> u64 {
+        self.state.context_growth_bytes()
+            + self
+                .mtp
+                .as_ref()
+                .map_or(0, Qwen4MtpGpu::context_growth_bytes)
+    }
+
+    fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        Qwen4Bundle::reset(self, gpu).map_err(|e| e.to_string())
+    }
 }
 
-/// Where a prefill starts: `start_pos == 0` is a cold reset, otherwise the
-/// durable checkpoint after exactly `start_pos` tokens is restored and
-/// `prompt[start_pos..]` is replayed. `start_pos` is the cached-token count.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Qwen4PrefixPlan {
-    pub start_pos: usize,
-}
-
-/// One durable canonical-chunk checkpoint. The device bytes live in the
-/// state/MTP prefix arenas (their `active` flags are the device validity);
-/// this records which tokens they hold and under which schedule.
-///
-/// The key is only tokens, mode and admitted chunk because everything else
-/// is immutable for this owner: model artifact, device, state formats,
-/// config and placement are fixed per bundle (a reload builds a new bundle
-/// with no checkpoint), and numeric dispatch knobs come from the process
-/// config snapshot (`hipfire_config` `OnceLock`), fixed for the process. Any
-/// future mutable route knob or cross-bundle transport must join the key.
-struct Qwen4PrefixCache {
-    /// Token ids `[0, p)` of the checkpoint; reused allocation.
-    tokens: Vec<u32>,
-    mode: Qwen4PrefixMode,
-    /// Admitted prefill chunk the checkpoint's schedule ran with.
-    chunk: usize,
-    /// Set only by a client-committed request; a running request's
-    /// candidate is never planned against.
-    published: bool,
-    /// Absolute position the running prefill checkpoints at.
-    capture_at: Option<usize>,
+/// Target and MTP-head parts of a [`Qwen4Bundle`] session meta: words
+/// `[route, target words]`, the target meta, then the head's (MTP only).
+fn split_session_meta(route: SessionRoute, meta: &[u8]) -> Result<(&[u8], &[u8]), String> {
+    let shape = || "qwen4 session snapshot shape mismatch".to_string();
+    let header = meta.get(..16).and_then(meta_words).ok_or_else(shape)?;
+    let target_end = usize::try_from(header[1])
+        .ok()
+        .and_then(|words| words.checked_mul(8)?.checked_add(16))
+        .filter(|&end| end <= meta.len())
+        .ok_or_else(shape)?;
+    let mtp_meta = &meta[target_end..];
+    if header[0] != u64::from(route == SessionRoute::Mtp)
+        || (route == SessionRoute::Ar) != mtp_meta.is_empty()
+    {
+        return Err(shape());
+    }
+    Ok((&meta[16..target_end], mtp_meta))
 }
 
 impl Qwen4Bundle {
@@ -287,7 +421,8 @@ impl Qwen4Bundle {
             spec_top1: None,
             spec_hidden: None,
             spec_host_top1: Vec::new(),
-            prefix: None,
+            session: None,
+            state_format,
         })
     }
 
@@ -536,7 +671,7 @@ impl Qwen4Bundle {
     /// Rows the attached forward can process in one chunked call.  The MTP
     /// prefill uses this to batch a whole prompt chunk through the shared
     /// forward instead of one single-row forward per prompt token.
-    pub(crate) fn spec_chunk_rows(&self) -> Option<usize> {
+    pub fn spec_chunk_rows(&self) -> Option<usize> {
         self.execution
             .as_ref()
             .map(|forward| forward.scratch.max_chunk)
@@ -1197,11 +1332,6 @@ impl Qwen4Bundle {
     }
 
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
-        if let Some(cache) = self.prefix.as_mut() {
-            cache.published = false;
-            cache.capture_at = None;
-            cache.tokens.clear();
-        }
         self.invalidate_ple_epoch()?;
         self.state.reset(gpu).map_err(BundleError::State)?;
         if let Some(mtp) = self.mtp.as_mut() {
@@ -1209,37 +1339,6 @@ impl Qwen4Bundle {
                 .map_err(|error| BundleError::Forward(error.to_string()))?;
         }
         Ok(())
-    }
-
-    /// Allocate the durable prefix checkpoint (target state plus, when
-    /// attached, the MTP head). Call after `attach_forward` and MTP attach;
-    /// its bytes are charged by the load reserve
-    /// (`Qwen4State::prefix_arena_bytes`).
-    /// Idempotent: call once right after assembly, before `attach_forward`
-    /// (so its free-VRAM chunk rung sees the checkpoint already allocated),
-    /// and again after MTP attach to add the head's part.
-    pub fn attach_prefix_cache(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
-        self.state
-            .attach_prefix_arena(gpu)
-            .map_err(BundleError::State)?;
-        if let Some(mtp) = self.mtp.as_mut() {
-            mtp.attach_prefix_arena(gpu)
-                .map_err(|error| BundleError::Forward(error.to_string()))?;
-        }
-        if self.prefix.is_none() {
-            self.prefix = Some(Qwen4PrefixCache {
-                tokens: Vec::with_capacity(self.state.max_seq_len),
-                mode: Qwen4PrefixMode::Ar,
-                chunk: 0,
-                published: false,
-                capture_at: None,
-            });
-        }
-        Ok(())
-    }
-
-    pub fn prefix_cache_attached(&self) -> bool {
-        self.prefix.is_some()
     }
 
     /// Device bytes the QSA context arenas commit now, `(target, MTP head)`:
@@ -1258,259 +1357,80 @@ impl Qwen4Bundle {
         Ok((target, mtp))
     }
 
-    /// Pure plan for `prompt` (the full canonical token ids) under `mode`:
-    /// restore the published checkpoint `p` when `prompt[..p]` equals its
-    /// tokens, `p < prompt.len()`, and mode, admitted chunk and device
-    /// validity all match; otherwise cold. No GPU or state mutation.
-    pub fn plan_prefix(&self, prompt: &[u32], mode: Qwen4PrefixMode) -> Qwen4PrefixPlan {
-        let cold = Qwen4PrefixPlan::default();
-        let Some(cache) = self.prefix.as_ref() else {
-            return cold;
-        };
-        let p = cache.tokens.len();
-        if cache.published
-            && cache.mode == mode
-            && Some(cache.chunk) == self.spec_chunk_rows()
-            && p > 0
-            && p < prompt.len()
-            && self.prefix_device_valid(p, mode)
-            && prompt[..p] == cache.tokens[..]
-        {
-            Qwen4PrefixPlan { start_pos: p }
-        } else {
-            cold
-        }
+    /// Attach the session cache (`hipfire_runtime::session_cache`): prefill
+    /// then restores and captures whole-chunk snapshots through it.
+    pub fn attach_session_cache(&mut self, cache: SessionCache) {
+        self.session = Some(cache);
     }
 
-    /// Whether the device arenas hold the checkpoint after `p` tokens: the
-    /// target's always, the head's too for native MTP.
-    fn prefix_device_valid(&self, p: usize, mode: Qwen4PrefixMode) -> bool {
-        self.state.prefix_position() == Some(p)
-            && match mode {
-                Qwen4PrefixMode::Ar => true,
-                Qwen4PrefixMode::NativeMtp => {
-                    self.mtp.as_ref().and_then(Qwen4MtpGpu::prefix_position) == Some(p)
-                }
-            }
+    /// Run `f` with the cache taken out, so it can drive `self` as its
+    /// [`SessionState`]. `None` without a cache.
+    fn with_session<R>(&mut self, f: impl FnOnce(&mut SessionCache, &mut Self) -> R) -> Option<R> {
+        let mut cache = self.session.take()?;
+        let result = f(&mut cache, self);
+        self.session = Some(cache);
+        Some(result)
     }
 
-    /// Discard live decode state the host will never extend, keeping the
-    /// checkpoint: restore it into every owner (its token record and publish
-    /// state untouched), as a hit's prefill would. Without a valid checkpoint,
-    /// or if the restore fails, reset instead. Every later prefill begins
-    /// with [`Self::begin_prefix`], so the live state is never built on.
-    pub fn rewind_to_prefix(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
-        let mode = match self.prefix.as_ref() {
-            Some(cache)
-                if !cache.tokens.is_empty()
-                    && self.prefix_device_valid(cache.tokens.len(), cache.mode) =>
-            {
-                cache.mode
-            }
-            _ => return self.reset(gpu),
-        };
-        if let Err(error) = self.restore_prefix_owners(gpu, mode) {
-            return match self.reset(gpu) {
-                Ok(()) => Ok(()),
-                Err(reset) => Err(BundleError::Forward(format!(
-                    "{error}; reset after the failed prefix rewind also failed: {reset}"
-                ))),
-            };
-        }
-        Ok(())
-    }
-
-    /// Start a prefill of `prompt` under `plan` (re-validated here): a cold
-    /// plan resets every owner, a hit restores the checkpoint into target
-    /// state and, for native MTP, the head and its draft policy. Any failure
-    /// after the first device write resets before returning. The cache is
-    /// unpublished until [`Self::commit_prefix`]; the prefill checkpoints at
-    /// the last whole-chunk boundary of `prompt` past `plan.start_pos`.
-    pub fn begin_prefix(
+    /// Start a prefill of `prompt` on `route`: restore the `reused`-token
+    /// snapshot the cache planned, or cold-start for 0.
+    pub(crate) fn session_begin(
         &mut self,
         gpu: &mut Gpu,
         prompt: &[u32],
-        plan: Qwen4PrefixPlan,
-        mode: Qwen4PrefixMode,
+        reused: usize,
+        route: SessionRoute,
     ) -> Result<(), BundleError> {
         // A lookahead left by an aborted request names another prompt's rows.
         self.set_ple_lookahead(&[]);
-        if plan.start_pos == 0 {
-            self.reset(gpu)?;
-        } else {
-            if self.plan_prefix(prompt, mode) != plan {
-                return Err(BundleError::Forward(format!(
-                    "Qwen4 prefix plan at {} is no longer valid",
-                    plan.start_pos
-                )));
-            }
-            let restored = self.restore_prefix_owners(gpu, mode);
-            if let Err(error) = restored {
-                let reset = self.reset(gpu);
-                return Err(match reset {
-                    Ok(()) => error,
-                    Err(reset) => BundleError::Forward(format!(
-                        "{error}; reset after the failed prefix restore also failed: {reset}"
-                    )),
-                });
-            }
+        match self.with_session(|cache, bundle| cache.begin(gpu, bundle, prompt, route, reused)) {
+            Some(result) => result.map_err(BundleError::Forward),
+            None if reused == 0 => self.reset(gpu),
+            None => Err(BundleError::Forward(format!(
+                "Qwen4 session cache is not attached; cannot reuse {reused} tokens"
+            ))),
         }
-        let chunk = self.spec_chunk_rows();
-        if let Some(cache) = self.prefix.as_mut() {
-            let chunk = chunk.ok_or_else(|| {
-                BundleError::Forward("Qwen4 forward resources are not attached".to_string())
-            })?;
-            cache.published = false;
-            cache.mode = mode;
-            cache.chunk = chunk;
-            let boundary = prompt.len() / chunk * chunk;
-            cache.capture_at = (boundary > plan.start_pos).then_some(boundary);
-        }
-        Ok(())
     }
 
-    fn restore_prefix_owners(
+    /// Next absolute position the running prefill must stop at and report.
+    pub(crate) fn session_next_boundary(&self) -> Option<usize> {
+        self.session.as_ref()?.next_boundary()
+    }
+
+    /// Report that every owner consumed exactly `prefix` (the boundary).
+    pub(crate) fn session_at_boundary(
         &mut self,
         gpu: &mut Gpu,
-        mode: Qwen4PrefixMode,
+        prefix: &[u32],
     ) -> Result<(), BundleError> {
-        self.invalidate_ple_epoch()?;
-        // Context rows stay mapped until unload, so the checkpoint's rows
-        // are covered; mapping through its position first keeps every
-        // restored access inside the mapped prefix regardless.
-        if let Some(position) = self.state.prefix_position() {
-            self.state
-                .ensure_mapped_capacity(gpu, position)
-                .map_err(BundleError::State)?;
-        }
-        if let (Qwen4PrefixMode::NativeMtp, Some(mtp)) = (mode, self.mtp.as_mut()) {
-            if let Some(position) = mtp.prefix_position() {
-                mtp.ensure_mapped_capacity(gpu, position)
-                    .map_err(|error| BundleError::Forward(error.to_string()))?;
-            }
-        }
-        self.state.restore_prefix(gpu).map_err(BundleError::State)?;
-        if let Some(mtp) = self.mtp.as_mut() {
-            match mode {
-                Qwen4PrefixMode::NativeMtp => mtp.restore_prefix(gpu),
-                // An AR prefill leaves the head cold, as a reset would.
-                Qwen4PrefixMode::Ar => mtp.reset(gpu),
-            }
-            .map_err(|error| BundleError::Forward(error.to_string()))?;
-        }
-        Ok(())
+        self.with_session(|cache, bundle| cache.at_boundary(gpu, bundle, prefix))
+            .unwrap_or(Ok(()))
+            .map_err(BundleError::Forward)
     }
 
-    /// Absolute position the running prefill must checkpoint at, if any.
-    pub fn prefix_capture_at(&self) -> Option<usize> {
-        self.prefix.as_ref().and_then(|cache| cache.capture_at)
-    }
-
-    /// Checkpoint the live state at the armed boundary. `prefix` is
-    /// `prompt[..boundary]`; target (and for native MTP, the head) must have
-    /// consumed exactly it. A failure leaves no valid checkpoint.
-    pub fn stage_prefix(&mut self, gpu: &mut Gpu, prefix: &[u32]) -> Result<(), BundleError> {
-        let (at, mode) = match self.prefix.as_ref() {
-            Some(cache) => (cache.capture_at, cache.mode),
-            None => return Ok(()),
-        };
-        let mtp_position = self.mtp.as_ref().map(Qwen4MtpGpu::position);
-        let aligned = at == Some(prefix.len())
-            && self.state.position == prefix.len()
-            && (mode == Qwen4PrefixMode::Ar || mtp_position == Some(prefix.len()));
-        let result = if aligned {
-            self.capture_prefix_owners(gpu, mode)
-        } else {
-            Err(BundleError::Forward(format!(
-                "Qwen4 prefix checkpoint at {} is not aligned (armed {at:?}, target {}, mtp {mtp_position:?})",
-                prefix.len(),
-                self.state.position
-            )))
-        };
-        let cache = self.prefix.as_mut().expect("prefix cache checked above");
-        cache.capture_at = None;
-        cache.tokens.clear();
-        match result {
-            Ok(()) => {
-                cache.tokens.extend_from_slice(prefix);
-                Ok(())
-            }
-            Err(error) => {
-                self.invalidate_prefix();
-                Err(error)
-            }
-        }
-    }
-
-    fn capture_prefix_owners(
-        &mut self,
-        gpu: &mut Gpu,
-        mode: Qwen4PrefixMode,
-    ) -> Result<(), BundleError> {
-        self.quiesce_ple()?;
-        self.state.capture_prefix(gpu).map_err(BundleError::State)?;
-        match (mode, self.mtp.as_mut()) {
-            (Qwen4PrefixMode::NativeMtp, Some(mtp)) => mtp
-                .capture_prefix(gpu)
-                .map_err(|error| BundleError::Forward(error.to_string())),
-            (Qwen4PrefixMode::NativeMtp, None) => Err(BundleError::Forward(
-                "Qwen4 MTP resources are not attached".to_string(),
-            )),
-            (Qwen4PrefixMode::Ar, Some(mtp)) => {
-                mtp.invalidate_prefix();
-                Ok(())
-            }
-            (Qwen4PrefixMode::Ar, None) => Ok(()),
-        }
-    }
-
-    /// Publish the checkpoint after the client committed the request. A
-    /// request that restored `p` and crossed no new boundary republishes `p`.
-    pub fn commit_prefix(&mut self) {
-        if let Some(cache) = self.prefix.as_mut() {
-            cache.capture_at = None;
-            cache.published = !cache.tokens.is_empty();
-        }
-    }
-
-    /// Drop the checkpoint (device validity and its token record).
-    pub fn invalidate_prefix(&mut self) {
-        if let Some(cache) = self.prefix.as_mut() {
-            cache.published = false;
-            cache.capture_at = None;
-            cache.tokens.clear();
-        }
-        self.state.invalidate_prefix();
-        if let Some(mtp) = self.mtp.as_mut() {
-            mtp.invalidate_prefix();
-        }
-    }
-
-    /// AR prefill of the full canonical `prompt` under `plan`, keeping only
-    /// the final logits row: begin (reset or restore), replay
-    /// `prompt[plan.start_pos..]` in the cold schedule's global chunks, and
-    /// checkpoint at the armed whole-chunk boundary.
+    /// AR prefill of the full canonical `prompt`, keeping only the final
+    /// logits row: restore the `reused`-token snapshot (or reset), then run
+    /// the rest in the cold schedule's global chunks, stopping at each
+    /// session-cache boundary.
     pub fn prefill_final(
         &mut self,
         gpu: &mut Gpu,
         prompt: &[u32],
-        plan: Qwen4PrefixPlan,
+        reused: usize,
         logits: &GpuTensor,
     ) -> Result<(), BundleError> {
-        self.begin_prefix(gpu, prompt, plan, Qwen4PrefixMode::Ar)?;
-        let start = plan.start_pos;
-        match self.prefix_capture_at() {
-            Some(at) => {
-                self.set_ple_lookahead(&prompt[at..]);
-                self.forward_chunk_final(gpu, &prompt[start..at], logits, None)?;
-                self.stage_prefix(gpu, &prompt[..at])?;
-                if at < prompt.len() {
-                    self.forward_chunk_final(gpu, &prompt[at..], logits, None)?;
-                }
-                Ok(())
-            }
-            None => self.forward_chunk_final(gpu, &prompt[start..], logits, None),
+        self.session_begin(gpu, prompt, reused, SessionRoute::Ar)?;
+        let mut pos = reused;
+        while let Some(boundary) = self.session_next_boundary() {
+            self.set_ple_lookahead(&prompt[boundary..]);
+            self.forward_chunk_final(gpu, &prompt[pos..boundary], logits, None)?;
+            self.session_at_boundary(gpu, &prompt[..boundary])?;
+            pos = boundary;
         }
+        if pos < prompt.len() {
+            self.forward_chunk_final(gpu, &prompt[pos..], logits, None)?;
+        }
+        Ok(())
     }
 
     pub fn snapshot(&mut self, gpu: &mut Gpu) -> Result<Qwen4StateSnapshot, BundleError> {
@@ -1572,8 +1492,12 @@ impl Qwen4Bundle {
             spec_logits,
             spec_top1,
             spec_hidden,
+            session,
             ..
         } = self;
+        if let Some(mut session) = session {
+            session.clear(gpu);
+        }
         let ple_result = ple_rows.unload().map(|_| ()).map_err(BundleError::PleRows);
         let execution_result = execution
             .map(|forward| forward.free_gpu(gpu).map_err(BundleError::Hip))
@@ -1628,7 +1552,23 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
     }
 
     fn reset_session_state(&mut self, gpu: &mut Gpu) -> Result<(), String> {
-        self.reset(gpu).map_err(|error| error.to_string())
+        Qwen4Bundle::reset(self, gpu).map_err(|error| error.to_string())
+    }
+
+    fn session_cache_attached(&self) -> bool {
+        self.session.is_some()
+    }
+
+    fn session_plan(&self, prompt: &[u32], route: SessionRoute) -> usize {
+        self.session
+            .as_ref()
+            .map_or(0, |cache| cache.plan(self, prompt, route))
+    }
+
+    fn session_commit(&mut self) {
+        if let Some(cache) = self.session.as_mut() {
+            cache.commit();
+        }
     }
 
     fn free_gpu(self: Box<Self>, gpu: &mut Gpu) {

@@ -31,6 +31,7 @@ use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::llama;
 use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
+use hipfire_runtime::session_cache::SessionRoute;
 use hipfire_runtime::tokenizer::TokenTextStream;
 use std::any::Any;
 use std::io::{BufRead, Write};
@@ -1904,7 +1905,11 @@ pub fn ep_serve_ds4(
             None => break,
         };
     }
-    for ev in parser.feed(&text_stream.flush()).into_iter().chain(parser.finish()) {
+    for ev in parser
+        .feed(&text_stream.flush())
+        .into_iter()
+        .chain(parser.finish())
+    {
         absorb_event(&ev);
         emit_stream_event(stdout, id, ev);
     }
@@ -2367,7 +2372,7 @@ pub fn qwen_history_tool_render(model_path: &str) -> hipfire_runtime::prompt_fra
 
 /// Native Qwen4 MTP never uses the shared conversation-LCP planner: generated
 /// history is not canonical prefill state. Its cache is the bundle's
-/// whole-chunk checkpoint (`Qwen4Bundle::plan_prefix`), planned separately,
+/// session cache (`ArchModel::session_plan`), planned separately,
 /// including for transitions from an AR turn. Qwen3.5/3.6/3.8 MTP and
 /// DFlash keep the prompt cache: the loaded model's family decides, never
 /// the speculator's name.
@@ -3082,28 +3087,32 @@ pub fn generate_dflash(
         None => (prompt_tokens.clone(), 0, false, 0),
     };
     // Native Qwen4 MTP keeps the shared conversation-LCP planner off
-    // (`spec_cache_disabled_for`): its only reusable prefix is the bundle's
-    // whole-chunk checkpoint, planned against this same canonical render.
-    // The drafter's prefill restores it (or resets) and replays the suffix.
+    // (`spec_cache_disabled_for`): its only reusable prefixes are the session
+    // cache's whole-chunk snapshots, planned against this same canonical
+    // render. The drafter's prefill restores one (or resets) and replays the
+    // suffix.
     let (prefill_tokens, prefill_start, cache_hit, cached_tokens_dflash) =
         match m.qwen4().filter(|_| spec_name == "mtp") {
-            Some(bundle) => {
-                let start = bundle
-                    .plan_prefix(
-                        &prompt_tokens,
-                        hipfire_arch_qwen4::bundle::Qwen4PrefixMode::NativeMtp,
-                    )
-                    .start_pos;
+            Some(_) => {
+                let start = m.state.as_deref().map_or(0, |state| {
+                    state.session_plan(&prompt_tokens, SessionRoute::Mtp)
+                });
                 if start > 0 {
                     m.seq_pos = start;
                     m.conversation_tokens.clear();
-                    m.conversation_tokens.extend_from_slice(&prompt_tokens[..start]);
+                    m.conversation_tokens
+                        .extend_from_slice(&prompt_tokens[..start]);
                     (prompt_tokens[start..].to_vec(), start, true, start)
                 } else {
                     (prompt_tokens.clone(), 0, false, 0)
                 }
             }
-            None => (prefill_tokens, prefill_start, cache_hit, cached_tokens_dflash),
+            None => (
+                prefill_tokens,
+                prefill_start,
+                cache_hit,
+                cached_tokens_dflash,
+            ),
         };
 
     // ── Grammar-guided decoding setup (dflash path) ─────────────
@@ -3422,8 +3431,8 @@ pub fn generate_dflash(
                     emit_spec_cancel_after_rollback(stdout, id, run.generated, &ep);
                     return true;
                 }
-                if let Some(bundle) = m.qwen4_mut() {
-                    bundle.commit_prefix();
+                if let Some(state) = m.state.as_deref_mut() {
+                    state.session_commit();
                 }
                 // No post-commit tool_calls event; calls live on staged terminal.
                 let mut action = qwen_dflash_cache_action(&terminal);
@@ -3598,8 +3607,8 @@ pub fn generate_dflash(
             emit_spec_cancel_after_rollback(stdout, id, run.generated, &ep);
             return true;
         }
-        if let Some(bundle) = m.qwen4_mut() {
-            bundle.commit_prefix();
+        if let Some(state) = m.state.as_deref_mut() {
+            state.session_commit();
         }
         // Safe stop/tool_calls only — length never stores; Abort suppressed above.
         if effects.store_cache {
@@ -8100,8 +8109,7 @@ pub fn generate_qwen4_ar(
         );
         return;
     }
-    let max_tokens =
-        crate::common::fit_max_tokens(max_tokens, prompt_tokens.len() + 1, m.max_seq);
+    let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_tokens.len() + 1, m.max_seq);
     let required = prompt_tokens
         .len()
         .checked_add(max_tokens)
@@ -8123,17 +8131,14 @@ pub fn generate_qwen4_ar(
         return;
     }
 
-    // Plan against the bundle's durable whole-chunk checkpoint (pure; no
-    // state touched). The prefill callback then resets on a miss or restores
-    // it on a hit and replays `prompt_tokens[start_pos..]` in the cold
-    // schedule's global chunks. Host mirrors are rebuilt from the full
-    // prompt after a successful prefill.
-    let prefix_plan = m
-        .qwen4()
-        .map(|bundle| {
-            bundle.plan_prefix(&prompt_tokens, hipfire_arch_qwen4::bundle::Qwen4PrefixMode::Ar)
-        })
-        .unwrap_or_default();
+    // Plan against the session cache (pure; no state touched). The prefill
+    // callback then resets on a miss or restores the snapshot on a hit and
+    // replays `prompt_tokens[reused..]` in the cold schedule's global chunks.
+    // Host mirrors are rebuilt from the full prompt after a successful
+    // prefill.
+    let reused = m.state.as_deref().map_or(0, |state| {
+        state.session_plan(&prompt_tokens, SessionRoute::Ar)
+    });
     m.seq_pos = 0;
     m.conversation_tokens.clear();
 
@@ -8162,7 +8167,7 @@ pub fn generate_qwen4_ar(
         // enables its tool router on `tools.is_some()`), so both Qwen4 routes
         // classify `<tool_call>` markup identically.
         tools.is_some(),
-        prefix_plan.start_pos,
+        reused,
         |model, device, tokens, logits| {
             // Prefill is never the retained body: the tape holds ordinary
             // single-token continuation only (docs/REDLINE.md §3). The Qwen4
@@ -8173,7 +8178,7 @@ pub fn generate_qwen4_ar(
                 .ok_or_else(|| "qwen4 AR bundle disappeared before prefill".to_string())
                 .and_then(|bundle| {
                     bundle
-                        .prefill_final(device, tokens, prefix_plan, logits)
+                        .prefill_final(device, tokens, reused, logits)
                         .map_err(|error| error.to_string())
                 })
         },
@@ -8188,8 +8193,8 @@ pub fn generate_qwen4_ar(
                 })
         },
         |model| {
-            if let Some(bundle) = model.qwen4_mut() {
-                bundle.commit_prefix();
+            if let Some(state) = model.state.as_deref_mut() {
+                state.session_commit();
             }
         },
     );

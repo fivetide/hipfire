@@ -15,12 +15,13 @@
 //! Target rollback counts accepted drafts only; the position helpers take the
 //! consumed-row count, which adds the seed.
 
-use crate::bundle::{Qwen4Bundle, Qwen4PrefixMode, Qwen4PrefixPlan};
+use crate::bundle::Qwen4Bundle;
 use crate::mtp_gpu::{MtpAppendScratch, MTP_FILL_ROWS};
 #[cfg(any(test, feature = "reference-parity"))]
 use crate::reference_mtp::{MtpError, Qwen4MtpState};
 use crate::state::Qwen4StateSnapshot;
 use hipfire_runtime::sampler::{sample_cpu, SamplerConfig};
+use hipfire_runtime::session_cache::SessionRoute;
 use hipfire_runtime::spec::{
     accept_greedy_prefix, GreedyAccept, MtpDrafter, MtpSpeculator, MtpWindow, SpecAdvance,
     SpecGrammar, SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
@@ -116,8 +117,8 @@ pub fn require_native_greedy(temp: f32) -> Result<(), String> {
 ///
 /// A cold fill is the complete prompt from position zero. A cache hit fills
 /// exactly `prompt_tokens[start_pos..]` after the bundle restored its
-/// checkpoint at `start_pos` (`Qwen4Bundle::begin_prefix` re-validates
-/// it), so target and MTP resume at the same absolute position.
+/// session snapshot at `start_pos`, so target and MTP resume at the same
+/// absolute position.
 pub fn validate_native_mtp_prefill_request(
     prompt_tokens: &[u32],
     fill_tokens: &[u32],
@@ -282,14 +283,6 @@ impl SpecTarget for Qwen4Bundle {
     fn reset_recurrent(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.reset(gpu)
             .map_err(|error| format!("Qwen4 reset_recurrent: {error}"))
-    }
-
-    /// Native MTP retains no pre-window snapshot to repair from, and the
-    /// prompt-cache checkpoint references the live QSA K/V rows a reset would
-    /// zero: rewind to it so the next turn can still restore it.
-    fn reset_after_unrepaired_terminal(&mut self, gpu: &mut Gpu) -> Result<(), String> {
-        self.rewind_to_prefix(gpu)
-            .map_err(|error| format!("Qwen4 terminal rewind: {error}"))
     }
 
     fn retry_reset_eligible(&self) -> bool {
@@ -1110,15 +1103,13 @@ impl MtpDrafter for Qwen4MtpDrafter {
         validate_native_mtp_prefill_request(prompt_tokens, fill_tokens, start_pos, cache_hit)?;
         self.agreement = [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH];
         // A miss resets target, head and draft policy; a hit restores the
-        // bundle's canonical checkpoint at `start_pos` into all three.
-        let plan = Qwen4PrefixPlan {
-            start_pos: if cache_hit { start_pos } else { 0 },
-        };
+        // session snapshot at `start_pos` into all three.
+        let reused = if cache_hit { start_pos } else { 0 };
         Self::bundle(target)?
-            .begin_prefix(gpu, prompt_tokens, plan, Qwen4PrefixMode::NativeMtp)
+            .session_begin(gpu, prompt_tokens, reused, SessionRoute::Mtp)
             .map_err(|error| error.to_string())?;
         self.ensure_resources(gpu, target)?;
-        let capture_at = {
+        {
             let bundle = Self::bundle(target)?;
             let target_position = bundle.state.position;
             let mtp_position = bundle.mtp_position().map_err(|error| error.to_string())?;
@@ -1128,8 +1119,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     target_position, mtp_position
                 ));
             }
-            bundle.prefix_capture_at()
-        };
+        }
         // Field borrows (not `pending_hidden()`): the batched fill below also
         // borrows `append_scratch` mutably.
         let pending = self
@@ -1216,11 +1206,12 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 }
             }
             // The head has caught up with the target: the only point a
-            // whole-chunk checkpoint of both owners is canonical.
+            // whole-chunk snapshot of both owners is canonical.
             let end = start_pos + base + chunk.len();
-            if capture_at == Some(end) {
-                Self::bundle(target)?
-                    .stage_prefix(gpu, &prompt_tokens[..end])
+            let bundle = Self::bundle(target)?;
+            if bundle.session_next_boundary() == Some(end) {
+                bundle
+                    .session_at_boundary(gpu, &prompt_tokens[..end])
                     .map_err(|error| error.to_string())?;
             }
             first_token = Some(pick);
