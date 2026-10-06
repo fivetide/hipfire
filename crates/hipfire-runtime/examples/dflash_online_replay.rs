@@ -82,6 +82,95 @@ fn feed(path: &str, b: &[u8], t: &mut OnlineDraftTuner, max_obs: usize, prompt: 
     }
 }
 
+/// One request of a `HIPFIRE_DFLASH_ONLINE_TUNE=sweep` dump: the prompt, the
+/// draft top-K (and seed) at every block start, and the committed text.
+struct Sweep {
+    prompt: Vec<u32>,
+    recs: std::collections::BTreeMap<usize, (u32, usize, Vec<u32>, Vec<f32>)>,
+    text: std::collections::HashMap<usize, u32>,
+}
+
+/// Parse the last request of a sweep dump.
+fn parse_sweep(path: &str, b: &[u8]) -> Sweep {
+    let mut sw = Sweep {
+        prompt: Vec::new(),
+        recs: Default::default(),
+        text: Default::default(),
+    };
+    let mut o = 0usize;
+    let mut prop: Option<(usize, u32, usize, Vec<u32>)> = None;
+    while o < b.len() {
+        let tag = b[o];
+        o += 1;
+        match tag {
+            b'P' => {
+                let start = u64_at(b, &mut o) as usize;
+                let seed = u64_at(b, &mut o) as u32;
+                let rows = u64_at(b, &mut o) as usize;
+                prop = Some((start, seed, rows, u32s(b, &mut o, rows * K)));
+            }
+            b'L' => {
+                let (start, seed, rows, ids) = prop.take().expect("L record without P");
+                let vals = u32s(b, &mut o, ids.len())
+                    .into_iter()
+                    .map(f32::from_bits)
+                    .collect();
+                sw.recs.insert(start, (seed, rows, ids, vals));
+                sw.text.insert(start, seed);
+            }
+            b'O' => {
+                let start = u64_at(b, &mut o) as usize;
+                let _ = u64_at(b, &mut o);
+                let n = u64_at(b, &mut o) as usize;
+                for (i, t) in u32s(b, &mut o, n).into_iter().enumerate() {
+                    sw.text.insert(start + 1 + i, t);
+                }
+            }
+            b'R' => {
+                sw = Sweep {
+                    prompt: Vec::new(),
+                    recs: Default::default(),
+                    text: Default::default(),
+                }
+            }
+            b'S' => {
+                let n = u64_at(b, &mut o) as usize;
+                sw.prompt = u32s(b, &mut o, n);
+            }
+            _ => panic!("{path}: bad record tag {tag} at {}", o - 1),
+        }
+    }
+    sw
+}
+
+/// Run a policy over a sweep session with its *own* block starts: accept the
+/// longest prefix of its picks matching the text, commit the bonus, start the
+/// next block after it. Returns (tokens, windows).
+fn simulate(sw: &Sweep, t: &mut OnlineDraftTuner) -> (usize, usize) {
+    t.seed_prompt(&sw.prompt);
+    let (mut tokens, mut windows) = (0usize, 0usize);
+    let Some(mut s) = sw.recs.keys().next().copied() else {
+        return (0, 0);
+    };
+    while let Some((seed, rows, ids, vals)) = sw.recs.get(&s) {
+        let picks = t.propose(s, *seed, ids, vals, *rows);
+        let acc = picks
+            .iter()
+            .enumerate()
+            .take_while(|(i, p)| sw.text.get(&(s + 1 + i)) == Some(p))
+            .count();
+        let Some(&bonus) = sw.text.get(&(s + acc + 1)) else {
+            break;
+        };
+        let committed: Vec<u32> = picks[..acc].iter().copied().chain([bonus]).collect();
+        t.observe(s, &committed, acc);
+        tokens += acc + 1;
+        windows += 1;
+        s += acc + 1;
+    }
+    (tokens, windows)
+}
+
 fn arg_value(args: &mut Vec<String>, flag: &str) -> Option<String> {
     let i = args.iter().position(|a| a == flag)?;
     let v = args.remove(i + 1);
@@ -102,6 +191,35 @@ fn main() {
         .unwrap_or_else(|e| panic!("{e}"));
     let first = arg_value(&mut args, "--first").map_or(usize::MAX, |v| v.parse().unwrap());
     let carry_loo = take_flag(&mut args, "--carry-loo");
+    if take_flag(&mut args, "--simulate") {
+        // Sweep dumps: tokens per window of the tuned policy vs argmax, each
+        // with its own block starts, one cold request per session.
+        let mut ratios = Vec::new();
+        for p in &args {
+            let b = std::fs::read(p).unwrap_or_else(|e| panic!("{p}: {e}"));
+            let sw = parse_sweep(p, &b);
+            let (at, aw) = simulate(&sw, &mut OnlineDraftTuner::new(Mode::Stats, hyper.clone()));
+            let (bt, bw) = simulate(
+                &sw,
+                &mut OnlineDraftTuner::new(
+                    Mode::On,
+                    Hyper {
+                        carry: false,
+                        ..hyper.clone()
+                    },
+                ),
+            );
+            let (a, b) = (at as f64 / aw.max(1) as f64, bt as f64 / bw.max(1) as f64);
+            println!("{p}: argmax tok/win={a:.3} ({at}/{aw}) tuned tok/win={b:.3} ({bt}/{bw})");
+            ratios.push(b / a);
+        }
+        let geo = (ratios.iter().map(|r| r.ln()).sum::<f64>() / ratios.len().max(1) as f64).exp();
+        println!(
+            "SIM GEOMEAN tuned/argmax tok/win over {} sessions: {geo:.4} (hp: {hyper:?})",
+            ratios.len()
+        );
+        return;
+    }
     let prompt = !take_flag(&mut args, "--no-prompt");
     let data: Vec<Vec<u8>> = args
         .iter()

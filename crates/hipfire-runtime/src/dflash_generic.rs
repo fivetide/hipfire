@@ -747,7 +747,13 @@ impl Speculator for GenericDflashSpeculator {
             // sampling verify (exact for any deterministic draft) require.
             Some(t) => {
                 let (ids, vals) = crate::dflash_online::top_k_rows(&draft_logits, vocab, batch);
-                t.propose(position, seed, &ids, &vals, batch)
+                let picks = t.propose(position, seed, &ids, &vals, batch);
+                if t.mode == crate::dflash_online::Mode::Sweep {
+                    // Always rejected: every cycle commits exactly one target token.
+                    vec![vocab as u32 - 1; batch]
+                } else {
+                    picks
+                }
             }
             None => (0..batch)
                 .map(|i| llama::argmax(&draft_logits[i * vocab..(i + 1) * vocab]))

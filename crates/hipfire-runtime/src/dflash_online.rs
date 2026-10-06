@@ -55,6 +55,13 @@ pub enum Mode {
     Stats,
     /// Train online and re-rank proposals.
     On,
+    /// Evaluation dumps: the caller drafts a token the target never picks, so
+    /// every cycle commits one target token and the dump holds the draft's
+    /// top-K at *every* position — `dflash_online_replay --simulate` then
+    /// replays any policy with its own block starts (fixed-start replay of a
+    /// normal session cannot: a policy that accepts more starts later blocks
+    /// elsewhere).
+    Sweep,
 }
 
 impl Mode {
@@ -65,6 +72,7 @@ impl Mode {
         {
             "stats" => Some(Mode::Stats),
             "1" | "on" => Some(Mode::On),
+            "sweep" => Some(Mode::Sweep),
             _ => None,
         }
     }
