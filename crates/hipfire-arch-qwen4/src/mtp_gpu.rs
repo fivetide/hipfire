@@ -16,7 +16,7 @@ use crate::gpu_forward::{
 };
 use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
 use crate::program::{Qwen4HyperReadWeights, Qwen4HyperWriteWeights, Qwen4QsaWeights};
-use crate::state::{meta_bytes, meta_words, state_part, whole_part};
+use crate::state::{meta_bytes, meta_words, whole_part};
 use crate::weights::{Qwen4Weights, WeightError};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::WeightRef;
@@ -29,7 +29,7 @@ use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::kv_backend::{
     KvChunkPlan, DEFAULT_KV_CHUNK_TOKENS, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
 };
-use hipfire_runtime::session_cache::StatePart;
+use hipfire_runtime::session_cache::{RowStream, StateLayout};
 use hipfire_runtime::spec::SpecGrammar;
 use rdna_compute::tensor_ops::{
     hyper_norm, hyper_read_projected, indexed_attention_append_prologue,
@@ -1409,38 +1409,34 @@ impl MtpGpuState {
         self.step_index = metadata.step_index;
     }
 
-    /// Device ranges of the state at `mark`: full K/V, raw and pooled rows
-    /// below it, then selection, device selected length and wide hidden.
-    fn session_layout(&self, mark: &MtpStateMark) -> Vec<StatePart<'_>> {
-        let rows = |tensor: &GpuTensor, capacity: usize, rows: usize| {
-            rows * (tensor.byte_size() / capacity)
-        };
-        vec![
-            state_part(
-                &self.full_keys,
-                rows(&self.full_keys, self.full_capacity, mark.full_len),
-            ),
-            state_part(
-                &self.full_values,
-                rows(&self.full_values, self.full_capacity, mark.full_len),
-            ),
-            state_part(
-                &self.raw_index_keys,
-                rows(&self.raw_index_keys, self.raw_capacity, mark.raw_len),
-            ),
-            state_part(
-                &self.pooled_keys,
-                rows(&self.pooled_keys, self.pooled_capacity, mark.pooled_len),
-            ),
-            whole_part(&self.selected_indices),
-            whole_part(&self.selected_len_out),
-            whole_part(&self.wide_hidden),
-        ]
+    /// Layout of the state at `mark`: full K/V, raw and pooled rows below it,
+    /// then selection, device selected length and wide hidden.
+    fn session_layout(&self, mark: &MtpStateMark) -> StateLayout<'_> {
+        StateLayout {
+            fixed: vec![
+                whole_part(&self.selected_indices),
+                whole_part(&self.selected_len_out),
+                whole_part(&self.wide_hidden),
+            ],
+            rows: [
+                (&self.full_keys, self.full_capacity, mark.full_len),
+                (&self.full_values, self.full_capacity, mark.full_len),
+                (&self.raw_index_keys, self.raw_capacity, mark.raw_len),
+                (&self.pooled_keys, self.pooled_capacity, mark.pooled_len),
+            ]
+            .into_iter()
+            .map(|(tensor, capacity, rows)| RowStream {
+                buf: &tensor.buf,
+                row_bytes: tensor.byte_size() / capacity,
+                rows,
+            })
+            .collect(),
+        }
     }
 
     /// Session-cache capture: `MTP_SESSION_WORDS` metadata words and the
     /// device ranges of the live state.
-    fn session_parts(&self) -> Result<(Vec<u64>, Vec<StatePart<'_>>), MtpGpuError> {
+    fn session_parts(&self) -> Result<(Vec<u64>, StateLayout<'_>), MtpGpuError> {
         let mark = self.mark();
         validate_mtp_mark(&mark, self)?;
         let words = [
@@ -1480,7 +1476,7 @@ impl MtpGpuState {
         &mut self,
         gpu: &mut Gpu,
         words: &[u64],
-    ) -> Result<Vec<StatePart<'_>>, MtpGpuError> {
+    ) -> Result<StateLayout<'_>, MtpGpuError> {
         let mark = self.parse_session_mark(words)?;
         self.ensure_mapped_capacity(gpu, mark.position)?;
         self.snapshot_arena.invalidate();
@@ -1741,7 +1737,7 @@ impl Qwen4MtpGpu {
     /// Prompt appends only `observe` (a qualifying input sets the full hold);
     /// drafts are the only decrement, so at a prompt boundary the policy is
     /// the canonical prompt summary.
-    pub(crate) fn session_parts(&self) -> Result<(Vec<u8>, Vec<StatePart<'_>>), MtpGpuError> {
+    pub(crate) fn session_parts(&self) -> Result<(Vec<u8>, StateLayout<'_>), MtpGpuError> {
         let (mut words, parts) = self.state.session_parts()?;
         let policy = self.draft.request_state();
         words.extend([
@@ -1761,7 +1757,7 @@ impl Qwen4MtpGpu {
         &mut self,
         gpu: &mut Gpu,
         meta: &[u8],
-    ) -> Result<Vec<StatePart<'_>>, MtpGpuError> {
+    ) -> Result<StateLayout<'_>, MtpGpuError> {
         let words = Self::session_words(meta)?;
         self.state
             .prepare_session_restore(gpu, &words[..MTP_SESSION_WORDS])

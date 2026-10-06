@@ -14,7 +14,7 @@ use hipfire_dispatch::pipeline::GdnRowCapture;
 use hipfire_runtime::kv_backend::{
     KvChunkPlan, KvChunkPlanError, DEFAULT_KV_CHUNK_TOKENS, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
 };
-use hipfire_runtime::session_cache::StatePart;
+use hipfire_runtime::session_cache::{RowStream, StateLayout, StatePart};
 use rdna_compute::tensor_ops::{
     copy_regions, gated_delta_rollback_layers, CopyRegion, GatedDeltaRollbackLayers,
     GdnStateFormat, QsaKvFormat,
@@ -408,18 +408,26 @@ fn arena_row_bytes(tensor: &GpuTensor, rows: usize) -> Result<usize, StateError>
     Ok(bytes / rows)
 }
 
-/// The first `bytes` of `tensor` as a session-snapshot part.
-pub(crate) fn state_part(tensor: &GpuTensor, bytes: usize) -> StatePart<'_> {
+/// All of `tensor` as a fixed session-snapshot part.
+pub(crate) fn whole_part(tensor: &GpuTensor) -> StatePart<'_> {
     StatePart {
         buf: &tensor.buf,
         offset: 0,
-        bytes,
+        bytes: tensor.byte_size(),
     }
 }
 
-/// All of `tensor` as a session-snapshot part.
-pub(crate) fn whole_part(tensor: &GpuTensor) -> StatePart<'_> {
-    state_part(tensor, tensor.byte_size())
+/// The first `rows` of an append-only arena holding `capacity` rows.
+pub(crate) fn row_stream(
+    tensor: &GpuTensor,
+    capacity: usize,
+    rows: usize,
+) -> Result<RowStream<'_>, StateError> {
+    Ok(RowStream {
+        buf: &tensor.buf,
+        row_bytes: arena_row_bytes(tensor, capacity)?,
+        rows,
+    })
 }
 
 /// Session-snapshot metadata: little-endian `u64` words.
@@ -1351,34 +1359,44 @@ impl Qwen4State {
     /// Device ranges of the live state for `marks`: GDN recurrent (live slot)
     /// and conv, per QSA layer the full K/V, raw and pooled rows below the
     /// mark plus the selection, then PLE conv and hyper feedback.
-    fn session_layout(&self, marks: &[QsaMark]) -> Result<Vec<StatePart<'_>>, StateError> {
-        let mut parts = Vec::with_capacity(2 * self.gdn.len() + 5 * self.qsa.len() + 2);
+    fn session_layout(&self, marks: &[QsaMark]) -> Result<StateLayout<'_>, StateError> {
+        let mut fixed = Vec::with_capacity(2 * self.gdn.len() + self.qsa.len() + 2);
+        let mut rows = Vec::with_capacity(4 * self.qsa.len());
         for layer in &self.gdn {
-            parts.push(whole_part(&layer.recurrent));
-            parts.push(whole_part(&layer.conv));
+            fixed.push(whole_part(&layer.recurrent));
+            fixed.push(whole_part(&layer.conv));
         }
         for (layer, mark) in self.qsa.iter().zip(marks) {
-            for (tensor, capacity, rows) in [
-                (&layer.full_keys, layer.full_capacity, mark.full_len),
-                (&layer.full_values, layer.full_capacity, mark.full_len),
-                (&layer.raw_index_keys, layer.raw_capacity, mark.raw_len),
-                (&layer.pooled_keys, layer.pooled_capacity, mark.pooled_len),
-            ] {
-                let bytes = rows
-                    .checked_mul(arena_row_bytes(tensor, capacity)?)
-                    .ok_or(StateError::DimensionOverflow)?;
-                parts.push(state_part(tensor, bytes));
-            }
-            parts.push(whole_part(&layer.selected_indices));
+            rows.push(row_stream(
+                &layer.full_keys,
+                layer.full_capacity,
+                mark.full_len,
+            )?);
+            rows.push(row_stream(
+                &layer.full_values,
+                layer.full_capacity,
+                mark.full_len,
+            )?);
+            rows.push(row_stream(
+                &layer.raw_index_keys,
+                layer.raw_capacity,
+                mark.raw_len,
+            )?);
+            rows.push(row_stream(
+                &layer.pooled_keys,
+                layer.pooled_capacity,
+                mark.pooled_len,
+            )?);
+            fixed.push(whole_part(&layer.selected_indices));
         }
-        parts.push(whole_part(&self.ple_conv));
-        parts.push(whole_part(&self.hyper_feedback));
-        Ok(parts)
+        fixed.push(whole_part(&self.ple_conv));
+        fixed.push(whole_part(&self.hyper_feedback));
+        Ok(StateLayout { fixed, rows })
     }
 
     /// Session-cache capture: metadata words and the device ranges that
     /// make up the live state. Never inside an armed verify.
-    pub(crate) fn session_parts(&self) -> Result<(Vec<u8>, Vec<StatePart<'_>>), StateError> {
+    pub(crate) fn session_parts(&self) -> Result<(Vec<u8>, StateLayout<'_>), StateError> {
         if self.row_capture_armed {
             return Err(StateError::SnapshotBusy);
         }
@@ -1443,12 +1461,12 @@ impl Qwen4State {
 
     /// Ready the live state for a session snapshot: map the context arenas
     /// to its position and retire every speculative ticket (like a reset).
-    /// Returns the destination ranges in [`Self::session_parts`] order.
+    /// Returns the destination layout in [`Self::session_parts`] order.
     pub(crate) fn prepare_session_restore(
         &mut self,
         gpu: &mut Gpu,
         meta: &[u8],
-    ) -> Result<Vec<StatePart<'_>>, StateError> {
+    ) -> Result<StateLayout<'_>, StateError> {
         if self.row_capture_armed {
             return Err(StateError::SnapshotBusy);
         }

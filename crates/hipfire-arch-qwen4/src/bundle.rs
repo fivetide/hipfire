@@ -27,7 +27,7 @@ use crate::weights::{
 use hipfire_runtime::external_rows::{RowEncoding, RowStore, RowStoreError};
 use hipfire_runtime::model_source::{SourceFormat, SourceRangeDescriptor};
 use hipfire_runtime::session_cache::{
-    SessionCache, SessionRoute, SessionState, SnapshotParts, StatePart,
+    SessionCache, SessionRoute, SessionState, SnapshotParts, StateLayout,
 };
 use hipfire_runtime::spec_sampling::{SampleSpec, SparseDist};
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
@@ -112,10 +112,11 @@ pub struct Qwen4Bundle {
     state_format: Qwen4StateFormat,
 }
 
-/// Device bytes of one session-cache snapshot after `p` tokens (each part
-/// rounded to the cache's 256-byte packing): GDN recurrent and conv, QSA
-/// rows below `p` plus selections, PLE conv and hyper feedback, and with
-/// native MTP the head's rows, selection and wide hidden.
+/// Device bytes of one session-cache snapshot holding `p` rows per token
+/// stream (each part rounded to the cache's 256-byte packing): GDN recurrent
+/// and conv, `p` QSA rows plus selections, PLE conv and hyper feedback, and
+/// with native MTP the head's rows, selection and wide hidden. A delta
+/// snapshot at a chunk boundary over its parent holds `p` = one chunk.
 pub fn session_snapshot_bytes(
     config: &Qwen4Config,
     format: Qwen4StateFormat,
@@ -218,18 +219,19 @@ impl SessionState for Qwen4Bundle {
         if self.state.position != position || mtp.is_some_and(|mtp| mtp.position() != position) {
             return Err(format!("qwen4 session capture: owners not at {position}"));
         }
-        let (target_meta, mut parts) = self.state.session_parts().map_err(|e| e.to_string())?;
+        let (target_meta, mut layout) = self.state.session_parts().map_err(|e| e.to_string())?;
         let mut meta = meta_bytes(&[
             (route == SessionRoute::Mtp).into(),
             (target_meta.len() / 8) as u64,
         ]);
         meta.extend(target_meta);
         if let Some(mtp) = mtp {
-            let (mtp_meta, mtp_parts) = mtp.session_parts().map_err(|e| e.to_string())?;
+            let (mtp_meta, mtp_layout) = mtp.session_parts().map_err(|e| e.to_string())?;
             meta.extend(mtp_meta);
-            parts.extend(mtp_parts);
+            layout.fixed.extend(mtp_layout.fixed);
+            layout.rows.extend(mtp_layout.rows);
         }
-        Ok(SnapshotParts { meta, parts })
+        Ok(SnapshotParts { meta, layout })
     }
 
     fn restore_parts(
@@ -237,10 +239,10 @@ impl SessionState for Qwen4Bundle {
         gpu: &mut Gpu,
         route: SessionRoute,
         meta: &[u8],
-    ) -> Result<Vec<StatePart<'_>>, String> {
+    ) -> Result<StateLayout<'_>, String> {
         self.invalidate_ple_epoch().map_err(|e| e.to_string())?;
         let (target_meta, mtp_meta) = split_session_meta(route, meta)?;
-        let mut parts = self
+        let mut layout = self
             .state
             .prepare_session_restore(gpu, target_meta)
             .map_err(|e| e.to_string())?;
@@ -249,12 +251,13 @@ impl SessionState for Qwen4Bundle {
                 .mtp
                 .as_mut()
                 .ok_or("Qwen4 MTP resources are not attached")?;
-            parts.extend(
-                mtp.prepare_session_restore(gpu, mtp_meta)
-                    .map_err(|e| e.to_string())?,
-            );
+            let mtp_layout = mtp
+                .prepare_session_restore(gpu, mtp_meta)
+                .map_err(|e| e.to_string())?;
+            layout.fixed.extend(mtp_layout.fixed);
+            layout.rows.extend(mtp_layout.rows);
         }
-        Ok(parts)
+        Ok(layout)
     }
 
     fn finish_restore(
