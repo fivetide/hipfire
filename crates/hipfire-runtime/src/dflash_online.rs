@@ -101,7 +101,7 @@ pub struct Hyper {
 impl Default for Hyper {
     fn default() -> Self {
         Self {
-            lr: 0.2,
+            lr: 0.3,
             acc0: 1.0,
             margin: 0.0,
             inject: 1.0,
