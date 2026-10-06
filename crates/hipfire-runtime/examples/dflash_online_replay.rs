@@ -194,21 +194,29 @@ fn main() {
     if take_flag(&mut args, "--simulate") {
         // Sweep dumps: tokens per window of the tuned policy vs argmax, each
         // with its own block starts, one cold request per session.
+        // With --carry-loo, the tuned run first serves every other session in
+        // the same tuner (weights carried, as a long-running daemon would).
+        let sweeps: Vec<Sweep> = args
+            .iter()
+            .map(|p| parse_sweep(p, &std::fs::read(p).unwrap_or_else(|e| panic!("{p}: {e}"))))
+            .collect();
         let mut ratios = Vec::new();
-        for p in &args {
-            let b = std::fs::read(p).unwrap_or_else(|e| panic!("{p}: {e}"));
-            let sw = parse_sweep(p, &b);
-            let (at, aw) = simulate(&sw, &mut OnlineDraftTuner::new(Mode::Stats, hyper.clone()));
-            let (bt, bw) = simulate(
-                &sw,
-                &mut OnlineDraftTuner::new(
-                    Mode::On,
-                    Hyper {
-                        carry: false,
-                        ..hyper.clone()
-                    },
-                ),
+        for (i, (p, sw)) in args.iter().zip(&sweeps).enumerate() {
+            let (at, aw) = simulate(sw, &mut OnlineDraftTuner::new(Mode::Stats, hyper.clone()));
+            let mut t = OnlineDraftTuner::new(
+                Mode::On,
+                Hyper {
+                    carry: carry_loo,
+                    ..hyper.clone()
+                },
             );
+            if carry_loo {
+                for (_, other) in sweeps.iter().enumerate().filter(|(j, _)| *j != i) {
+                    simulate(other, &mut t);
+                    t.reset();
+                }
+            }
+            let (bt, bw) = simulate(sw, &mut t);
             let (a, b) = (at as f64 / aw.max(1) as f64, bt as f64 / bw.max(1) as f64);
             println!("{p}: argmax tok/win={a:.3} ({at}/{aw}) tuned tok/win={b:.3} ({bt}/{bw})");
             ratios.push(b / a);
