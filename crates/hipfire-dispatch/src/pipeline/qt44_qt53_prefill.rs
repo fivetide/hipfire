@@ -304,14 +304,29 @@ pub(crate) fn shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<
                 })
             }
         };
-        batch_projection(
-            gpu,
-            &shared.weights.gate,
-            x_gate,
-            shared.gate_out,
-            p.batch_size,
-        )?;
-        batch_projection(gpu, &shared.weights.up, x_gate, shared.up_out, p.batch_size)?;
+        let (gate, up) = (&shared.weights.gate, &shared.weights.up);
+        if gate.dtype == DType::Q8_0
+            && up.dtype == DType::Q8_0
+            && gate.k == 2560
+            && up.k == 2560
+            && gpu.gemv_q8_0_staged_rows_supported(2560, p.batch_size)
+        {
+            // Few-row verify: the Q8 decode copies of the shared gate and up
+            // read the same rows; one launch, each row the single kernel's.
+            hip(gpu.gemv_q8_0_k2560_staged_rows_x2(
+                gate.buf,
+                shared.gate_out,
+                gate.m,
+                up.buf,
+                shared.up_out,
+                up.m,
+                x_gate,
+                p.batch_size,
+            ))?;
+        } else {
+            batch_projection(gpu, gate, x_gate, shared.gate_out, p.batch_size)?;
+            batch_projection(gpu, up, x_gate, shared.up_out, p.batch_size)?;
+        }
     }
     // BF16 recipe: every reader rounds what it reads (the top-10 router its
     // logits, the shared activation its selector, gate and up), so no
