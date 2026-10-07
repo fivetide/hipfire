@@ -106,10 +106,7 @@ fn arena_regions<'a>(
             let live_offset = (raw_len - rows)
                 .checked_mul(row_bytes)
                 .ok_or(StateError::DimensionOverflow)?;
-            let (live, saved) = (
-                &layer.raw_index_keys.buf,
-                &arena.qsa_raw_circular[index].buf,
-            );
+            let (live, saved) = (&layer.raw_index_keys.buf, &arena.qsa_raw_circular[index].buf);
             copies.push(if capture {
                 CopyRegion {
                     dst: saved,
@@ -402,7 +399,7 @@ fn context_arena_plan(
 /// Bytes per row of a context arena holding `rows` capacity rows.
 fn arena_row_bytes(tensor: &GpuTensor, rows: usize) -> Result<usize, StateError> {
     let bytes = tensor.byte_size();
-    if rows == 0 || bytes % rows != 0 {
+    if rows == 0 || !bytes.is_multiple_of(rows) {
         return Err(StateError::DimensionOverflow);
     }
     Ok(bytes / rows)
@@ -437,7 +434,7 @@ pub(crate) fn meta_bytes(words: &[u64]) -> Vec<u8> {
 
 /// Inverse of [`meta_bytes`]; `None` unless whole words.
 pub(crate) fn meta_words(meta: &[u8]) -> Option<Vec<u64>> {
-    (meta.len() % 8 == 0).then(|| {
+    meta.len().is_multiple_of(8).then(|| {
         meta.chunks_exact(8)
             .map(|word| u64::from_le_bytes(word.try_into().expect("8-byte chunk")))
             .collect()
@@ -1329,9 +1326,9 @@ impl Qwen4State {
             for tensor in layer.context_arenas() {
                 let committed = match self.qsa_backend {
                     Qwen4KvBackend::Legacy => tensor.buf.size(),
-                    Qwen4KvBackend::Vmm => {
-                        gpu.vmm_mapped_bytes(tensor).ok_or(StateError::VmmOwner)?
-                    }
+                    Qwen4KvBackend::Vmm => gpu
+                        .vmm_mapped_bytes(tensor)
+                        .ok_or(StateError::VmmOwner)?,
                 };
                 bytes = bytes
                     .checked_add(committed)
@@ -1367,26 +1364,14 @@ impl Qwen4State {
             fixed.push(whole_part(&layer.conv));
         }
         for (layer, mark) in self.qsa.iter().zip(marks) {
-            rows.push(row_stream(
-                &layer.full_keys,
-                layer.full_capacity,
-                mark.full_len,
-            )?);
-            rows.push(row_stream(
-                &layer.full_values,
-                layer.full_capacity,
-                mark.full_len,
-            )?);
-            rows.push(row_stream(
-                &layer.raw_index_keys,
-                layer.raw_capacity,
-                mark.raw_len,
-            )?);
-            rows.push(row_stream(
-                &layer.pooled_keys,
-                layer.pooled_capacity,
-                mark.pooled_len,
-            )?);
+            for (tensor, capacity, len) in [
+                (&layer.full_keys, layer.full_capacity, mark.full_len),
+                (&layer.full_values, layer.full_capacity, mark.full_len),
+                (&layer.raw_index_keys, layer.raw_capacity, mark.raw_len),
+                (&layer.pooled_keys, layer.pooled_capacity, mark.pooled_len),
+            ] {
+                rows.push(row_stream(tensor, capacity, len)?);
+            }
             fixed.push(whole_part(&layer.selected_indices));
         }
         fixed.push(whole_part(&self.ple_conv));
@@ -1406,8 +1391,6 @@ impl Qwen4State {
             self.position as u64,
             ple0.into(),
             ple1.into(),
-            self.ple_history.eos_token_id().into(),
-            self.qsa.len() as u64,
         ];
         let mut marks = Vec::with_capacity(self.qsa.len());
         for layer in &self.qsa {
@@ -1429,6 +1412,12 @@ impl Qwen4State {
         Ok((meta_bytes(&words), self.session_layout(&marks)?))
     }
 
+    /// Byte length of a [`Self::session_parts`] meta: model id, position and
+    /// PLE context, then six words per QSA layer.
+    pub(crate) fn session_meta_bytes(&self) -> usize {
+        8 * (4 + 6 * self.qsa.len())
+    }
+
     /// Position, PLE context and QSA marks of a [`Self::session_parts`] meta.
     fn parse_session_meta(
         &self,
@@ -1436,16 +1425,14 @@ impl Qwen4State {
     ) -> Result<(usize, PleHistory, Vec<QsaMark>), StateError> {
         let words = meta_words(meta).ok_or(StateError::SnapshotShape)?;
         let to_u32 = |word: u64| u32::try_from(word).map_err(|_| StateError::SnapshotShape);
-        if words.len() != 6 + 6 * self.qsa.len()
-            || words[0] != self.model_id
-            || words[5] != self.qsa.len() as u64
-            || to_u32(words[4])? != self.ple_history.eos_token_id()
-        {
+        if words.len() * 8 != self.session_meta_bytes() || words[0] != self.model_id {
             return Err(StateError::SnapshotShape);
         }
-        let ple =
-            PleHistory::from_previous(to_u32(words[4])?, [to_u32(words[2])?, to_u32(words[3])?]);
-        let marks = words[6..]
+        let ple = PleHistory::from_previous(
+            self.ple_history.eos_token_id(),
+            [to_u32(words[2])?, to_u32(words[3])?],
+        );
+        let marks = words[4..]
             .chunks_exact(6)
             .map(|w| QsaMark {
                 full_len: w[0] as usize,
@@ -1719,11 +1706,7 @@ impl Qwen4State {
         gdn_layers
             .checked_mul(ring.checked_add(inputs)?)?
             .checked_add(output)?
-            .checked_add(
-                gdn_layers
-                    .checked_mul(2 * std::mem::size_of::<u64>())?
-                    .max(1),
-            )
+            .checked_add(gdn_layers.checked_mul(2 * std::mem::size_of::<u64>())?.max(1))
     }
 
     /// Allocate the few-row verify rollback points for blocks of up to
@@ -2284,20 +2267,11 @@ mod tests {
         assert!(full.growth(512 * MIB, s + 1).is_err());
 
         let raw = context_arena_plan(512, s, 2 * MIB).unwrap();
-        assert_eq!(
-            raw.token_capacity(raw.growth(0, 1).unwrap().unwrap().size_bytes),
-            4096
-        );
+        assert_eq!(raw.token_capacity(raw.growth(0, 1).unwrap().unwrap().size_bytes), 4096);
         // Pooled keys map ceil(required / 4) rows: 4097 tokens are 1025 rows,
         // inside the first 4096-row page, which covers 16384 tokens.
         let pooled = context_arena_plan(512, s.div_ceil(4), 2 * MIB).unwrap();
-        let rows = pooled.token_capacity(
-            pooled
-                .growth(0, 4097usize.div_ceil(4))
-                .unwrap()
-                .unwrap()
-                .size_bytes,
-        );
+        let rows = pooled.token_capacity(pooled.growth(0, 4097usize.div_ceil(4)).unwrap().unwrap().size_bytes);
         assert_eq!(rows, 4096);
         assert_eq!(qsa_covered_tokens(rows, 4, s), 16_384);
         // A short state's last pooled row covers its ragged tail only.
@@ -2338,13 +2312,11 @@ mod tests {
         let s = 1024;
         let mut state =
             Qwen4State::new(&mut gpu, &config, s, Qwen4StateFormat::F32).expect("legacy state");
-        let full =
-            config.qsa_context_arena_bytes(s, QsaKvFormat::F32).unwrap() * config.n_full_layers();
+        let full = config.qsa_context_arena_bytes(s, QsaKvFormat::F32).unwrap()
+            * config.n_full_layers();
         assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), full);
         assert_eq!(state.mapped_context_tokens(), s);
-        state
-            .ensure_mapped_capacity(&mut gpu, s)
-            .expect("admitted tokens");
+        state.ensure_mapped_capacity(&mut gpu, s).expect("admitted tokens");
         assert!(matches!(
             state.ensure_mapped_capacity(&mut gpu, s + 1),
             Err(StateError::ContextCapacity { required, admitted }) if required == s + 1 && admitted == s
@@ -2414,9 +2386,7 @@ mod tests {
         assert_eq!((state.position, state.qsa[0].full_len), (5, 5));
 
         let granularity = gpu.vmm_granularity(&state.qsa[0].full_keys).unwrap();
-        state
-            .ensure_mapped_capacity(&mut gpu, 1)
-            .expect("first page");
+        state.ensure_mapped_capacity(&mut gpu, 1).expect("first page");
         let (bytes, first) = expected_vmm(granularity, s, 1);
         assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), bytes);
         assert_eq!(state.mapped_context_tokens(), first);
@@ -2425,15 +2395,11 @@ mod tests {
         gpu.hip
             .memcpy_htod(&state.qsa[0].full_keys.buf, &pattern)
             .expect("write row 0");
-        state
-            .ensure_mapped_capacity(&mut gpu, first)
-            .expect("covered");
+        state.ensure_mapped_capacity(&mut gpu, first).expect("covered");
         assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), bytes);
 
         let old_size = state.qsa[0].full_keys.buf.size();
-        state
-            .ensure_mapped_capacity(&mut gpu, first + 1)
-            .expect("grow");
+        state.ensure_mapped_capacity(&mut gpu, first + 1).expect("grow");
         let (bytes, tokens) = expected_vmm(granularity, s, first + 1);
         assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), bytes);
         assert_eq!(state.mapped_context_tokens(), tokens);
@@ -2441,20 +2407,14 @@ mod tests {
         let keys = &state.qsa[0].full_keys;
         assert!(keys.buf.size() > old_size);
         let mut row = vec![0u8; 2048];
-        gpu.hip
-            .memcpy_dtoh(&mut row, &keys.buf)
-            .expect("read row 0");
+        gpu.hip.memcpy_dtoh(&mut row, &keys.buf).expect("read row 0");
         assert_eq!(row, pattern, "growth preserves mapped rows");
         let fresh = keys.sub_offset(old_size / 4, (keys.buf.size() - old_size) / 4);
         let mut grown = vec![0xFFu8; fresh.buf.size()];
-        gpu.hip
-            .memcpy_dtoh(&mut grown, &fresh.buf)
-            .expect("read new page");
+        gpu.hip.memcpy_dtoh(&mut grown, &fresh.buf).expect("read new page");
         assert!(grown.iter().all(|&b| b == 0), "new pages are zeroed");
 
-        state
-            .ensure_mapped_capacity(&mut gpu, s)
-            .expect("whole context");
+        state.ensure_mapped_capacity(&mut gpu, s).expect("whole context");
         let (bytes, tokens) = expected_vmm(granularity, s, s);
         assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), bytes);
         assert_eq!(tokens, s);
@@ -2505,8 +2465,8 @@ mod tests {
         for backend in [Qwen4KvBackend::Vmm, Qwen4KvBackend::Legacy] {
             let before = vram(&gpu);
             let start = std::time::Instant::now();
-            let mut state =
-                Qwen4State::new_with_backend(&mut gpu, &config, s, format, backend).expect("state");
+            let mut state = Qwen4State::new_with_backend(&mut gpu, &config, s, format, backend)
+                .expect("state");
             let built = start.elapsed();
             eprintln!(
                 "{backend:?} new: {:.1} ms vram_delta={} MiB context_committed={} MiB covered={}",
@@ -2526,9 +2486,7 @@ mod tests {
                 let covered = state.mapped_context_tokens();
                 let size = state.qsa[0].full_keys.buf.size();
                 let start = std::time::Instant::now();
-                state
-                    .ensure_mapped_capacity(&mut gpu, tokens)
-                    .expect("grow");
+                state.ensure_mapped_capacity(&mut gpu, tokens).expect("grow");
                 let took = start.elapsed();
                 let keys = &state.qsa[0].full_keys;
                 if size > 0 {
@@ -2561,11 +2519,7 @@ mod tests {
                 Err(StateError::ContextCapacity { .. })
             ));
             assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), committed);
-            eprintln!(
-                "refused {} tokens; committed unchanged {} MiB",
-                s + 1,
-                committed / MIB
-            );
+            eprintln!("refused {} tokens; committed unchanged {} MiB", s + 1, committed / MIB);
             state.free_gpu(&mut gpu).expect("free VMM");
             eprintln!("vmm owners after free: {}", gpu.vmm_allocation_count());
         }

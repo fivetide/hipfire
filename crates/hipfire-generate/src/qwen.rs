@@ -1905,11 +1905,7 @@ pub fn ep_serve_ds4(
             None => break,
         };
     }
-    for ev in parser
-        .feed(&text_stream.flush())
-        .into_iter()
-        .chain(parser.finish())
-    {
+    for ev in parser.feed(&text_stream.flush()).into_iter().chain(parser.finish()) {
         absorb_event(&ev);
         emit_stream_event(stdout, id, ev);
     }
@@ -3100,19 +3096,13 @@ pub fn generate_dflash(
                 if start > 0 {
                     m.seq_pos = start;
                     m.conversation_tokens.clear();
-                    m.conversation_tokens
-                        .extend_from_slice(&prompt_tokens[..start]);
+                    m.conversation_tokens.extend_from_slice(&prompt_tokens[..start]);
                     (prompt_tokens[start..].to_vec(), start, true, start)
                 } else {
                     (prompt_tokens.clone(), 0, false, 0)
                 }
             }
-            None => (
-                prefill_tokens,
-                prefill_start,
-                cache_hit,
-                cached_tokens_dflash,
-            ),
+            None => (prefill_tokens, prefill_start, cache_hit, cached_tokens_dflash),
         };
 
     // ── Grammar-guided decoding setup (dflash path) ─────────────
@@ -8109,7 +8099,8 @@ pub fn generate_qwen4_ar(
         );
         return;
     }
-    let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_tokens.len() + 1, m.max_seq);
+    let max_tokens =
+        crate::common::fit_max_tokens(max_tokens, prompt_tokens.len() + 1, m.max_seq);
     let required = prompt_tokens
         .len()
         .checked_add(max_tokens)

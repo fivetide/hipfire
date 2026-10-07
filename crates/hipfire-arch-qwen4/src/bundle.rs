@@ -17,9 +17,8 @@ use crate::gpu_forward::{
 use crate::kv_backend::Qwen4KvBackend;
 use crate::mtp_gpu::{MtpAppendScratch, MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
 use crate::ple::PleHashMetadata;
-use crate::state::{
-    meta_bytes, meta_words, Qwen4State, Qwen4StateFormat, Qwen4StateSnapshot, StateError,
-};
+use crate::state::Qwen4StateFormat;
+use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
 use crate::weights::{
     ple_valid_rows_for_shard, Qwen4Manifest, Qwen4Placement, Qwen4Weights, WeightError,
     PLE_ROW_WIDTH, PLE_SHARD_COUNT, PLE_SHARD_ROWS,
@@ -192,7 +191,7 @@ impl SessionState for Qwen4Bundle {
         ))
     }
 
-    fn snapshot_boundaries(&self, _route: SessionRoute, after: usize, up_to: usize) -> Vec<usize> {
+    fn snapshot_boundaries(&self, after: usize, up_to: usize) -> Vec<usize> {
         let Some(chunk) = self.spec_chunk_rows() else {
             return Vec::new();
         };
@@ -203,7 +202,6 @@ impl SessionState for Qwen4Bundle {
 
     fn snapshot_parts(
         &mut self,
-        _gpu: &mut Gpu,
         route: SessionRoute,
         position: usize,
     ) -> Result<SnapshotParts<'_>, String> {
@@ -219,12 +217,7 @@ impl SessionState for Qwen4Bundle {
         if self.state.position != position || mtp.is_some_and(|mtp| mtp.position() != position) {
             return Err(format!("qwen4 session capture: owners not at {position}"));
         }
-        let (target_meta, mut layout) = self.state.session_parts().map_err(|e| e.to_string())?;
-        let mut meta = meta_bytes(&[
-            (route == SessionRoute::Mtp).into(),
-            (target_meta.len() / 8) as u64,
-        ]);
-        meta.extend(target_meta);
+        let (mut meta, mut layout) = self.state.session_parts().map_err(|e| e.to_string())?;
         if let Some(mtp) = mtp {
             let (mtp_meta, mtp_layout) = mtp.session_parts().map_err(|e| e.to_string())?;
             meta.extend(mtp_meta);
@@ -241,7 +234,9 @@ impl SessionState for Qwen4Bundle {
         meta: &[u8],
     ) -> Result<StateLayout<'_>, String> {
         self.invalidate_ple_epoch().map_err(|e| e.to_string())?;
-        let (target_meta, mtp_meta) = split_session_meta(route, meta)?;
+        let (target_meta, mtp_meta) = meta
+            .split_at_checked(self.state.session_meta_bytes())
+            .ok_or("qwen4 session snapshot shape mismatch")?;
         let mut layout = self
             .state
             .prepare_session_restore(gpu, target_meta)
@@ -266,7 +261,9 @@ impl SessionState for Qwen4Bundle {
         route: SessionRoute,
         meta: &[u8],
     ) -> Result<(), String> {
-        let (target_meta, mtp_meta) = split_session_meta(route, meta)?;
+        let (target_meta, mtp_meta) = meta
+            .split_at_checked(self.state.session_meta_bytes())
+            .ok_or("qwen4 session snapshot shape mismatch")?;
         self.state
             .finish_session_restore(target_meta)
             .map_err(|e| e.to_string())?;
@@ -290,25 +287,6 @@ impl SessionState for Qwen4Bundle {
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         Qwen4Bundle::reset(self, gpu).map_err(|e| e.to_string())
     }
-}
-
-/// Target and MTP-head parts of a [`Qwen4Bundle`] session meta: words
-/// `[route, target words]`, the target meta, then the head's (MTP only).
-fn split_session_meta(route: SessionRoute, meta: &[u8]) -> Result<(&[u8], &[u8]), String> {
-    let shape = || "qwen4 session snapshot shape mismatch".to_string();
-    let header = meta.get(..16).and_then(meta_words).ok_or_else(shape)?;
-    let target_end = usize::try_from(header[1])
-        .ok()
-        .and_then(|words| words.checked_mul(8)?.checked_add(16))
-        .filter(|&end| end <= meta.len())
-        .ok_or_else(shape)?;
-    let mtp_meta = &meta[target_end..];
-    if header[0] != u64::from(route == SessionRoute::Mtp)
-        || (route == SessionRoute::Ar) != mtp_meta.is_empty()
-    {
-        return Err(shape());
-    }
-    Ok((&meta[16..target_end], mtp_meta))
 }
 
 impl Qwen4Bundle {

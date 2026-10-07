@@ -22,8 +22,9 @@ use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::pipeline::{
     execute_validated_steps, validate_steps, BroadcastAddOp, ClearOp, DraftHead, DraftHeadLayout,
-    DraftHeadPolicy, DraftHeadRequestState, EmbeddingOp, HyperNormOp, HyperReadOp, HyperWriteOp,
-    IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, ProjectOp, Step,
+    DraftHeadRequestState,
+    DraftHeadPolicy, EmbeddingOp, HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode,
+    IndexedAttentionOp, IndexedAttentionState, ProjectOp, Step,
 };
 use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::kv_backend::{
@@ -413,7 +414,9 @@ impl AppendWidths {
                 .checked_mul(config.indexer_head_dim)?
                 .checked_add(index_kv_width)?,
             index_kv_width,
-            kv_width: config.num_key_value_heads.checked_mul(config.head_dim)?,
+            kv_width: config
+                .num_key_value_heads
+                .checked_mul(config.head_dim)?,
         })
     }
 }
@@ -596,47 +599,21 @@ impl<'a> AppendWeights<'a> {
             return Err(invalid("MTP batched append needs a Q8_0 embedding table"));
         }
         let fc_embedding = dense_ref(weights, &weights.mtp.fc_embedding)?;
-        check(
-            "fc_embedding",
-            &fc_embedding,
-            DType::BF16,
-            w.hidden,
-            w.hidden,
-        )?;
+        check("fc_embedding", &fc_embedding, DType::BF16, w.hidden, w.hidden)?;
         let fc_hidden = dense_ref(weights, &weights.mtp.fc_hidden)?;
         check("fc_hidden", &fc_hidden, DType::BF16, w.hidden, w.hidden)?;
         let hc = hyper_desc(weights, &weights.mtp.attn_hyper)?.read;
         if !w.wide.is_multiple_of(32) {
             return Err(invalid("MTP batched append HC down needs K % 32 == 0"));
         }
-        check(
-            "HC down",
-            &hc.input_mix_down,
-            DType::BF16,
-            config.hc_lowrank,
-            w.wide,
-        )?;
-        check(
-            "HC up",
-            &hc.input_mix_up,
-            DType::BF16,
-            w.wide,
-            config.hc_lowrank,
-        )?;
+        check("HC down", &hc.input_mix_down, DType::BF16, config.hc_lowrank, w.wide)?;
+        check("HC up", &hc.input_mix_up, DType::BF16, w.wide, config.hc_lowrank)?;
         let qsa = qsa_desc(weights, &weights.mtp.attention)?;
         // The tiled Q8_0 projection is the K = 2560 staged kernel.
         if w.hidden != 2560 {
-            return Err(invalid(
-                "MTP batched append Q8_0 projections need hidden 2560",
-            ));
+            return Err(invalid("MTP batched append Q8_0 projections need hidden 2560"));
         }
-        check(
-            "indexer_qk",
-            &qsa.indexer_qk,
-            DType::Q8_0,
-            w.index_width,
-            w.hidden,
-        )?;
+        check("indexer_qk", &qsa.indexer_qk, DType::Q8_0, w.index_width, w.hidden)?;
         check("k_proj", &qsa.k, DType::Q8_0, w.kv_width, w.hidden)?;
         check("v_proj", &qsa.v, DType::Q8_0, w.kv_width, w.hidden)?;
         Ok(Self {
