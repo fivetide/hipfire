@@ -39,14 +39,18 @@
 //! forward at a FIXED position. `use_ordered_embeddings`/centroid masking is
 //! disabled (the shipped head ties lm_head directly).
 //!
-//! A draft step is one declarative step list: `Gemv(pre_projection)`, one
+//! A draft step is one declarative step list: the target-embedding lookup and
+//! its √backbone scale into the first concat half, `Gemv(pre_projection)`, one
 //! query-only `[SandwichAttention, SandwichMlp, Scale?]` block per layer over
 //! the target's last cache slot of the matching type (`crate::program`, the
-//! same ops the target runs), the final norm, the tied `lm_head` and
-//! `post_projection`. The target's weights and state are READ-ONLY here.
+//! same ops the target runs), the final norm, and `post_projection` straight
+//! into the second concat half (the next step's hidden input). The shared
+//! `DraftHead` ranks the tied `lm_head` on the GPU and returns the draft. The
+//! target's weights and state are READ-ONLY here.
 
 use crate::config::{Gemma4Config, LayerType, RopeType};
 use crate::gemma4::{Gemma4State, Gemma4Weights};
+use hipfire_dispatch::pipeline::{DraftHead, DraftHeadLayout, DraftHeadPolicy};
 use hipfire_runtime::hfq::{load_awq_scale, HfqFile};
 use hipfire_runtime::llama::{f16_to_f32, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -435,7 +439,6 @@ pub struct Gemma4DrafterWeights {
     pub post_projection: WeightTensor, // [backbone_hidden, hidden]
 
     pub layers: Vec<DrafterLayerWeights>,
-    embd_q8: bool,
 }
 
 impl Gemma4DrafterWeights {
@@ -450,12 +453,11 @@ impl Gemma4DrafterWeights {
         let (embed_info, embed_data) = hfq
             .tensor_data(embed_name)
             .ok_or_else(|| "gemma4-drafter: embed_tokens not found".to_string())?;
-        let (embed_tokens, embd_dtype, embd_q8) = match embed_info.quant_type {
+        let (embed_tokens, embd_dtype) = match embed_info.quant_type {
             3 => (
                 gpu.upload_raw(embed_data, &[embed_data.len()])
                     .map_err(|e| format!("gemma4-drafter: upload embed: {e:?}"))?,
                 DType::Q8_0,
-                true,
             ),
             1 => {
                 let f32_data: Vec<f32> = embed_data
@@ -466,7 +468,6 @@ impl Gemma4DrafterWeights {
                     gpu.upload_f32(&f32_data, &[cfg.vocab_size, hidden])
                         .map_err(|e| format!("gemma4-drafter: upload embed f32: {e:?}"))?,
                     DType::F32,
-                    false,
                 )
             }
             16 => {
@@ -478,7 +479,6 @@ impl Gemma4DrafterWeights {
                     gpu.upload_f32(&f32_data, &[cfg.vocab_size, hidden])
                         .map_err(|e| format!("gemma4-drafter: upload embed f32: {e:?}"))?,
                     DType::F32,
-                    false,
                 )
             }
             qt => return Err(format!("gemma4-drafter: unsupported embed quant_type {qt}")),
@@ -606,7 +606,6 @@ impl Gemma4DrafterWeights {
             pre_projection,
             post_projection,
             layers,
-            embd_q8,
         })
     }
 
@@ -642,12 +641,14 @@ impl Gemma4DrafterWeights {
 
 /// Per-draft-step GPU scratch. No KV cache (the drafter reads the target's).
 pub struct Gemma4DrafterScratch {
-    pub concat: GpuTensor,     // [2·backbone_hidden] = 7680 pre-proj input
-    pub embed_half: GpuTensor, // [backbone_hidden] = 3840 target-embed row scratch
-    pub x: GpuTensor,          // [hidden] = 1024 residual stream
-    pub residual: GpuTensor,   // [hidden]
-    pub tmp: GpuTensor,        // [hidden] norm / o_proj scratch
-    /// FWHT rotation scratch for MagnumQuant projections, `[max_q_dim]`.
+    /// `[2·backbone_hidden]`: target embedding half ‖ hidden half. The hidden
+    /// half holds the target hidden for a round's first step, then each
+    /// step's `post_projection` output for the next.
+    pub concat: GpuTensor,
+    pub x: GpuTensor,        // [hidden] residual stream
+    pub residual: GpuTensor, // [hidden]
+    pub tmp: GpuTensor,      // [hidden] norm / o_proj scratch
+    /// FWHT rotation scratch for MagnumQuant projections, `[max(q, hidden, bb)]`.
     pub x_rot: GpuTensor,
     pub q: GpuTensor,          // [max_q_dim]
     pub attn_out: GpuTensor,   // [max_q_dim]
@@ -656,96 +657,190 @@ pub struct Gemma4DrafterScratch {
     pub ffn_hidden: GpuTensor, // [hidden_dim]
     pub ffn_out: GpuTensor,    // [hidden]
     pub normed: GpuTensor,     // [hidden] final-norm output (drives lm_head + post_proj)
-    pub post_proj: GpuTensor,  // [backbone_hidden] post_projection output
-    pub logits: GpuTensor,     // [vocab]
+    /// `[1]` i32 input token of the step.
+    pub token_ids: GpuTensor,
     /// device i32 query position scalar (constant across a round).
     pub pos_buf: hip_bridge::DeviceBuffer,
-    /// Host copy of the query position staged in `pos_buf`.
-    pub query_pos: usize,
+    /// Ranks the tied `lm_head` and returns the draft token.
+    pub head: DraftHead,
 }
 
 impl Gemma4DrafterScratch {
-    pub fn new(gpu: &mut Gpu, cfg: &Gemma4DrafterConfig) -> Result<Self, String> {
-        let alloc = |g: &mut Gpu, n: usize, label: &str| -> Result<GpuTensor, String> {
-            g.zeros(&[n], DType::F32)
-                .map_err(|e| format!("gemma4-drafter: alloc {label}: {e:?}"))
+    pub fn new(
+        gpu: &mut Gpu,
+        cfg: &Gemma4DrafterConfig,
+        weights: &Gemma4DrafterWeights,
+    ) -> Result<Self, String> {
+        let mut owned: Vec<GpuTensor> = Vec::new();
+        let mut alloc = |g: &mut Gpu, n: usize, label: &str| -> Result<GpuTensor, String> {
+            let t = g
+                .zeros(&[n], DType::F32)
+                .map_err(|e| format!("gemma4-drafter: alloc {label}: {e:?}"))?;
+            // SAFETY: rollback-only duplicate owner; see `crate::gemma4`.
+            owned.push(GpuTensor {
+                buf: unsafe { std::ptr::read(&t.buf) },
+                shape: t.shape.clone(),
+                dtype: t.dtype,
+            });
+            Ok(t)
         };
-        let pos_buf = gpu
-            .hip
-            .malloc(4)
-            .map_err(|e| format!("gemma4-drafter: pos_buf malloc: {e:?}"))?;
+        let built = (|| -> Result<_, String> {
+            let concat = alloc(gpu, cfg.pre_proj_in(), "concat")?;
+            let x = alloc(gpu, cfg.hidden, "x")?;
+            let residual = alloc(gpu, cfg.hidden, "residual")?;
+            let tmp = alloc(gpu, cfg.hidden, "tmp")?;
+            let rot = cfg.max_q_dim().max(cfg.hidden).max(cfg.backbone_hidden);
+            let x_rot = alloc(gpu, rot, "x_rot")?;
+            let q = alloc(gpu, cfg.max_q_dim(), "q")?;
+            let attn_out = alloc(gpu, cfg.max_q_dim(), "attn_out")?;
+            let gate_ffn = alloc(gpu, cfg.hidden_dim, "gate_ffn")?;
+            let up_ffn = alloc(gpu, cfg.hidden_dim, "up_ffn")?;
+            let ffn_hidden = alloc(gpu, cfg.hidden_dim, "ffn_hidden")?;
+            let ffn_out = alloc(gpu, cfg.hidden, "ffn_out")?;
+            let normed = alloc(gpu, cfg.hidden, "normed")?;
+            let token_ids = alloc(gpu, 1, "token_ids")?;
+            Ok((
+                concat, x, residual, tmp, x_rot, q, attn_out, gate_ffn, up_ffn, ffn_hidden,
+                ffn_out, normed, token_ids,
+            ))
+        })();
+        let rollback = |gpu: &mut Gpu, owned: Vec<GpuTensor>| {
+            for t in owned {
+                let _ = gpu.free_tensor(t);
+            }
+        };
+        let (
+            concat,
+            x,
+            residual,
+            tmp,
+            x_rot,
+            q,
+            attn_out,
+            gate_ffn,
+            up_ffn,
+            ffn_hidden,
+            ffn_out,
+            normed,
+            token_ids,
+        ) = match built {
+            Ok(v) => v,
+            Err(e) => {
+                rollback(gpu, owned);
+                return Err(e);
+            }
+        };
+        let layout = DraftHeadLayout {
+            vocab: cfg.vocab_size,
+            hidden: cfg.hidden,
+            front: 0,
+            special: cfg.vocab_size,
+            full_hold: 0,
+        };
+        let policy = DraftHeadPolicy {
+            copy: None,
+            rescore: false,
+        };
+        let head = match DraftHead::new(gpu, &weights.lm_head.buf, layout, policy) {
+            Ok(head) => head,
+            Err(e) => {
+                rollback(gpu, owned);
+                return Err(format!("gemma4-drafter: draft head: {e}"));
+            }
+        };
+        let pos_buf = match gpu.hip.malloc(4) {
+            Ok(buf) => buf,
+            Err(e) => {
+                let _ = head.free_gpu(gpu);
+                rollback(gpu, owned);
+                return Err(format!("gemma4-drafter: pos_buf malloc: {e:?}"));
+            }
+        };
         Ok(Gemma4DrafterScratch {
-            concat: alloc(gpu, cfg.pre_proj_in(), "concat")?,
-            embed_half: alloc(gpu, cfg.backbone_hidden, "embed_half")?,
-            x: alloc(gpu, cfg.hidden, "x")?,
-            residual: alloc(gpu, cfg.hidden, "residual")?,
-            tmp: alloc(gpu, cfg.hidden, "tmp")?,
-            x_rot: alloc(gpu, cfg.max_q_dim().max(cfg.hidden), "x_rot")?,
-            q: alloc(gpu, cfg.max_q_dim(), "q")?,
-            attn_out: alloc(gpu, cfg.max_q_dim(), "attn_out")?,
-            gate_ffn: alloc(gpu, cfg.hidden_dim, "gate_ffn")?,
-            up_ffn: alloc(gpu, cfg.hidden_dim, "up_ffn")?,
-            ffn_hidden: alloc(gpu, cfg.hidden_dim, "ffn_hidden")?,
-            ffn_out: alloc(gpu, cfg.hidden, "ffn_out")?,
-            normed: alloc(gpu, cfg.hidden, "normed")?,
-            post_proj: alloc(gpu, cfg.backbone_hidden, "post_proj")?,
-            logits: alloc(gpu, cfg.vocab_size, "logits")?,
+            concat,
+            x,
+            residual,
+            tmp,
+            x_rot,
+            q,
+            attn_out,
+            gate_ffn,
+            up_ffn,
+            ffn_hidden,
+            ffn_out,
+            normed,
+            token_ids,
             pos_buf,
-            query_pos: 0,
+            head,
         })
     }
 
-    /// Return all scratch buffers to the pool. Consumes self. The raw
-    /// `pos_buf` DeviceBuffer is freed directly (it never went through the
-    /// tensor pool).
+    /// Return all scratch buffers to the pool. Consumes self.
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        let _ = gpu.free_tensor(self.concat);
-        let _ = gpu.free_tensor(self.embed_half);
-        let _ = gpu.free_tensor(self.x);
-        let _ = gpu.free_tensor(self.residual);
-        let _ = gpu.free_tensor(self.tmp);
-        let _ = gpu.free_tensor(self.x_rot);
-        let _ = gpu.free_tensor(self.q);
-        let _ = gpu.free_tensor(self.attn_out);
-        let _ = gpu.free_tensor(self.gate_ffn);
-        let _ = gpu.free_tensor(self.up_ffn);
-        let _ = gpu.free_tensor(self.ffn_hidden);
-        let _ = gpu.free_tensor(self.ffn_out);
-        let _ = gpu.free_tensor(self.normed);
-        let _ = gpu.free_tensor(self.post_proj);
-        let _ = gpu.free_tensor(self.logits);
+        for t in [
+            self.concat,
+            self.x,
+            self.residual,
+            self.tmp,
+            self.x_rot,
+            self.q,
+            self.attn_out,
+            self.gate_ffn,
+            self.up_ffn,
+            self.ffn_hidden,
+            self.ffn_out,
+            self.normed,
+            self.token_ids,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+        let _ = self.head.free_gpu(gpu);
         let _ = gpu.hip.free(self.pos_buf);
     }
+
+    /// Start a round at the constant `query_pos` with the target `hidden`
+    /// (`[backbone_hidden]`) as the first step's hidden half.
+    pub fn begin_round(
+        &self,
+        gpu: &mut Gpu,
+        hidden: &GpuTensor,
+        query_pos: usize,
+    ) -> Result<(), String> {
+        let bb = self.concat.numel() / 2;
+        gpu.memcpy_htod_auto(&self.pos_buf, &(query_pos as i32).to_ne_bytes())
+            .map_err(|e| format!("gemma4-drafter: htod pos: {e:?}"))?;
+        gpu.hip
+            .memcpy_dtod_at(&self.concat.buf, bb * 4, &hidden.buf, 0, bb * 4)
+            .map_err(|e| format!("gemma4-drafter: stage hidden half: {e:?}"))
+    }
+}
+
+/// The target embedding table as a format-tagged tensor the embedding step
+/// reads; `None` for formats without a batched lookup (F32 oracle tables).
+pub fn target_embedding_table(target: &Gemma4Weights) -> Option<GpuTensor> {
+    use hipfire_runtime::llama::EmbeddingFormat;
+    let dtype = match target.embd_format {
+        EmbeddingFormat::Q8_0 => DType::Q8_0,
+        EmbeddingFormat::HFQ4G256 => DType::HFQ4G256,
+        EmbeddingFormat::HFQ4G128 => DType::HFQ4G128,
+        EmbeddingFormat::F32 | EmbeddingFormat::Q4K => return None,
+    };
+    Some(GpuTensor {
+        // SAFETY: a view of the target-owned table for one step list.
+        buf: unsafe { target.embed_tokens.buf.alias() },
+        shape: target.embed_tokens.shape.clone(),
+        dtype,
+    })
 }
 
 // ─── One draft step ─────────────────────────────────────────────────────────
 
-/// Result of one drafter step: the argmax draft token + its post-projected
-/// hidden half (3840), which becomes the `hidden_3840` half of the NEXT step's
-/// concat. Also exposes the final normed hidden + full logits for validation.
-pub struct DrafterStepOut {
-    pub argmax: u32,
-    /// post_projection(normed) — [backbone_hidden]; the next step's hidden half.
-    pub post_proj_hidden: Vec<f32>,
-    /// final-norm output [hidden] (drives lm_head + post_proj) — for oracle.
-    pub normed_hidden: Vec<f32>,
-    /// full logits [vocab] — for oracle cosine.
-    pub logits: Vec<f32>,
-}
-
-/// One drafter step (single-token forward at a FIXED `query_pos`).
-///
-/// * `dw` / `dcfg` / `ds` — drafter weights / config / scratch.
-/// * `target_weights` — for the target embed table (3840-dim) + √backbone scale.
-/// * `target_state`   — for the target's last sliding / last full KV slot.
-/// * `prev_token`     — token whose target-embed forms the concat's [0:3840] half.
-/// * `hidden_backbone`— the [3840] hidden half (target's NORMED final hidden on
-///                      step 0, else the previous step's `post_proj_hidden`).
-/// * `query_pos`      — CONSTANT across the round = committed seq_len − 1.
-///
-/// Reads `target_weights` + `target_state` ONLY; writes nothing back.
+/// One draft step from `prev_token` at the round's query position: reads the
+/// hidden half staged in `ds.concat`, leaves the next step's hidden half
+/// there, and returns the draft token. Reads `target_weights` and
+/// `target_state` only.
 #[allow(clippy::too_many_arguments)]
-pub fn drafter_step(
+pub fn draft_step(
     gpu: &mut Gpu,
     dw: &Gemma4DrafterWeights,
     dcfg: &Gemma4DrafterConfig,
@@ -754,104 +849,47 @@ pub fn drafter_step(
     target_state: &Gemma4State,
     target_cfg: &Gemma4Config,
     prev_token: u32,
-    hidden_backbone: &GpuTensor,
     query_pos: usize,
-) -> Result<DrafterStepOut, String> {
-    let bb = dcfg.backbone_hidden;
-
-    // Set the device position scalar = query_pos (drives RoPE + attention range).
-    {
-        let pos_host = [query_pos as i32];
-        let pos_bytes = unsafe { std::slice::from_raw_parts(pos_host.as_ptr() as *const u8, 4) };
-        gpu.memcpy_htod_auto(&ds.pos_buf, pos_bytes)
-            .map_err(|e| format!("gemma4-drafter: htod pos: {e:?}"))?;
-        ds.query_pos = query_pos;
-    }
-
-    // ── (a) concat = [ target_embed(prev)·√bb  ‖  hidden_backbone ] (7680) ──
-    // target_embed half: look up the TARGET embed row (bb-dim), scale by √bb.
-    // (The target's ScaledWordEmbedding bakes ·√bb into its forward, which the
-    // candidate generator invokes; we replicate that scale here.)
-    use hipfire_runtime::llama::EmbeddingFormat;
-    match target_weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => gpu
-            .embedding_lookup_hfq4g256(&target_weights.embed_tokens, &ds.embed_half, prev_token, bb)
-            .map_err(|e| format!("gemma4-drafter: target embed hfq4g256: {e:?}"))?,
-        EmbeddingFormat::HFQ4G128 => gpu
-            .embedding_lookup_hfq4g128(&target_weights.embed_tokens, &ds.embed_half, prev_token, bb)
-            .map_err(|e| format!("gemma4-drafter: target embed hfq4g128: {e:?}"))?,
-        EmbeddingFormat::Q8_0 => gpu
-            .embedding_lookup_q8(&target_weights.embed_tokens, &ds.embed_half, prev_token, bb)
-            .map_err(|e| format!("gemma4-drafter: target embed q8: {e:?}"))?,
-        EmbeddingFormat::F32 => gpu
-            .embedding_lookup(&target_weights.embed_tokens, &ds.embed_half, prev_token, bb)
-            .map_err(|e| format!("gemma4-drafter: target embed f32: {e:?}"))?,
-        EmbeddingFormat::Q4K => {
-            return Err("gemma4-drafter: Q4K target embed unsupported".to_string())
-        }
-    }
-    let _ = target_cfg; // embed scale uses bb (= target hidden), not target_cfg directly
-    gpu.scale_f32(&ds.embed_half, (bb as f32).sqrt())
-        .map_err(|e| format!("gemma4-drafter: embed scale: {e:?}"))?;
-    // concat[0:bb] = embed_half;  concat[bb:2bb] = hidden_backbone (no scale).
-    gpu.memcpy_dtod_at_auto(&ds.concat.buf, 0, &ds.embed_half.buf, 0, bb * 4)
-        .map_err(|e| format!("gemma4-drafter: concat embed half: {e:?}"))?;
-    gpu.memcpy_dtod_at_auto(&ds.concat.buf, bb * 4, &hidden_backbone.buf, 0, bb * 4)
-        .map_err(|e| format!("gemma4-drafter: concat hidden half: {e:?}"))?;
-
-    // ── (b)-(f) pre_projection → layers → norm → lm_head/post_proj ──
-    // pos_buf is already staged above; concat is built into ds.concat.
-    drafter_step_from_concat_inner(gpu, dw, dcfg, ds, target_state, target_cfg)
+) -> Result<u32, String> {
+    gpu.memcpy_htod_auto(&ds.token_ids.buf, &(prev_token as i32).to_ne_bytes())
+        .map_err(|e| format!("gemma4-drafter: htod token: {e:?}"))?;
+    run_step(
+        gpu,
+        dw,
+        dcfg,
+        ds,
+        target_weights,
+        target_state,
+        target_cfg,
+        query_pos,
+        true,
+    )?;
+    ds.head
+        .draft(gpu, &dw.lm_head.buf, &ds.normed)
+        .map_err(|e| format!("gemma4-drafter: draft head: {e}"))
 }
 
-/// Run (b)-(f) of a draft step from a PRE-BUILT concat in `ds.concat` and a
-/// PRE-STAGED `ds.pos_buf`. Used by `drafter_step` (after it builds the concat)
-/// and by the validation harness (which injects an HF-exact concat to isolate
-/// the backbone + heads from the embed/feedback path).
+/// The step list. With `embed`, the first concat half is the target
+/// embedding of `ds.token_ids` (× √backbone); without, the caller staged the
+/// whole concat (validation harness).
 #[allow(clippy::too_many_arguments)]
-pub fn drafter_step_from_concat(
+fn run_step(
     gpu: &mut Gpu,
     dw: &Gemma4DrafterWeights,
     dcfg: &Gemma4DrafterConfig,
     ds: &mut Gemma4DrafterScratch,
+    target_weights: &Gemma4Weights,
     target_state: &Gemma4State,
     target_cfg: &Gemma4Config,
-    concat: &[f32],
-    query_pos: usize,
-) -> Result<DrafterStepOut, String> {
-    {
-        let pos_host = [query_pos as i32];
-        let pos_bytes = unsafe { std::slice::from_raw_parts(pos_host.as_ptr() as *const u8, 4) };
-        gpu.memcpy_htod_auto(&ds.pos_buf, pos_bytes)
-            .map_err(|e| format!("gemma4-drafter: htod pos: {e:?}"))?;
-        ds.query_pos = query_pos;
-    }
-    if concat.len() != dcfg.pre_proj_in() {
-        return Err(format!(
-            "gemma4-drafter: concat len {} != {}",
-            concat.len(),
-            dcfg.pre_proj_in()
-        ));
-    }
-    gpu.hip
-        .memcpy_htod(&ds.concat.buf, unsafe {
-            std::slice::from_raw_parts(concat.as_ptr() as *const u8, concat.len() * 4)
-        })
-        .map_err(|e| format!("gemma4-drafter: upload concat: {e:?}"))?;
-    drafter_step_from_concat_inner(gpu, dw, dcfg, ds, target_state, target_cfg)
-}
-
-fn drafter_step_from_concat_inner(
-    gpu: &mut Gpu,
-    dw: &Gemma4DrafterWeights,
-    dcfg: &Gemma4DrafterConfig,
-    ds: &mut Gemma4DrafterScratch,
-    target_state: &Gemma4State,
-    target_cfg: &Gemma4Config,
-) -> Result<DrafterStepOut, String> {
+    pos: usize,
+    embed: bool,
+) -> Result<(), String> {
     use crate::program::{Geometry, LayerKv, LayerRefs, LayerScratch, ProgramBinding, Resident};
+    use hipfire_dispatch::pipeline::sandwich::ScaleOp;
+    use hipfire_dispatch::pipeline::EmbeddingOp;
     use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 
+    let bb = dcfg.backbone_hidden;
     // Each block attends the target's LAST cache slot of its type.
     let last_slot = |n: usize, kind: &str| {
         n.checked_sub(1)
@@ -859,7 +897,10 @@ fn drafter_step_from_concat_inner(
     };
     let sliding_slot = last_slot(target_cfg.n_sliding_layers(), "sliding")?;
     let full_slot = last_slot(target_cfg.n_full_layers(), "full")?;
-    let pos = ds.query_pos;
+    let table = target_embedding_table(target_weights)
+        .ok_or("gemma4-drafter: target embedding format has no batched lookup")?;
+    let embed_half = ds.concat.sub_offset(0, bb);
+    let hidden_half = ds.concat.sub_offset(bb, bb);
     let binding = ProgramBinding {
         geo: Geometry::drafter(dcfg),
         resident: Resident {
@@ -891,12 +932,24 @@ fn drafter_step_from_concat_inner(
         },
     };
 
-    // pre_projection → blocks → final norm → tied lm_head (no softcap) and
-    // post_projection, one step list.
     let pre = dw.pre_projection.dispatch_ref();
-    let lm_head = dw.lm_head.dispatch_ref();
     let post = dw.post_projection.dispatch_ref();
-    let mut steps = Vec::with_capacity(3 * dcfg.n_layers + 4);
+    let mut steps = Vec::with_capacity(3 * dcfg.n_layers + 5);
+    if embed {
+        steps.push(Step::Embed(EmbeddingOp {
+            table: &table,
+            rotated: &ds.x_rot,
+            token_ids: &ds.token_ids,
+            output: &embed_half,
+            rows: 1,
+            dim: bb,
+        }));
+        // The target's ScaledWordEmbedding bakes ·√backbone into its forward.
+        steps.push(Step::Scale(ScaleOp {
+            x: &embed_half,
+            factor: (bb as f32).sqrt(),
+        }));
+    }
     steps.push(Step::Gemv {
         w: &pre,
         input: GemvInput::Raw(&ds.concat),
@@ -928,47 +981,82 @@ fn drafter_step_from_concat_inner(
         eps: dcfg.norm_eps,
         rotation: hipfire_dispatch::types::RotationPlan::None,
     });
-    steps.push(Step::Gemv {
-        w: &lm_head,
-        input: GemvInput::Raw(&ds.normed),
-        out: &ds.logits,
-    });
+    // The next step's hidden half; pre_projection already consumed this one.
     steps.push(Step::Gemv {
         w: &post,
         input: GemvInput::Raw(&ds.normed),
-        out: &ds.post_proj,
+        out: &hidden_half,
     });
     let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
-    execute_steps(gpu, &ctx, &steps).map_err(|e| format!("gemma4-drafter: {e}"))?;
-    drop(steps);
-
-    let logits = gpu
-        .download_f32(&ds.logits)
-        .map_err(|e| format!("gemma4-drafter: download logits: {e:?}"))?;
-    let argmax = argmax_f32(&logits);
-    let post_proj_hidden = gpu
-        .download_f32(&ds.post_proj)
-        .map_err(|e| format!("gemma4-drafter: download post_proj: {e:?}"))?;
-    let normed_hidden = gpu
-        .download_f32(&ds.normed)
-        .map_err(|e| format!("gemma4-drafter: download normed: {e:?}"))?;
-    let _ = dw.embd_q8;
-    Ok(DrafterStepOut {
-        argmax,
-        post_proj_hidden,
-        normed_hidden,
-        logits,
-    })
+    execute_steps(gpu, &ctx, &steps).map_err(|e| format!("gemma4-drafter: {e}"))
 }
 
-fn argmax_f32(v: &[f32]) -> u32 {
-    let mut bi = 0u32;
-    let mut bv = f32::NEG_INFINITY;
-    for (i, &x) in v.iter().enumerate() {
-        if x > bv {
-            bv = x;
-            bi = i as u32;
-        }
+/// Oracle outputs of one validation step: the draft, its full logits, the
+/// final normed hidden and the post-projected hidden half.
+pub struct DrafterStepOut {
+    pub argmax: u32,
+    pub post_proj_hidden: Vec<f32>,
+    pub normed_hidden: Vec<f32>,
+    pub logits: Vec<f32>,
+}
+
+/// Validation entry: run one step from a PRE-BUILT `concat` (HF-exact inputs
+/// isolate the backbone and heads from the embedding/feedback path) at
+/// `query_pos` and download every intermediate the oracle compares.
+#[allow(clippy::too_many_arguments)]
+pub fn drafter_step_from_concat(
+    gpu: &mut Gpu,
+    dw: &Gemma4DrafterWeights,
+    dcfg: &Gemma4DrafterConfig,
+    ds: &mut Gemma4DrafterScratch,
+    target_weights: &Gemma4Weights,
+    target_state: &Gemma4State,
+    target_cfg: &Gemma4Config,
+    concat: &[f32],
+    query_pos: usize,
+) -> Result<DrafterStepOut, String> {
+    if concat.len() != dcfg.pre_proj_in() {
+        return Err(format!(
+            "gemma4-drafter: concat len {} != {}",
+            concat.len(),
+            dcfg.pre_proj_in()
+        ));
     }
-    bi
+    gpu.memcpy_htod_auto(&ds.pos_buf, &(query_pos as i32).to_ne_bytes())
+        .map_err(|e| format!("gemma4-drafter: htod pos: {e:?}"))?;
+    gpu.hip
+        .memcpy_htod(&ds.concat.buf, unsafe {
+            std::slice::from_raw_parts(concat.as_ptr() as *const u8, concat.len() * 4)
+        })
+        .map_err(|e| format!("gemma4-drafter: upload concat: {e:?}"))?;
+    run_step(
+        gpu,
+        dw,
+        dcfg,
+        ds,
+        target_weights,
+        target_state,
+        target_cfg,
+        query_pos,
+        false,
+    )?;
+    let argmax = ds
+        .head
+        .draft(gpu, &dw.lm_head.buf, &ds.normed)
+        .map_err(|e| format!("gemma4-drafter: draft head: {e}"))?;
+    let download = |gpu: &mut Gpu, t: &GpuTensor, what: &str| {
+        gpu.download_f32(t)
+            .map_err(|e| format!("gemma4-drafter: download {what}: {e:?}"))
+    };
+    Ok(DrafterStepOut {
+        argmax,
+        post_proj_hidden: download(
+            gpu,
+            &ds.concat
+                .sub_offset(dcfg.backbone_hidden, dcfg.backbone_hidden),
+            "post_proj",
+        )?,
+        normed_hidden: download(gpu, &ds.normed, "normed")?,
+        logits: download(gpu, ds.head.logits(), "logits")?,
+    })
 }

@@ -13,20 +13,23 @@ EAGLE/MTP drafter.
 
 The architecture crate keeps:
 
-- weight and state ownership (one config, one weight set, KV allocation);
+- weight and state ownership (one config, one weight set, KV allocation)
+  for every variant: 12B dense, E2B/E4B and the 26B-A4B MoE;
 - the per-layer program shape (`src/program.rs`: which ops, in which order,
   bound to which tensors);
-- lifecycle: hipGraph capture, the spec-decode driver, Redline shadow, the
-  chunk loop.
+- lifecycle: hipGraph capture, the chunk loop, the session-cache owner
+  (`src/bundle.rs`) and the EAGLE drafter/verify seams (`src/mtp.rs`). The
+  spec-decode loop itself is the engine's generic `generate_spec`.
 
 The #397 super-op facade (`lowered.rs` `lower_variant` / `Gemma4Bindings`)
-and the hand-written decode arms in `forward.rs` and `lowered.rs` are deleted.
-Gemma 4 has no EP/TP route, so nothing keeps the super-op program alive for it.
+and the hand-written decode arms in `forward.rs` are deleted, and so is the
+whole `lowered.rs` stack. Gemma 4 has no EP/TP route, so nothing keeps the
+super-op program alive for it.
 
 ## Before the port
 
-Two parallel stacks, each with its own config, weights and loader (both stay;
-they now bind the same program):
+Two parallel stacks, each with its own config, weights and loader (unified
+since; see "Engine seams"):
 
 | Stack | Fixtures | KV | Notes |
 |---|---|---|---|
@@ -145,6 +148,59 @@ batched kernel one GEMV per row.
   `eval_hipfire` per-token 0.733489 and prefill 0.824203: both `.kldseq`
   files byte-identical to the pre-rebase branch.
 
+## Engine seams
+
+After the program port, Gemma 4 moved onto the seams Qwen4 introduced:
+
+- **One stack.** `config.rs` carries the MoE fields, `gemma4.rs` loads every
+  variant (pooled expert tensors and pointer tables for the 26B), and
+  `Gemma4State` holds position-indexed sliding and full caches for all of
+  them (the 26B's 1024-row sliding ring is gone). `lowered.rs` is deleted.
+  `supports_batched_prefill` admits the 26B on Q8/Q8 loads. The decode
+  hipGraph stays off when an expert `down_proj` is Q8_0 (its atomic sum is
+  not replay-exact) and while a launch recorder is armed (`graph_exact`).
+- **Session cache.** `Gemma4Bundle` (`bundle.rs`) implements
+  `SessionState`: a snapshot is the Q8 K/V rows of every cache slot up to its
+  position (`RowStream`s, no fixed state), scoped `gemma4/rows{N}` by prefill
+  width because batched and per-token prefill write different bits. Boundaries
+  fall every 1024 prompt tokens. The route-generic live/plan/begin/commit
+  logic is `hipfire_runtime::session_cache::SessionDriver`, shared with
+  Qwen4. Each request now plans against its own prompt. Before this, a Gemma 4
+  request continued the previous request's KV in the same process.
+- **Spec seams.** `mtp.rs`: `Gemma4Drafter: MtpDrafter` (driven by the
+  generic `MtpSpeculator`) and `SpecTarget for Gemma4Bundle`. A window at
+  position `p` holds the pending seed and the target's post-norm hidden of
+  `p - 1`. It drafts `k` tokens at the constant query position `p` through
+  the step-list draft head (`Embed`, `Scale`, `Gemv` pre-projection, the
+  query-only blocks, norm, `DraftHead` whole-vocab argmax, `Gemv`
+  post-projection), verifies `[seed, drafts]` in one batched forward and
+  commits the greedy prefix plus bonus. KV is position-indexed, so
+  `commit_prefix` only moves the cursor. `emit.rs` `GemmaSpecEmit` routes
+  the thought channel, and `generate_gemma4_spec` wraps the engine's
+  `generate_spec`. The inline EAGLE loop and `speculative.rs` are deleted.
+
+Measured (gfx1151, PR-head daemon md5 `83c3ca2c175e0ac66b47ce1802e8f815`
+vs `7cb5f3aa83272fd5283628332ad4e29d`, five greedy prompts, 128 tokens, a
+daemon `reset` between prompts on both arms so neither carries the previous
+request):
+
+- 12B AR, 12B prefill batch 64, E2B, E4B, E4B prefill batch 64: token
+  streams and top-16 logit traces byte-identical.
+- 26B-A4B q8-experts and requantized MQ4: text identical on all five
+  prompts. Decode 36.1 vs 36.4 tok/s (q8) and 43.2 vs 43.9 (MQ4), measured
+  alone. Runs overlapping a cargo build read 10–15% lower on either binary.
+- EAGLE (12B, `HIPFIRE_GEMMA4_EAGLE=1`, `spec` 2, 3 and 5): four of five
+  prompts equal AR. The fifth (p1) leaves AR at step 91, where AR's top-1/top-2
+  margin is 0.021 logits (26.2946 vs 26.2735), the smallest in that sequence.
+  Batched verify logits differ from single-row decode by about 1e-2 from the
+  first verify row on. Strict mode does not make them bitwise-equal on
+  gfx1151, so greedy EAGLE equals AR only where the margin exceeds that
+  noise. The PR-head loop matched AR on all five prompts. It re-verified the
+  last prompt token, so its KV differs from this route's and the near-tie
+  fell the other way. Per-prompt tau at `spec` 3: 3.342/3.175/2.592/3.528/3.024
+  vs PR head 3.368/3.122/2.633/3.639/2.977. The first token now comes from
+  prefill, and each window pairs its seed with the hidden that predicted it.
+
 ## Progress
 
 | Piece | State | Commit |
@@ -153,9 +209,16 @@ batched kernel one GEMV per row.
 | MoE decode (`ParallelMoeMlp`), lowered decode on the shared program; super-op facade (`lower_variant`, `Gemma4Bindings`) and lowered hand arms deleted; unsupported expert formats refuse at load | landed; 26B byte-identical with the two non-bitwise fusions off, coherent with them on | `287e67d5b` |
 | EAGLE draft head as one step list (`Gemv` pre-projection, query-only `[SandwichAttention, SandwichMlp, Scale?]` blocks over the target's last slot, norm, `lm_head`, post-projection) | landed; EAGLE text and per-prompt tau identical | `287e67d5b` |
 | Calibration tools (`calib_sweep`, `eval_hipfire`, `prefill_parity_gemma4`) on the batched program; dispatch-owned calibration taps; batched `ParallelMoeMlp`; old batched prefill, `HIPFIRE_BATCHED_PREFILL`/`HIPFIRE_WMMA_PREFILL` deleted | landed; tool parity above | `e89080332` |
+| One weight stack for every variant; `lowered.rs` deleted | landed; see "Engine seams" | this change |
+| Engine session cache (`SessionState`, `SessionDriver` shared with Qwen4) | landed; see "Engine seams" | this change |
+| EAGLE on `MtpDrafter`/`SpecTarget`/`SpecEmit` + `generate_spec`; `DraftHead` | landed; see "Engine seams" | this change |
 
 ## Remaining
 
-- Two weight stacks remain (`gemma4.rs` eager for dense/E-series/EAGLE,
-  `lowered.rs` for MoE) with duplicate config and loaders; both bind to the
-  same program.
+- Batched verify is not bitwise-equal to single-row decode on gfx1151, so
+  greedy EAGLE can leave the AR stream at near-tied logits. EAGLE stays
+  opt-in until the verify and decode arithmetic match.
+- In the session scenario a follow-up turn restored the newest snapshot
+  instead of extending the previous turn's live state, so its rendered
+  history is not a token-exact extension of that turn (assumed cause: the
+  reply is re-rendered from text; Qwen keeps a verbatim assistant-turn cache).
