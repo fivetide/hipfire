@@ -12,11 +12,10 @@
 //! and scratch to the shared `hipfire_dispatch::pipeline::sandwich`
 //! operations; route selection and executor bodies live in dispatch. The same
 //! program serves single-token decode (`rows == 1`) and batched prefill /
-//! verify (`rows > 1`), for both weight stacks (`gemma4` and `lowered`).
+//! verify (`rows > 1`) of every Gemma 4 variant.
 
 use crate::config::{Gemma4Config, LayerType, RopeType};
-use crate::gemma4::{self, PerLayerBranchWeights};
-use crate::lowered;
+use crate::gemma4::{self, MoeLayerExtras, MoeScratch, PerLayerBranchWeights};
 use hip_bridge::DeviceBuffer;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::pipeline::sandwich::{
@@ -39,7 +38,7 @@ pub(crate) struct AttnGeometry {
     pub rope: Rope,
 }
 
-/// Model geometry the program reads; built from either config type.
+/// Model geometry the program reads.
 #[derive(Clone, Copy)]
 pub(crate) struct Geometry {
     pub dim: usize,
@@ -78,8 +77,16 @@ impl Geometry {
             vocab: cfg.vocab_size,
             softcap: cfg.final_logit_softcapping,
             ple_width: cfg.hidden_size_per_layer_input,
-            moe_top_k: 0,
-            moe_hidden: 0,
+            moe_top_k: if cfg.enable_moe_block {
+                cfg.top_k_experts
+            } else {
+                0
+            },
+            moe_hidden: if cfg.enable_moe_block {
+                cfg.moe_intermediate_size
+            } else {
+                0
+            },
             sliding: AttnGeometry {
                 head_dim: cfg.sliding_head_dim,
                 n_kv_heads: cfg.sliding_n_kv_heads,
@@ -138,44 +145,6 @@ impl Geometry {
             },
         }
     }
-
-    pub fn lowered(cfg: &lowered::Gemma4Config) -> Self {
-        let rope_type = match cfg.full_rope_type {
-            lowered::RopeType::Default => RopeType::Default,
-            lowered::RopeType::Proportional => RopeType::Proportional,
-        };
-        Self {
-            dim: cfg.dim,
-            eps: cfg.norm_eps,
-            n_heads: cfg.n_heads,
-            n_layers: cfg.n_layers,
-            vocab: cfg.vocab_size,
-            softcap: cfg.final_logit_softcapping,
-            ple_width: 0,
-            moe_top_k: cfg.top_k_experts,
-            moe_hidden: cfg.moe_intermediate_size,
-            sliding: AttnGeometry {
-                head_dim: cfg.sliding_head_dim,
-                n_kv_heads: cfg.sliding_n_kv_heads,
-                window: cfg.sliding_window,
-                rope: Rope {
-                    kind: RopeKind::RotateHalf,
-                    theta: cfg.sliding_rope_theta,
-                },
-            },
-            full: AttnGeometry {
-                head_dim: cfg.full_head_dim,
-                n_kv_heads: cfg.full_n_kv_heads,
-                window: 0,
-                rope: full_rope(
-                    cfg.full_head_dim,
-                    rope_type,
-                    cfg.full_partial_rotary_factor,
-                    cfg.full_rope_theta,
-                ),
-            },
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -204,7 +173,7 @@ pub(crate) struct LayerRefs<'a> {
     down: &'a WeightTensor,
     ffn_hidden_dim: usize,
     per_layer: Option<&'a PerLayerBranchWeights>,
-    moe: Option<&'a lowered::MoeLayerExtras>,
+    moe: Option<&'a MoeLayerExtras>,
 }
 
 impl<'a> LayerRefs<'a> {
@@ -230,7 +199,7 @@ impl<'a> LayerRefs<'a> {
                 down: &l.down_proj,
                 ffn_hidden_dim: l.ffn_hidden_dim,
                 per_layer: l.per_layer.as_ref(),
-                moe: None,
+                moe: l.moe.as_ref(),
             },
             gemma4::LayerWeights::Full(l) => Self {
                 layer_type: LayerType::Full,
@@ -252,56 +221,6 @@ impl<'a> LayerRefs<'a> {
                 down: &l.down_proj,
                 ffn_hidden_dim: l.ffn_hidden_dim,
                 per_layer: l.per_layer.as_ref(),
-                moe: None,
-            },
-        }
-    }
-
-    /// `hidden_dim` is the lowered config's dense FFN width.
-    pub fn lowered(layer: &'a lowered::LayerWeights, hidden_dim: usize) -> Self {
-        match layer {
-            lowered::LayerWeights::Sliding(l) => Self {
-                layer_type: LayerType::Sliding,
-                input_norm: &l.input_layernorm,
-                post_attn_norm: &l.post_attention_layernorm,
-                pre_ffn_norm: &l.pre_feedforward_layernorm,
-                post_ffn_norm: &l.post_feedforward_layernorm,
-                layer_scalar: l.layer_scalar_host,
-                q: &l.q_proj,
-                q_norm: &l.q_norm,
-                kv: Some(LayerKvWeights {
-                    k: &l.k_proj,
-                    v: Some(&l.v_proj),
-                    k_norm: &l.k_norm,
-                }),
-                o: &l.o_proj,
-                gate: &l.gate_proj,
-                up: &l.up_proj,
-                down: &l.down_proj,
-                ffn_hidden_dim: hidden_dim,
-                per_layer: None,
-                moe: l.moe.as_ref(),
-            },
-            lowered::LayerWeights::Full(l) => Self {
-                layer_type: LayerType::Full,
-                input_norm: &l.input_layernorm,
-                post_attn_norm: &l.post_attention_layernorm,
-                pre_ffn_norm: &l.pre_feedforward_layernorm,
-                post_ffn_norm: &l.post_feedforward_layernorm,
-                layer_scalar: l.layer_scalar_host,
-                q: &l.q_proj,
-                q_norm: &l.q_norm,
-                kv: Some(LayerKvWeights {
-                    k: &l.k_proj,
-                    v: None,
-                    k_norm: &l.k_norm,
-                }),
-                o: &l.o_proj,
-                gate: &l.gate_proj,
-                up: &l.up_proj,
-                down: &l.down_proj,
-                ffn_hidden_dim: hidden_dim,
-                per_layer: None,
                 moe: l.moe.as_ref(),
             },
         }
@@ -414,28 +333,7 @@ impl<'a> LayerScratch<'a> {
             act: &state.ffn_hidden,
             mlp_out: &state.ffn_out,
             ple,
-            moe: None,
-        }
-    }
-
-    /// The resident single-row scratch of the lowered state.
-    pub fn lowered(s: &'a lowered::Gemma4Scratch, moe: bool) -> Self {
-        Self {
-            x: &s.x,
-            residual: &s.residual,
-            normed: &s.tmp,
-            attn_rot: &s.x_rot,
-            mlp_rot: &s.x_rot,
-            q: &s.q,
-            k: &s.k,
-            v: &s.v,
-            attn_out: &s.attn_out,
-            gate: &s.gate_ffn,
-            up: &s.up_ffn,
-            act: &s.ffn_hidden,
-            mlp_out: &s.ffn_out,
-            ple: None,
-            moe: moe.then(|| routed_scratch(s)),
+            moe: state.moe.as_ref().map(routed_scratch),
         }
     }
 }
@@ -464,21 +362,21 @@ pub(crate) fn q8_flash_partials_len(
         .unwrap_or(0)
 }
 
-/// The lowered state's single-row routed-expert scratch; batched forwards
-/// route row by row through it.
-pub(crate) fn routed_scratch(s: &lowered::Gemma4Scratch) -> RoutedScratch<'_> {
+/// The state's single-row routed-expert scratch; batched forwards route row
+/// by row through it.
+pub(crate) fn routed_scratch(s: &MoeScratch) -> RoutedScratch<'_> {
     RoutedScratch {
-        input: &s.moe_pre2,
-        input_rot: &s.moe_pre2_rot,
-        router_in: &s.moe_router_in,
-        router_logits: &s.moe_router_logits,
-        topk_indices: &s.moe_topk_indices,
-        topk_weights: &s.moe_topk_weights,
-        gate: &s.moe_expert_gate_batch,
-        up: &s.moe_expert_up_batch,
-        act: &s.moe_expert_hidden_batch,
-        out: &s.moe_cur_moe,
-        dense_normed: &s.moe_cur_mlp,
+        input: &s.pre2,
+        input_rot: &s.pre2_rot,
+        router_in: &s.router_in,
+        router_logits: &s.router_logits,
+        topk_indices: &s.topk_indices,
+        topk_weights: &s.topk_weights,
+        gate: &s.gate_batch,
+        up: &s.up_batch,
+        act: &s.hidden_batch,
+        out: &s.cur_moe,
+        dense_normed: &s.cur_mlp,
     }
 }
 
@@ -714,10 +612,6 @@ impl<'a> ProgramBinding<'a> {
                     .moe
                     .as_ref()
                     .ok_or_else(|| format!("gemma4 layer {layer_idx}: missing MoE scratch"))?;
-                let expert = moe
-                    .experts
-                    .first()
-                    .ok_or_else(|| format!("gemma4 layer {layer_idx}: MoE layer has no experts"))?;
                 steps.push(Step::ParallelMoeMlp(ParallelMoeMlpOp {
                     mlp,
                     dense_post_norm: &moe.post_feedforward_layernorm_1,
@@ -726,11 +620,11 @@ impl<'a> ProgramBinding<'a> {
                         router_norm: &moe.router_scale,
                         router_input_scale: 1.0 / (geo.dim as f32).sqrt(),
                         router: moe.router_proj.dispatch_ref(),
-                        n_experts: moe.experts.len(),
+                        n_experts: moe.n_experts,
                         top_k: geo.moe_top_k,
                         hidden_dim: geo.moe_hidden,
-                        gate_up_dtype: expert.gate_up_proj.gpu_dtype,
-                        down_dtype: expert.down_proj.gpu_dtype,
+                        gate_up_dtype: moe.gate_up_dtype,
+                        down_dtype: moe.down_dtype,
                         gate_up_ptrs: &moe.experts_gate_up_ptrs,
                         down_ptrs: &moe.experts_down_ptrs,
                         per_expert_scale: &moe.per_expert_scale,

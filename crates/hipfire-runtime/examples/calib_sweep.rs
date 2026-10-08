@@ -172,7 +172,7 @@ fn build_capture_llama(
     m
 }
 fn build_capture_gemma(
-    weights: &hipfire_arch_gemma4::lowered::Gemma4Weights,
+    weights: &hipfire_arch_gemma4::Gemma4Weights,
     start: usize,
     end: usize,
     prefix: &str,
@@ -181,7 +181,7 @@ fn build_capture_gemma(
     for i in start..end.min(weights.layers.len()) {
         let p = format!("{prefix}layers.{i}");
         match &weights.layers[i] {
-            hipfire_arch_gemma4::lowered::LayerWeights::Sliding(s) => {
+            hipfire_arch_gemma4::LayerWeights::Sliding(s) => {
                 m.insert(
                     s.q_proj.buf.buf.as_ptr() as usize,
                     format!("{p}.self_attn.q_proj.weight"),
@@ -211,7 +211,7 @@ fn build_capture_gemma(
                     format!("{p}.mlp.down_proj.weight"),
                 );
             }
-            hipfire_arch_gemma4::lowered::LayerWeights::Full(f) => {
+            hipfire_arch_gemma4::LayerWeights::Full(f) => {
                 m.insert(
                     f.q_proj.buf.buf.as_ptr() as usize,
                     format!("{p}.self_attn.q_proj.weight"),
@@ -220,7 +220,13 @@ fn build_capture_gemma(
                     f.k_proj.buf.buf.as_ptr() as usize,
                     format!("{p}.self_attn.k_proj.weight"),
                 );
-                // no v_proj on Full — V reuses k_proj pre-norm
+                // Full layers with attention_k_eq_v reuse k_proj's pre-norm output as V.
+                if let Some(v) = &f.v_proj {
+                    m.insert(
+                        v.buf.buf.as_ptr() as usize,
+                        format!("{p}.self_attn.v_proj.weight"),
+                    );
+                }
                 m.insert(
                     f.o_proj.buf.buf.as_ptr() as usize,
                     format!("{p}.self_attn.o_proj.weight"),
@@ -352,14 +358,14 @@ fn build_capture_lfm(
     m
 }
 fn estimate_peak_gemma(
-    weights: &hipfire_arch_gemma4::lowered::Gemma4Weights,
+    weights: &hipfire_arch_gemma4::Gemma4Weights,
     start: usize,
     end: usize,
 ) -> u64 {
     let mut b = 0u64;
     for i in start..end.min(weights.layers.len()) {
         let ks: Vec<usize> = match &weights.layers[i] {
-            hipfire_arch_gemma4::lowered::LayerWeights::Sliding(s) => vec![
+            hipfire_arch_gemma4::LayerWeights::Sliding(s) => vec![
                 s.q_proj.k,
                 s.k_proj.k,
                 s.v_proj.k,
@@ -368,14 +374,18 @@ fn estimate_peak_gemma(
                 s.up_proj.k,
                 s.down_proj.k,
             ],
-            hipfire_arch_gemma4::lowered::LayerWeights::Full(f) => vec![
-                f.q_proj.k,
-                f.k_proj.k,
-                f.o_proj.k,
-                f.gate_proj.k,
-                f.up_proj.k,
-                f.down_proj.k,
-            ],
+            hipfire_arch_gemma4::LayerWeights::Full(f) => {
+                let mut ks = vec![
+                    f.q_proj.k,
+                    f.k_proj.k,
+                    f.o_proj.k,
+                    f.gate_proj.k,
+                    f.up_proj.k,
+                    f.down_proj.k,
+                ];
+                ks.extend(f.v_proj.as_ref().map(|v| v.k));
+                ks
+            }
         };
         for k in ks {
             b += compact_hessian_bytes(k) + (k * 4) as u64;
@@ -739,24 +749,22 @@ fn run_llama_batched(
 }
 fn run_gemma_batched(
     gpu: &mut rdna_compute::Gpu,
-    weights: &hipfire_arch_gemma4::lowered::Gemma4Weights,
-    cfg: &hipfire_arch_gemma4::lowered::Gemma4Config,
+    weights: &hipfire_arch_gemma4::Gemma4Weights,
+    cfg: &hipfire_arch_gemma4::Gemma4Config,
     toks: &[u32],
     seq: usize,
-    kv_sliding: &mut hipfire_runtime::llama::KvCache,
-    kv_full: &mut hipfire_runtime::llama::KvCache,
-    scratch: &hipfire_arch_gemma4::lowered::Gemma4Scratch,
+    state: &mut hipfire_arch_gemma4::Gemma4State,
 ) -> Result<(), String> {
     for (si, chunk) in toks.chunks(seq.max(1)).enumerate() {
-        kv_sliding
+        state
+            .kv_sliding
             .clear_gpu(gpu)
             .map_err(|e| format!("gemma kv sliding clear {si}: {e:?}"))?;
-        kv_full
+        state
+            .kv_full
             .clear_gpu(gpu)
             .map_err(|e| format!("gemma kv full clear {si}: {e:?}"))?;
-        hipfire_arch_gemma4::lowered::forward_prefill_batch(
-            gpu, weights, cfg, chunk, 0, kv_sliding, kv_full, scratch,
-        )
+        hipfire_arch_gemma4::forward::forward_prefill_batch(cfg, weights, state, gpu, chunk, 0)
         .map_err(|e| {
             format!(
                 "gemma forward_prefill_batch seq {si} B {}: {e:?}",
@@ -1610,8 +1618,8 @@ fn main() {
     } else if gemma {
         // Gemma4 — WIRED. forward_prefill_batch runs the declarative layer program; the
         // dispatch sandwich projections (gemm_rows / gemv) tap every projection input.
-        let cfg = hipfire_arch_gemma4::lowered::config_from_hfq(&hfq)
-            .unwrap_or_else(|| panic!("gemma4 cfg: missing/invalid config in HFQ"));
+        let cfg = hipfire_arch_gemma4::Gemma4Config::from_hfq(&hfq)
+            .unwrap_or_else(|e| panic!("gemma4 cfg: {e}"));
         eprintln!(
             "gemma4 arch=13 n_layers={} dim={} vocab={} hidden={} layer_types={:?} enable_moe={}",
             cfg.n_layers,
@@ -1626,7 +1634,7 @@ fn main() {
             eprintln!("If this is the dense Gemma4-12B/27B (no MoE), enable_moe_block should be false — check the model is the dense variant.");
             std::process::exit(2);
         }
-        let mut weights = hipfire_arch_gemma4::lowered::load_weights(&mut hfq, &cfg, &mut gpu)
+        let weights = hipfire_arch_gemma4::Gemma4Weights::load(&hfq, &cfg, &mut gpu)
             .unwrap_or_else(|e| panic!("gemma4 weights: {e}"));
         {
             let all_names: Vec<String> =
@@ -1639,31 +1647,11 @@ fn main() {
         }
         drop(hfq);
         let kv_max = seq_len + 16;
-        let scratch = hipfire_arch_gemma4::lowered::Gemma4Scratch::new(&mut gpu, &cfg, kv_max)
-            .unwrap_or_else(|e| panic!("gemma4 scratch: {e:?}"));
-        hipfire_arch_gemma4::lowered::init_scratch_constants(&mut gpu, &scratch, cfg.full_head_dim)
-            .unwrap_or_else(|e| panic!("gemma4 init_scratch_constants: {e:?}"));
-        // Q8 KV, matching the qwen35 arm above. `new_gpu` allocates an F32 cache
-        // and gemma4's batched prefill has no `KvWriteF32` kernel registered, so
-        // an F32 cache fails at the first layer with "no implementation for
-        // KvWriteF32". KV dtype does not affect what is captured — the tap reads
+        // Q8 KV on both tiers: gemma4's batched prefill has no `KvWriteF32`
+        // kernel. KV dtype does not affect what is captured — the tap reads
         // the projection INPUT activations, not cache contents.
-        let mut kv_sliding = hipfire_runtime::llama::KvCache::new_gpu_q8(
-            &mut gpu,
-            cfg.n_layers,
-            cfg.sliding_n_kv_heads,
-            cfg.sliding_head_dim,
-            kv_max,
-        )
-        .unwrap_or_else(|e| panic!("gemma sliding kv alloc q8 {kv_max}: {e:?}"));
-        let mut kv_full = hipfire_runtime::llama::KvCache::new_gpu_q8(
-            &mut gpu,
-            cfg.n_layers,
-            cfg.full_n_kv_heads,
-            cfg.full_head_dim,
-            kv_max,
-        )
-        .unwrap_or_else(|e| panic!("gemma full kv alloc q8 {kv_max}: {e:?}"));
+        let mut state = hipfire_arch_gemma4::Gemma4State::new_with_max_seq(&mut gpu, &cfg, kv_max)
+            .unwrap_or_else(|e| panic!("gemma4 state {kv_max}: {e}"));
         // Honesty guard: the tap must fire; if layer count mismatch or unsupported embed format, run will Err and we exit 1 (honest) — never emit partial hfq.
         let lpp = lpp.max(1);
         let peak = estimate_peak_gemma(&weights, 0, lpp.min(cfg.n_layers));
@@ -1676,7 +1664,7 @@ fn main() {
             kv_max
         );
         let batch_actual = seq_len.min(n_tok.max(1));
-        eprintln!("batching: gemma4::lowered::forward_prefill_batch → step program → sandwich gemm_rows tap, batch={} KV [seq_len+16]", batch_actual);
+        eprintln!("batching: gemma4::forward::forward_prefill_batch → step program → sandwich gemm_rows tap, batch={} KV [seq_len+16]", batch_actual);
         let t0 = std::time::Instant::now();
         let grouped = lpp < cfg.n_layers;
         let calib_prefix_grouped = calib_prefix.clone();
@@ -1686,14 +1674,14 @@ fn main() {
             collect_grouped(&mut gpu, arch, cfg.n_layers, lpp, Vec::new(), Path::new(&output),
                 &[("source_model", serde_json::json!(model.clone())), ("corpus", serde_json::json!(corpus.clone())), ("corpus_md5", serde_json::json!(md5.clone())), ("n_calib_tokens", serde_json::json!(n_tok)), ("source_arch_id", serde_json::json!(arch)), ("seq_len", serde_json::json!(seq_len)), ("batch_size", serde_json::json!(batch_actual)), ("syrk_chosen", serde_json::json!(syrk_chosen)), ("syrk_mode", serde_json::json!(syrk_mode.clone())), ("layers_per_pass", serde_json::json!(lpp)), ("batches", serde_json::json!(n_seqs)), ("kv_max", serde_json::json!(kv_max)), ("calib_driver", serde_json::json!("calib_sweep gemma4 forward_prefill_batch (step program, sandwich projection tap)"))],
                 |s,e| build_capture_gemma(&weights,s,e, &calib_prefix_grouped),
-                |gpu,_| { run_gemma_batched(gpu,&weights,&cfg,&tc,seq_len,&mut kv_sliding,&mut kv_full,&scratch)?; Ok(CalibForward::default()) }
+                |gpu,_| { run_gemma_batched(gpu,&weights,&cfg,&tc,seq_len,&mut state)?; Ok(CalibForward::default()) }
             ).unwrap_or_else(|e| { eprintln!("collect_grouped gemma: {e}"); std::process::exit(1); })
         } else {
             let cap = build_capture_gemma(&weights, 0, cfg.n_layers, &calib_prefix_single);
             let tc = toks.clone();
             collect(&mut gpu, arch, cap, Vec::new(), Path::new(&output),
                 &[("source_model", serde_json::json!(model.clone())), ("corpus", serde_json::json!(corpus.clone())), ("corpus_md5", serde_json::json!(md5.clone())), ("n_calib_tokens", serde_json::json!(n_tok)), ("source_arch_id", serde_json::json!(arch)), ("seq_len", serde_json::json!(seq_len)), ("batch_size", serde_json::json!(batch_actual)), ("syrk_chosen", serde_json::json!(syrk_chosen)), ("syrk_mode", serde_json::json!(syrk_mode.clone())), ("layers_per_pass", serde_json::json!(cfg.n_layers)), ("batches", serde_json::json!(n_seqs)), ("kv_max", serde_json::json!(kv_max)), ("calib_driver", serde_json::json!("calib_sweep gemma4 forward_prefill_batch (step program, sandwich projection tap)"))],
-                |gpu| { run_gemma_batched(gpu,&weights,&cfg,&tc,seq_len,&mut kv_sliding,&mut kv_full,&scratch)?; Ok(CalibForward::default()) }
+                |gpu| { run_gemma_batched(gpu,&weights,&cfg,&tc,seq_len,&mut state)?; Ok(CalibForward::default()) }
             ).unwrap_or_else(|e| { eprintln!("collect gemma: {e}"); std::process::exit(1); })
         };
         // prevent weights moved in closure from being dropped before summary

@@ -64,16 +64,6 @@ use hipfire_dispatch::pipeline::execute_steps;
 use hipfire_runtime::llama::{weight_gemv, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-/// Greedy EAGLE promises byte-identical target decisions.  Its batched verify
-/// must therefore use the same arithmetic family as eager decode rather than
-/// numerically-close fused/WMMA variants whose small drift accumulates in KV.
-fn eagle_strict_enabled() -> bool {
-    hipfire_config::developer_var("HIPFIRE_GEMMA4_EAGLE")
-        .ok()
-        .as_deref()
-        == Some("1")
-}
-
 /// Decode one token (eager); returns the full logits vector. Used for prefill,
 /// the warm pass, and as the `HIPFIRE_GEMMA4_GRAPH=0` fallback.
 pub fn decode_step(
@@ -85,9 +75,59 @@ pub fn decode_step(
     position: u32,
 ) -> Result<Vec<f32>, String> {
     prepare_token_inputs(cfg, weights, state, gpu, token_id)?;
+    stage_position(state, gpu, position)?;
     decode_step_body(cfg, weights, state, gpu, position, None)?;
     gpu.download_f32(&state.logits)
         .map_err(|e| format!("gemma4: download logits: {e:?}"))
+}
+
+/// Stage `position` into the device scalar every position-reading kernel
+/// uses. Inside a hipGraph capture the copy is recorded and re-reads
+/// `state.pos_host` on replay.
+fn stage_position(state: &mut Gemma4State, gpu: &mut Gpu, position: u32) -> Result<(), String> {
+    state.pos_host[0] = position as i32;
+    let pos_bytes = unsafe { std::slice::from_raw_parts(state.pos_host.as_ptr() as *const u8, 4) };
+    gpu.memcpy_htod_auto(&state.pos_buf.buf, pos_bytes)
+        .map_err(|e| format!("gemma4: htod pos: {e:?}"))
+}
+
+/// The token-dependent prologue of one decode step: embedding (× √dim) into
+/// `state.x` and, on E-series checkpoints, the per-layer inputs.
+pub fn prepare_token(
+    cfg: &Gemma4Config,
+    weights: &Gemma4Weights,
+    state: &mut Gemma4State,
+    gpu: &mut Gpu,
+    token_id: u32,
+) -> Result<(), String> {
+    prepare_token_inputs(cfg, weights, state, gpu, token_id)
+}
+
+/// The position-independent body of one decode step (every layer, final
+/// norm, LM head, softcap into `state.logits`). It reads the token from
+/// `state.x` ([`prepare_token`]) and the position from `state.pos_buf`, which
+/// the caller staged; it issues no copies, so a launch recorder sees the
+/// whole step.
+pub fn decode_body(
+    cfg: &Gemma4Config,
+    weights: &Gemma4Weights,
+    state: &mut Gemma4State,
+    gpu: &mut Gpu,
+    position: u32,
+) -> Result<(), String> {
+    decode_step_body(cfg, weights, state, gpu, position, None)
+}
+
+/// Whether replaying a captured decode reproduces direct decode exactly. The
+/// Q8_0 expert `down_proj` accumulates with atomics, whose scheduling-order
+/// sum is not exact; a launch recorder must see direct launches.
+fn graph_exact(weights: &Gemma4Weights, gpu: &Gpu) -> bool {
+    !gpu.replay.is_recording()
+        && weights
+            .layers
+            .iter()
+            .filter_map(LayerWeights::moe)
+            .all(|moe| moe.down_dtype == DType::HFQ4G128)
 }
 
 /// Decode one token, appending each layer's post-residual hidden state (pre
@@ -103,6 +143,7 @@ pub fn decode_step_capture(
     capture: &mut [Vec<f32>],
 ) -> Result<(), String> {
     prepare_token_inputs(cfg, weights, state, gpu, token_id)?;
+    stage_position(state, gpu, position)?;
     decode_step_body(cfg, weights, state, gpu, position, Some(capture))
 }
 
@@ -144,7 +185,7 @@ pub fn decode_step_with_graph(
     // The captured path is the default. Set HIPFIRE_GEMMA4_GRAPH=0 to retain
     // the eager fallback for diagnostics.
     let graph_on = env_override.unwrap_or(true);
-    if !graph_on {
+    if !graph_on || !graph_exact(weights, gpu) {
         return decode_step(cfg, weights, state, gpu, token_id, position);
     }
 
@@ -173,16 +214,22 @@ pub fn decode_step_with_graph(
 
     if gpu.graphs.graph_exec.is_none() {
         // ── Capture phase ──────────────────────────────────────────────
-        // decode_step_body stages pos_host → pos_buf via memcpy_htod_auto
-        // INSIDE the capture, so the recorded memcpy node re-reads pos_host
-        // on each replay.
+        // The position copy is captured too, so the recorded memcpy node
+        // re-reads pos_host on each replay.
         gpu.graphs
             .begin_graph_capture(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
             .map_err(|e| format!("gemma4 begin_graph_capture: {e:?}"))?;
-        decode_step_body(cfg, weights, state, gpu, position, None)?;
-        gpu.graphs
+        let body = stage_position(state, gpu, position)
+            .and_then(|()| decode_step_body(cfg, weights, state, gpu, position, None));
+        let end = gpu
+            .graphs
             .end_graph_capture(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
-            .map_err(|e| format!("gemma4 end_graph_capture: {e:?}"))?;
+            .map_err(|e| format!("gemma4 end_graph_capture: {e:?}"));
+        if let Err(e) = body.and(end) {
+            gpu.graphs.capture_mode = false;
+            gpu.graphs.graph_destroy(&gpu.hip, gpu.device_id);
+            return Err(e);
+        }
         // Captured kernels were RECORDED, not run — launch once so this token's
         // logits actually get produced.
         gpu.graphs
@@ -483,7 +530,7 @@ fn eager_resident(state: &Gemma4State) -> Resident<'_> {
     Resident {
         kv_sliding: &state.kv_sliding,
         kv_full: &state.kv_full,
-        pos_buf: &state.pos_buf,
+        pos_buf: &state.pos_buf.buf,
         v_norm_ones: &state.v_norm_ones,
         flash_partials: &state.q8_flash_partials,
     }
@@ -504,16 +551,7 @@ fn decode_step_body(
         ));
     }
 
-    // Device position scalar (i32). Staged from the heap-stable `state.pos_host`
-    // so the captured memcpy re-reads it on replay (memcpy_htod_auto → async on
-    // the capture stream when capturing).
-    state.pos_host[0] = position as i32;
-    {
-        let pos_bytes =
-            unsafe { std::slice::from_raw_parts(state.pos_host.as_ptr() as *const u8, 4) };
-        gpu.memcpy_htod_auto(&state.pos_buf, pos_bytes)
-            .map_err(|e| format!("gemma4: htod pos: {e:?}"))?;
-    }
+    // The caller staged `position` into `state.pos_buf`.
 
     // Per-layer program: [SandwichAttention, SandwichMlp, PerLayerInput?, Scale?].
     let ctx = DispatchCtx::new(gpu);
@@ -583,32 +621,35 @@ fn decode_step_body(
 // ADDITIVE: does not touch `decode_step` / `decode_step_with_graph`. The eager
 // path is unchanged.
 
-/// Whether every projection used by batched prefill has a matching kernel.
-/// Other loadable quantizations must remain on eager prefill.
-pub fn supports_batched_prefill(weights: &Gemma4Weights) -> bool {
+/// Whether every projection used by batched prefill has a matching kernel
+/// and both caches are Q8 (the batched attention writes Q8 rows). Other
+/// loads remain on eager prefill.
+pub fn supports_batched_prefill(weights: &Gemma4Weights, state: &Gemma4State) -> bool {
     let supports = |weight: &WeightTensor| {
         hipfire_dispatch::pipeline::sandwich::supports_batched_projection(weight.gpu_dtype)
     };
-    weights.layers.iter().all(|layer| match layer {
-        LayerWeights::Sliding(layer) => {
-            supports(&layer.q_proj)
-                && supports(&layer.k_proj)
-                && supports(&layer.v_proj)
-                && supports(&layer.o_proj)
-                && supports(&layer.gate_proj)
-                && supports(&layer.up_proj)
-                && supports(&layer.down_proj)
-        }
-        LayerWeights::Full(layer) => {
-            supports(&layer.q_proj)
-                && supports(&layer.k_proj)
-                && layer.v_proj.as_ref().map_or(true, supports)
-                && supports(&layer.o_proj)
-                && supports(&layer.gate_proj)
-                && supports(&layer.up_proj)
-                && supports(&layer.down_proj)
-        }
-    })
+    state.kv_sliding.quant_q8
+        && state.kv_full.quant_q8
+        && weights.layers.iter().all(|layer| match layer {
+            LayerWeights::Sliding(layer) => {
+                supports(&layer.q_proj)
+                    && supports(&layer.k_proj)
+                    && supports(&layer.v_proj)
+                    && supports(&layer.o_proj)
+                    && supports(&layer.gate_proj)
+                    && supports(&layer.up_proj)
+                    && supports(&layer.down_proj)
+            }
+            LayerWeights::Full(layer) => {
+                supports(&layer.q_proj)
+                    && supports(&layer.k_proj)
+                    && layer.v_proj.as_ref().map_or(true, supports)
+                    && supports(&layer.o_proj)
+                    && supports(&layer.gate_proj)
+                    && supports(&layer.up_proj)
+                    && supports(&layer.down_proj)
+            }
+        })
 }
 
 /// argmax over a logits row (spec-decode greedy per-position prediction).
@@ -683,6 +724,57 @@ pub fn forward_batch_spec(
     per_token_hidden_out: Option<&GpuTensor>,
     per_pos_argmax_out: Option<&mut Vec<u32>>,
 ) -> Result<Vec<f32>, String> {
+    forward_rows(
+        cfg,
+        weights,
+        state,
+        gpu,
+        tokens,
+        start_pos,
+        per_token_hidden_out,
+        per_pos_argmax_out,
+        true,
+    )
+}
+
+/// Prefill `tokens` from `start_pos` through the batched program in chunks of
+/// [`GEMMA4_FORWARD_BATCH_MAX`] rows, writing both KV caches and computing no
+/// logits. A calibration collector, when armed, sees every projection input.
+pub fn forward_prefill_batch(
+    cfg: &Gemma4Config,
+    weights: &Gemma4Weights,
+    state: &mut Gemma4State,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+    start_pos: usize,
+) -> Result<(), String> {
+    for (i, chunk) in tokens.chunks(GEMMA4_FORWARD_BATCH_MAX).enumerate() {
+        let pos = start_pos + i * GEMMA4_FORWARD_BATCH_MAX;
+        // One row runs the decode route, which reads the staged position.
+        if let [token] = chunk {
+            decode_step(cfg, weights, state, gpu, *token, pos as u32)?;
+            continue;
+        }
+        forward_rows(cfg, weights, state, gpu, chunk, pos, None, None, false)?;
+    }
+    Ok(())
+}
+
+/// The batched program over `tokens` at `[start_pos, start_pos + B)`; with
+/// `last_logits` the last row's logits are computed, downloaded and returned
+/// (else an empty vector).
+#[allow(clippy::too_many_arguments)]
+fn forward_rows(
+    cfg: &Gemma4Config,
+    weights: &Gemma4Weights,
+    state: &mut Gemma4State,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+    start_pos: usize,
+    per_token_hidden_out: Option<&GpuTensor>,
+    per_pos_argmax_out: Option<&mut Vec<u32>>,
+    last_logits: bool,
+) -> Result<Vec<f32>, String> {
     let b = tokens.len();
     if b == 0 {
         return Err("gemma4 forward_batch: empty token slice".to_string());
@@ -701,6 +793,9 @@ pub fn forward_batch_spec(
     let ple_packed = cfg.n_layers * ple_dim;
     // seq_len after this batch = absolute positions [start_pos, start_pos+B).
     checked_batch_seq_len(start_pos, b, state.max_seq)?;
+    if !(state.kv_sliding.quant_q8 && state.kv_full.quant_q8) {
+        return Err("gemma4 forward_batch: batched attention needs Q8 caches".to_string());
+    }
 
     let mut bufs = RowBuffers::new(gpu);
     let widths = RowWidths {
@@ -803,7 +898,7 @@ pub fn forward_batch_spec(
         rows: b,
         position: start_pos,
         positions: Some(&acts.positions),
-        scratch: acts.scratch(ple, None),
+        scratch: acts.scratch(ple, state.moe.as_ref().map(crate::program::routed_scratch)),
     };
     let mut steps = Vec::with_capacity(4 * cfg.n_layers);
     for (layer_idx, layer) in weights.layers.iter().enumerate() {
@@ -868,25 +963,16 @@ pub fn forward_batch_spec(
                 // (tanh-scaled), so argmax(softcap(z)) == argmax(z). The accept
                 // decision is an argmax, so this is bit-exact in the decision.
                 let logits_b = bufs.alloc(b * vocab, "spec_logits_b")?;
-                let lm_result = if eagle_strict_enabled() {
-                    gpu.gemm_q8_0_batched(
-                        &weights.lm_head.buf,
-                        normed_hidden,
-                        &logits_b,
-                        weights.lm_head.m,
-                        weights.lm_head.k,
-                        b,
-                    )
-                } else {
-                    gpu.gemm_q8_0_batched_chunked(
-                        &weights.lm_head.buf,
-                        normed_hidden,
-                        &logits_b,
-                        weights.lm_head.m,
-                        weights.lm_head.k,
-                        b,
-                    )
-                };
+                // Not `_chunked`: verify stays on the scalar kernel rather
+                // than the gfx12 WMMA variant, whose drift accumulates in KV.
+                let lm_result = gpu.gemm_q8_0_batched(
+                    &weights.lm_head.buf,
+                    normed_hidden,
+                    &logits_b,
+                    weights.lm_head.m,
+                    weights.lm_head.k,
+                    b,
+                );
                 lm_result
                     .map_err(|e| format!("gemma4 forward_batch_spec batched lm_head: {e:?}"))?;
                 // GPU per-row argmax over [B, vocab]; only B indices land on PCIe.
@@ -930,6 +1016,9 @@ pub fn forward_batch_spec(
         }
     }
 
+    if !last_logits {
+        return Ok(Vec::new());
+    }
     // ── Final RMSNorm + tied lm_head on the LAST row only (verify needs the
     //    last position's logits). ──
     let x_last = bufs.alloc(dim, "x_last")?;
