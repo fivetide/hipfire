@@ -60,7 +60,7 @@ fn batched_fusion_arch(arch: &str) -> bool {
 /// True while a calibration collector is armed. Routes that never
 /// materialize a projection's unrotated input (fused norm+FWHT) step aside so
 /// every projection reaches its `maybe_capture_activation` tap.
-fn capturing(gpu: &Gpu) -> bool {
+fn calibrating(gpu: &Gpu) -> bool {
     gpu.active_capture.is_some()
 }
 
@@ -425,7 +425,7 @@ impl SandwichAttentionOp<'_> {
             .iter()
             .flatten()
             .all(|(w, _)| w.dtype == DType::MQ4G256 && w.awq_scale.is_none());
-        if all_mq4 && !capturing(gpu) {
+        if all_mq4 && !calibrating(gpu) {
             gpu.fused_rmsnorm_rotate_mq(s.x, self.input_norm, self.x_rot, s.hidden, s.eps)
                 .map_err(hip)?;
             for (w, out) in self.projections().iter().flatten() {
@@ -796,7 +796,7 @@ fn dense_mlp(
         }
     } else if op.w_gate.dtype == DType::MQ4G256
         && op.w_up.dtype == DType::MQ4G256
-        && !capturing(gpu)
+        && !calibrating(gpu)
     {
         gpu.fused_rmsnorm_rotate_mq(s.x, op.pre_norm, op.x_rot, s.hidden, s.eps)
             .map_err(hip)?;
