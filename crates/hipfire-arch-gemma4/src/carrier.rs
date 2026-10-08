@@ -337,7 +337,11 @@ mod tests {
     fn lowered_full_kv_mode_follows_kv_cache() {
         use hipfire_runtime::kv_mode::KvMode;
         for raw in ["", "auto", "q8"] {
-            assert_eq!(resolve_lowered_full_kv_mode(raw), Ok((KvMode::Q8, None)), "{raw:?}");
+            assert_eq!(
+                resolve_lowered_full_kv_mode(raw),
+                Ok((KvMode::Q8, None)),
+                "{raw:?}"
+            );
         }
         assert_eq!(
             resolve_lowered_full_kv_mode("legacy-asym3"),
