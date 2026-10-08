@@ -1,7 +1,7 @@
 # Gemma 4 declarative layer program (#666 G6)
 
-Status: in progress on `feat/gemma-declarative` (cut from #795
-`feat/qwen35-declarative` at `d101a15d0`).
+Status: landed on `feat/gemma-declarative` (#813), rebased onto `beta` with
+the #795 Qwen3.5 port it builds on.
 
 ## Goal
 
@@ -23,14 +23,15 @@ The #397 super-op facade (`lowered.rs` `lower_variant` / `Gemma4Bindings`)
 and the hand-written decode arms in `forward.rs` and `lowered.rs` are deleted.
 Gemma 4 has no EP/TP route, so nothing keeps the super-op program alive for it.
 
-## Today
+## Before the port
 
-Two parallel stacks, each with its own config, weights and loader:
+Two parallel stacks, each with its own config, weights and loader (both stay;
+they now bind the same program):
 
 | Stack | Fixtures | KV | Notes |
 |---|---|---|---|
 | eager (`config.rs`, `gemma4.rs`, `forward.rs`) | 12B dense (default), E2B/E4B, EAGLE target | Q8 both tiers, `physical_cap = max_seq` | fused qk-norm+RoPE and fused post-norm+residual; hipGraph decode; `forward_batch{,_spec}` B≤64 |
-| lowered (`lowered.rs`) | 26B-A4B MoE (always); 12B with `HIPFIRE_{BATCHED,WMMA}_PREFILL=1` | sliding Q8 ring (`window`), full asym3 hd512 | super-op facade; per-token serve prefill; `forward_prefill_batch` only for calibration tools |
+| lowered (`lowered.rs`) | 26B-A4B MoE (always); 12B with `HIPFIRE_{BATCHED,WMMA}_PREFILL=1` (removed) | sliding Q8 ring (`window`), full tier Q8 (beta default; asym3 hd512 under `legacy-asym3`) | super-op facade (removed); per-token serve prefill; `forward_prefill_batch` only for calibration tools |
 
 ## Vocabulary
 
@@ -39,7 +40,7 @@ New model-neutral ops live in `hipfire-dispatch/src/pipeline/sandwich.rs`
 
 | Step | Semantics | Route choice owned by dispatch |
 |---|---|---|
-| `SandwichAttention` | `x = residual + post_norm(o_proj(attend(rope(norm_h(q)), rope(norm_h(k)), norm(v))))` on `input_norm(x)`. Optional V projection (`None` = K=V from pre-norm K); optional weightless V norm; Q prescale; **explicit `Rope { kind: RotateHalf \| PartialHalved { rot_pairs }, theta }`**; KV `write: Option` (`None` = read-only shared slot, used by E-series KV sharing and the drafter); `window` | fused norm+FWHT-rotate + prerotated GEMVs (MQ4), fused Q8 q+k, fused qk-norm+RoPE, fused post-norm+residual, KV tier via `KvTierPlan` |
+| `SandwichAttention` | `x = residual + post_norm(o_proj(attend(rope(norm_h(q)), rope(norm_h(k)), norm(v))))` on `input_norm(x)`. Optional V projection (`None` = K=V from pre-norm K); optional weightless V norm; Q prescale; **explicit `Rope { kind: RotateHalf \| PartialHalved { rot_pairs }, theta }`**; `kv_proj: Option<KvProjection>` (`None` = query-only attend over a shared slot, no cache write: E-series KV sharing and the drafter); `window` | fused norm+FWHT-rotate + prerotated GEMVs (MQ4), fused Q8 q+k, fused qk-norm+RoPE, fused post-norm+residual, KV tier via `KvTierPlan` |
 | `SandwichMlp` | `x = residual + post_norm(down(act(gate(n)) * up(n)))`, `n = pre_norm(x)`, `act ∈ {GeluTanh}` | fused norm+rotate + fused gate/up (MQ4), fused post-norm+residual |
 | `ParallelMoeMlp` | Gemma 4 MoE block: dense GeGLU MLP ∥ routed experts (router input `rms(x)·router_scale/√dim`, softmax top-k renorm, per-expert scale, GeGLU), `post_ffn_norm(norm1(mlp) + norm2(moe))`, residual add | expert dtype routes (MQ4 / HFQ4 / Q8 indexed) |
 | `PerLayerInput` | E-series PLE branch: `x += post_norm(proj(gelu(gate(x)) * ple[layer]))` | batched strided PLE kernel |
@@ -57,10 +58,10 @@ Projections, the final norm and the LM head reuse `Gemv` and
    same program. The token-level PLE staging and embedding stay in the arch
    crate, outside the captured body.
 2. **MoE.** `ParallelMoeMlp` (`rows == 1` and `rows > 1`); 26B-A4B runs the
-   shared program on its ring/asym3 KV.
-3. **EAGLE/MTP drafter.** The drafter block is `[SandwichAttention(q-only,
-   write: None, target KV), SandwichMlp, Scale]`; pre/post projection and head
-   are `Gemv` steps.
+   shared program on its sliding ring and full-tier KV.
+3. **EAGLE/MTP drafter.** The drafter block is `[SandwichAttention(query-only,
+   kv_proj: None, target KV), SandwichMlp, Scale]`; pre/post projection and
+   head are `Gemv` steps.
 4. **Deletion.** `lowered.rs` super-op facade and hand arms; calibration
    tools move to the shared batched program.
 
@@ -116,6 +117,26 @@ batched kernel one GEMV per row.
   per-token scoring 0.7338 pre-port vs 0.7335 now; prefill scoring 0.8150 vs
   0.8242 (prefill wall 160 s vs 110 s). The pre-port `eval_hipfire` needed
   the Gemma-branch fix to score at all.
+- Rebased onto `beta` `e268a0798` (gfx1151, beta daemon md5
+  `94070f1ce9ce722fcbf4dcf7cc87da58` vs rebased daemon
+  `ea7b9af9f33b242a81a400486f169f02`), five greedy prompts per row:
+  12B AR, 12B prefill batch 64, 12B `HIPFIRE_GEMMA4_EAGLE=1` (strict), E2B,
+  E4B, E2B/E4B prefill batch 64 have byte-identical token streams and top-16
+  logit traces; EAGLE (now opt-in on beta via `HIPFIRE_GEMMA4_EAGLE=1`) is
+  byte-identical with per-prompt tau 3.368/3.459/2.667/3.447/3.514 on both;
+  26B-A4B q8-experts: 3 of 5 identical, 2 diverge late (chars 295 and 322),
+  coherent; `gemma4-26b-a4b.mq4` (MQ6G256/HFQ4G128 experts) produces garbage
+  on beta and refuses at load here. `serve_harness.py --thinking off
+  --sampling greedy`: 12B battery and chain, E4B battery and 26B battery
+  `transcript_byte_identical=true` against beta. 26B Redline `--pm4
+  --skip-prefill` shadow exact on both (beta 1263 launches, hash
+  `9f57d0ca48889bda`; here 1083, hash `f2675ac01238613c`; both with beta's
+  default Q8 full tier), decode 38.1 vs 38.2 tok/s. `prefill_parity_gemma4`
+  725 tokens: 12B and 26B batched vs per-token same argmax and identical
+  24-token continuation (12B 4.2 s vs 33.8 s per-token, 26B 8.2 s vs 19.2 s).
+  `calib_sweep` 12B coverage 328/328, consistency 0, identity PASS.
+  `eval_hipfire` per-token 0.733489 and prefill 0.824203: both `.kldseq`
+  files byte-identical to the pre-rebase branch.
 
 ## Progress
 
