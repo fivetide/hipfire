@@ -35,15 +35,14 @@ pub use layer_ops::{
     execute_argmax, execute_broadcast_add, execute_clear, execute_embedding, execute_final_hyper,
     execute_gated_delta_net, execute_grouped_depthwise, execute_hyper_norm, execute_hyper_read,
     execute_hyper_write, execute_indexed_attention, execute_lm_head, execute_project,
-    project_weight, validate_lm_head, BroadcastAddOp, ClearOp, EmbeddingOp, GatedDeltaNetOp,
-    GdnRowCapture, GroupedDepthwiseOp, HyperNormOp, HyperReadOp, HyperWriteOp,
-    IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, ProjectOp,
-    qsa_projection_hook_installed, reset_qsa_projection_slot, set_qsa_projection_hook,
-    QsaProjectionHook,
+    project_weight, qsa_projection_hook_installed, reset_qsa_projection_slot,
+    set_qsa_projection_hook, validate_lm_head, BroadcastAddOp, ClearOp, EmbeddingOp,
+    GatedDeltaNetOp, GdnRowCapture, GroupedDepthwiseOp, HyperNormOp, HyperReadOp, HyperWriteOp,
+    IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, ProjectOp, QsaProjectionHook,
 };
 pub use steps::{
-    execute_steps, execute_validated_steps, execute_validated_steps_with_moe_hooks,
-    validate_steps, FusedPattern, GemvInput, MoeStepHooks, Step,
+    execute_steps, execute_validated_steps, execute_validated_steps_with_moe_hooks, validate_steps,
+    FusedPattern, GemvInput, MoeStepHooks, Step,
 };
 
 // #397 Ship 6 — forward-as-pipeline C-design lowered super-op substrate (types
@@ -3227,7 +3226,9 @@ fn decode_route_gpu_stage(
             ))?;
         }
         // The grouped top-10 router stores its weights BF16-rounded itself.
-        if p.recipe.bf16_round_trip() && !route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+        if p.recipe.bf16_round_trip()
+            && !route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
+        {
             // Only the selected slots are live; scratch may be prefill-sized.
             hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(p.topk_weights, 0, p.k)))?;
         }

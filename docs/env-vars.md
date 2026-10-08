@@ -567,7 +567,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1461
+**Count:** 1448
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -619,7 +619,6 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_BASELINE_PROMPT` | scripts/baseline_quant_smoke.sh | harness |
 | `HIPFIRE_BASELINE_PROMPT_MODE` | scripts/baseline_quant_smoke.sh | harness |
 | `HIPFIRE_BASELINE_WIDE_MARGIN` | scripts/baseline_quant_smoke.sh | harness |
-| `HIPFIRE_BATCHED_PREFILL` | crates/hipfire-arch-gemma4/examples/prefill_parity_gemma4.rs, crates/hipfire-arch-gemma4/src/lowered.rs | developer |
 | `HIPFIRE_BENCH_AB` | benchmarks/scripts/bench_dflash_27b_gfx906.sh | harness |
 | `HIPFIRE_BENCH_MAX` | scripts/adaptive_b_bench.sh, scripts/qwen36_bench.sh | harness |
 | `HIPFIRE_BENCH_N` | crates/rdna-compute/examples/bench_indexed_moe_keystone.rs | harness |
@@ -1074,18 +1073,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GDN_STATE_SRC` | crates/rdna-compute/src/dflash_gdn_replay.rs | developer |
 | `HIPFIRE_GDN_TILE_ROWS` | crates/rdna-compute/src/dflash_gdn_replay.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GDN_WAVES_PER_BLOCK` | crates/rdna-compute/src/kernels.rs | developer |
-| `HIPFIRE_GEMMA4_ATTN_VERIFY` | crates/hipfire-arch-gemma4/src/lowered.rs | developer |
-| `HIPFIRE_GEMMA4_BASELINE_ATTN` | crates/hipfire-arch-gemma4/src/forward.rs | developer |
 | `HIPFIRE_GEMMA4_BATCHED_EMBEDDING_PREFILL` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
-| `HIPFIRE_GEMMA4_DUMP` | crates/hipfire-arch-gemma4/examples/prefill_parity_gemma4.rs, crates/hipfire-arch-gemma4/src/lowered.rs | developer |
-| `HIPFIRE_GEMMA4_EAGLE` | crates/hipfire-arch-gemma4/src/forward.rs, crates/hipfire-generate/src/dense.rs | developer |
-| `HIPFIRE_GEMMA4_FUSED_ATTN_NORM` | crates/hipfire-arch-gemma4/src/forward.rs | developer |
-| `HIPFIRE_GEMMA4_FUSED_FFN` | crates/hipfire-arch-gemma4/src/forward.rs | developer |
-| `HIPFIRE_GEMMA4_FUSED_POSTNORM` | crates/hipfire-arch-gemma4/src/forward.rs | developer |
-| `HIPFIRE_GEMMA4_FUSED_PROJ` | crates/hipfire-arch-gemma4/src/forward.rs | developer |
-| `HIPFIRE_GEMMA4_FUSED_QK` | crates/hipfire-arch-gemma4/src/forward.rs | developer |
-| `HIPFIRE_GEMMA4_FUSED_QK_ROPE` | crates/hipfire-arch-gemma4/src/forward.rs | developer |
-| `HIPFIRE_GEMMA4_GEMM_VERIFY` | crates/hipfire-arch-gemma4/src/lowered.rs | developer |
+| `HIPFIRE_GEMMA4_DUMP` | crates/hipfire-arch-gemma4/src/lowered.rs, crates/hipfire-runtime/examples/debug_gemma4_attention.rs | developer |
+| `HIPFIRE_GEMMA4_EAGLE` | crates/hipfire-arch-gemma4/src/forward.rs, crates/hipfire-dispatch/src/pipeline/sandwich.rs | developer |
 | `HIPFIRE_GEMMA4_GRAPH` | crates/hipfire-arch-gemma4/examples/infer_gemma4.rs, crates/hipfire-arch-gemma4/src/forward.rs | developer |
 | `HIPFIRE_GEMMA4_LOGIT_TRACE_DIR` | crates/hipfire-generate/src/dense.rs, scripts/diag-gemma4-logit-routes.sh | developer |
 | `HIPFIRE_GEMMA4_LOGIT_TRACE_FULL_STEPS` | crates/hipfire-generate/src/dense.rs, scripts/diag-gemma4-logit-routes.sh | developer |
@@ -1420,8 +1410,6 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MODEL_STORE` | scripts/baseline_quant_smoke.sh | harness |
 | `HIPFIRE_MODULE_LOAD_AUDIT` | crates/hip-bridge/src/ffi.rs, crates/rdna-compute/src/scratch.rs | developer |
 | `HIPFIRE_MOE_AWQ` | crates/hipfire-arch-qwen35/src/qwen35/load.rs | developer |
-| `HIPFIRE_MOE_BUCKETED` | crates/hipfire-arch-gemma4/src/lowered.rs | developer |
-| `HIPFIRE_MOE_BYPASS` | crates/hipfire-arch-gemma4/src/lowered.rs | developer |
 | `HIPFIRE_MOE_CODEBOOK_BATCHED` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-dispatch/src/families/moe.rs | developer |
 | `HIPFIRE_MOE_COMBINE_NEXT_RMS` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs | developer |
 | `HIPFIRE_MOE_COMBINE_NEXT_RMS_RENORM` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs | developer |
@@ -1596,7 +1584,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_PP_PFLASH` | crates/hipfire-daemon/src/main.rs | deprecated |
 | `HIPFIRE_PP_RESET_MODEL` | crates/hipfire-generate/tests/qwen35_reset_hw.rs | harness |
 | `HIPFIRE_PREFILL_BATCHED` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-config/src/lib.rs | stable |
-| `HIPFIRE_PREFILL_CHUNK` | crates/hipfire-arch-gemma4/examples/prefill_parity_gemma4.rs, crates/hipfire-runtime/examples/ep_decode_parity.rs | harness |
+| `HIPFIRE_PREFILL_CHUNK` | crates/hipfire-runtime/examples/ep_decode_parity.rs | harness |
 | `HIPFIRE_PREFILL_CHUNK_ROWS` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | stable |
 | `HIPFIRE_PREFILL_MAX_BATCH` | crates/hipfire-arch-qwen35/src/qwen35/ep_batch.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
 | `HIPFIRE_PREFILL_REUSE_PBS` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/hipfire-arch-qwen35/src/speculative.rs | developer |
@@ -2023,7 +2011,6 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_WMMA_BATCH_TILES` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_WMMA_FA` | benchmarks/results/wmma-fa-probe-gfx1100.sh, benchmarks/results/wmma-fa-probe.sh | developer |
 | `HIPFIRE_WMMA_FA_MIN_BATCH` | crates/rdna-compute/src/attention.rs | developer |
-| `HIPFIRE_WMMA_PREFILL` | crates/hipfire-arch-gemma4/examples/prefill_parity_gemma4.rs, crates/hipfire-arch-gemma4/src/lowered.rs | developer |
 | `HIPFIRE_WO_MMQ` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
 | `HIPFIRE_WO_WMMA_VARIANT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/test_wmma_correctness.rs | experimental |
 | `HIPFIRE_XDNA_A` | crates/hipfire-xdna/src/lib.rs | developer |
