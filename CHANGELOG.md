@@ -37,7 +37,35 @@
 - **GDN replay route no longer depends on memory pressure (exactness fix):** the gfx1201 multi-layer GDN tape replay (and the D8 snapshot-source tables) armed lazily at a tape's first accept, and an allocation failure there silently moved that tape to the per-layer replay for life, which commits different DeltaNet bytes on the production model. `GdnTape::new_for_config` now arms the tables when the tape is built (`GdnTape::new_for_dflash` adds the D8 tables), so an allocation failure refuses the lane or request at provision with a logged error; an admitted replay never falls back. The replay's q/k/v/out scratch is now a `Gpu`-owned map keyed by scratch shape (layers, rows, value width): every armed tape of one shape shares one refcounted buffer, released when no tape or replay graph references it and drained on model unload, so eager arming costs a lane only its pointer tables instead of ~75 MB on the 27B. The serve engine's batched verify tape, which is repaired per layer and never replayed, is built with `GdnTape::new_capture_only`. `HIPFIRE_GDN_REPLAY_ML_OFF=1` stays an explicit diagnostic opt-in and is documented as not byte-identical. `GpuPool::alloc` now returns its free lists to HIP and retries once when `hipMalloc` runs out of memory (freed scratch parked in the pool is invisible to HIP; 9 GiB in the reproduction). `DeltaNetSnapshot::new_for` frees partial buffers on a mid-way failure, and `take_dn_checkpoint` logs a skipped checkpoint and frees the snapshot when its save fails. Open: the per-layer `replay_gdn_inner` is still not byte-identical to the multi-layer replay.
 - **VMM maps reclaim pooled memory:** `hipMemCreate` cannot see buffers parked in `GpuPool` either (12.6–13.7 GiB pooled with 0.1–1.4 GiB reported free in the 4-lane MTP state oracle, which failed its 32K lanes with `hipMemCreate: out of memory`). A whole-segment VMM map (`alloc_vmm_tensor`, `grow_vmm_tensor`) that runs out of memory now returns the pool to HIP and retries once; a granule map (`grow_vmm_tensor_granules`, prefix forks), whose failure aborts its arena, returns the pool first when HIP's free figure cannot cover it plus 64 MiB. Both log a `GpuPool: VMM map ...` line.
 - **Removed config keys warn instead of failing the load:** 0.4.1 removed `kernel.mw16` (shipped in 0.3.1 and 0.4.0) from the schema outright, so a `config.toml` that still set it made every command fail with `unknown configuration key 'kernel.mw16'`. Removed keys that shipped now live in `hipfire_config::RETIRED_CONFIG_KEYS`; through their deprecation window (`kernel.mw16`: until 0.5.0) the load drops them and run/serve/chat and `hipfire config show` print `warning: ignored kernel.mw16 in <file>: removed in 0.4.1 (…)`. Keys that never shipped (such as `kernel.gfx11_iu4_swizzle`, which only existed on an experiment branch) and typos still fail the load. See [`docs/CONFIG.md`](docs/CONFIG.md#lifecycle-status).
-
+- Gemma 4 layers run as engine `Step`s: 12B dense, E2B/E4B, the 26B-A4B MoE
+  and the EAGLE draft head (`gemma-4-*-assistant`) all execute
+  `[SandwichAttention, SandwichMlp | ParallelMoeMlp, PerLayerInput?, Scale?]`
+  from `hipfire_dispatch`; dense and E-series batched prefill and EAGLE verify
+  run the same program with `rows > 1`. The Gemma 4 super-op path and its
+  `HIPFIRE_FORWARD_LOWERED` hand arms are gone.
+  - 12B, E2B and E4B decode, batched prefill and EAGLE verify are
+    byte-identical, logits included; EAGLE tau is unchanged.
+  - The 26B-A4B now takes the 12B's fused qk-norm+RoPE and post-norm+residual
+    kernels. Greedy text stays coherent and can diverge late.
+  - `calib_sweep`, `eval_hipfire` and `prefill_parity_gemma4` prefill Gemma 4
+    through the same program (`lowered::forward_prefill_batch`, 64-row
+    chunks, Q8 KV). The dispatch sandwich projections feed the calibration
+    collector, so any architecture on these steps calibrates without
+    per-architecture taps. Gemma calibration and KLD numbers move: the tools
+    now use the serve kernels. The 26B-A4B MoE block runs batched too.
+  - `HIPFIRE_BATCHED_PREFILL` and `HIPFIRE_WMMA_PREFILL` are removed; dense
+    Gemma 4 always loads on the eager stack, MoE on the lowered one.
+  - The `HIPFIRE_GEMMA4_FUSED_{FFN,QK,QK_ROPE,POSTNORM,ATTN_NORM,PROJ}` developer
+    switches are removed; the fused routes are always on. The debug switches
+    `HIPFIRE_GEMMA4_{BASELINE_ATTN,ATTN_VERIFY,GEMM_VERIFY}` and
+    `HIPFIRE_MOE_{BYPASS,BUCKETED}` are removed with their hand-written paths.
+  - The 26B-A4B lowered stack loads MQ4G256V2 weights and runs MQ4G256V2 and
+    MQ6G256 routed experts on the indexed kernels, which is what the current
+    quantizer emits for it. A MoE checkpoint whose expert formats have no
+    indexed kernel pair now refuses to load instead of running a host-side
+    expert loop, and so does one whose HFQ4-G128 expert `down_proj` (K = 704)
+    was packed across rows by a quantizer before `b4846285e`; both produced
+    garbage. Requantize such files.
 
 ## v0.4.1.1 — release draft
 

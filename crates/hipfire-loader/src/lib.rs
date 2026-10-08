@@ -1966,7 +1966,10 @@ fn resolve_qwen35_mtp_head(
     gpu: &mut rdna_compute::Gpu,
     physical_cap: usize,
     device: Option<&str>,
-) -> (Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>, Vec<String>) {
+) -> (
+    Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>,
+    Vec<String>,
+) {
     use hipfire_arch_qwen35::mtp_head;
     let tag = device.map(|d| format!(", {d}")).unwrap_or_default();
     let sidecar = sidecar.unwrap_or_else(|| trunk_path.with_extension("mtp"));
@@ -4522,7 +4525,9 @@ fn load_model_tp_qwen35_dense(
             } else {
                 errors.join("; ")
             };
-            return Err(format!("MTP head required (mtp=on) but not loaded: {reason}"));
+            return Err(format!(
+                "MTP head required (mtp=on) but not loaded: {reason}"
+            ));
         }
         head
     } else {
@@ -5119,9 +5124,14 @@ mod ep_admission_tests {
         let before = active.request();
         let mut effects = LoadEffects::default();
         let refusal = attempt_candidate_swap(
-            &candidate, 1, admission::KvBackendRequest::Explicit(hipfire_runtime::kv_backend::KvBackend::Vmm),
-            "gfx1100", &mut active, &mut effects,
-        ).unwrap_err();
+            &candidate,
+            1,
+            admission::KvBackendRequest::Explicit(hipfire_runtime::kv_backend::KvBackend::Vmm),
+            "gfx1100",
+            &mut active,
+            &mut effects,
+        )
+        .unwrap_err();
         assert!(refusal.contains("vmm") && refusal.contains("unsupported"));
         assert_eq!(effects, LoadEffects::default());
         assert_eq!(active.request(), before);

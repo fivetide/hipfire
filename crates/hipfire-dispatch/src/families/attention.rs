@@ -2163,7 +2163,8 @@ fn dispatch_attend(
                     && (64..=8192).contains(&io.batch_size)
                     && (io.batch_size <= 512 || io.batch_size % 512 == 0)
                     && gpu.fa2_gfx11_ctx_admitted(io.max_ctx_len)
-                    && io.max_ctx_len
+                    && io
+                        .max_ctx_len
                         .checked_mul(4 * (256 / 32) * 34)
                         .is_some_and(|bytes| {
                             io.k_cache.buf.size() >= bytes && io.v_cache.buf.size() >= bytes
