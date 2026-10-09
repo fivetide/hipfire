@@ -141,8 +141,15 @@ def parse_cargo(text):
     return {"summaries": "test result:" in text, "passed": sum(p for p, _ in counts),
             "failed": sum(f for _, f in counts)}
 
+# Ignored GPU tests `return` early (and count as passed) when a fixture, GPU or
+# env selector is missing; their skip line is only visible under --nocapture.
+SKIP_RE = re.compile(r"(?im)^\s*(?:skip(?:ped)?:|=== SKIP ===).*$|^.*; skipping\b.*$")
+
 def eval_cargo(text, minimum):
     s = parse_cargo(text)
+    skip = SKIP_RE.search(text)
+    if skip:
+        return False, "cargo: vacuous skip: %s" % skip.group(0).strip()[:200]
     return (s["summaries"] and not s["failed"] and s["passed"] >= minimum,
             "cargo: passed=%d failed=%d min=%d" % (s["passed"], s["failed"], minimum))
 
@@ -475,6 +482,8 @@ def exec_probe(ctx, cmd, timeout):
     first = os.path.basename(argv[0])
     if first not in ("cargo", "python3") and argv[0] != ctx["cli_bin"]:
         return {"skipped": "display-only; covered by session driver"}
+    if first == "cargo" and "--ignored" in argv and "--nocapture" not in argv:
+        argv.append("--nocapture")  # surface skip lines to eval_cargo
     res = run_cmd(argv, dict(ctx["row_env"], **env_extra), timeout)
     idx = argv.index("--out") if "--out" in argv else -1
     res["out_path"] = argv[idx + 1] if 0 <= idx < len(argv) - 1 else None
@@ -700,6 +709,10 @@ def self_test():
     check("cargo-min-bound", not eval_cargo(SAMPLE_CARGO_PASS, 6)[0])
     check("cargo-fail", not eval_cargo(SAMPLE_CARGO_FAIL, 1)[0])
     check("cargo-no-summary", not eval_cargo("nothing here", 1)[0])
+    check("cargo-vacuous-skip-fails",
+          not eval_cargo("skip: HIPFIRE_DFLASH_DRAFT unset\n" + SAMPLE_CARGO_PASS, 1)[0])
+    check("cargo-oracle-skipping-fails",
+          not eval_cargo("g3-oracle: fixture absent (/x.hf4); skipping\n" + SAMPLE_CARGO_PASS, 1)[0])
     check("cargo-not-bare-ok", parse_cargo("all ok folks")["passed"] == 0)
     check("serve-clean", eval_serve_rows(SAMPLE_SERVE_CLEAN, True)[0])
     check("serve-dirty-fails", not eval_serve_rows(SAMPLE_SERVE_DIRTY, True)[0])
