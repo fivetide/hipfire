@@ -99,15 +99,16 @@ pub fn stage_continuous_batch(
 ) -> Result<BatchStaging, String> {
     let mut out = BatchStaging::default();
     if let Some(req) = vmm {
-        if requested > 1
-            && m.pp == 1
-            && m.ep.is_none()
-            && matches!(
-                crate::continuous_batch_route(m.arch_id),
-                Some(crate::ContinuousBatchRoute::Qwen35)
-            )
-        {
-            return Ok(stage_qwen_vmm_batch(m, gpu, requested, req));
+        if requested > 1 && m.pp == 1 && m.ep.is_none() {
+            match crate::continuous_batch_route(m.arch_id) {
+                Some(crate::ContinuousBatchRoute::Qwen35) => {
+                    return Ok(stage_qwen_vmm_batch(m, gpu, requested, req));
+                }
+                Some(crate::ContinuousBatchRoute::Qwen4) => {
+                    return Ok(stage_qwen4_lanes(m, gpu, requested, req));
+                }
+                _ => {}
+            }
         }
         eprintln!(
             "[daemon] VMM continuous batch requested but unsupported (arch_id={} pp={} ep={}) — existing route",
@@ -197,6 +198,12 @@ pub fn stage_continuous_batch(
                 } else {
                     eprintln!("[daemon] continuous batch requested but model state not Qwen35 — fallback to sequential");
                 }
+            }
+            Some(crate::ContinuousBatchRoute::Qwen4) => {
+                // The only qwen4 batch route is the exact fn-lanes store,
+                // staged through the VMM branch above; there is no
+                // fixed-lane qwen4 batch state.
+                eprintln!("[daemon] qwen4 lanes need serve.vmm_batch — fallback to sequential");
             }
             Some(crate::ContinuousBatchRoute::Lfm2Moe) => {
                 if m.lfm2moe().is_none() {
@@ -500,6 +507,82 @@ pub fn stage_continuous_batch(
         }
     }
     Ok(out)
+}
+
+/// Stage the exact Flash-Next (qwen4) AR lane store beside the resident
+/// bundle. Qwen4 has only the exact route: the non-exact `VmmRoute` and any
+/// non-VMM QSA backend are refused, as is a lane store that does not fit the
+/// free device memory. Every refusal logs the reason and keeps the singleton
+/// route (`capable == false`); nothing is staged.
+fn stage_qwen4_lanes(
+    m: &mut LoadedModel,
+    gpu: &mut Gpu,
+    requested: usize,
+    req: VmmStagingRequest,
+) -> BatchStaging {
+    use hipfire_arch_qwen4::lane::Qwen4LaneStore;
+    use hipfire_arch_qwen4::{Qwen4ContextCommit, Qwen4KvBackend};
+    let refuse = |reason: &str| {
+        eprintln!("[daemon] qwen4 lanes refused: {reason} — fallback to sequential");
+        BatchStaging::default()
+    };
+    if req.route == hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Nonexact {
+        return refuse("qwen4 has only the exact lane route");
+    }
+    let max_seq = m.max_seq;
+    let Some(bundle) = m.qwen4_mut() else {
+        return refuse("model state not Qwen4");
+    };
+    if bundle.state.qsa_backend() != Qwen4KvBackend::Vmm {
+        return refuse("QSA context backend is not VMM");
+    }
+    let row_budget = req.row_budget.max(requested);
+    let chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu.arch, max_seq);
+    let context = Qwen4ContextCommit::new(
+        Qwen4KvBackend::Vmm,
+        max_seq,
+        chunk,
+        gpu.vmm_recommended_granularity().unwrap_or(1),
+    );
+    let Some(need) = Qwen4LaneStore::device_bytes(
+        &bundle.config,
+        bundle.state_format(),
+        &context,
+        requested,
+        row_budget,
+    ) else {
+        return refuse("lane store device bytes overflow");
+    };
+    let free = match gpu.device_mem_info() {
+        Ok((free, _)) => free as u64,
+        Err(e) => return refuse(&format!("device memory query failed: {e}")),
+    };
+    if need > free {
+        return refuse(&format!(
+            "lane store needs {} MiB, {} MiB free (lanes={requested} row_budget={row_budget})",
+            need >> 20,
+            free >> 20
+        ));
+    }
+    if let Err(e) = bundle.stage_lanes(gpu, requested, row_budget) {
+        return refuse(&format!("staging failed: {e}"));
+    }
+    let Some(store) = bundle.lanes() else {
+        return refuse("lane store missing after staging");
+    };
+    eprintln!(
+        "[daemon] qwen4 fn-lanes staged: lanes={requested} row_budget={} policy={}",
+        store.row_budget(),
+        store.stage_policy().describe()
+    );
+    BatchStaging {
+        capable: true,
+        slots: requested,
+        vmm: true,
+        row_budget: store.row_budget(),
+        lane_capacity: max_seq,
+        ..Default::default()
+    }
 }
 
 /// Stage the VMM continuous-batching store beside the resident Qwen35

@@ -510,6 +510,45 @@ python3 scripts/serve_harness.py --model ~/.hipfire/models/<file> --tag qwen3.5:
 No-GPU CI (`.github/workflows/no-gpu-ci.yml` → `scripts/no-gpu-ci.sh`) never
 certifies GPU serve, model coherence, or throughput.
 
+## Flash-Next exact lane batching (qwen4, arch 16)
+
+Concurrent Qwen3.8 Flash-Next requests can share one trunk step on the exact
+**fn-lanes** route: each admitted request owns a lane (its own request state:
+QSA K/V, GDN recurrent state, PLE history) over the one resident weight set,
+and every committed token and state byte per request is identical to that
+request run alone on the singleton route. **Default off, experimental.**
+
+- **Enable:** `serve.vmm_batch = true` (`HIPFIRE_SERVE_VMM_BATCH=1`) **and**
+  `serve.continuous_batch_size >= 2` (`HIPFIRE_CONTINUOUS_BATCH_SIZE`); the
+  row budget per step is `serve.max_batch_tokens`. The QSA context backend must
+  be VMM and the lane store must fit the free device memory; otherwise the
+  load logs `[daemon] qwen4 lanes refused: <reason> — fallback to sequential`
+  and serves the singleton route exactly as before. With
+  `continuous_batch_size >= 2` but `serve.vmm_batch` off the load logs
+  `[daemon] qwen4 lanes need serve.vmm_batch — fallback to sequential` and
+  advertises `continuous_batch_capable: false`.
+- **Kill switch:** `HIPFIRE_SERVE_VMM_BATCH=0` (the compatibility spelling of
+  `serve.vmm_batch = false`) stages no lane store and restores today's serial
+  behavior.
+- **Eligible requests:** greedy decoding, plain text chat only — no tools,
+  images, logprobs or penalties. Ineligible requests keep the singleton route.
+- **Singleton when alone:** a request that is alone at dispatch runs the
+  unchanged singleton route (including native MTP).
+- **AR lanes only:** lanes decode one token per step. There are no MTP lanes
+  yet, and no per-lane session cache, parking or promotion.
+- **Exact per request:** stateful stages (PLE conv, GDN core, QSA core) run per
+  lane on the lane's own state; a row-local stage runs once over all lanes'
+  rows only where the G0 byte-identity oracle admitted it, otherwise per lane.
+
+The loaded ack reports `continuous_batch_route: "fn-lanes"`,
+`continuous_batch_slots`, `continuous_batch_exact: true`,
+`continuous_batch_sampling: "greedy_only"` and the lane-store receipt:
+`fn_lanes_kv_backend`, `fn_lanes_qsa_format`, `fn_lanes_gdn_format`,
+`fn_lanes_ring_rows`, `fn_lanes_max_lanes`, `fn_lanes_row_budget`,
+`fn_lanes_mapped_bytes`, `fn_lanes_stage_policy` (the per-stage sharing
+policy) and `fn_lanes_stage_evidence` (the G0 receipt id for the production
+policy).
+
 ## Multi-process notes
 
 - One listener per bind; second serve on the same host/port exits.

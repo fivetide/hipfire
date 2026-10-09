@@ -2592,7 +2592,7 @@ fn main() {
                                 serde_json::to_string(&card_cap).unwrap(), seq_kv,
                             );
                             let ack = hipfire_generate::batch::vmm_loaded_ack(
-                                ack, &mut m, vmm_batch, staging.slots, staging.row_budget,
+                                ack, &mut m, vmm_batch, staging.slots, staging.row_budget, &gpu,
                             );
                             let _ = writeln!(stdout, "{ack}");
                         }
@@ -3668,7 +3668,11 @@ fn main() {
                     // failing closed. The batch route above still wins when
                     // staged and requested with `serve_continuous_batch`.
                     let vmm_route = hipfire_generate::batch::vmm_route_active(vmm_batch, m);
-                    let batch_eligible = if !singleton_handoff && batch_scheduler.is_some() {
+                    // Qwen4 batches only through its staged fn-lanes route.
+                    let qwen4_batch = hipfire_loader::continuous_batch_route(m.arch_id)
+                        == Some(hipfire_loader::ContinuousBatchRoute::Qwen4);
+                    let qwen4_lanes = qwen4_batch && vmm_route;
+                    let batch_eligible = if !singleton_handoff && batch_scheduler.is_some() && (!qwen4_batch || qwen4_lanes) {
                         hipfire_generate::batch::batch_request_eligible_for_route(
                             vmm_route, &msg, m, continuous_batch_size, serve_continuous_batch, pflash_active, &mut inbox,
                         )
@@ -3686,7 +3690,11 @@ fn main() {
                                 admission,
                             );
                             hipfire_generate::ar::emit_generation_start(
-                                hipfire_generate::ar::GenerationRoute::QwenAr,
+                                if qwen4_lanes {
+                                    hipfire_generate::ar::GenerationRoute::Qwen4Ar
+                                } else {
+                                    hipfire_generate::ar::GenerationRoute::QwenAr
+                                },
                                 &mut stdout,
                                 id,
                                 false,
@@ -3699,7 +3707,13 @@ fn main() {
                         // Render prompt once at admission and store tokens/started flag; do not render twice at lane assignment.
                         let prompt_owned =
                             batch_single_user_content(&msg).unwrap_or_else(|| prompt.to_string());
-                        let (prompt_tokens, started_in_think) = match batch_render_prompt_tokens(
+                        // Qwen4 lanes: the driver renders exactly at assignment (its own
+                        // template path, not the Qwen3.5 batch render); admission defers
+                        // prompt tokens and skips Qwen3.5 length/think validation.
+                        let render = if qwen4_lanes {
+                            Ok((Vec::new(), false))
+                        } else {
+                            batch_render_prompt_tokens(
                             &prompt_owned,
                             system,
                             assistant_prefix,
@@ -3709,7 +3723,8 @@ fn main() {
                             messages_history.as_deref(),
                             enable_thinking_jinja,
                             reasoning_effort_jinja.as_deref(),
-                        ) {
+                        ) };
+                        let (prompt_tokens, started_in_think) = match render {
                             Ok(v) => v,
                             Err(e) => {
                                 emit_batch_admission_error(
@@ -3736,7 +3751,7 @@ fn main() {
                             );
                             // Fall through to sequential generate below (do not enqueue).
                         } else {
-                            if prompt_tokens.is_empty() || prompt_tokens.len() >= m.max_seq {
+                            if !qwen4_lanes && (prompt_tokens.is_empty() || prompt_tokens.len() >= m.max_seq) {
                                 emit_batch_admission_error(
                                     &mut stdout,
                                     id,
@@ -3804,7 +3819,7 @@ fn main() {
                                         &mut inbox,
                                     );
                                     apply_batch_drive_result(drive_res, "[batch]", &mut batch_scheduler, &mut continuous_batch_size, &mut batch_poisoned);
-                                } else if arch == 5 || arch == 6 {
+                                } else if arch == 5 || arch == 6 || qwen4_lanes {
                                     let enq_ok = sched.enqueue(pending);
                                     if !enq_ok {
                                         eprintln!(
@@ -3813,7 +3828,9 @@ fn main() {
                                         );
                                         continue;
                                     }
-                                    {
+                                    // Qwen4 lanes announce `Qwen4Ar` from the driver after
+                                    // its exact render (started_in_think is known only then).
+                                    if !qwen4_lanes {
                                         let _scope = BatchAttemptScope::enter_for_generation(
                                             id,
                                             gen_attempt_id,

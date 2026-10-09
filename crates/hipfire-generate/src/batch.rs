@@ -183,7 +183,7 @@ fn take_singleton_handoff(
 
 /// Retire a think-open lane only after its caller has reset GPU state, then
 /// hand its full original request and exact singleton transaction to main.
-fn handoff_started_in_think(
+pub(crate) fn handoff_started_in_think(
     sched: &mut ContinuousBatchScheduler,
     lane_idx: usize,
     key: &AttemptKey,
@@ -343,6 +343,11 @@ pub fn is_batch_request_eligible(
     };
     let route = select_generation_route(&route_inputs);
     if caps.supports_continuous_batch {
+        // Qwen4 continuous batching is the fn-lanes route only; the fixed
+        // Qwen35 lanes must never take a Qwen4Bundle.
+        if m.qwen4().is_some() {
+            return false;
+        }
         if let Some(bundle) = m.state.as_ref().and_then(|s| {
             (s.as_ref() as &dyn Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()
         }) {
@@ -512,7 +517,7 @@ pub(crate) fn drain_qwen_batch_inbox(
                             let _scope =
                                 BatchAttemptScope::enter_for_generation(&id, attempt_id, admission);
                             crate::ar::emit_generation_start(
-                                crate::ar::GenerationRoute::QwenAr,
+                                route,
                                 stdout,
                                 &id,
                                 false,
@@ -599,17 +604,25 @@ pub(crate) fn drain_qwen_batch_inbox(
                             json.get("thinking_enabled").and_then(|v| v.as_bool());
                         let (batch_enable_thinking, batch_reasoning_effort) =
                             qwen_jinja_reasoning(thinking_enabled, raw_effort, max_think);
-                        let (prompt_tokens, started_in_think) = match batch_render_prompt_tokens(
-                            &prompt_str,
-                            system_str.as_deref(),
-                            assistant_prefix,
-                            tokenizer,
-                            chat_template,
-                            max_think,
-                            batch_messages.as_deref(),
-                            batch_enable_thinking,
-                            batch_reasoning_effort.as_deref(),
-                        ) {
+                        // Qwen4Ar: the lane driver renders the exact qwen4 prompt
+                        // at assignment (its own template/think handling), so the
+                        // shared qwen35 render must neither run nor reject here.
+                        let rendered = if route == GenerationRoute::Qwen4Ar {
+                            Ok((Vec::new(), false))
+                        } else {
+                            batch_render_prompt_tokens(
+                                &prompt_str,
+                                system_str.as_deref(),
+                                assistant_prefix,
+                                tokenizer,
+                                chat_template,
+                                max_think,
+                                batch_messages.as_deref(),
+                                batch_enable_thinking,
+                                batch_reasoning_effort.as_deref(),
+                            )
+                        };
+                        let (prompt_tokens, started_in_think) = match rendered {
                             Ok(v) => v,
                             Err(e) => {
                                 emit_batch_admission_error(
@@ -641,7 +654,11 @@ pub(crate) fn drain_qwen_batch_inbox(
                             barrier = Some(handoff);
                             break;
                         }
-                        if prompt_tokens.is_empty() || prompt_tokens.len() >= sched.lane_capacity {
+                        // Qwen4Ar defers rendering to the lane driver, so the
+                        // prompt-length gate runs there (before store admit).
+                        if route != GenerationRoute::Qwen4Ar
+                            && (prompt_tokens.is_empty() || prompt_tokens.len() >= sched.lane_capacity)
+                        {
                             emit_batch_admission_error(
                                 stdout,
                                 &id,
@@ -2244,11 +2261,12 @@ pub fn is_vmm_batch_request_eligible(
     serve_continuous_batch: bool,
     pflash_active: bool,
 ) -> bool {
-    let staged = m.state.as_ref().is_some_and(|s| {
-        (s.as_ref() as &dyn Any)
-            .downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()
-            .is_some_and(|b| b.vmm_store.is_some())
-    });
+    let staged = qwen4_lanes_staged(m)
+        || m.state.as_ref().is_some_and(|s| {
+            (s.as_ref() as &dyn Any)
+                .downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()
+                .is_some_and(|b| b.vmm_store.is_some())
+        });
     if !staged || !serve_continuous_batch || continuous_batch_size <= 1 {
         return false;
     }
@@ -2279,13 +2297,80 @@ pub fn is_vmm_batch_request_eligible(
     if msg.get("budget_alert_at_tok").is_some() || msg.get("budget_alert_text").is_some() {
         return false;
     }
-    resolve_batch_sampling(msg, m).temp <= 0.0
+    let sampling = resolve_batch_sampling(msg, m);
+    if sampling.temp > 0.0 {
+        return false;
+    }
+    if m.qwen4().is_some() {
+        return qwen4_lane_request_supported(msg, &sampling);
+    }
+    true
 }
 
 /// Daemon: the VMM route serves this model (params parsed at load and
 /// `vmm_store` staged).
 pub fn vmm_route_active(vmm_batch: Option<VmmBatchParams>, m: &LoadedModel) -> bool {
-    vmm_batch.is_some() && m.qwen35().is_some_and(|b| b.vmm_store.is_some())
+    vmm_batch.is_some() && (m.qwen35().is_some_and(|b| b.vmm_store.is_some()) || qwen4_lanes_staged(m))
+}
+
+/// A Qwen4 model whose AR lane store is staged (`Qwen4Bundle::stage_lanes`).
+fn qwen4_lanes_staged(m: &LoadedModel) -> bool {
+    m.qwen4().is_some_and(|b| b.lanes().is_some())
+}
+
+/// Qwen4 lane request gate beyond the shared greedy/text-chat predicate. A
+/// lane commits the greedy argmax only, so everything the singleton sampler
+/// or protocol layers add on top stays sequential: non-neutral resolved
+/// penalties, any tool field other than an absent/empty array (a non-array
+/// value is a validation error the singleton reports), images, and
+/// logprobs.
+fn qwen4_lane_request_supported(
+    msg: &serde_json::Value,
+    sampling: &hipfire_engine::scheduler::BatchSampling,
+) -> bool {
+    use serde_json::Value;
+    let tools_ok = match msg.get("tools") {
+        None => true,
+        Some(Value::Array(a)) => a.is_empty(),
+        Some(_) => false,
+    };
+    let images_ok = msg.get("image").is_none() && msg.get("image_base64").is_none();
+    let logprobs_ok = matches!(msg.get("logprobs"), None | Some(Value::Bool(false)))
+        && matches!(msg.get("top_logprobs"), None | Some(Value::Null))
+        && sampling.repeat_penalty == 1.0
+        && sampling.presence_penalty == 0.0
+        && sampling.frequency_penalty == 0.0;
+    tools_ok && images_ok && logprobs_ok
+}
+
+/// Qwen4 load-ack fields: `fn-lanes` route, exact greedy-only lanes with
+/// speculation off, plus the staged `LaneStoreReceipt`.
+fn qwen4_lane_ack_fields(
+    v: &mut serde_json::Value,
+    r: &hipfire_arch_qwen4::lane::LaneStoreReceipt,
+    slots: usize,
+    row_budget: usize,
+    p: VmmBatchParams,
+) {
+    v["continuous_batch_route"] = serde_json::json!("fn-lanes");
+    v["continuous_batch_slots"] = serde_json::json!(slots);
+    v["continuous_batch_row_budget"] = serde_json::json!(row_budget);
+    v["continuous_batch_row_budget_requested"] = serde_json::json!(p.max_batch_tokens);
+    v["continuous_batch_spec"] = serde_json::json!(false);
+    v["continuous_batch_spec_mode"] = serde_json::json!("off");
+    v["continuous_batch_spec_requested"] = serde_json::json!(p.spec);
+    v["continuous_batch_nonexact"] = serde_json::json!(false);
+    v["continuous_batch_exact"] = serde_json::json!(true);
+    v["continuous_batch_sampling"] = serde_json::json!("greedy_only");
+    v["fn_lanes_kv_backend"] = serde_json::json!(r.kv_backend);
+    v["fn_lanes_qsa_format"] = serde_json::json!(r.qsa_format);
+    v["fn_lanes_gdn_format"] = serde_json::json!(r.gdn_format);
+    v["fn_lanes_ring_rows"] = serde_json::json!(r.ring_rows);
+    v["fn_lanes_max_lanes"] = serde_json::json!(r.max_lanes);
+    v["fn_lanes_row_budget"] = serde_json::json!(r.row_budget);
+    v["fn_lanes_mapped_bytes"] = serde_json::json!(r.mapped_bytes);
+    v["fn_lanes_stage_policy"] = serde_json::json!(r.stage_policy);
+    v["fn_lanes_stage_evidence"] = serde_json::json!(r.stage_evidence);
 }
 
 /// Daemon load: the loader's VMM staging request for the parsed
@@ -2306,17 +2391,31 @@ pub fn vmm_staging_request(
 
 /// Daemon load ack: on the VMM batch route (`vmm_batch` Some) append the
 /// actual per-request owner receipt. Absent on every other route, so the
-/// flag-off ack is returned unchanged.
+/// flag-off ack is returned unchanged. A Qwen4 model reports the `fn-lanes`
+/// route with the staged `LaneStoreReceipt` (read through `gpu`); an
+/// unstaged Qwen4 model leaves the ack unchanged.
 pub fn vmm_loaded_ack(
     ack: String,
     m: &mut LoadedModel,
     vmm_batch: Option<VmmBatchParams>,
     slots: usize,
     row_budget: usize,
+    gpu: &rdna_compute::Gpu,
 ) -> String {
     let Some(p) = vmm_batch else {
         return ack;
     };
+    if m.qwen4().is_some() {
+        let Some(store) = m.qwen4().and_then(|b| b.lanes()) else {
+            return ack;
+        };
+        let receipt = store.receipt(gpu);
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&ack) else {
+            return ack;
+        };
+        qwen4_lane_ack_fields(&mut v, &receipt, slots, row_budget, p);
+        return v.to_string();
+    }
     let (receipt, spec_mode, dflash_receipt) = match m.qwen35_mut().and_then(|b| b.vmm_store.as_mut()) {
         Some(s) => {
             let mode = vmm_store_spec_mode(s);
@@ -2387,8 +2486,9 @@ pub fn batch_request_eligible_for_route(
     }
 }
 
-/// Daemon: drive the staged batch scheduler — the VMM driver when
-/// `vmm_batch` is Some, else the fixed-lane Qwen driver.
+/// Daemon: drive the staged batch scheduler — the Qwen4 lane driver on a
+/// Qwen4 model, else the VMM driver when `vmm_batch` is Some, else the
+/// fixed-lane Qwen driver (which never serves Qwen4).
 pub fn drive_staged_continuous_batch(
     sched: &mut ContinuousBatchScheduler,
     gpu: &mut rdna_compute::Gpu,
@@ -2397,6 +2497,16 @@ pub fn drive_staged_continuous_batch(
     stdout: &mut std::io::Stdout,
     inbox: &mut DaemonInbox,
 ) -> Result<(), BatchDriveError> {
+    if m.qwen4().is_some() {
+        return match vmm_batch {
+            Some(params) => {
+                crate::fn_batch::drive_qwen4_lane_batch(sched, gpu, m, params, stdout, inbox)
+            }
+            None => Err(BatchDriveError::Gpu(
+                "Qwen4 continuous batch requires the fn-lanes route (serve.vmm_batch)".to_string(),
+            )),
+        };
+    }
     match vmm_batch {
         Some(params) => drive_qwen_vmm_continuous_batch(sched, gpu, m, params, stdout, inbox, None),
         None => drive_qwen_continuous_batch(sched, gpu, m, stdout, inbox),
@@ -2421,7 +2531,9 @@ pub fn arm_promotion(
     client_seed: Option<u64>,
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
 ) {
+    // Qwen4 never promotes: its lane store has no singleton hand-off.
     let permit = (armed
+        && m.qwen4().is_none()
         && is_vmm_batch_request_eligible(msg, m, continuous_batch_size, serve_continuous_batch, pflash_active))
     .then(|| PromotionPermit {
         original_msg: msg.clone(),
@@ -2452,6 +2564,11 @@ pub fn drive_promoted(
     inbox: &mut DaemonInbox,
 ) -> Option<Result<(), BatchDriveError>> {
     set_promotion_permit(None);
+    // Qwen4 lanes have no singleton→lane promotion and no qwen35 prefix-pool
+    // parking (per-lane session cache is out of scope for AR lanes).
+    if m.qwen4().is_some() {
+        return None;
+    }
     let Some(promoted) = take_promoted() else {
         if vmm_batch.is_some() {
             crate::vmm_conv::park_resident(m, gpu);
@@ -6540,6 +6657,91 @@ mod tests {
     use super::*;
     fn lock() -> std::sync::MutexGuard<'static, ()> {
         crate::ar::generation_test_lock()
+    }
+
+    fn qwen4_neutral_sampling() -> hipfire_engine::scheduler::BatchSampling {
+        hipfire_engine::scheduler::BatchSampling {
+            temp: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            min_p: None,
+            repeat_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            repeat_window: 64,
+        }
+    }
+
+    #[test]
+    fn qwen4_lane_ack_reports_fn_lanes_route_and_receipt() {
+        let receipt = hipfire_arch_qwen4::lane::LaneStoreReceipt {
+            kv_backend: "vmm",
+            qsa_format: "q8",
+            gdn_format: "f32",
+            ring_rows: 16,
+            max_lanes: 4,
+            row_budget: 32,
+            mapped_bytes: 123_456,
+            stage_policy: "embed=once,argmax=once".to_string(),
+            stage_evidence: "g0-receipt",
+        };
+        let mut v = serde_json::json!({"type": "loaded"});
+        let params = VmmBatchParams {
+            spec: true,
+            nonexact: false,
+            max_batch_tokens: 4096,
+            prefill_min_tokens: 1,
+        };
+        qwen4_lane_ack_fields(&mut v, &receipt, 4, 32, params);
+        assert_eq!(v["continuous_batch_route"], "fn-lanes");
+        assert_eq!(v["continuous_batch_slots"], 4);
+        assert_eq!(v["continuous_batch_row_budget"], 32);
+        assert_eq!(v["continuous_batch_row_budget_requested"], 4096);
+        assert_eq!(v["continuous_batch_spec"], false);
+        assert_eq!(v["continuous_batch_spec_mode"], "off");
+        assert_eq!(v["continuous_batch_spec_requested"], true);
+        assert_eq!(v["continuous_batch_exact"], true);
+        assert_eq!(v["continuous_batch_nonexact"], false);
+        assert_eq!(v["continuous_batch_sampling"], "greedy_only");
+        assert_eq!(v["fn_lanes_kv_backend"], "vmm");
+        assert_eq!(v["fn_lanes_qsa_format"], "q8");
+        assert_eq!(v["fn_lanes_gdn_format"], "f32");
+        assert_eq!(v["fn_lanes_ring_rows"], 16);
+        assert_eq!(v["fn_lanes_max_lanes"], 4);
+        assert_eq!(v["fn_lanes_row_budget"], 32);
+        assert_eq!(v["fn_lanes_mapped_bytes"], 123_456);
+        assert_eq!(v["fn_lanes_stage_policy"], "embed=once,argmax=once");
+        assert_eq!(v["fn_lanes_stage_evidence"], "g0-receipt");
+    }
+
+    #[test]
+    fn qwen4_lane_request_gate_refuses_penalties_tools_images_logprobs() {
+        use serde_json::json;
+        let neutral = qwen4_neutral_sampling();
+        assert!(qwen4_lane_request_supported(&json!({}), &neutral));
+        assert!(qwen4_lane_request_supported(&json!({"tools": []}), &neutral));
+        assert!(qwen4_lane_request_supported(&json!({"logprobs": false}), &neutral));
+
+        let penalized = [
+            hipfire_engine::scheduler::BatchSampling { repeat_penalty: 1.1, ..neutral.clone() },
+            hipfire_engine::scheduler::BatchSampling { presence_penalty: 0.5, ..neutral.clone() },
+            hipfire_engine::scheduler::BatchSampling { frequency_penalty: -0.5, ..neutral.clone() },
+        ];
+        for s in &penalized {
+            assert!(!qwen4_lane_request_supported(&json!({}), s), "{s:?}");
+        }
+        for refused in [
+            json!({"tools": [{"type": "function"}]}),
+            json!({"tools": {"type": "function"}}),
+            json!({"tools": "none"}),
+            json!({"tools": null}),
+            json!({"image": "x"}),
+            json!({"image_base64": "x"}),
+            json!({"logprobs": true}),
+            json!({"top_logprobs": 2}),
+        ] {
+            assert!(!qwen4_lane_request_supported(&refused, &neutral), "{refused}");
+        }
     }
 
     #[test]

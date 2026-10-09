@@ -237,15 +237,19 @@ pub fn carrier_for(arch_id: u32) -> Option<&'static dyn Carrier> {
 pub enum ContinuousBatchRoute {
     Qwen35,
     Lfm2Moe,
+    /// Flash-Next (qwen4, arch 16) exact AR lanes. Staged only through the
+    /// VMM branch (`serve.vmm_batch`); there is no fixed-lane qwen4 body.
+    Qwen4,
 }
-/// Exact arch_id -> continuous-batch route. Only qwen35 5|6 admits: LFM2 (11)
-/// has no servable batch path (see the lfm2moe carrier caps), so the route
-/// refuses it and no batch state is ever allocated. No carrier probing — pure
-/// id match. `ContinuousBatchRoute::Lfm2Moe` stays for the staging body, which
-/// is now unreachable.
+/// Exact arch_id -> continuous-batch route. qwen35 5|6 and qwen4 16 admit:
+/// LFM2 (11) has no servable batch path (see the lfm2moe carrier caps), so
+/// the route refuses it and no batch state is ever allocated. No carrier
+/// probing — pure id match. `ContinuousBatchRoute::Lfm2Moe` stays for the
+/// staging body, which is now unreachable.
 pub fn continuous_batch_route(arch_id: u32) -> Option<ContinuousBatchRoute> {
     match arch_id {
         5 | 6 => Some(ContinuousBatchRoute::Qwen35),
+        16 => Some(ContinuousBatchRoute::Qwen4),
         _ => None,
     }
 }
@@ -5154,6 +5158,18 @@ mod lfm2_batch_admission_tests {
                 .caps()
                 .supports_continuous_batch
         );
+        // qwen4 (16) admits the exact fn-lanes route, staged only under
+        // `serve.vmm_batch`.
+        assert_eq!(
+            continuous_batch_route(16),
+            Some(super::ContinuousBatchRoute::Qwen4)
+        );
+        assert!(
+            carrier_for(16)
+                .expect("qwen4 carrier")
+                .caps()
+                .supports_continuous_batch
+        );
     }
 }
 
@@ -5543,12 +5559,13 @@ mod registry_tests {
             }
         );
 
-        // ── continuous_batch_route: 5|6 -> Qwen35 only (11/LFM2 refuses) ──
+        // ── continuous_batch_route: 5|6 -> Qwen35, 16 -> Qwen4 (11/LFM2 refuses) ──
         // The Some/None half duplicates caps().supports_continuous_batch; the
-        // variant picks between two distinct staging bodies in batch_staging.
-        for id in 0u32..=14 {
+        // variant picks between distinct staging bodies in batch_staging.
+        for id in 0u32..=22 {
             let want = match id {
                 5 | 6 => Some(ContinuousBatchRoute::Qwen35),
+                16 => Some(ContinuousBatchRoute::Qwen4),
                 _ => None,
             };
             assert_eq!(

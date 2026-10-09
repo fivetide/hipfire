@@ -339,7 +339,10 @@ impl Carrier for Qwen4Carrier {
 
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
-            supports_continuous_batch: false,
+            // The only qwen4 batch route is the exact fn-lanes route, staged
+            // under `serve.vmm_batch` (`batch_staging::stage_qwen4_lanes`);
+            // there is no fixed-lane qwen4 batch state.
+            supports_continuous_batch: true,
             supports_ep_batch: false,
             dflash: None,
             supports_mtp: true,
