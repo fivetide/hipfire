@@ -334,7 +334,8 @@ impl Qwen4LaneStore {
             ring_rows: 0,
             format: bundle.state_format(),
             backend: bundle.state.qsa_backend(),
-            policy: LaneStagePolicy::production(),
+            // Shared stages only where G0 evidenced them (gfx1151).
+            policy: LaneStagePolicy::for_arch(&gpu.arch),
             logits,
             top1,
             top1_host: vec![0; rows * std::mem::size_of::<i32>()],

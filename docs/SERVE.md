@@ -539,6 +539,9 @@ request run alone on the singleton route. **Default off, experimental.**
 - **Exact per request:** stateful stages (PLE conv, GDN core, QSA core) run per
   lane on the lane's own state; a row-local stage runs once over all lanes'
   rows only where the G0 byte-identity oracle admitted it, otherwise per lane.
+  On gfx1151 G0 admitted every row-local stage (embedding, HC read/write, the
+  GDN/QSA projections, the MoE, final HC read, head, argmax); other cards run
+  every stage per lane until their own G0 run.
 
 The loaded ack reports `continuous_batch_route: "fn-lanes"`,
 `continuous_batch_slots`, `continuous_batch_exact: true`,

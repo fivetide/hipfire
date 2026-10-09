@@ -194,30 +194,41 @@ impl StageShare {
 /// (MQ6 / Q8 / BF16 row GEMVs, the Q8 decode copies) switch above 8 rows.
 pub const LANE_MAX_ROWS: usize = 8;
 
-/// Production share policy. Every row-local stage is per lane until the G0
-/// oracle proves its once-over-all-rows launch byte-identical per row
-/// (S0: the few-row forward is not bitwise at any N ≥ 2).
+/// Production share policy, from the G0 oracle on gfx1151 ([`STAGE_EVIDENCE`]):
+/// every row-local stage — embedding, PLE rows, HC read/write, the GDN/QSA
+/// projections, the sealed MoE (the grouped few-row route over ≤ 8 AR rows is
+/// byte-identical per row to the one-row indexed decode), final HC read, head
+/// and argmax — produced the per-lane bytes once over all rows; the stateful
+/// cores stay per lane. S0's chunk-vs-singles mismatch therefore lives in the
+/// multi-row GDN/QSA cores of consecutive positions, which a lane never runs.
 pub const STAGE_SHARE: [(StageName, StageShare); 15] = [
-    (StageName::Embed, StageShare::PerLane),
-    (StageName::PleRows, StageShare::PerLane),
-    (StageName::HcRead, StageShare::PerLane),
-    (StageName::HcWrite, StageShare::PerLane),
+    (StageName::Embed, StageShare::OnceAllRows),
+    (StageName::PleRows, StageShare::OnceAllRows),
+    (StageName::HcRead, StageShare::OnceAllRows),
+    (StageName::HcWrite, StageShare::OnceAllRows),
     (StageName::PleConv, StageShare::PerLane),
-    (StageName::GdnInProj, StageShare::PerLane),
+    (StageName::GdnInProj, StageShare::OnceAllRows),
     (StageName::GdnCore, StageShare::PerLane),
-    (StageName::GdnOutProj, StageShare::PerLane),
-    (StageName::QsaInProj, StageShare::PerLane),
+    (StageName::GdnOutProj, StageShare::OnceAllRows),
+    (StageName::QsaInProj, StageShare::OnceAllRows),
     (StageName::QsaCore, StageShare::PerLane),
-    (StageName::QsaOutProj, StageShare::PerLane),
-    (StageName::Moe, StageShare::PerLane),
-    (StageName::FinalHyper, StageShare::PerLane),
-    (StageName::Head, StageShare::PerLane),
-    (StageName::Argmax, StageShare::PerLane),
+    (StageName::QsaOutProj, StageShare::OnceAllRows),
+    (StageName::Moe, StageShare::OnceAllRows),
+    (StageName::FinalHyper, StageShare::OnceAllRows),
+    (StageName::Head, StageShare::OnceAllRows),
+    (StageName::Argmax, StageShare::OnceAllRows),
 ];
 
-/// G0 oracle receipt behind [`STAGE_SHARE`]; empty while every stage is per
-/// lane (exact by construction, nothing to evidence).
-pub const STAGE_EVIDENCE: &str = "";
+/// G0 oracle receipt behind [`STAGE_SHARE`] (`fn-batch/S3-RESULT.md`): each
+/// row-local stage flipped alone at k=2 and k=8, then the combined policy at
+/// k=1/2/8, contexts 512/2048, per-step logits, ids and full state bytes
+/// identical to the singleton.
+pub const STAGE_EVIDENCE: &str = "g0 fn-batch-s3/j2-g0 2026-10-09 gfx1151";
+
+/// The only architecture [`STAGE_EVIDENCE`] covers. Other cards bind other
+/// kernels (no Q8_0 decode copies on gfx1201) and keep every stage per lane
+/// until their own G0 run.
+pub const STAGE_EVIDENCE_ARCH: &str = "gfx1151";
 
 /// One share per [`StageName`], indexed in [`StageName::ALL`] order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -226,6 +237,16 @@ pub struct LaneStagePolicy {
 }
 
 impl LaneStagePolicy {
+    /// [`Self::production`] on the evidenced architecture, else every stage
+    /// per lane.
+    pub fn for_arch(arch: &str) -> Self {
+        if arch == STAGE_EVIDENCE_ARCH {
+            Self::production()
+        } else {
+            Self::all_per_lane()
+        }
+    }
+
     pub fn production() -> Self {
         let mut shares = [StageShare::PerLane; 15];
         for (stage, share) in STAGE_SHARE {
