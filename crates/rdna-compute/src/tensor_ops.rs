@@ -7632,8 +7632,30 @@ mod tests {
         )
         .expect("index-key write");
 
+        // The incremental pool at a large capacity: `first_block` is declared
+        // and the grid is `ceil(rows / compress)`, not the capacity.
+        let inc_rows = 3usize;
+        let inc_start = blocks * compress - inc_rows;
+        indexed_attention_pool_rope_incremental(
+            &mut gpu,
+            &IndexedAttentionPoolRope {
+                raw_keys: &raw_gpu,
+                pooled: &pooled_gpu,
+                norm: None,
+                block_count: blocks,
+                compress,
+                index_dim,
+                position: Some(QsaPositionBinding {
+                    position_start: inc_start,
+                    rows: inc_rows,
+                }),
+                grid_bound: 65_536,
+            },
+        )
+        .expect("incremental QSA pool/RoPE");
+
         let launches = gpu.replay.recorded_launches();
-        assert_eq!(launches.len(), 4, "the recorded QSA sequence changed");
+        assert_eq!(launches.len(), 5, "the recorded QSA sequence changed");
 
         // The declared slot must hold the value this very launch used.
         let check = |launch: &crate::replay::RecordedHipLaunch,
@@ -7742,6 +7764,37 @@ mod tests {
             "index-key write must declare `position * index_kv_width`"
         );
         check(&launches[3], copy_mul, dco as u32, "index-key row offset");
+
+        let inc = &launches[4];
+        assert_eq!(
+            inc.grid[0],
+            inc_rows.div_ceil(compress) as u32,
+            "incremental pool grid must be ceil(rows / compress), not the capacity"
+        );
+        assert!(
+            inc.grid_binding.is_none(),
+            "incremental pool grid must be constant"
+        );
+        check(
+            inc,
+            crate::replay::ReplayKernargBinding::PositionDivU32 {
+                offset: 24,
+                addend: inc_rows as u32,
+                divisor: compress as u32,
+            },
+            blocks as u32,
+            "incremental pool block count",
+        );
+        check(
+            inc,
+            crate::replay::ReplayKernargBinding::PositionDivU32 {
+                offset: 36,
+                addend: 0,
+                divisor: compress as u32,
+            },
+            (inc_start / compress) as u32,
+            "incremental pool first block",
+        );
 
         gpu.free_tensor(raw_gpu).expect("free raw");
         gpu.free_tensor(pooled_gpu).expect("free pooled");
