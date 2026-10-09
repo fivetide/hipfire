@@ -4014,11 +4014,7 @@ fn indexed_attention_pool_rope_impl(
     // `blockIdx.x` by it), so its grid depends on `rows` only: constant across
     // replayed positions, with `first_block` arriving as a declared kernarg.
     let grid_x = match (incremental, p.position) {
-        (true, Some(position)) => position
-            .rows
-            .div_ceil(p.compress)
-            .max(1)
-            .min(p.grid_bound),
+        (true, Some(position)) => position.rows.div_ceil(p.compress).max(1).min(p.grid_bound),
         _ => p.grid_bound,
     };
     let block_grid = checked_u32(grid_x, "QSA pool/RoPE block grid")?;
@@ -8368,7 +8364,13 @@ mod tests {
             (159, 1),
             (160, 3),
         ] {
-            let inc = inc_pool(&mut gpu, Some(QsaPositionBinding { position_start, rows }));
+            let inc = inc_pool(
+                &mut gpu,
+                Some(QsaPositionBinding {
+                    position_start,
+                    rows,
+                }),
+            );
             let split = position_start / compress * index_dim;
             assert!(
                 inc[..split].iter().all(|v| *v == -7.5),
