@@ -322,38 +322,78 @@ fn restored_prefill_matches_cold_on_flash_next() {
     bundle.free_gpu(&mut gpu).expect("free bundle");
 }
 
-/// Snapshots demoted to the disk tier by unload restore into a second load
-/// of the model (new per-process model ids, same build) byte-equal to a cold
-/// prefill.
+const DISK_WRITE_PHASE: &str = "HIPFIRE_SESSION_CACHE_DISK_WRITE_PHASE";
+
+fn snap_files(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter(|e| {
+                    e.as_ref()
+                        .is_ok_and(|e| e.path().extension() == Some("snap".as_ref()))
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Snapshots demoted to the disk tier at unload restore in a new process (a
+/// daemon restart of the same build) byte-equal to a cold prefill. The write
+/// phase runs in a child process: one process cannot load the model twice,
+/// because unloading does not return the weight memory to the system.
 #[test]
 #[ignore = "needs a HIP GPU and HIPFIRE_SESSION_CACHE_MODEL"]
-fn disk_snapshots_restore_after_reload_on_flash_next() {
+fn disk_snapshots_restore_after_restart_on_flash_next() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("qwen4-session-disk");
-    let _ = std::fs::remove_dir_all(&dir);
     let Loaded {
         mut bundle,
         mut gpu,
         vocab,
         ..
-    } = load(false, Some(&dir));
+    } = if std::env::var_os(DISK_WRITE_PHASE).is_some() {
+        // Child: prefill A, then unload, which demotes its three snapshots.
+        let mut loaded = load(false, Some(&dir));
+        let chunk = loaded.bundle.spec_chunk_rows().expect("chunk rows");
+        let a = prompt(0xa, 3 * chunk + 300);
+        let logits = loaded
+            .gpu
+            .zeros(&[loaded.vocab], DType::F32)
+            .expect("logits");
+        run(&mut loaded.bundle, &mut loaded.gpu, &logits, &a, 0);
+        loaded.gpu.free_tensor(logits).expect("free logits");
+        loaded
+            .bundle
+            .free_gpu(&mut loaded.gpu)
+            .expect("free bundle");
+        return;
+    } else {
+        let _ = std::fs::remove_dir_all(&dir);
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--ignored",
+                "--exact",
+                "disk_snapshots_restore_after_restart_on_flash_next",
+            ])
+            .args(["--nocapture", "--test-threads", "1"])
+            .env(DISK_WRITE_PHASE, "1")
+            .status()
+            .expect("spawn write phase");
+        assert!(status.success(), "write phase failed: {status}");
+        assert_eq!(
+            snap_files(&dir),
+            3,
+            "unload must demote A's three snapshots"
+        );
+        load(false, Some(&dir))
+    };
     let chunk = bundle.spec_chunk_rows().expect("chunk rows");
     let a = prompt(0xa, 3 * chunk + 300);
-    let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
-    let cold = run(&mut bundle, &mut gpu, &logits, &a, 0);
-    gpu.free_tensor(logits).expect("free logits");
-    // Unload demotes every snapshot and releases the directory lock.
-    bundle.free_gpu(&mut gpu).expect("free bundle");
-    drop(gpu);
-
-    let Loaded {
-        mut bundle,
-        mut gpu,
-        ..
-    } = load(false, Some(&dir));
     let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
     let reused = bundle.session_plan(&a, SessionRoute::Ar);
     assert_eq!(reused, 3 * chunk, "plan must offer A's disk snapshot");
     let (digests, warm_logits, warm_ids) = run(&mut bundle, &mut gpu, &logits, &a, reused);
+    assert_eq!(snap_files(&dir), 0, "restore must promote all three links");
+    let cold = run(&mut bundle, &mut gpu, &logits, &a, 0);
     assert_same_state("disk A", &cold.0, &digests);
     assert!(
         warm_logits == cold.1,
