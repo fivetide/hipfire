@@ -3,12 +3,14 @@
 scripts/device-mesh/matrix.json. Existing harnesses/tests plus thin
 daemon-JSONL drivers for G1/G2 rows. Predicates parse structured output."""
 import argparse
+import collections
 import hashlib
 import json
 import os
 import queue
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -106,12 +108,20 @@ def run_cmd(argv, env_extra, timeout):
     env = isolated_env(env_extra)
     start = time.time()
     try:
-        proc = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=timeout)
-        return {"rc": proc.returncode, "out": proc.stdout + proc.stderr,
-                "stdout": proc.stdout, "elapsed": round(time.time() - start, 1)}
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        rc = 124 if isinstance(exc, subprocess.TimeoutExpired) else 127
-        return {"rc": rc, "out": "%s" % exc, "elapsed": 0.0}
+        # Own session: on timeout the whole tree dies. Killing only `cargo`
+        # orphans the test binary, which keeps the GPU busy for later rows.
+        proc = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, start_new_session=True)
+    except FileNotFoundError as exc:
+        return {"rc": 127, "out": "%s" % exc, "elapsed": 0.0}
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        rc = proc.returncode
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        out, err = proc.communicate()
+        rc, err = 124, "%s\ntimed out after %ss (process group killed)\n" % (err, timeout)
+    return {"rc": rc, "out": out + err, "stdout": out, "elapsed": round(time.time() - start, 1)}
 
 def git_identity(root):
     def git(*args):
@@ -349,6 +359,10 @@ def drive_session(daemon_bin, script, mapping, env, timeout):
         finally:
             lines.put(None)
     threading.Thread(target=pump, daemon=True).start()
+    # An undrained stderr pipe blocks the daemon once ~64 KiB of load/kernel
+    # logging accumulates, which surfaces as an opaque `load: timed out`.
+    err_tail = collections.deque(maxlen=200)
+    threading.Thread(target=lambda: err_tail.extend(proc.stderr), daemon=True).start()
     budgets = {"until": 0.0}
     def read_line(context):
         rest = budgets["until"] - time.time()
@@ -463,6 +477,7 @@ def drive_session(daemon_bin, script, mapping, env, timeout):
         except subprocess.TimeoutExpired:
             proc.kill()
         run["vram_raw"] = best_effort(["rocm-smi", "--showmeminfo", "vram"], 500)
+        run["stderr_tail"] = "".join(list(err_tail))[-4000:]
     return run
 
 def split_env(cmd):
@@ -641,6 +656,7 @@ def execute_row(ctx, row, out, timeout):
     detail["logs"] = save_logs(out, row["id"], "positive", positives)
     broken = next((s["broken"] for s in sessions if s.get("broken")), "")
     if broken:
+        detail["stderr_tail"] = next(s.get("stderr_tail", "") for s in sessions if s.get("broken"))
         return "failed", "session driver: %s" % broken, detail
     detail["probes"] = [{"session": i, "broken": s.get("broken", ""),
                          "texts": [event_text(id_events(s, g))[:200] for g in s.get("generates", [])],
@@ -754,6 +770,14 @@ def self_test():
     check("cargo-fail", not eval_cargo(SAMPLE_CARGO_FAIL, 1)[0])
     check("cargo-no-summary", not eval_cargo("nothing here", 1)[0])
     check("cargo-not-bare-ok", parse_cargo("all ok folks")["passed"] == 0)
+    check("cmd-timeout-kills-tree", run_cmd(["sh", "-c", "sleep 30 & wait"], None, 1)["rc"] == 124)
+    # A daemon that logs >64 KiB to stderr before answering must not stall.
+    chatty = os.path.join(isolated_env(None)["HIPFIRE_HOME"], "chatty-daemon.sh")
+    with open(chatty, "w") as fh:
+        fh.write("#!/bin/sh\nhead -c 300000 /dev/zero | tr '\\0' x >&2\necho '{\"type\":\"loaded\"}'\ncat >/dev/null\n")
+    os.chmod(chatty, 0o755)
+    chatty_run = drive_session(chatty, [{"send": {"type": "load"}, "expect": "loaded"}], {}, {}, 10)
+    check("session-drains-stderr", not chatty_run["broken"] and len(chatty_run["loaded"]) == 1)
     check("serve-clean", eval_serve_rows(SAMPLE_SERVE_CLEAN, True)[0])
     check("serve-dirty-fails", not eval_serve_rows(SAMPLE_SERVE_DIRTY, True)[0])
     check("serve-negative-accounting", eval_serve_rows(SAMPLE_SERVE_DIRTY, False)[0])
