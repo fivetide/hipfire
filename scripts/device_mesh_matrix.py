@@ -571,6 +571,17 @@ def extend_outs(rows, results):
         except (TypeError, OSError, ValueError):
             pass
 
+def save_logs(out, row_id, kind, results):
+    """Receipts keep a 2000-char tail; #666 evidence needs the complete output."""
+    paths = []
+    for i, res in enumerate(r for r in results if isinstance(r, dict) and "out" in r):
+        path = os.path.join(out, "logs", "%s-%s-%d.log" % (row_id, kind, i))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("$ %s\n%s" % (res.get("cmd", ""), res["out"]))
+        paths.append(path)
+    return paths
+
 def run_negatives(ctx, row, mapping, env, timeout):
     pred = row.get("negative_predicate") or {}
     kind = pred.get("kind", "")
@@ -627,6 +638,7 @@ def execute_row(ctx, row, out, timeout):
                 break
     for cmd in row.get("commands", {}).get("positive", []):
         positives += [r for r in [exec_probe(sub, cmd, timeout)] if "skipped" not in r]
+    detail["logs"] = save_logs(out, row["id"], "positive", positives)
     broken = next((s["broken"] for s in sessions if s.get("broken")), "")
     if broken:
         return "failed", "session driver: %s" % broken, detail
@@ -686,7 +698,8 @@ def execute_row(ctx, row, out, timeout):
     if not good:
         return "failed", "positive: %s" % note, detail
     if row.get("negative_session") or row.get("commands", {}).get("negative"):
-        (ngood, nnote), _ = run_negatives(ctx, row, mapping, env, timeout)
+        (ngood, nnote), negatives = run_negatives(ctx, row, mapping, env, timeout)
+        detail["logs"] += save_logs(out, row["id"], "negative", negatives)
         detail["negative_note"] = nnote
         if not ngood:
             return "failed", "negative: %s" % nnote, detail
