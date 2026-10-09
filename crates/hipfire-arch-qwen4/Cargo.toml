@@ -45,6 +45,10 @@ required-features = ["lab"]
 name = "qwen4_rows"
 required-features = ["lab"]
 
+[[example]]
+name = "fn_lane_oracle"
+required-features = ["lab"]
+
 [[test]]
 name = "mtp_takeover_fill_hw"
 required-features = ["reference-parity"]

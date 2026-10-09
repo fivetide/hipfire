@@ -235,6 +235,9 @@ pub struct Qwen4Bundle {
     turn_end_token: Option<u32>,
     /// Request-state storage, part of every session snapshot's scope.
     state_format: Qwen4StateFormat,
+    /// Exact AR lane store of the Flash-Next batch route (`stage_lanes`);
+    /// `None` = not staged. Lane steps never touch `state` or `mtp`.
+    pub(crate) lanes: Option<crate::lane::Qwen4LaneStore>,
 }
 
 /// `HIPFIRE_QWEN4_PENALTY_PREPASS=0` keeps a penalized request's repeat /
@@ -550,6 +553,7 @@ impl Qwen4Bundle {
             turn_snapshots: hipfire_config::developer_bool(TURN_SNAPSHOTS_ENV, false),
             turn_end_token: None,
             state_format,
+            lanes: None,
         })
     }
 
@@ -1946,6 +1950,194 @@ impl Qwen4Bundle {
         Ok(())
     }
 
+    /// Request-state storage formats of the resident (and every lane) state.
+    pub fn state_format(&self) -> Qwen4StateFormat {
+        self.state_format
+    }
+
+    /// Stage the exact AR lane store: `max_lanes` request owners, at most
+    /// `row_budget` AR rows per step. Lane states are allocated on first
+    /// admission into a slot.
+    pub fn stage_lanes(
+        &mut self,
+        gpu: &mut Gpu,
+        max_lanes: usize,
+        row_budget: usize,
+    ) -> Result<(), BundleError> {
+        if self.lanes.is_some() {
+            return Err(BundleError::Forward("Qwen4 lanes are already staged".to_string()));
+        }
+        if self.execution.is_none() {
+            return Err(BundleError::Forward(
+                "Qwen4 lanes need the attached forward".to_string(),
+            ));
+        }
+        let store = crate::lane::Qwen4LaneStore::new(gpu, self, max_lanes, row_budget)
+            .map_err(BundleError::Forward)?;
+        self.lanes = Some(store);
+        Ok(())
+    }
+
+    pub fn lanes(&self) -> Option<&crate::lane::Qwen4LaneStore> {
+        self.lanes.as_ref()
+    }
+
+    pub fn lanes_mut(&mut self) -> Option<&mut crate::lane::Qwen4LaneStore> {
+        self.lanes.as_mut()
+    }
+
+    /// The frozen §4.2 executor over the staged lanes.
+    pub fn lane_executor(&mut self) -> Result<crate::lane_exec::Qwen4LaneExecutor<'_>, BundleError> {
+        if self.lanes.is_none() {
+            return Err(BundleError::Forward("Qwen4 lanes are not staged".to_string()));
+        }
+        Ok(crate::lane_exec::Qwen4LaneExecutor { bundle: self })
+    }
+
+    /// Run `f` on the staged store taken out of the bundle, so it may borrow
+    /// the bundle (weights, formats) while the store is mutated.
+    fn with_lanes<R>(
+        &mut self,
+        f: impl FnOnce(&mut crate::lane::Qwen4LaneStore, &mut Self) -> Result<R, String>,
+    ) -> Result<R, BundleError> {
+        let mut store = self
+            .lanes
+            .take()
+            .ok_or_else(|| BundleError::Forward("Qwen4 lanes are not staged".to_string()))?;
+        let result = f(&mut store, self);
+        self.lanes = Some(store);
+        result.map_err(BundleError::Forward)
+    }
+
+    /// Admit `epoch` with its canonical `prompt` into a free lane; returns
+    /// the lane slot.
+    pub fn admit_lane(
+        &mut self,
+        gpu: &mut Gpu,
+        epoch: hipfire_runtime::slot_batch::RequestEpoch,
+        prompt: Vec<u32>,
+    ) -> Result<usize, BundleError> {
+        self.with_lanes(|store, bundle| store.admit(gpu, bundle, epoch, prompt))
+    }
+
+    /// Free `epoch`'s lane (its device state stays allocated for reuse).
+    pub fn release_lane(
+        &mut self,
+        epoch: &hipfire_runtime::slot_batch::RequestEpoch,
+    ) -> Result<(), BundleError> {
+        self.with_lanes(|store, _| store.release(epoch))
+    }
+
+    /// Mark `epoch`'s lane untrusted: it runs no further step.
+    pub fn poison_lane(&mut self, epoch: &hipfire_runtime::slot_batch::RequestEpoch) {
+        if let Some(store) = self.lanes.as_mut() {
+            store.poison(epoch);
+        }
+    }
+
+    /// Feed `token` as `epoch`'s next AR row instead of its last pick (the
+    /// singleton's think-budget forced close tokens).
+    pub fn force_lane_seed(
+        &mut self,
+        epoch: &hipfire_runtime::slot_batch::RequestEpoch,
+        token: u32,
+    ) -> Result<(), BundleError> {
+        self.with_lanes(|store, _| store.force_seed(epoch, token))
+    }
+
+    /// A fresh lane trunk state: the resident state's formats, QSA backend
+    /// and context bound, allocated through the same constructor.
+    pub(crate) fn new_lane_state(&self, gpu: &mut Gpu) -> Result<Qwen4State, BundleError> {
+        Qwen4State::new_with_backend(
+            gpu,
+            &self.config,
+            self.state.max_seq_len,
+            self.state_format,
+            self.state.qsa_backend(),
+        )
+        .map_err(BundleError::State)
+    }
+
+    pub(crate) fn lane_vocab(&self) -> usize {
+        self.config.vocab_size
+    }
+
+    /// The tile [`Self::prefill_final`] runs next on a cold prefill of
+    /// `prompt` that has forwarded `prefilled` tokens: up to the next session
+    /// boundary (the cache's cold schedule, when one is attached), tiled by
+    /// the forward's `max_chunk` from the segment start.
+    pub fn lane_prefill_tile_len(&self, prompt: &[u32], prefilled: usize) -> usize {
+        let remaining = prompt.len().saturating_sub(prefilled);
+        let Some(max_chunk) = self.spec_chunk_rows() else {
+            return remaining;
+        };
+        // The cold schedule's segments start at 0 and at every boundary; a
+        // segment is tiled by `max_chunk` from its start.
+        let boundaries = if self.session.is_some() {
+            SessionState::snapshot_boundaries(self, prompt, 0, prompt.len())
+        } else {
+            Vec::new()
+        };
+        let segment_start = boundaries
+            .iter()
+            .copied()
+            .filter(|&b| b <= prefilled)
+            .max()
+            .unwrap_or(0);
+        let segment_end = boundaries
+            .iter()
+            .copied()
+            .find(|&b| b > prefilled)
+            .unwrap_or(prompt.len())
+            .min(prompt.len());
+        let tile_end = segment_start
+            + ((prefilled - segment_start) / max_chunk + 1).saturating_mul(max_chunk);
+        tile_end.min(segment_end).saturating_sub(prefilled).min(remaining)
+    }
+
+    /// One prefill tile of a lane: the singleton chunk program
+    /// (`forward_chunk_final` / `forward_chunk_silent`) on `state`. The lane
+    /// state is swapped in for the call only; the session cache stays out
+    /// (lanes keep none) and the forward runs in lane scope, so it never
+    /// records or replays the resident state's retained body. The resident
+    /// state is back in place on every return path.
+    pub(crate) fn lane_prefill_tile(
+        &mut self,
+        gpu: &mut Gpu,
+        state: &mut Qwen4State,
+        tokens: &[u32],
+        final_logits: Option<&GpuTensor>,
+    ) -> Result<(), BundleError> {
+        let mut forward = self.execution.take().ok_or_else(|| {
+            BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+        })?;
+        let session = self.session.take();
+        std::mem::swap(&mut self.state, state);
+        forward.lane_scope = true;
+        // No lookahead names this lane's next rows: never adopt another
+        // request's PLE ticket by accident (ids would have to match exactly,
+        // which keeps bytes identical anyway, but the prefetch is wasted).
+        forward.set_ple_lookahead(&[]);
+        let result = match final_logits {
+            Some(logits) => forward.forward_chunk(
+                self,
+                gpu,
+                tokens,
+                logits,
+                None,
+                None,
+                Qwen4OutputRows::Final,
+            ),
+            None => forward.forward_chunk_silent(self, gpu, tokens, None),
+        }
+        .map_err(|error| BundleError::Forward(error.to_string()));
+        forward.lane_scope = false;
+        std::mem::swap(&mut self.state, state);
+        self.session = session;
+        self.execution = Some(forward);
+        result
+    }
+
     pub fn snapshot(&mut self, gpu: &mut Gpu) -> Result<Qwen4StateSnapshot, BundleError> {
         self.quiesce_ple()?;
         self.state.snapshot(gpu).map_err(BundleError::State)
@@ -2007,6 +2199,7 @@ impl Qwen4Bundle {
             spec_hidden,
             session,
             penalty_stage,
+            lanes,
             ..
         } = self;
         if let Some(mut session) = session {
@@ -2035,7 +2228,11 @@ impl Qwen4Bundle {
                     .map(|stage| gpu.free_penalty_table_stage(stage).map_err(BundleError::Hip))
                     .unwrap_or(Ok(())),
             );
-        let state_result = state.free_gpu(gpu).map_err(BundleError::State);
+        // Lane states are request owners like `state`: free them first.
+        let lanes_result = lanes
+            .map(|store| store.free_gpu(gpu).map_err(BundleError::Forward))
+            .unwrap_or(Ok(()));
+        let state_result = lanes_result.and(state.free_gpu(gpu).map_err(BundleError::State));
         let weight_result = weights.free_gpu(gpu).map_err(BundleError::Hip);
         let store_result = weight_store.drain(gpu).map_err(BundleError::Hip);
         first_bundle_error([

@@ -24,7 +24,7 @@ use hipfire_dispatch::pipeline::{
     execute_validated_steps, validate_steps, BroadcastAddOp, ClearOp, DraftHead, DraftHeadLayout,
     DraftHeadRequestState,
     DraftHeadPolicy, EmbeddingOp, HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode,
-    IndexedAttentionOp, IndexedAttentionState, ProjectOp, Step,
+    IndexedAttentionOp, IndexedAttentionState, MixerPhase, ProjectOp, Step,
 };
 use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::kv_backend::{
@@ -1966,6 +1966,7 @@ impl Qwen4MtpGpu {
                 rotation: &scratch.rotation,
                 mode,
                 trunk_a4: 0,
+                phase: MixerPhase::Whole,
             };
             let lengths = attention.next_lengths()?;
             let moe = if step == MtpStep::Append {

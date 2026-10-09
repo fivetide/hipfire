@@ -8,7 +8,7 @@
 //! `Reference*` structs are used only by CPU equation tests and parity probes.
 
 use crate::config::{LayerType, Qwen4Config};
-use crate::kv_backend::Qwen4KvBackend;
+use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
 use crate::ple::PleHistory;
 use hipfire_dispatch::pipeline::GdnRowCapture;
 use hipfire_runtime::kv_backend::{
@@ -1215,6 +1215,75 @@ impl Qwen4State {
         })
     }
 
+    /// Device bytes one request state commits: every allocation
+    /// [`Self::new_with_backend`] makes (GDN recurrent and conv, the QSA
+    /// fixed arenas and, as `context` commits them, the context arenas, PLE
+    /// conv, hyper feedback) plus the snapshot arena's mirror of the state
+    /// the forwards overwrite in place. The verify ring
+    /// ([`Self::ensure_row_capture`]) is not allocated here and not counted.
+    pub(crate) fn device_bytes(
+        config: &Qwen4Config,
+        format: Qwen4StateFormat,
+        context: &Qwen4ContextCommit,
+    ) -> Option<usize> {
+        let f32_bytes = std::mem::size_of::<f32>();
+        let recurrent = format
+            .gdn
+            .state_units(
+                config.linear_num_value_heads,
+                config.linear_key_head_dim,
+                config.linear_value_head_dim,
+            )
+            .checked_mul(format.gdn.dtype().size())?;
+        let conv_channels = config
+            .linear_num_key_heads
+            .checked_mul(config.linear_key_head_dim)?
+            .checked_mul(2)?
+            .checked_add(
+                config
+                    .linear_num_value_heads
+                    .checked_mul(config.linear_value_head_dim)?,
+            )?;
+        let conv = conv_channels
+            .checked_mul(config.linear_conv_kernel_dim.saturating_sub(1))?
+            .checked_mul(f32_bytes)?;
+        let raw_width = config
+            .indexer_kv_heads
+            .checked_mul(config.indexer_head_dim)?;
+        let full_width = config.num_key_value_heads.checked_mul(config.head_dim)?;
+        let compress = config.indexer_compress_ratio;
+        let partial_keys = compress.checked_mul(raw_width)?.checked_mul(f32_bytes)?;
+        let partial_values = compress.checked_mul(full_width)?.checked_mul(f32_bytes)?;
+        let selected = config
+            .qsa_selected_capacity()
+            .checked_mul(std::mem::size_of::<i32>())?;
+        let circular = compress
+            .checked_mul(raw_width)?
+            .checked_mul(format.qsa.index_dtype().size())?;
+        let ple = config
+            .ple_conv_history_rows()
+            .checked_mul(config.ple_embed_dim)?
+            .checked_mul(config.hc_count)?
+            .checked_mul(f32_bytes)?;
+        let feedback = config
+            .hc_count
+            .checked_mul(config.hidden_size)?
+            .checked_mul(f32_bytes)?;
+        let context_arenas = context.committed_layer_bytes(config, format.qsa)?;
+        // Live state plus the snapshot arena's mirror of each in-place part.
+        let gdn_layer = recurrent.checked_add(conv)?.checked_mul(2)?;
+        let qsa_fixed = partial_keys
+            .checked_add(partial_values)?
+            .checked_add(selected)?
+            .checked_mul(2)?;
+        let qsa_layer = context_arenas.checked_add(qsa_fixed)?.checked_add(circular)?;
+        let per_request = ple.checked_add(feedback)?.checked_mul(2)?;
+        gdn_layer
+            .checked_mul(config.n_linear_layers())?
+            .checked_add(qsa_layer.checked_mul(config.n_full_layers())?)?
+            .checked_add(per_request)
+    }
+
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), StateError> {
         self.reset_epoch = self.reset_epoch.wrapping_add(1);
         self.snapshot_arena.invalidate();
@@ -2128,6 +2197,26 @@ mod tests {
     fn new_compact_state(gpu: &mut Gpu) -> Qwen4State {
         let config = crate::config::compact_test_config();
         Qwen4State::new(gpu, &config, 8, Qwen4StateFormat::F32).expect("compact Qwen4 state")
+    }
+
+    #[test]
+    fn device_bytes_matches_the_constructors_allocations() {
+        let config = crate::config::compact_test_config();
+        let context = Qwen4ContextCommit::legacy(1024);
+        // Hand computation, F32 QSA and GDN state, 36 GDN + 12 QSA layers.
+        let gdn = 48 * 128 * 128 * 4 + 10_240 * 3 * 4;
+        let arena = 1024 * (2 * 2048 + 512) + 256 * 512;
+        assert_eq!(config.qsa_context_arena_bytes(1024, QsaKvFormat::F32), Some(arena));
+        let fixed = 4 * 128 * 4 + 4 * 512 * 4 + (2048 + 3) * 4;
+        let circular = 4 * 128 * 4;
+        let ple = 9 * 2560 * 4 * 4;
+        let feedback = 4 * 2560 * 4;
+        let expected = 36 * 2 * gdn + 12 * (arena + 2 * fixed + circular) + 2 * (ple + feedback);
+        assert_eq!(expected, 294_822_176);
+        assert_eq!(
+            Qwen4State::device_bytes(&config, Qwen4StateFormat::F32, &context),
+            Some(expected)
+        );
     }
 
     #[test]

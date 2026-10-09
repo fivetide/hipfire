@@ -36,7 +36,7 @@ pub use layer_ops::{
     execute_hyper_write, execute_indexed_attention, execute_lm_head, execute_project,
     project_weight, validate_lm_head, BroadcastAddOp, ClearOp, EmbeddingOp, GatedDeltaNetOp,
     GdnRowCapture, GroupedDepthwiseOp, HyperNormOp, HyperReadOp, HyperWriteOp,
-    IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, ProjectOp,
+    IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, MixerPhase, ProjectOp,
     qsa_projection_hook_installed, reset_qsa_projection_slot, set_qsa_projection_hook,
     QsaProjectionHook,
 };

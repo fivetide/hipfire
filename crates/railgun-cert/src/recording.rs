@@ -1116,7 +1116,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-ple-async-upload",
         predicates: &[CaptureMode, GraphSlotCapturing],
-        condition: "hipfire-arch-qwen4 ple_async_upload (ple_stage.rs), consulted by forward_chunk_scoped (gpu_forward.rs) with `gpu.graphs.capture_mode`: the deferred PLE rows upload with a fenced asynchronous copy (HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD) only when no graph capture is open; under capture the blocking `memcpy_htod_auto` path (async on the active stream while capturing) runs",
+        condition: "hipfire-arch-qwen4 ple_async_upload (ple_stage.rs), consulted by forward_chunk_scoped (gpu_forward.rs) and the exact lane step forward_lanes_scoped (gpu_forward_lanes.rs) with `gpu.graphs.capture_mode`: the deferred PLE rows upload with a fenced asynchronous copy (HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD) only when no graph capture is open; under capture the blocking `memcpy_htod_auto` path (async on the active stream while capturing) runs",
         effect: LaunchMechanism,
         switches: "hipMemcpyAsync on the null stream with a hip-event fence over the host staging buffer, vs the blocking or capture-aware upload; same bytes to the same device buffer",
         kernels: &[],
@@ -1170,6 +1170,7 @@ pub const SITES: &[Site] = &[
     Site { file: "hipfire-arch-qwen35/src/speculative.rs", function: "rides_ordinary_prefill", occurrences: 2, decisions: &["widened-prefill-batching", "gdn-chunk-scan"] },
     Site { file: "hipfire-arch-qwen35/src/speculative.rs", function: "verify_dflash_block_inner", occurrences: 1, decisions: &["graph-capture-lifecycle"] },
     Site { file: "hipfire-arch-qwen4/src/gpu_forward.rs", function: "forward_chunk_scoped", occurrences: 8, decisions: &["replay-recorder-lifecycle", "qwen4-g2-expert-stage", "qwen4-prefill-token-id-reuse", "qwen4-ple-async-upload"] },
+    Site { file: "hipfire-arch-qwen4/src/gpu_forward_lanes.rs", function: "forward_lanes_scoped", occurrences: 1, decisions: &["qwen4-ple-async-upload"] },
     Site { file: "hipfire-arch-qwen4/src/ple_stage.rs", function: "ple_async_upload", occurrences: 2, decisions: &["qwen4-ple-async-upload"] },
     Site { file: "hipfire-arch-qwen4/src/mtp_gpu.rs", function: "ensure_mapped_capacity", occurrences: 1, decisions: &["eager-only-refusals"] },
     Site { file: "hipfire-arch-qwen4/src/state.rs", function: "ensure_mapped_capacity", occurrences: 3, decisions: &["eager-only-refusals"] },

@@ -12,6 +12,7 @@ use crate::cpu_exec;
 use crate::families::fused_qkv::{FusedQkvBiasParams, FusedQkvFamily, FusedQkvParams};
 use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
 use crate::families::rotation::{RotationFamily, RotationParams};
+use crate::pipeline::layer_ops::MixerPhase;
 use crate::pipeline::sealed_moe;
 use crate::types::GemvVariant;
 use crate::types::{DispatchError, KernelKey, PipelineOp, RotationPlan, RotationVariant};
@@ -865,7 +866,11 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
                 // write already has its gates carries that write in its output
                 // projection's epilogue; unfused when its projection is not
                 // covered (the write then runs pregated as at level 1).
-                Step::GatedDeltaNet(op) if hc_level >= 2 && pregated == Some(i + 1) => {
+                Step::GatedDeltaNet(op)
+                    if hc_level >= 2
+                        && pregated == Some(i + 1)
+                        && matches!(op.phase, MixerPhase::Whole | MixerPhase::OutProj) =>
+                {
                     if let Step::HyperWrite(write) = &steps[i + 1] {
                         let mut fused = false;
                         execute_gated_delta_net_hc(gpu, op, Some(write), &mut fused)?;
@@ -877,7 +882,11 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
                         continue;
                     }
                 }
-                Step::IndexedAttention(op) if hc_level >= 2 && pregated == Some(i + 1) => {
+                Step::IndexedAttention(op)
+                    if hc_level >= 2
+                        && pregated == Some(i + 1)
+                        && matches!(op.phase, MixerPhase::Whole | MixerPhase::OutProj) =>
+                {
                     if let Step::HyperWrite(write) = &steps[i + 1] {
                         let mut fused = false;
                         execute_indexed_attention_hc(gpu, op, Some(write), &mut fused)?;
@@ -1016,10 +1025,18 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
                 // first rotate, cleared after that step).
                 let mixed = read.mixed.buf.as_ptr();
                 let rotate_into = match steps.get(i + if clear.is_some() { 3 } else { 2 }) {
-                    Some(Step::GatedDeltaNet(op)) if op.input.buf.as_ptr() == mixed => {
+                    // Only a phase that rotates its `input` can take the read's
+                    // rotation: the core and the output projection never do.
+                    Some(Step::GatedDeltaNet(op))
+                        if op.input.buf.as_ptr() == mixed
+                            && matches!(op.phase, MixerPhase::Whole | MixerPhase::InProj) =>
+                    {
                         Some(op.rotation)
                     }
-                    Some(Step::IndexedAttention(op)) if op.input.buf.as_ptr() == mixed => {
+                    Some(Step::IndexedAttention(op))
+                        if op.input.buf.as_ptr() == mixed
+                            && matches!(op.phase, MixerPhase::Whole | MixerPhase::InProj) =>
+                    {
                         Some(op.rotation)
                     }
                     Some(Step::Moe(call)) => call

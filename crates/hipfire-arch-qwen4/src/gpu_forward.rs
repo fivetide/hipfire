@@ -42,7 +42,7 @@ use hipfire_dispatch::pipeline::{
     seal_decode, validate_steps, BoundMoeExperts, ClearOp, EmbeddingOp, ExpertBindingCache,
     ExpertMetadata, ExpertResource, ExpertResources, ExpertTable, GatedDeltaNetOp,
     GroupedDepthwiseOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
-    IndexedAttentionState, MoeStepHooks, Step,
+    IndexedAttentionState, MixerPhase, MoeStepHooks, Step,
 };
 use hipfire_dispatch::types::DispatchError;
 use hipfire_dispatch::types::dtype_rotation_plan;
@@ -56,7 +56,7 @@ use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::time::Instant;
 
-const EPSILON: f32 = 1.0e-6;
+pub(crate) const EPSILON: f32 = 1.0e-6;
 /// Default rows of one Qwen4 prefill chunk (the reusable forward scratch).
 ///
 /// Public serving calls may receive longer prompts; the forward owner tiles
@@ -314,7 +314,7 @@ impl From<WeightError> for Qwen4GpuForwardError {
     }
 }
 
-fn invalid(message: impl Into<String>) -> Qwen4GpuForwardError {
+pub(crate) fn invalid(message: impl Into<String>) -> Qwen4GpuForwardError {
     Qwen4GpuForwardError::Invalid(message.into())
 }
 
@@ -323,12 +323,12 @@ fn checked_bytes(rows: usize, stride: usize) -> Result<usize, Qwen4GpuForwardErr
         .ok_or_else(|| invalid("packed row byte size overflow"))
 }
 
-fn f32_view(tensor: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
+pub(crate) fn f32_view(tensor: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
     debug_assert_eq!(tensor.dtype, DType::F32);
     tensor.sub_offset(offset, len)
 }
 
-fn view(tensor: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
+pub(crate) fn view(tensor: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
     tensor.sub_offset(offset, len)
 }
 
@@ -356,7 +356,7 @@ fn uploaded_ids_range(
         .then_some((start_byte, end_byte - start_byte))
 }
 
-fn matrix_view(
+pub(crate) fn matrix_view(
     tensor: &GpuTensor,
     rows: usize,
     columns: usize,
@@ -433,7 +433,7 @@ fn qwen4_route_policy(
         },
     }
 }
-fn program_dims(config: &Qwen4Config) -> Qwen4ProgramDims {
+pub(crate) fn program_dims(config: &Qwen4Config) -> Qwen4ProgramDims {
     Qwen4ProgramDims {
         hidden: config.hidden_size,
         hc_count: config.hc_count,
@@ -461,12 +461,12 @@ fn program_dims(config: &Qwen4Config) -> Qwen4ProgramDims {
 }
 
 /// Q8_0 decode copies per layer (`Qwen4GpuForward::decode_q8`).
-const DECODE_Q8_PER_LAYER: usize = 7;
+pub(crate) const DECODE_Q8_PER_LAYER: usize = 7;
 
 /// A decode-shaped forward's projection (one token, or the few rows of a
 /// speculative verify, which must match it bitwise): its Q8_0 decode copy
 /// (`Qwen4GpuForward::decode_q8`) when one exists.
-fn decode_copy<'a>(
+pub(crate) fn decode_copy<'a>(
     copies: &'a [GpuTensor],
     index: usize,
     rows: usize,
@@ -545,7 +545,7 @@ pub(crate) fn qsa_desc<'a>(
         output: dense_ref(weights, &qsa.output)?,
     })
 }
-fn ple_desc<'a>(
+pub(crate) fn ple_desc<'a>(
     weights: &'a Qwen4Weights,
     ple: &crate::weights::PleWeights,
 ) -> Result<Qwen4PleWeights<'a>, Qwen4GpuForwardError> {
@@ -562,7 +562,7 @@ fn ple_desc<'a>(
 /// `decode_q8` / `rows`: the forward's Q8_0 decode copies and row count; a
 /// one-row forward binds this layer's shared-expert copies.
 #[allow(clippy::too_many_arguments)]
-fn layer_desc<'a>(
+pub(crate) fn layer_desc<'a>(
     weights: &'a Qwen4Weights,
     layer: &Qwen4LayerWeights,
     moe: &'a Qwen4MoeLayerRuntime,
@@ -1013,7 +1013,7 @@ enum DonorState {
 /// once, by `ensure_capture_stream`, and never replaced) therefore sees the
 /// donor layers whole. Routing-independent: neither the copies nor the
 /// pointer tables depend on the experts a row picks.
-struct Qwen4ExpertStage {
+pub(crate) struct Qwen4ExpertStage {
     /// Forwards of at least this many rows stage.
     min_rows: usize,
     /// Donor trunk layer per parity.
@@ -1935,7 +1935,7 @@ impl Qwen4GpuForwardScratch {
     }
 }
 
-fn layer_scratch<'a>(
+pub(crate) fn layer_scratch<'a>(
     scratch: &'a Qwen4GpuForwardScratch,
     router_logits: &'a GpuTensor,
 ) -> Qwen4LayerScratch<'a> {
@@ -2001,14 +2001,14 @@ pub type Qwen4QsaTap =
 /// exact same chunk implementation.
 pub struct Qwen4GpuForward {
     pub scratch: Qwen4GpuForwardScratch,
-    host_token_bytes: Vec<u8>,
+    pub(crate) host_token_bytes: Vec<u8>,
     /// Rows of `scratch.token_ids` the last forward uploaded whole from
     /// `host_token_bytes` (its mirror): 0 for a HIP single-row body, a device
     /// argmax id or a captured upload.
-    uploaded_id_rows: usize,
+    pub(crate) uploaded_id_rows: usize,
     /// Host staging for the PLE rows and the fence over its asynchronous
     /// upload (`HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD`).
-    host_ple: PleHostStage,
+    pub(crate) host_ple: PleHostStage,
     /// Tokens of the prefill chunk that follows the next forward. A
     /// successful forward enqueues their PLE rows (hashed from the history it
     /// committed) as `ple_ahead` once its own lease is released, so the next
@@ -2017,10 +2017,10 @@ pub struct Qwen4GpuForward {
     ple_lookahead: Vec<u32>,
     /// Retained next-chunk PLE ticket. The next forward adopts it when its
     /// row ids and epoch match exactly, else drops it and fetches afresh.
-    ple_ahead: Option<RowTicket>,
+    pub(crate) ple_ahead: Option<RowTicket>,
     /// Device-argmax token readback (`forward_token_or_argmax`), once used.
     token_readback: Option<TokenReadback>,
-    moe: Vec<Qwen4MoeLayerRuntime>,
+    pub(crate) moe: Vec<Qwen4MoeLayerRuntime>,
     expert_stage: Option<Qwen4ExpertStage>,
     /// `DECODE_Q8_PER_LAYER` per layer [HC attn down, attn up, mlp down, mlp
     /// up, shared gate, up, down]: BF16 matrices requantized to Q8_0 for
@@ -2029,7 +2029,7 @@ pub struct Qwen4GpuForward {
     /// decode KLD inside the noise band (HC 0.0743 -> 0.0754, shared +0.0007
     /// over 32 chunks). Prefill keeps the BF16 source for its WMMA routes and
     /// the exact multi-row arms short prompts take.
-    decode_q8: Vec<GpuTensor>,
+    pub(crate) decode_q8: Vec<GpuTensor>,
     /// `HIPFIRE_QWEN4_ROUTE_TRACE`: routed expert ids per layer of every
     /// single-token HIP forward, for expert-cache sizing. `None` when unset.
     route_trace: Option<RouteTrace>,
@@ -2037,10 +2037,15 @@ pub struct Qwen4GpuForward {
     /// `HIPFIRE_QWEN4_TRUNK_IU4`: per layer, the GDN Z|beta|alpha fold the
     /// IU4 trunk's V2B SET reads (see [`prepare_trunk_iu4`]); empty when the
     /// route is off or the trunk did not verify.
-    trunk_zba: Vec<Option<GpuTensor>>,
+    pub(crate) trunk_zba: Vec<Option<GpuTensor>>,
     /// `HIPFIRE_QWEN4_TRUNK_IU4`: per layer, the [`TrunkFamily`] bits the
     /// mask selected for A4 (empty when the route is off or did not arm).
-    trunk_a4: Vec<u16>,
+    pub(crate) trunk_a4: Vec<u16>,
+    /// Set only while a lane's prefill tile runs the singleton chunk program
+    /// on a lane state ([`Qwen4Bundle::lane_prefill_tile`]): the forward is
+    /// then never a retained-body candidate, so it neither records nor
+    /// replays the singleton's tape (whose pointers name the resident state).
+    pub(crate) lane_scope: bool,
 }
 
 /// An event after a forward's device argmax and a stream independent of the
@@ -2317,7 +2322,18 @@ impl Qwen4GpuForward {
             trunk_zba,
             trunk_a4,
             qsa_tap: None,
+            lane_scope: false,
         })
+    }
+
+    /// Before a forward that is not this owner's chunk program (the lane
+    /// step) reads any expert: restore the donor layers a failed staged
+    /// forward may have left overwritten. A no-op without G2 staging.
+    pub(crate) fn restore_expert_stage(&self, gpu: &mut Gpu) -> Result<(), Qwen4GpuForwardError> {
+        match self.expert_stage.as_ref() {
+            Some(stage) => stage.restore_blocking(gpu),
+            None => Ok(()),
+        }
     }
 
     /// Name the tokens that follow the next forward (at most one chunk is
@@ -3235,6 +3251,7 @@ impl Qwen4GpuForward {
                         row_capture: bundle.state.gdn_row_capture(gdn_slot - 1, n),
                         zba_fold: self.trunk_zba.get(layer_index).and_then(Option::as_ref),
                         trunk_a4: self.trunk_a4.get(layer_index).copied().unwrap_or(0),
+                        phase: MixerPhase::Whole,
                     }));
                 }
                 LayerType::FullAttention => {
@@ -3298,6 +3315,7 @@ impl Qwen4GpuForward {
                         head_dim: dims.head_dim,
                         input_width: dims.hidden,
                         trunk_a4: self.trunk_a4.get(layer_index).copied().unwrap_or(0),
+                        phase: MixerPhase::Whole,
                     }));
                 }
             }
@@ -3402,8 +3420,9 @@ impl Qwen4GpuForward {
             }
         }
         // A HIP body: no retained tape records or routes this forward.
-        let hip_body =
-            n == 1 && matches!(gpu.replay.state(), ReplayState::Hip | ReplayState::Fallback);
+        let hip_body = n == 1
+            && !self.lane_scope
+            && matches!(gpu.replay.state(), ReplayState::Hip | ReplayState::Fallback);
         // `argmax_of` on a HIP body: the GPU argmax writes the token id and the
         // host reads it back only at the PLE layer, so the GPU runs this
         // forward's first layers while the host waits. Otherwise the host
@@ -3663,6 +3682,7 @@ impl Qwen4GpuForward {
             // Eligible only for a plain single-token continuation: the wide-hidden
             // capture is the speculative-verify shape and must never enter the tape.
             let eligible = n == 1
+                && !self.lane_scope
                 && wide_hidden_capture.is_none()
                 && self.qsa_tap.is_none()
                 && !hipfire_dispatch::pipeline::qsa_projection_hook_installed();
