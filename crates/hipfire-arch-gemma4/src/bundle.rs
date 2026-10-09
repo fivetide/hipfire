@@ -21,21 +21,22 @@ use hipfire_runtime::session_cache::{
 };
 use rdna_compute::Gpu;
 
-/// Snapshot boundary stride in prompt tokens (a multiple of the 64-row
+/// Snapshot boundary stride in prompt tokens (a multiple of the 256-row
 /// prefill chunk, so restored prefills keep the cold chunk grid).
 pub const SESSION_STRIDE: usize = 1024;
 
-/// Prefill rows per forward on `gpu_arch`: 64-row batches where batched
-/// prefill is validated (`HIPFIRE_GEMMA4_PREFILL_BATCH` overrides), else
-/// per-token decode.
+/// Prefill rows per forward on `gpu_arch` where batched prefill is validated
+/// (`HIPFIRE_GEMMA4_PREFILL_BATCH` overrides), else per-token decode. gfx1151
+/// takes 256-row batches: its grouped MoE, Q8 and attention prefill routes
+/// read each weight / KV tile once per batch.
 pub fn prefill_rows_for_arch(gpu_arch: &str, requested: Option<usize>) -> usize {
     requested
-        .unwrap_or(if matches!(gpu_arch, "gfx1100" | "gfx1201") {
-            64
-        } else {
-            1
+        .unwrap_or(match gpu_arch {
+            "gfx1151" => 256,
+            "gfx1100" | "gfx1201" => 64,
+            _ => 1,
         })
-        .clamp(1, 64)
+        .clamp(1, crate::gemma4::GEMMA4_FORWARD_BATCH_MAX)
 }
 
 /// Published Gemma 4 owner (arch_id 13).
@@ -171,6 +172,7 @@ impl Gemma4Bundle {
     ) -> Result<Vec<f32>, String> {
         let width = self.prefill_rows;
         let mut logits = Vec::new();
+        let n_chunks = tokens.len().div_ceil(width);
         for (i, chunk) in tokens.chunks(width).enumerate() {
             let pos = start + i * width;
             logits = if let [token] = chunk {
@@ -182,6 +184,17 @@ impl Gemma4Bundle {
                     *token,
                     pos as u32,
                 )?
+            } else if i + 1 < n_chunks {
+                // Only the last chunk's logits are returned; skip the LM head.
+                forward::forward_prefill_batch(
+                    &self.config,
+                    &self.weights,
+                    &mut self.state,
+                    gpu,
+                    chunk,
+                    pos,
+                )?;
+                Vec::new()
             } else {
                 forward::forward_batch(
                     &self.config,
@@ -371,14 +384,15 @@ mod tests {
     use super::prefill_rows_for_arch;
 
     #[test]
-    fn validated_arches_default_to_full_wmma_batch_tile_group() {
+    fn validated_arches_default_to_batched_prefill() {
         assert_eq!(prefill_rows_for_arch("gfx1100", None), 64);
         assert_eq!(prefill_rows_for_arch("gfx1201", None), 64);
+        assert_eq!(prefill_rows_for_arch("gfx1151", None), 256);
     }
 
     #[test]
     fn unvalidated_arches_keep_the_sequential_default() {
-        for arch in ["gfx1151", "gfx1200", "gfx942"] {
+        for arch in ["gfx1200", "gfx942"] {
             assert_eq!(prefill_rows_for_arch(arch, None), 1);
         }
     }
@@ -388,6 +402,6 @@ mod tests {
         assert_eq!(prefill_rows_for_arch("gfx1100", Some(8)), 8);
         assert_eq!(prefill_rows_for_arch("gfx1201", Some(32)), 32);
         assert_eq!(prefill_rows_for_arch("gfx1100", Some(0)), 1);
-        assert_eq!(prefill_rows_for_arch("gfx1100", Some(128)), 64);
+        assert_eq!(prefill_rows_for_arch("gfx1100", Some(512)), 256);
     }
 }

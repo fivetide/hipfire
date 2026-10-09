@@ -377,6 +377,7 @@ pub(crate) fn routed_scratch(s: &MoeScratch) -> RoutedScratch<'_> {
         act: &s.hidden_batch,
         out: &s.cur_moe,
         dense_normed: &s.cur_mlp,
+        batch: None,
     }
 }
 

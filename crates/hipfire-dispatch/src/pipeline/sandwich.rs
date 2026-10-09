@@ -142,9 +142,43 @@ pub fn gemm_rows(
         DType::F32 => gpu
             .gemm_f32_batched(w.buf, x, y, w.m, w.k, rows)
             .map_err(hip),
-        DType::Q8_0 if *EAGLE_STRICT => gpu
-            .gemm_q8_0_batched(w.buf, x, y, w.m, w.k, rows)
-            .map_err(hip),
+        DType::Q8_0 if *EAGLE_STRICT => {
+            // The scalar kernel holds at most 64 rows.
+            for off in (0..rows).step_by(64) {
+                let n = (rows - off).min(64);
+                gpu.gemm_q8_0_batched(
+                    w.buf,
+                    &x.sub_offset(off * w.k, n * w.k),
+                    &y.sub_offset(off * w.m, n * w.m),
+                    w.m,
+                    w.k,
+                    n,
+                )
+                .map_err(hip)?;
+            }
+            Ok(())
+        }
+        // gfx1151: the 4-warp 64x64 tile reads each weight tile once per 64
+        // rows (the 16x16 kernel re-reads it per 16 rows); a sub-64 row tail
+        // takes the 16x16 kernel.
+        DType::Q8_0 if gpu.arch_caps.is_gfx1151() && w.m % 64 == 0 && rows >= 64 => {
+            let full = rows / 64 * 64;
+            gpu.gemm_q8_0_wmma_4w(w.buf, &x.sub_offset(0, full * w.k), y, w.m, w.k, full)
+                .map_err(hip)?;
+            if full < rows {
+                let tail = rows - full;
+                gpu.gemm_q8_0_wmma(
+                    w.buf,
+                    &x.sub_offset(full * w.k, tail * w.k),
+                    &y.sub_offset(full * w.m, tail * w.m),
+                    w.m,
+                    w.k,
+                    tail,
+                )
+                .map_err(hip)?;
+            }
+            Ok(())
+        }
         DType::Q8_0 => gpu
             .gemm_q8_0_batched_chunked(w.buf, x, y, w.m, w.k, rows)
             .map_err(hip),
@@ -156,6 +190,11 @@ pub fn gemm_rows(
         DType::MQ6G256 => {
             rotate_x_mq_rows(gpu, w, x, x_rot, rows)?;
             gpu.gemm_mq6g256_batched_lmhead(w.buf, x_rot, y, w.m, w.k, rows)
+                .map_err(hip)
+        }
+        DType::MQ4G256V2 => {
+            rotate_x_mq_rows(gpu, w, x, x_rot, rows)?;
+            gpu.gemm_mq4g256v2(w.buf, x_rot, y, w.m, w.k, rows)
                 .map_err(hip)
         }
         // BF16 teachers (calibration): stage the F32 input to BF16 for the
@@ -192,7 +231,13 @@ pub fn gemm_rows(
 pub fn supports_batched_projection(dtype: DType) -> bool {
     matches!(
         dtype,
-        DType::F32 | DType::BF16 | DType::Q8_0 | DType::MQ4G256 | DType::HFQ4G256 | DType::MQ6G256
+        DType::F32
+            | DType::BF16
+            | DType::Q8_0
+            | DType::MQ4G256
+            | DType::HFQ4G256
+            | DType::MQ6G256
+            | DType::MQ4G256V2
     )
 }
 
@@ -656,8 +701,22 @@ impl SandwichAttentionOp<'_> {
                 .map_err(hip)?;
         }
         // Prefill is not tree verification: the native causal kernels, and the
-        // windowed tile kernel for sliding layers.
-        if kv.window > 0 {
+        // windowed tile kernel for sliding layers. gfx1151 takes the
+        // GQA-shared WMMA flash kernel for every layer.
+        if gpu.attention_q8_0_prefill_gqa_wmma_admitted(n_heads, n_kv, hd) {
+            gpu.attention_q8_0_prefill_gqa_wmma(
+                self.q,
+                kv.k_cache,
+                kv.v_cache,
+                self.attn_out,
+                positions,
+                n_heads,
+                n_kv,
+                hd,
+                rows,
+                kv.window as i32,
+            )
+        } else if kv.window > 0 {
             gpu.attention_flash_q8_0_batched_masked_windowed(
                 self.q,
                 kv.k_cache,
@@ -869,6 +928,54 @@ impl RoutedExperts<'_> {
                 | DType::Q8_0
         ) && matches!(down, DType::Q8_0 | DType::HFQ4G128)
     }
+
+    /// Formats whose batched rows take the grouped (sorted-by-expert) gate/up
+    /// GEMM: each expert's weights are read once per batch instead of once
+    /// per routed row.
+    pub fn grouped_rows(gate_up: DType, down: DType) -> bool {
+        matches!(gate_up, DType::MQ4G256V2 | DType::MQ6G256) && down == DType::HFQ4G128
+    }
+}
+
+/// Batched-rows scratch of the grouped routed-expert route (`rows` rows,
+/// `slots = rows * top_k`, `m_total = slots + n_experts * MOE_GROUPED_BLOCK_M`).
+/// Index buffers hold i32.
+#[derive(Clone, Copy)]
+pub struct RoutedBatch<'a> {
+    /// `[rows, hidden]`: router input, then `pre_norm(residual)`.
+    pub input: &'a GpuTensor,
+    /// `[rows, hidden]` FWHT rotation (router `x_rot` scratch first).
+    pub input_rot: &'a GpuTensor,
+    /// `[rows, n_experts]`.
+    pub router_logits: &'a GpuTensor,
+    /// `[slots]` each.
+    pub topk_indices: &'a GpuTensor,
+    pub topk_weights: &'a GpuTensor,
+    pub inverse_perm: &'a GpuTensor,
+    /// `[n_experts]`, `[n_experts + 1]`.
+    pub counts: &'a GpuTensor,
+    pub offsets: &'a GpuTensor,
+    /// `[m_total]`, `[m_total / MOE_GROUPED_BLOCK_M]`.
+    pub sorted_slots: &'a GpuTensor,
+    pub tile_ids: &'a GpuTensor,
+    /// `[m_total, max(2 * hidden_dim, hidden)]`: grouped gate/up rows, then
+    /// grouped down rows.
+    pub gate_up_grouped: &'a GpuTensor,
+    /// `[slots, hidden_dim]` each; `gate` ends as the activation.
+    pub gate: &'a GpuTensor,
+    pub up: &'a GpuTensor,
+    /// `[rows, hidden]` combined expert output.
+    pub out: &'a GpuTensor,
+}
+
+impl RoutedBatch<'_> {
+    /// Grouped rows (with padding) for `rows` rows: a whole number of
+    /// 16-slot tiles, because the grouped kernels launch `ceil(m_total / 16)`
+    /// tiles and read one tile id each.
+    pub fn m_total(rows: usize, top_k: usize, n_experts: usize) -> usize {
+        let block = crate::families::moe::MOE_GROUPED_BLOCK_M;
+        (rows * top_k).next_multiple_of(block) + n_experts * block
+    }
 }
 
 /// Scratch of one routed-expert pass.
@@ -889,6 +996,8 @@ pub struct RoutedScratch<'a> {
     pub out: &'a GpuTensor,
     /// `dense_post_norm(dense MLP output)`.
     pub dense_normed: &'a GpuTensor,
+    /// Grouped-route scratch for batched rows; `None` routes row by row.
+    pub batch: Option<RoutedBatch<'a>>,
 }
 
 /// Parallel dense+MoE MLP sublayer:
@@ -931,19 +1040,155 @@ pub fn execute_parallel_moe_mlp(
         gpu.add_f32(r.dense_normed, r.out, s.normed).map_err(hip)?;
         s.norm(gpu, s.normed, mlp.post_norm, s.normed)?;
     } else {
-        // The indexed expert kernels are single-row: route row by row and
-        // accumulate into the normed dense output.
         s.norm(gpu, mlp.out, op.dense_post_norm, mlp.out)?;
-        for row in 0..s.rows {
-            let residual = s.residual.sub_offset(row * s.hidden, s.hidden);
-            routed_row(gpu, ctx, e, r, &residual, s.hidden, s.eps)?;
-            let out = mlp.out.sub_offset(row * s.hidden, s.hidden);
-            gpu.add_inplace_f32(&out, r.out).map_err(hip)?;
+        match r.batch.filter(|_| {
+            gpu.arch_caps.is_gfx1151() && RoutedExperts::grouped_rows(e.gate_up_dtype, e.down_dtype)
+        }) {
+            Some(b) => {
+                routed_rows_grouped(gpu, ctx, e, &b, s)?;
+                gpu.add_inplace_f32(mlp.out, b.out).map_err(hip)?;
+            }
+            // The indexed expert kernels are single-row: route row by row
+            // and accumulate into the normed dense output.
+            None => {
+                for row in 0..s.rows {
+                    let residual = s.residual.sub_offset(row * s.hidden, s.hidden);
+                    routed_row(gpu, ctx, e, r, &residual, s.hidden, s.eps)?;
+                    let out = mlp.out.sub_offset(row * s.hidden, s.hidden);
+                    gpu.add_inplace_f32(&out, r.out).map_err(hip)?;
+                }
+            }
         }
         s.norm(gpu, mlp.out, mlp.post_norm, s.normed)?;
     }
     s.restore_residual(gpu)?;
     gpu.add_inplace_f32(s.x, s.normed).map_err(hip)
+}
+
+/// `b.out = experts.post_norm(moe(pre_norm(residual)))` for all `s.rows`
+/// rows: batched router, then the routed slots sorted by expert so each
+/// expert's gate/up and down weights are read once per 16-slot tile.
+fn routed_rows_grouped(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    e: &RoutedExperts<'_>,
+    b: &RoutedBatch<'_>,
+    s: SandwichStream<'_>,
+) -> Result<(), DispatchError> {
+    use crate::families::moe::MOE_GROUPED_BLOCK_M;
+    let (rows, hidden, mi, k) = (s.rows, s.hidden, e.hidden_dim, e.top_k);
+    gpu.rmsnorm_batched(s.residual, e.router_norm, b.input, rows, hidden, s.eps)
+        .map_err(hip)?;
+    scale(gpu, b.input, e.router_input_scale)?;
+    // Expert selection is tie-sensitive: the F16-input Q8 WMMA GEMM moves
+    // router logits by ~1e-3, which flips near-tied experts and costs
+    // prefill KL 0.16 -> 1.19 on 26B-A4B. The batched Q8 GEMV keeps F32
+    // activations and shares each weight load across eight rows.
+    if e.router.dtype == DType::Q8_0 {
+        gpu.gemm_q8_0_batched_wide_exact(
+            e.router.buf,
+            b.input,
+            b.router_logits,
+            e.router.m,
+            e.router.k,
+            rows,
+        )
+        .map_err(hip)?;
+    } else {
+        gemm_rows(
+            gpu,
+            ctx,
+            &e.router,
+            b.input,
+            b.router_logits,
+            b.input_rot,
+            rows,
+        )?;
+    }
+    gpu.moe_softmax_topk_renorm_k8_batched(
+        b.router_logits,
+        b.topk_indices,
+        b.topk_weights,
+        e.n_experts,
+        true,
+        rows,
+    )
+    .map_err(hip)?;
+
+    gpu.rmsnorm_batched(s.residual, e.pre_norm, b.input, rows, hidden, s.eps)
+        .map_err(hip)?;
+    gpu.rotate_x_mq_batched(b.input, b.input_rot, hidden, rows)
+        .map_err(hip)?;
+    let m_total = RoutedBatch::m_total(rows, k, e.n_experts);
+    gpu.moe_scatter_fused_k8(
+        b.topk_indices,
+        b.counts,
+        b.offsets,
+        b.sorted_slots,
+        b.tile_ids,
+        b.inverse_perm,
+        rows * k,
+        e.n_experts,
+        m_total,
+        MOE_GROUPED_BLOCK_M,
+    )
+    .map_err(hip)?;
+    super::dispatch_grouped_gemm(
+        gpu,
+        e.gate_up_dtype,
+        None,
+        e.gate_up_ptrs,
+        b.tile_ids,
+        b.sorted_slots,
+        b.input_rot,
+        b.gate_up_grouped,
+        2 * mi,
+        hidden,
+        k,
+        m_total,
+        rows,
+        false,
+        false,
+        false,
+    )?;
+    gpu.moe_gate_up_unscatter_k8(
+        b.gate_up_grouped,
+        b.sorted_slots,
+        b.gate,
+        b.up,
+        mi,
+        k,
+        m_total,
+    )
+    .map_err(hip)?;
+    gpu.gelu_tanh_f32(b.gate, b.gate, rows * k * mi)
+        .map_err(hip)?;
+    gpu.mul_f32(b.gate, b.up, b.gate).map_err(hip)?;
+    gpu.gemv_hfq4g128_moe_down_grouped(
+        e.down_ptrs,
+        b.tile_ids,
+        b.sorted_slots,
+        e.per_expert_scale,
+        b.gate,
+        b.gate_up_grouped,
+        hidden,
+        mi,
+        m_total,
+    )
+    .map_err(hip)?;
+    gpu.zero_f32(b.out).map_err(hip)?;
+    gpu.moe_down_combine_grouped_k8(
+        b.gate_up_grouped,
+        b.inverse_perm,
+        b.topk_weights,
+        b.out,
+        hidden,
+        k,
+        rows,
+    )
+    .map_err(hip)?;
+    gpu.rmsnorm_batched(b.out, e.post_norm, b.out, rows, hidden, s.eps)
+        .map_err(hip)
 }
 
 /// `r.out = experts.post_norm(moe(pre_norm(residual)))` for one row; the
@@ -1182,6 +1427,7 @@ mod tests {
             DType::MQ4G256,
             DType::HFQ4G256,
             DType::MQ6G256,
+            DType::MQ4G256V2,
         ] {
             assert!(supports_batched_projection(dtype));
         }
