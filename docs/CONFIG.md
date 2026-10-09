@@ -747,6 +747,8 @@ Two checks exist; only one is gated:
 | `memory.prompt_cache_capacity` | `32` | int ≥0; maximum cached assistant-turn tokenizations (`0` keeps none). Env: `HIPFIRE_PROMPT_CACHE_CAP`. |
 | `memory.prompt_cache_unbounded` | `false` | Remove the capacity bound. Env: `HIPFIRE_PROMPT_CACHE_UNBOUNDED`. |
 | `memory.session_cache_bytes` | `8589934592` | int 0–1 TiB; byte budget (a ceiling, not a reservation) of the Qwen4 engine-owned session cache (cold-exact prefill snapshots shared across sessions, plus live continuation of the previous turn; `0` = off, cold prefill every turn). Snapshots take free device memory only while the context does not need it: they are skipped or evicted before VMM context growth would run short. Env: `HIPFIRE_SESSION_CACHE_BYTES` ([`env-vars.md`](env-vars.md)). |
+| `memory.session_cache_disk_bytes` | `0` | int 0–64 TiB; byte budget of the session cache's disk tier (one budget for the whole `memory.session_cache_dir`, every model and build). Snapshots evicted from memory, and every snapshot at model unload, are written there and restored on demand, surviving daemon restarts of the same build; LRU over leaves, other builds' files evicted first. `0` = off. Env: `HIPFIRE_SESSION_CACHE_DISK_BYTES` ([`env-vars.md`](env-vars.md)). |
+| `memory.session_cache_dir` | `""` | Directory of the session cache's disk tier; empty = `$HIPFIRE_HOME/session-cache`. One process uses it at a time (a second one runs without the disk tier). Env: `HIPFIRE_SESSION_CACHE_DIR`. |
 | `memory.ple_hot_store_bytes` | `0` | `auto` or int 0–1 TiB; prewarm budget of the Qwen4 PLE hot-row store. The most frequently used rows of the per-layer-embedding table, ranked by the `<model>.plehot` sidecar (`hipfire-quantize ple-hot-rank`), are copied verbatim from the model file into the `<model>.plehotrows` hot-row pack (`hipfire-quantize ple-hot-pack`), grouped by rank. Rows the pack holds are read from it through the page cache and decoded by the same row decoder, so output is byte-identical to the model-file path. After load the first N bytes of the pack are read into the page cache (hottest tier first, then tier 0 once more so its pages are promoted to the active list) while no request runs: `auto` = `MemAvailable` minus 4 GiB at ready, an explicit N is that many bytes, both capped at the pack. The pack is clean page cache: the kernel drops it under memory pressure instead of swapping. Off by default (`0`); unified-memory GPUs only. Env: `HIPFIRE_PLE_HOT_STORE_BYTES`, paths `HIPFIRE_PLE_HOT_RANK_FILE` / `HIPFIRE_PLE_HOT_PACK_FILE` ([`env-vars.md`](env-vars.md)). |
 | `memory.ple_format` | `auto` | `auto` \| `q4` \| `q8`; which PLE row table a Flash-Next (Qwen4) load reads. `q8` = the exact Q8F16 rows (embedded in the monolithic `qwen3.8:flash-next-mq4-xts`, or the `<model>.ple-q8` sidecar of a split base); `q4` = the 4-bit Lloyd-Max rows `<model>.ple-q4`, decode equal to the tested q4 table, derived from the Q8 rows on first load when missing (about 1 minute, progress on stderr; `hipfire ple derive --format q4 <model>` does it ahead of time). `auto` = q4 on gfx1151 (unified-memory Strix Halo), q8 elsewhere; `auto` never derives or downloads and falls back to the other available format with a note. An explicit `q8` on a split base needs `<model>.ple-q8` (`hipfire pull <tag> --ple q8`; `serve` downloads it on demand for registry models). See [Qwen4 PLE row tables](#qwen4-ple-row-tables). Env: `HIPFIRE_PLE_FORMAT` ([`env-vars.md`](env-vars.md)). |
 | `memory.ple_prewarm_bytes` | `auto` | `auto` or int 0–1 TiB; idle-only page-cache prewarm of the q4 PLE table `<model>.ple-q4` after the model is ready (a rank-ordered table: hottest tier first, then tier 0 again, the hot-row store's prewarm; a row-ordered one: sequentially). `auto` = 15 GiB (the hottest rows, where the value per GB of warm rows is highest), capped at `MemAvailable` minus 8 GiB at ready and at the table; `0` = off (kill switch); an explicit N is that many bytes. The pages are clean, reclaimable page cache: dropped, never swapped, under memory pressure, and not charged in admission. See [Qwen4 PLE row tables](#qwen4-ple-row-tables). Env: `HIPFIRE_PLE_PREWARM_BYTES` ([`env-vars.md`](env-vars.md)). |
@@ -1019,6 +1021,8 @@ uses ambient variables in engine hot paths.
 | `ple_format` | `memory.ple_format` | `HIPFIRE_PLE_FORMAT` | `auto` (q4 on gfx1151, q8 elsewhere; see [Qwen4 PLE row tables](#qwen4-ple-row-tables)) |
 | `ple_prewarm_bytes` | `memory.ple_prewarm_bytes` | `HIPFIRE_PLE_PREWARM_BYTES` | `auto` (prewarm 15 GiB of the q4 PLE table, capped at `MemAvailable` − 8 GiB; `0` off) |
 | `ple_load_fill_bytes` | `memory.ple_load_fill_bytes` | `HIPFIRE_PLE_LOAD_FILL_BYTES` | `auto` (read the hottest 14 GiB of a rank-ordered q4 PLE table during load at ≤ 0.2 GB/s; `0` off) |
+| `session_cache_disk_bytes` | `memory.session_cache_disk_bytes` | `HIPFIRE_SESSION_CACHE_DISK_BYTES` | 0 (off) |
+| `session_cache_dir` | `memory.session_cache_dir` | `HIPFIRE_SESSION_CACHE_DIR` | `$HIPFIRE_HOME/session-cache` |
 | `devices` | `hardware.devices` | `HIPFIRE_DEVICES` (alias `HIPFIRE_DEVICE`) | unset |
 | `allow_mixed_arch` | `hardware.allow_mixed_arch` | `HIPFIRE_ALLOW_MIXED_ARCH` | false unless `1` |
 | `uniform_vram_tolerance_gb` | `hardware.uniform_vram_tolerance_gb` | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | unset |
@@ -1072,7 +1076,7 @@ misspelled key is unknown and fails the load with
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 
-**Count:** 282 schema keys, plus the `developer.<name>` namespace.
+**Count:** 284 schema keys, plus the `developer.<name>` namespace.
 
 | Key | Legacy key | Env | Lifecycle |
 |---|---|---|---|
@@ -1278,6 +1282,8 @@ misspelled key is unknown and fails the load with
 | `memory.prompt_cache_capacity` | `prompt_cache_capacity` | `HIPFIRE_PROMPT_CACHE_CAP` | stable |
 | `memory.prompt_cache_unbounded` | `prompt_cache_unbounded` | `HIPFIRE_PROMPT_CACHE_UNBOUNDED` | experimental |
 | `memory.session_cache_bytes` | `session_cache_bytes` | `HIPFIRE_SESSION_CACHE_BYTES` | stable |
+| `memory.session_cache_dir` | `session_cache_dir` | `HIPFIRE_SESSION_CACHE_DIR` | stable |
+| `memory.session_cache_disk_bytes` | `session_cache_disk_bytes` | `HIPFIRE_SESSION_CACHE_DISK_BYTES` | stable |
 | `memory.unsafe_wsl_vmm_kv` | `unsafe_wsl_vmm_kv` | `HIPFIRE_UNSAFE_WSL_VMM_KV` | experimental |
 | `model.deepseek4_experts_per_token` | `deepseek4_experts_per_token` |  | stable |
 | `prefill.chunk_rows` | `prefill_chunk_rows` | `HIPFIRE_PREFILL_CHUNK_ROWS` | stable |

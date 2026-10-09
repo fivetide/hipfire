@@ -1667,6 +1667,29 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_PLE_LOAD_FILL_BYTES",
         "Bytes of a rank-ordered q4 PLE table (`<model>.ple-q4`) read into the page cache while the model loads, hottest rows first, at no more than 0.2 GB/s so the weight upload keeps the drive, re-reading pages the upload's cache traffic evicted (hottest first) until ready; the prewarm after ready (`memory.ple_prewarm_bytes`) continues at the end of the resident prefix. Ready never waits for it: what is resident by then serves the first request. Default `auto` = 14 GiB, capped at the table, at an explicit `memory.ple_prewarm_bytes`, and at the host RAM available at load start (MemAvailable plus TTM's page pool) minus the weights the load puts in host RAM minus 8 GiB. `0` turns it off; an explicit N is that many bytes (same caps). Ordinary reclaimable page cache, not charged in admission."
     ),
+    process_field!(
+        "memory.session_cache_disk_bytes",
+        "session_cache_disk_bytes",
+        Memory,
+        DefaultValue::Integer(0),
+        ValueRule::Integer {
+            min: 0,
+            max: 70368744177664
+        },
+        false,
+        "HIPFIRE_SESSION_CACHE_DISK_BYTES",
+        "Byte budget of the session cache's disk tier: snapshots evicted from memory are written to memory.session_cache_dir and restored on demand, surviving restarts. 0 disables it."
+    ),
+    process_field!(
+        "memory.session_cache_dir",
+        "session_cache_dir",
+        Memory,
+        DefaultValue::String(""),
+        ValueRule::String,
+        false,
+        "HIPFIRE_SESSION_CACHE_DIR",
+        "Directory of the session cache's disk tier; empty = $HIPFIRE_HOME/session-cache. One process uses it at a time."
+    ),
     process_bool_field!(
         "memory.prompt_cache_unbounded",
         "prompt_cache_unbounded",
@@ -7019,6 +7042,25 @@ pub mod memory {
     /// (`HIPFIRE_PLE_HOT_DEBUG=1`, developer variable).
     pub fn ple_hot_debug() -> bool {
         developer_var("HIPFIRE_PLE_HOT_DEBUG").is_ok_and(|v| v == "1")
+    }
+
+    /// Byte budget of the session cache's disk tier
+    /// (`memory.session_cache_disk_bytes`, compat env
+    /// `HIPFIRE_SESSION_CACHE_DISK_BYTES`); 0 disables it.
+    pub fn session_cache_disk_bytes() -> u64 {
+        process_value("HIPFIRE_SESSION_CACHE_DISK_BYTES")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Directory of the session cache's disk tier (`memory.session_cache_dir`,
+    /// compat env `HIPFIRE_SESSION_CACHE_DIR`); empty =
+    /// `$HIPFIRE_HOME/session-cache`.
+    pub fn session_cache_dir() -> std::path::PathBuf {
+        match process_value("HIPFIRE_SESSION_CACHE_DIR") {
+            Some(value) if !value.trim().is_empty() => super::expand_tilde(value.trim()),
+            _ => crate::ConfigPaths::discover().root.join("session-cache"),
+        }
     }
 
     /// Which engine executes the ops that read a spilled layer's weights
