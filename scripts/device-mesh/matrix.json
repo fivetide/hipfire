@@ -2021,13 +2021,14 @@
   {
    "commands": {
     "positive": [
-     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_single -- --ignored --test-threads=1 --nocapture"
+     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r HIPFIRE_QWEN36_MOE_FIXTURE=$MODELS_DIR/qwen3.6-35b-a3b.mq4r cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_single -- --ignored --test-threads=1 --nocapture"
     ],
     "negative": []
    },
    "fixtures": [
     "qwen3.8:27b-mq4-xt",
-    "ornith-1.5:35b-a3b-mq4r"
+    "ornith-1.5:35b-a3b-mq4r",
+    "qwen3.6:35b-a3b-mq4r"
    ],
    "hosts": [
     "gfx1201",
@@ -2036,16 +2037,17 @@
    ],
    "id": "g1-route-oracles-nonllama",
    "milestone": "G1",
-   "note": "Single-route cells (Qwen35 dense + MoE, fresh load A vs B, bitwise). The PP/TP mesh cells are g1-route-oracles-mesh; the EP cell is g5-ep2-vs-single-physical.",
+   "note": "Single-route cells (Qwen35 dense, Ornith MoE and Qwen3.6 MoE, fresh load A vs B, bitwise). The PP/TP mesh cells are g1-route-oracles-mesh; the EP cell is g5-ep2-vs-single-physical.",
    "predicate": {
     "forbid": [
      "skip:"
     ],
     "kind": "cargo",
-    "min_passed": 2,
+    "min_passed": 3,
     "require": [
      "g1-single-oracle[dense]: PASS",
-     "g1-single-oracle[moe]: PASS"
+     "g1-single-oracle[moe]: PASS",
+     "g1-single-oracle[moe-qwen3.6]: PASS"
     ]
    },
    "probe": "existing",
