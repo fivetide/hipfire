@@ -678,7 +678,7 @@ fn checked_batch_seq_len(start_pos: usize, batch: usize, max_seq: usize) -> Resu
 }
 
 /// Batched verify forward. See module-level note above. `tokens.len()` = B
-/// (1..=64, the `gemm_q8_0_batched` / batched-attention kernel cap). Returns
+/// (1..=`GEMMA4_FORWARD_BATCH_MAX`). Returns
 /// the LAST token's logits. Side effect: writes both KV caches for positions
 /// [start_pos, start_pos+B) and sets `state.n_tokens = start_pos + B`.
 ///
@@ -892,13 +892,67 @@ fn forward_rows(
         }),
         _ => None,
     };
+    // Grouped routed-expert scratch for the batched rows (index buffers are
+    // i32 in F32-sized slots).
+    let routed_batch = match state.moe.as_ref() {
+        Some(_) if b > 1 => {
+            let (k, ne, mi) = (
+                cfg.top_k_experts,
+                cfg.num_experts,
+                cfg.moe_intermediate_size,
+            );
+            let m_total = hipfire_dispatch::pipeline::sandwich::RoutedBatch::m_total(b, k, ne);
+            let block_m = hipfire_dispatch::families::moe::MOE_GROUPED_BLOCK_M;
+            let mut a = |n: usize, label: &str| bufs.alloc(n, label);
+            Some([
+                a(b * dim, "moe input")?,
+                a(b * dim, "moe input_rot")?,
+                a(b * ne, "moe router_logits")?,
+                a(b * k, "moe topk_indices")?,
+                a(b * k, "moe topk_weights")?,
+                a(b * k, "moe inverse_perm")?,
+                a(ne, "moe counts")?,
+                a(ne + 1, "moe offsets")?,
+                a(m_total, "moe sorted_slots")?,
+                a(m_total / block_m, "moe tile_ids")?,
+                a(m_total * (2 * mi).max(dim), "moe grouped rows")?,
+                a(b * k * mi, "moe gate")?,
+                a(b * k * mi, "moe up")?,
+                a(b * dim, "moe out")?,
+            ])
+        }
+        _ => None,
+    };
+    let routed = state.moe.as_ref().map(|m| {
+        let mut r = crate::program::routed_scratch(m);
+        r.batch =
+            routed_batch
+                .as_ref()
+                .map(|t| hipfire_dispatch::pipeline::sandwich::RoutedBatch {
+                    input: &t[0],
+                    input_rot: &t[1],
+                    router_logits: &t[2],
+                    topk_indices: &t[3],
+                    topk_weights: &t[4],
+                    inverse_perm: &t[5],
+                    counts: &t[6],
+                    offsets: &t[7],
+                    sorted_slots: &t[8],
+                    tile_ids: &t[9],
+                    gate_up_grouped: &t[10],
+                    gate: &t[11],
+                    up: &t[12],
+                    out: &t[13],
+                });
+        r
+    });
     let binding = ProgramBinding {
         geo: Geometry::eager(cfg),
         resident: eager_resident(state),
         rows: b,
         position: start_pos,
         positions: Some(&acts.positions),
-        scratch: acts.scratch(ple, state.moe.as_ref().map(crate::program::routed_scratch)),
+        scratch: acts.scratch(ple, routed),
     };
     let mut steps = Vec::with_capacity(4 * cfg.n_layers);
     for (layer_idx, layer) in weights.layers.iter().enumerate() {

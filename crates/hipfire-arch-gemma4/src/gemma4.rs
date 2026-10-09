@@ -15,7 +15,11 @@ use hipfire_runtime::weight_backend::load_embedding;
 use hipfire_runtime::weight_store::upload_pooled_bytes;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-pub(crate) const GEMMA4_FORWARD_BATCH_MAX: usize = 64;
+/// Rows per batched forward.
+pub(crate) const GEMMA4_FORWARD_BATCH_MAX: usize = 256;
+/// Query rows the flash partials are sized for; batched attention launches
+/// split larger batches into sub-batches of this many rows.
+const FLASH_PARTIALS_ROWS: usize = 64;
 
 // ───────────────────────── Allocation ledger ─────────────────────────
 
@@ -1169,7 +1173,7 @@ impl Gemma4State {
             l.gpu,
             &crate::program::Geometry::eager(cfg),
             max_seq,
-            GEMMA4_FORWARD_BATCH_MAX,
+            FLASH_PARTIALS_ROWS,
         );
         if tier != FullKvTier::Q8 {
             partials = partials.max(asym3_flash_partials_len(cfg, max_seq));

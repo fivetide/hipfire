@@ -48,7 +48,7 @@
   - The 26B-A4B now takes the 12B's fused qk-norm+RoPE and post-norm+residual
     kernels. Greedy text stays coherent and can diverge late.
   - `calib_sweep`, `eval_hipfire` and `prefill_parity_gemma4` prefill Gemma 4
-    through the same program (`forward::forward_prefill_batch`, 64-row
+    through the same program (`forward::forward_prefill_batch`, 256-row
     chunks, Q8 KV). The dispatch sandwich projections feed the calibration
     collector, so any architecture on these steps calibrates without
     per-architecture taps. Gemma calibration and KLD numbers move: the tools
@@ -68,7 +68,7 @@
 - Gemma 4 runs on one weight stack: the 26B-A4B MoE loads through the same
   config, weights, state and forward as the 12B and E-series, and the separate
   `lowered.rs` stack is gone. Its sliding cache is position-indexed like the
-  12B's (no 1024-row ring), so batched prefill (default on gfx1100/gfx1201)
+  12B's (no 1024-row ring), so batched prefill (default on gfx1100/gfx1151/gfx1201)
   now reaches the 26B on Q8/Q8 loads.
   Its hipGraph decode is off when expert `down_proj` is Q8_0, whose atomic
   sum is not replay-exact. Text on the q8-experts and requantized MQ4 26B
@@ -94,6 +94,30 @@
   bitwise-equal to single-row decode, so greedy EAGLE can leave the AR stream
   where two logits are nearly tied. Measured on gfx1151: one of five fixture
   prompts at a 0.021-logit margin.
+- Gemma 4 prefills in 256-row batches by default on gfx1151
+  (`HIPFIRE_GEMMA4_PREFILL_BATCH` overrides; gfx1100/gfx1201 keep 64, other
+  architectures stay per-token). On gfx1151 the batched rows:
+  - route the 26B-A4B's experts sorted by expert: one scatter, a grouped WMMA
+    gate/up (MQ4G256V2, MQ6G256) and a grouped HFQ4-G128 down per batch, so
+    each expert's weights are read once per batch. The router stays an
+    F32-activation Q8 GEMV: the F16 WMMA GEMM moves router logits by ~1e-3
+    and flips near-tied experts;
+  - project MQ4G256V2 weights through WMMA (previously one GEMV per row) and
+    Q8 weights through the 4-warp 64x64 WMMA tile;
+  - attend with a GQA-shared WMMA flash kernel, sliding window included
+    (`HIPFIRE_Q8_PREFILL_GQA_WMMA=0` restores the tile kernels);
+  - compute the LM head on the last chunk only.
+  Greedy continuations differ from per-token prefill only by reduction order:
+  the reference continuation's NLL moves by at most 0.02 nats/token across
+  12B, E2B, E4B and both 26B fixtures.
+- Gemma 4 26B-A4B long-context decode: flash-decode tiles that lie wholly
+  below the sliding window exit without reading V, and the Q8 reduce skips
+  them and loads tile partials eight at a time (both bit-exact, for every
+  model on these kernels). On gfx1151 the Gemma decode shapes (head_dim 256 /
+  GQA 2, head_dim 512 / GQA 8) run a GQA-shared 8-wave tile
+  (`HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA_GEMMA=0` restores the reference tile),
+  and the HFQ4-G128 routed down kernel computes eight rows per workgroup
+  with all eight experts' loads in flight.
 
 ## v0.4.1.1 — release draft
 
