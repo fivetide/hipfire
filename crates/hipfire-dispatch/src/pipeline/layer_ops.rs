@@ -2627,9 +2627,10 @@ pub fn execute_indexed_attention_hc(
         ))?;
     }
 
-    // Every QSA launch declares a position-independent shape: the pool grid and
-    // both dynamic-LDS reservations come from the declared capacities while the
-    // active lengths stay scalars. Measured bit-identical to the position-derived
+    // Every QSA launch declares a position-independent shape: the incremental
+    // pool grid is `ceil(rows / compress)` (offset by the `first_block` kernarg)
+    // and both dynamic-LDS reservations come from the declared capacities while
+    // the active lengths stay scalars. Measured bit-identical to the position-derived
     // shapes with no throughput delta (docs/design/qwen4-program-retained-pm4.md).
     if complete > 0 {
         // Pool only the blocks this launch's rows complete: blocks below

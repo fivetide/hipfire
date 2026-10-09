@@ -3389,11 +3389,13 @@ static __device__ __forceinline__ void qsa_pool_rope(
     int compress,
     int index_dim,
     int first_block) {
-    int block = (int)blockIdx.x;
+    // The grid starts at `first_block` (0 for the full pool): blocks below it
+    // already hold this kernel's output for their unchanged raw keys (the
+    // incremental decode caller), so an incremental launch covers only the
+    // blocks its rows complete.
+    int block = first_block + (int)blockIdx.x;
     int channel = (int)(blockIdx.y * blockDim.x + threadIdx.x);
-    // Blocks below `first_block` already hold this kernel's output for their
-    // unchanged raw keys (the incremental decode caller).
-    if (block < first_block || block >= block_count || compress <= 0) return;
+    if ( block >= block_count || compress <= 0) return;
     bool active = channel < index_dim;
     int base = block * compress * index_dim;
     float mean = 0.0f;

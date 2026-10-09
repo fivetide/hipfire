@@ -3916,10 +3916,12 @@ pub struct IndexedAttentionPoolRope<'a> {
     /// Declared source of `block_count`, or `None` for a synthetic caller whose
     /// count is not position-derived (which then declares nothing).
     pub position: Option<QsaPositionBinding>,
-    /// Declared `grid.x` for this launch. A retained tape needs the grid to be
-    /// position-independent, so callers pass the capacity the kernel masks
-    /// against (`>= block_count`); a caller without a capacity passes the active
-    /// count. Must be `>= block_count`.
+    /// `grid.x` bound for a full (non-incremental) launch. A retained tape needs
+    /// the grid to be position-independent, so callers pass the capacity the
+    /// kernel masks against (`>= block_count`); a caller without a capacity
+    /// passes the active count. Must be `>= block_count`. An incremental launch
+    /// instead uses `ceil(rows / compress)` (capped by this bound), which is
+    /// also position-independent.
     pub grid_bound: usize,
 }
 
@@ -4007,7 +4009,19 @@ fn indexed_attention_pool_rope_impl(
             ),
         ));
     }
-    let block_grid = checked_u32(p.grid_bound, "QSA pool/RoPE block grid")?;
+    // An incremental launch completes `(start + rows) / c - start / c <=
+    // ceil(rows / c)` blocks from `first_block` (the kernel offsets
+    // `blockIdx.x` by it), so its grid depends on `rows` only: constant across
+    // replayed positions, with `first_block` arriving as a declared kernarg.
+    let grid_x = match (incremental, p.position) {
+        (true, Some(position)) => position
+            .rows
+            .div_ceil(p.compress)
+            .max(1)
+            .min(p.grid_bound),
+        _ => p.grid_bound,
+    };
+    let block_grid = checked_u32(grid_x, "QSA pool/RoPE block grid")?;
     let dim_grid = blocks(p.index_dim)?;
     if p.raw_keys.numel() < raw_elements || p.pooled.numel() < pooled_elements {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
@@ -8304,6 +8318,69 @@ mod tests {
             pooled_pinned, pooled_derived,
             "a masked pool grid above the active block count changed the result"
         );
+
+        // ── incremental pool: `first_block > 0` at a large capacity ──
+        // The grid is `ceil(rows / compress)` offset by `first_block`, not the
+        // capacity: every block the rows complete must equal the full pool,
+        // and every block below `first_block` must stay untouched.
+        let inc_blocks = 40usize;
+        let inc_capacity = 65_536usize;
+        let inc_cells = inc_blocks * compress * index_dim;
+        let inc_raw: Vec<f32> = (0..inc_cells)
+            .map(|i| ((i * 37 % 251) as f32 - 125.0) / 37.0)
+            .collect();
+        let inc_raw_gpu = gpu.upload_f32(&inc_raw, &[inc_cells]).expect("raw upload");
+        let inc_pool = |gpu: &mut Gpu, position: Option<QsaPositionBinding>| {
+            let sentinel = vec![-7.5f32; inc_blocks * index_dim];
+            let pooled = gpu
+                .upload_f32(&sentinel, &[sentinel.len()])
+                .expect("pooled upload");
+            let p = IndexedAttentionPoolRope {
+                raw_keys: &inc_raw_gpu,
+                pooled: &pooled,
+                norm: None,
+                block_count: inc_blocks,
+                compress,
+                index_dim,
+                position,
+                grid_bound: inc_capacity,
+            };
+            match position {
+                Some(_) => indexed_attention_pool_rope_incremental(gpu, &p),
+                None => indexed_attention_pool_rope(gpu, &p),
+            }
+            .expect("QSA pool/RoPE");
+            let values = gpu.download_f32(&pooled).expect("pooled download");
+            gpu.free_tensor(pooled).expect("free pooled");
+            values
+        };
+        let full = inc_pool(&mut gpu, None);
+        assert!(full.iter().all(|v| *v != -7.5), "full pool left a block unwritten");
+        // `(position_start + rows) / compress == inc_blocks`, aligned and
+        // unaligned, completing zero to three blocks.
+        for (position_start, rows) in [
+            (150, 10),
+            (153, 7),
+            (155, 5),
+            (156, 4),
+            (157, 3),
+            (158, 2),
+            (159, 1),
+            (160, 3),
+        ] {
+            let inc = inc_pool(&mut gpu, Some(QsaPositionBinding { position_start, rows }));
+            let split = position_start / compress * index_dim;
+            assert!(
+                inc[..split].iter().all(|v| *v == -7.5),
+                "incremental pool at {position_start}+{rows} wrote below first_block"
+            );
+            assert_eq!(
+                inc[split..],
+                full[split..],
+                "incremental pool at {position_start}+{rows} diverged from the full pool"
+            );
+        }
+        gpu.free_tensor(inc_raw_gpu).expect("free raw");
 
         // ── select: a larger LDS reservation, at an active count and at zero ──
         let index_heads = 2usize;

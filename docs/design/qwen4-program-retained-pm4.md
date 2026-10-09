@@ -453,6 +453,13 @@ must fix.
   count as `PositionDivU32 { addend: rows, divisor: compress }`; the wrapper
   verifies the caller's count *equals* the declared formula, so the declaration
   cannot drift from the launch.
+- The incremental pool (every decode/prefill lowering) does not use the
+  capacity grid: its `grid.x` is `ceil(rows / compress)`, the most blocks a
+  launch of `rows` rows can complete, and the kernel offsets `blockIdx.x` by
+  `first_block` (`PositionDivU32 { addend: 0, divisor: compress }`). The grid is
+  still constant per launch shape, so retained programs stay valid. At the
+  automatic `max_seq` 262144 the capacity grid was 65,536 workgroups of which
+  1–2 worked, ~4% of Flash-Next C1 decode on gfx1151.
 - `IndexedAttentionSelectBatch` takes a declared `shape_blocks` (LDS + symbol come
   from the bound, not the active count) and declares both its active count and
   `position_start`. `IndexedAttentionAttentionBatch` takes a declared
