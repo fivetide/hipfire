@@ -36,7 +36,7 @@ use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const MODEL_ENV: &str = "HIPFIRE_SESSION_CACHE_MODEL";
 const MAX_SEQ: usize = 32768;
@@ -179,10 +179,11 @@ struct Loaded {
 }
 
 /// Load the model named by `HIPFIRE_SESSION_CACHE_MODEL` and attach the
-/// forward and an unbounded session cache. `turn_snapshots` sets message-end
-/// snapshots explicitly, whatever `HIPFIRE_QWEN4_TURN_SNAPSHOTS` says (the
-/// `<|im_end|>` token is still the caller's `set_turn_end_token`).
-fn load(turn_snapshots: bool) -> Loaded {
+/// forward and an unbounded session cache, with a disk tier in `disk` when
+/// given. `turn_snapshots` sets message-end snapshots explicitly, whatever
+/// `HIPFIRE_QWEN4_TURN_SNAPSHOTS` says (the `<|im_end|>` token is still the
+/// caller's `set_turn_end_token`).
+fn load(turn_snapshots: bool, disk: Option<&Path>) -> Loaded {
     let model = std::env::var_os(MODEL_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| panic!("{MODEL_ENV} must name qwen3.8-flash-next-gptq3.mq4"));
@@ -234,7 +235,11 @@ fn load(turn_snapshots: bool) -> Loaded {
     .expect("assemble");
     bundle.set_turn_snapshots(turn_snapshots);
     bundle.attach_forward(&mut gpu, MAX_SEQ).expect("forward");
-    bundle.attach_session_cache(SessionCache::new(domain, u64::MAX >> 1));
+    let cache = SessionCache::new(domain, u64::MAX >> 1);
+    bundle.attach_session_cache(match disk {
+        Some(dir) => cache.with_disk(dir, 1 << 40),
+        None => cache,
+    });
     Loaded {
         bundle,
         gpu,
@@ -255,7 +260,7 @@ fn restored_prefill_matches_cold_on_flash_next() {
         vocab,
         backend,
         ..
-    } = load(false);
+    } = load(false, None);
     let chunk = bundle.spec_chunk_rows().expect("chunk rows");
     let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
     let a = prompt(0xa, 3 * chunk + 300);
@@ -317,6 +322,49 @@ fn restored_prefill_matches_cold_on_flash_next() {
     bundle.free_gpu(&mut gpu).expect("free bundle");
 }
 
+/// Snapshots demoted to the disk tier by unload restore into a second load
+/// of the model (new per-process model ids, same build) byte-equal to a cold
+/// prefill.
+#[test]
+#[ignore = "needs a HIP GPU and HIPFIRE_SESSION_CACHE_MODEL"]
+fn disk_snapshots_restore_after_reload_on_flash_next() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("qwen4-session-disk");
+    let _ = std::fs::remove_dir_all(&dir);
+    let Loaded {
+        mut bundle,
+        mut gpu,
+        vocab,
+        ..
+    } = load(false, Some(&dir));
+    let chunk = bundle.spec_chunk_rows().expect("chunk rows");
+    let a = prompt(0xa, 3 * chunk + 300);
+    let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
+    let cold = run(&mut bundle, &mut gpu, &logits, &a, 0);
+    gpu.free_tensor(logits).expect("free logits");
+    // Unload demotes every snapshot and releases the directory lock.
+    bundle.free_gpu(&mut gpu).expect("free bundle");
+    drop(gpu);
+
+    let Loaded {
+        mut bundle,
+        mut gpu,
+        ..
+    } = load(false, Some(&dir));
+    let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
+    let reused = bundle.session_plan(&a, SessionRoute::Ar);
+    assert_eq!(reused, 3 * chunk, "plan must offer A's disk snapshot");
+    let (digests, warm_logits, warm_ids) = run(&mut bundle, &mut gpu, &logits, &a, reused);
+    assert_same_state("disk A", &cold.0, &digests);
+    assert!(
+        warm_logits == cold.1,
+        "disk A: restored final logits differ from cold"
+    );
+    assert_eq!(warm_ids, cold.2, "disk A");
+    gpu.free_tensor(logits).expect("free logits");
+    bundle.free_gpu(&mut gpu).expect("free bundle");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// P1b: message-end snapshots (`HIPFIRE_QWEN4_TURN_SNAPSHOTS`, forced on through
 /// `set_turn_snapshots`). A prompt with two message ends below one chunk is
 /// prefilled cold and committed; a second prompt extending the first message
@@ -335,7 +383,7 @@ fn message_end_snapshots_restore_on_flash_next() {
         tokenizer,
         vocab,
         ..
-    } = load(true);
+    } = load(true, None);
     let im_end = tokenizer
         .special_token_id("<|im_end|>")
         .expect("tokenizer has <|im_end|>");
