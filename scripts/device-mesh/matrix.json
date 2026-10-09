@@ -1546,11 +1546,11 @@
    "commands": {
     "negative": [],
     "positive": [
-     "HIPFIRE_DSPARK_FIXTURE=/home/kaden/.hipfire/models/deepseek-v4-flash-0731-dspark.mq2r cargo test -p hipfire-arch-deepseek4 --locked dspark_after_ -- --ignored --test-threads=1"
+     "HIPFIRE_DSPARK_FIXTURE=$MODELS_DIR/deepseek-v4-flash-0731-dspark.mq2r cargo test -p hipfire-arch-deepseek4 --locked dspark_after_ -- --ignored --test-threads=1"
     ]
    },
    "env": {
-    "HIPFIRE_DSPARK_FIXTURE": "/home/kaden/.hipfire/models/deepseek-v4-flash-0731-dspark.mq2r"
+    "HIPFIRE_DSPARK_FIXTURE": "$MODELS_DIR/deepseek-v4-flash-0731-dspark.mq2r"
    },
    "fixtures": [
     "ornith-1.5:35b-a3b-mq4r"
@@ -1573,14 +1573,14 @@
    "probe": "existing",
    "route": "single/dspark-staged-construction-rollback",
    "fixture_files": [
-    "/home/kaden/.hipfire/models/deepseek-v4-flash-0731-dspark.mq2r"
+    "$MODELS_DIR/deepseek-v4-flash-0731-dspark.mq2r"
    ]
   },
   {
    "commands": {
     "negative": [],
     "positive": [
-     "HIPFIRE_QWEN35_RESET_MODEL=/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw single_qwen35 -- --ignored --test-threads=1"
+     "HIPFIRE_QWEN35_RESET_MODEL=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw single_qwen35 -- --ignored --test-threads=1"
     ]
    },
    "env": {
@@ -1612,7 +1612,7 @@
   {
    "commands": {
     "positive": [
-     "HIPFIRE_QWEN35_RESET_MODEL=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_DFLASH_DRAFT=/home/kaden/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw dflash_qwen35 -- --ignored --test-threads=1"
+     "HIPFIRE_QWEN35_RESET_MODEL=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_DFLASH_DRAFT=$MODELS_DIR/qwen38-27b-dflash-mq4.hfq HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw dflash_qwen35 -- --ignored --test-threads=1"
     ],
     "negative": [
      "HIPFIRE_QWEN35_RESET_MODEL=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw single_qwen35 -- --ignored --test-threads=1"
@@ -1643,14 +1643,14 @@
    "commands": {
     "negative": [],
     "positive": [
-     "HIPFIRE_HAVE_2_GPU=1 HIPFIRE_PP_RESET_MODEL=/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt HIPFIRE_PP_DEVICES=0,1 HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw pp_qwen35 -- --ignored --test-threads=1"
+     "HIPFIRE_HAVE_2_GPU=1 HIPFIRE_PP_RESET_MODEL=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_PP_DEVICES=0,1 HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw pp_qwen35 -- --ignored --test-threads=1"
     ]
    },
    "env": {
     "HIPFIRE_DAEMON_BIN": "$DAEMON_BIN",
     "HIPFIRE_HAVE_2_GPU": "1",
     "HIPFIRE_PP_DEVICES": "0,1",
-    "HIPFIRE_PP_RESET_MODEL": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+    "HIPFIRE_PP_RESET_MODEL": "$MODELS_DIR/qwen3.8-27b.mq4-xt",
     "HIPFIRE_RESET_ROUNDS": "1"
    },
    "fixtures": [
@@ -1705,21 +1705,21 @@
    "probe": "existing",
    "route": "single/dense-route-rollback",
    "fixture_files": [
-    "/home/kaden/.hipfire/models/lfm2.5-1.2b.mq4"
+    "$MODELS_DIR/lfm2.5-1.2b.mq4"
    ]
   },
   {
    "commands": {
     "positive": [
-     "HIPFIRE_VISION_FIXTURE=\"/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt,/home/kaden/.hipfire/models/qwen3.8-27b-vision.hfq\" HIPFIRE_DOTS_OCR_FIXTURE=/home/kaden/.hipfire/models/dots-ocr.q8.hfq cargo test -p hipfire-generate --locked --test vision_lifecycle_tests -- --ignored --test-threads=1"
+     "HIPFIRE_VISION_FIXTURE=\"$MODELS_DIR/qwen3.8-27b.mq4-xt,$MODELS_DIR/qwen3.8-27b-vision.hfq\" HIPFIRE_DOTS_OCR_FIXTURE=$MODELS_DIR/dots-ocr.q8.hfq cargo test -p hipfire-generate --locked --test vision_lifecycle_tests -- --ignored --test-threads=1"
     ],
     "negative": [
      "cargo test -p hipfire-generate --locked --test vision_lifecycle_tests vision_fixture_pair_rejects -- --test-threads=1"
     ]
    },
    "env": {
-    "HIPFIRE_VISION_FIXTURE": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt,/home/kaden/.hipfire/models/qwen3.8-27b-vision.hfq",
-    "HIPFIRE_DOTS_OCR_FIXTURE": "/home/kaden/.hipfire/models/dots-ocr.q8.hfq"
+    "HIPFIRE_VISION_FIXTURE": "$MODELS_DIR/qwen3.8-27b.mq4-xt,$MODELS_DIR/qwen3.8-27b-vision.hfq",
+    "HIPFIRE_DOTS_OCR_FIXTURE": "$MODELS_DIR/dots-ocr.q8.hfq"
    },
    "fixtures": [
     "qwen3.8:27b-mq4-xt"
@@ -1742,8 +1742,8 @@
    "probe": "existing",
    "route": "single/vision-ocr-lifecycle",
    "fixture_files": [
-    "/home/kaden/.hipfire/models/qwen3.8-27b-vision.hfq",
-    "/home/kaden/.hipfire/models/dots-ocr.q8.hfq"
+    "$MODELS_DIR/qwen3.8-27b-vision.hfq",
+    "$MODELS_DIR/dots-ocr.q8.hfq"
    ],
    "timeout": 2000
   },

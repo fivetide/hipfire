@@ -508,7 +508,7 @@ def prompt_identity(ctx, row, mapping):
     return ""
 def fixture_identity(ctx, row):
     pairs = [(t, ctx["fixture_paths"].get(t, "")) for t in row.get("fixtures", [])]
-    pairs += [(os.path.basename(p), p) for p in row.get("fixture_files", [])]
+    pairs += [(os.path.basename(p), p) for p in subst(row.get("fixture_files", []), {"$MODELS_DIR": models_dir()})]
     out = []
     for tag, path in pairs:
         try:
@@ -556,7 +556,7 @@ def execute_row(ctx, row, out, timeout):
         return "rerun-required", "no existing probe: %s" % row.get("note", ""), detail
     if needs_gpu(row) and not has_gpu():
         return "hardware-blocked", "no HIP GPU (/dev/kfd and /dev/dri absent)", detail
-    paths = [ctx["fixture_paths"].get(t, "") for t in row.get("fixtures", [])] + row.get("fixture_files", [])
+    paths = [ctx["fixture_paths"].get(t, "") for t in row.get("fixtures", [])] + subst(row.get("fixture_files", []), mapping)
     # Rows that carry their fixture inline as an env prefix (HIPFIRE_*_FIXTURE=
     # /path[,/path]) are just as host-dependent as a declared fixture: on a host
     # without that sidecar the command runs and reports zero tests, which is
