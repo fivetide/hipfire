@@ -7820,6 +7820,16 @@ pub fn generate_cohere2moe(
         return;
     }
 
+    // Open the stream contract before any token or post-validation terminal:
+    // the CLI fail-closes on any event that precedes `gen_start` (same fix as
+    // DS4 and lfm2moe). The optional `<think>` opener below stays in-band text.
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::CohereAr),
+        stdout,
+        id,
+        false,
+    );
+
     let eos_tok = m.cohere2moe().unwrap().eos_tok;
 
     // Capacity guard. No eviction on arch_id=12 — reset the KV cursor when the
