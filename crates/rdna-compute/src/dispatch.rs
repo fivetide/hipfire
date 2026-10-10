@@ -6182,6 +6182,7 @@ impl Gpu {
     /// owned by no tensor. `hipMemGetInfo` counts them as used; every pool
     /// allocation and VMM map returns them to HIP on demand before failing.
     pub fn pool_parked_bytes(&self) -> usize {
+        // bind_thread: skip — pure read of the pool's host-side byte counter, no HIP call.
         self.pool.pooled_bytes()
     }
 
