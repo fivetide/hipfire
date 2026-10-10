@@ -247,8 +247,8 @@ impl MultiChunkScratch {
 /// Does this request's singleton attend run `attention_fp8_e4m3_kv_batched`
 /// after `kv_cache_write_fp8_e4m3_batched` (the fp8 scalar-batched arm:
 /// gfx1201, under 64 rows, context at most the 4096 crossover, not a
-/// speculative-verify block, which takes the tile + reduce —
-/// `verify_attend_takes_tile`)? Then the
+/// DFlash chain-verify block, which takes the tile + reduce —
+/// `DispatchCtx::verify_tile_attend`)? Then the
 /// segment twin reproduces it.
 fn attn_fp8_twin_eligible(
     gpu: &Gpu,
@@ -256,13 +256,13 @@ fn attn_fp8_twin_eligible(
     kv: &llama::KvCache,
     start_pos: usize,
     n: usize,
-    workload: DispatchWorkload,
+    fusion: DflashFusionCtx,
 ) -> bool {
     if !(gpu.arch_caps.is_gfx1201()
         && kv.quant_fp8
         && (MIN_BATCH..64).contains(&n)
         && start_pos + n <= 4096
-        && !hipfire_dispatch::families::attention::verify_attend_takes_tile(workload, n))
+        && fusion != DflashFusionCtx::ChainVerify)
     {
         return false;
     }
@@ -512,14 +512,18 @@ pub fn forward_prefill_batch_multi(
     let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
     let arch_has_wmma = q8_wmma_arch;
     let tapes = reqs.iter().any(|r| r.gdn_tape.is_some());
-    let ctx = DispatchCtx::new(gpu).with_workload(prefill_dispatch_workload(hidden_out.is_some(), tapes, false));
+    let workload = prefill_dispatch_workload(hidden_out.is_some(), tapes, false);
+    // MTP / plain requests keep the attend crossover; a ChainVerify request
+    // attends through the tile + reduce (`verify_tile_attend`).
+    let ctx = DispatchCtx::new(gpu).with_workload(workload);
+    let chain_ctx = DispatchCtx::new(gpu).with_workload(workload).with_verify_tile_attend(true);
 
     // Requests whose singleton attend is the fp8 scalar-batched arm run it
     // as one segment-twin launch per layer (tables staged up front). All
     // twin segments share the singleton `max_seq` (`physical_cap`) word.
     let mut twin_attn: Vec<bool> = reqs
         .iter()
-        .map(|r| *SEG_TWINS && attn_fp8_twin_eligible(gpu, s, r.kv_cache, r.start_pos, r.tokens.len(), ctx.workload))
+        .map(|r| *SEG_TWINS && attn_fp8_twin_eligible(gpu, s, r.kv_cache, r.start_pos, r.tokens.len(), r.fusion))
         .collect();
     let twin_cap = reqs.iter().zip(&twin_attn).find(|(_, &t)| t).map(|(r, _)| r.kv_cache.physical_cap);
     for (r, t) in reqs.iter().zip(twin_attn.iter_mut()) {
@@ -669,6 +673,7 @@ pub fn forward_prefill_batch_multi(
                 for ((r, view), &twin) in reqs.iter_mut().zip(&views).zip(&twin_attn) {
                     let n = r.tokens.len();
                     let max_ctx_len = r.start_pos + n;
+                    let rctx = if r.fusion == DflashFusionCtx::ChainVerify { &chain_ctx } else { &ctx };
                     let gfx12_fa_prep = gfx12_fa_prep_admitted(gpu, config, r.fusion, n);
                     let multirow = q8_multirow_attn_admitted(
                         gpu.arch_caps.arch(),
@@ -683,7 +688,7 @@ pub fn forward_prefill_batch_multi(
                         false,
                     );
                     batch_chunk_full_attn_prepare(
-                        gpu, multirow, layer, config, view, s, r.kv_cache, n, r.start_pos, max_ctx_len, &ctx, sem, None,
+                        gpu, multirow, layer, config, view, s, r.kv_cache, n, r.start_pos, max_ctx_len, rctx, sem, None,
                         kv_layer_idx, layer_idx, r.fusion, gfx12_fa_prep, false, false,
                     )?;
                     if twin {
@@ -703,7 +708,7 @@ pub fn forward_prefill_batch_multi(
                         }
                     } else {
                         batch_chunk_fa_attend(
-                            gpu, config, view, s, r.kv_cache, n, r.start_pos, max_ctx_len, &ctx, sem, None, layer_idx,
+                            gpu, config, view, s, r.kv_cache, n, r.start_pos, max_ctx_len, rctx, sem, None, layer_idx,
                             multirow, None, false,
                         )?;
                     }

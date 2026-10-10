@@ -906,22 +906,6 @@ fn gfx12_query16_arch_default_eligible(arch: &str) -> bool {
     arch == "gfx1201"
 }
 
-/// Largest speculative-verify block that bypasses the batched Q8/fp8 LDS
-/// crossover (the VerifyAttn row bound: DFlash B = 16, MTP K + 1).
-pub const VERIFY_TILE_ATTEND_MAX_ROWS: usize = 32;
-
-/// Whether a batched masked Q8/fp8 attend of `batch_size` rows skips the LDS
-/// kernel and always takes the tile + reduce. True for speculative verify
-/// blocks: at B = 16 the LDS kernel is 3.8-23x slower (ctx 64-4096, fp8 KV,
-/// R9700), and the tile + reduce output does not depend on `max_ctx_len`, so
-/// the eager verify and its HIP graph (recorded with `physical_cap`) produce
-/// the same bytes. Larger `SpeculativeVerify` batches (perplexity/KLD scoring
-/// with captured hidden rows) keep the crossover.
-pub fn verify_attend_takes_tile(workload: crate::context::DispatchWorkload, batch_size: usize) -> bool {
-    workload == crate::context::DispatchWorkload::SpeculativeVerify
-        && batch_size <= VERIFY_TILE_ATTEND_MAX_ROWS
-}
-
 fn dispatch_attend(
     ctx: &DispatchCtx,
     gpu: &mut Gpu,
@@ -2323,9 +2307,9 @@ fn dispatch_attend(
                 } else {
                     8192
                 };
-                // Speculative verify blocks always take the tile + reduce
-                // (`verify_attend_takes_tile`).
-                if io.max_ctx_len <= crossover && !verify_attend_takes_tile(ctx.workload, io.batch_size) {
+                // DFlash ChainVerify blocks always take the tile + reduce
+                // (`DispatchCtx::verify_tile_attend`).
+                if io.max_ctx_len <= crossover && !ctx.verify_tile_attend {
                     // Fast path: single-launch batched kernel, LDS-backed attention tile.
                     let positions = io.positions.unwrap();
                     hip!(gpu.attention_q8_0_kv_batched_masked(
@@ -2552,8 +2536,8 @@ fn dispatch_attend(
                     } else {
                         8192
                     };
-                // Speculative verify blocks: always the tile + reduce.
-                if io.max_ctx_len <= crossover && !verify_attend_takes_tile(ctx.workload, io.batch_size) {
+                // DFlash ChainVerify blocks: always the tile + reduce.
+                if io.max_ctx_len <= crossover && !ctx.verify_tile_attend {
                     let positions = io.positions.unwrap();
                     hip!(gpu.attention_fp8_e4m3_kv_batched(
                         io.q,

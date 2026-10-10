@@ -836,7 +836,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "captured-batch-attention-physical-cap",
         predicates: &[CaptureMode],
-        condition: "`max_ctx_len = if capture_mode { kv_cache.physical_cap } else { logical_max_ctx }` (qwen35 prefill.rs forward_batch_chunk_impl; llama.rs forward_prefill_chunk), feeding the batched Q8 and fp8 attend crossover `max_ctx_len <= 4096` on gfx1200/gfx1201 (hipfire-dispatch families/attention.rs `AttnQ8_0KvBatchedMasked` / `AttnFp8E4m3KvBatchedMasked`) for every attend except speculative-verify blocks of <= 32 rows, which never take the crossover (`verify_attend_takes_tile`; see captured-verify-attention-physical-cap)",
+        condition: "`max_ctx_len = if capture_mode { kv_cache.physical_cap } else { logical_max_ctx }` (qwen35 prefill.rs forward_batch_chunk_impl; llama.rs forward_prefill_chunk), feeding the batched Q8 and fp8 attend crossover `max_ctx_len <= 4096` on gfx1200/gfx1201 (hipfire-dispatch families/attention.rs `AttnQ8_0KvBatchedMasked` / `AttnFp8E4m3KvBatchedMasked`) for every attend except DFlash chain-verify blocks (`DflashFusionCtx::ChainVerify`), which never take the crossover (`DispatchCtx::verify_tile_attend`; see captured-verify-attention-physical-cap); MTP verify keeps the crossover",
         effect: KernelSelection,
         switches: "captured: attention sized by physical_cap (attention_flash_{q8_0,fp8_e4m3}_tile_batched when physical_cap > 4096); recorded or eager: sized by the logical context (attention_{q8_0,fp8_e4m3}_kv_batched at ctx <= 4096) and a logical `max_ctx_len` kernarg",
         kernels: &["attention_q8_0_kv_batched*", "attention_fp8_e4m3_kv_batched*", "attention_flash_q8_0_tile_batched*", "attention_flash_fp8_e4m3_tile_batched*", "attention_flash_asym_reduce_batched*"],
@@ -847,7 +847,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "captured-verify-attention-physical-cap",
         predicates: &[CaptureMode],
-        condition: "the same `max_ctx_len = physical_cap` under capture (qwen35 prefill.rs forward_batch_chunk_impl) for speculative-verify blocks (`SpeculativeVerify` workload, <= 32 rows), which on gfx1200/gfx1201 skip the LDS crossover in both batched attend arms and always run the tile + reduce (hipfire-dispatch families/attention.rs `verify_attend_takes_tile`)",
+        condition: "the same `max_ctx_len = physical_cap` under capture (qwen35 prefill.rs forward_batch_chunk_impl) for DFlash chain-verify blocks (`DflashFusionCtx::ChainVerify`, `DispatchCtx::verify_tile_attend`), which on gfx1200/gfx1201 skip the LDS crossover in both batched attend arms and always run the tile + reduce (hipfire-dispatch families/attention.rs); MTP verify is not captured and keeps the crossover",
         effect: LaunchShape,
         switches: "captured: tile + reduce (gfx1201: the VerifyAttn twin try_attention_verify_gqa) with max_tiles = ceil(physical_cap / tile) and its split count; eager or recorded: the same kernels with max_tiles from the logical context",
         kernels: &["attention_flash_fp8_e4m3_tile_batched*", "attention_flash_q8_0_tile_batched*", "attention_flash_asym_reduce_batched*", "attention_verify_gqa*"],
