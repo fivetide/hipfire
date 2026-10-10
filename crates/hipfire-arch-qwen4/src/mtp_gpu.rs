@@ -422,11 +422,15 @@ impl AppendWidths {
 }
 
 /// Allocations of one [`MtpAppendScratch`], in field order.
-const MTP_APPEND_TENSORS: usize = 14;
+const MTP_APPEND_TENSORS: usize = 15;
 
 /// Row-batched operator buffers of the prompt-fill Append pass
 /// (`Qwen4MtpGpu::append_rows`): the per-row [`MtpGpuScratch`] tensors that an
 /// Append step touches, each with `rows` rows. Never aliases the per-row scratch.
+///
+/// Also owns the prompt chunk's token ids ([`Self::upload_prompt_ids`]): the
+/// whole target chunk uploads once, and each sub-chunk's `append_rows` reads
+/// its rows in place through [`Self::prompt_ids_view`].
 pub(crate) struct MtpAppendScratch {
     /// Row capacity.
     rows: usize,
@@ -445,7 +449,12 @@ pub(crate) struct MtpAppendScratch {
     index: GpuTensor,
     qsa_k: GpuTensor,
     qsa_v: GpuTensor,
+    /// `id_rows` i32 token ids of one prompt chunk, as raw bytes.
+    prompt_ids: GpuTensor,
+    /// Token-id row capacity of `prompt_ids`.
+    id_rows: usize,
     host_token_bytes: Vec<u8>,
+    host_prompt_ids: Vec<u8>,
 }
 
 impl MtpAppendScratch {
@@ -454,8 +463,17 @@ impl MtpAppendScratch {
         self.rows
     }
 
+    /// Token-id row capacity of [`Self::upload_prompt_ids`].
+    pub(crate) fn prompt_id_rows(&self) -> usize {
+        self.id_rows
+    }
+
     /// Element count and dtype of each scratch tensor, in field order.
-    fn shapes(config: &Qwen4Config, rows: usize) -> Option<[(usize, DType); MTP_APPEND_TENSORS]> {
+    fn shapes(
+        config: &Qwen4Config,
+        rows: usize,
+        id_rows: usize,
+    ) -> Option<[(usize, DType); MTP_APPEND_TENSORS]> {
         let w = AppendWidths::new(config)?;
         let per = |width: usize| rows.checked_mul(width);
         Some([
@@ -473,12 +491,14 @@ impl MtpAppendScratch {
             (per(w.index_width)?, DType::F32),
             (per(w.kv_width)?, DType::F32),
             (per(w.kv_width)?, DType::F32),
+            (id_rows.checked_mul(std::mem::size_of::<i32>())?, DType::Raw),
         ])
     }
 
-    /// Device bytes [`Self::new`] allocates for `rows` rows.
-    pub(crate) fn device_bytes(config: &Qwen4Config, rows: usize) -> Option<usize> {
-        Self::shapes(config, rows)?
+    /// Device bytes [`Self::new`] allocates for `rows` rows and `id_rows`
+    /// prompt-chunk token ids.
+    pub(crate) fn device_bytes(config: &Qwen4Config, rows: usize, id_rows: usize) -> Option<usize> {
+        Self::shapes(config, rows, id_rows)?
             .iter()
             .try_fold(0usize, |total, &(elements, dtype)| {
                 total.checked_add(elements.checked_mul(dtype.size())?)
@@ -489,11 +509,12 @@ impl MtpAppendScratch {
         gpu: &mut Gpu,
         config: &Qwen4Config,
         rows: usize,
+        id_rows: usize,
     ) -> Result<Self, MtpGpuError> {
-        if rows == 0 {
+        if rows == 0 || id_rows == 0 {
             return Err(invalid("MTP append scratch needs at least one row"));
         }
-        let shapes = Self::shapes(config, rows)
+        let shapes = Self::shapes(config, rows, id_rows)
             .ok_or_else(|| invalid("MTP append scratch extent overflow"))?;
         let mut allocated = Vec::with_capacity(MTP_APPEND_TENSORS);
         for (elements, dtype) in shapes {
@@ -525,8 +546,50 @@ impl MtpAppendScratch {
             index: next(),
             qsa_k: next(),
             qsa_v: next(),
+            prompt_ids: next(),
+            id_rows,
             host_token_bytes: vec![0; rows * std::mem::size_of::<i32>()],
+            host_prompt_ids: vec![0; id_rows * std::mem::size_of::<i32>()],
         })
+    }
+
+    /// Upload `tokens` (at most the id-row capacity) as the prompt chunk's i32
+    /// ids: the same bytes `append_rows` would upload per sub-chunk. The copy
+    /// is a blocking `hipMemcpy`, so call it where the device is already idle
+    /// (after the target forward's readback) and after every earlier
+    /// `append_rows` that reads the previous chunk's ids has been enqueued.
+    pub(crate) fn upload_prompt_ids(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+    ) -> Result<(), MtpGpuError> {
+        if tokens.is_empty() || tokens.len() > self.id_rows {
+            return Err(invalid(format!(
+                "MTP prompt ids of {} rows need 1..={}",
+                tokens.len(),
+                self.id_rows
+            )));
+        }
+        for (bytes, &token) in self.host_prompt_ids.chunks_exact_mut(4).zip(tokens) {
+            bytes.copy_from_slice(&(token as i32).to_ne_bytes());
+        }
+        gpu.memcpy_htod_auto(
+            &self.prompt_ids.buf,
+            &self.host_prompt_ids[..tokens.len() * std::mem::size_of::<i32>()],
+        )?;
+        Ok(())
+    }
+
+    /// Non-owning view of `rows` prompt-chunk ids from row `first` of the
+    /// last [`Self::upload_prompt_ids`] upload, for `append_rows`'s
+    /// `device_ids`. The view must not be freed.
+    pub(crate) fn prompt_ids_view(&self, first: usize, rows: usize) -> Result<GpuTensor, MtpGpuError> {
+        match first.checked_add(rows) {
+            Some(end) if end <= self.id_rows => Ok(self
+                .prompt_ids
+                .sub_offset(first * std::mem::size_of::<i32>(), rows * std::mem::size_of::<i32>())),
+            _ => Err(invalid("MTP prompt id view is outside the id capacity")),
+        }
     }
 
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
@@ -545,6 +608,7 @@ impl MtpAppendScratch {
             self.index,
             self.qsa_k,
             self.qsa_v,
+            self.prompt_ids,
         ];
         let mut first = None;
         for tensor in tensors {
@@ -2130,9 +2194,13 @@ impl Qwen4MtpGpu {
     ///
     /// `device_ids`, when given, holds `tokens` as `tokens.len()` device i32
     /// ids (at least that many bytes) that the embedding gather reads in place
-    /// of the scratch upload. The backing allocation must remain live and
-    /// any later writes must be ordered after the enqueued embedding gather;
-    /// returning from this call does not imply device completion.
+    /// of the scratch upload: the trunk forward's uploaded rows, or the
+    /// caller's once-per-chunk `MtpAppendScratch::upload_prompt_ids` rows.
+    /// The backing allocation must remain live and any later writes must be
+    /// ordered after the enqueued embedding gather; returning from this call
+    /// does not imply device completion. With `device_ids` this call never
+    /// blocks the host; without it the scratch upload is a blocking
+    /// `hipMemcpy` that waits for all previously queued device work.
     pub(crate) fn append_rows(
         &mut self,
         gpu: &mut Gpu,
@@ -2202,8 +2270,9 @@ impl Qwen4MtpGpu {
         for &token in tokens {
             self.draft.observe(token);
         }
-        // Reused device ids (the trunk's already uploaded rows, same bytes as
-        // `tokens`) skip the host fill and copy; otherwise the scratch uploads.
+        // Given device ids (the trunk's already uploaded rows or the prompt
+        // chunk's one upload, same bytes as `tokens`) skip the host fill and
+        // copy; otherwise the scratch uploads.
         let token_ids = match device_ids {
             Some(ids) => ids,
             None => {

@@ -1045,7 +1045,11 @@ impl Qwen4Bundle {
             ));
         }
         let source = source.sub_offset(offset, width);
-        gpu.copy_d2d(&source, destination, destination.byte_size())
+        // Stream-ordered and host-asynchronous: the copy rides the stream the
+        // kernels launch on (the active stream, else the default stream), so
+        // every consumer sees it in order without the host waiting for the
+        // work queued before it.
+        gpu.memcpy_dtod_at_ordered_async(&destination.buf, 0, &source.buf, 0, destination.byte_size())
             .map_err(BundleError::Hip)
     }
 
@@ -1428,6 +1432,19 @@ impl Qwen4Bundle {
         self.mtp.is_some() && Qwen4MtpGpu::append_rows_supported(gpu, &self.weights, &self.config)
     }
 
+    /// Map the MTP head's QSA context through `last_position` (the row the
+    /// last Append of a run writes) in one go: the coverage each Append's own
+    /// `mapped_mtp` would grow to, so those calls then find it mapped. A VMM
+    /// grow zero-fills with a blocking memset, which belongs where the device
+    /// is idle (before the run's first Append) rather than between launches.
+    pub(crate) fn mtp_map_through(
+        &mut self,
+        gpu: &mut Gpu,
+        last_position: usize,
+    ) -> Result<(), BundleError> {
+        mapped_mtp(self.mtp.as_mut(), gpu, last_position).map(|_| ())
+    }
+
     /// Batched prompt fill: [`MtpStep::Append`] for `tokens` at
     /// `position..position + tokens.len()`, row `i` paired with captured spec
     /// hidden row `hidden_row0 + i`; the same (token p, hidden p) rows as
@@ -1435,8 +1452,11 @@ impl Qwen4Bundle {
     ///
     /// `trunk_ids_row` is `Some(r)` when `tokens` are rows `r..` of the spec
     /// forward that just ran, with nothing run since: the head then embeds
-    /// from that forward's device token ids when they hold exactly `tokens`,
-    /// and uploads its own copy otherwise (or when `None`).
+    /// from that forward's device token ids when they hold exactly `tokens`.
+    /// Otherwise it embeds from `prompt_ids`, device ids that already hold
+    /// exactly `tokens` as i32 (the caller's once-per-chunk upload, see
+    /// `MtpAppendScratch::upload_prompt_ids`), and uploads its own copy when
+    /// that is `None` too.
     pub(crate) fn mtp_append_rows(
         &mut self,
         gpu: &mut Gpu,
@@ -1444,6 +1464,7 @@ impl Qwen4Bundle {
         tokens: &[u32],
         hidden_row0: usize,
         trunk_ids_row: Option<usize>,
+        prompt_ids: Option<&GpuTensor>,
         position: usize,
     ) -> Result<(), BundleError> {
         if tokens.is_empty() {
@@ -1477,11 +1498,12 @@ impl Qwen4Bundle {
         let hidden = source.sub_offset(offset, len);
         // The ids the trunk forward already uploaded stand in for the head's
         // own copy; no forward runs between that upload and this call.
-        let device_ids = trunk_ids_row.and_then(|row| {
+        let trunk_ids = trunk_ids_row.and_then(|row| {
             self.execution
                 .as_ref()
                 .and_then(|forward| forward.uploaded_token_ids(row, tokens))
         });
+        let device_ids = trunk_ids.as_ref().or(prompt_ids);
         let last = position
             .checked_add(tokens.len() - 1)
             .ok_or_else(|| BundleError::Forward("Qwen4 MTP position overflows".to_string()))?;
@@ -1493,7 +1515,7 @@ impl Qwen4Bundle {
                 scratch,
                 tokens,
                 &hidden,
-                device_ids.as_ref(),
+                device_ids,
                 position,
             )
             .map_err(|error| BundleError::Forward(error.to_string()))

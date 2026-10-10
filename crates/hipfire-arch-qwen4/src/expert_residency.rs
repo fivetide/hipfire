@@ -532,11 +532,13 @@ mod tests {
                 crate::state::Qwen4State::row_capture_bytes(&config, gdn, 11).unwrap() as u64;
             let request = (AUTO_VRAM_RESERVE_CHUNK as u64 + 2) * hidden_row + capture;
             assert_eq!(native(&measured, 10, Some(gdn)), resident + scratch.max(request));
-            // The gfx1151 batched prompt fill adds its row scratch to the
-            // request (sub-chunks of at most MTP_FILL_ROWS rows).
+            // The gfx1151 batched prompt fill adds its row scratch (sub-chunks
+            // of at most MTP_FILL_ROWS rows) and one chunk of prompt token ids
+            // to the request.
             let fill = crate::mtp_gpu::MtpAppendScratch::device_bytes(
                 &config,
                 crate::mtp_gpu::MTP_FILL_ROWS.min(AUTO_VRAM_RESERVE_CHUNK),
+                AUTO_VRAM_RESERVE_CHUNK,
             )
             .unwrap() as u64;
             assert!(fill > 0);

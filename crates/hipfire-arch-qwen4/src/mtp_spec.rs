@@ -1471,7 +1471,7 @@ impl Qwen4MtpDrafter {
             let bundle = Self::bundle(target)?;
             if bundle.mtp_append_rows_supported(gpu) {
                 let rows = MTP_FILL_ROWS.min(prefill_rows);
-                let scratch = MtpAppendScratch::new(gpu, &bundle.config, rows)
+                let scratch = MtpAppendScratch::new(gpu, &bundle.config, rows, prefill_rows)
                     .map_err(|error| format!("Qwen4 MTP append scratch allocation: {error}"))?;
                 self.append_scratch = Some(scratch);
             }
@@ -2355,7 +2355,7 @@ impl Qwen4MtpDrafter {
                 .filter(|fill| consumed >= 2 && consumed <= fill.rows() && mtp_batched_fill_enabled());
             match fill {
                 Some(fill) => bundle
-                    .mtp_append_rows(gpu, fill, &block[..consumed], 0, None, position)
+                    .mtp_append_rows(gpu, fill, &block[..consumed], 0, None, None, position)
                     .map_err(|error| error.to_string())?,
                 None => {
                     let row_hidden = self
@@ -2723,6 +2723,33 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 None
             };
             if let Some(scratch) = batched_scratch.as_deref_mut() {
+                // The chunk's ids upload once, here: the target forward's pick
+                // readback has already drained the stream (a silent chunk
+                // leaves the copy waiting for that forward, once per chunk
+                // instead of once per sub-chunk). Each sub-chunk then embeds
+                // from its rows of that upload; the bytes are the chunk's own
+                // tokens as i32, exactly what `append_rows` would upload
+                // itself. With the trunk-id reuse lever on, the head keeps
+                // that lever's own ids (and its own upload when they differ).
+                let chunk_ids_uploaded = prefill_uploads_chunk_ids(
+                    reuse_trunk_ids,
+                    chunk.len(),
+                    scratch.prompt_id_rows(),
+                );
+                if chunk_ids_uploaded {
+                    scratch
+                        .upload_prompt_ids(gpu, chunk)
+                        .map_err(|error| error.to_string())?;
+                }
+                // Map the head's QSA context through the chunk's last row once,
+                // here (the device is idle after the target forward), instead
+                // of growing inside each sub-chunk's Append: a VMM grow
+                // zero-fills with a blocking memset. Same pages, same zero
+                // fill, all before any Append writes; each sub-chunk's own
+                // mapping check then finds the coverage in place.
+                Self::bundle(target)?
+                    .mtp_map_through(gpu, pos + chunk.len() - 1)
+                    .map_err(|error| error.to_string())?;
                 // One batched Append pass per sub-chunk of at most `scratch.rows()`
                 // rows; row `i` is still paired with spec hidden row `i`.
                 let mut off = 0;
@@ -2737,7 +2764,8 @@ impl MtpDrafter for Qwen4MtpDrafter {
                         .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
                     if n == 1 {
                         // The multirow projections need two rows or more; a
-                        // lone row is exactly the per-row Append.
+                        // lone row is exactly the per-row Append (its token
+                        // upload stays the per-row path's own, blocking one).
                         let bundle = Self::bundle(target)?;
                         bundle
                             .copy_spec_hidden_row_to(gpu, off, pending)
@@ -2746,6 +2774,15 @@ impl MtpDrafter for Qwen4MtpDrafter {
                             .mtp_append_token(gpu, chunk[off], Some(pending), position)
                             .map_err(|error| error.to_string())?;
                     } else {
+                        let prompt_ids = if chunk_ids_uploaded {
+                            Some(
+                                scratch
+                                    .prompt_ids_view(off, n)
+                                    .map_err(|error| error.to_string())?,
+                            )
+                        } else {
+                            None
+                        };
                         Self::bundle(target)?
                             .mtp_append_rows(
                                 gpu,
@@ -2753,6 +2790,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                                 &chunk[off..off + n],
                                 off,
                                 prefill_trunk_ids_row(reuse_trunk_ids, off),
+                                prompt_ids.as_ref(),
                                 position,
                             )
                             .map_err(|error| error.to_string())?;
@@ -3431,6 +3469,14 @@ fn prefill_trunk_ids_row(reuse: bool, off: usize) -> Option<usize> {
     reuse.then_some(off)
 }
 
+/// Whether a prompt-fill chunk of `chunk_rows` rows uploads its token ids once
+/// into the `capacity`-row prompt id buffer for its sub-chunks to embed from:
+/// not with the trunk-id reuse lever on (it supplies its own ids), not for a
+/// lone row (the per-row Append uploads its own), and not past the buffer.
+fn prefill_uploads_chunk_ids(reuse: bool, chunk_rows: usize, capacity: usize) -> bool {
+    !reuse && (2..=capacity).contains(&chunk_rows)
+}
+
 /// `HIPFIRE_QWEN4_MTP_SKIP_INTERMEDIATE_PICK`: a non-final `mtp_prefill` chunk
 /// skips the LM head, argmax and readback unless set to `0`; read at every
 /// `mtp_prefill`.
@@ -3501,7 +3547,7 @@ pub fn native_mtp_device_bytes(
 /// verify hidden rows (`max_k + 1` rows or one `chunk_rows` forward chunk,
 /// whichever is larger), the pending and row hidden carries, with
 /// `row_capture` the `max_k + 1`-row GDN capture in that format, and with
-/// `batched_fill` the batched prompt-fill scratch.
+/// `batched_fill` the batched prompt-fill scratch and one chunk of prompt ids.
 pub fn native_mtp_request_bytes(
     config: &crate::Qwen4Config,
     max_seq: usize,
@@ -3521,7 +3567,11 @@ pub fn native_mtp_request_bytes(
         None => 0,
     };
     let fill = if batched_fill {
-        MtpAppendScratch::device_bytes(config, MTP_FILL_ROWS.min(chunk_rows).max(1))?
+        MtpAppendScratch::device_bytes(
+            config,
+            MTP_FILL_ROWS.min(chunk_rows).max(1),
+            chunk_rows.max(1),
+        )?
     } else {
         0
     };
@@ -3627,6 +3677,20 @@ mod tests {
         assert_eq!(prefill_trunk_ids_row(true, 1024), Some(1024));
         assert_eq!(prefill_trunk_ids_row(false, 0), None);
         assert_eq!(prefill_trunk_ids_row(false, 1024), None);
+    }
+
+    #[test]
+    fn prefill_head_append_uploads_the_chunk_ids_once_unless_reuse_or_oversized() {
+        // A chunk of two rows or more has a multirow sub-chunk to feed.
+        assert!(prefill_uploads_chunk_ids(false, 8192, 8192));
+        assert!(prefill_uploads_chunk_ids(false, 1025, 8192));
+        assert!(prefill_uploads_chunk_ids(false, 2, 8192));
+        // A lone row is the per-row Append, which never reads the upload.
+        assert!(!prefill_uploads_chunk_ids(false, 1, 8192));
+        // The reuse lever keeps its own ids.
+        assert!(!prefill_uploads_chunk_ids(true, 8192, 8192));
+        // A chunk past the buffer's capacity keeps the per-sub-chunk upload.
+        assert!(!prefill_uploads_chunk_ids(false, 8193, 8192));
     }
 
     #[test]
