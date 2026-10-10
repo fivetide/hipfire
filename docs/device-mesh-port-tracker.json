@@ -7,17 +7,20 @@
     "remote": "upstream",
     "branch": "beta",
     "series_origin_ref": "6163369329d3b076376286a00c13cadbae069ecc",
-    "integration_base_commit": "b8092f7c7fe0eb3dabccc28e8993ee10c3465fc6",
+    "integration_base_commit": "6d71d955e711dc816aa87f066364a8b59545bb76",
     "release_branch": "master",
-    "release_head_commit": "f4e1412e81b84e35934ba51fb453d329f4c2f041",
-    "integration_status": "upstream/beta is the current composed integration line and contains the upstream-native G2 and G3 work plus the first G4.1 and G4.2 constituent transactions. Upstream/master remains the release destination. Integration, GitHub PR state, constituent evidence, and milestone acceptance remain separate: no G1-G5 milestone is promoted here without a complete final-head matrix and accepted structured receipt.",
+    "release_head_commit": "0f999cb4dc3a271d9f7c1c473d4c4703111a2bc1",
+    "integration_status": "As of 2026-10-10, upstream/master (v0.4.1.1) contains the upstream-native G1-G5 implementation: G1-G4 through beta promotion #730 (2026-09-13), G5 sealed MoE through #755 and the #774 content released in v0.4.1. Upstream/beta remains the integration line; G6 #813 and G8 #795 target beta directly. Integration, GitHub PR state, constituent evidence, and milestone acceptance remain separate: no G1-G5 milestone is promoted here without a complete final-head matrix on one frozen beta head and accepted structured receipts.",
     "integration_records": [
       "G1 #681 merged on master at 8cd15a62b593e950b6fe0082b88bb79d122d1dc2 and is present on beta; tracker milestone acceptance remains unchanged and unclaimed.",
-      "G2 #682 remains open against master with changes requested and behind status, while its exact head 95e0e654e59a3892777a6fc73894006a576c6e43 was maintainer-integrated into beta through staging commit 4d0e0a1b4. Related admission-refusal PR #687 remains open against master while its content is integrated into beta at 0297aed6b. Neither GitHub state nor beta integration alone promotes G2.",
-      "G3 #704 was closed as ported rather than merged unchanged. The maintainer-integrated, review-corrected Single plain-LLaMA manifest/load pilot is on beta at 35dbd64a3; master remains unchanged. Its current numerical, lifecycle, rollback, and serving evidence is integration evidence, while tracker promotion still requires an accepted structured receipt bound to the final composed head.",
-      "G4.1 consists of #731 merged into beta at af3990571 and #735 closed as ported and integrated at 800ddf740. Maintainer-composed hardware rollback/retry and decoded-serving evidence closes those construction constituents only; complete G4 lifecycle acceptance remains blocked.",
-      "G4.2 #736 was closed as ported and maintainer-integrated with review corrections into beta at 24fc65c45. Its DFlash construction evidence closes that constituent only; complete G4 lifecycle acceptance remains blocked.",
-      "Historical #675 is closed and #677 remains stale; their provenance and evidence remain non-promoting."
+      "G2 #682 and admission-refusal PR #687 merged on master on 2026-09-13 together with beta promotion #730. A 2026-10-10 gfx1151 rerun of g1-text-with-vision-meta on master 0f999cb4dc3a271d9f7c1c473d4c4703111a2bc1 passed both halves (text artifact vl=false; bad vision sidecar refused with the prior model still serving). This is pre-sweep, host-local evidence and does not promote G2.",
+      "G3 #704 was closed as ported rather than merged unchanged. The review-corrected Single plain-LLaMA manifest/load pilot integrated on beta at 35dbd64a3 reached master through #730. Tracker promotion still requires an accepted structured receipt bound to the final composed head.",
+      "G4 constituents are on beta and master: G4.1 #731/#735, G4.2 #736, G4.3-G4.6 #742, G4.9 #747 (via g4/integration), G4.7 d42a76e1d/5c50285b0/1c695b020, G4.8 1725bb067 (merge bb148a2af), G4.10 6fd4b92b7/d9f8ff251/14f18b867 with ignored GPU contract tests af49a11c8. What remains is validation, not implementation; complete G4 lifecycle acceptance remains blocked.",
+      "G5 #755 closed 2026-09-30 as superseded; its final head a9e75e2573266b879eaea728e168a5dbf6d85523 is an ancestor of master. #774 closed 2026-10-08 after its content landed in v0.4.1 (9a648f96c). Physical EP evidence is still absent; all EP results are emulated and non-promoting.",
+      "G6 #813 (fivetide:feat/gemma-declarative, head fac557de2) and G8 #795 (feat/qwen35-declarative, head 8d64d0deb) are open against beta. Both are implementation ahead of their gates and promote nothing.",
+      "Runner and oracle PRs open against beta: #844 (fixture lock, physical EP/PP/TP rows, operator instructions; head be6a9468c) and #843 (Qwen35 single-route oracle cell on qwen3.6-35b-a3b.mq4r; head 9b19067df).",
+      "2026-10-10 gfx1151 pre-sweep on beta f4ea8109b plus the #844 runner commits: 49 rows, 42 current, 7 failed, no hardware block. Failed: G4.1 Qwen35 construction-fault retry grows the pool by one allocation; G4.6 abort during prefill ends in a validation error instead of the cancel pair; G4.7 spec-route fault test never takes the spec route (test defect); G4.8 vision lifecycle exceeds the 1800 s child watchdog; G4.10 LFM2-MoE after-first-decode fault never fires; G5 production run row prints no visible text at 64 tokens (row defect); G5 alloc/pointer-table fault shows a ~927 MiB free-VRAM delta on emulated EP2. g4-redline-kernel is current on gfx1151. DS4, MiniMax and Cohere2MoE rollback rows are fixture-missing. Host-local pre-sweep evidence; non-promoting.",
+      "Historical #675, #677 and #527 are closed; their provenance and evidence remain non-promoting."
     ]
   },
   "branch_provenance": {
