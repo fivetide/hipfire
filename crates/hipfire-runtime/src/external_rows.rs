@@ -1446,6 +1446,7 @@ impl RowStoreInner {
                     output: None,
                     read_buffer,
                     result: Err(RowStoreError::Canceled),
+                    pending: PendingPages::new(),
                 };
             };
             (
@@ -1463,6 +1464,7 @@ impl RowStoreInner {
                 output: Some(output),
                 read_buffer,
                 result: Err(RowStoreError::Canceled),
+                pending: PendingPages::new(),
             };
         }
         let current = self.current_epoch.load(Ordering::Acquire);
@@ -1474,19 +1476,36 @@ impl RowStoreInner {
                     requested: epoch,
                     current,
                 }),
+                pending: PendingPages::new(),
             };
         }
-        let result = self.fill_output(&locations, &pages, &mut output, &mut read_buffer, &canceled);
+        let mut pending = PendingPages::new();
+        let result = self.fill_output(
+            &locations,
+            &pages,
+            &mut output,
+            &mut read_buffer,
+            &canceled,
+            &mut pending,
+        );
         ProcessedTicket {
             output: Some(output),
             read_buffer,
             result,
+            pending,
         }
     }
 
     /// Fill the final bounded lease directly while each page group is
     /// available.  Requested page sets may be much larger than the cache;
     /// no second pass assumes all pages remain resident.
+    ///
+    /// `pages` MUST be strictly ascending (sorted, deduplicated), as
+    /// `RowStore::plan_rows` builds it.  A request of several page groups
+    /// reads and decodes them on parallel readers and leaves the pages it read
+    /// in `pending` for the caller to cache after the ticket completes (also
+    /// when it returns `Canceled`); a single group is read, decoded, and
+    /// cached inline.
     fn fill_output(
         &self,
         locations: &[RowLocation],
@@ -1494,7 +1513,13 @@ impl RowStoreInner {
         output: &mut [u8],
         read_staging: &mut Vec<u8>,
         canceled: &AtomicBool,
+        pending: &mut PendingPages,
     ) -> Result<(), RowStoreError> {
+        if pages.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(RowStoreError::InvalidLease {
+                reason: "page plan is not strictly ascending".to_string(),
+            });
+        }
         let expected = locations
             .len()
             .checked_mul(self.decoded_row_bytes)
@@ -1547,33 +1572,39 @@ impl RowStoreInner {
             // scattered single-page reads: issued serially each one waits a
             // full device round trip (~64 reads = 10-15 ms per few-token
             // request on NVMe), issued together the device overlaps them.
-            let mut buffers: Vec<Vec<u8>> = vec![Vec::new(); groups.len()];
+            // Each reader decodes its pages' requested rows into the output
+            // right after its read, so assembly overlaps the reads instead of
+            // following them serially.
             let per_thread = groups
                 .len()
                 .div_ceil(reader_count(groups.len(), self.max_readers));
-            std::thread::scope(|scope| -> Result<(), RowStoreError> {
+            let shared = SharedOutput::new(&mut *output);
+            let shared = &shared;
+            let requested = &requested;
+            let read = std::thread::scope(|scope| -> Result<PendingPages, RowStoreError> {
                 let handles: Vec<_> = groups
                     .chunks(per_thread)
-                    .zip(buffers.chunks_mut(per_thread))
-                    .map(|(chunk, staging)| {
-                        scope.spawn(move || -> Result<(), RowStoreError> {
-                            for (group, bytes) in chunk.iter().zip(staging) {
-                                self.read_group_bytes(group, bytes)?;
-                            }
-                            Ok(())
-                        })
+                    .map(|chunk| {
+                        scope.spawn(move || self.read_and_copy_groups(chunk, requested, shared))
                     })
                     .collect();
+                let mut read = Vec::with_capacity(handles.len());
                 for handle in handles {
-                    handle.join().expect("row reader thread panicked")?;
+                    read.push(handle.join().expect("row reader thread panicked")?);
                 }
-                Ok(())
+                Ok(read)
             })?;
-            // Pages are published even under cancellation: the reads are done
-            // and a later request (or the warm-up's owner) wants them cached.
-            for (group, bytes) in groups.iter().zip(&buffers) {
-                self.publish_group(group, bytes, &requested, output)?;
+            let read_bytes: usize = read.iter().flatten().map(|(_, bytes)| bytes.len()).sum();
+            {
+                let mut state = self.state.lock().expect("row store state mutex poisoned");
+                state.cache.reads += groups.len() as u64;
+                state.cache.coalesced_reads += groups.len() as u64;
+                state.cache.read_bytes += read_bytes as u64;
             }
+            // Pages are cached even under cancellation: the reads are done
+            // and a later request (or the warm-up's owner) wants them cached.
+            // The worker inserts them once this ticket is completed.
+            *pending = read;
             if canceled.load(Ordering::Acquire) {
                 return Err(RowStoreError::Canceled);
             }
@@ -1718,6 +1749,60 @@ impl RowStoreInner {
             .map_err(RowStoreError::Source)
     }
 
+    /// One reader thread's share of a multi-group request: read each group,
+    /// decode its requested rows straight into the shared output, and return
+    /// the pages (in group order) for [`Self::publish_pending`].  A group of
+    /// one page hands its read buffer over without a copy.
+    fn read_and_copy_groups(
+        &self,
+        groups: &[Vec<PageKey>],
+        requested: &HashMap<PageKey, Vec<RowCopy>>,
+        output: &SharedOutput<'_>,
+    ) -> Result<Vec<(PageKey, Vec<u8>)>, RowStoreError> {
+        let mut pages = Vec::with_capacity(groups.iter().map(Vec::len).sum());
+        for group in groups {
+            let mut bytes = Vec::new();
+            self.read_group_bytes(group, &mut bytes)?;
+            let single = group.len() == 1;
+            let mut cursor = 0usize;
+            for &page in group {
+                let length = self.page_len(page)?;
+                let page_bytes = &bytes[cursor..cursor + length];
+                if let Some(rows) = requested.get(&page) {
+                    copy_requested_rows_shared(
+                        self.encoding,
+                        self.encoded_row_bytes,
+                        self.decoded_row_bytes,
+                        page,
+                        page_bytes,
+                        rows,
+                        output,
+                    )?;
+                }
+                if !single {
+                    pages.push((page, page_bytes.to_vec()));
+                }
+                cursor += length;
+            }
+            if single {
+                pages.push((group[0], bytes));
+            }
+        }
+        Ok(pages)
+    }
+
+    /// Insert pages read by a multi-group request into the cache, in the order
+    /// the serial publish used to, taking the state lock once per reader's
+    /// list rather than holding it across the whole request.
+    fn publish_pending(&self, pending: PendingPages) {
+        for pages in pending {
+            let mut state = self.state.lock().expect("row store state mutex poisoned");
+            for (page, bytes) in pages {
+                state.cache.insert(page, bytes);
+            }
+        }
+    }
+
     /// Copy a read group's requested rows into `output` and cache its pages.
     fn publish_group(
         &self,
@@ -1780,35 +1865,147 @@ fn copy_requested_rows(
     output: &mut [u8],
 ) -> Result<(), RowStoreError> {
     for row in rows {
-        let page_end = row
-            .page_offset
-            .checked_add(encoded_row_bytes)
-            .ok_or_else(|| RowStoreError::InvalidLease {
-                reason: format!("page {page:?} row offset overflow"),
-            })?;
-        let output_end = row
-            .output_offset
-            .checked_add(decoded_row_bytes)
-            .ok_or_else(|| RowStoreError::InvalidLease {
-                reason: "output row offset overflow".to_string(),
-            })?;
-        if page_end > page_bytes.len() || output_end > output.len() {
-            return Err(RowStoreError::InvalidLease {
-                reason: format!("requested row is outside page {page:?} or output"),
-            });
-        }
-        encoding.decode_row(
-            &page_bytes[row.page_offset..page_end],
-            &mut output[row.output_offset..output_end],
+        let (page_range, output_range) = checked_row_ranges(
+            encoded_row_bytes,
+            decoded_row_bytes,
+            page,
+            page_bytes.len(),
+            output.len(),
+            row,
         )?;
+        encoding.decode_row(&page_bytes[page_range], &mut output[output_range])?;
     }
     Ok(())
 }
+
+/// [`copy_requested_rows`] for readers that write disjoint rows of one shared
+/// output at the same time.
+///
+/// The caller upholds [`SharedOutput::range_mut`]'s contract by handing each
+/// output row to exactly one call: `rows` are the requested rows of `page`,
+/// whose `output_offset`s are `index * decoded_row_bytes` of distinct request
+/// positions, and every page of a request is read by exactly one thread.
+fn copy_requested_rows_shared(
+    encoding: RowEncoding,
+    encoded_row_bytes: usize,
+    decoded_row_bytes: usize,
+    page: PageKey,
+    page_bytes: &[u8],
+    rows: &[RowCopy],
+    output: &SharedOutput<'_>,
+) -> Result<(), RowStoreError> {
+    for row in rows {
+        let (page_range, output_range) = checked_row_ranges(
+            encoded_row_bytes,
+            decoded_row_bytes,
+            page,
+            page_bytes.len(),
+            output.len(),
+            row,
+        )?;
+        // SAFETY: `output_range` is `row.output_offset..+decoded_row_bytes`
+        // (bounds checked above).  Each request position is one `RowCopy` in
+        // exactly one page's list, request positions are `decoded_row_bytes`
+        // apart so their ranges never overlap, and `fill_output` hands each
+        // (strictly ascending, so unique) page to exactly one thread.  No
+        // other slice of this row exists while this one is live.
+        let destination = unsafe { output.range_mut(output_range) };
+        encoding.decode_row(&page_bytes[page_range], destination)?;
+    }
+    Ok(())
+}
+
+/// Bounds-check one requested row against its page and the output, returning
+/// the encoded byte range in the page and the decoded byte range in the output.
+fn checked_row_ranges(
+    encoded_row_bytes: usize,
+    decoded_row_bytes: usize,
+    page: PageKey,
+    page_len: usize,
+    output_len: usize,
+    row: &RowCopy,
+) -> Result<(std::ops::Range<usize>, std::ops::Range<usize>), RowStoreError> {
+    let page_end = row
+        .page_offset
+        .checked_add(encoded_row_bytes)
+        .ok_or_else(|| RowStoreError::InvalidLease {
+            reason: format!("page {page:?} row offset overflow"),
+        })?;
+    let output_end = row
+        .output_offset
+        .checked_add(decoded_row_bytes)
+        .ok_or_else(|| RowStoreError::InvalidLease {
+            reason: "output row offset overflow".to_string(),
+        })?;
+    if page_end > page_len || output_end > output_len {
+        return Err(RowStoreError::InvalidLease {
+            reason: format!("requested row is outside page {page:?} or output"),
+        });
+    }
+    Ok((
+        row.page_offset..page_end,
+        row.output_offset..output_end,
+    ))
+}
+
+/// The lease staging buffer shared by the scoped reader threads of one
+/// request, each of which decodes its own pages' rows straight into it.
+///
+/// Rust cannot split the buffer by page (a page's rows are scattered through
+/// the output), so the threads share a raw pointer and the disjointness of the
+/// rows they write is argued at [`copy_requested_rows_shared`].  It borrows the
+/// buffer mutably for `'a`, so nothing else touches the buffer meanwhile.
+struct SharedOutput<'a> {
+    ptr: *mut u8,
+    len: usize,
+    _borrow: std::marker::PhantomData<&'a mut [u8]>,
+}
+
+// SAFETY: the handle only ever yields `range_mut` slices, whose callers
+// guarantee that concurrently live ranges are disjoint; `u8` has no thread
+// affinity.
+unsafe impl Send for SharedOutput<'_> {}
+unsafe impl Sync for SharedOutput<'_> {}
+
+impl<'a> SharedOutput<'a> {
+    fn new(output: &'a mut [u8]) -> Self {
+        Self {
+            ptr: output.as_mut_ptr(),
+            len: output.len(),
+            _borrow: std::marker::PhantomData,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// # Safety
+    /// No other slice obtained from this handle that overlaps `range` may be
+    /// live (or created) while the returned slice is.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn range_mut(&self, range: std::ops::Range<usize>) -> &mut [u8] {
+        assert!(
+            range.start <= range.end && range.end <= self.len,
+            "shared output range outside the buffer"
+        );
+        // SAFETY: in bounds per the assert; exclusivity is the caller's
+        // contract above.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.add(range.start), range.end - range.start) }
+    }
+}
+
+/// Pages a request read, in group order, that still have to enter the cache,
+/// one list per reader thread.  Empty when nothing was read.
+type PendingPages = Vec<Vec<(PageKey, Vec<u8>)>>;
 
 struct ProcessedTicket {
     output: Option<Vec<u8>>,
     read_buffer: Vec<u8>,
     result: Result<(), RowStoreError>,
+    /// Pages to cache after the ticket has been handed to its waiter, whatever
+    /// `result` says (see [`RowStoreInner::publish_pending`]).
+    pending: PendingPages,
 }
 
 struct TicketState {
@@ -1953,69 +2150,92 @@ fn worker_loop(weak: Weak<RowStoreInner>) {
             break;
         };
         let ProcessedTicket {
-            mut output,
+            output,
             read_buffer,
             result,
+            pending,
         } = inner.process_ticket(id, read_buffer);
         let mut state = inner.state.lock().expect("row store state mutex poisoned");
-        state.active_readers = state.active_readers.saturating_sub(1);
         inner.return_staging_locked(&mut state, read_buffer);
-        if state.tickets.get(&id).is_some_and(|ticket| ticket.warm) {
-            if let Some(ticket) = state.tickets.remove(&id) {
-                if let Some(buffer) = ticket.output {
-                    inner.return_staging_locked(&mut state, buffer);
-                }
-            }
-            if let Some(buffer) = output.take() {
-                inner.return_staging_locked(&mut state, buffer);
-            }
-            inner.cv.notify_all();
-            continue;
+        if pending.is_empty() {
+            state.active_readers = state.active_readers.saturating_sub(1);
         }
-        let Some((ticket_canceled, ticket_epoch)) = state
-            .tickets
-            .get(&id)
-            .map(|ticket| (ticket.canceled.load(Ordering::Acquire), ticket.epoch))
-        else {
-            if let Some(buffer) = output.take() {
-                inner.return_staging_locked(&mut state, buffer);
-            }
-            inner.cv.notify_all();
-            continue;
-        };
-        let canceled =
-            ticket_canceled || ticket_epoch != inner.current_epoch.load(Ordering::Acquire);
-        if canceled {
-            if let Some(ticket) = state.tickets.remove(&id) {
-                if let Some(buffer) = ticket.output {
-                    inner.return_staging_locked(&mut state, buffer);
-                }
-            }
-            if let Some(buffer) = output.take() {
-                inner.return_staging_locked(&mut state, buffer);
-            }
-            inner.cv.notify_all();
-            continue;
-        }
-        let mut return_buffer = None;
-        {
-            let ticket = state.tickets.get_mut(&id).expect("ticket disappeared");
-            match result {
-                Ok(()) => {
-                    ticket.output = output;
-                    ticket.status = TicketStatus::Completed(Ok(()));
-                }
-                Err(error) => {
-                    return_buffer = output.take();
-                    ticket.output = None;
-                    ticket.status = TicketStatus::Completed(Err(error));
-                }
-            }
-        }
-        if let Some(buffer) = return_buffer {
-            inner.return_staging_locked(&mut state, buffer);
-        }
+        complete_ticket_locked(&inner, &mut state, id, output, result);
         inner.cv.notify_all();
+        if pending.is_empty() {
+            continue;
+        }
+        // The waiter can already take its lease.  The pages the reads brought
+        // in are cached here, before this serial worker picks up the next
+        // ticket, so a following ticket needing the same pages sees them; the
+        // reader stays counted as active so quiesce waits for the inserts.
+        drop(state);
+        inner.publish_pending(pending);
+        let mut state = inner.state.lock().expect("row store state mutex poisoned");
+        state.active_readers = state.active_readers.saturating_sub(1);
+        inner.cv.notify_all();
+    }
+}
+
+/// Hand a processed ticket's result to its waiter (or drop its buffers when
+/// the ticket is warm, canceled, stale, or gone).
+fn complete_ticket_locked(
+    inner: &RowStoreInner,
+    state: &mut RowStoreState,
+    id: u64,
+    mut output: Option<Vec<u8>>,
+    result: Result<(), RowStoreError>,
+) {
+    if state.tickets.get(&id).is_some_and(|ticket| ticket.warm) {
+        if let Some(ticket) = state.tickets.remove(&id) {
+            if let Some(buffer) = ticket.output {
+                inner.return_staging_locked(state, buffer);
+            }
+        }
+        if let Some(buffer) = output.take() {
+            inner.return_staging_locked(state, buffer);
+        }
+        return;
+    }
+    let Some((ticket_canceled, ticket_epoch)) = state
+        .tickets
+        .get(&id)
+        .map(|ticket| (ticket.canceled.load(Ordering::Acquire), ticket.epoch))
+    else {
+        if let Some(buffer) = output.take() {
+            inner.return_staging_locked(state, buffer);
+        }
+        return;
+    };
+    let canceled = ticket_canceled || ticket_epoch != inner.current_epoch.load(Ordering::Acquire);
+    if canceled {
+        if let Some(ticket) = state.tickets.remove(&id) {
+            if let Some(buffer) = ticket.output {
+                inner.return_staging_locked(state, buffer);
+            }
+        }
+        if let Some(buffer) = output.take() {
+            inner.return_staging_locked(state, buffer);
+        }
+        return;
+    }
+    let mut return_buffer = None;
+    {
+        let ticket = state.tickets.get_mut(&id).expect("ticket disappeared");
+        match result {
+            Ok(()) => {
+                ticket.output = output;
+                ticket.status = TicketStatus::Completed(Ok(()));
+            }
+            Err(error) => {
+                return_buffer = output.take();
+                ticket.output = None;
+                ticket.status = TicketStatus::Completed(Err(error));
+            }
+        }
+    }
+    if let Some(buffer) = return_buffer {
+        inner.return_staging_locked(state, buffer);
     }
 }
 
@@ -3096,6 +3316,77 @@ mod tests {
         assert!(stats.cache_misses > 0);
         assert!(stats.evictions > 0);
         assert!(stats.resident_bytes <= ROW_BYTES * 10);
+        assert!(rows.unload().unwrap().is_clean());
+    }
+
+    /// A request of thousands of scattered groups decodes on the reader
+    /// threads and caches its pages after the ticket completes: the rows are
+    /// the table's bytes in request order, and the next ticket for the same
+    /// rows is served from the cache without a read.
+    #[test]
+    fn large_multi_group_fetch_is_byte_identical_and_cached_after_completion() {
+        let rows_per_shard = 16384;
+        let source = Arc::new(MemoryRowSource {
+            shards: rows_source(2, rows_per_shard),
+            reads: AtomicUsize::new(0),
+            fail: None,
+        });
+        let rows = RowStore::from_test_source_with_page_rows(
+            metadata_with_head_size(2048, 32768),
+            rows_per_shard,
+            1,
+            source.clone(),
+        )
+        .unwrap();
+        // Stride-4 rows are one-page groups; every seventh also asks for its
+        // neighbour (a two-page group) and some ids repeat.
+        let mut ids: Vec<u64> = Vec::new();
+        for index in 0..8000u64 {
+            ids.push(index * 4);
+            if index % 7 == 0 {
+                ids.push(index * 4 + 1);
+            }
+            if index % 11 == 0 {
+                ids.push(index * 4);
+            }
+        }
+        assert!(ids.len() <= rows.max_rows_per_prefetch());
+        let distinct: std::collections::BTreeSet<u64> = ids.iter().copied().collect();
+        let expected: Vec<u8> = ids
+            .iter()
+            .flat_map(|&id| {
+                let shard = id as usize / rows_per_shard;
+                let row = id as usize % rows_per_shard;
+                source.shards[shard][row * ROW_BYTES..(row + 1) * ROW_BYTES].to_vec()
+            })
+            .collect();
+
+        let ticket = rows.prefetch(0, ids.clone()).unwrap();
+        let lease = rows.wait_completed_lease(&ticket).unwrap();
+        assert_eq!(lease.row_ids(), ids.as_slice());
+        assert_eq!(lease.as_bytes().unwrap(), expected.as_slice());
+        drop(lease);
+        let first = rows.cache_stats();
+        assert_eq!(first.cache_hits, 0);
+        assert_eq!(first.cache_misses as usize, distinct.len());
+        assert!(first.reads > 1 && (first.reads as usize) < distinct.len());
+        assert_eq!(source.reads.load(Ordering::Acquire) as u64, first.reads);
+        assert_eq!(first.read_bytes as usize, distinct.len() * ROW_BYTES);
+
+        // The worker is serial, so this ticket runs after the first one's
+        // pages were inserted.
+        let second = rows.prefetch(0, ids.clone()).unwrap();
+        let lease = rows.wait_completed_lease(&second).unwrap();
+        assert_eq!(lease.as_bytes().unwrap(), expected.as_slice());
+        drop(lease);
+        let stats = rows.cache_stats();
+        assert_eq!(stats.cache_hits as usize, distinct.len());
+        assert_eq!(stats.cache_misses, first.cache_misses);
+        assert_eq!(stats.reads, first.reads);
+        assert_eq!(stats.read_bytes, first.read_bytes);
+        assert_eq!(source.reads.load(Ordering::Acquire) as u64, first.reads);
+        assert_eq!(stats.resident_pages, distinct.len());
+        assert_eq!(stats.resident_bytes, distinct.len() * ROW_BYTES);
         assert!(rows.unload().unwrap().is_clean());
     }
 
