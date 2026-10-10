@@ -6178,6 +6178,13 @@ impl Gpu {
         )
     }
 
+    /// Bytes parked in the buffer pool's free lists: allocated from HIP but
+    /// owned by no tensor. `hipMemGetInfo` counts them as used; every pool
+    /// allocation and VMM map returns them to HIP on demand before failing.
+    pub fn pool_parked_bytes(&self) -> usize {
+        self.pool.pooled_bytes()
+    }
+
     /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.
     /// Call after model unload to return VRAM to the system.
     pub fn drain_pool(&mut self) {

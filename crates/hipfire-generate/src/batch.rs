@@ -1670,6 +1670,62 @@ fn dflash_lane_fits(prompt_len: usize, max_tokens: usize, block: usize, cap: usi
     prompt_len + max_tokens + block <= cap
 }
 
+/// Memory admission of the inbox head, checked before it takes a lane
+/// (vLLM's scheduler likewise leaves a waiting request queued when its
+/// blocks do not fit). A lone request always proceeds (no lane admitted:
+/// the singleton route or the first lane). Otherwise the head is charged
+/// its DeltaNet state, its prompt KV, and, when it can become a DFlash lane
+/// (a DFlash engine is staged and it is greedy), the probed DFlash lane
+/// state and checkpoint bound, with growth reserved to `prompt + max_tokens`
+/// (`Qwen35VmmStore::admission_check`); it waits while that would leave
+/// the admitted lanes unable to complete. `wait` remembers the waiting head
+/// so each wait is logged once. A failed memory query admits (the provision
+/// budget still refuses an overrun).
+fn vmm_head_admissible(
+    b: Option<&hipfire_arch_qwen35::Qwen35Bundle>,
+    gpu: &rdna_compute::Gpu,
+    sched: &ContinuousBatchScheduler,
+    any_admitted: bool,
+    dflash_engine: bool,
+    wait: &mut Option<AttemptKey>,
+) -> bool {
+    let (Some(key), true) = (sched.inbox.front(), any_admitted) else {
+        return true;
+    };
+    let (Some(req), Some(b)) = (sched.pending.get(key), b) else {
+        return true;
+    };
+    let Some(store) = b.vmm_store.as_ref() else {
+        return true;
+    };
+    let prompt = req.prompt_tokens.len();
+    let end = prompt + req.max_tokens + hipfire_arch_qwen35::forward_slots::vmm::VMM_RESERVE_SLACK_ROWS;
+    let dflash = dflash_engine && req.sampling.temp <= 0.0;
+    match store.admission_check(gpu, &b.kv_cache, &b.dn_state, prompt, end, dflash) {
+        Ok(a) if a.fits => {
+            if wait.as_ref() == Some(key) {
+                eprintln!("[vmm-admit] id={} admitted after waiting for device memory", key.id);
+                *wait = None;
+            }
+            true
+        }
+        Ok(a) => {
+            if wait.as_ref() != Some(key) {
+                eprintln!(
+                    "[vmm-admit] id={} waits for device memory: lane holds {} B after its prompt (+{} B KV growth), room {} B, KV budget room {} B, admitted lanes' reserved KV growth {} B",
+                    key.id, a.need.held, a.need.remaining, a.room, a.kv_room, a.committed
+                );
+                *wait = Some(key.clone());
+            }
+            false
+        }
+        Err(e) => {
+            eprintln!("[vmm-admit] id={} memory check failed ({e}); admitting", key.id);
+            true
+        }
+    }
+}
+
 /// Whole-lane window selection under the global trunk-row budget: lanes
 /// `(slot, rows)` in slot order are taken whole, rotating from `cursor`
 /// (the slot deferred first last step), until the next does not fit.
@@ -1911,6 +1967,8 @@ pub(crate) fn promote_singleton(
     }
     state.position = b.position;
     state.pending_seed = Some(b.pending_seed);
+    state.reserve_end =
+        b.prompt_len + b.permit.max_tokens + hipfire_arch_qwen35::forward_slots::vmm::VMM_RESERVE_SLACK_ROWS;
     let key = AttemptKey::new(b.id, attempt_id);
     let pending = BatchPendingRequest {
         key: key.clone(),
@@ -2644,6 +2702,8 @@ pub fn drive_qwen_vmm_continuous_batch(
             .chain(pair("<think>", "</think>"))
             .collect()
     };
+    // Last step planned nothing because every lane waited for memory.
+    let mut memory_stalled = false;
     let idle_work = |i: usize| PendingWork {
         slot: SlotId(i),
         remaining_prompt: Vec::new(),
@@ -2697,6 +2757,9 @@ pub fn drive_qwen_vmm_continuous_batch(
     let mut dflash_win: Vec<Option<DflashWindow>> = (0..batch_size).map(|_| None).collect();
     // First spec lane (slot) deferred by the global row budget last step.
     let mut spec_cursor = 0usize;
+    // Queue head waiting for device memory (`vmm_head_admissible`), logged
+    // once per wait.
+    let mut memory_wait: Option<AttemptKey> = None;
     // First generated ids of spec lanes prefilled this iteration, emitted
     // with this iteration's commits (the singleton emits the seed first).
     let mut spec_seeds: Vec<hipfire_runtime::slot_batch::RequestAdvance> = Vec::new();
@@ -3188,7 +3251,21 @@ pub fn drive_qwen_vmm_continuous_batch(
         // (`vmm_conv::pool_pending`): the singleton never renders or picks a
         // cache before the previous turn commits.
         let hold = keep_conversations && crate::vmm_conv::pool_pending(model);
-        while let Some((key, ticket)) = (!hold).then(|| sched.try_assign_one()).flatten() {
+        // Memory admission (vLLM-style): a queue head whose lane would leave
+        // the admitted lanes unable to complete waits for one to finish
+        // instead of being admitted into a growth-time refusal.
+        while let Some((key, ticket)) = (!hold
+            && vmm_head_admissible(
+                vmm_bundle(&mut model.state).map(|b| &*b),
+                gpu,
+                sched,
+                epochs.iter().any(|e| e.is_admitted()),
+                dflash_engine.is_some(),
+                &mut memory_wait,
+            ))
+        .then(|| sched.try_assign_one())
+        .flatten()
+        {
             let lane_idx = ticket.lane;
             let Some(pending_req) = sched.pending.get(&key).cloned() else {
                 continue;
@@ -3307,6 +3384,9 @@ pub fn drive_qwen_vmm_continuous_batch(
                 Seed(u32),
                 Aborted,
             }
+            let reserve_end = rendered.len()
+                + lane_max_tokens(&key, sched)
+                + hipfire_arch_qwen35::forward_slots::vmm::VMM_RESERVE_SLACK_ROWS;
             let admitted = (|| -> Result<(SpecAdmit, crate::vmm_conv::Checkpoints, usize), String> {
                 let b = vmm_bundle(&mut model.state).ok_or("model is not Qwen35")?;
                 let init = || hipfire_arch_qwen35::forward_slots::vmm::VmmRequestInit {
@@ -3316,7 +3396,7 @@ pub fn drive_qwen_vmm_continuous_batch(
                     rng_state,
                     history: Vec::new(),
                 };
-                let (state, checkpoints, start) = if keep {
+                let (mut state, checkpoints, start) = if keep {
                     crate::vmm_conv::lane_owner(gpu, b, &rendered, epoch, lane_idx, init)?
                 } else {
                     let state = hipfire_arch_qwen35::forward_slots::vmm::Qwen35RequestState::new_like(
@@ -3330,6 +3410,7 @@ pub fn drive_qwen_vmm_continuous_batch(
                     )?;
                     (state, Vec::new(), 0)
                 };
+                state.reserve_end = reserve_end;
                 let hipfire_arch_qwen35::Qwen35Bundle {
                     vmm_store,
                     weights,
@@ -3798,6 +3879,56 @@ pub fn drive_qwen_vmm_continuous_batch(
                 return fail_all(sched, gpu, model, &mut epochs, &mut ctl, stdout, format!("exact chunk: {e}"))
             }
         };
+        // Device-memory grants: a lane whose KV growth this step would leave
+        // the admitted lanes unable to complete (`Qwen35VmmStore::
+        // step_grants`) waits a step with its state untouched, as a lane
+        // over the row budget does. After a step where every lane waited,
+        // grants are skipped once so the provision budget reports the
+        // overrun instead of the driver spinning.
+        let mut eligible = eligible;
+        let mut mem_granted: Vec<(RequestEpoch, usize)> = Vec::new();
+        let mut mem_denied = false;
+        let check_memory = !std::mem::take(&mut memory_stalled);
+        if check_memory {
+            let reqs: Vec<(usize, RequestEpoch, usize)> = {
+                let store = vmm_bundle(&mut model.state).and_then(|b| b.vmm_store.as_ref());
+                (0..batch_size)
+                    .filter(|&i| eligible[i])
+                    .filter_map(|i| {
+                        let w = &work[i];
+                        let rows = if w.decoding || w.remaining_prompt.is_empty() {
+                            1
+                        } else {
+                            planner
+                                .forced_prefill_len
+                                .get(i)
+                                .copied()
+                                .flatten()
+                                .unwrap_or_else(|| w.remaining_prompt.len().min(row_budget))
+                        };
+                        let st = store?.request_state(&epochs[i])?;
+                        Some((i, epochs[i], st.position + rows))
+                    })
+                    .collect()
+            };
+            let grants = vmm_bundle(&mut model.state)
+                .and_then(|b| b.vmm_store.as_ref())
+                .map(|s| s.step_grants(gpu, &[], &reqs.iter().map(|&(_, e, end)| (e, end)).collect::<Vec<_>>()));
+            match grants {
+                Some(Ok(g)) => {
+                    for (&(i, e, end), ok) in reqs.iter().zip(g) {
+                        if ok {
+                            mem_granted.push((e, end));
+                        } else {
+                            eligible[i] = false;
+                            mem_denied = true;
+                        }
+                    }
+                }
+                Some(Err(e)) => eprintln!("[vmm-memory] step grants unavailable ({e}); lanes proceed"),
+                None => {}
+            }
+        }
         let plan = match planner.plan_step(
             &work,
             &epochs,
@@ -3872,12 +4003,32 @@ pub fn drive_qwen_vmm_continuous_batch(
                 })
                 .map(|r| r.rows.len)
                 .sum();
-            let (chosen, next_cursor) = select_spec_windows(
+            let (mut chosen, next_cursor) = select_spec_windows(
                 &cands.iter().map(|c| (c.slot, c.rows)).collect::<Vec<_>>(),
                 row_budget.saturating_sub(used),
                 spec_cursor,
             );
             spec_cursor = next_cursor;
+            if check_memory && !chosen.is_empty() {
+                let reqs: Vec<(RequestEpoch, usize)> = chosen
+                    .iter()
+                    .filter_map(|s| cands.iter().find(|c| c.slot == *s))
+                    .map(|c| (epochs[c.slot], c.position + c.rows))
+                    .collect();
+                let grants = vmm_bundle(&mut model.state)
+                    .and_then(|b| b.vmm_store.as_ref())
+                    .map(|s| s.step_grants(gpu, &mem_granted, &reqs));
+                match grants {
+                    Some(Ok(g)) => {
+                        let denied: Vec<RequestEpoch> =
+                            reqs.iter().zip(g).filter(|(_, ok)| !ok).map(|((e, _), _)| *e).collect();
+                        mem_denied |= !denied.is_empty();
+                        chosen.retain(|s| !denied.contains(&epochs[*s]));
+                    }
+                    Some(Err(e)) => eprintln!("[vmm-memory] spec window grants unavailable ({e}); lanes proceed"),
+                    None => {}
+                }
+            }
             for c in cands.iter().filter(|c| chosen.contains(&c.slot)) {
                 let i = c.slot;
                 let k = c.rows - 1;
@@ -3932,6 +4083,14 @@ pub fn drive_qwen_vmm_continuous_batch(
             // Stable slot order.
             let rs = step_plan.batch.row_slot.clone();
             step_plan.requests.sort_by_key(|r| rs[r.rows.begin]);
+        }
+        if mem_denied && step_plan.requests.is_empty() {
+            let report = vmm_bundle(&mut model.state)
+                .and_then(|b| b.vmm_store.as_ref())
+                .map(|s| s.budget_report(gpu))
+                .unwrap_or_default();
+            eprintln!("[vmm-memory] every lane waits for device memory; next step maps without grants: {report}");
+            memory_stalled = true;
         }
         let mut advances = if step_plan.requests.is_empty() {
             planner.discard();

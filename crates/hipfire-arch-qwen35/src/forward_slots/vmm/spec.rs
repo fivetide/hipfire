@@ -13,7 +13,7 @@
 //! the committed ids and the full state (trunk KV, DeltaNet, MTP head KV,
 //! `prev_hidden`) equal its isolated singleton spec run (greedy).
 
-use super::{Qwen35RequestState, Qwen35VmmStore, VMM_MAP_DEVICE_RESERVE_BYTES};
+use super::{vmm_map_room, Qwen35RequestState, Qwen35VmmStore};
 use crate::mtp_head::{MtpKvMode, Qwen35MtpHead};
 use crate::mtp_spec::cb::{
     mtp_cb_accept, mtp_cb_draft_batched, mtp_cb_verify, MtpCbDraftLane, MtpCbScratch, MtpCbVerified, MtpCbVerifyLane,
@@ -89,14 +89,15 @@ impl Qwen35VmmStore {
     }
 
     /// Map KV positions `[0, end)` of `epoch` against the shared physical
-    /// budget and the device's free memory (as `provision_step`).
+    /// budget and the device memory a map can use (as `provision_step`).
     pub(super) fn spec_provision(&mut self, gpu: &mut Gpu, epoch: &RequestEpoch, end: usize) -> Result<(), String> {
         let mapped_total = self.mapped_kv_bytes()?;
-        let device_room = gpu
-            .device_mem_info()
-            .map_err(|e| format!("spec provision: VRAM query: {e}"))?
-            .0
-            .saturating_sub(VMM_MAP_DEVICE_RESERVE_BYTES);
+        let device_room = vmm_map_room(
+            gpu.device_mem_info()
+                .map_err(|e| format!("spec provision: VRAM query: {e}"))?
+                .0,
+            gpu.pool_parked_bytes(),
+        );
         let budget = self.kv_budget_bytes.saturating_sub(mapped_total).min(device_room);
         let s = self
             .slots

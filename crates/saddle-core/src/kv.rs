@@ -2114,6 +2114,26 @@ impl KvCache {
         gpu: &Gpu,
         required_tokens: usize,
     ) -> HipResult<usize> {
+        self.planned_mapped_bytes(gpu, required_tokens, false)
+    }
+
+    /// Physical bytes an owner shaped like this one maps to hold
+    /// `required_tokens` from an empty mapping: the admission cost of a new
+    /// request owner under the same chunk plan and encoding strides.
+    pub fn planned_mapped_bytes_from_empty(
+        &self,
+        gpu: &Gpu,
+        required_tokens: usize,
+    ) -> HipResult<usize> {
+        self.planned_mapped_bytes(gpu, required_tokens, true)
+    }
+
+    fn planned_mapped_bytes(
+        &self,
+        gpu: &Gpu,
+        required_tokens: usize,
+        from_empty: bool,
+    ) -> HipResult<usize> {
         if !self.uses_vmm_backend() {
             return Ok(0);
         }
@@ -2130,9 +2150,13 @@ impl KvCache {
                     }
                     continue;
                 }
-                let mapped = gpu.vmm_mapped_bytes(tensor).ok_or_else(|| {
-                    hip_bridge::HipError::new(0, "VMM KV tensor is not registered with its GPU")
-                })?;
+                let mapped = if from_empty {
+                    0
+                } else {
+                    gpu.vmm_mapped_bytes(tensor).ok_or_else(|| {
+                        hip_bridge::HipError::new(0, "VMM KV tensor is not registered with its GPU")
+                    })?
+                };
                 let granularity = gpu.vmm_granularity(tensor).ok_or_else(|| {
                     hip_bridge::HipError::new(0, "VMM KV tensor has no allocation granularity")
                 })?;

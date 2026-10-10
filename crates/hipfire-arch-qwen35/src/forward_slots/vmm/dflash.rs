@@ -34,7 +34,7 @@ use crate::dflash_spec::{
     release_shared_dflash_weights, DflashLaneSnapshot, DflashVmmAssets, DflashWindowMark,
 };
 use crate::qwen35::prefill::multi::{multi_chunk_pack_cap, MULTI_CHUNK_MAX_LANE_ROWS};
-use crate::qwen35::{Qwen35Config, Qwen35Scratch, Qwen35Weights};
+use crate::qwen35::{DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use crate::speculative::{
     dflash_greedy_accept_commit_parts, DeltaNetSnapshot, DflashCbDraft, DflashTargetParts, DflashVerifyOutput,
 };
@@ -51,6 +51,11 @@ use rdna_compute::Gpu;
 pub struct VmmDflashEngine {
     assets: DflashVmmAssets,
     cb: DflashCbScratch,
+    /// Device bytes of one lane's DFlash state (`new_dflash_lane_state`),
+    /// probed at staging.
+    lane_bytes: usize,
+    /// Device bytes of one DeltaNet checkpoint snapshot, probed at staging.
+    snapshot_bytes: usize,
 }
 
 // SAFETY: like every GPU owner in the store (`DeviceBuffer` is `Send`), the
@@ -92,6 +97,7 @@ impl VmmDflashEngine {
         gpu: &mut Gpu,
         weights: &Qwen35Weights,
         config: &Qwen35Config,
+        template_dn: &DeltaNetState,
         assets: DflashVmmAssets,
         max_rows: usize,
     ) -> Result<Self, String> {
@@ -134,7 +140,59 @@ impl VmmDflashEngine {
                 return refuse_engine(gpu, assets, format!("draft batch scratch: {e}"));
             }
         }
-        Ok(Self { assets, cb })
+        // Probe one lane's footprint (lane state, one checkpoint snapshot)
+        // for the store's memory admission: allocate both shaped from the
+        // resident DeltaNet state, measure the live-byte drop (HIP free plus
+        // pool-parked), free them. The freed buffers park in the pool, where
+        // the first lane reuses them.
+        let live = |gpu: &Gpu| gpu.device_mem_info().map(|(f, _)| f + gpu.pool_parked_bytes());
+        let probed = (|| -> Result<(usize, usize), String> {
+            let before = live(gpu).map_err(|e| e.to_string())?;
+            let df = new_dflash_lane_state(gpu, &assets, config, template_dn)?;
+            let mid = live(gpu).map_err(|e| e.to_string());
+            let snap = DeltaNetSnapshot::new_for(gpu, template_dn);
+            let after = live(gpu).map_err(|e| e.to_string());
+            df.free_gpu(gpu);
+            let snap = snap.map_err(|e| format!("snapshot: {e}"))?;
+            snap.free_gpu(gpu);
+            let (mid, after) = (mid?, after?);
+            Ok((before.saturating_sub(mid), mid.saturating_sub(after)))
+        })();
+        let (lane_bytes, snapshot_bytes) = match probed {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = cb.free_gpu(gpu);
+                return refuse_engine(gpu, assets, format!("lane footprint probe: {e}"));
+            }
+        };
+        Ok(Self {
+            assets,
+            cb,
+            lane_bytes,
+            snapshot_bytes,
+        })
+    }
+
+    /// Probed device bytes of one lane's DFlash state.
+    pub fn lane_bytes(&self) -> usize {
+        self.lane_bytes
+    }
+
+    /// Probed device bytes of one DeltaNet checkpoint snapshot.
+    pub fn snapshot_bytes(&self) -> usize {
+        self.snapshot_bytes
+    }
+
+    /// Upper bound on the checkpoints a `prompt_len`-row lane prefill takes
+    /// under the resolved policy: one per `interval` rows (chunk ends at
+    /// least `interval` apart, the first at the first chunk end), at most
+    /// `cap`.
+    pub fn checkpoint_bound(&self, prompt_len: usize) -> usize {
+        let p = self.assets.checkpoint;
+        if !p.resume_enabled {
+            return 0;
+        }
+        prompt_len.div_ceil(p.interval.max(1)).min(p.cap)
     }
 
     /// Fixed configured block (e.g. 16).
@@ -172,7 +230,7 @@ impl VmmDflashEngine {
     /// them, whichever of lanes / engine / singleton that is).
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.hip.device_synchronize();
-        let VmmDflashEngine { assets, cb } = self;
+        let VmmDflashEngine { assets, cb, .. } = self;
         let _ = cb.free_gpu(gpu);
         release_shared_dflash_weights(gpu, assets.weights);
     }

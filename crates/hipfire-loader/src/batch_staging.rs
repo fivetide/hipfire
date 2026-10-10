@@ -757,6 +757,7 @@ fn stage_qwen_vmm_dflash(m: &mut LoadedModel, gpu: &mut Gpu, row_budget: usize) 
         gpu,
         &b.weights,
         &b.config,
+        &b.dn_state,
         assets,
         row_budget.min(hipfire_arch_qwen35::qwen35::prefill::multi::MULTI_CHUNK_MAX_ROWS),
     ) {
@@ -767,12 +768,16 @@ fn stage_qwen_vmm_dflash(m: &mut LoadedModel, gpu: &mut Gpu, row_budget: usize) 
         }
     };
     let receipt = engine.receipt();
+    let (lane_bytes, snapshot_bytes) = (engine.lane_bytes(), engine.snapshot_bytes());
     let store = b.vmm_store.as_mut().expect("route checked above");
     match store.install_dflash(engine) {
-        Ok(()) => eprintln!(
-            "[daemon] VMM DFlash lanes staged: block={} chunk_row_limit={} ctx_capacity={} (shared draft weights)",
-            receipt.block_size, receipt.chunk_row_limit, receipt.ctx_capacity
-        ),
+        Ok(()) => {
+            eprintln!(
+                "[daemon] VMM DFlash lanes staged: block={} chunk_row_limit={} ctx_capacity={} (shared draft weights)",
+                receipt.block_size, receipt.chunk_row_limit, receipt.ctx_capacity
+            );
+            eprintln!("[daemon] VMM DFlash lane footprint: lane_state={lane_bytes} B dn_snapshot={snapshot_bytes} B");
+        }
         Err(engine) => {
             eprintln!(
                 "[daemon] VMM DFlash lanes unavailable: store row budget {} cannot run a {}-row block — AR lanes",
