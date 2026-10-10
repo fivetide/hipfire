@@ -246,10 +246,24 @@ impl MultiChunkScratch {
 
 /// Does this request's singleton attend run `attention_fp8_e4m3_kv_batched`
 /// after `kv_cache_write_fp8_e4m3_batched` (the fp8 scalar-batched arm:
-/// gfx1201, under 64 rows, context at most the 4096 crossover)? Then the
+/// gfx1201, under 64 rows, context at most the 4096 crossover, not a
+/// speculative-verify block, which takes the tile + reduce —
+/// `verify_attend_takes_tile`)? Then the
 /// segment twin reproduces it.
-fn attn_fp8_twin_eligible(gpu: &Gpu, s: &Qwen35Scratch, kv: &llama::KvCache, start_pos: usize, n: usize) -> bool {
-    if !(gpu.arch_caps.is_gfx1201() && kv.quant_fp8 && (MIN_BATCH..64).contains(&n) && start_pos + n <= 4096) {
+fn attn_fp8_twin_eligible(
+    gpu: &Gpu,
+    s: &Qwen35Scratch,
+    kv: &llama::KvCache,
+    start_pos: usize,
+    n: usize,
+    workload: DispatchWorkload,
+) -> bool {
+    if !(gpu.arch_caps.is_gfx1201()
+        && kv.quant_fp8
+        && (MIN_BATCH..64).contains(&n)
+        && start_pos + n <= 4096
+        && !hipfire_dispatch::families::attention::verify_attend_takes_tile(workload, n))
+    {
         return false;
     }
     KvTierPlan::derive(KvTierInputs {
@@ -505,7 +519,7 @@ pub fn forward_prefill_batch_multi(
     // twin segments share the singleton `max_seq` (`physical_cap`) word.
     let mut twin_attn: Vec<bool> = reqs
         .iter()
-        .map(|r| *SEG_TWINS && attn_fp8_twin_eligible(gpu, s, r.kv_cache, r.start_pos, r.tokens.len()))
+        .map(|r| *SEG_TWINS && attn_fp8_twin_eligible(gpu, s, r.kv_cache, r.start_pos, r.tokens.len(), ctx.workload))
         .collect();
     let twin_cap = reqs.iter().zip(&twin_attn).find(|(_, &t)| t).map(|(r, _)| r.kv_cache.physical_cap);
     for (r, t) in reqs.iter().zip(twin_attn.iter_mut()) {
