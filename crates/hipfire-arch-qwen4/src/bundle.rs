@@ -929,10 +929,16 @@ impl Qwen4Bundle {
         tokens: &[u32],
         capture_hidden: bool,
     ) -> Result<u32, BundleError> {
-        self.spec_forward_rows_with_output(gpu, tokens, capture_hidden, Qwen4OutputRows::Final, true)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| BundleError::Forward("Qwen4 prefill produced no argmax".into()))
+        self.spec_forward_rows_with_output(
+            gpu,
+            tokens,
+            capture_hidden,
+            Qwen4OutputRows::Final,
+            true,
+        )?
+        .into_iter()
+        .next()
+        .ok_or_else(|| BundleError::Forward("Qwen4 prefill produced no argmax".into()))
     }
 
     /// [`Self::spec_prefill_rows`] for a prompt chunk whose pick nothing
@@ -2356,7 +2362,9 @@ impl Qwen4Bundle {
             .as_ref()
             .is_some_and(|mtp| mtp.state.snapshot_active())
         {
-            return Err("promotion: the resident MTP head has an active snapshot ticket".to_string());
+            return Err(
+                "promotion: the resident MTP head has an active snapshot ticket".to_string(),
+            );
         }
         Ok(())
     }
@@ -2395,7 +2403,8 @@ impl Qwen4Bundle {
                 self.state.position
             )));
         }
-        self.promotion_resident_ready().map_err(BundleError::Forward)?;
+        self.promotion_resident_ready()
+            .map_err(BundleError::Forward)?;
         match (spec, parts.as_ref()) {
             (Some(_), None) => {
                 return Err(BundleError::Forward(
@@ -2679,18 +2688,22 @@ impl Qwen4Bundle {
                 .state
                 .position
                 .checked_add(lane.tokens.len())
-                .ok_or_else(|| BundleError::Forward("Qwen4 wave lane position overflows".to_string()))?;
+                .ok_or_else(|| {
+                    BundleError::Forward("Qwen4 wave lane position overflows".to_string())
+                })?;
             if end > lane.state.max_seq_len {
                 return Err(BundleError::Forward(format!(
                     "Qwen4 wave lane end position {end} exceeds its context capacity {}",
                     lane.state.max_seq_len
                 )));
             }
-            lane.state.ensure_mapped_capacity(gpu, end).map_err(|error| {
-                BundleError::Forward(format!(
-                    "map Qwen4 wave lane QSA context through {end} tokens: {error}"
-                ))
-            })?;
+            lane.state
+                .ensure_mapped_capacity(gpu, end)
+                .map_err(|error| {
+                    BundleError::Forward(format!(
+                        "map Qwen4 wave lane QSA context through {end} tokens: {error}"
+                    ))
+                })?;
         }
         crate::gpu_forward_lanes::forward_wave(gpu, self, lanes, head, logits, top1, policy)
             .map_err(|error| BundleError::Forward(error.to_string()))

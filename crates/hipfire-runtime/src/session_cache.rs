@@ -255,8 +255,7 @@ fn restore_resident(
     let dst = state.restore_parts(gpu, route, &resident.meta)?;
     let fixed = dst.fixed.iter().map(|part| part.bytes);
     let rows = dst.rows.iter().map(|stream| stream.rows);
-    if !fixed.eq(resident.fixed_bytes.iter().copied()) || !rows.eq(resident.rows.iter().copied())
-    {
+    if !fixed.eq(resident.fixed_bytes.iter().copied()) || !rows.eq(resident.rows.iter().copied()) {
         return Err("session cache: resident snapshot layout mismatch".to_string());
     }
     let regions: Vec<CopyRegion<'_>> = dst
@@ -784,7 +783,10 @@ impl SessionCache {
             Some(resident) if resident.buf.size() == total => resident.buf,
             previous => {
                 if memory_fits(gpu, total as u64 + growth) != Some(true) {
-                    eprintln!("  session cache: skipped {}-token resident snapshot (memory guard)", key.1);
+                    eprintln!(
+                        "  session cache: skipped {}-token resident snapshot (memory guard)",
+                        key.1
+                    );
                     self.resident_pending = previous;
                     return Ok(());
                 }
@@ -810,7 +812,9 @@ impl SessionCache {
             .collect();
         if let Err(error) = copy_regions(gpu, &regions) {
             free_device(gpu, buf);
-            return Err(format!("session cache: resident snapshot copy failed: {error}"));
+            return Err(format!(
+                "session cache: resident snapshot copy failed: {error}"
+            ));
         }
         self.resident_pending = Some(Resident {
             key,
@@ -1002,7 +1006,11 @@ mod tests {
             let mut boundaries: Vec<usize> = (after / STRIDE + 1..=up_to / STRIDE)
                 .map(|k| k * STRIDE)
                 .collect();
-            boundaries.extend((after..up_to).filter(|&i| prompt[i] == MARKER).map(|i| i + 1));
+            boundaries.extend(
+                (after..up_to)
+                    .filter(|&i| prompt[i] == MARKER)
+                    .map(|i| i + 1),
+            );
             boundaries.sort_unstable();
             boundaries.dedup();
             boundaries
@@ -1364,7 +1372,9 @@ mod tests {
         let marker_end = m.len() + 10;
         assert_eq!(cache.next_boundary(), Some(marker_end));
         toy.advance(gpu, &live[..marker_end]);
-        cache.at_boundary(gpu, &mut toy, &live[..marker_end]).unwrap();
+        cache
+            .at_boundary(gpu, &mut toy, &live[..marker_end])
+            .unwrap();
         assert_eq!(cache.next_boundary(), None);
         toy.advance(gpu, &live);
         assert_eq!(cache.plan(&toy, &probe, SessionRoute::Ar), 2 * STRIDE);

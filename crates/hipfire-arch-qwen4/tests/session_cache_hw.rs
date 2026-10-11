@@ -358,7 +358,11 @@ fn resident_restore_matches_cold_on_flash_next() {
     let cold = run_mtp(&mut bundle, &mut gpu, &mut drafter, &a2, 0);
     run_mtp(&mut bundle, &mut gpu, &mut drafter, &a, 0);
     let reused = bundle.session_plan(&a2, SessionRoute::Mtp);
-    assert_eq!(reused, 3 * chunk, "MTP plan must offer the resident snapshot");
+    assert_eq!(
+        reused,
+        3 * chunk,
+        "MTP plan must offer the resident snapshot"
+    );
     let (digests, seed) = run_mtp(&mut bundle, &mut gpu, &mut drafter, &a2, reused);
     assert_same_state("MTP resident", &cold.0, &digests);
     assert_eq!(seed, cold.1, "MTP resident seed");
