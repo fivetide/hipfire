@@ -2103,14 +2103,19 @@ mod tests {
 
     #[test]
     fn bundled_vision_sidecar_is_shared_across_qwen38_tiers() {
-        // Every `qwen3.8:27b*` tier declares the same vision-tower sidecar
+        // Every `qwen3.8:27b*` text tier declares the same vision-tower sidecar
         // (`qwen3.8-27b-vision.hfq`) so each text quant tier serves images
         // without requantizing the trunk. Unlike dflash, the vision file is
-        // standalone: no registry entry's `file` names it.
+        // standalone: no registry entry's `file` names it. DFlash drafts carry
+        // none, so pulling a draft does not also fetch the tower.
         let registry = bundled().unwrap();
         let mut declared = 0;
         for (tag, entry) in &registry.models {
             if !tag.starts_with("qwen3.8:27b") {
+                continue;
+            }
+            if tag.contains("draft") {
+                assert!(entry.vision.is_none(), "{tag}: a DFlash draft carries no vision sidecar");
                 continue;
             }
             let sidecar = entry
