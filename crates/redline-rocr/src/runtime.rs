@@ -3471,6 +3471,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::reversed_empty_ranges)] // 4..3 is the reversed-range rejection case under test
     fn subimage_bounds_are_relative_and_checked() {
         let image = CodeObjectBytes::from(ELF);
         let inner = image.subimage(2..8).unwrap();
