@@ -22,9 +22,8 @@ use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::pipeline::{
     execute_validated_steps, validate_steps, BroadcastAddOp, ClearOp, DraftHead, DraftHeadLayout,
-    DraftHeadRequestState,
-    DraftHeadPolicy, EmbeddingOp, HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode,
-    IndexedAttentionOp, IndexedAttentionState, MixerPhase, ProjectOp, Step,
+    DraftHeadPolicy, DraftHeadRequestState, EmbeddingOp, HyperNormOp, HyperReadOp, HyperWriteOp,
+    IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, MixerPhase, ProjectOp, Step,
 };
 use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::kv_backend::{
@@ -415,9 +414,7 @@ impl AppendWidths {
                 .checked_mul(config.indexer_head_dim)?
                 .checked_add(index_kv_width)?,
             index_kv_width,
-            kv_width: config
-                .num_key_value_heads
-                .checked_mul(config.head_dim)?,
+            kv_width: config.num_key_value_heads.checked_mul(config.head_dim)?,
         })
     }
 }
@@ -584,11 +581,16 @@ impl MtpAppendScratch {
     /// Non-owning view of `rows` prompt-chunk ids from row `first` of the
     /// last [`Self::upload_prompt_ids`] upload, for `append_rows`'s
     /// `device_ids`. The view must not be freed.
-    pub(crate) fn prompt_ids_view(&self, first: usize, rows: usize) -> Result<GpuTensor, MtpGpuError> {
+    pub(crate) fn prompt_ids_view(
+        &self,
+        first: usize,
+        rows: usize,
+    ) -> Result<GpuTensor, MtpGpuError> {
         match first.checked_add(rows) {
-            Some(end) if end <= self.id_rows => Ok(self
-                .prompt_ids
-                .sub_offset(first * std::mem::size_of::<i32>(), rows * std::mem::size_of::<i32>())),
+            Some(end) if end <= self.id_rows => Ok(self.prompt_ids.sub_offset(
+                first * std::mem::size_of::<i32>(),
+                rows * std::mem::size_of::<i32>(),
+            )),
             _ => Err(invalid("MTP prompt id view is outside the id capacity")),
         }
     }
@@ -664,21 +666,47 @@ impl<'a> AppendWeights<'a> {
             return Err(invalid("MTP batched append needs a Q8_0 embedding table"));
         }
         let fc_embedding = dense_ref(weights, &weights.mtp.fc_embedding)?;
-        check("fc_embedding", &fc_embedding, DType::BF16, w.hidden, w.hidden)?;
+        check(
+            "fc_embedding",
+            &fc_embedding,
+            DType::BF16,
+            w.hidden,
+            w.hidden,
+        )?;
         let fc_hidden = dense_ref(weights, &weights.mtp.fc_hidden)?;
         check("fc_hidden", &fc_hidden, DType::BF16, w.hidden, w.hidden)?;
         let hc = hyper_desc(weights, &weights.mtp.attn_hyper)?.read;
         if !w.wide.is_multiple_of(32) {
             return Err(invalid("MTP batched append HC down needs K % 32 == 0"));
         }
-        check("HC down", &hc.input_mix_down, DType::BF16, config.hc_lowrank, w.wide)?;
-        check("HC up", &hc.input_mix_up, DType::BF16, w.wide, config.hc_lowrank)?;
+        check(
+            "HC down",
+            &hc.input_mix_down,
+            DType::BF16,
+            config.hc_lowrank,
+            w.wide,
+        )?;
+        check(
+            "HC up",
+            &hc.input_mix_up,
+            DType::BF16,
+            w.wide,
+            config.hc_lowrank,
+        )?;
         let qsa = qsa_desc(weights, &weights.mtp.attention)?;
         // The tiled Q8_0 projection is the K = 2560 staged kernel.
         if w.hidden != 2560 {
-            return Err(invalid("MTP batched append Q8_0 projections need hidden 2560"));
+            return Err(invalid(
+                "MTP batched append Q8_0 projections need hidden 2560",
+            ));
         }
-        check("indexer_qk", &qsa.indexer_qk, DType::Q8_0, w.index_width, w.hidden)?;
+        check(
+            "indexer_qk",
+            &qsa.indexer_qk,
+            DType::Q8_0,
+            w.index_width,
+            w.hidden,
+        )?;
         check("k_proj", &qsa.k, DType::Q8_0, w.kv_width, w.hidden)?;
         check("v_proj", &qsa.v, DType::Q8_0, w.kv_width, w.hidden)?;
         Ok(Self {
@@ -1008,7 +1036,10 @@ impl MtpGpuState {
     /// first chunk's mapped pages, the rest being virtual until forwards
     /// map it), then the selection and wide-hidden carry, twice with their
     /// snapshot backups.
-    pub(crate) fn device_bytes(config: &Qwen4Config, context: &Qwen4ContextCommit) -> Option<usize> {
+    pub(crate) fn device_bytes(
+        config: &Qwen4Config,
+        context: &Qwen4ContextCommit,
+    ) -> Option<usize> {
         let carry = config
             .qsa_selected_capacity()
             .checked_mul(std::mem::size_of::<i32>())?
@@ -1529,15 +1560,11 @@ impl MtpGpuState {
         words: &[u64],
     ) -> Result<StateLayout<'_>, MtpGpuError> {
         let mark = self.parse_session_mark(words)?;
-        let required = mark
-            .position
-            .max(mark.full_len)
-            .max(mark.raw_len)
-            .max(
-                mark.pooled_len
-                    .saturating_mul(self.compress)
-                    .min(self.full_capacity),
-            );
+        let required = mark.position.max(mark.full_len).max(mark.raw_len).max(
+            mark.pooled_len
+                .saturating_mul(self.compress)
+                .min(self.full_capacity),
+        );
         self.ensure_mapped_capacity(gpu, required)?;
         self.snapshot_arena.invalidate();
         self.request_epoch = self.request_epoch.wrapping_add(1);
@@ -2483,13 +2510,7 @@ impl Qwen4MtpGpu {
         let qsa_v = view(&scratch.qsa_v, w.kv_width);
 
         // Embed (`Step::Embed`): the Q8_0 table, one grid row per token.
-        gpu.embedding_lookup_q8_batched(
-            mw.embedding,
-            &token_embedding,
-            token_ids,
-            rows,
-            w.hidden,
-        )?;
+        gpu.embedding_lookup_q8_batched(mw.embedding, &token_embedding, token_ids, rows, w.hidden)?;
         hyper_norm(
             gpu,
             &HyperNorm {
