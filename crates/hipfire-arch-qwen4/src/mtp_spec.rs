@@ -4929,7 +4929,10 @@ mod tests {
                 budget: 4,
                 max_seq_len: 16,
                 rotary_dim: 2,
-                rope_theta: 10_000,
+                rope: rdna_compute::rope::Rope {
+                    theta: 10_000.0,
+                    scaling: rdna_compute::rope::RopeScaling::None,
+                },
             })
             .unwrap();
             state.position = 7;
@@ -4955,7 +4958,10 @@ mod tests {
             budget: 4,
             max_seq_len: 16,
             rotary_dim: 2,
-            rope_theta: 10_000,
+            rope: rdna_compute::rope::Rope {
+                theta: 10_000.0,
+                scaling: rdna_compute::rope::RopeScaling::None,
+            },
         })
         .unwrap();
         state.qsa.position = 6;

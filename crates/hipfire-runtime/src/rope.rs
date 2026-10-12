@@ -60,8 +60,8 @@ fn resolve(text: &Value, yarn_factor: Option<f64>) -> Result<RopeScaling, String
             None => max_position_embeddings.ok_or("YaRN needs a factor")? as f64 / original as f64,
         },
     };
-    if !(factor.is_finite() && factor > 0.0) {
-        return Err(format!("YaRN factor {factor} must be finite and positive"));
+    if !(factor.is_finite() && factor >= 1.0) {
+        return Err(format!("YaRN factor {factor} must be finite and >= 1"));
     }
     // A declared attention_factor was tuned for the declared factor only.
     let attention_factor = if yarn_factor.is_none() {
@@ -150,5 +150,8 @@ mod tests {
         assert_eq!(yarn(resolve(&text, None).unwrap()).factor, 4.0);
         let err = resolve(&qwen38(json!({"rope_type": "longrope"})), None).unwrap_err();
         assert!(err.contains("longrope"), "{err}");
+        // A shrinking factor would invert the ramp and the context limit.
+        let shrink = qwen38(json!({"rope_type": "yarn", "factor": 0.5}));
+        assert!(resolve(&shrink, None).unwrap_err().contains(">= 1"));
     }
 }

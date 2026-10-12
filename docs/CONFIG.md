@@ -547,7 +547,8 @@ above 1 applies YaRN with that factor over the checkpoint's
 extends the admitted context to `factor x original`; `1` disables a
 checkpoint's YaRN. Equivalent to the `rope_parameters` edit model cards give
 for vLLM/SGLang, e.g. Qwen3.8-Flash-Next: `yarn_factor = 4` admits
-`max_seq` up to 1,048,576. Static YaRN, as in those frameworks: it also
+`max_seq` up to 1,048,576 (measured on gfx1151 up to a 499K-token prompt,
+where memory still fits; past that the state allocation decides). Static YaRN, as in those frameworks: it also
 changes outputs at short context, so set it only for long-context loads.
 Implemented by the engine (`rdna_compute::rope`, `kernels/src/rope_yarn.h`);
 currently wired for Qwen4 (Flash-Next). Other families ignore it.

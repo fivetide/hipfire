@@ -578,7 +578,7 @@ impl Probe {
                 let mut value: Vec<f32> = (0..dim)
                     .map(|c| bf16_round(mean[c] * inv * (1.0 + norm[c])))
                     .collect();
-                ops::rope_prefix_halfsplit(&mut value, block * compress, dim.min(64), 10_000_000.0)
+                ops::rope_prefix_halfsplit(&mut value, block * compress, dim.min(64), op.rope)
                     .map_err(err)?;
                 for c in 0..dim {
                     let cpu = bf16_round(value[c]);

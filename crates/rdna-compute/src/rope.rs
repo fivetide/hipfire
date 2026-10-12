@@ -39,6 +39,8 @@ pub struct Yarn {
 impl Yarn {
     /// HF defaults: `beta_fast` 32, `beta_slow` 1, and `attention_factor`
     /// from `factor` (plus `mscale`/`mscale_all_dim` when both are given).
+    /// `factor` must be finite and >= 1: below 1 the correction ramp inverts
+    /// and [`RopeScaling::context_limit`] shrinks below the original context.
     pub fn new(
         factor: f64,
         original_max_position_embeddings: usize,
@@ -47,6 +49,10 @@ impl Yarn {
         attention_factor: Option<f64>,
         mscale: Option<(f64, f64)>,
     ) -> Self {
+        assert!(
+            factor.is_finite() && factor >= 1.0,
+            "YaRN factor {factor} must be finite and >= 1"
+        );
         let get_mscale = |m: f64| {
             if factor <= 1.0 {
                 1.0
@@ -103,6 +109,26 @@ impl RopeYarn {
     pub fn push(&self, args: &mut hip_bridge::KernargBlob) {
         for v in [self.freq_scale, self.corr_low, self.corr_high, self.mscale] {
             args.push_f32(v);
+        }
+    }
+
+    /// Host twin of `rope_yarn_sincos` (`kernels/src/rope_yarn.h`), same f32
+    /// operation order: `(sin, cos)` of `angle` (= position * inv_freq[pair]).
+    /// [`Self::OFF`] is `angle.sin_cos()`, so unscaled host references keep
+    /// their results. Not bit-equal to HF, which scales `inv_freq` before the
+    /// position multiply.
+    pub fn sin_cos(&self, mut angle: f32, pair: usize) -> (f32, f32) {
+        if self.freq_scale != 1.0 {
+            let span = self.corr_high - self.corr_low;
+            let span = if span == 0.0 { 0.001 } else { span };
+            let ramp = ((pair as f32 - self.corr_low) / span).clamp(0.0, 1.0);
+            angle *= ramp * self.freq_scale + (1.0 - ramp);
+        }
+        let (sine, cosine) = angle.sin_cos();
+        if self.mscale != 1.0 {
+            (sine * self.mscale, cosine * self.mscale)
+        } else {
+            (sine, cosine)
         }
     }
 }
