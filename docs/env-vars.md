@@ -102,6 +102,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_KV_V` | **developer-only** V-axis override (e.g. `lloyd2`/`lloyd3`/`lloyd4`); **lower precedence** than an authored `--kv-v` or `memory.kv_v` | Qwen carrier (`developer_var`); not a second user config plane — prefer CLI/TOML |
 | `HIPFIRE_QWEN_KV_DEFAULT_Q8` | default **ON** (implicit Qwen Q8/Q8 wherever `auto` does not pick native fp8). **`=0`** is the emergency kill switch: restores the prior *implicit* HFQ/PaRo defaults on every load that does not get native fp8, gfx1201 included (HFQ `auto`/unset and PaRo `"auto"` → FWHT3/Q8; PaRo raw unset stays Q8). Does **not** override authored `--kv-mode`/`--kv-k`/`--kv-v` or `memory.kv_*`, native gfx1201 fp8, or non-Qwen families. | Loader admission (`qwen_default_q8_enabled`); sampled once per load |
 | `HIPFIRE_ATTN_FLASH` | from `flash_mode` (`auto`/`always`/`never`) | CLI → daemon |
+| `HIPFIRE_YARN_FACTOR` | unset = checkpoint `rope_parameters`; `>1` YaRN factor over the original context; `1` disables | `attention.yarn_factor`; `RuntimeConfig` → `hipfire_runtime::rope` (Qwen4) |
 | `HIPFIRE_NORMALIZE_PROMPT` | on unless `0`/`false`/`off`/`no` | `RuntimeConfig` |
 | `HIPFIRE_PROMPT_TOKEN_HEAT=1` | dump BPE heat | RuntimeConfig |
 | `HIPFIRE_PROMPT_HEAT_JSON=1` | JSON heat | RuntimeConfig |
@@ -615,7 +616,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1540
+**Count:** 1541
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1770,13 +1771,13 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` | crates/hip-bridge/src/ffi.rs, crates/hipfire-arch-qwen4/src/cache_quality.rs | developer |
 | `HIPFIRE_QWEN4_F16_WMMA` | crates/hipfire-arch-qwen4/examples/qwen4_qsa_arena_check.rs, crates/hipfire-arch-qwen4/examples/qwen4_qsa_ctx.rs | developer |
 | `HIPFIRE_QWEN4_F16_WMMA_GFX1201` | crates/rdna-compute/examples/bench_qwen4_hc_wmma.rs, crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_QWEN4_GDN_CONV_QKNORM` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs, crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_QWEN4_GDN_CONV_QKNORM` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs, crates/hipfire-dispatch/src/pipeline/layer_ops.rs | developer |
 | `HIPFIRE_QWEN4_GDN_PIPE` | crates/rdna-compute/src/tensor_ops.rs | developer |
 | `HIPFIRE_QWEN4_GDN_PREFILL` | crates/hipfire-arch-qwen4/examples/fn_prefill_g0.rs, crates/rdna-compute/src/prefill_invariant.rs | developer |
 | `HIPFIRE_QWEN4_GDN_Q8_INLINE` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/kernel_registry.rs | developer |
 | `HIPFIRE_QWEN4_HC_DOWN_TILE` | crates/railgun-cert/src/recording.rs, crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_QWEN4_HC_FUSE` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs, crates/hipfire-dispatch/src/pipeline/moe_program.rs | developer |
-| `HIPFIRE_QWEN4_HC_ROW_FOLD` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs, crates/hipfire-dispatch/src/pipeline/moe_program.rs | developer |
+| `HIPFIRE_QWEN4_HC_FUSE` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs, crates/hipfire-dispatch/src/pipeline/layer_ops.rs | developer |
+| `HIPFIRE_QWEN4_HC_ROW_FOLD` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs, crates/hipfire-dispatch/src/pipeline/layer_ops.rs | developer |
 | `HIPFIRE_QWEN4_HC_UP_TILE` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/tensor_ops.rs | developer |
 | `HIPFIRE_QWEN4_MOE_COMBINE_ZINIT` | crates/hipfire-dispatch/src/pipeline/moe_program.rs, crates/hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs | developer |
 | `HIPFIRE_QWEN4_MOE_SYM_DOWN_RR` | crates/rdna-compute/examples/qwen4_moe_sym.rs, crates/rdna-compute/src/gemm.rs | developer |
@@ -2159,6 +2160,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_XDNA_INSTS` | crates/hipfire-xdna/src/lib.rs | developer |
 | `HIPFIRE_XDNA_MKN` | crates/hipfire-xdna/src/lib.rs | developer |
 | `HIPFIRE_XDNA_PDI` | crates/hipfire-xdna/src/lib.rs | developer |
+| `HIPFIRE_YARN_FACTOR` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | stable |
 
 <!-- env-inventory:end -->
 

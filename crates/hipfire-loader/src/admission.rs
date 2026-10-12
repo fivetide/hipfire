@@ -1352,10 +1352,12 @@ pub fn admit_source_with_options(
             native_mtp,
             spec_mtp,
         )?;
-        let positions = admitted.config.max_position_embeddings;
+        // Native positions, or the YaRN-extended `factor x original` context.
+        let positions = admitted.config.context_limit();
         if max_seq > positions {
             return Err(format!(
-                "qwen4: max_seq {max_seq} exceeds max_position_embeddings {positions}"
+                "qwen4: max_seq {max_seq} exceeds the model's RoPE context {positions} \
+                 (max_position_embeddings, or YaRN factor x original; see attention.yarn_factor)"
             ));
         }
         let model_ctx = positions.min(hipfire_arch_qwen4::QWEN4_MAX_CONTEXT);

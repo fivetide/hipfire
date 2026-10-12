@@ -611,6 +611,9 @@ pub struct Qwen4Config {
     pub head_dim: usize,
     pub partial_rotary_factor: f64,
     pub rope_theta: f64,
+    /// Long-context RoPE scaling, resolved by the engine
+    /// ([`hipfire_runtime::rope::rope_scaling`]); shared by the MTP head.
+    pub rope_scaling: rdna_compute::rope::RopeScaling,
     pub attention_bias: bool,
     pub layer_types: Vec<LayerType>,
     pub full_attention_interval: usize,
@@ -949,6 +952,8 @@ impl Qwen4Config {
             head_dim: required_usize(text, "head_dim")?,
             partial_rotary_factor,
             rope_theta,
+            rope_scaling: hipfire_runtime::rope::rope_scaling(text)
+                .map_err(|error| format!("qwen4: {error}"))?,
             attention_bias: optional_bool(text, "attention_bias").unwrap_or(false),
             layer_types,
             full_attention_interval: required_usize(text, "full_attention_interval")?,
@@ -1586,6 +1591,17 @@ impl Qwen4Config {
         (self.head_dim as f64 * self.partial_rotary_factor).round() as usize
     }
 
+    /// The full-attention rotary embedding (the MTP head shares it).
+    pub fn rope(&self) -> rdna_compute::rope::Rope {
+        rdna_compute::rope::Rope { theta: self.rope_theta, scaling: self.rope_scaling }
+    }
+
+    /// Positions the RoPE covers: `max_position_embeddings`, or the YaRN
+    /// `factor x original` context.
+    pub fn context_limit(&self) -> usize {
+        self.rope_scaling.context_limit(self.max_position_embeddings)
+    }
+
     /// Number of values in each sharded n-gram row (0 without PLE).
     pub fn ple_row_width(&self) -> usize {
         self.ple.as_ref().map_or(0, |ple| ple.row_width)
@@ -1806,12 +1822,13 @@ fn ple_metadata_object(ple: &Qwen4PleConfig) -> Value {
     })
 }
 
-/// Largest context a Qwen4 load admits: the model's native
-/// `max_position_embeddings`. Past 15,360 pooled blocks (61,440 tokens) the
-/// QSA selector keeps its score rows in global memory instead of LDS; whether
-/// a context fits is decided by the state allocation, which names the MiB it
-/// needed when it does not.
-pub const QWEN4_MAX_CONTEXT: usize = 262_144;
+/// Largest context any Qwen4 load admits (the `memory.max_seq` ceiling, the
+/// Flash-Next native 262,144 under YaRN factor 4); a model admits only up to
+/// its own [`Qwen4Config::context_limit`]. Past 15,360 pooled blocks (61,440
+/// tokens) the QSA selector keeps its score rows in global memory instead of
+/// LDS; whether a context fits is decided by the state allocation, which names
+/// the MiB it needed when it does not.
+pub const QWEN4_MAX_CONTEXT: usize = 1_048_576;
 
 /// Context a Qwen4 load gets when `max_seq` is omitted.
 pub const QWEN4_DEFAULT_CONTEXT: usize = 32768;

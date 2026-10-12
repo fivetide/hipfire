@@ -57,6 +57,7 @@ pub mod qwen35_fa_batch;
 pub mod rdna;
 pub mod railgun_check;
 pub mod replay;
+pub mod rope;
 pub mod sampling;
 pub mod scratch;
 pub mod select_regrid;

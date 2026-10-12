@@ -2133,6 +2133,10 @@ pub struct IndexedAttentionOp<'a> {
     /// they would not derive runs the batched launches (queries/keys) or is
     /// refused (pooled keys).
     pub rotary_dim: usize,
+    /// The model's rotary embedding. The QSA kernels hard-code the RoPE base;
+    /// its scaling is lowered at [`Self::rotary_dim`] for every QSA rotation
+    /// (queries, keys, indexer queries and pooled keys).
+    pub rope: rdna_compute::rope::Rope,
     pub input_width: usize,
     /// FWHT basis scratch for quantized payloads (`rows * k` elements); the
     /// BF16 path never reads it.
@@ -2696,6 +2700,7 @@ pub fn execute_indexed_attention_hc(
     if let Some(arena) = &op.state.f16_arena {
         arena.valid_len.clamp(initial_position);
     }
+    let yarn = op.rope.yarn(op.rotary_dim);
     if gpu.route_rows(op.rows) <= 8
         && op.index_dim <= 256
         && op.head_dim <= 256
@@ -2725,6 +2730,7 @@ pub fn execute_indexed_attention_hc(
                 position: initial_position,
                 rows: op.rows,
                 format: op.state.format,
+                yarn,
             },
         ))?;
     } else {
@@ -2740,6 +2746,7 @@ pub fn execute_indexed_attention_hc(
                 head_stride: op.index_dim,
                 position_start: initial_position,
                 rotary_dim: op.rotary_dim,
+                yarn,
             },
         ))?;
         if op.state.format.index_dtype() == DType::BF16 {
@@ -2797,6 +2804,7 @@ pub fn execute_indexed_attention_hc(
                 head_stride: 2 * op.head_dim,
                 position_start: initial_position,
                 rotary_dim: op.rotary_dim,
+                yarn,
             },
         ))?;
         hip(indexed_attention_norm_rope_batch(
@@ -2811,6 +2819,7 @@ pub fn execute_indexed_attention_hc(
                 head_stride: op.head_dim,
                 position_start: initial_position,
                 rotary_dim: op.rotary_dim,
+                yarn,
             },
         ))?;
         hip(indexed_attention_cache_append_batch(
@@ -2854,6 +2863,7 @@ pub fn execute_indexed_attention_hc(
                     rows: op.rows,
                 }),
                 grid_bound: op.state.pooled_capacity,
+                yarn,
             },
         ))?;
     }
@@ -3824,6 +3834,10 @@ mod tests {
         };
         IndexedAttentionOp {
             rotary_dim: 2,
+            rope: rdna_compute::rope::Rope {
+                theta: 10_000_000.0,
+                scaling: rdna_compute::rope::RopeScaling::None,
+            },
             indexer_qk: weight,
             indexer_q_norm: t,
             indexer_k_norm: t,

@@ -70,6 +70,7 @@ pub mod ple_sidecar;
 pub mod prefix;
 pub mod prefix_index;
 pub mod reset_core;
+pub mod rope;
 pub mod safetensors_source;
 pub mod sampler;
 /// `Scheduler` — decides what goes into each step's `SlotBatch`. Pure CPU

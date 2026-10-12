@@ -130,6 +130,10 @@ pub struct RuntimeConfig {
     /// or `auto`: the consumer applies its default (`hipfire_config::
     /// mtp_k_default_for_arch` for native Qwen4 MTP, else `MTP_K_DEFAULT`).
     pub mtp_k: Option<usize>,
+    /// `attention.yarn_factor` / `HIPFIRE_YARN_FACTOR`: YaRN RoPE factor
+    /// override applied by [`crate::rope::rope_scaling`]. `None` = the
+    /// checkpoint's own `rope_parameters`.
+    pub yarn_factor: Option<f64>,
     /// Opt-in gfx1151 XDNA NPU spillover (`kernel.npu_spillover`,
     /// `HIPFIRE_NPU_SPILLOVER`). Default false; snapshotted once here, never
     /// re-read from the environment on hot paths.
@@ -243,6 +247,7 @@ impl RuntimeConfig {
                 .and_then(|s| s.parse().ok()),
             mtp_mode: value("HIPFIRE_MTP_MODE").unwrap_or_else(|| "auto".into()),
             mtp_k: value("HIPFIRE_MTP_K").and_then(|value| value.parse().ok()),
+            yarn_factor: value("HIPFIRE_YARN_FACTOR").and_then(|value| value.parse().ok()),
             npu_spillover: value("HIPFIRE_NPU_SPILLOVER").as_deref() == Some("1"),
         }
     }

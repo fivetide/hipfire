@@ -1428,6 +1428,7 @@ fn forward_lanes_scoped(
                                 kv_heads: dims.num_key_value_heads,
                                 head_dim: dims.head_dim,
                                 rotary_dim: config.rotary_dim(),
+                                rope: config.rope(),
                                 input_width: dims.hidden,
                                 trunk_a4: fwd.trunk_a4.get(layer).copied().unwrap_or(0),
                                 phase,

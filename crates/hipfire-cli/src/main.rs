@@ -5917,16 +5917,18 @@ fn bench_matrix_seq_need(
 
 /// The model's declared context window: `max_position_embeddings` under
 /// `config.text_config`, `config`, or the top level of the source metadata,
-/// the same lookup admission uses for a model's trained context.
+/// extended by YaRN RoPE scaling (checkpoint or `attention.yarn_factor`), the
+/// same lookup admission uses for a model's trained context.
 fn declared_context_from_metadata(metadata_json: &str) -> Option<u64> {
     let meta: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
     let config = meta.get("config").unwrap_or(&meta);
-    config
-        .get("text_config")
-        .unwrap_or(config)
+    let text = config.get("text_config").unwrap_or(config);
+    let native = text
         .get("max_position_embeddings")
         .and_then(serde_json::Value::as_u64)
-        .filter(|&context| context > 0)
+        .filter(|&context| context > 0)?;
+    let scaling = hipfire_runtime::rope::rope_scaling(text).unwrap_or_default();
+    Some(scaling.context_limit(native as usize) as u64)
 }
 
 /// [`declared_context_from_metadata`] for a model file or directory. `None`

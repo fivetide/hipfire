@@ -15,6 +15,7 @@ use crate::prefill_invariant::{qwen4_gdn_prefill, Qwen4GdnPrefill};
 
 pub(crate) const TENSOR_OPS_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq_fwht256.h"),
+    include_str!("../../../kernels/src/rope_yarn.h"),
     include_str!("../../../kernels/src/tensor_ops.hip")
 );
 pub(crate) const HYPER_READ_UP_WMMA_SRC: &str =
@@ -2445,6 +2446,8 @@ pub struct IndexedAttentionNormRope<'a> {
     pub head_stride: usize,
     pub position: usize,
     pub rotary_dim: usize,
+    /// [`crate::rope::Rope::yarn`] of the model's RoPE at `rotary_dim`.
+    pub yarn: crate::rope::RopeYarn,
 }
 
 pub fn indexed_attention_norm_rope(
@@ -2488,6 +2491,7 @@ pub fn indexed_attention_norm_rope(
     args.push_i32(head_stride);
     args.push_i32(position);
     args.push_i32(rotary_dim);
+    p.yarn.push(&mut args);
     args.pad_to(16);
     gpu.launch_blob_recorded(
         "indexed_attention_norm_rope_f32",
@@ -2509,6 +2513,8 @@ pub struct IndexedAttentionNormRopeBatch<'a> {
     pub head_stride: usize,
     pub position_start: usize,
     pub rotary_dim: usize,
+    /// [`crate::rope::Rope::yarn`] of the model's RoPE at `rotary_dim`.
+    pub yarn: crate::rope::RopeYarn,
 }
 
 /// Storage format of a QSA layer's state: the full K/V caches and the
@@ -2769,6 +2775,9 @@ pub struct IndexedAttentionDecodePrologue<'a> {
     pub position: usize,
     pub rows: usize,
     pub format: QsaKvFormat,
+    /// [`crate::rope::Rope::yarn`] at the prologue's rotary width
+    /// (`min(dim, 64)`).
+    pub yarn: crate::rope::RopeYarn,
 }
 
 pub fn indexed_attention_decode_prologue(
@@ -2852,6 +2861,7 @@ pub fn indexed_attention_decode_prologue(
     // Declared dynamic field: replay re-derives the position (angles and
     // both cache rows follow it).
     let position_offset = args.len() - 4;
+    p.yarn.push(&mut args);
     args.pad_to(16);
     let position_binding = [crate::replay::ReplayKernargBinding::PositionPlusU32 {
         offset: position_offset,
@@ -2897,6 +2907,8 @@ pub struct IndexedAttentionAppendPrologue<'a> {
     pub position: usize,
     pub rows: usize,
     pub format: QsaKvFormat,
+    /// See [`IndexedAttentionDecodePrologue::yarn`].
+    pub yarn: crate::rope::RopeYarn,
 }
 
 pub fn indexed_attention_append_prologue(
@@ -2979,6 +2991,7 @@ pub fn indexed_attention_append_prologue(
     // Declared dynamic field: replay re-derives the position (angles and
     // both cache rows follow it).
     let position_offset = args.len() - 4;
+    p.yarn.push(&mut args);
     args.pad_to(16);
     let position_binding = [crate::replay::ReplayKernargBinding::PositionPlusU32 {
         offset: position_offset,
@@ -3061,6 +3074,7 @@ pub fn indexed_attention_norm_rope_batch(
     // base; the kernel adds the row index itself.
     let position_offset = args.len() - 4;
     args.push_i32(rotary_dim);
+    p.yarn.push(&mut args);
     args.pad_to(16);
     let position_binding = [crate::replay::ReplayKernargBinding::PositionPlusU32 {
         offset: position_offset,
@@ -4080,6 +4094,9 @@ pub struct IndexedAttentionPoolRope<'a> {
     /// instead uses `ceil(rows / compress)` (capped by this bound), which is
     /// also position-independent.
     pub grid_bound: usize,
+    /// [`crate::rope::Rope::yarn`] at the pooled keys' rotary width
+    /// (`min(index_dim, 64)`).
+    pub yarn: crate::rope::RopeYarn,
 }
 
 pub fn indexed_attention_pool_rope(
@@ -4201,6 +4218,7 @@ fn indexed_attention_pool_rope_impl(
     args.push_i32(checked_i32(first_block, "QSA pool/RoPE first block")?);
     // Declared dynamic too when incremental: `position_start / compress`.
     let first_block_offset = args.len() - 4;
+    p.yarn.push(&mut args);
     args.pad_to(16);
     let addend = u32::try_from(p.position.map_or(0, |position| position.rows))
         .map_err(|_| HipError::new(0, "QSA pool/RoPE rows exceed u32"))?;
@@ -8054,6 +8072,7 @@ mod tests {
                     rows,
                 }),
                 grid_bound: blocks,
+                yarn: crate::rope::RopeYarn::OFF,
             },
         )
         .expect("QSA pool/RoPE");
@@ -8166,6 +8185,7 @@ mod tests {
                     rows: inc_rows,
                 }),
                 grid_bound: 65_536,
+                yarn: crate::rope::RopeYarn::OFF,
             },
         )
         .expect("incremental QSA pool/RoPE");
@@ -8401,6 +8421,7 @@ mod tests {
                         rows: 1,
                     }),
                     grid_bound: max_blocks,
+                    yarn: crate::rope::RopeYarn::OFF,
                 },
             )
             .expect("QSA pool/RoPE");
@@ -8870,6 +8891,7 @@ mod tests {
                     index_dim,
                     position: None,
                     grid_bound: bound,
+                    yarn: crate::rope::RopeYarn::OFF,
                 },
             )
             .expect("QSA pool/RoPE");
@@ -8909,6 +8931,7 @@ mod tests {
                 index_dim,
                 position,
                 grid_bound: inc_capacity,
+                yarn: crate::rope::RopeYarn::OFF,
             };
             match position {
                 Some(_) => indexed_attention_pool_rope_incremental(gpu, &p),
@@ -10063,7 +10086,6 @@ mod tests {
         const HEAD_DIM: usize = 256;
         const HEAD_STRIDE: usize = 2 * HEAD_DIM;
         const ROTARY_DIM: usize = 64;
-        const POSITION: usize = 11;
         let mut input = vec![0.0f32; HEADS * HEAD_STRIDE];
         for head in 0..HEADS {
             for channel in 0..HEAD_DIM {
@@ -10073,57 +10095,67 @@ mod tests {
                     1000.0 + (head * HEAD_DIM + channel) as f32;
             }
         }
-        let values = gpu
-            .upload_f32(&input, &[input.len()])
-            .expect("query/gate upload");
         let norm = gpu
             .zeros(&[HEAD_DIM], DType::BF16)
             .expect("zero norm allocation");
-        indexed_attention_norm_rope(
-            &mut gpu,
-            &IndexedAttentionNormRope {
-                values: &values,
-                norm: &norm,
-                heads: HEADS,
-                head_dim: HEAD_DIM,
-                head_stride: HEAD_STRIDE,
-                position: POSITION,
-                rotary_dim: ROTARY_DIM,
-            },
-        )
-        .expect("QSA norm/RoPE");
-        let actual = gpu.download_f32(&values).expect("query/gate download");
-        let mut expected = input.clone();
-        for head in 0..HEADS {
-            let start = head * HEAD_STRIDE;
-            let inv = (input[start..start + HEAD_DIM]
-                .iter()
-                .map(|value| value * value)
-                .sum::<f32>()
-                / HEAD_DIM as f32
-                + 1.0e-6)
-                .sqrt()
-                .recip();
-            for channel in 0..HEAD_DIM {
-                expected[start + channel] = input[start + channel] * inv;
+        // Plain RoPE at a short position, and the Qwen3.8 README YaRN override
+        // (factor 4 over 262144) against the host HF reference, at a position
+        // where interpolated pairs and the cos/sin factor are both visible.
+        use crate::rope::{Rope, RopeScaling, Yarn};
+        let yarn = RopeScaling::Yarn(Yarn::new(4.0, 262_144, None, None, None, None));
+        for (scaling, position, tolerance) in [(RopeScaling::None, 11, 1.0e-4), (yarn, 4099, 2.0e-3)]
+        {
+            let rope = Rope { theta: 10_000_000.0, scaling };
+            let values = gpu
+                .upload_f32(&input, &[input.len()])
+                .expect("query/gate upload");
+            indexed_attention_norm_rope(
+                &mut gpu,
+                &IndexedAttentionNormRope {
+                    values: &values,
+                    norm: &norm,
+                    heads: HEADS,
+                    head_dim: HEAD_DIM,
+                    head_stride: HEAD_STRIDE,
+                    position,
+                    rotary_dim: ROTARY_DIM,
+                    yarn: rope.yarn(ROTARY_DIM),
+                },
+            )
+            .expect("QSA norm/RoPE");
+            let actual = gpu.download_f32(&values).expect("query/gate download");
+            gpu.free_tensor(values).expect("free query/gate");
+            let (inv_freq, mscale) = rope.inv_freq(ROTARY_DIM);
+            let mut expected = input.clone();
+            for head in 0..HEADS {
+                let start = head * HEAD_STRIDE;
+                let inv = (input[start..start + HEAD_DIM]
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f32>()
+                    / HEAD_DIM as f32
+                    + 1.0e-6)
+                    .sqrt()
+                    .recip();
+                for channel in 0..HEAD_DIM {
+                    expected[start + channel] = input[start + channel] * inv;
+                }
+                for channel in 0..ROTARY_DIM / 2 {
+                    let (sine, cosine) = (position as f64 * inv_freq[channel]).sin_cos();
+                    let (sine, cosine) = ((sine * mscale) as f32, (cosine * mscale) as f32);
+                    let first = input[start + channel] * inv;
+                    let second = input[start + ROTARY_DIM / 2 + channel] * inv;
+                    expected[start + channel] = first * cosine - second * sine;
+                    expected[start + ROTARY_DIM / 2 + channel] = first * sine + second * cosine;
+                }
             }
-            for channel in 0..ROTARY_DIM / 2 {
-                let angle = POSITION as f32
-                    / 10_000_000.0f32.powf(2.0 * channel as f32 / ROTARY_DIM as f32);
-                let (sine, cosine) = angle.sin_cos();
-                let first = input[start + channel] * inv;
-                let second = input[start + ROTARY_DIM / 2 + channel] * inv;
-                expected[start + channel] = first * cosine - second * sine;
-                expected[start + ROTARY_DIM / 2 + channel] = first * sine + second * cosine;
+            for (index, (got, want)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    (got - want).abs() <= tolerance,
+                    "QSA norm/RoPE {scaling:?} mismatch at {index}: got {got}, expected {want}"
+                );
             }
         }
-        for (index, (got, want)) in actual.iter().zip(&expected).enumerate() {
-            assert!(
-                (got - want).abs() <= 1.0e-4,
-                "QSA norm/RoPE mismatch at {index}: got {got}, expected {want}"
-            );
-        }
-        gpu.free_tensor(values).expect("free query/gate");
         gpu.free_tensor(norm).expect("free norm");
     }
 
@@ -10288,6 +10320,7 @@ mod tests {
                     position,
                     rows,
                     format,
+                    yarn: crate::rope::RopeYarn::OFF,
                 },
             )
             .expect("QSA prologue");
@@ -10592,6 +10625,7 @@ mod tests {
                     index_dim,
                     position: None,
                     grid_bound: block_count,
+                    yarn: crate::rope::RopeYarn::OFF,
                 },
             )
             .expect("QSA pool");

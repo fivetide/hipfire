@@ -506,6 +506,7 @@ fn select_target(
                         rows: 1,
                     }),
                     grid_bound: visible / config.indexer_compress_ratio,
+                    yarn: config.rope().yarn(raw_width.min(64)),
                 },
             )
             .map_err(|e| e.to_string())?;
@@ -574,6 +575,7 @@ fn select_mtp(
                     rows: 1,
                 }),
                 grid_bound: visible / config.indexer_compress_ratio,
+                yarn: config.rope().yarn(raw_width.min(64)),
             },
         )
         .map_err(|e| e.to_string())?;

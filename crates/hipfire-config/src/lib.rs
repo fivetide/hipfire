@@ -795,6 +795,18 @@ pub static FIELDS: &[ConfigField] = &[
         "Flash-attention admission preference."
     ),
     field!(
+        "attention.yarn_factor",
+        "yarn_factor",
+        Attention,
+        ModelLoad,
+        DefaultValue::Null,
+        ValueRule::NullableFloat { min: 1.0, max: 64.0 },
+        true,
+        false,
+        Some("HIPFIRE_YARN_FACTOR"),
+        "YaRN RoPE scaling factor override. Default null = the checkpoint's own rope_parameters; above 1 enables YaRN over the checkpoint's original context (factor x original positions); 1 disables a checkpoint's YaRN."
+    ),
+    field!(
         "serve.default_model",
         "default_model",
         Serve,

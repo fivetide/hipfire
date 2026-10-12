@@ -4949,6 +4949,7 @@ impl Qwen4GpuForward {
                         kv_heads: dims.num_key_value_heads,
                         head_dim: dims.head_dim,
                         rotary_dim: config.rotary_dim(),
+                        rope: config.rope(),
                         input_width: dims.hidden,
                         trunk_a4: self.trunk_a4.get(layer_index).copied().unwrap_or(0),
                         phase: MixerPhase::Whole,
