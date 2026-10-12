@@ -239,6 +239,13 @@ works, what to measure, what counts as pass/fail.
    TypeScript/JavaScript runtime surface. `scripts/install.{sh,ps1}`, Nix, and
    the container build install the native `hipfire` binary. Python remains
    appropriate for developer-only orchestration and analysis scripts.
+7. **Run `scripts/pre-commit-ci.sh [origin/<base>]` before every commit.**
+   It runs the GPU-free CI checks that finish quickly: ratchets, crate
+   maps, scratch growth, changelog, ratchet-diff, cargo-deny
+   bans/licenses/sources, rustfmt on changed files, clippy, env docs and
+   lifecycle. It skips the tests and the release build. Pass the branch
+   your PR targets (for example `origin/beta`) so ratchet-diff compares
+   against it. Fix every failure before you commit.
 
 ---
 
