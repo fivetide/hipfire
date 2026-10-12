@@ -29,7 +29,7 @@ The mechanical section is fenced by explicit markers:
 
 ```text
 <!-- crate-map:generated:begin -->
-...modules, dependencies, reverse dependencies...
+...modules with exported symbols, dependencies, reverse dependencies...
 <!-- crate-map:generated:end -->
 ```
 
@@ -39,15 +39,15 @@ byte-for-byte. Never hand-edit inside the markers — rerun the generator.
 
 The generated section carries only stable structure, measured from the tree:
 
-- modules: every `src/**/*.rs` (doubles as the TOC, with relative links);
+- modules and exported symbols: every `src/**/*.rs` (doubles as the TOC, with
+  relative links), each followed by a sub-list of its `pub` item names;
 - direct dependencies from `Cargo.toml`, split path / external / dev / build;
 - reverse dependencies: workspace crates with a path dependency on this one.
 
-Every list is sorted alphabetically with one entry per line, so two branches
-that each add an entry merge cleanly unless the entries are adjacent. It
-deliberately carries no per-module detail (exported symbols, line/item/test
-counts) and no totals, so a change that does not add/remove a file or a
-dependency edge never requires a map regen.
+Every list and sub-list is sorted alphabetically with one entry per line, so
+two branches that each add an entry merge cleanly unless the entries are
+adjacent. It deliberately carries no line/item/test counts and no totals, so a
+change that only edits function bodies never requires a map regen.
 
 ## Running it
 
@@ -69,6 +69,7 @@ crate without a map.
 
 - a `src/**/*.rs` file exists with no map entry;
 - the map lists a file that no longer exists;
+- a file gained, lost, or renamed an exported (`pub`) symbol;
 - a declared dependency (or reverse dependency) in the map is stale or
   missing relative to `Cargo.toml`.
 
