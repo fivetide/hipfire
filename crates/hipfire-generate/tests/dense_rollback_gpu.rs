@@ -51,7 +51,9 @@ extern "C" {
 static DENSE_GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn lock() -> std::sync::MutexGuard<'static, ()> {
-    DENSE_GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    DENSE_GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// Slack for device-global free-byte assertions: far below one resident
@@ -304,8 +306,7 @@ fn assert_single_attested_error(
     m: &hipfire_loader::LoadedModel,
 ) {
     let events = parse_lines(output);
-    let errors: Vec<&serde_json::Value> =
-        events.iter().filter(|e| e["type"] == "error").collect();
+    let errors: Vec<&serde_json::Value> = events.iter().filter(|e| e["type"] == "error").collect();
     assert_eq!(
         errors.len(),
         1,
@@ -338,14 +339,10 @@ fn assert_envelope_equal(baseline: &[u8], retry: &[u8]) {
         retry_events.len(),
         "same envelope count after rollback"
     );
-    let base_norm: Vec<serde_json::Value> = base_events
-        .into_iter()
-        .map(normalize_envelope)
-        .collect();
-    let retry_norm: Vec<serde_json::Value> = retry_events
-        .into_iter()
-        .map(normalize_envelope)
-        .collect();
+    let base_norm: Vec<serde_json::Value> =
+        base_events.into_iter().map(normalize_envelope).collect();
+    let retry_norm: Vec<serde_json::Value> =
+        retry_events.into_iter().map(normalize_envelope).collect();
     assert_eq!(
         base_norm, retry_norm,
         "post-rollback turn is envelope-equal to the fresh turn"
@@ -396,6 +393,17 @@ fn exercise_dense_fixture(name: &str, attempts: u64) {
         base_events.iter().any(|e| e["type"] == "done"),
         "clean turn ends in done: {base_events:?}"
     );
+    // The after-first-decode seam fires at generated_count == 1; a baseline
+    // whose greedy first token is a stop token can never reach it.
+    assert!(
+        base_events.iter().any(|e| e["type"] == "token"),
+        "{name} ({}): clean baseline emitted no token, so the after-first-decode \
+         seam is unreachable; this fixture/prompt is invalid for the rollback \
+         contract: {base_events:?}",
+        path.canonicalize()
+            .unwrap_or_else(|_| path.clone())
+            .display()
+    );
 
     // After-prefill fault: single attested terminal, no cache store.
     let id_prefill = format!("dense-{attempts}-prefill");
@@ -409,7 +417,13 @@ fn exercise_dense_fixture(name: &str, attempts: u64) {
         attempts + 1,
         false,
     );
-    assert_single_attested_error(&prefill_out, &id_prefill, attempts + 1, cache_empty_before, &m);
+    assert_single_attested_error(
+        &prefill_out,
+        &id_prefill,
+        attempts + 1,
+        cache_empty_before,
+        &m,
+    );
 
     // After-first-decode fault: same contract.
     let id_decode = format!("dense-{attempts}-decode");
@@ -423,7 +437,13 @@ fn exercise_dense_fixture(name: &str, attempts: u64) {
         attempts + 2,
         false,
     );
-    assert_single_attested_error(&decode_out, &id_decode, attempts + 2, cache_empty_before, &m);
+    assert_single_attested_error(
+        &decode_out,
+        &id_decode,
+        attempts + 2,
+        cache_empty_before,
+        &m,
+    );
 
     // Next request on the rolled-back state matches the fresh turn.
     let id_retry = format!("dense-{attempts}-retry");
