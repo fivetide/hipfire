@@ -3487,18 +3487,10 @@ pub fn generate_lfm2_vl(
     }
 
     // EOS-class stop set (verbatim rationale lives at the text path copy).
-    let stop_toks: Vec<u32> = {
-        let tk = m.tokenizer.as_ref().unwrap();
-        let eos_tok = m.lfm2moe().unwrap().eos_tok;
-        let mut v = vec![eos_tok];
-        for s in ["<|endoftext|>", "</s>", "<|im_end|>"] {
-            let ids = tk.encode(s);
-            if ids.len() == 1 && !v.contains(&ids[0]) {
-                v.push(ids[0]);
-            }
-        }
-        v
-    };
+    let stop_toks = hipfire_arch_lfm2moe::carrier::stop_tokens(
+        m.tokenizer.as_ref().unwrap(),
+        m.lfm2moe().unwrap().eos_tok,
+    );
 
     // ── Prefill with visual embeddings spliced at placeholder positions ──
     let mut last_logits: Vec<f32> = Vec::new();

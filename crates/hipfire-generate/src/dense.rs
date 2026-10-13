@@ -6966,26 +6966,10 @@ pub fn generate_lfm2moe(
 
     // LFM2.5 emits MULTIPLE EOS-class tokens inconsistently: the chat turn-end
     // `<|im_end|>` (which `eos_tok` resolves to) but ALSO the document-end
-    // `<|endoftext|>` (and rarely `</s>`). The single `next_tok == eos_tok` stop
-    // in the decode loop misses the others, so the model LEAKS a literal
-    // `<|endoftext|>` into the visible answer (observed: "...Paris.<|endoftext|>")
-    // and wastefully keeps generating. This id-set is the FAST path: it catches
-    // any EOS-class token whose literal string round-trips through `encode` to a
-    // single id (true for `<|im_end|>`). NOTE it does NOT round-trip for
-    // `<|endoftext|>` (encode yields subwords, not the special id), so the
-    // reliable catch for that one is the string-level guard in the decode loop
-    // below, which matches on the DECODED frag.
-    let stop_toks: Vec<u32> = {
-        let tk = m.tokenizer.as_ref().unwrap();
-        let mut v = vec![eos_tok];
-        for s in ["<|endoftext|>", "</s>", "<|im_end|>"] {
-            let ids = tk.encode(s);
-            if ids.len() == 1 && !v.contains(&ids[0]) {
-                v.push(ids[0]);
-            }
-        }
-        v
-    };
+    // `<|endoftext|>` (and rarely `</s>`). This id-set is the FAST path; the
+    // string-level guard in the decode loop below stays as a backstop for a
+    // marker the tokenizer does not register as a special token.
+    let stop_toks = lfm2moe::carrier::stop_tokens(m.tokenizer.as_ref().unwrap(), eos_tok);
 
     // Capacity guard BEFORE gen_start — an oversized prompt is a validation error
     // and must not emit gen_start (client expects no stream on validation failure).
@@ -7134,12 +7118,10 @@ pub fn generate_lfm2moe(
         }
 
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        // String-level EOS-class guard. The id-based `stop_toks` above misses
-        // `<|endoftext|>` because encoding the literal STRING doesn't round-trip
-        // to the special-token id (it yields subwords), so the real token id is
-        // never in the set. The leaking turn-end token decodes on its own to the
-        // marker: catch it on the token's own text and stop WITHOUT emitting
-        // (was: "...Paris.<|endoftext|>").
+        // String-level EOS-class guard: backstop for a marker that is not in
+        // the special-token table (so not in `stop_toks`). The leaking turn-end
+        // token decodes on its own to the marker: catch it on the token's own
+        // text and stop WITHOUT emitting (was: "...Paris.<|endoftext|>").
         if matches!(
             tokenizer.decode(&[next_tok]).trim(),
             "<|endoftext|>" | "</s>" | "<|im_end|>"

@@ -4860,16 +4860,9 @@ pub fn drive_lfm_continuous_batch(
     let weights = unsafe { &*weights_ptr };
     let tokenizer: &hipfire_runtime::tokenizer::Tokenizer = unsafe { &*tokenizer_ptr };
     let chat_template = chat_template_clone;
-    // Stop set mirrors crate::dense::generate_lfm2moe: eos_tok plus single-id encodings for
-    // <|endoftext|>, </s>, <|im_end|>. String guard catches leaked EOS-class
-    // strings where encode does not round-trip (e.g. <|endoftext|>).
-    let mut stop_toks: Vec<u32> = vec![eos_tok];
-    for s in ["<|endoftext|>", "</s>", "<|im_end|>"] {
-        let ids = tokenizer.encode(s);
-        if ids.len() == 1 && !stop_toks.contains(&ids[0]) {
-            stop_toks.push(ids[0]);
-        }
-    }
+    // Stop set shared with crate::dense::generate_lfm2moe. String guard catches
+    // leaked EOS-class strings not registered as special tokens.
+    let stop_toks = lfm2moe::carrier::stop_tokens(tokenizer, eos_tok);
     let mut loop_guards: Vec<hipfire_runtime::loop_guard::LoopGuard> = (0..batch_size)
         .map(
             |_| hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get()),

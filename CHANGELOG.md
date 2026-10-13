@@ -2,6 +2,7 @@
 
 ## Unreleased (0.4.2)
 
+- **LFM2.5 stop tokens resolve to the real `<|im_end|>` / `<|endoftext|>` ids.** `encode()` prepends BOS on LFM tokenizers, so the single-id probe never matched and `eos_tok` fell back to id 1 (BOS on 1.2B, a 9-newline content token on 8B-A1B, which ended turns early). Stop ids now come from the special-token table in the AR, continuous-batch and VL decode loops and in `SpecTarget::eos_token()`.
 - Container validation uses supported Python harness commands and honors `HIPFIRE_HOME` for runtime storage.
 - Redline reproduction packages now capture and install indexed-object metadata alongside code objects and hashes for fail-closed kernel verification.
 - Detached `hipfire serve` now preserves `--vision` and forwards `--max-seq` exactly once, matching foreground serving.
