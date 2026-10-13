@@ -110,7 +110,9 @@ extern "C" __global__ void kv_transcode_k_fwht4_to_fwht2(
 
     // Re-quantize the UNIT-normalized reconstruction at 2-bit (matches the
     // write kernels, which normalize before quantizing).
-    float inv_norm = (orig_norm > 1e-10f) ? 1.0f / orig_norm : 0.0f;
+    // Same sqrt(2) threshold scale at hd 256 as kv_cache_write_asym_k_fwht2.
+    const float q_scale = head_dim == 256 ? 1.41421356f : 1.0f;
+    float inv_norm = (orig_norm > 1e-10f) ? 1.0f / orig_norm * q_scale : 0.0f;
     int didx[8];
     float local_rsq = 0.0f;
     for (int i = 0; i < n_halves * 4; i++) {

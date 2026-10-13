@@ -16308,7 +16308,8 @@ impl Gpu {
         }
     }
 
-    /// CASK m-folding merge for asym4 K (givens4).
+    /// CASK m-folding merge for asym4 K (givens4 or fwht4 records; `fwht` picks
+    /// the fwht4 writer's sqrt(2) threshold scale at head_dim 256).
     pub fn kv_fold_asym4(
         &mut self,
         src: &GpuTensor,
@@ -16319,6 +16320,7 @@ impl Gpu {
         head_dim: usize,
         m: usize,
         budget: usize,
+        fwht: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_givens4_kernel("kv_fold_asym4", kernels::KV_FOLD_ASYM4_SRC, "kv_fold_asym4")?;
@@ -16330,6 +16332,7 @@ impl Gpu {
         let mut nkv = n_kv as i32;
         let mut hd = head_dim as i32;
         let mut mi = m as i32;
+        let mut qs: f32 = if fwht && head_dim == 256 { std::f32::consts::SQRT_2 } else { 1.0 };
         let mut params: Vec<*mut c_void> = vec![
             &mut sp as *mut _ as *mut c_void,
             &mut dp as *mut _ as *mut c_void,
@@ -16338,6 +16341,7 @@ impl Gpu {
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut mi as *mut _ as *mut c_void,
+            &mut qs as *mut _ as *mut c_void,
         ];
         unsafe {
             self.hip.launch_kernel(

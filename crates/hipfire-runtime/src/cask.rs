@@ -350,7 +350,7 @@ impl CaskCtx {
                         self.fold_m,
                         budget,
                     )?,
-                    KTier::Asym4 { .. } => gpu.kv_fold_asym4(
+                    KTier::Asym4 { fwht } => gpu.kv_fold_asym4(
                         &kv.k_gpu[layer_idx],
                         &self.base.k_compact,
                         &indices_dev,
@@ -359,6 +359,7 @@ impl CaskCtx {
                         d,
                         self.fold_m,
                         budget,
+                        fwht,
                     )?,
                     KTier::Asym2 { .. } => gpu.kv_fold_asym2(
                         &kv.k_gpu[layer_idx],
