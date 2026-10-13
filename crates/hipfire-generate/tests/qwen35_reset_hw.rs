@@ -244,10 +244,12 @@ fn token_text(events: &[&Value]) -> String {
         .collect()
 }
 
-fn load_req(model: &str, pp: Option<u64>) -> Value {
+/// `dflash` selects `dflash_mode`: the daemon treats `off` as a hard override
+/// that skips even an env-forced draft, so spec-route tests must send `on`.
+fn load_req(model: &str, pp: Option<u64>, dflash: bool) -> Value {
     let mut params = serde_json::json!({
         "max_seq": 2048,
-        "dflash_mode": "off",
+        "dflash_mode": if dflash { "on" } else { "off" },
         "mtp_mode": "off",
         "ngram_draft": false,
     });
@@ -341,8 +343,8 @@ fn assert_fault_terminal(events: &[Value], id: &str, context: &str, stderr_tail:
 }
 
 /// Send load and wait for `loaded`.
-fn session_load(s: &mut Session, model: &str, pp: Option<u64>, context: &str) {
-    s.send(&load_req(model, pp));
+fn session_load(s: &mut Session, model: &str, pp: Option<u64>, dflash: bool, context: &str) {
+    s.send(&load_req(model, pp, dflash));
     loop {
         let e = s.recv(context);
         if e.get("type").and_then(|v| v.as_str()) == Some("loaded") {
@@ -491,7 +493,7 @@ fn clean_bytes(
 ) -> String {
     let id = "fresh";
     let mut s = Session::spawn(extra_env);
-    session_load(&mut s, model, pp, context);
+    session_load(&mut s, model, pp, expect_dflash, context);
     let events = session_generate(&mut s, id, 7001, false, false, false, context);
     assert_done_stop(
         &events,
@@ -521,7 +523,7 @@ fn fault_round(
     expect_dflash: bool,
 ) {
     let mut s = Session::spawn(extra_env);
-    session_load(&mut s, model, pp, context);
+    session_load(&mut s, model, pp, expect_dflash, context);
     let tail = s.stderr_tail();
     let prefill = session_generate(&mut s, "fault-prefill", 7002, true, false, false, context);
     assert_fault_terminal(&prefill, "fault-prefill", context, &tail);
@@ -555,7 +557,7 @@ fn sealed_expert_mutation_fault_round(
     context: &str,
 ) {
     let mut s = Session::spawn(extra_env);
-    session_load(&mut s, model, None, context);
+    session_load(&mut s, model, None, false, context);
     let tail = s.stderr_tail();
     let fault = session_generate(
         &mut s,
