@@ -954,7 +954,7 @@ def main(argv=None):
         start = time.time()
         try:
             # A row may declare its own per-command budget (the vision matrix
-            # legitimately runs ~15 min on gfx1201 and has an 1800 s watchdog).
+            # runs ~15 min on gfx1201 and ~66 min on gfx1151).
             disposition, note, detail = execute_row(sub, row, out, int(row.get("timeout", args.timeout)))
         except Exception as exc:  # never abort the matrix on one row
             disposition, note, detail = "failed", "runner exception: %s" % exc, {}

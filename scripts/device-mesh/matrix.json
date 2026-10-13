@@ -1846,7 +1846,7 @@
     "$MODELS_DIR/qwen3.8-27b-vision.hfq",
     "$MODELS_DIR/dots-ocr.q8.hfq"
    ],
-   "timeout": 2000
+   "timeout": 6000
   },
   {
    "commands": {

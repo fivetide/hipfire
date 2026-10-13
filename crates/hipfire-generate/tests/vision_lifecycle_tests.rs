@@ -185,9 +185,29 @@ fn terminal_classifier_accepts_exactly_one_outcome() {
 
 const CHILD_ENV: &str = "HIPFIRE_VISION_LIFECYCLE_CHILD";
 const CHILD_TEST: &str = "vision_lifecycle_child";
+/// A child silent this long is wedged. The budget bounds a stall, not the run:
+/// each matrix takes ~32-34 min on gfx1151 (slow ViT/dots encoders, ~110-140 s
+/// per image), while every turn prints within a few minutes on any host.
+const CHILD_STALL_SECS: u64 = 1800;
+
+/// Child stdout that records (seconds since `start`) when the child last wrote.
+struct Heartbeat {
+    inner: ChildStdout,
+    start: std::time::Instant,
+    last: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl std::io::Read for Heartbeat {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        let now = self.start.elapsed().as_secs();
+        self.last.store(now, std::sync::atomic::Ordering::Relaxed);
+        Ok(n)
+    }
+}
 
 /// Re-execute this test binary as a matrix child with piped stdio.
-fn spawn_child(scenario: &str) -> (Child, BufReader<ChildStdout>, ChildStdin) {
+fn spawn_child(scenario: &str) -> (Child, BufReader<Heartbeat>, ChildStdin) {
     let exe = std::env::current_exe().expect("current test exe");
     let mut child = Command::new(exe)
         .arg("--exact")
@@ -203,10 +223,24 @@ fn spawn_child(scenario: &str) -> (Child, BufReader<ChildStdout>, ChildStdin) {
     let stdin = child.stdin.take().expect("child stdin");
     // Watchdog: a wedged GPU child must fail the test, never hang it.
     let pid = child.id();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(1800));
-        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+    let start = std::time::Instant::now();
+    let last = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let seen = last.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(10));
+        let last = seen.load(std::sync::atomic::Ordering::Relaxed);
+        let silent = start.elapsed().as_secs().saturating_sub(last);
+        if silent >= CHILD_STALL_SECS {
+            eprintln!("matrix child {pid} silent for {silent} s; killing it");
+            let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+            return;
+        }
     });
+    let stdout = Heartbeat {
+        inner: stdout,
+        start,
+        last,
+    };
     (child, BufReader::new(stdout), stdin)
 }
 
@@ -527,26 +561,28 @@ fn warm_first_alloc(gpu: &mut rdna_compute::Gpu) {
     gpu.drain_pool();
 }
 
+/// Commit the active turn once it reports ready. Waits for as long as the turn
+/// stays active (a gfx1151 ViT/dots encode alone takes ~100-140 s), and stops
+/// once the turn is cleared without becoming ready (error/cancel paths).
 #[cfg(test)]
 fn spawn_committer(id: &str, attempt: u64) {
     use hipfire_engine::terminal::{apply_terminal_control, terminal_control};
     let id = id.to_string();
-    std::thread::spawn(move || {
-        for _ in 0..12_000 {
-            let ready = terminal_control()
-                .mu
-                .lock()
-                .map(|g| {
-                    g.active
-                        .as_ref()
-                        .is_some_and(|a| a.id == id && a.attempt_id == attempt && a.ready)
-                })
-                .unwrap_or(false);
-            if ready {
+    std::thread::spawn(move || loop {
+        // None: this turn is no longer active (or the lock is poisoned).
+        let ready = terminal_control().mu.lock().ok().and_then(|g| {
+            g.active
+                .as_ref()
+                .filter(|a| a.id == id && a.attempt_id == attempt)
+                .map(|a| a.ready)
+        });
+        match ready {
+            Some(true) => {
                 apply_terminal_control("commit", &id, attempt);
                 return;
             }
-            std::thread::sleep(Duration::from_millis(5));
+            Some(false) => std::thread::sleep(Duration::from_millis(5)),
+            None => return,
         }
     });
 }

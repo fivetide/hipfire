@@ -2,6 +2,7 @@
 
 ## Unreleased (0.4.2)
 
+- G4.8 vision/OCR lifecycle matrices now finish on gfx1151: the child watchdog kills only after 1800 s without output (not 1800 s total), the test committer waits for the whole turn instead of 60 s, and the `g4-vision-lifecycle` row budget is 6000 s (each matrix takes ~32-34 min there).
 - Container validation uses supported Python harness commands and honors `HIPFIRE_HOME` for runtime storage.
 - Redline reproduction packages now capture and install indexed-object metadata alongside code objects and hashes for fail-closed kernel verification.
 - Detached `hipfire serve` now preserves `--vision` and forwards `--max-seq` exactly once, matching foreground serving.
