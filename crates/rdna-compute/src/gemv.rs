@@ -15459,7 +15459,14 @@ impl Gpu {
             && k == 512
             && m % 8 == 0
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_DOWN_ROW8", false);
-        let (module_name, source, func_name) = if cpol_slc {
+        // Every variant below is a K=512 (two-group) body; other K need the loop twin.
+        let (module_name, source, func_name) = if k != 512 {
+            (
+                "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_any_k",
+                kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_ANY_K_SRC,
+                "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_any_k",
+            )
+        } else if cpol_slc {
             (
                 "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc_gfx1100",
                 kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_CPOL_SLC_GFX1100_SRC,

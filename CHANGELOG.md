@@ -2,6 +2,7 @@
 
 ## Unreleased (0.4.2)
 
+- **MQ4 routed-expert down GEMV no longer drops input groups when `moe_intermediate_size` is not 512.** The atomic-free expanded down kernel (`gemv_hfq4g256_moe_down_k8_indexed_batched_expanded`, all RDNA targets) had been specialized to two 256-wide groups since July, so any other K read only the first 512 inputs. LFM2.5-8B-A1B (K=1792) decoded whitespace and terminator loops; MiniMax M2 (K=1536) MQ4 experts used the same kernel. Other K now take a per-group loop. K=512 output is bitwise unchanged (Qwen3.5/3.6 A3B).
 - Container validation uses supported Python harness commands and honors `HIPFIRE_HOME` for runtime storage.
 - Redline reproduction packages now capture and install indexed-object metadata alongside code objects and hashes for fail-closed kernel verification.
 - Detached `hipfire serve` now preserves `--vision` and forwards `--max-seq` exactly once, matching foreground serving.

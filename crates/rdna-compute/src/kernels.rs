@@ -3421,6 +3421,17 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str = concat!
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
 );
 
+/// General-K twin of [`GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC`]
+/// (that body is the K=512 two-group specialization). Same 4-row tiling and
+/// output contract; sequential group loop for any K%256==0 (LFM2 K=1792).
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_ANY_K_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_DOWN_ANY_K 1\n",
+    "#define HIPFIRE_MOE_DOWN_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_any_k\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
+);
+
 /// MQ4G256V2 (qt=44) sister of
 /// [`GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC`]. Same tiling and
 /// output contract; differs only in the group header decode — qt44 carries two

@@ -1311,6 +1311,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             Some(vec![read(0), read(8), read(16), write(24), write(32)])
         }
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded"
+        | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_any_k"
         | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc" => {
             Some(vec![read(0), read(8), read(16), write(24)])
         }
@@ -1752,6 +1753,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_silu_mul_mq_rotate"
         | "gated_norm_f32"
         | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded"
+        | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_any_k"
         | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_dlc"

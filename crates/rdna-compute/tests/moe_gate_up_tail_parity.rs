@@ -8,6 +8,9 @@
 //! launcher (`gemv_hfq4g256_moe_gate_up_k8_indexed`, plain input), against a
 //! CPU dequant reference built from the documented 136 B/group packed layout.
 //!
+//! `indexed_moe_down_expanded_k_parity` covers the expanded down kernel the
+//! same way at K1792 (seven groups) and K512 (two-group fast path).
+//!
 //! Provenance: converted from the `maintainer_tail_smoke` throwaway after a
 //! parent GPU run measured fixed-kernel maxerr 2e-6 (MQ4) / 3e-6 (HFQ) at
 //! K2816 and 2e-6 both launchers at K2048, vs 2.02 (MQ4) / 5.20 (HFQ) on the
@@ -254,5 +257,86 @@ fn indexed_moe_gate_up_tail_parity() {
                 "[{launcher} K={k}] max_abs_err={max_err:.6} exceeds tol={TOL}"
             );
         }
+    }
+}
+
+/// Indexed MoE down (atomic-free expanded) at K1792 (seven groups, LFM2-MoE
+/// moe_intermediate) and K512 (the two-group fast path) against the same CPU
+/// dequant. The fast path once served every K and read only groups 0..1, so
+/// LFM2.5-8B-A1B decoded whitespace loops (HIPF-72).
+#[test]
+#[ignore]
+fn indexed_moe_down_expanded_k_parity() {
+    let mut gpu = match Gpu::init() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP — no GPU ({e:?}).");
+            return;
+        }
+    };
+    if !gpu.arch_caps.is_wave32() {
+        eprintln!("SKIP — requires an RDNA wave32 device.");
+        return;
+    }
+    // 66 rows: the last 4-row tile is partial. Two tokens x k_top=4 slots.
+    const DM: usize = 66;
+    const DK_TOP: usize = 4;
+    const BATCH: usize = 2;
+    let topk: Vec<i32> = (0..BATCH * DK_TOP).map(|j| (j % N_EXP) as i32).collect();
+    for k in [512usize, 1792usize] {
+        let groups = k / 256;
+        let mut st = 0x5EEDu64 + k as u64;
+        let x: Vec<f32> = (0..BATCH * DK_TOP * k)
+            .map(|_| {
+                st = st
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((st >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+            })
+            .collect();
+        let mut keep: Vec<GpuTensor> = Vec::new();
+        let mut ptrs: Vec<u64> = Vec::with_capacity(N_EXP);
+        let mut hosts: Vec<Vec<u8>> = Vec::with_capacity(N_EXP);
+        for e in 0..N_EXP {
+            let packed = synth_packed(DM, k, 0x51ED_270B ^ (k as u64) ^ (e as u64));
+            let t = upload_u8(&mut gpu, &packed);
+            ptrs.push(t.buf.as_ptr() as u64);
+            keep.push(t);
+            hosts.push(packed);
+        }
+        let expert_ptrs = upload_u64(&mut gpu, &ptrs);
+        let topk_buf = upload_i32(&mut gpu, &topk);
+        let x_buf = upload_f32(&mut gpu, &x);
+        let out = alloc_f32_zeros(&mut gpu, BATCH * DK_TOP * DM);
+        gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+            &expert_ptrs,
+            &topk_buf,
+            &x_buf,
+            &out,
+            DM,
+            k,
+            DK_TOP,
+            BATCH,
+        )
+        .expect("down expanded");
+        gpu.hip.device_synchronize().expect("launch sync");
+        let got = download_f32(&gpu, &out, BATCH * DK_TOP * DM);
+        let mut max_err: f32 = 0.0;
+        for slot in 0..BATCH * DK_TOP {
+            let e = topk[slot] as usize;
+            let xs = &x[slot * k..(slot + 1) * k];
+            for row in 0..DM {
+                let v = got[slot * DM + row];
+                assert!(
+                    v.is_finite(),
+                    "[K={k}] slot {slot} row {row} nonfinite: {v}"
+                );
+                max_err = max_err.max((v - dot(&deq_row(&hosts[e], row, groups), xs)).abs());
+            }
+        }
+        assert!(
+            max_err <= TOL,
+            "[down K={k}] max_abs_err={max_err:.6} exceeds tol={TOL}"
+        );
     }
 }
