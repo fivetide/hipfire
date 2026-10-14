@@ -5177,6 +5177,48 @@ fn main() {
                 handle_redline_prefix_shadow(&msg, &mut model, &mut gpu, &mut stdout);
             }
 
+            "calibrate_npu_trunk" => {
+                // `hipfire calibrate-npu-trunk --measure`: time this host's NPU
+                // trunk on the loaded model and reply with the keyed record.
+                let Some(m) = model.as_mut() else {
+                    emit_uncorrelated_error(&mut stdout, None, "no model loaded", "validation", false, false);
+                    let _ = stdout.flush();
+                    continue;
+                };
+                let carrier = hipfire_loader::carrier_for(m.arch_id)
+                    .expect("calibrate_npu_trunk: unknown arch_id");
+                match carrier.calibrate_npu_trunk(m, &mut gpu) {
+                    Some(Ok((calibration, report))) => {
+                        let response = serde_json::json!({
+                            "type": "npu_trunk_calibration",
+                            "calibration": calibration,
+                            "report": report,
+                        });
+                        let _ = writeln!(stdout, "{response}");
+                    }
+                    Some(Err(error)) => emit_uncorrelated_error(
+                        &mut stdout,
+                        None,
+                        &format!("npu-trunk calibration failed: {error}"),
+                        "validation",
+                        false,
+                        false,
+                    ),
+                    None => emit_uncorrelated_error(
+                        &mut stdout,
+                        None,
+                        "the loaded model has no NPU trunk",
+                        "unsupported",
+                        false,
+                        false,
+                    ),
+                }
+                // The measurement left the bundle reset; the next request starts cold.
+                m.seq_pos = 0;
+                m.conversation_tokens.clear();
+                let _ = stdout.flush();
+            }
+
             "profile" => {
                 // Compile the arch's registry inventory into the kernel cache so
                 // the profiler has every packaged kernel, not only this model's.

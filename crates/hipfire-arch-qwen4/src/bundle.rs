@@ -2262,6 +2262,30 @@ impl Qwen4Bundle {
         result
     }
 
+    /// Measure this host's NPU trunk calibration through the loaded `npu_trunk=on`
+    /// trunk (`hipfire calibrate-npu-trunk --measure`): the keyed record and its
+    /// raw measurements. Leaves the request state reset.
+    pub fn measure_npu_trunk_calibration(
+        &mut self,
+        gpu: &mut Gpu,
+    ) -> Result<(crate::npu_trunk::Calibration, serde_json::Value), BundleError> {
+        self.ep_refuse("NPU trunk calibration")?;
+        let mut forward = self.execution.take().ok_or_else(|| {
+            BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+        })?;
+        #[cfg(target_os = "linux")]
+        let result = forward
+            .measure_npu_trunk(self, gpu)
+            .map_err(|error| BundleError::Forward(error.to_string()));
+        #[cfg(not(target_os = "linux"))]
+        let result = {
+            let _ = gpu;
+            Err(BundleError::Forward("the NPU trunk is Linux-only".to_string()))
+        };
+        self.execution = Some(forward);
+        result
+    }
+
     /// Run `tokens` through the shared execution owner committing model state
     /// only: no logits, argmax or wide-hidden rows. Tiles exactly as
     /// [`Self::forward_chunk_final`], so a prefill split at a capture boundary

@@ -868,6 +868,24 @@ impl Carrier for Qwen4Carrier {
         let _ = gpu.free_tensor(logits);
         Some(ok)
     }
+
+    fn calibrate_npu_trunk(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+    ) -> Option<Result<(serde_json::Value, serde_json::Value), String>> {
+        let bundle = m.qwen4_mut()?;
+        Some(
+            bundle
+                .measure_npu_trunk_calibration(gpu)
+                .map_err(|error| error.to_string())
+                .and_then(|(calibration, report)| {
+                    serde_json::to_value(calibration)
+                        .map(|calibration| (calibration, report))
+                        .map_err(|error| error.to_string())
+                }),
+        )
+    }
 }
 
 /// Expert parallelism refuses what the replicated single-device program does

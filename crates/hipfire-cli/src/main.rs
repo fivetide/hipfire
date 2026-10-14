@@ -156,7 +156,7 @@ pub(crate) enum Commands {
     Restart(ServeArgs),
     /// Derive or split the Flash-Next PLE row sidecars (`<model>.ple-q4`, `<base>.ple-q8`).
     Ple(ple::PleArgs),
-    /// Write a keyed NPU trunk calibration from offline measurement inputs.
+    /// Measure this host's NPU trunk calibration (`--measure`), or write one from offline measurements.
     CalibrateNpuTrunk(npu_trunk::CalibrateArgs),
 }
 
@@ -946,7 +946,7 @@ fn run() -> Result<()> {
         Some(Commands::List(args)) => list_command(&paths, args),
         Some(Commands::Pull(args)) => pull_command(&paths, args),
         Some(Commands::Ple(args)) => ple::ple_command(&paths, args),
-        Some(Commands::CalibrateNpuTrunk(args)) => npu_trunk::calibrate_command(args),
+        Some(Commands::CalibrateNpuTrunk(args)) => npu_trunk::calibrate_command(&paths, args),
         Some(Commands::Rm(args)) => rm_command(&paths, args),
         Some(Commands::Diag(output)) => diag_command(&paths, output),
         Some(Commands::Ps(output)) => ps_command(&paths, output),
@@ -6459,6 +6459,8 @@ struct BenchLoadOpts {
     multi_slot: Option<(usize, usize)>,
     /// `continuous_batch_size` and the `serve_vmm_batch` load parameter.
     continuous_batch: Option<(usize, serde_json::Value)>,
+    /// Process-config keys set for the daemon (`calibrate-npu-trunk --measure`: `fusions.npu_trunk=on`).
+    config: &'static [(&'static str, &'static str)],
 }
 
 fn open_bench_engine(
@@ -6508,6 +6510,9 @@ fn open_bench_engine(
     let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
     let environment = BTreeMap::new();
     let mut process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
+    for (key, value) in load_opts.config {
+        process_config.values.set_cli(key, value)?;
+    }
     if args.redline {
         process_config.values.set_cli("replay.backend", "redline")?;
         process_config.values.set_cli("replay.transport", "pm4")?;

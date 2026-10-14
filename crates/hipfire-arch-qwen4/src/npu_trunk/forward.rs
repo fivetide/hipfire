@@ -33,6 +33,11 @@ pub(super) struct NpuForward {
     request_origin: usize,
     /// Wave-padded bank rows below 8192 whose row-adaptive NPU programs this load admitted ([`admitted_plan`]).
     adaptive: Vec<usize>,
+    /// `stock` or `overlay:<marker>`: the successfully applied route the calibration key names.
+    trunk_route: String,
+    npu_panels_bytes: usize,
+    /// Measurement instrumentation (`hipfire calibrate-npu-trunk --measure`); `None` when serving.
+    probe: Option<measure::Probe>,
 }
 
 // SAFETY: this private owner exclusively owns the entire railgun HIP Rc graph;
@@ -148,19 +153,20 @@ impl PreparedTrunk {
     }
 }
 
+/// Ends the single refusal line when no record matches this host.
+const MEASURE_HINT: &str = "measure this host with `hipfire calibrate-npu-trunk --measure`";
+
 fn match_calibration(gpu: &Gpu, bundle: &Qwen4Bundle, route: &str, mode: NpuTrunkMode, firmware: Option<&str>) -> Result<(trunk::Calibration, trunk::CalKey, &'static str, FamilyMask), String> {
     let (cal, source) = trunk::Calibration::load_with_builtin(hipfire_config::npu_trunk_calibration_path(), route)
-        .map_err(|e| format!("calibration unavailable: {e}"))?;
+        .map_err(|e| format!("calibration unavailable: {e}; {MEASURE_HINT}"))?;
     let index = bundle.npu_model_index.as_ref().ok_or("model index identity unavailable")?.as_ref().map_err(Clone::clone)?;
     let pci = gpu.hip.device_pci_bus_id(gpu.device_id).map_err(|e| e.to_string())?;
     let key = match firmware {
         Some(firmware) => trunk::runtime_key_with_firmware(&gpu.arch, &pci, firmware, index, route)?,
         None => trunk::runtime_calibration_key(&gpu.arch, &pci, index, route)?,
     };
-    let families = if mode == NpuTrunkMode::Auto { trunk::auto_admission(&cal, &key)? } else {
-        cal.key_matches(&key)?;
-        trunk::select_families(&cal).0
-    };
+    cal.key_matches(&key).map_err(|e| format!("{e}; {MEASURE_HINT}"))?;
+    let families = if mode == NpuTrunkMode::Auto { trunk::auto_admission(&cal, &key)? } else { trunk::select_families(&cal).0 };
     Ok((cal, key, source, families))
 }
 
@@ -391,7 +397,7 @@ impl NpuForward {
             }
             eprintln!("npu-trunk: mode={mode} families={:#x} contract=bf16_direct trunk_route={trunk_route} zab_source={zab_source} pack_ms={pack_ms:.3} download_ms={download_ms:.3} resident_bytes={resident_bytes} npu_panels_bytes={npu_panels_bytes} gpu_twin_bytes={gpu_twin_bytes} bank_b_bytes={bank_b_bytes} runtime={} raw=DtoH(no-retained-host-copy)", families.bits(), if runtime.is_some() { "open" } else { "not-opened" });
             Ok(Some(Self { mode, families, layers, emulation, scales: [d0,d1], bank_b, runtime, arenas, trace,host_tokens,host_ple,pair_logged:false,
-                calibration, n_star, request_plan: None, request_origin: 0, adaptive: Vec::new() }))
+                calibration, n_star, request_plan: None, request_origin: 0, adaptive: Vec::new(), trunk_route: trunk_route.clone(), npu_panels_bytes, probe: None }))
         })();
         if result.is_err() { for tensor in allocations { let _ = gpu.free_tensor(tensor); } }
         result
@@ -488,6 +494,10 @@ impl NpuForward {
         gpu.npu_trunk_emulate_bf16(&scratch.a,&twin.w,&twin.scales,&self.scales[0],&scratch.sums,layout(&l.map,rows),rows,l.map.padded_cols(),&outs)?;
         Ok(())
     }
+    /// Whether the layer's projections come from the NPU (or twin) in this pair; a GPU-only measurement pass runs all native.
+    fn covered(&self, layer: usize) -> bool {
+        self.layers[layer].map.panel_count() != 0 && !self.probe.as_ref().is_some_and(|probe| probe.gpu_only)
+    }
     fn uncovered(&self, gpu: &mut Gpu, step: &Step<'_>) -> Result<(), Qwen4GpuForwardError> {
         let covered = |families: [Family; 4]| families.map(|f| self.families.contains(f));
         match step {
@@ -521,6 +531,8 @@ fn phase(step: &mut Step<'_>, value: MixerPhase) {
 
 #[path = "layers.rs"]
 mod layers;
+#[path = "measure.rs"]
+pub(super) mod measure;
 use railgun::npu::trunk::monotonic_ns;
 
 struct TraceRow {
@@ -649,7 +661,8 @@ impl NpuForward {
     fn prepare(&self, gpu: &mut Gpu, ctx: &DispatchCtx, program: &layers::BankProgram<'_>, hc: &mut HcFusionCursor, layer: usize, bank: usize, records: &mut [TraceRow], snapshot: Option<Snapshot<'_>>) -> Result<Option<Seq>,Qwen4GpuForwardError> {
         let index=mixer_index(program,layer);
         let rt=self.runtime.as_ref();
-        let covered = self.layers[layer].map.panel_count() != 0;
+        let covered = self.covered(layer);
+        let kind = self.layers[layer].shape.index();
         if let Some(r) = records.get(layer*2+bank) {
             gpu.hip.event_record(&r.prep_begin, gpu.active_stream.as_ref())?;
         }
@@ -673,7 +686,7 @@ impl NpuForward {
             }
         });
         match ple_cut {
-            None => execute(gpu,ctx,&program.steps,start..index,hc)?,
+            None => self.timed(gpu,(bank,kind,measure::Phase::Pre),|gpu| execute(gpu,ctx,&program.steps,start..index,hc))?,
             Some((stage,row)) => {
                 // The PLE depthwise convolution carries state: the snapshot holds
                 // it at the snapshot row, so a cut inside this bank splits it too.
@@ -712,7 +725,7 @@ impl NpuForward {
             self.emulate(gpu,layer,&program.steps[index])?;
             return Ok(None);
         };
-        let pack_issue_ns=self.pack(gpu,&program.steps[index],bank,true,prep_end)?;
+        let pack_issue_ns=self.timed(gpu,(bank,kind,measure::Phase::Pack),|gpu| self.pack(gpu,&program.steps[index],bank,true,prep_end))?;
         if let Some(r) = records.get(layer*2+bank) {
             gpu.hip.event_record(&r.pack_end, gpu.active_stream.as_ref())?;
         }
@@ -727,7 +740,8 @@ impl NpuForward {
     fn run_bank(&self, gpu: &mut Gpu, ctx: &DispatchCtx, program: &mut layers::BankProgram<'_>, hc: &mut HcFusionCursor, layer: usize, bank: usize, seq: Option<Seq>, cut: Option<CoreCut<'_>>, records: &mut [TraceRow]) -> Result<(),Qwen4GpuForwardError> {
         let index=mixer_index(program,layer);
         let rt=self.runtime.as_ref();
-        let covered = self.layers[layer].map.panel_count() != 0;
+        let covered = self.covered(layer);
+        let kind = self.layers[layer].shape.index();
         if let Some(r) = records.get(layer*2+bank) {
             gpu.hip.event_record(&r.wait_begin, gpu.active_stream.as_ref())?;
         }
@@ -744,6 +758,7 @@ impl NpuForward {
         if !covered {
             let end=program.ranges[layer].end;
             match &cut {
+                None if self.probe.as_ref().is_some_and(|probe| probe.gpu_only) => self.measured_native(gpu,ctx,program,hc,layer,bank,index..end)?,
                 None => execute_validated_steps_window(gpu,ctx,&program.steps,index..end,hc).map_err(fail)?,
                 Some(cut) => {
                     // Native route with a snapshot row inside this bank: bank-wide
@@ -767,12 +782,15 @@ impl NpuForward {
         phase(&mut program.steps[index],MixerPhase::Core);
         // One launch, or two split at the snapshot row with the stage copies
         // taken after the first and never after the second.
-        for (at,window) in core_windows(rows,cut_row).into_iter().enumerate() {
-            self.core_launch(gpu,layer,bank,&program.steps[index],true,window)?;
-            if let (0, Some(cut)) = (at, &cut) {
-                copy_mixer_state(gpu,cut.stage,&program.steps[index],cut.gdn_total,cut.gdn_slot,cut.qsa_slot)?;
+        self.timed(gpu,(bank,kind,measure::Phase::Core),|gpu| {
+            for (at,window) in core_windows(rows,cut_row).into_iter().enumerate() {
+                self.core_launch(gpu,layer,bank,&program.steps[index],true,window)?;
+                if let (0, Some(cut)) = (at, &cut) {
+                    copy_mixer_state(gpu,cut.stage,&program.steps[index],cut.gdn_total,cut.gdn_slot,cut.qsa_slot)?;
+                }
             }
-        }
+            Ok(())
+        })?;
         // Core queues every arena reader (including the GDN Z gate and QSA
         // cache/index appends). OutProj and the remaining layer read only scratch.
         // prepare_bank waits this event before packing A; kick records ready
@@ -781,7 +799,7 @@ impl NpuForward {
         if let (Some(rt),Some(seq))=(rt,seq) { unsafe { rt.retire_bank(seq,stream(gpu)).map_err(fail)?; } }
         phase(&mut program.steps[index],MixerPhase::OutProj);
         let end=program.ranges[layer].end;
-        execute(gpu,ctx,&program.steps,index..end,hc)?;
+        self.timed(gpu,(bank,kind,measure::Phase::Post),|gpu| execute(gpu,ctx,&program.steps,index..end,hc))?;
         if !records.is_empty() { gpu.hip.event_record(&records[layer*2+bank].end,gpu.active_stream.as_ref())?; }
         Ok(())
     }
@@ -859,7 +877,9 @@ impl NpuForward {
         let mut history=bundle.state.ple_history;
         // Bank A only: bank B initializes after kick(0, A) (L1 fill reorder),
         // so NPU(0, A) does not wait behind bank B's embedding/PLE staging.
+        let span=self.span_begin(gpu)?;
         let mut ple_next=initialize(gpu,bundle,&owner.scratch,&tokens[..rows[0]],&history,programs[0].ple_rows_f16,&mut self.host_tokens,&mut self.host_ple,ple_ahead,Some(&tokens[rows[0]..]))?;
+        self.span_end(gpu,(0,0,measure::Phase::Init),span)?;
         for &token in &tokens[..rows[0]] { history.push(token); }
         if let (Some(stage), Some(cut)) = (&mut stage, shape.cut) {
             let (cut_bank, cut_row) = match site {
@@ -877,7 +897,8 @@ impl NpuForward {
         let commits: SmallVec<[_; QWEN4_QSA_INLINE_CAPACITY]>=programs[1].steps.iter().filter_map(|step|match step {
             Step::IndexedAttention(op)=>Some(op.next_lengths().map_err(fail)), _=>None,
         }).collect::<Result<_,_>>()?;
-        let anchor=if self.trace.is_some() && self.runtime.is_some() { Some(gpu.hip.event_create()?) } else { None };
+        let instrumented = self.trace.is_some() || self.probe.as_ref().is_some_and(|probe| !probe.gpu_only);
+        let anchor=if instrumented && self.runtime.is_some() { Some(gpu.hip.event_create()?) } else { None };
         let mut anchor_ns=0;
         let mut anchor_uncertainty_ns=0;
         let mut records=Vec::new();
@@ -908,7 +929,9 @@ impl NpuForward {
             // Same stream: prepare(0, A) is enqueued before bank B's
             // initialization overwrites the shared init buffers (Footprint table).
             let bank_b_tokens=&tokens[rows[0]..];
+            let span=self.span_begin(gpu)?;
             initialize(gpu,bundle,b,bank_b_tokens,&history,programs[1].ple_rows_f16,&mut host_tokens,&mut host_ple,ple_next.take(),None)?;
+            self.span_end(gpu,(1,0,measure::Phase::Init),span)?;
             for &token in bank_b_tokens { history.push(token); }
             seq[1]=self.prepare(gpu,&ctx,&programs[1],&mut hc[1],0,1,&mut records,snapshot)?;
             let mut last_seq = seq;
@@ -961,7 +984,7 @@ impl NpuForward {
         self.host_ple=host_ple;
         drop(programs);
         let attempt = attempt.and_then(|_| {
-            if let (Some(out),Some(anchor))=(&mut self.trace,&anchor) {
+            if let Some(anchor)=&anchor {
                 if let Some(last)=records.last() { gpu.hip.event_synchronize(&last.end)?; }
                 for r in &records {
                     let start_ns=anchor_ns+(gpu.hip.event_elapsed_ms(anchor,&r.start)? as f64*1e6) as u64;
@@ -969,16 +992,18 @@ impl NpuForward {
                     let stamp = |event| -> Result<u64, hip_bridge::HipError> {
                         Ok(anchor_ns+(gpu.hip.event_elapsed_ms(anchor,event)? as f64*1e6) as u64)
                     };
-                    TraceRecord {
+                    let record = TraceRecord {
                         layer:r.layer, bank:if r.bank==0{"A"}else{"B"}, position:r.position, rows:r.rows, seq:r.seq,
                         pack_issue_ns:r.pack_issue_ns, kick_ns:r.kick_ns, npu_submit_ns:r.submit_ns, npu_done_ns:r.done_ns,
                         gpu_wait_enqueue_ns:r.wait_enqueue_ns, consume_issue_ns:r.consume_issue_ns,
                         mixer_start_ns:start_ns, mixer_end_ns:end_ns, anchor_uncertainty_ns,
                         prep_begin_ns:stamp(&r.prep_begin)?, prep_end_ns:stamp(&r.prep_end)?, pack_end_ns:stamp(&r.pack_end)?,
                         wait_begin_ns:stamp(&r.wait_begin)?, wait_end_ns:stamp(&r.wait_end)?, signal_write_ns:r.signal_write_ns,
-                    }.write(out).map_err(fail)?;
+                    };
+                    if let Some(out)=&mut self.trace { record.write(out).map_err(fail)?; }
+                    if let Some(probe)=&mut self.probe { probe.records.push(record); }
                 }
-                out.flush().map_err(fail)?;
+                if let Some(out)=&mut self.trace { out.flush().map_err(fail)?; }
             }
             Ok(())
         });

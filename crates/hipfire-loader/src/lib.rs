@@ -196,6 +196,18 @@ pub trait Carrier: Send + Sync {
         None
     }
 
+    /// `calibrate_npu_trunk`: measure this host's NPU trunk calibration on the
+    /// loaded model (Qwen4 Flash-Next under `npu_trunk=on`) and return the
+    /// keyed record and its raw measurements as JSON. `None` = this arch has
+    /// no NPU trunk.
+    fn calibrate_npu_trunk(
+        &self,
+        _m: &mut LoadedModel,
+        _gpu: &mut Gpu,
+    ) -> Option<Result<(serde_json::Value, serde_json::Value), String>> {
+        None
+    }
+
     /// Spawn this arch's multi-slot engine, arch-erased as a
     /// [`hipfire_runtime::serve::SlotEngineHandle`]. This is the daemon's
     /// single slot-mode dispatch — it resolves `carrier_for(arch_id)` and

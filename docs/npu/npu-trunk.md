@@ -30,7 +30,10 @@ kept for provenance and are not current recommendations.
 * **Calibration.** `fusions.npu_trunk_calibration` /
   `HIPFIRE_QWEN4_NPU_TRUNK_CAL` defaults to `<hipfire home>/npu-trunk/calibration.json`.
   A file there wins; only an absent file falls back to the compiled-in measured
-  Halo records, which cover the reference key and never arbitrary devices. The
+  Halo records, which cover the reference key and never arbitrary devices. Any
+  other host measures its own record once with `hipfire calibrate-npu-trunk --measure`
+  (see [Measuring on this host](#measuring-on-this-host)); auto's refusal line names
+  that command when no record matches. The
   schema is **4**, BF16-direct only: there is no int32 contract
   (`glue.fold_ms_per_col_8192` is gone and `epilogue` must be `bf16`), and a
   schema-3 record is rejected.
@@ -497,6 +500,56 @@ pipe/GPU milliseconds. `request_log_line(rows, &plan)` prints e.g.
 `npu-trunk: rows=16384 plan=[pipe 0..8192+8192..16384] predicted=-14.7%`.
 The key/hash plus stored calibration identify every deterministic model input.
 
+### Measuring on this host
+
+```sh
+hipfire calibrate-npu-trunk --measure [--model qwen3.8:flash-next] [--out cal.json]
+```
+
+`--measure` starts a fresh daemon and loads the model with `npu_trunk=on`. The
+load takes the serving path: same overlay, admission, memlock check and runtime
+open, with every family packed and no calibration needed. The command then times
+the trunk through the serving pair executor. It writes the record to the path
+serving reads (`fusions.npu_trunk_calibration`, default
+`<hipfire home>/npu-trunk/calibration.json`) unless `--out` is given, and writes the
+raw measurements next to it as `calibration.measurements.json`. The key is
+`runtime_calibration_key` of the loaded bundle (GPU PCI bus ID, `accel0` firmware,
+`uname -r`, model index digest, applied trunk route), the same derivation as
+`match_calibration`, so a later `auto` load on the same host and model matches by
+construction. A changed kernel, firmware, model index or overlay route invalidates
+the record through the key; rerun the command then. The measurement uses the GPU
+and NPU exclusively for a few minutes; serving is not involved, and `auto` never
+measures on its own.
+
+Synthetic token ids (as `bench_prefill`) drive, after one warmup of each kind,
+three repetitions of a GPU-only 8192+8192 pair, an `on` 8192+8192 pair and an `on`
+8192+2048 pair, then one GPU-only pair each of 512, 1024, 2048 and 4096 rows per bank.
+Spans are deferred HIP events around the executor's fragments (resolved after the
+pair, no per-layer synchronization); NPU chains are the relay's submit/done times
+from the trace records.
+
+| Field | Measurement |
+| --- | --- |
+| `gpu.trunk_in_ms_per_8192` | GPU-only pair, bank A (8192 rows, prefix 0): the fused native in-projection (`MixerPhase::InProj`) summed over the layers of its kind, split between the two groups of that kind by the time of each group run alone through the uncovered-projection path that `on` uses for kept families |
+| `gdn_core_per_layer_ms`, `qsa_per_layer_ms` | mean Core per layer, bank A |
+| `qsa_growth_per_layer_ms_per_8192_prefix` | QSA Core of bank B (prefix 8192) minus bank A |
+| `uniform_per_layer_ms` | mean of the steps before the mixer plus OutProj, HC and MoE per layer, bank A |
+| `fixed_per_chunk_ms` | embedding and PLE staging of bank A |
+| `boundary_tax_ms` | GPU layer work of the 4096+4096 pair minus that of bank A of the 8192+8192 pair |
+| `min_bank_rows` | smallest of 512, 1024, 2048, 4096 whose GPU layer cost per row is within 10% of a full 8192-row bank (the planner prices GPU work linearly in rows); 8192 if none is |
+| `glue.pack_ms_8192` | rotation plus A-pack per layer of the `on` pair |
+| `glue.sync_ms`, `npu.tops_corun` | least-squares fit `chain = sync + 2*rows*padded_cols*2560/tops` over every chain of the 8192+8192 and 8192+2048 `on` pairs (refit through the origin when the intercept is negative) |
+| `npu.bytes_per_kop` | declared: A arena, resident B panels and C arena bytes per kilo-op of the full-width 8192-row chains |
+| `contention.alpha_overlap` | the GPU work (pre-mixer, Core, OutProj) of the `on` pair minus that of the GPU-only pair, divided by the planner's overlap `sum(min(G_other, N_this))` of this record, plus 1 (at least 1) |
+| `glue.consume_mode` | `direct` with zero consume costs: the shipped route has no consume pass (Core reads the arenas) |
+
+`margin` is 0, `families` carries today's packing widths (`qkv` 10240, `zab` 6240,
+`q` 12288, `kvidx` 1664, which pad to the same 13/11 panels), and the out families
+and `qsa_order` are omitted, as the route does not move them. Records the command
+writes pass `Calibration::validate`. The command prints the plan at 16384 rows,
+or reports that the measured costs select no families, in which case `auto` stays
+GPU-only on this host.
+
 ### Assembling measurements
 
 ```sh
@@ -543,13 +596,13 @@ The measurements schema is the same as the schema-version-4 output record:
   `C_A C_B P_A P_B`; required with `qsa.o`).
 
 Collect once per exact device/build/kernel/PerfOpt/model/epilogue/trunk-route tuple.
-The collection procedure lives in the maintainers' NPU lab workspace, not in this repository:
+`--measure` above is the in-tree collector. The built-in reference records were
+collected with the maintainers' NPU lab workspace, which is not in this repository:
 `ptrace.sh` attributes GPU kernel costs by layer/family; `contend.sh` measures
 co-run throughput and the contention fit; `tax.sh` measures the extra boundary
-tax; `g80bf16.sh` measures the direct-BF16 NPU rate/traffic. Measure GPU glue
-separately and record costs on the same tuple. Preserve those source results
-alongside the record. Hardware measurement is a separately scheduled gate;
-the CLI performs only offline assembly and never claims to have measured.
+tax; `g80bf16.sh` measures the direct-BF16 NPU rate/traffic. Preserve the source
+results alongside a record. `--from` performs only offline assembly and never
+claims to have measured.
 
 ### Offline golden parity
 
@@ -610,6 +663,10 @@ checks; successful arming logs `cal_source=file|builtin`. The reference key is
 gfx1151, the reference unit's PCI bus ID (`device.pci_bdf` in the built-in record), firmware `1.1.2.65`, uname `7.3.0-rc7-perfopt+`,
 model index `8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013`,
 BF16 and the matching stock/overlay route; the builtin does not admit other keys.
+Every other host needs its own record from `hipfire calibrate-npu-trunk --measure`
+([Measuring on this host](#measuring-on-this-host)); a missing record or a key
+mismatch ends the refusal reason with
+``; measure this host with `hipfire calibrate-npu-trunk --measure` ``.
 
 Admission runs in this order, before any stock MQ6 download/packing or NPU allocation:
 
@@ -646,7 +703,7 @@ Quality accepted: S11 j103 BF16-direct family B, ΔKLD WT2 −0.0005 / code24
 | `on` | `calibration=none (forced)`, ALL, natural 8192+B pairs | Use selected families; planned pairs from the first row (no crossover arming) | Use subset; none stays native |
 | `emulate` | Same as `on`, GPU twin | Same as `on`, GPU twin | Same as `on`, GPU twin |
 
-An auto key mismatch logs exactly `npu-trunk: off (calibration key mismatch: <field>)`.
+An auto key mismatch logs exactly ``npu-trunk: off (calibration key mismatch: <field>; measure this host with `hipfire calibrate-npu-trunk --measure`)``.
 Matching records log `load_log_line` with selection, key/hash, crossover and
 predicted 16K/64K times. Packing, twin, row-major programs, C arenas and request
 planning all use that same selected mask. Without a match, forced modes use ALL.
@@ -683,7 +740,8 @@ against the limit, although it never locked them (`VmLck` stayed 0).
 At open, the trunk computes the exact requirement from its bank layout, `VmPin` + arena
 bytes. If the soft limit is short and the hard limit allows, it raises the soft limit to
 exactly that figure. Otherwise it fails closed with a message naming the bytes and the fix:
-a `WARN npu-trunk: off (...)` line under `auto`, a load error under `on`. The 8 MiB
+a `WARN npu-trunk: off (...)` line under `auto`, a load error under `on` (and under
+`hipfire calibrate-npu-trunk --measure`, whose load is `on`). The 8 MiB
 default that ssh sessions and many desktop logins get is therefore too small. Grant the
 hipfire process a **bounded** limit, the requirement × 1.25 rounded up to the MiB:
 1,318,060,032 B (1257 MiB). Do not use `infinity`.
@@ -710,8 +768,10 @@ shared over dma-buf) are planned for 0.4.3.
 
 After CPU acceptance, install the **same** release CLI/daemon on the Halo host.
 The built-in calibration covers the reference key, so no calibration file is
-needed there. A file at `<hipfire home>/npu-trunk/calibration.json` is needed
-only to override it, and must be a schema-4 BF16-direct record whose key matches
+needed there. Any other Strix Halo host runs `hipfire calibrate-npu-trunk --measure`
+once (under the bounded memlock limit above) to write a record keyed to that host.
+A file at `<hipfire home>/npu-trunk/calibration.json` takes precedence over the
+built-in, and must be a schema-4 BF16-direct record whose key matches
 this device exactly (schema-3 and I32 records are refused). These commands are
 for the maintainer running the gate, not the CPU worker:
 
@@ -719,14 +779,15 @@ for the maintainer running the gate, not the CPU worker:
 GATE=<gate directory on the Halo host>
 ssh <halo-host> "mkdir -p $GATE/bin"
 scp target/release/hipfire target/release/hipfire-daemon <halo-host>:$GATE/bin/
-# Optional override only (schema 4, key must match this device):
-# scp <schema-4 calibration.json> <halo-host>:<hipfire home>/npu-trunk/calibration.json
+# Not the reference unit: measure this host's record once on the Halo host:
+# ssh <halo-host> "$GATE/bin/hipfire calibrate-npu-trunk --measure"
 ```
 
 On the Halo host, verify `uname -r` is `7.3.0-rc7-perfopt+`, the GPU PCI bus ID
 equals the record's `device.pci_bdf`, and
 `cat /sys/class/accel/accel0/device/fw_version` matches the record (for the
-built-in reference key, the values in the built-in record). Do not rewrite a
+built-in reference key, the values in the built-in record). A record written by
+`--measure` on this host matches by construction. Do not rewrite a
 measured device/kernel key to hide a mismatch. The default route uses the
 verified overlay-bound model; for the stock route instead set
 `HIPFIRE_QWEN4_TRUNK_OVERLAY=0` (the built-in stock record then applies). Do

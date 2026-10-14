@@ -4312,6 +4312,12 @@ impl Qwen4GpuForward {
         { false }
     }
 
+    /// Measure this host's NPU trunk calibration through the attached `npu_trunk=on` trunk.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn measure_npu_trunk(&mut self, bundle: &mut Qwen4Bundle, gpu: &mut Gpu) -> Result<(crate::npu_trunk::Calibration, serde_json::Value), Qwen4GpuForwardError> {
+        npu_forward::measure::collect(self, bundle, gpu).map(|collected| (collected.calibration, collected.report))
+    }
+
     pub(crate) fn begin_npu_trunk_request(&mut self) {
         #[cfg(target_os = "linux")]
         if let Some(npu)=&mut self.npu_trunk { npu.begin_request(); }
