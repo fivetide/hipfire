@@ -826,7 +826,14 @@ pub fn mtp_forward_batched(
     //   Positions: start_pos + b.
     //   attn_state: slot = (start_pos + b) % swa_window; n_valid = min(start_pos + b + 1, swa_window).
     precompute_positions_batched(cfg, pbs, gpu, start_pos, batch_size)?;
-    precompute_attn_state_batched(cfg, pbs, gpu, start_pos, batch_size)?;
+    precompute_attn_state_batched(
+        cfg,
+        state.compressor_cache_placement,
+        pbs,
+        gpu,
+        start_pos,
+        batch_size,
+    )?;
 
     // ── 8. Standard batched layer block at layer_idx = mtp_layer_idx ──
     // The MTP layer has compress_ratio = 0 so attention_block_batched_swa_only

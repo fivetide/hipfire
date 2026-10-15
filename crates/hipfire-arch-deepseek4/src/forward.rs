@@ -25,7 +25,9 @@
 
 use crate::backend::Mq2rBackend;
 use crate::config_cache;
-use crate::deepseek4::{DeepseekV4HeterogeneousWeights, DeepseekV4RoutedWeights};
+use crate::deepseek4::{
+    CompressorCachePlacement, DeepseekV4HeterogeneousWeights, DeepseekV4RoutedWeights,
+};
 use crate::heterogeneous::DeepseekV4HeterogeneousExecution;
 use crate::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use hipfire_dispatch::context::DispatchCtx;
@@ -3829,80 +3831,75 @@ fn capped_compressed_count(position: i32, ratio: i32, max_compressed: i32) -> i3
     ((position + 1) / ratio).min(max_compressed)
 }
 
-fn fill_attn_state_host(cfg: &DeepseekV4Config, state: &mut DeepseekV4State, position: u32) {
+/// Attention-state slots per position, shared by the decode buffer and each
+/// row stripe of the batched buffer. 10 / 11 are the global ratio-4 / 128
+/// commit slots the device-commit compressor reads for its overlap shift.
+pub(crate) const ATTN_STATE_SLOTS: usize = 12;
+
+fn attn_state_slots(
+    cfg: &DeepseekV4Config,
+    placement: CompressorCachePlacement,
+    max_compressed: i32,
+    pos: i32,
+) -> [i32; ATTN_STATE_SLOTS] {
     let win = cfg.sliding_window as i32;
     let topk = cfg.index_topk as i32; // DeepSeek V4: 512
-    let pos = position as i32;
-    let max_compressed = state.compressor_capacity.active_rows() as i32;
-    let swa_slot = pos % win;
-    let n_valid_swa = (pos + 1).min(win);
     let n_compressed_4 = capped_compressed_count(pos, 4, max_compressed);
     let n_compressed_128 = capped_compressed_count(pos, 128, max_compressed);
-    let k_active_4 = topk.min(n_compressed_4);
-    let k_active_128 = topk.min(n_compressed_128);
     // Compressor ring/commit slots. For overlap=true (ratio=4 in DeepSeek V4),
     // the state ring is sized [2*ratio, proj_dim] and writes go to the
     // second half: `ring + ratio + (pos % ratio)`. Commit slot is
     // pos/ratio at commit positions, -1 otherwise (commit kernels
     // early-return on -1).
-    let ring_slot_4 = 4 + (pos % 4);
-    let global_commit_slot_4 = if (pos + 1) % 4 == 0 {
-        let s = pos / 4;
-        if s < max_compressed {
+    let global_commit = |ratio: i32| {
+        let s = pos / ratio;
+        if (pos + 1) % ratio == 0 && s < max_compressed {
             s
         } else {
             -1
         }
-    } else {
-        -1
     };
-    let ring_slot_128 = pos % 128; // overlap=false (ratio=128)
-    let global_commit_slot_128 = if (pos + 1) % 128 == 0 {
-        let s = pos / 128;
-        if s < max_compressed {
-            s
-        } else {
-            -1
+    let local_commit = |global: i32| {
+        if global < 0 {
+            return -1;
         }
-    } else {
-        -1
-    };
-    let commit_slot_4 = if global_commit_slot_4 >= 0 {
-        state
-            .compressor_cache_placement
-            .global_to_local(global_commit_slot_4 as usize)
+        placement
+            .global_to_local(global as usize)
             .map(|slot| slot as i32)
             .unwrap_or(-1)
-    } else {
-        -1
     };
-    let commit_slot_128 = if global_commit_slot_128 >= 0 {
-        state
-            .compressor_cache_placement
-            .global_to_local(global_commit_slot_128 as usize)
-            .map(|slot| slot as i32)
-            .unwrap_or(-1)
-    } else {
-        -1
-    };
-    let host = state
+    let global_commit_slot_4 = global_commit(4);
+    let global_commit_slot_128 = global_commit(128);
+    [
+        pos % win,
+        (pos + 1).min(win),
+        n_compressed_4,
+        n_compressed_128,
+        topk.min(n_compressed_4),
+        topk.min(n_compressed_128),
+        4 + (pos % 4),
+        local_commit(global_commit_slot_4),
+        pos % 128, // overlap=false (ratio=128)
+        local_commit(global_commit_slot_128),
+        // Cache writes use rank-local slots above. Ring state remains
+        // replicated, so its overlap shift must fire on every rank at each
+        // global commit.
+        global_commit_slot_4,
+        global_commit_slot_128,
+    ]
+}
+
+fn fill_attn_state_host(cfg: &DeepseekV4Config, state: &mut DeepseekV4State, position: u32) {
+    let slots = attn_state_slots(
+        cfg,
+        state.compressor_cache_placement,
+        state.compressor_capacity.active_rows() as i32,
+        position as i32,
+    );
+    **state
         .attn_state_host
         .as_mut()
-        .expect("fill_attn_state_host: attn_state_host not initialised");
-    host[0] = swa_slot;
-    host[1] = n_valid_swa;
-    host[2] = n_compressed_4;
-    host[3] = n_compressed_128;
-    host[4] = k_active_4;
-    host[5] = k_active_128;
-    host[6] = ring_slot_4;
-    host[7] = commit_slot_4;
-    host[8] = ring_slot_128;
-    host[9] = commit_slot_128;
-    // Cache writes use rank-local slots above. Ring state remains replicated,
-    // so its overlap shift must fire on every rank at each global commit.
-    host[10] = global_commit_slot_4;
-    host[11] = global_commit_slot_128;
+        .expect("fill_attn_state_host: attn_state_host not initialised") = slots;
 }
 
 /// Update host-only `attn_state_host[]` (no device copy). Used by the
@@ -8098,70 +8095,22 @@ pub(crate) fn precompute_positions_batched(
 }
 
 /// Per-batch twin of `precompute_attn_state`. Fills B contiguous stripes
-/// of 10 slots in `pbs.attn_state_buf_batch` — one stripe per batch row
-/// b at absolute position `start_pos + b`. Slot layout matches
-/// `fill_attn_state_host` (see line ~1389).
+/// of `ATTN_STATE_SLOTS` in `pbs.attn_state_buf_batch` — one stripe per
+/// batch row b at absolute position `start_pos + b`, laid out exactly like
+/// the decode buffer so the device-commit compressor can read any slot.
 pub(crate) fn precompute_attn_state_batched(
     cfg: &DeepseekV4Config,
+    placement: CompressorCachePlacement,
     pbs: &PrefillBatchScratch,
     gpu: &mut Gpu,
     start_pos: u32,
     batch_size: usize,
 ) -> Result<(), String> {
-    let slots_per_pos = 10;
-    let total_i32s = batch_size * slots_per_pos;
-
-    let win = cfg.sliding_window as i32;
-    let topk = cfg.index_topk as i32;
     let max_compressed = pbs.idx_score_capacity as i32;
-
-    let mut host: Vec<i32> = vec![0i32; total_i32s];
-    for b in 0..batch_size {
-        let pos = (start_pos as i32) + b as i32;
-        let stripe = b * slots_per_pos;
-
-        let swa_slot = pos % win;
-        let n_valid_swa = (pos + 1).min(win);
-        let n_compressed_4 = capped_compressed_count(pos, 4, max_compressed);
-        let n_compressed_128 = capped_compressed_count(pos, 128, max_compressed);
-        let k_active_4 = topk.min(n_compressed_4);
-        let k_active_128 = topk.min(n_compressed_128);
-        let ring_slot_4 = 4 + (pos % 4);
-        let commit_slot_4 = if (pos + 1) % 4 == 0 {
-            let s = pos / 4;
-            if s < max_compressed {
-                s
-            } else {
-                -1
-            }
-        } else {
-            -1
-        };
-        let ring_slot_128 = pos % 128;
-        let commit_slot_128 = if (pos + 1) % 128 == 0 {
-            let s = pos / 128;
-            if s < max_compressed {
-                s
-            } else {
-                -1
-            }
-        } else {
-            -1
-        };
-
-        host[stripe] = swa_slot;
-        host[stripe + 1] = n_valid_swa;
-        host[stripe + 2] = n_compressed_4;
-        host[stripe + 3] = n_compressed_128;
-        host[stripe + 4] = k_active_4;
-        host[stripe + 5] = k_active_128;
-        host[stripe + 6] = ring_slot_4;
-        host[stripe + 7] = commit_slot_4;
-        host[stripe + 8] = ring_slot_128;
-        host[stripe + 9] = commit_slot_128;
-    }
-
-    let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, total_i32s * 4) };
+    let host: Vec<i32> = (0..batch_size)
+        .flat_map(|b| attn_state_slots(cfg, placement, max_compressed, start_pos as i32 + b as i32))
+        .collect();
+    let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 4) };
     gpu.memcpy_htod_auto(&pbs.attn_state_buf_batch.buf, bytes)
         .map_err(|e| format!("htod attn_state_buf_batch: {e:?}"))
 }
@@ -8455,7 +8404,7 @@ pub struct PrefillBatchScratch {
     /// right batch row.
     pub pos_array_device_batch: GpuTensor,
     /// Per-batch-position attn_state buffer (Option B per-batch state).
-    /// `[max_batch * ATTN_STATE_SLOTS=10]` i32 stored as F32. Same
+    /// `[max_batch * ATTN_STATE_SLOTS]` i32 stored as F32. Same
     /// swap-and-sub-view pattern as pos_array_device_batch.
     pub attn_state_buf_batch: GpuTensor,
     /// Batched MTP next-token ids `[max_batch]` stored as F32 (i32-in-F32
@@ -8602,7 +8551,7 @@ impl PrefillBatchScratch {
         raw_bytes += 2 * b * hidden * 2; // two F16 activation staging slabs
         add(b)?; // compressor positions
         add(b * (cfg.num_hidden_layers as u128 + 1) * POS_SLOTS_PER_LAYER as u128)?;
-        add(b * 10)?;
+        add(b * ATTN_STATE_SLOTS as u128)?;
         add(b)?; // MTP tokens
         add(b * hidden)?; // MTP embed
         add(b * hidden)?; // MTP e norm
@@ -8830,7 +8779,8 @@ impl PrefillBatchScratch {
             &[max_batch * (cfg.num_hidden_layers + 1) * POS_SLOTS_PER_LAYER],
             "pos_array_device_batch"
         );
-        let attn_state_buf_batch = alloc_f32!(&[max_batch * 10], "attn_state_buf_batch");
+        let attn_state_buf_batch =
+            alloc_f32!(&[max_batch * ATTN_STATE_SLOTS], "attn_state_buf_batch");
         let mtp_tokens_batch = alloc_f32!(&[max_batch], "mtp_tokens_batch");
         let mtp_embed_batch = alloc_f32!(&[max_batch, hidden], "mtp_embed_batch");
         let mtp_e_norm_batch = alloc_f32!(&[max_batch, hidden], "mtp_e_norm_batch");
@@ -10059,7 +10009,7 @@ pub(crate) fn attention_block_batched_mixed(
         // by `upload_prefill_batch_inputs`, outside graph / retained capture.
 
         let slots_per_pos = (cfg.num_hidden_layers + 1) * POS_SLOTS_PER_LAYER;
-        let attn_state_slots = 10;
+        let attn_state_slots = ATTN_STATE_SLOTS;
 
         // Snapshot per-position state pointers so we can restore after
         // the loop. Decode-time (B=1) uses these; we transiently replace
@@ -12382,6 +12332,7 @@ pub fn forward_prefill_batch(
 /// permitted in the capture-safe body.
 pub(crate) fn upload_prefill_batch_inputs(
     cfg: &DeepseekV4Config,
+    placement: CompressorCachePlacement,
     gpu: &mut Gpu,
     pbs: &PrefillBatchScratch,
     tokens: &[u32],
@@ -12448,7 +12399,7 @@ pub(crate) fn upload_prefill_batch_inputs(
     // compressor fallback. They depend only on (start_pos, B), so one upload
     // is both faster for direct prefill and mandatory for capture/replay.
     precompute_positions_batched(cfg, pbs, gpu, start_pos, n)?;
-    precompute_attn_state_batched(cfg, pbs, gpu, start_pos, n)?;
+    precompute_attn_state_batched(cfg, placement, pbs, gpu, start_pos, n)?;
     Ok(())
 }
 
@@ -12469,7 +12420,14 @@ pub fn forward_prefill_batch_chunk(
         pbs,
         (start_pos as usize).saturating_add(tokens.len()),
     )?;
-    upload_prefill_batch_inputs(cfg, gpu, pbs, tokens, start_pos)?;
+    upload_prefill_batch_inputs(
+        cfg,
+        state.compressor_cache_placement,
+        gpu,
+        pbs,
+        tokens,
+        start_pos,
+    )?;
     forward_prefill_batch_chunk_impl(cfg, weights, state, gpu, pbs, tokens, start_pos, false)
 }
 
@@ -12967,7 +12925,14 @@ pub fn forward_ep_prefill_batch_chunked(
         for rank in 0..n_ranks {
             let gpu = &mut gpus.devices[rank];
             let pbs = &pbs_per_rank[rank];
-            upload_prefill_batch_inputs(cfg, gpu, pbs, chunk, chunk_start)?;
+            upload_prefill_batch_inputs(
+                cfg,
+                state_per_rank[rank].compressor_cache_placement,
+                gpu,
+                pbs,
+                chunk,
+                chunk_start,
+            )?;
             let token_embd = weights_per_rank[rank]
                 .token_embd
                 .as_ref()

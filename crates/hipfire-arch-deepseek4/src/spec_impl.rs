@@ -164,19 +164,25 @@ impl Deepseek4Bundle {
         let n_verify = block.len();
         let mut pbs = self.redline_take_dspark_verify_pbs(gpu, n_verify)?;
         let forward_result = if capture_safe {
-            upload_prefill_batch_inputs(&self.config, gpu, &pbs, block, position as u32).and_then(
-                |()| {
-                    forward_prefill_batch_chunk_preuploaded(
-                        &self.config,
-                        &self.weights,
-                        &mut self.state,
-                        gpu,
-                        &pbs,
-                        block,
-                        position as u32,
-                    )
-                },
+            upload_prefill_batch_inputs(
+                &self.config,
+                self.state.compressor_cache_placement,
+                gpu,
+                &pbs,
+                block,
+                position as u32,
             )
+            .and_then(|()| {
+                forward_prefill_batch_chunk_preuploaded(
+                    &self.config,
+                    &self.weights,
+                    &mut self.state,
+                    gpu,
+                    &pbs,
+                    block,
+                    position as u32,
+                )
+            })
         } else {
             forward_prefill_batch_chunk(
                 &self.config,
@@ -202,8 +208,14 @@ impl Deepseek4Bundle {
     ) -> Result<(Vec<u32>, DsparkVerifyCaptureInfo), String> {
         let n_verify = block.len();
         let pbs = self.redline_take_dspark_verify_pbs(gpu, n_verify)?;
-        let upload_result =
-            upload_prefill_batch_inputs(&self.config, gpu, &pbs, block, position as u32);
+        let upload_result = upload_prefill_batch_inputs(
+            &self.config,
+            self.state.compressor_cache_placement,
+            gpu,
+            &pbs,
+            block,
+            position as u32,
+        );
         std::mem::swap(&mut gpu.replay, controller);
         let capture_result = (|| -> Result<DsparkVerifyCaptureInfo, String> {
             upload_result?;
@@ -261,8 +273,14 @@ impl Deepseek4Bundle {
     ) -> Result<Vec<u32>, String> {
         let n_verify = block.len();
         let pbs = self.redline_take_dspark_verify_pbs(gpu, n_verify)?;
-        let upload_result =
-            upload_prefill_batch_inputs(&self.config, gpu, &pbs, block, position as u32);
+        let upload_result = upload_prefill_batch_inputs(
+            &self.config,
+            self.state.compressor_cache_placement,
+            gpu,
+            &pbs,
+            block,
+            position as u32,
+        );
         std::mem::swap(&mut gpu.replay, controller);
         let replay_result = upload_result.and_then(|()| {
             let launches = gpu.replay.recorded_launches().len();
@@ -284,8 +302,14 @@ impl Deepseek4Bundle {
     ) -> Result<Vec<u32>, String> {
         let n_verify = block.len();
         let pbs = self.redline_take_dspark_verify_pbs(gpu, n_verify)?;
-        let upload_result =
-            upload_prefill_batch_inputs(&self.config, gpu, &pbs, block, position as u32);
+        let upload_result = upload_prefill_batch_inputs(
+            &self.config,
+            self.state.compressor_cache_placement,
+            gpu,
+            &pbs,
+            block,
+            position as u32,
+        );
         std::mem::swap(&mut gpu.replay, controller);
         let replay_result = upload_result.and_then(|()| {
             if !gpu.replay.should_route_pm4() {
@@ -366,7 +390,14 @@ impl Deepseek4Bundle {
             && (graph_batch == 0 || graph_batch == n_verify);
         let fwd_result = if graph_enabled {
             (|| -> Result<(), String> {
-                upload_prefill_batch_inputs(&self.config, gpu, &pbs, block, position as u32)?;
+                upload_prefill_batch_inputs(
+                    &self.config,
+                    self.state.compressor_cache_placement,
+                    gpu,
+                    &pbs,
+                    block,
+                    position as u32,
+                )?;
                 if gpu.active_stream.is_none() {
                     return Err(
                         "DSpark verify graph: upload did not create an active stream".into(),
@@ -448,7 +479,14 @@ impl Deepseek4Bundle {
             })()
         } else if retained_enabled {
             (|| -> Result<(), String> {
-                upload_prefill_batch_inputs(&self.config, gpu, &pbs, block, position as u32)?;
+                upload_prefill_batch_inputs(
+                    &self.config,
+                    self.state.compressor_cache_placement,
+                    gpu,
+                    &pbs,
+                    block,
+                    position as u32,
+                )?;
 
                 let mut controller = pbs.dspark_verify_pm4.remove(&n_verify).unwrap_or_else(|| {
                     if aql_enabled {
