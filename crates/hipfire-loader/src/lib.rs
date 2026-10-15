@@ -2166,7 +2166,7 @@ fn finish_qwen35_load(
                                             physical_cap,
                                             conf_threshold,
                                             true, // sampled verify (temp>0) supported
-                                            0.5,
+                                            hipfire_runtime::dspark_block_controller::WindowCost::Measured { max_ratio: 0.5 },
                                         ))
                                         }
                                         Err(e) => {

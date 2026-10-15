@@ -3581,7 +3581,7 @@ impl Carrier for LlamaCarrier {
                 // (fused sample_top_p_pf, honors temp+top_p+top_k). The daemon routes
                 // temp>0 llama through the chain path (requires_greedy()==false).
                 true,
-                0.5,
+                hipfire_runtime::dspark_block_controller::WindowCost::Measured { max_ratio: 0.5 },
             ))
         } else if let Some(dp) = ctx.draft_path {
             // Peek at the draft's arch_id without consuming the path; the builder

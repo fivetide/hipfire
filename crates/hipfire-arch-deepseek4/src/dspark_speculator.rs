@@ -39,12 +39,23 @@
 
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use crate::forward;
+use hipfire_runtime::dspark_block_controller::WindowCost;
 use hipfire_runtime::dspark_core::{
     build_dspark_speculator, main_proj_ingest, main_proj_ingest_batched, DsparkBody,
     DsparkConfig as CoreDsparkConfig, DsparkWeights as CoreDsparkWeights,
 };
 use hipfire_runtime::spec::Speculator;
 use rdna_compute::{DType, Gpu, GpuTensor};
+
+/// DSpark window cost for the block controller: `dt / t_ar`, the window time one
+/// more draft adds relative to a draft-less window. Fixed rather than timed so the draft-block
+/// schedule, and with it greedy output, repeats across processes (HIPF-78:
+/// the live fit landed at 0.390-0.423 on warm gfx1151 processes and the chosen
+/// verify widths, hence the text, changed between runs). 0.40 is the median of
+/// those fits.
+// ponytail: one gfx1151 number for every device; measure gfx1201/TP routes
+// and key it by arch if their verify cost curve differs.
+const DS4_DSPARK_WINDOW_COST: WindowCost = WindowCost::Fixed { ratio: 0.40 };
 
 // ── Deepseek4DsparkBody ───────────────────────────────────────────────────────
 
@@ -320,7 +331,7 @@ pub fn build_deepseek4_dspark_speculator(
         ctx_capacity,
         conf_threshold,
         supports_temp,
-        0.45,
+        DS4_DSPARK_WINDOW_COST,
     ))
 }
 
@@ -491,7 +502,7 @@ mod tests {
             8,
             0.3,
             false,
-            0.45,
+            DS4_DSPARK_WINDOW_COST,
         );
         // Dirtied rings are inside the body; reset must free them (no panic).
         let _ = spec.reset(&mut gpu);

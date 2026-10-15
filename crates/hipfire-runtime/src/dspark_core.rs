@@ -2,6 +2,7 @@
 //! chain, qwen3 dense transformer) is the only arch-specific seam — see
 //! [`DsparkBody`]. Everything else (main_proj ingest, markov head, confidence
 //! head, window orchestration) lives here.
+use crate::dspark_block_controller::WindowCost;
 use crate::spec::{
     accept_greedy_prefix, MtpDrafter, MtpSpeculator, MtpWindow, SpecGrammar, SpecRequestConfig,
     SpecScratch, SpecTarget, Speculator,
@@ -1737,6 +1738,8 @@ impl MtpDrafter for DsparkDrafter {
 /// `mtp_final_norm`; qwen3: drafter `norm`); `lm_head` is `[vocab, hidden]`.
 /// `supports_temp` enables distribution-preserving sampled verify at temp>0
 /// (requires the target to implement `verify_block_sampled_capture_gpu`).
+/// `window_cost` feeds the adaptive block controller; only
+/// [`WindowCost::Fixed`] keeps greedy output reproducible across processes.
 #[allow(clippy::too_many_arguments)]
 pub fn build_dspark_speculator(
     body: Box<dyn DsparkBody>,
@@ -1747,7 +1750,7 @@ pub fn build_dspark_speculator(
     ctx_capacity: usize,
     conf_threshold: f32,
     supports_temp: bool,
-    max_cost_ratio: f32,
+    window_cost: WindowCost,
 ) -> Box<dyn Speculator> {
     let block = block.clamp(1, 8);
     let persistent_verify_context_scratch = body.persistent_verify_context_scratch();
@@ -1766,7 +1769,7 @@ pub fn build_dspark_speculator(
             1,
             block,
             0.18,
-            max_cost_ratio,
+            window_cost,
         )
     });
     Box::new(MtpSpeculator::new(DsparkDrafter {

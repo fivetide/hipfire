@@ -23,6 +23,19 @@
 //! and seeds the survival counts at every depth so the argmax has real signal. After
 //! the ramp the argmax takes over for the remainder of the request.
 
+/// Where the controller's window-cost curve (`dt / t_ar`) comes from.
+#[derive(Clone, Copy, Debug)]
+pub enum WindowCost {
+    /// Fit the curve from live window wall time, rejecting fits steeper than
+    /// `max_ratio`. Wall time differs run to run, so the block schedule does
+    /// too, and with it the verify width that the committed greedy tokens
+    /// depend on: greedy output is not reproducible across processes.
+    Measured { max_ratio: f32 },
+    /// A fixed, model-measured `dt / t_ar`. The block schedule is then a pure
+    /// function of the request's acceptance history.
+    Fixed { ratio: f32 },
+}
+
 /// Cost-model draft-block controller for the DSpark drafter.
 pub(crate) struct BlockController {
     block: usize,
@@ -51,19 +64,19 @@ pub(crate) struct BlockController {
     /// Per-n EMA of full-window wall-time in ms (draft+heads+verify), indexed by
     /// n_verify (= 1 + drafted block), slots 2..9.
     t_window_by_n: [f32; 10],
-    /// True once the window-cost curve has been fit; preserved across reset().
+    /// True once the window-cost curve has been fit (from the start for
+    /// `WindowCost::Fixed`, which never fits); preserved across reset().
     calibrated: bool,
     /// Marginal per-position window cost (ms) = slope of the window-cost curve,
     /// clamped to ≥0 (a flat curve lets the block climb to the acceptance depth).
     dt: f32,
     /// Single-block window cost (ms) = intercept of the window-cost curve.
     t_ar: f32,
-    /// True once dt/t_ar are usable (live-calibrated or test-seeded). Until then
+    /// True once dt/t_ar are usable (fixed, live-calibrated or test-seeded). Until then
     /// the argmax is disabled and the block stays at default_block.
     cost_ready: bool,
-    /// Largest marginal/base cost ratio accepted as a stable linear fit. This
-    /// is supplied by the owning model: near the rejection edge, DS4's sparse
-    /// ramp samples can flip the chosen block across fresh processes.
+    /// Largest marginal/base cost ratio accepted as a stable linear fit
+    /// (`WindowCost::Measured`; unused for `Fixed`).
     max_cost_ratio: f32,
 }
 
@@ -81,9 +94,13 @@ impl BlockController {
         min_block: usize,
         max_block: usize,
         p_star: f32,
-        max_cost_ratio: f32,
+        cost: WindowCost,
     ) -> Self {
         let default_block = default_block.clamp(min_block, max_block);
+        let (fixed_ratio, max_cost_ratio) = match cost {
+            WindowCost::Measured { max_ratio } => (None, max_ratio),
+            WindowCost::Fixed { ratio } => (Some(ratio), ratio),
+        };
         Self {
             block: default_block,
             default_block,
@@ -95,14 +112,15 @@ impl BlockController {
             windows_seen: 0,
             timing_samples: 0,
             t_window_by_n: [0.0f32; 10],
-            calibrated: false,
-            // Dormant cost prior: only the dt/t_ar RATIO drives the argmax, and it
-            // stays disabled (cost_ready=false) until live window timing refines
-            // these into real milliseconds. Seeded from the caller's p* prior so the
-            // ratio is sane if ever consulted before calibration (assume ~100ms AR).
+            calibrated: fixed_ratio.is_some(),
+            // Without a fixed ratio the cost prior is dormant: only the dt/t_ar
+            // RATIO drives the argmax, and it stays disabled (cost_ready=false)
+            // until live window timing refines these into real milliseconds.
+            // Seeded from the caller's p* prior so the ratio is sane if ever
+            // consulted before calibration (assume ~100ms AR).
             t_ar: 100.0,
-            dt: p_star * 100.0,
-            cost_ready: false,
+            dt: fixed_ratio.unwrap_or(p_star) * 100.0,
+            cost_ready: fixed_ratio.is_some(),
             max_cost_ratio,
         }
     }
@@ -256,13 +274,15 @@ impl BlockController {
 mod tests {
     use super::*;
 
+    const MEASURED: WindowCost = WindowCost::Measured { max_ratio: 0.5 };
+
     // DS4-like: expensive verify (dt large) + survival that SATURATES at 2
     // (accept_len ∈ {0,1,2}). τ stops growing past 2, so the argmax settles low.
     // Run well past ramp_end (ramp sweeps min→max in 2*max_block=14 post-warmup
     // windows; we run 200 total so the argmax has long settled).
     #[test]
     fn settles_low_when_survival_saturates_and_verify_expensive() {
-        let mut c = BlockController::new(2, 1, 7, 0.0, 0.5);
+        let mut c = BlockController::new(2, 1, 7, 0.0, MEASURED);
         c.set_cost_for_test(15.0, 85.0); // DS4-like
         for i in 0..200 {
             c.observe([0, 1, 2, 2][i % 4], 5); // depth ~1.5, never > 2
@@ -275,7 +295,7 @@ mod tests {
     // after ramp_end the cost model rewards over-drafting and settles high.
     #[test]
     fn climbs_high_when_survival_deep_and_verify_cheap() {
-        let mut c = BlockController::new(2, 1, 7, 0.0, 0.5);
+        let mut c = BlockController::new(2, 1, 7, 0.0, MEASURED);
         c.set_cost_for_test(4.0, 33.0); // qwen3-like
                                         // Always accept the whole drafted block, so all depths are rewarded.
         for _ in 0..200 {
@@ -296,7 +316,7 @@ mod tests {
     #[test]
     fn cheaper_verify_picks_larger_block() {
         let mk = |dt: f32| {
-            let mut c = BlockController::new(2, 1, 7, 0.0, 0.5);
+            let mut c = BlockController::new(2, 1, 7, 0.0, MEASURED);
             c.set_cost_for_test(dt, 50.0);
             for i in 0..400 {
                 c.observe([1, 2, 3, 4][i % 4], 7);
@@ -317,7 +337,7 @@ mod tests {
     // n=2 → 90ms, n=6 → 150ms: dt=(150-90)/4=15, t_ar=90-15=75; flips cost_ready.
     #[test]
     fn calibrates_dt_t_ar_from_window_curve() {
-        let mut c = BlockController::new(3, 1, 7, 0.18, 0.5);
+        let mut c = BlockController::new(3, 1, 7, 0.18, MEASURED);
         for _ in 0..30 {
             c.observe_timing(90.0, 2);
             c.observe_timing(150.0, 6);
@@ -328,28 +348,32 @@ mod tests {
         assert!((t_ar - 75.0).abs() < 1.0, "t_ar={}", t_ar);
     }
 
+    // Repeat-run check (HIPF-78). The block schedule sets the verify width, and
+    // batched verify logits depend on it, so greedy DSpark text follows the
+    // schedule. Two fresh DS4 processes on gfx1151 calibrated dt/t_ar at 0.390
+    // and 0.423 (same prompts, warm kernels). With a fixed cost, two runs that
+    // see those different window times must draft the same schedule.
     #[test]
-    fn model_scoped_ratio_ceiling_rejects_borderline_ds4_fit() {
-        let mut generic = BlockController::new(2, 1, 7, 0.18, 0.5);
-        let mut ds4 = BlockController::new(2, 1, 7, 0.18, 0.45);
-        for _ in 0..30 {
-            // Reproduces the DS4 fresh-process cliff: dt=19.7, t_ar=40.1,
-            // ratio=0.4913. The generic policy accepts it; DS4 rejects this
-            // borderline sparse-ramp fit and keeps the measured-good default.
-            generic.observe_timing(59.8, 2);
-            generic.observe_timing(138.6, 6);
-            ds4.observe_timing(59.8, 2);
-            ds4.observe_timing(138.6, 6);
-        }
-        assert!(generic.cost_ready);
-        assert!(!ds4.cost_ready);
+    fn fixed_cost_block_schedule_repeats_across_window_timings() {
+        let run = |measured_ratio: f32| {
+            let mut c = BlockController::new(2, 1, 7, 0.18, WindowCost::Fixed { ratio: 0.40 });
+            let mut schedule = Vec::new();
+            for i in 0..200 {
+                let block = c.block();
+                schedule.push(block);
+                c.observe_timing(55.0 * (1.0 + measured_ratio * block as f32), block + 1);
+                c.observe([2, 2, 0][i % 3].min(block), block);
+            }
+            schedule
+        };
+        assert_eq!(run(0.390), run(0.423));
     }
 
     // A too-STEEP fit (Δt > t_ar/2, ratio > 0.5 — a thermal spike) must be REJECTED:
     // cost_ready stays false (the block then safely stays at default).
     #[test]
     fn rejects_out_of_range_fit() {
-        let mut c = BlockController::new(3, 1, 7, 0.18, 0.5);
+        let mut c = BlockController::new(3, 1, 7, 0.18, MEASURED);
         // t_w[2]=100, t_w[6]=300 → dt=50, t_ar=50, ratio=1.0 > 0.5 → reject.
         for _ in 0..30 {
             c.observe_timing(100.0, 2);
@@ -368,7 +392,7 @@ mod tests {
     // back to default. t_w[2]=80, t_w[8]=68 → slope=−2 → dt clamped 0, t_ar=80.
     #[test]
     fn flat_window_cost_calibrates_dt_zero() {
-        let mut c = BlockController::new(2, 1, 7, 0.05, 0.5);
+        let mut c = BlockController::new(2, 1, 7, 0.05, MEASURED);
         for _ in 0..30 {
             c.observe_timing(80.0, 2);
             c.observe_timing(68.0, 8);
@@ -386,7 +410,7 @@ mod tests {
     // window cost (thermal-invariant hardware ratio).
     #[test]
     fn reset_preserves_calibration() {
-        let mut c = BlockController::new(3, 1, 7, 0.18, 0.5);
+        let mut c = BlockController::new(3, 1, 7, 0.18, MEASURED);
         for _ in 0..30 {
             c.observe_timing(90.0, 2);
             c.observe_timing(150.0, 6);
@@ -415,7 +439,7 @@ mod tests {
     // tests above structurally cannot.
     #[test]
     fn settles_at_interior_argmax_n3() {
-        let mut c = BlockController::new(2, 1, 7, 0.0, 0.5);
+        let mut c = BlockController::new(2, 1, 7, 0.0, MEASURED);
         c.set_cost_for_test(10.0, 50.0);
         for _ in 0..200 {
             c.observe(3, 7); // accept exactly 3 of 7 drafted, every window
@@ -432,7 +456,7 @@ mod tests {
     // block to the minimum without indexing OOB.
     #[test]
     fn zero_proposed_is_safe() {
-        let mut c = BlockController::new(3, 1, 7, 0.18, 0.5);
+        let mut c = BlockController::new(3, 1, 7, 0.18, MEASURED);
         c.set_cost_for_test(10.0, 50.0);
         for _ in 0..50 {
             c.observe(0, 0); // n_proposed=0; all-reject
