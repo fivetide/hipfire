@@ -2812,7 +2812,6 @@ fn prefill_chunk_batched(
 ) -> Result<Option<Vec<f32>>, String> {
     let b = chunk.len();
     // Ensure persistent BF16 scratch sized to 512*hidden_dim (max chunk) is allocated once.
-    // This is the prefill analogue of GlimmerDecodeBatchState::bf16_scratch.
     let bf16_needed = 512 * cfg.hidden_dim;
     if state.prefill_bf16_scratch.is_none() {
         let t = gpu
