@@ -2864,7 +2864,8 @@ fn load_weights_inner(
     use std::time::Instant;
     // Every allocation of the weight sweep is immutable model data: railgun
     // check mode verifies it unchanged instead of snapshotting it (§2.4).
-    let _weights_role = hip_bridge::registry::role_scope(hip_bridge::registry::AllocationRole::Weights);
+    let _weights_role =
+        hip_bridge::registry::role_scope(hip_bridge::registry::AllocationRole::Weights);
     let t_sweep = Instant::now();
     let LoadedWeights {
         token_embd,
@@ -5160,10 +5161,7 @@ fn try_load_packed_experts(
                 let (_, bytes) = hfq.tensor_data_pread(&spec.gate_up_name).ok_or_else(|| {
                     HipError::new(
                         0,
-                        &format!(
-                            "qwen35: packed tensor disappeared: {}",
-                            spec.gate_up_name
-                        ),
+                        &format!("qwen35: packed tensor disappeared: {}", spec.gate_up_name),
                     )
                 })?;
                 if bytes.len() != gate_up_stride {
@@ -6082,18 +6080,11 @@ pub(crate) fn load_moe_ffn(
     );
 
     let expert_ids = source_expert_ids;
-    let packed = match try_load_packed_experts(
-        hfq,
-        gpu,
-        p,
-        &expert_ids,
-        mi,
-        config.dim,
-        expert_target,
-    ) {
-        Ok(packed) => packed,
-        Err(error) => return Err(pending.rollback(gpu, error)),
-    };
+    let packed =
+        match try_load_packed_experts(hfq, gpu, p, &expert_ids, mi, config.dim, expert_target) {
+            Ok(packed) => packed,
+            Err(error) => return Err(pending.rollback(gpu, error)),
+        };
     if packed.is_none() && residency.experts_host() {
         // No packer covered this layer (uniform host packing needs an admitted
         // dtype and shared projection strides; graded packing needs one
@@ -7610,6 +7601,9 @@ mod sealed_ep_tests {
             error.message.contains("fault injection"),
             "fault stage {stage:?} fired with the injected error: {error:?}"
         );
+        // clr pins the mmap'd copy source as KFD userptr (counted by
+        // hipMemGetInfo) until munmap; unmap so only device allocations count.
+        drop(hfq);
         gpus.devices[0].drain_pool();
         gpus.devices[1].drain_pool();
         let free_after = free_vram_bytes(&gpus.devices[0]);
