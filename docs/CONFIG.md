@@ -1327,6 +1327,7 @@ daemon after changing them.
 | Exact gfx1100 / gfx1151 / gfx1201 | `kernel.gfx12_gdn_chunk_scan`, `kernel.iu4_prefill`, `kernel.verify_attn` |
 | Exact gfx1100 / gfx1151 | `kernel.gfx11_fa2_prefill`, `kernel.gfx11_producer_quant_fused`, `kernel.gfx11_lean_pbs`, `kernel.gfx11_iu4_symfold` (symmetric artifacts only) |
 | Exact gfx1201 / gfx1151 | `kernel.g12_dec_norm` |
+| Exact gfx1151 | `kernel.gfx11_a8_prefill` (symmetric MQ4V2 only; opt-in on gfx1100) |
 | Exact gfx1100 | `kernel.gfx1100_dec_norm`, `kernel.gfx11_iu4_shape` |
 
 `kernel.gfx11_a4_candidates` (default `"2"`; `"1"`, `"2"`, `"4"` or `"8"`) sets
@@ -1338,14 +1339,15 @@ gfx1100/gfx1151 IU4 producers; `"8"` restores the full-grid search.
 interior tiles use the unchecked specialization and only the final tile uses
 guarded loads and stores.
 
-`kernel.gfx11_a8_prefill` (default `false`; opt in with `true` or
-`HIPFIRE_GFX11_A8_PREFILL=1`, exact gfx1100/gfx1151 only) moves the MQ4V2
-prefill projections from IU4 W4A4 to W4A8: the fused producers emit int8
-per-128 activations and an iu8-WMMA GEMM consumes them. It applies to
-symmetric MQ4V2, eager prefill (no Redline recording or graph capture) with
-batch >= 64 and K % 256 == 0, and takes precedence over IU4 there; everything
-else stays on IU4. On qwen3.8-27b it gives about the `kernel.iu4_prefill=false`
-quality at a fraction of that route's prefill time.
+`kernel.gfx11_a8_prefill` (default `true` on exact gfx1151, opt-in with `true`
+or `HIPFIRE_GFX11_A8_PREFILL=1` on gfx1100; `false` or `=0` restores IU4
+W4A4) moves the MQ4V2 prefill projections from IU4 W4A4 to W4A8: the fused
+producers emit int8 per-128 activations and an iu8-WMMA GEMM consumes them.
+It applies to symmetric MQ4V2, eager prefill (no Redline recording or graph
+capture) with batch >= 64 and K % 256 == 0, and takes precedence over IU4
+there; everything else stays on IU4. On qwen3.8-27b it gives about the
+`kernel.iu4_prefill=false` quality (WT2 KLD 0.0394 vs 0.0695 for IU4) at
+about 0.62x the IU4 pp8192 throughput.
 
 ### Retained replay
 
@@ -1655,7 +1657,7 @@ misspelled key is unknown and fails the load with
 | `kernel.gfx1100_dec_norm` | `gfx1100_dec_norm` | `HIPFIRE_GFX1100_DEC_NORM` | stable |
 | `kernel.gfx1100_fa2_split_verify` | `gfx1100_fa2_split_verify` | `HIPFIRE_GFX1100_FA2_SPLIT_VERIFY` | experimental |
 | `kernel.gfx11_a4_candidates` | `gfx11_a4_candidates` | `HIPFIRE_GFX11_A4_CANDIDATES` | experimental |
-| `kernel.gfx11_a8_prefill` | `gfx11_a8_prefill` | `HIPFIRE_GFX11_A8_PREFILL` | experimental |
+| `kernel.gfx11_a8_prefill` | `gfx11_a8_prefill` | `HIPFIRE_GFX11_A8_PREFILL` | stable |
 | `kernel.gfx11_fa2_prefill` | `gfx11_fa2_prefill` | `HIPFIRE_GFX11_FA2_PREFILL` | stable |
 | `kernel.gfx11_iu4_gridspec` | `gfx11_iu4_gridspec` | `HIPFIRE_GFX11_IU4_GRIDSPEC` | stable |
 | `kernel.gfx11_iu4_shape` | `gfx11_iu4_shape` | `HIPFIRE_GFX11_IU4_SHAPE` | experimental |

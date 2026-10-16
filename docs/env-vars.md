@@ -760,7 +760,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1644
+**Count:** 1645
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1452,7 +1452,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GFX1151_WEIGHT_BUFFER_SIGMOID` | crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_GFX1151_XLDS` | crates/railgun-cert/src/recording.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_GFX11_A4_CANDIDATES` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
-| `HIPFIRE_GFX11_A8_PREFILL` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
+| `HIPFIRE_GFX11_A8_PREFILL` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | stable |
 | `HIPFIRE_GFX11_FA2_PREFILL` | crates/hipfire-config/src/lib.rs, crates/hipfire-dispatch/src/families/attention.rs | stable |
 | `HIPFIRE_GFX11_IU4_GRIDSPEC` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | stable |
 | `HIPFIRE_GFX11_IU4_SHAPE` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
@@ -1636,7 +1636,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_LOAD_TIMEOUT` | docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-profile-feed.py, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | harness |
 | `HIPFIRE_LOAD_TRACE` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/hipfire-arch-qwen35/src/qwen35/weights.rs | developer |
 | `HIPFIRE_LOCAL` | benchmarks/scripts/mq4v2_k5120_abba.sh, crates/hipfire-cli/src/main.rs | stable |
-| `HIPFIRE_LOCK_DIR` | crates/hipfire-cli/src/main.rs, crates/hipfire-daemon/src/gpu_lock.rs | developer |
+| `HIPFIRE_LOCK_DIR` | crates/hipfire-cli/src/doctor/probe.rs, crates/hipfire-cli/src/main.rs | developer |
 | `HIPFIRE_LOG` | crates/hipfire-daemon/src/process_init.rs | developer |
 | `HIPFIRE_LOG_FORMAT` | crates/hipfire-daemon/src/process_init.rs, scripts/check-env-docs.py | developer |
 | `HIPFIRE_LOWBIT_WMMA_WAVES` | crates/rdna-compute/src/gemm.rs | developer |
@@ -1865,7 +1865,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_PFLASH_TARGET` | scripts/pflash-gate.sh | deprecated |
 | `HIPFIRE_PING_TIMEOUT` | docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-profile-feed.py, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | harness |
 | `HIPFIRE_PINNED_XFER_DEFAULT` | crates/hip-bridge/src/ffi.rs | developer |
-| `HIPFIRE_PLE_FORMAT` | crates/hipfire-config/src/lib.rs, scripts/perf_config_receipt.py | stable |
+| `HIPFIRE_PLE_FORMAT` | crates/hipfire-arch-qwen4/examples/fn_lane_oracle.rs, crates/hipfire-arch-qwen4/examples/qwen4_parity.rs | stable |
 | `HIPFIRE_PLE_HOT_DEBUG` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/external_rows.rs | developer |
 | `HIPFIRE_PLE_HOT_PACK_FILE` | crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_PLE_HOT_RANK_FILE` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/ple_convert.rs | developer |
@@ -2010,7 +2010,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_NPU_TRUNK_CAL` | crates/hipfire-config/src/lib.rs, scripts/perf_config_receipt.py | experimental |
 | `HIPFIRE_QWEN4_NPU_TRUNK_FAMILIES` | crates/hipfire-arch-qwen4/src/npu_trunk/forward.rs | developer |
 | `HIPFIRE_QWEN4_NPU_TRUNK_FAULT_CHAIN` | crates/hipfire-arch-qwen4/src/npu_trunk/forward.rs | developer |
-| `HIPFIRE_QWEN4_NPU_TRUNK_SAMPLE_LOG` | crates/hipfire-arch-qwen4/src/npu_trunk/forward.rs | developer |
+| `HIPFIRE_QWEN4_NPU_TRUNK_SAMPLE_LOG` | crates/hipfire-arch-qwen4/src/npu_trunk/forward.rs, crates/hipfire-cli/src/doctor/calibrate.rs | developer |
 | `HIPFIRE_QWEN4_NPU_TRUNK_TRACE` | crates/hipfire-arch-qwen4/src/npu_trunk/forward.rs | developer |
 | `HIPFIRE_QWEN4_ORACLE_CACHE` | crates/hipfire-arch-qwen4/reference_oracle/generate_fixtures.py, crates/hipfire-arch-qwen4/reference_oracle/test_route_floor.py | harness |
 | `HIPFIRE_QWEN4_PENALTY_PREPASS` | crates/hipfire-arch-qwen4/src/bundle.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |

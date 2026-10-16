@@ -466,7 +466,7 @@ const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I8_GFX12_SRC: &str = concat!(
 // with the gfx11 IU4 producers' defines (the RMSNorm `_b8_gfx1151` drain/max8
 // Phase-1a, bit-identical to the plain batched one) under `_i8_gfx11`
 // symbols. Launch geometry equals the `_i8_gfx12` twins.
-const FUSED_RMSNORM_MQ_ROTATE_I8_GFX11_SRC: &str = concat!(
+pub(crate) const FUSED_RMSNORM_MQ_ROTATE_I8_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/block_i8_128_emit.hip"),
@@ -475,7 +475,7 @@ const FUSED_RMSNORM_MQ_ROTATE_I8_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_i8_gfx11\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
-const FUSED_RMSNORM_MQ_ROTATE_AWQ_I8_GFX11_SRC: &str = concat!(
+pub(crate) const FUSED_RMSNORM_MQ_ROTATE_AWQ_I8_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/block_i8_128_emit.hip"),
@@ -485,7 +485,7 @@ const FUSED_RMSNORM_MQ_ROTATE_AWQ_I8_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i8_gfx11\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
-const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I8_HIN_GFX11_SRC: &str = concat!(
+pub(crate) const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I8_HIN_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/block_i8_128_emit.hip"),
@@ -494,7 +494,7 @@ const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I8_HIN_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq_i8_hin_gfx11\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip")
 );
-const GATED_NORM_MQ_ROTATE_I8_GFX11_SRC: &str = concat!(
+pub(crate) const GATED_NORM_MQ_ROTATE_I8_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/block_i8_128_emit.hip"),
@@ -502,7 +502,7 @@ const GATED_NORM_MQ_ROTATE_I8_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_i8_gfx11\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
 );
-const GATED_NORM_MQ_ROTATE_AWQ_I8_GFX11_SRC: &str = concat!(
+pub(crate) const GATED_NORM_MQ_ROTATE_AWQ_I8_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/block_i8_128_emit.hip"),
@@ -511,7 +511,7 @@ const GATED_NORM_MQ_ROTATE_AWQ_I8_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i8_gfx11\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
 );
-const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I8_GFX11_SRC: &str = concat!(
+pub(crate) const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I8_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/block_i8_128_emit.hip"),

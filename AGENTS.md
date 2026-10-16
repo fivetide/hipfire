@@ -642,8 +642,8 @@ are the expected re-pins, including the repaired native-FP8 producer route.
 | gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | code24 | 0.029867 | `8373bc27da1fa88245b18bdb2ae90caebd275c06d1ecaf0dce1b9dc4855ca38e` |
 | gfx1100 | A4 (default), `--kv-mode q8 --kv-v q8` | WT2 | 0.069312 | `3169b09310d7598852a6eaa1f32f41aa54b531737c4d4ddd29b8dc90f546e7b2` |
 | gfx1100 | A4 (default), `--kv-mode q8 --kv-v q8` | code24 | 0.052757 | `27d837f388f3294d645b825d1cff7d1b06d219595f4459e9efc3fc4af2f93311` |
-| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8`, warm kernel cache | WT2 | 0.070054 | `2355f76cfd730cae26cdad027b3de00aeb14b0af8bb666eef934680bd14ca225` |
-| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8`, warm kernel cache | code24 | 0.050338 | `9caca85b4bf9c4049c921d85afc372ffcbb4698642313d5ce605eb1b2bb8feb0` |
+| gfx1151 | A4 (`HIPFIRE_GFX11_A8_PREFILL=0`), `--kv-mode q8 --kv-v q8`, warm kernel cache | WT2 | 0.070054 | `2355f76cfd730cae26cdad027b3de00aeb14b0af8bb666eef934680bd14ca225` |
+| gfx1151 | A4 (`HIPFIRE_GFX11_A8_PREFILL=0`), `--kv-mode q8 --kv-v q8`, warm kernel cache | code24 | 0.050338 | `9caca85b4bf9c4049c921d85afc372ffcbb4698642313d5ce605eb1b2bb8feb0` |
 
 Cold-cache gfx1151 discriminator (not pins): WT2 measured 0.070054
 (`2355f76c…`) and 0.069878 (`a2f550a9…`); code24 measured 0.050417
@@ -652,6 +652,15 @@ After one cache-populating WT2 run, both scored warm WT2 runs reproduced
 `2355f76c…`; code24 warmup and both scored warm runs reproduced `9caca85b…`.
 This ties the observed instability to the cold-JIT path; its root cause is
 not established, and empty-cache Halo determinism is not claimed.
+
+gfx1151 defaults to the W4A8 route (`kernel.gfx11_a8_prefill`) since HIPF-96;
+its ROCm 10.1 pins are still open. On HIP 7.2 (halo `rocm-merged`, warm
+cache, eval_hipfire md5 `844f6351`) it scored WT2 0.039374
+(`0bf93004ee83f6bceb4d19b48bfdf5387ced1849499eebb2bbc43954907fc48a`) and
+code24 0.027297
+(`aec8f346a21cbe3d9159dd20c2fa99413f3473d9e416cb492e4f5afb58622f23`), receipts
+in `~/mesh-validation/HIPF-96/runs/kld/dflt-*` on halo. Re-pin both rows on
+the pin toolchain and add them to `kld/VERIFY.md`.
 
 Historical HIP 7.15 pins (same row order as above): KLD
 `0.069571 / 0.052119 / 0.041859 / 0.029867 / 0.068687 / 0.052666 / 0.068955 / 0.051358`;

@@ -3000,10 +3000,10 @@ pub static FIELDS: &[ConfigField] = &[
         "kernel.gfx11_a8_prefill",
         "gfx11_a8_prefill",
         Kernel,
-        false,
         true,
+        false,
         "HIPFIRE_GFX11_A8_PREFILL",
-        "Opt in to the W4A8 MQ4V2 prefill route on exact gfx1100/gfx1151 (symmetric MQ4V2, eager, batch >= 64, K % 256 == 0): int8 per-128 activations from the fused producers and an iu8-WMMA GEMM, about the IU4-off quality at a fraction of its time. Default off (IU4 W4A4 stays the default); other architectures ignore it."
+        "W4A8 MQ4V2 prefill on gfx11 (symmetric MQ4V2, eager, batch >= 64, K % 256 == 0): int8 per-128 activations from the fused producers and an iu8-WMMA GEMM instead of IU4 W4A4 (about the IU4-off quality). Default on for exact gfx1151; opt-in on gfx1100; set to false or HIPFIRE_GFX11_A8_PREFILL=0 to restore IU4 W4A4. Other architectures ignore it."
     ),
     process_bool_field!(
         "kernel.npu_spillover",

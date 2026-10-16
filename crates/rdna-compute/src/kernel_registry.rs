@@ -533,6 +533,23 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("gemv_mq4g256v2_mq4v2", kernels::GEMV_MQ4G256V2_SRC, ["gemv_mq4g256v2"]);
         add!("gemv_mq4g256v2_residual_row_serial_gfx1151", kernels::GEMV_MQ4G256V2_RESIDUAL_ROW_SERIAL_GFX1151_SRC, ["gemv_mq4g256v2_residual_row_serial_gfx1151"]);
         add!("qwen35_fa_prep_batched_gfx1151", crate::qwen35_fa_batch::FA_PREP_BATCHED_GFX1151_SRC, ["qwen35_fa_prep_batched_gfx1151"]);
+        // Default-on `kernel.gfx11_a8_prefill`: the A8 GEMM (both tile builds;
+        // the 128 build also carries the standalone quantizer) and the four
+        // `_i8_gfx11` producers.
+        add!("gemm_mq4g256v2_residual_mmq_i8_gfx11", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX11_SRC, [
+            "gemm_mq4g256v2_gate_up_silu_mmq_i8", "gemm_mq4g256v2_residual_mmq_i8_full_add",
+            "gemm_mq4g256v2_residual_mmq_i8_full_set", "quantize_int8_mmq_ds128",
+        ]);
+        add!("gemm_mq4g256v2_residual_mmq_i8_gfx11_t256", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX11_T256_SRC, [
+            "gemm_mq4g256v2_gate_up_silu_mmq_i8_t256", "gemm_mq4g256v2_residual_mmq_i8_full_add_t256",
+            "gemm_mq4g256v2_residual_mmq_i8_full_set_t256", "quantize_int8_mmq_ds128",
+        ]);
+        add!("fused_rmsnorm_mq_rotate_i8_gfx11", crate::gemv::FUSED_RMSNORM_MQ_ROTATE_I8_GFX11_SRC, ["fused_rmsnorm_mq_rotate_i8_gfx11"]);
+        add!("fused_rmsnorm_mq_rotate_awq_i8_gfx11", crate::gemv::FUSED_RMSNORM_MQ_ROTATE_AWQ_I8_GFX11_SRC, ["fused_rmsnorm_mq_rotate_awq_i8_gfx11"]);
+        add!("fused_silu_mul_mq_rotate_awq_i8_hin_gfx11", crate::gemv::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I8_HIN_GFX11_SRC, ["fused_silu_mul_mq_rotate_awq_i8_hin_gfx11"]);
+        add!("gated_norm_mq_rotate_i8_gfx11", crate::gemv::GATED_NORM_MQ_ROTATE_I8_GFX11_SRC, ["gated_norm_mq_rotate_i8_gfx11"]);
+        add!("gated_norm_mq_rotate_awq_i8_gfx11", crate::gemv::GATED_NORM_MQ_ROTATE_AWQ_I8_GFX11_SRC, ["gated_norm_mq_rotate_awq_i8_gfx11"]);
+        add!("sigmoid_mul_rotate_x_mq_awq_i8_gfx11", crate::gemv::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I8_GFX11_SRC, ["sigmoid_mul_rotate_x_mq_awq_i8_gfx11"]);
         // Exact-gfx1151 Qwen4 decode MoE head (HIPFIRE_QWEN4_DECODE_HEAD_FUSE; =0 keeps the x4 + Q8_0 pair launches).
         add!("qwen4_decode_head_fuse", kernels::QWEN4_DECODE_HEAD_FUSE_SRC, ["gemv_bf16_xf32_x2_q8_0_k2560_staged_pair"]);
         // Exact-gfx1151 derived BF16 mirror of the F32 pooled index keys (HIPFIRE_QWEN4_QSA_POOLED_BF16, default off).
