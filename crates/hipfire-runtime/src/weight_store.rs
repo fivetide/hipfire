@@ -16,7 +16,7 @@
 //! `WeightStoreAssembly::take` transfers a resident handle to the owner that is
 //! assembling typed weights, and therefore removes the cell from the store's
 //! cleanup set.
-use crate::device_mesh::{DeviceMesh, MeshEpoch};
+use crate::device_mesh::{DeviceMesh, DimKind, MeshEpoch};
 use crate::mesh_placement::BandPlacement;
 use crate::model_source::{SourceFormat, SourcePayload, SourceRangeDescriptor};
 use crate::tp_shard::ExpertAssign;
@@ -814,7 +814,7 @@ fn next_range_chunk(offset: usize, total_len: usize, alignment: usize) -> usize 
     (total_len - offset).min(max_chunk)
 }
 
-fn source_dtype(dtype: &str) -> Result<DType, String> {
+pub(crate) fn source_dtype(dtype: &str) -> Result<DType, String> {
     let normalized = dtype.trim().to_ascii_uppercase();
     let parsed = match normalized.as_str() {
         "F32" | "FLOAT32" => DType::F32,
@@ -1481,17 +1481,12 @@ fn validate_external_range(
     Ok(())
 }
 
-/// One rank of an expert-parallel fulfillment. Entries declared
-/// [`ShardPolicy::ExpertSharded`] with `Stride` assignment are uploaded
-/// compactly: rank `r` of `ranks` keeps experts `e % ranks == r` in ascending
-/// `e` (local index `e / ranks`), so the uploaded tensor is
-/// `[ep_local_expert_count(n_experts, rank, ranks), ..]` (an uneven split gives
-/// the low ranks one more expert) and byte-identical per expert to the source.
-/// Every other entry is fulfilled exactly as on a single device.
+/// One rank's share of an expert-parallel fulfillment (see
+/// [`fulfill_manifest_from_payloads`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct EpFulfill {
-    pub rank: usize,
-    pub ranks: usize,
+struct EpFulfill {
+    rank: usize,
+    ranks: usize,
 }
 
 /// Experts rank `rank` of `ranks` owns under `Stride` assignment
@@ -1634,7 +1629,19 @@ fn checked_expert_payload(
     Ok(dtype)
 }
 
-/// Fulfill a Single manifest from the canonical source payload seam.
+/// Fulfill a manifest on one device from the canonical source payload seam.
+///
+/// `mesh` is the single-device mesh or a pure expert-parallel mesh (an `Ep`
+/// axis only), of which this call fulfills logical rank
+/// `expected.logical_rank()`. Every EP rank holds the whole manifest, except
+/// that each [`ShardPolicy::ExpertSharded`] stack uploads only the rank's
+/// owned experts compactly: under `Stride` assignment rank `r` of `ranks`
+/// keeps experts `e % ranks == r` in ascending `e` (local index `e / ranks`),
+/// so the tensor is `[ep_local_expert_count(n_experts, r, ranks), ..]` and
+/// byte-identical per expert to the source; its projection is
+/// `ExpertCompact` with `rank`/`ranks`. The store's origin is the rank's
+/// identity in `mesh` (epoch, logical rank, physical device), so every rank
+/// of one load carries the same mesh epoch.
 ///
 /// Small tensors may be borrowed from a source mmap or owned by the callback.
 /// Large tensors use a checked [`SourceRangeDescriptor`], which is uploaded
@@ -1651,31 +1658,20 @@ pub fn fulfill_manifest_from_payloads<'a, F>(
 where
     F: Fn(&WeightEntry) -> Result<SourcePayload<'a>, String>,
 {
-    fulfill_manifest_from_payloads_ep(weights, mesh, n_layers, gpu, expected, None, source)
-}
-
-/// [`fulfill_manifest_from_payloads`] for one rank of an expert-parallel
-/// mesh: with `ep` set, every [`ShardPolicy::ExpertSharded`] entry uploads its
-/// owned experts compactly (see [`EpFulfill`]) and records an
-/// `ExpertCompact` projection carrying `rank`/`ranks`. `ep == None` is the
-/// single-device path, unchanged.
-#[allow(clippy::too_many_arguments)]
-pub fn fulfill_manifest_from_payloads_ep<'a, F>(
-    weights: &[WeightEntry],
-    mesh: &DeviceMesh,
-    n_layers: usize,
-    gpu: &mut Gpu,
-    expected: WeightOrigin,
-    ep: Option<EpFulfill>,
-    source: F,
-) -> Result<WeightLoadTransaction, FulfillError>
-where
-    F: Fn(&WeightEntry) -> Result<SourcePayload<'a>, String>,
-{
-    if let Some(error) = target_error(mesh) {
+    // An EP rank places the manifest as one device does; only the expert
+    // stacks are cut to the rank's share.
+    let single = DeviceMesh::default();
+    let ep = (mesh.n_devices() > 1 && mesh.size_of(DimKind::Ep) == mesh.n_devices()).then(|| {
+        EpFulfill {
+            rank: expected.logical_rank(),
+            ranks: mesh.n_devices(),
+        }
+    });
+    let view = if ep.is_some() { &single } else { mesh };
+    if let Some(error) = target_error(view) {
         return Err(error);
     }
-    if let Err(reason) = validate_fulfillment_manifest(weights, mesh, n_layers) {
+    if let Err(reason) = validate_fulfillment_manifest(weights, view, n_layers) {
         return Err(FulfillError {
             name: "<manifest>".to_string(),
             layer: None,
@@ -1684,19 +1680,22 @@ where
         });
     }
 
-    let origin = WeightOrigin::for_single(mesh, gpu);
-    if origin != expected {
+    let rank = ep.map_or(0, |ep| ep.rank);
+    let origin = WeightOrigin::from_parts(mesh.epoch(), rank, gpu.device_id);
+    if origin != expected || ep.is_some_and(|ep| ep.rank >= ep.ranks) {
         return Err(FulfillError {
             name: "<origin>".to_string(),
             layer: None,
             device: 0,
             reason: format!(
-                "admitted target identity {expected:?} does not match runtime mesh/GPU {origin:?}; refusing before upload"
+                "admitted target identity {expected:?} does not match runtime mesh/GPU {origin:?} \
+                 ({} logical devices); refusing before upload",
+                mesh.n_devices()
             ),
         });
     }
 
-    let placement = BandPlacement::uniform(mesh, n_layers).map_err(|reason| FulfillError {
+    let placement = BandPlacement::uniform(view, n_layers).map_err(|reason| FulfillError {
         name: "<manifest>".to_string(),
         layer: None,
         device: 0,
@@ -1704,7 +1703,7 @@ where
     })?;
     let mut store = WeightStore::with_origin(origin);
     for entry in weights {
-        let devices = placement_devices(entry, mesh, &placement);
+        let devices = placement_devices(entry, view, &placement);
         if devices.as_slice() != [0] {
             return Err(rollback_fulfill_error(
                 store,
@@ -2816,6 +2815,36 @@ mod tests {
         assert!(error.reason.contains("refusing before upload"));
         assert_eq!(test_support::resident_allocations(), 0);
         assert_eq!(test_support::resident_releases(), 0);
+        test_support::reset();
+    }
+    #[test]
+    fn expert_parallel_rank_refuses_a_foreign_epoch_or_rank_before_any_upload() {
+        let Ok(mut gpu) = Gpu::init() else {
+            return;
+        };
+        test_support::reset();
+        let mesh = DeviceMesh::rect(&[(DimKind::Ep, 2)]).unwrap();
+        let other = DeviceMesh::rect(&[(DimKind::Ep, 2)]).unwrap();
+        let entries = vec![WeightEntry::model(
+            "w",
+            vec![1],
+            DType::F32,
+            ShardPolicy::Replicate,
+        )];
+        // Another mesh epoch, then a rank outside the mesh: both refuse before
+        // the first source read.
+        for expected in [
+            WeightOrigin::from_parts(other.epoch(), 1, gpu.device_id),
+            WeightOrigin::from_parts(mesh.epoch(), 2, gpu.device_id),
+        ] {
+            let error =
+                fulfill_manifest_from_payloads(&entries, &mesh, 1, &mut gpu, expected, |_| {
+                    panic!("source must not run after an admitted-identity mismatch")
+                })
+                .unwrap_err();
+            assert_eq!(error.name, "<origin>", "{expected:?}");
+        }
+        assert_eq!(test_support::resident_allocations(), 0);
         test_support::reset();
     }
     #[test]
