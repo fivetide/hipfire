@@ -361,6 +361,62 @@ impl Metrics {
                 escape_label(model)
             ));
         }
+        // Multi-slot only, from the latest `done.engine_stats`: absent on the
+        // standard route rather than a 0 that reads as an empty pool. Updated
+        // when a request finishes, not during a long generation.
+        if let Some(s) = &meta.engine_stats {
+            // A non-paged engine has no page pool to report.
+            if s.pool_total_pages > 0 {
+                gauge(
+                    &mut out,
+                    "hipfire_kv_pages_free",
+                    "Free KV pages in the multi-slot page pool, at the last step of the latest finished request.",
+                    s.pool_free_pages as f64,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kv_pages_total",
+                    "KV pages in the multi-slot page pool.",
+                    s.pool_total_pages as f64,
+                );
+            }
+            gauge(
+                &mut out,
+                "hipfire_slots_active",
+                "Multi-slot slots still holding a request when the latest request finished.",
+                s.active_slots as f64,
+            );
+            gauge(
+                &mut out,
+                "hipfire_slots_total",
+                "Multi-slot engine slots.",
+                s.total_slots as f64,
+            );
+            counter(
+                &mut out,
+                "hipfire_evictions_total",
+                "Idle multi-slot sessions parked to host swap to free a slot or KV pages.",
+                s.evictions as u64,
+            );
+            counter(
+                &mut out,
+                "hipfire_restores_total",
+                "Parked multi-slot sessions restored to a slot from host swap.",
+                s.restores as u64,
+            );
+            counter(
+                &mut out,
+                "hipfire_prefix_hits_total",
+                "Multi-slot continuations served from a session's resident KV.",
+                s.prefix_hits as u64,
+            );
+            counter(
+                &mut out,
+                "hipfire_prefix_reused_tokens_total",
+                "Prompt tokens reused from the multi-slot cross-session prefix cache.",
+                s.reused_tokens as u64,
+            );
+        }
 
         self.ttft_ms.render(
             &mut out,
@@ -620,5 +676,55 @@ mod tests {
         let idle = m.render(&ServeMeta::new("t".to_owned()), 0, 16);
         assert!(!idle.contains("hipfire_model_info{"), "{idle}");
         assert!(idle.contains("hipfire_engine_up 1\n"), "{idle}");
+    }
+
+    #[test]
+    fn engine_stats_export_only_when_the_daemon_sent_them() {
+        use hipfire_runtime::serve::EngineStats;
+        let m = Metrics::default();
+        // The wire object is the serde form of `EngineStats`.
+        let wire = serde_json::json!({
+            "admitted": 5, "rejected": 1, "evictions": 2, "restores": 1,
+            "prefix_hits": 3, "reused_tokens": 640, "pool_free_pages": 90,
+            "pool_total_pages": 128, "active_slots": 1, "total_slots": 4,
+        });
+        let meta = ServeMeta {
+            engine_stats: Some(serde_json::from_value(wire).unwrap()),
+            ..ServeMeta::new("t".to_owned())
+        };
+        let out = m.render(&meta, 0, 16);
+        for sample in [
+            "hipfire_kv_pages_free 90\n",
+            "hipfire_kv_pages_total 128\n",
+            "hipfire_slots_active 1\n",
+            "hipfire_slots_total 4\n",
+            "# TYPE hipfire_evictions_total counter\nhipfire_evictions_total 2\n",
+            "hipfire_restores_total 1\n",
+            "hipfire_prefix_hits_total 3\n",
+            "hipfire_prefix_reused_tokens_total 640\n",
+        ] {
+            assert!(out.contains(sample), "{sample}: {out}");
+        }
+        // Standard route: no snapshot, no series (not zeros).
+        let standard = m.render(&ServeMeta::new("t".to_owned()), 0, 16);
+        for name in [
+            "hipfire_kv_pages",
+            "hipfire_slots_",
+            "hipfire_evictions",
+            "hipfire_prefix_",
+        ] {
+            assert!(!standard.contains(name), "{name}: {standard}");
+        }
+        // A non-paged engine has slots but no page pool.
+        let unpaged = ServeMeta {
+            engine_stats: Some(EngineStats {
+                total_slots: 2,
+                ..EngineStats::default()
+            }),
+            ..ServeMeta::new("t".to_owned())
+        };
+        let out = m.render(&unpaged, 0, 16);
+        assert!(out.contains("hipfire_slots_total 2\n"), "{out}");
+        assert!(!out.contains("hipfire_kv_pages"), "{out}");
     }
 }

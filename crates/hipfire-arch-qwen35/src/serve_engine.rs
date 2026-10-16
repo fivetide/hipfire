@@ -3254,6 +3254,7 @@ fn commit_sampled_token(
     rig: &mut Rig,
     slots: &mut [Option<InFlight>],
     work: &mut [PendingWork],
+    stats: &Mutex<EngineStats>,
     s: usize,
     tok: u32,
 ) {
@@ -3308,6 +3309,7 @@ fn commit_sampled_token(
         // the generated JSON is incomplete/invalid — emit a typed rejection
         // instead of a successful done (spec §7.1 G1, A17). ClientGone is
         // never overridden: the receiver is already dropped.
+        lock_stats(stats).note_slot_released();
         if grammar_incomplete && !matches!(reason, DoneReason::ClientGone) {
             let _ = send_event(
                 &f.reply,
@@ -3805,7 +3807,7 @@ fn run_loop(
                 stats
                     .lock()
                     .expect("stats")
-                    .note_pool_free_pages(pp.free_pages());
+                    .note_pool_pages(pp.free_pages(), pp.n_pages());
             }
             // Expire timed-out waiters → typed queue timeout rejection. The
             // deadline is WALL-CLOCK (`serve.queue_timeout_ms` against the
@@ -3899,6 +3901,10 @@ fn run_loop(
                 }
                 continue;
             }
+            // Slot occupancy for this step, after admission. Each terminal
+            // below releases its slot in the stats BEFORE posting its event,
+            // so the snapshot a `done` reads counts only slots still busy.
+            lock_stats(&stats).note_slots(slots.iter().flatten().count(), n);
 
             let image_pad_id = rig.tokenizer.special_token_id("<|image_pad|>");
             for s in 0..n {
@@ -3925,7 +3931,9 @@ fn run_loop(
                     pad,
                     grammar,
                 ) {
-                    Ok(tok) => commit_sampled_token(&mut rig, &mut slots, &mut work, s, tok),
+                    Ok(tok) => {
+                        commit_sampled_token(&mut rig, &mut slots, &mut work, &stats, s, tok)
+                    }
                     Err(reason) => {
                         if let Some(mut f) = slots[s].take() {
                             let _ = send_event(
@@ -5172,7 +5180,9 @@ fn run_loop(
                     match accept_outcome {
                         Ok(tokens) => {
                             for tok in &tokens {
-                                commit_sampled_token(&mut rig, &mut slots, &mut work, s, *tok);
+                                commit_sampled_token(
+                                    &mut rig, &mut slots, &mut work, &stats, s, *tok,
+                                );
                                 if slots[s].is_none() {
                                     break;
                                 }
@@ -5288,7 +5298,9 @@ fn run_loop(
                                 if crate::mtp_spec::mtp_trace_enabled() {
                                     eprintln!("[mtp-trace] prefill done seed={seed}");
                                 }
-                                commit_sampled_token(&mut rig, &mut slots, &mut work, s, seed);
+                                commit_sampled_token(
+                                    &mut rig, &mut slots, &mut work, &stats, s, seed,
+                                );
                             }
                         }
                         Err(reason) => {
@@ -5332,7 +5344,7 @@ fn run_loop(
                 if let Some(forced) = jump_forced[s].take() {
                     if !forced.token_ids.is_empty() {
                         for &tok in &forced.token_ids {
-                            commit_sampled_token(&mut rig, &mut slots, &mut work, s, tok);
+                            commit_sampled_token(&mut rig, &mut slots, &mut work, &stats, s, tok);
                             if slots[s].is_none() {
                                 break;
                             }
@@ -5403,6 +5415,7 @@ fn run_loop(
                     // a typed rejection instead of a successful done (spec §7.1
                     // G1, A17). ClientGone is never overridden: the receiver is
                     // already dropped.
+                    lock_stats(&stats).note_slot_released();
                     if grammar_incomplete && !matches!(reason, DoneReason::ClientGone) {
                         let _ = send_event(
                             &f.reply,

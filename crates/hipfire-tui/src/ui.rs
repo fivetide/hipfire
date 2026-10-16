@@ -409,9 +409,14 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
+    // One extra line for the multi-slot engine row, only when serve exports it.
+    let card_height = match &app.live_metrics {
+        MetricsView::Live(m) if m.engine.is_some() => 9,
+        _ => 8,
+    };
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(8)])
+        .constraints([Constraint::Min(8), Constraint::Length(card_height)])
         .split(pad(area, 1, 0));
     draw_live_metrics(frame, app, rows[1]);
     let cols = Layout::default()
@@ -666,7 +671,7 @@ fn draw_live_metrics(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(tau) = m.tau {
         extra.push(format!("tau {tau:.2}"));
     }
-    let lines = vec![
+    let mut lines = vec![
         Line::from(quantiles("TTFT", m.ttft_ms)),
         Line::from(quantiles("TPOT", m.tpot_ms)),
         Line::from(Span::styled(
@@ -682,6 +687,17 @@ fn draw_live_metrics(frame: &mut Frame, app: &App, area: Rect) {
         )),
         Line::from(Span::styled(extra.join(" · "), Style::default().fg(MUTED))),
     ];
+    if let Some(e) = &m.engine {
+        let mut row = vec![format!("slots {:.0}/{:.0}", e.slots_active, e.slots_total)];
+        if let Some((free, total)) = e.kv_pages {
+            row.push(format!("KV free {free:.0}/{total:.0} pages"));
+        }
+        row.push(format!(
+            "evict {:.0} · restore {:.0} · prefix hits {:.0}",
+            e.evictions, e.restores, e.prefix_hits
+        ));
+        lines.push(Line::from(row.join(" · ")));
+    }
     frame.render_widget(Paragraph::new(lines), rows[2]);
 }
 
@@ -1640,7 +1656,7 @@ mod render_tests {
 
     #[test]
     fn live_metrics_card_states() {
-        use crate::hipfire::metrics::{LiveMetrics, MetricsView};
+        use crate::hipfire::metrics::{EngineRow, LiveMetrics, MetricsView};
         let live = MetricsView::Live(LiveMetrics {
             window_s: 180.0,
             req_s: 0.33,
@@ -1653,6 +1669,7 @@ mod render_tests {
             tau: Some(3.0),
             tok_s_series: (0..119).collect(),
             req_s_series: vec![0; 119],
+            engine: None,
         });
         let text = render_metrics(live.clone(), 110);
         assert!(text.contains("Live metrics"));
@@ -1660,8 +1677,29 @@ mod render_tests {
         assert!(text.contains("TTFT  p50 62 ms · p95 100 ms"));
         assert!(text.contains("TPOT  —"));
         assert!(text.contains("cache hit 50% · 3m 0s window · tau 3.00"));
+        assert!(
+            !text.contains("slots "),
+            "standard route shows no engine row"
+        );
         // Narrow terminal: rows truncate instead of panicking or reflowing.
-        assert!(render_metrics(live, 40).contains("tok/s     47.2"));
+        assert!(render_metrics(live.clone(), 40).contains("tok/s     47.2"));
+        let MetricsView::Live(mut multi) = live else {
+            unreachable!()
+        };
+        multi.engine = Some(EngineRow {
+            slots_active: 1.0,
+            slots_total: 4.0,
+            kv_pages: Some((90.0, 128.0)),
+            evictions: 2.0,
+            restores: 1.0,
+            prefix_hits: 3.0,
+        });
+        let text = render_metrics(MetricsView::Live(multi), 110);
+        assert!(
+            text.contains("slots 1/4 · KV free 90/128 pages · evict 2 · restore 1 · prefix hits 3")
+        );
+        // The engine row is extra: the existing rows stay visible.
+        assert!(text.contains("cache hit 50% · 3m 0s window · tau 3.00"));
         assert!(render_metrics(MetricsView::Collecting, 110).contains("collecting…"));
         assert!(render_metrics(MetricsView::Unavailable, 110)
             .contains("metrics unavailable (older serve)"));

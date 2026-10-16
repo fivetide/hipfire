@@ -2725,6 +2725,9 @@ pub(crate) fn complete_request_attempt(
         first_token_at.get().map(|d| d.as_secs_f64() * 1000.0),
         attempt_started.elapsed().as_secs_f64() * 1000.0,
     );
+    if let Some(stats) = done.get("engine_stats") {
+        meta.engine_stats = serde_json::from_value(stats.clone()).ok();
+    }
     meta.last_activity = Instant::now();
 
     if let Some(completion) = committed {

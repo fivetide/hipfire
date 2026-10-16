@@ -104,6 +104,22 @@ pub struct LiveMetrics {
     pub tok_s_series: Vec<u64>,
     /// Per-scrape-interval req/s × 1000, oldest first (Sparkline input).
     pub req_s_series: Vec<u64>,
+    /// Multi-slot engine state from the newest scrape; `None` when serve does
+    /// not export it (standard route).
+    pub engine: Option<EngineRow>,
+}
+
+/// Latest multi-slot engine snapshot. Counters are totals since the engine
+/// loaded; serve refreshes all of it when a request finishes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EngineRow {
+    pub slots_active: f64,
+    pub slots_total: f64,
+    /// `(free, total)` KV pages; `None` for a non-paged engine.
+    pub kv_pages: Option<(f64, f64)>,
+    pub evictions: f64,
+    pub restores: f64,
+    pub prefix_hits: f64,
 }
 
 #[derive(Debug, Default)]
@@ -160,6 +176,7 @@ impl MetricsRing {
             tau: (tau_count > 0.0).then(|| d("hipfire_spec_tau_sum") / tau_count),
             tok_s_series: self.series(COMPLETION, 1.0),
             req_s_series: self.series(REQUESTS, 1000.0),
+            engine: engine_row(b),
         })
     }
 
@@ -181,6 +198,18 @@ impl MetricsRing {
 
 fn delta(a: &Scrape, b: &Scrape, key: &str) -> f64 {
     b.values.get(key).unwrap_or(&0.0) - a.values.get(key).unwrap_or(&0.0)
+}
+
+fn engine_row(s: &Scrape) -> Option<EngineRow> {
+    let v = |k: &str| s.values.get(k).copied();
+    Some(EngineRow {
+        slots_total: v("hipfire_slots_total")?,
+        slots_active: v("hipfire_slots_active").unwrap_or(0.0),
+        kv_pages: v("hipfire_kv_pages_free").zip(v("hipfire_kv_pages_total")),
+        evictions: v("hipfire_evictions_total").unwrap_or(0.0),
+        restores: v("hipfire_restores_total").unwrap_or(0.0),
+        prefix_hits: v("hipfire_prefix_hits_total").unwrap_or(0.0),
+    })
 }
 
 fn restarted(prev: &Scrape, next: &Scrape) -> bool {
@@ -302,6 +331,38 @@ mod tests {
         assert_eq!(m.tok_s_series, vec![0, 300]);
         assert_eq!(m.req_s_series, vec![0, 1500]);
         assert_eq!(m.ttft_ms, None, "no histogram in window");
+        assert_eq!(m.engine, None, "standard route exports no engine series");
+    }
+
+    #[test]
+    fn engine_row_comes_from_the_newest_scrape() {
+        let t0 = Instant::now();
+        let mut ring = MetricsRing::default();
+        let engine = |active, evictions| {
+            format!(
+                "hipfire_slots_active {active}\nhipfire_slots_total 4\n\
+                 hipfire_kv_pages_free 90\nhipfire_kv_pages_total 128\n\
+                 hipfire_evictions_total {evictions}\nhipfire_restores_total 1\n\
+                 hipfire_prefix_hits_total 3\n"
+            )
+        };
+        view_after(&mut ring, t0, &engine(2, 0));
+        let m = live(view_after(
+            &mut ring,
+            t0 + Duration::from_secs(1),
+            &engine(1, 2),
+        ));
+        assert_eq!(
+            m.engine,
+            Some(EngineRow {
+                slots_active: 1.0,
+                slots_total: 4.0,
+                kv_pages: Some((90.0, 128.0)),
+                evictions: 2.0,
+                restores: 1.0,
+                prefix_hits: 3.0,
+            })
+        );
     }
 
     #[test]

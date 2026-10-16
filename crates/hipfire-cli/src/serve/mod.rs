@@ -81,6 +81,10 @@ pub(crate) struct ServeMeta {
     /// published state, not working state, and `/v1/models` may not need the
     /// runtime lock to serve an entry.
     pub(crate) loaded: LoadedInfo,
+    /// Latest multi-slot `done.engine_stats` snapshot, for `/metrics`. `None`
+    /// on the standard route, where the daemon sends none; cleared with
+    /// `current_model` so a model switch never shows the previous engine.
+    pub(crate) engine_stats: Option<hipfire_runtime::serve::EngineStats>,
 }
 
 impl ServeMeta {
@@ -99,6 +103,7 @@ impl ServeMeta {
             engine_state: EngineState::Up,
             n_ctx: 0,
             loaded: LoadedInfo::default(),
+            engine_stats: None,
         }
     }
 }
@@ -2339,6 +2344,7 @@ impl ServeRuntime {
             meta.current_model = Some(served_name);
             meta.n_ctx = self.current_max_seq;
             meta.loaded = published;
+            meta.engine_stats = None;
         }
         Ok(resolved)
     }
@@ -2403,6 +2409,7 @@ impl ServeRuntime {
         let mut loaded = LoadedInfo::default();
         loaded.reasoning_contract = "unsupported".to_owned();
         meta.loaded = loaded;
+        meta.engine_stats = None;
     }
 
     /// Replace a daemon that exited: reap it (freeing its GPU memory), then

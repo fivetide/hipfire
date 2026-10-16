@@ -376,6 +376,24 @@ TTFT, latency and TPOT are measured at the gateway.
 Buckets: TTFT and latency `10 … 60000` ms; TPOT `2 … 500` ms; throughput
 `1 … 5000` tok/s.
 
+Multi-slot serve (`serve.multi_slot`) attaches the engine's counters to every
+`done` event as `engine_stats`, and serve exports the latest snapshot. The
+values change when a request finishes, not during a long generation. Free
+pages are sampled at the start of that request's last engine step; active
+slots exclude the finishing request, so an idle engine reads 0. The standard
+route sends no snapshot, so these series are absent there (never 0); a model
+switch clears them until the new model finishes a request.
+
+| Series | Type | Meaning |
+|---|---|---|
+| `hipfire_kv_pages_free`, `hipfire_kv_pages_total` | gauge | Free and total pages in the KV page pool (absent when the engine is not paged) |
+| `hipfire_slots_active`, `hipfire_slots_total` | gauge | Slots holding a request; engine slots |
+| `hipfire_evictions_total`, `hipfire_restores_total` | counter | Idle sessions parked to host swap; parked sessions restored to a slot |
+| `hipfire_prefix_hits_total` | counter | Continuations served from a session's resident KV |
+| `hipfire_prefix_reused_tokens_total` | counter | Prompt tokens reused from the cross-session prefix cache |
+
+The engine counters start at 0 when the model loads.
+
 ### `POST /v1/chat/completions`
 
 ```bash

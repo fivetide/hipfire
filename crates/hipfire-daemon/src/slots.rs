@@ -1682,6 +1682,9 @@ impl SlotBackend {
             "cached_tokens": cached_tokens,
             "prefill_tokens": prefill_tokens,
             "tok_s": (tok_s * 10.0).round() / 10.0,
+            // Pushed on every done because a polled stats request would queue
+            // behind generation; the gateway exports the latest snapshot.
+            "engine_stats": self.engine.stats(),
         });
         stage_terminal_tool_calls(&mut pending_done, finish_reason, &terminal_tool_calls);
 

@@ -203,7 +203,9 @@ pub fn send_event(tx: &Sender<Event>, e: Event) -> Result<(), String> {
         .map_err(|_| "client receiver dropped".to_string())
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Serialized as the `engine_stats` object of every multi-slot `done` event;
+/// the serve gateway exports it on `/metrics`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EngineStats {
     pub admitted: usize,
     pub rejected: usize,
@@ -222,6 +224,13 @@ pub struct EngineStats {
     /// telemetry). A monotonic decline across identical request cycles is
     /// the page-level leak signature the oracle asserts against.
     pub pool_free_pages: usize,
+    /// Physical KV pages in the pool; 0 when the engine is not paged.
+    pub pool_total_pages: usize,
+    /// Slots holding a request, out of `total_slots`: sampled before each
+    /// engine step and decremented as each request finishes, before its
+    /// terminal event, so a `done` snapshot counts only the slots still busy.
+    pub active_slots: usize,
+    pub total_slots: usize,
 }
 
 impl EngineStats {
@@ -244,8 +253,16 @@ impl EngineStats {
     pub fn note_prefix_hit(&mut self) {
         self.prefix_hits += 1;
     }
-    pub fn note_pool_free_pages(&mut self, n: usize) {
-        self.pool_free_pages = n;
+    pub fn note_pool_pages(&mut self, free: usize, total: usize) {
+        self.pool_free_pages = free;
+        self.pool_total_pages = total;
+    }
+    pub fn note_slots(&mut self, active: usize, total: usize) {
+        self.active_slots = active;
+        self.total_slots = total;
+    }
+    pub fn note_slot_released(&mut self) {
+        self.active_slots = self.active_slots.saturating_sub(1);
     }
 }
 
