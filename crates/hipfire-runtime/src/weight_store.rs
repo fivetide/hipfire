@@ -1510,6 +1510,30 @@ pub fn compact_owned_experts(
     ranks: usize,
     assign: ExpertAssign,
 ) -> Result<Vec<u8>, String> {
+    compact_owned_expert_spans(
+        bytes.len(),
+        n_experts,
+        rank,
+        ranks,
+        assign,
+        |offset, dst| {
+            dst.copy_from_slice(&bytes[offset..offset + dst.len()]);
+            Ok(())
+        },
+    )
+}
+
+/// [`compact_owned_experts`] over a payload of `len` bytes that `read(offset,
+/// dst)` fills span by span, so a source range is read only for the owned
+/// experts.
+fn compact_owned_expert_spans(
+    len: usize,
+    n_experts: usize,
+    rank: usize,
+    ranks: usize,
+    assign: ExpertAssign,
+    mut read: impl FnMut(usize, &mut [u8]) -> Result<(), String>,
+) -> Result<Vec<u8>, String> {
     if assign != ExpertAssign::Stride {
         return Err(format!("compact expert upload supports Stride assignment, got {assign:?}"));
     }
@@ -1519,17 +1543,18 @@ pub fn compact_owned_experts(
     if n_experts < ranks {
         return Err(format!("{n_experts} experts cannot cover {ranks} ranks"));
     }
-    if bytes.is_empty() || bytes.len() % n_experts != 0 {
+    if len == 0 || len % n_experts != 0 {
         return Err(format!(
-            "{} payload bytes do not split into {n_experts} equal experts",
-            bytes.len()
+            "{len} payload bytes do not split into {n_experts} equal experts"
         ));
     }
-    let per_expert = bytes.len() / n_experts;
-    let mut compact =
-        Vec::with_capacity(per_expert * ep_local_expert_count(n_experts, rank, ranks));
-    for expert in (rank..n_experts).step_by(ranks) {
-        compact.extend_from_slice(&bytes[expert * per_expert..(expert + 1) * per_expert]);
+    let per_expert = len / n_experts;
+    let mut compact = vec![0u8; per_expert * ep_local_expert_count(n_experts, rank, ranks)];
+    for (slot, expert) in (rank..n_experts).step_by(ranks).enumerate() {
+        read(
+            expert * per_expert,
+            &mut compact[slot * per_expert..(slot + 1) * per_expert],
+        )?;
     }
     Ok(compact)
 }
@@ -1547,32 +1572,66 @@ fn upload_expert_compact(
     assign: ExpertAssign,
     payload: SourcePayload<'_>,
 ) -> Result<(GpuTensor, DType), String> {
-    let (info, bytes): (&crate::model_source::TensorInfo, &[u8]) = match &payload {
-        SourcePayload::Borrowed { info, bytes } => (info, bytes),
-        SourcePayload::Owned { info, bytes } => (info, bytes.as_slice()),
-        SourcePayload::Range(_) => {
-            return Err(
-                "expert-parallel expert stacks need a borrowed or owned payload, not a source range"
-                    .to_string(),
-            );
+    let compact_of =
+        |bytes: &[u8]| compact_owned_experts(bytes, n_experts, ep.rank, ep.ranks, assign);
+    let (dtype, compact) = match &payload {
+        SourcePayload::Borrowed { info, bytes } => (
+            checked_expert_payload(entry, &info.dtype, &info.shape, bytes.len())?,
+            compact_of(bytes)?,
+        ),
+        SourcePayload::Owned { info, bytes } => (
+            checked_expert_payload(entry, &info.dtype, &info.shape, bytes.len())?,
+            compact_of(bytes)?,
+        ),
+        // Unified memory reads its weights through source ranges: only the
+        // owned experts' spans are read, each released once uploaded.
+        SourcePayload::Range(descriptor) => {
+            let len = usize::try_from(descriptor.length)
+                .map_err(|_| "source range length does not fit usize".to_string())?;
+            let dtype =
+                checked_expert_payload(entry, &descriptor.dtype, &descriptor.logical_shape, len)?;
+            let read = |offset: usize, dst: &mut [u8]| {
+                let absolute = descriptor
+                    .offset
+                    .checked_add(offset as u64)
+                    .ok_or_else(|| "source range offset overflow".to_string())?;
+                descriptor
+                    .read_exact_at(absolute, dst)
+                    .map_err(|error| format!("source range read failed: {error}"))?;
+                descriptor.release_uploaded(absolute, dst.len() as u64);
+                Ok(())
+            };
+            let compact =
+                compact_owned_expert_spans(len, n_experts, ep.rank, ep.ranks, assign, read)?;
+            (dtype, compact)
         }
     };
-    let dtype = source_dtype(&info.dtype)?;
-    validate_payload_shape(entry, &info.shape)?;
-    if !entry.dtype_constraint.accepts(dtype) {
-        return Err(format!(
-            "source dtype {dtype:?} violates constraint {:?}",
-            entry.dtype_constraint
-        ));
-    }
-    validate_payload_extent(&info.shape, dtype, bytes.len())?;
-    let compact = compact_owned_experts(bytes, n_experts, ep.rank, ep.ranks, assign)?;
     let mut shape = entry.logical_shape.clone();
     shape[0] = ep_local_expert_count(n_experts, ep.rank, ep.ranks);
     let mut tensor = upload_resident_bytes(gpu, entry.residency, &compact, &shape)
         .map_err(|error| format!("pooled upload failed: {error}"))?;
     tensor.dtype = dtype;
     Ok((tensor, dtype))
+}
+
+/// Validate an expert-stack payload's dtype, shape and byte extent against its
+/// manifest entry; returns the source dtype.
+fn checked_expert_payload(
+    entry: &WeightEntry,
+    source_dtype_name: &str,
+    source_shape: &[usize],
+    len: usize,
+) -> Result<DType, String> {
+    let dtype = source_dtype(source_dtype_name)?;
+    validate_payload_shape(entry, source_shape)?;
+    if !entry.dtype_constraint.accepts(dtype) {
+        return Err(format!(
+            "source dtype {dtype:?} violates constraint {:?}",
+            entry.dtype_constraint
+        ));
+    }
+    validate_payload_extent(source_shape, dtype, len)?;
+    Ok(dtype)
 }
 
 /// Fulfill a Single manifest from the canonical source payload seam.

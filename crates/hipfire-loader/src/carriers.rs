@@ -1592,7 +1592,9 @@ pub fn qwen4_ep_vram_layers(
             "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
         );
     };
-    if gpu.is_uma() {
+    // Logical emulation (`HIPFIRE_EMULATE_GPUS`) aliases every rank onto one
+    // device, so a UMA APU (gfx1151) runs it with the per-alias VRAM split.
+    if gpu.is_uma() && hipfire_runtime::config::get().emulate_gpus.is_none() {
         return Err("qwen4: expert parallelism needs discrete GPUs".into());
     }
     let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(hfq, Some(&gpu.arch))
