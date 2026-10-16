@@ -59,6 +59,10 @@ pub struct FeatureFlags {
     pub pm_decode: bool,
     /// Exact gfx1201 MQ4v2 A8 prefill (int8 per K128); opt-in, default off.
     pub a8_prefill: bool,
+    /// Exact gfx1100/gfx1151 MQ4v2 A8 prefill (`kernel.gfx11_a8_prefill`,
+    /// `HIPFIRE_GFX11_A8_PREFILL`); opt-in, default off. Takes precedence over
+    /// the IU4 W4A4 projections wherever it is admitted.
+    pub gfx11_a8_prefill: bool,
     /// Fuse A8 sidecar emission into the four activation producers (default on).
     pub a8_fused_prod: bool,
     /// Qwen4 chunked GDN prefill (`HIPFIRE_QWEN4_GDN_CONV_QKNORM`): the
@@ -795,6 +799,7 @@ impl FeatureFlags {
             g12_iu4_isa: parse_bool("HIPFIRE_G12_IU4_ISA").unwrap_or(true),
             pm_decode: parse_bool("HIPFIRE_PM_DECODE").unwrap_or(arch == "gfx1201"),
             a8_prefill: parse_bool("HIPFIRE_A8_PREFILL").unwrap_or(false),
+            gfx11_a8_prefill: parse_bool("HIPFIRE_GFX11_A8_PREFILL").unwrap_or(false),
             a8_fused_prod: parse_bool("HIPFIRE_A8_FUSED_PROD").unwrap_or(true),
             qwen4_gdn_conv_qknorm: parse_bool("HIPFIRE_QWEN4_GDN_CONV_QKNORM")
                 .unwrap_or(halo_hyper_default),
@@ -1174,9 +1179,12 @@ impl FeatureFlags {
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
     }
 
-    /// A8 replaces the gfx1201 FP8 projection route only when explicitly selected.
+    /// A8 projection route, only when explicitly selected: `HIPFIRE_A8_PREFILL`
+    /// on exact gfx1201 (replacing FP8), `kernel.gfx11_a8_prefill` on exact
+    /// gfx1100/gfx1151 (replacing IU4).
     pub fn a8_prefill_enabled(&self) -> bool {
-        self.a8_prefill && self.arch == "gfx1201"
+        (self.a8_prefill && self.arch == "gfx1201")
+            || (self.gfx11_a8_prefill && matches!(self.arch.as_str(), "gfx1100" | "gfx1151"))
     }
 
     /// H5: the chunked GDN convolution also writes the normalized Q/K. Exact
@@ -1394,6 +1402,7 @@ impl FeatureFlags {
             g12_iu4_isa: false,
             pm_decode: false,
             a8_prefill: false,
+            gfx11_a8_prefill: false,
             a8_fused_prod: false,
             qwen4_gdn_conv_qknorm: false,
             qwen4_gdn_q8_inline: false,
@@ -1770,6 +1779,36 @@ mod tests {
                 assert!(!on.mq4v2_gateup_k5120_enabled(gate_m, up_m, k));
             }
         }
+    }
+
+    #[test]
+    fn a8_prefill_is_opt_in_and_scoped_per_arch() {
+        let defaults = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
+        for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1201", "gfx906"] {
+            assert!(!FeatureFlags::from_process_config(arch, &defaults).a8_prefill_enabled());
+            let only = |env: &'static str| {
+                FeatureFlags::from_lookup(arch, move |name| {
+                    if name == env { Ok("1".into()) } else { Err(()) }
+                })
+            };
+            assert_eq!(
+                only("HIPFIRE_GFX11_A8_PREFILL").a8_prefill_enabled(),
+                matches!(arch, "gfx1100" | "gfx1151")
+            );
+            assert_eq!(only("HIPFIRE_A8_PREFILL").a8_prefill_enabled(), arch == "gfx1201");
+        }
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.gfx11_a8_prefill", "true").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        assert!(FeatureFlags::from_process_config("gfx1151", &process).a8_prefill_enabled());
+        assert!(!FeatureFlags::from_process_config("gfx1201", &process).a8_prefill_enabled());
     }
 
     #[test]

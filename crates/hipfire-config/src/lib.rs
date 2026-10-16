@@ -2997,6 +2997,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Exploit symmetric MQ4V2 weights on exact gfx1100/gfx1151 by rebiasing q to q-8 and using signed-weight IU4 WMMA (default on for symmetric artifacts only); set false or HIPFIRE_IU4_SYMFOLD=0 to opt out. Asymmetric artifacts and other architectures are unchanged."
     ),
     process_bool_field!(
+        "kernel.gfx11_a8_prefill",
+        "gfx11_a8_prefill",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_GFX11_A8_PREFILL",
+        "Opt in to the W4A8 MQ4V2 prefill route on exact gfx1100/gfx1151 (symmetric MQ4V2, eager, batch >= 64, K % 256 == 0): int8 per-128 activations from the fused producers and an iu8-WMMA GEMM, about the IU4-off quality at a fraction of its time. Default off (IU4 W4A4 stays the default); other architectures ignore it."
+    ),
+    process_bool_field!(
         "kernel.npu_spillover",
         "npu_spillover",
         Kernel,

@@ -5086,6 +5086,21 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_APF0_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx12.hip")
 );
+/// gfx1100/gfx1151 A8 MQ4v2 (`kernel.gfx11_a8_prefill`): the same quantizer
+/// and the gfx11 iu8-WMMA twins of the three GEMM entries (same symbols and
+/// argument lists) on 128x128 CTA tiles; launch geometry in `gemm.rs`
+/// `a8_launch`.
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX11_SRC: &str = concat!(
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx11.hip")
+);
+/// The 256x256-tile build of [`GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX11_SRC`]
+/// (entries suffixed `_t256`, 1024 threads): half the L2/fabric bytes per MAC.
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX11_T256_SRC: &str = concat!(
+    "#define I8_TILE 256\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx11.hip")
+);
 // gfx12 (RDNA4) i8-WMMA MMQ port (single-wave 16-row tile, [32,1,1], LDS 0).
 // RDNA3's #if guard excludes gfx12, so RDNA4 needs this separate source.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str =

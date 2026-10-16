@@ -759,6 +759,12 @@ required-features = ["deltanet"]
 
 
 [[example]]
+name = "tmp_a8_gfx11_oracle"
+required-features = ["lab"]
+
+
+
+[[example]]
 name = "tmp_halo_iu4_oracle"
 required-features = ["lab"]
 

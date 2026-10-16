@@ -85,7 +85,7 @@ fn try_a8_rmsnorm_prepared(
         return Ok(None);
     }
     let reservation = gpu.reserve_int8_mmq(k, n)?;
-    gpu.fused_rmsnorm_rotate_mq_i8_gfx12_batched(
+    gpu.fused_rmsnorm_rotate_mq_i8_batched(
         x,
         weight,
         next.awq_scale.as_ref(),
@@ -115,7 +115,7 @@ fn try_a8_hin_prepared(
         return Ok(None);
     };
     let reservation = gpu.reserve_int8_mmq(k, n)?;
-    gpu.fused_silu_hin_rotate_mq_i8_gfx12_batched(h, awq, reservation, k, n)
+    gpu.fused_silu_hin_rotate_mq_i8_batched(h, awq, reservation, k, n)
         .map(Some)
 }
 
@@ -154,7 +154,7 @@ fn try_a8_gdn_prepared(
         return Ok(None);
     }
     let reservation = gpu.reserve_int8_mmq(k, n)?;
-    gpu.gated_norm_rotate_mq_i8_gfx12_batched(
+    gpu.gated_norm_rotate_mq_i8_batched(
         x,
         z,
         weight,
@@ -190,7 +190,7 @@ fn try_a8_sigmoid_prepared(
         return Ok(None);
     };
     let reservation = gpu.reserve_int8_mmq(k, n)?;
-    gpu.sigmoid_mul_rotate_x_mq_awq_i8_gfx12_batched(attn, gate, awq, None, reservation, k, n)
+    gpu.sigmoid_mul_rotate_x_mq_awq_i8_batched(attn, gate, awq, None, reservation, k, n)
         .map(Some)
 }
 
@@ -7248,7 +7248,7 @@ fn batch_chunk_delta_net_output_projection(
     } else {
         None
     };
-    if gdn_fused_prep.is_none() {
+    if a8_gdn_prep.is_none() && gdn_fused_prep.is_none() {
         gdn_fused_prep = try_gfx11_gdn_quant_fused_prepared(
             gpu,
             &layer.wo,
@@ -9664,7 +9664,7 @@ fn batch_chunk_full_attn_output_projection(
     } else {
         None
     };
-    if iu4_wo_prep.is_none() && !fa_gate_in_place {
+    if a8_wo_prep.is_none() && iu4_wo_prep.is_none() && !fa_gate_in_place {
         // gfx11 twin of the slices-5 sigmoid fusion: skip the standalone
         // sigmoid store when the `_gfx11` producer admits (prepared GEMM is
         // the only consumer, `attn` left unmodified).
