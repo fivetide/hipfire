@@ -5688,6 +5688,14 @@ pub fn load_legacy_json_layer(path: &Path) -> Result<(ConfigLayer, Vec<String>)>
             warnings.push(format!("ignored unsupported legacy value for {key}"));
             continue;
         };
+        // 32768 was the TypeScript CLI's built-in default, which it always sent.
+        // Carrying it over would pin 32K on carriers that size their own context.
+        if field.key == "memory.max_seq" && value == ConfigValue::Integer(32768) {
+            warnings.push(format!(
+                "dropped legacy {key} = 32768 (the old built-in default); an omitted max_seq sizes the context automatically"
+            ));
+            continue;
+        }
         if let Err(error) = layer.set(field.key, value) {
             warnings.push(format!("ignored invalid legacy {key}: {error}"));
         }
@@ -6938,6 +6946,20 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
         );
         assert_eq!(loaded.warnings.len(), 1);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_json_drops_only_the_old_default_max_seq() {
+        for (raw, kept) in [(32768, None), (65536, Some(ConfigValue::Integer(65536)))] {
+            let root = temp_root(&format!("legacy-max-seq-{raw}"));
+            fs::create_dir_all(&root).unwrap();
+            let paths = ConfigPaths::under(&root);
+            fs::write(&paths.config_json, format!(r#"{{"max_seq":{raw}}}"#)).unwrap();
+            let loaded = load_global(&paths).unwrap();
+            assert_eq!(loaded.layer.get("memory.max_seq"), kept.as_ref());
+            assert_eq!(loaded.warnings.len(), usize::from(kept.is_none()));
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]

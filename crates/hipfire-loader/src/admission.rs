@@ -1423,7 +1423,7 @@ fn resolve_sequence(
         .saturating_add(512 << 20);
     let scratch =
         hipfire_arch_qwen35::qwen35::prefill::minimum_prefill_reservation_bytes(&config, gpu_arch)
-            .ok_or("Qwen minimum prefill scratch sizing overflow or unsupported MoE")?;
+            .ok_or("Qwen minimum prefill scratch sizing overflow")?;
     let projected_card_cap = free
         .saturating_sub(weights)
         .saturating_sub(scratch)
@@ -2149,10 +2149,12 @@ pub fn admit_source_with_options(
     if let Some(carrier) = carrier {
         carrier.admit_topology(arch_id, is_dir, pp, kv_backend)?;
     }
-    // The widened dense PBS ledger does not describe MoE scratch. Preserve
-    // the existing 32768 CLI/config default instead of refusing a Qwen MoE
-    // load or pretending its card capacity was measured.
-    let qwen_moe = if matches!(arch_id, 5 | 6)
+    // Qwen MoE on a discrete card keeps the prior 32768 CLI/config default:
+    // automatic context there is not validated against expert placement. On
+    // unified memory its prefill scratch is charged like dense
+    // (`PrefillBatchScratch::projected_allocation_bytes`), so it sizes itself.
+    let pinned_moe = if !unified_memory
+        && matches!(arch_id, 5 | 6)
         && topology == EffectiveTopology::Single
         && kv_backend == KvBackend::Vmm
         && (hints.free_vram_bytes.is_some() || max_seq == 0)
@@ -2171,7 +2173,7 @@ pub fn admit_source_with_options(
     let sequence = if matches!(arch_id, 5 | 6)
         && topology == EffectiveTopology::Single
         && kv_backend == KvBackend::Vmm
-        && !qwen_moe
+        && !pinned_moe
         && (hints.free_vram_bytes.is_some() || max_seq == 0)
     {
         Some(resolve_sequence(&source, max_seq, gpu_arch, hints)?)
@@ -2191,7 +2193,7 @@ pub fn admit_source_with_options(
     let effective_seq = sequence.as_ref().map_or_else(
         || {
             if max_seq == 0 {
-                if qwen_moe {
+                if pinned_moe {
                     32768
                 } else {
                     4096
@@ -2202,8 +2204,9 @@ pub fn admit_source_with_options(
         },
         |resolved| resolved.max_seq,
     );
-    let sequence_reason = (qwen_moe && max_seq == 0)
-        .then_some("max_seq auto-capacity unsupported for MoE; using prior default");
+    let sequence_reason = (pinned_moe && max_seq == 0).then_some(
+        "max_seq auto-capacity unsupported for MoE on a discrete GPU; using prior default",
+    );
     let mut has_vision = probe_vision(&source, arch_id)?;
     // Shared tower sidecar (registry `vision` slot / `params.vision` /
     // `HIPFIRE_VISION_SIDECAR`), validated fail-closed; a tower-bearing
@@ -3865,7 +3868,7 @@ mod tests {
             cleanup(&trunk);
         }
         #[test]
-        fn moe_preserves_legacy_context_when_dense_capacity_is_unknown() {
+        fn moe_pins_legacy_context_on_discrete_and_sizes_itself_on_uma() {
             let path = write_hfq("moe-capacity", 6, false);
             let metadata = r#"{"config":{"text_config":{"hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"num_key_value_heads":4,"vocab_size":1000,"num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":1024,"max_position_embeddings":131072}}}"#;
             let embedding = HfqMemTensor {
@@ -3920,6 +3923,25 @@ mod tests {
             .expect("explicit MoE max_seq must remain authoritative");
             assert_eq!(explicit.max_seq, 50000);
             assert!(explicit.sequence_reason.is_none());
+            // Unified memory sizes MoE like dense: the trained window, capped
+            // by the carrier's post-weight card measurement.
+            let uma = super::super::admit_source(
+                path.to_str().unwrap(),
+                1,
+                1,
+                KvBackendRequest::Automatic,
+                None,
+                "gfx1151",
+                None,
+                "auto",
+                None,
+                0,
+                hints,
+            )
+            .expect("UMA MoE omission sizes automatically");
+            let sequence = uma.sequence.expect("UMA MoE resolves a sequence");
+            assert_eq!((sequence.max_seq, sequence.bound), (131072, "pending"));
+            assert!(uma.sequence_reason.is_none());
             cleanup(&path);
         }
     }

@@ -602,10 +602,20 @@ that fits currently free VRAM after mapped (not virtually reserved) KV. When
 future KV growth needs the memory, widened PBS reuse is released between
 requests, allowing later chunks to narrow rather than making growth OOM.
 The loaded diagnostic reports `max_seq`, its `model`/`card`/`user` bound,
-`model_ctx`, `card_cap` and KV mode. Qwen MoE keeps its prior 32768 built-in
-default (with a loaded diagnostic reason) until its distinct prefill scratch can
-be budgeted; other carriers keep their existing context behavior until their
-different cache ownership can use the same allocation accounting.
+`model_ctx`, `card_cap` and KV mode. Qwen MoE uses the same automatic sizing on
+unified-memory GPUs (gfx1151): its minimum prefill scratch, including the
+shared-expert, expanded-expert and grouped-GEMM buffers, is charged through
+`PrefillBatchScratch::projected_allocation_bytes`, so `qwen3.6-35b-a3b` and
+`ornith-1.5-35b-a3b` load at their 262144-token trained window on Strix Halo.
+On a discrete GPU Qwen MoE keeps its prior 32768 built-in default (with a loaded
+diagnostic reason). Other carriers keep their existing context behavior until
+their different cache ownership can use the same allocation accounting.
+
+A legacy `config.json` that carries `max_seq: 32768` (the old TypeScript CLI's
+built-in default) loads and migrates without it, with a warning, so the
+migrated `config.toml` does not pin carriers that size their own context. A
+`config.toml` written by an earlier migration keeps its explicit value; remove it
+with `hipfire config reset memory.max_seq`.
 
 **Explicit backend override precedence** (forced choices, not automatic
 policy): CLI `--kv-backend` **>** per-model TOML `memory.kv_backend` **>**

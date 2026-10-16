@@ -1364,6 +1364,9 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
                         paths.config.config_toml.display(),
                         paths.config.config_json.display()
                     );
+                    for warning in loaded.warnings {
+                        eprintln!("warning: {warning}");
+                    }
                 }
                 ConfigFormat::Empty => {
                     write_global_toml(&paths.config, &ConfigLayer::default())?;

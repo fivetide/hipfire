@@ -311,11 +311,10 @@ fn placement_capacity_inputs(
         crate::qwen35::prefill::vmm_kv_token_bytes(config, plan.pair, plan.adaptive.is_some())
             .ok_or("Qwen KV stride overflow")?;
     let kv = offload::kv_reserve(stride as u64, rows).ok_or("Qwen KV reservation overflow")?;
-    // A MoE model has no prefill-scratch sizing model
-    // (`dense_prefill_allocation_bytes` deliberately returns `None` for
-    // `num_experts != 0`), which is why the VMM path refuses MoE models outright.
-    // Reserve 0 and say so: the placement is then bounded by the KV reservation
-    // alone, and the shortfall is visible rather than hidden.
+    // `None` only on sizing overflow (MoE is charged through
+    // `PrefillBatchScratch::projected_allocation_bytes`). Reserve 0 and say so:
+    // the placement is then bounded by the KV reservation alone, and the
+    // shortfall is visible rather than hidden.
     let pbs_reservation =
         crate::qwen35::prefill::minimum_prefill_reservation_bytes(config, &ctx.gpu.arch);
     let pbs = pbs_reservation.unwrap_or(0) as u64;
