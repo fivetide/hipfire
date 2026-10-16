@@ -14328,21 +14328,22 @@ impl Gpu {
         Ok(true)
     }
 
-    /// Muse Glimmer-owned row-reuse batch-tiled gfx1100 residual GEMM (K2).
+    /// Muse Glimmer-owned row-reuse batch-tiled gfx11 residual GEMM (K2).
     ///
-    /// Production for exact gate/up through [`Self::gemm_hfq4g256_batched_lmhead`]
-    /// when gfx1100 + M=19968 + K=6656 + B=192 with `rm=2` (symbol
-    /// `gemm_hfq4g256_residual_wmma_gfx1100_muse_rm2_bv6`). Other rm
-    /// instantiations (3/4/6 → BV 4/3/2) remain measurement-only. Sibling of
-    /// [`Self::gemm_hfq4g256_residual_muse_gfx1100`]; no shared selector,
-    /// heuristic, or tile constant beyond that exact production gate.
+    /// Production through [`Self::gemm_hfq4g256_batched_lmhead`] with `rm=2`
+    /// (symbol `gemm_hfq4g256_residual_wmma_gfx1100_muse_rm2_bv6`) for exact
+    /// gfx1100 gate/up (M=19968, K=6656, B=192) and for gfx1151 full-tile
+    /// batches (`batch % 96 == 0`). Other rm instantiations (3/4/6 → BV 4/3/2)
+    /// remain measurement-only. Sibling of
+    /// [`Self::gemm_hfq4g256_residual_muse_gfx1100`].
     ///
     /// Each wave owns RM row tiles × BV batch tiles with RM*BV=12. For each g/kt
     /// pair it loads/dequants one A fragment per row tile, loads each B half16
     /// once per batch tile, and reuses that B fragment across all RM WMMA calls.
-    /// Preserves exact per-accumulator K2 g/kt WMMA order and `Y +=` semantics.
-    /// Full-tile only (`batch % (16*BV) == 0`); candidate rm 2/3/4/6
-    /// (BV 6/4/3/2). Exact gate/up shape only: M=19968, K=6656.
+    /// Preserves exact per-accumulator K2 g/kt WMMA order and `Y +=` semantics,
+    /// so the output is bitwise identical to `gemm_hfq4g256_residual_wmma_k2`.
+    /// Full-tile only (`batch % (16*BV) == 0`, `M % (16*RM) == 0`); gfx1100
+    /// additionally requires the exact gate/up shape M=19968, K=6656.
     /// Grid `[M/(16*RM), batch/(16*BV), 1]`, block `[32, 1, 1]`.
     ///
     /// Returns `Ok(false)` without bind/compile when arch/shape/rm/batch
@@ -14364,12 +14365,12 @@ impl Gpu {
             6 => ("gemm_hfq4g256_residual_wmma_gfx1100_muse_rm6_bv2", 2usize),
             _ => return Ok(false),
         };
-        if !self.arch_caps.is_gfx1100()
-            || m != 19_968
-            || k != 6_656
-            || batch_size == 0
-            || batch_size % (16 * bv) != 0
-        {
+        let shape_ok = if self.arch_caps.is_gfx1100() {
+            m == 19_968 && k == 6_656
+        } else {
+            self.arch_caps.is_gfx1151() && m % (16 * rm) == 0 && k % 256 == 0
+        };
+        if !shape_ok || batch_size == 0 || batch_size % (16 * bv) != 0 {
             return Ok(false);
         }
         self.bind_thread()?;
@@ -14400,6 +14401,7 @@ impl Gpu {
 
         let row_tiles = m / (16 * rm);
         let batch_tiles = batch_size / (16 * bv);
+        let lds = self.gfx1151_hfq4_wmma_occupancy_lds(row_tiles * batch_tiles, 16 * rm);
 
         let bytes =
             crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
@@ -14408,7 +14410,7 @@ impl Gpu {
             kname,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
-            0,
+            lds,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
@@ -21977,6 +21979,28 @@ impl Gpu {
         }
     }
 
+    /// Dynamic LDS (bytes) that caps resident waves of a single-wave
+    /// HFQ4-G256 WMMA GEMM on gfx1151 (`_k2`, `_k2x32`, `_k4`, Muse `_rm*`),
+    /// or 0 when no cap applies. The kernels use no LDS; the reservation only
+    /// bounds occupancy, so the output bytes do not change.
+    ///
+    /// Each wave walks `rows_per_wave` weight rows group by group and reads the
+    /// same 128-byte line of every row on 8 consecutive K-tile pairs. At the
+    /// VGPR-limited occupancy (16 waves/SIMD for k2) the resident working set
+    /// overflows the per-CU caches and lines are refetched: M=19968 K=6656 k2
+    /// ran 4.4 ms at B=4 (~15 GB/s) and 0.52 ms capped, bitwise identical.
+    /// 512 B per row was the measured optimum for k2 (8 KB), k2x32 and rm2
+    /// (16 KB). Grids under ~640 blocks never fill the GPU to that occupancy,
+    /// and capping them only lengthens the tail, so they launch uncapped.
+    fn gfx1151_hfq4_wmma_occupancy_lds(&self, blocks: usize, rows_per_wave: usize) -> u32 {
+        const MIN_BLOCKS: usize = 640;
+        if self.arch_caps.is_gfx1151() && blocks >= MIN_BLOCKS {
+            (rows_per_wave * 512) as u32
+        } else {
+            0
+        }
+    }
+
 
     /// WMMA-accelerated batched HFQ4-G256 GEMM with residual add.
     /// gfx1100+ only. 16×16 output tiles via wave32 WMMA.
@@ -22207,11 +22231,17 @@ impl Gpu {
         } else {
             None
         };
+        // Single-wave row-tile variants (k2/k2x32/k4) take the gfx1151 cap.
+        let lds = if block_size == 32 && k_splits == 1 {
+            self.gfx1151_hfq4_wmma_occupancy_lds(row_tiles * batch_tiles, row_step)
+        } else {
+            0
+        };
         let result = self.launch_maybe_blob(
             kernel_name,
             [row_tiles as u32, batch_tiles as u32, k_splits],
             [block_size, 1, 1],
-            0,
+            lds,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
@@ -23516,13 +23546,22 @@ impl Gpu {
             return if arch.starts_with("gfx12") {
                 self.gemm_hfq4g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size)
             } else {
-                // Exact gfx1100 gate/up (M=19968, K=6656, B=192): Muse RM2/BV6
-                // residual. Y is already zeroed once above; residual does Y+=.
-                // Ok(false) must not be treated as success — fall through.
-                if self.arch_caps.is_gfx1100()
-                    && m == 19_968
-                    && k == 6_656
-                    && batch_size == 192
+                // Muse RM2/BV6 residual (bitwise equal to k2): exact gfx1100
+                // gate/up (M=19968, K=6656, B=192), and gfx1151 full 96-column
+                // tiles, where it reuses each B fragment across 2 row tiles and
+                // each A fragment across 6 batch tiles (3.6-6x over k2 at the
+                // Glimmer B=192 shapes). Narrow outputs (k/v, M=256) keep k2:
+                // their RM2 grid is too small to fill the GPU. Y is already
+                // zeroed once above; residual does Y+=. Ok(false) must not be
+                // treated as success — fall through.
+                let rm2 = if self.arch_caps.is_gfx1100() {
+                    m == 19_968 && k == 6_656 && batch_size == 192
+                } else {
+                    self.arch_caps.is_gfx1151()
+                        && batch_size % 96 == 0
+                        && (m / 32) * (batch_size / 96) >= 256
+                };
+                if rm2
                     && self
                         .gemm_hfq4g256_residual_muse_gfx1100_rm(a_raw, x, y, m, k, batch_size, 2)?
                 {
@@ -26009,6 +26048,13 @@ impl Gpu {
         // 80 cycles); mq4 never hit it (4-bit hfq4 projections). Mirrors the
         // W3i MTP-head lm_head fix (5ac96a8f, +47% gfx12).
         if !use_legacy && self.arch_caps.has_wmma() && k % 32 == 0 && n > 0 {
+            // gfx1151 prefill widths: the 4-warp 64×64 tile shares each X slice
+            // across 4 row tiles. Same per-accumulator dequant and K order as
+            // the single-warp kernel, so bitwise identical; 2-3.5× at
+            // M=4096 K=6656 B=64..256. Narrow M (k/v, M=256) stays single-warp.
+            if self.arch_caps.is_gfx1151() && m >= 4096 && m % 64 == 0 && n % 64 == 0 {
+                return self.gemm_q8_0_wmma_4w(a_raw, x, y, m, k, n);
+            }
             return self.gemm_q8_0_wmma(a_raw, x, y, m, k, n);
         }
 
@@ -30248,14 +30294,20 @@ impl Gpu {
         ];
         let row_tiles = (m + 63) / 64;
         let batch_tiles = (batch_size + 63) / 64;
-        launch_params_blob!(
+        let bytes = m * (k / 32) * 34 + batch_size * k * 2 + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_q8_0_wmma_4w", bytes);
+        let result = launch_params_blob!(
             self,
             "gemm_q8_0_wmma_4w",
             [row_tiles as u32, batch_tiles as u32, 1],
             [128, 1, 1],
             0,
             params; a_p, xp, y_p, m_val, k_val, n_val
-        )
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
     /// F16 weight × F16 input → F32 batched GEMM, arch-routed.
     ///
