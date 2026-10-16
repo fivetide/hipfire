@@ -207,3 +207,87 @@ impl Qwen4Bundle {
         self.ep_seal.as_ref()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hipfire_runtime::model_source::{SourceFileIdentity, SourceFormat, SourceRangeIdentity};
+    use rdna_compute::DType;
+
+    /// The Flash-Next manifest's own tensor index: every entry encoded as its
+    /// declared dtype.
+    fn source_of(manifest: &Qwen4Manifest, mtime_secs: i64) -> SourceIdentity {
+        let ranges = manifest
+            .weights
+            .iter()
+            .map(|entry| {
+                let cols = *entry.logical_shape.last().unwrap();
+                let row_bytes = match entry.dtype {
+                    DType::MQ4G256V2 => cols.div_ceil(256) * 136,
+                    DType::MQ4G128V2 => cols.div_ceil(128) * 68,
+                    _ => cols * 4,
+                };
+                let rows: usize = entry.logical_shape.iter().rev().skip(1).product();
+                SourceRangeIdentity {
+                    name: entry.name.clone(),
+                    file_index: 0,
+                    offset: 0,
+                    length: (rows.max(1) * row_bytes) as u64,
+                    dtype: format!("{:?}", entry.dtype),
+                    logical_shape: entry.logical_shape.clone(),
+                }
+            })
+            .collect();
+        SourceIdentity {
+            canonical_path: "/m.mq4".into(),
+            format: SourceFormat::Hfq,
+            files: vec![SourceFileIdentity {
+                canonical_path: "/m.mq4".into(),
+                dev: 1,
+                ino: 2,
+                len: 3,
+                mtime_secs,
+                mtime_nanos: 0,
+            }],
+            metadata_json: String::new(),
+            manifest: ranges,
+        }
+    }
+
+    #[test]
+    fn seal_derives_every_rank_from_one_mesh_epoch_and_refuses_another_generation() {
+        let manifest = Qwen4Manifest::build(&crate::config::compact_test_config()).unwrap();
+        let source = source_of(&manifest, 10);
+        for (ranks, devices) in [(2, vec![0, 1]), (6, vec![5, 4, 3, 2, 1, 0])] {
+            let seal = Qwen4EpSeal::seal(&manifest, 48, ranks, &devices, &source).unwrap();
+            // 48 trunk MoE layers, then the MTP head labelled after them.
+            let layers: Vec<_> = seal.plans().iter().map(|plan| plan.layer()).collect();
+            assert_eq!(layers, (0..49).map(Some).collect::<Vec<_>>());
+            assert!(seal
+                .plans()
+                .iter()
+                .all(|plan| plan.mesh_epoch() == seal.mesh().epoch()));
+            for rank in 0..ranks {
+                assert_eq!(
+                    seal.placement(rank).unwrap(),
+                    Qwen4EpPlacement { rank, ranks }
+                );
+                let origin = seal.origin(rank).unwrap();
+                assert_eq!(origin.mesh_epoch(), seal.mesh().epoch());
+                assert_eq!(
+                    (origin.logical_rank(), origin.physical_device()),
+                    (rank, devices[rank])
+                );
+            }
+            assert!(seal.placement(ranks).is_err());
+            assert_eq!(seal.origin(ranks), None);
+            seal.check_source(&source).unwrap();
+            let replaced = seal.check_source(&source_of(&manifest, 11)).unwrap_err();
+            assert!(replaced.contains("not the sealed generation"), "{replaced}");
+        }
+        // Two seals of the same shape are two mesh epochs.
+        let a = Qwen4EpSeal::seal(&manifest, 48, 2, &[0, 1], &source).unwrap();
+        let b = Qwen4EpSeal::seal(&manifest, 48, 2, &[0, 1], &source).unwrap();
+        assert_ne!(a.origin(1), b.origin(1));
+    }
+}
