@@ -10,6 +10,7 @@
 
 ## Unreleased (0.4.3)
 
+- **Tokenizer: an HF byte-level BPE vocabulary without a symbol for every byte now loads, as in HF.** SmolLM2's trained vocab has no symbol for bytes such as 0x04 or 0xff, and hipfire refused it as damaged. With no `unk_token` and no `byte_fallback`, HF drops such a byte; hipfire's `tokenizer.json` path now does the same. GGUF and HFQ-metadata vocabularies still require all 256 byte symbols.
 - **Fixed: Flash-Next load no longer scans every routed expert header before choosing the scratch mode; the scan ran even when compact mode could not be selected (regression from b9ab7f229).**
 - **Fixed: experimental multislot no longer drops Qwen3.8's supported reasoning effort.** Its load acknowledgement hardcoded `reasoning_effort_native: false` and `reasoning_efforts: []`, so HTTP/config resolution discarded valid `low`, `medium`, and `xhigh` values. It now probes the actual slot template, as the ordinary loader does. The bug was present in v0.4.2.
 - **Reasoning-effort warnings describe the loaded template, not a guessed Qwen version.** A template without semantic effort support no longer gets mislabeled Qwen3.6; HTTP and config warnings explain that native effort is unavailable and recommend `thinking_budget` or `max_think_tokens` for a cap. `native` is not an effort value; the Qwen diagnostic names `low|medium|xhigh` and its existing fallback. Config documentation explains template capability reporting and supported families.
