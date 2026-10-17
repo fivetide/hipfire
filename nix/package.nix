@@ -12,6 +12,16 @@
 let
   cargoToml = builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"));
   rocmRoot = callPackage ./rocm-root.nix { };
+  # Both wrappers need the same ROCm env: a CLI-launched daemon takes its
+  # policy (incl. diagnostic.compiler.hipcc_extra_flags) from the CLI's
+  # startup config, not its own environment. The device-lib flag must match
+  # the one hipfire-kernels was packed with, or every packaged object is
+  # rejected and JIT-compiled.
+  rocmWrapArgs = lib.optionalString rocmSupport ''
+    --set HIPFIRE_ROCM_PATH ${rocmRoot} \
+    --set HIPFIRE_HIPCC_EXTRA_FLAGS --rocm-device-lib-path=${rocmPackages.rocm-device-libs}/amdgcn/bitcode \
+    --prefix LD_LIBRARY_PATH : ${rocmRoot}/lib
+  '';
 in
 rustPlatform.buildRustPackage {
   pname = "hipfire";
@@ -44,30 +54,13 @@ rustPlatform.buildRustPackage {
     # `hipfire-daemon`'s [[bin]] name is `daemon`, so the artifact is
     # target/release/daemon (mirrors Containerfile's COPY to /opt/hipfire/bin/daemon).
     cp target/release/daemon $out/bin/hipfire-daemon-unwrapped
-    makeWrapper $out/bin/hipfire-daemon-unwrapped $out/bin/hipfire-daemon \
-      ${lib.optionalString rocmSupport ''
-        --set HIPFIRE_ROCM_PATH ${rocmRoot} \
-        --set HIPFIRE_HIPCC_EXTRA_FLAGS --rocm-device-lib-path=${rocmPackages.rocm-device-libs}/amdgcn/bitcode \
-        --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [
-          rocmPackages.clr
-          rocmPackages.rocm-runtime
-          rocmPackages.rocm-comgr
-          rocmPackages.rocprofiler-register
-        ]}
-      ''}
+    makeWrapper $out/bin/hipfire-daemon-unwrapped $out/bin/hipfire-daemon ${rocmWrapArgs}
 
     # Install the native Rust control plane. HIPFIRE_DAEMON_BIN points it at
     # the ROCm-wrapped daemon rather than relying on a source-tree layout.
     cp target/release/hipfire $out/bin/hipfire-unwrapped
     makeWrapper $out/bin/hipfire-unwrapped $out/bin/hipfire \
-      --set HIPFIRE_DAEMON_BIN $out/bin/hipfire-daemon \
-      ${lib.optionalString rocmSupport
-        "--prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [
-          rocmPackages.clr
-          rocmPackages.rocm-runtime
-          rocmPackages.rocm-comgr
-          rocmPackages.rocprofiler-register
-        ]}"}
+      --set HIPFIRE_DAEMON_BIN $out/bin/hipfire-daemon ${rocmWrapArgs}
 
     runHook postInstall
   '';

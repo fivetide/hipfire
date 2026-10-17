@@ -341,8 +341,11 @@ weight upload — prefer the overlay on Strix Halo hosts.
 unit when `rocmSupport = true`. hipfire treats `HIPFIRE_ROCM_PATH` as one
 authoritative root that must hold `libamdhip64`, `libhsa-runtime64`, the HIP
 headers and `hipcc`; nixpkgs splits those across `clr` and `rocm-runtime`, so
-the kernel build, daemon wrapper and dev shell point it at a `symlinkJoin`
-of both (`nix/rocm-root.nix`).
+the kernel build, both wrappers and the dev shell point it at a `symlinkJoin`
+of both (`nix/rocm-root.nix`). Both wrappers also pin
+`HIPFIRE_HIPCC_EXTRA_FLAGS` to the device-lib path `hipfire-kernels` was
+packed with: a CLI-launched daemon takes that setting from the CLI, and any
+other value makes the runtime reject every packaged object and JIT-compile.
 
 ### Bring your own ROCm
 
