@@ -1661,6 +1661,7 @@ pub(crate) fn launch_op_rows(
                             givens_theta: None,
                             givens_scales: None,
                             givens_krot: None,
+                            givens_group_size: None,
                         },
                     )
                     .map_err(|e| DispatchError::Hip(e.to_string()))
@@ -2207,8 +2208,8 @@ mod tests {
 
     /// The pack4 kernel behind `FusedGateUpParo4G128T` reads the rotation from
     /// native PARO4-G128 weight bytes. A safetensors-Dir weight of the same
-    /// dtype carries a sidecar rotation instead and must stay on the
-    /// per-projection Givens + GEMV path.
+    /// dtype carries a sidecar rotation instead, and a G64 weight has neither
+    /// layout: both must stay on the per-projection Givens + GEMV path.
     #[test]
     fn paro_gate_up_fusion_admits_only_native_g128() {
         use crate::families::gemv::GivensRef;
@@ -2270,6 +2271,11 @@ mod tests {
             !admits(DType::ParoQ4G128, Some(sidecar)),
             "sidecar G128 must not fuse"
         );
+        assert!(
+            !admits(DType::ParoQ4G64, Some(sidecar)),
+            "G64 must not fuse"
+        );
+        assert!(!admits(DType::ParoQ4G64, None), "G64 must not fuse");
     }
 
     #[test]
