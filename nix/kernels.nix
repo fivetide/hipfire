@@ -1,4 +1,5 @@
 { lib
+, callPackage
 , rustPlatform
 , rocmPackages
 , src ? lib.cleanSource ./..
@@ -8,6 +9,7 @@
 
 let
   cargoToml = builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"));
+  rocmRoot = callPackage ./rocm-root.nix { };
 in
 rustPlatform.buildRustPackage {
   pname = "hipfire-kernels";
@@ -23,7 +25,7 @@ rustPlatform.buildRustPackage {
   buildPhase = ''
     runHook preBuild
     export HOME=$TMPDIR
-    export HIPFIRE_ROCM_PATH=${rocmPackages.clr}
+    export HIPFIRE_ROCM_PATH=${rocmRoot}
     export HIPFIRE_HIPCC_EXTRA_FLAGS=--rocm-device-lib-path=${rocmPackages.rocm-device-libs}/amdgcn/bitcode
     bash scripts/compile-kernels.sh ${lib.concatStringsSep " " gpuTargets}
     runHook postBuild

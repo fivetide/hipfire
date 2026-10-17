@@ -338,7 +338,11 @@ nixos-25.11’s ROCm 6.4.3 `libamdhip64` can segfault on **gfx1151** during
 weight upload — prefer the overlay on Strix Halo hosts.
 
 `LD_LIBRARY_PATH` is injected on the daemon/CLI wrappers and the systemd
-unit when `rocmSupport = true`.
+unit when `rocmSupport = true`. hipfire treats `HIPFIRE_ROCM_PATH` as one
+authoritative root that must hold `libamdhip64`, `libhsa-runtime64`, the HIP
+headers and `hipcc`; nixpkgs splits those across `clr` and `rocm-runtime`, so
+the kernel build, daemon wrapper and dev shell point it at a `symlinkJoin`
+of both (`nix/rocm-root.nix`).
 
 ### Bring your own ROCm
 

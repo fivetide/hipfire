@@ -1,4 +1,5 @@
 { lib
+, callPackage
 , rustPlatform
 , rocmPackages
 , makeWrapper
@@ -10,6 +11,7 @@
 
 let
   cargoToml = builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"));
+  rocmRoot = callPackage ./rocm-root.nix { };
 in
 rustPlatform.buildRustPackage {
   pname = "hipfire";
@@ -44,7 +46,7 @@ rustPlatform.buildRustPackage {
     cp target/release/daemon $out/bin/hipfire-daemon-unwrapped
     makeWrapper $out/bin/hipfire-daemon-unwrapped $out/bin/hipfire-daemon \
       ${lib.optionalString rocmSupport ''
-        --set HIPFIRE_ROCM_PATH ${rocmPackages.clr} \
+        --set HIPFIRE_ROCM_PATH ${rocmRoot} \
         --set HIPFIRE_HIPCC_EXTRA_FLAGS --rocm-device-lib-path=${rocmPackages.rocm-device-libs}/amdgcn/bitcode \
         --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [
           rocmPackages.clr

@@ -1,4 +1,5 @@
 { lib
+, callPackage
 , mkShell
 , rust-bin
 , rocmPackages
@@ -37,6 +38,11 @@ mkShell {
       rocmPackages.rocm-comgr
       rocmPackages.rocprofiler-register
     ]);
+
+  # clr's setup hook exports HIP_PATH=clr, which lacks libhsa-runtime64;
+  # HIPFIRE_ROCM_PATH outranks it (see nix/rocm-root.nix).
+  HIPFIRE_ROCM_PATH = lib.optionalString rocmSupport
+    "${callPackage ./rocm-root.nix { }}";
 
   shellHook = ''
     echo "hipfire dev shell"
