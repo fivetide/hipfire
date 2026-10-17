@@ -31,6 +31,8 @@ pub use moe_program::{MoeStage, SealedMoeOp};
 pub(crate) mod draft_head;
 pub mod moe_dump;
 pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState};
+#[cfg(feature = "deltanet")]
+pub mod hybrid;
 pub(crate) mod layer_ops;
 pub mod sandwich;
 pub mod step_graph;

@@ -2833,10 +2833,6 @@ pub fn forward_ep(
     assert_eq!(partials.len(), n, "forward_ep: partials.len() != n_ranks");
 
     let dim = config.dim;
-    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
-    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
-    let n_v_heads = config.linear_num_value_heads;
-    let hd = config.linear_key_head_dim;
     let pos_i32 = pos as i32;
 
     // 1. Embed token + write pos on each rank (replicated; deterministic, since
@@ -2891,10 +2887,6 @@ pub fn forward_ep(
                 pos,
                 layer_idx,
                 delta_layer_idx,
-                k_dim,
-                v_dim,
-                n_v_heads,
-                hd,
                 precomputed_attn_x_rot: false,
                 fa_output_prerotated: false,
                 defer_routed_combine: false,

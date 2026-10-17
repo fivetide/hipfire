@@ -976,7 +976,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "kv-tier-capture-forces-flash",
         predicates: &[CaptureMode],
-        condition: "`use_flash = capture_mode || flash_mode == 2 || (flash_mode == 1 && pos + 1 >= 2048)` in KvTierPlan q8/fp8/bf16_attend_key (hipfire-dispatch kv_tier.rs:460-490) and the ep_batch twin (ep_batch.rs:3826, 4531); callers forward `capture_mode` into KvTierInputs (qwen35 forward.rs kv_cache_attention_dispatch and Qwen35Bindings::run_attend, prefill.rs:9529, prefill_multi.rs:155 attn_fp8_twin_eligible and :602 lane_fa_plan_ok, which derives the plan the lane-batched FullAttention admission must reproduce, gemma4, llama, qwen2, hipfire-runtime llama.rs). run_attend also uses the selected flash key to admit the opt-in single-token Q8 KV-write fold",
+        condition: "`use_flash = capture_mode || flash_mode == 2 || (flash_mode == 1 && pos + 1 >= 2048)` in KvTierPlan q8/fp8/bf16_attend_key (hipfire-dispatch kv_tier.rs:460-490) and the ep_batch twin (ep_batch.rs:3826, 4531); callers forward `capture_mode` into KvTierInputs (hipfire-dispatch pipeline/hybrid.rs AttentionKv::tier_plan for every qwen35 decode attention, prefill.rs:9529, prefill_multi.rs:155 attn_fp8_twin_eligible and :602 lane_fa_plan_ok, which derives the plan the lane-batched FullAttention admission must reproduce, gemma4, llama, qwen2, hipfire-runtime llama.rs). GatedAttentionOp::attend also uses the selected flash key to admit the opt-in single-token Q8 KV-write fold",
         effect: KernelSelection,
         switches: "captured: flash tile attention; eager/recorded with flash_mode 0|1 at short context: non-flash attention_*_kv. With HIPFIRE_FA_KVWRITE_FOLD=1 on the supported non-compact gfx1100 decode shape, capture-forced Q8 flash also admits qwen35_fa_prep_kvwrite_gfx1100 in place of qwen35_fa_prep_gfx1100 + kv_cache_write_q8_0_pair",
         kernels: &["attention_q8_0_kv", "attention_fp8_e4m3_kv", "attention_bf16_kv", "attention_flash_q8_0_tile", "attention_flash_fp8_e4m3_tile", "attention_flash_bf16_tile", "attention_flash_q8_0_reduce", "qwen35_fa_prep_kvwrite_gfx1100", "qwen35_fa_prep_gfx1100", "kv_cache_write_q8_0_pair"],
@@ -1615,18 +1615,6 @@ pub const SITES: &[Site] = &[
         decisions: &["graph-capture-lifecycle"],
     },
     Site {
-        file: "hipfire-arch-qwen35/src/qwen35/forward.rs",
-        function: "kv_cache_attention_dispatch",
-        occurrences: 2,
-        decisions: &["kv-tier-capture-forces-flash"],
-    },
-    Site {
-        file: "hipfire-arch-qwen35/src/qwen35/forward.rs",
-        function: "run_attend",
-        occurrences: 2,
-        decisions: &["kv-tier-capture-forces-flash"],
-    },
-    Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
         function: "batch_chunk_fa_attend_ragged_fp8q",
         occurrences: 2,
@@ -1837,6 +1825,12 @@ pub const SITES: &[Site] = &[
     Site {
         file: "hipfire-dispatch/src/families/kv_tier.rs",
         function: "q8_attend_key",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/hybrid.rs",
+        function: "tier_plan",
         occurrences: 2,
         decisions: &["kv-tier-capture-forces-flash"],
     },

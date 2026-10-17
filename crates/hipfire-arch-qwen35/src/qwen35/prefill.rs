@@ -1915,8 +1915,7 @@ fn widened_arch_admitted(arch: &str) -> bool {
 /// predicate plus the 17408 hidden_dim that fixes the allocation envelope.
 #[inline]
 fn widened_dense_shape_admitted(config: &Qwen35Config) -> bool {
-    config.hidden_dim == 17_408
-        && super::config::qwen36_27b_dense_shape(config, config.linear_num_value_heads)
+    config.hidden_dim == 17_408 && super::program::hybrid_dims(config).is_dense_27b_shape()
 }
 ///
 /// Verbatim truthy predicate of rdna-compute's private `dn_requant_per_token`
@@ -14884,9 +14883,8 @@ fn run_fa_layer_body(
         gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
     }
     let ctx = DispatchCtx::new(gpu);
-    let fused_epilogue = kv_cache_attention_dispatch(
-        &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos, false,
-    )?;
+    let fused_epilogue =
+        kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos)?;
 
     if !fused_epilogue {
         gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
