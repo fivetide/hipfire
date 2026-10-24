@@ -86,6 +86,7 @@ fn layout(map: &trunk::ColumnMap, rows: usize) -> NpuBf16Layout {
         padded_rows: rows.div_ceil(256) * 256,
         k: 2560,
         panels: map.panel_count(),
+        n512: false,
     }
 }
 fn family_view<'a>(
@@ -712,6 +713,7 @@ impl NpuForward {
                     padded_rows: rows.div_ceil(256) * 256,
                     k: 2560,
                     panels: 1,
+                    n512: false,
                 }
                 .a_bytes();
                 let a = gpu.zeros(&[a_bytes], DType::Raw)?;
@@ -772,6 +774,9 @@ impl NpuForward {
                         T::QsaIn => (Shape::QsaIn, cols[1]),
                         T::GdnOut => (Shape::GdnOut, 0),
                         T::QsaO => (Shape::QsaO, 0),
+                        T::DenseGdnIn | T::DenseFaIn => {
+                            return Err(format!("{shape:?} is not a Flash-Next trunk shape"))
+                        }
                     };
                     trunk::build_program_for_rows(shape, cols, rows)
                         .map(|(pdi, txn)| PanelBuild { pdi, txn })

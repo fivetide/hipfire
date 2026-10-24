@@ -302,7 +302,7 @@ wiring attempt are in the root changelog. The design description and
 Gate K0 below are historical simulator records.
 
 `peacemaker-npu::kernels::gemm_g80_n512` (`design_g80_n512(m, 512, 6144, Epilogue::Bf16, Fast)`,
-`build_panel_program_out(rows_max, pitch, col0)`) is the program of the QSA `o_proj` / GDN
+`build_panel_program_n512(rows_max, pitch, col0, 6144)`) is the program of the QSA `o_proj` / GDN
 `out_proj` shapes (`Shape::{QsaO, GdnOut}`, N = 2560 = five 512-column panels, one pass each,
 K = 6144). Numerics: integer-exact accumulation on the array over the whole K, one RNE to BF16
 (`bf16_direct`); no int32 partial, combine or fold anywhere. It reuses the silicon-proven V8 geometry
@@ -329,6 +329,26 @@ Host layout: arg0 = A, 8 segments of `W*kc*4608` B (`W` 512-row waves; 56,623,10
 arg1 = B, 8 segments of `kc*4352` B (3,342,336 B), arg2 = C row-major `rows*pitch*2` B (pitch 2560,
 panel `p` at `col0 = 512*p`, `append_run_body` / `append_lean_run_body` with `arena_base[2] =
 2*512*p`) or native 16,384 B tiles. `pack_a_bf16` / `pack_b_bf16` dispatch on the design.
+
+### qwen3.8-27b dense in-projections: K = 5120 on N512 (HIPF-161, kernel/program/transport only)
+
+The same N512 program at `k = 5120` (kc 80, two B groups of 40, credit 63; B panel 348,160 B per column) holds the
+27B in-projections, whose every NPU-eligible projection has K = 5120: GDN qkv 10240 + z 6144 + a 48 + b 48 = 16480
+columns (33 panels, pitch 16896) and FA gated q 12288 + k 1024 + v 1024 = 14336 (28 panels). One BF16 rounding after
+the whole K, as above; the N1280 core (`MAX_KC` 40) cannot hold K5120 without an int32 partial combine.
+
+- GPU producer: `Gpu::npu_trunk_pack_a_bf16` with `NpuBf16Layout { k: 5120, n512: true, .. }` writes the 8-segment
+  512-row-wave A stream (`rows * 5760` B) and the compact `Dm/De` vector (`npu_trunk_pack_a_bf16_k5120`, same grid15-up
+  quant DAG as K2560). `n512: false` writes the N1280 4-segment stream the emulate GEMM addresses (`npu_trunk_i8_gemm_pm`
+  is K-generic); consume and the emulate GEMM refuse `n512` layouts (the NPU writes row-major C itself).
+- Transport: `railgun::npu::trunk::Shape::{DenseGdnIn, DenseFaIn}` (`Shape::k()` = 5120, `is_n512()`); the N512 A arena is
+  sized for the largest K of the open N512 shapes, B panels from `k`. The relay keys adaptive contexts by `(k, padded rows)`.
+- Oracles: `npu_trunk_glue_check` (pack vs the CPU N512 stream, emulate vs `bf16_direct` at both shapes),
+  `g80_n512_k5120_*` and the ignored `g80_n512_real_27b_tile` (real qwen3.8-27b tiles) simulator tests,
+  `npu-trunk-transport --shape dense_gdn_in --shape dense_fa_in [--corun]` on silicon.
+
+Measured on gfx1151 (8192 rows, exact every round, fclk not pinned): GDN 60.5 ms busy p50 = 22.9 TOPS (wall 20.7),
+FA 51.3 ms = 23.4 TOPS (wall 21.2); against 16 GiB/round of GPU copies GDN 17.8 / 15.1 and FA 19.5 / 16.6 TOPS.
 
 ### Gate K0 (design round verdict section 2), simulator ticks, never silicon (historical)
 

@@ -4700,6 +4700,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "npu_trunk_consume_bf16_fast",
                 "npu_trunk_epi_bf16",
                 "npu_trunk_pack_a_bf16",
+                "npu_trunk_pack_a_bf16_k5120",
                 "npu_trunk_pack_a_bf16_old",
             ]
         );

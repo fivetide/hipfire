@@ -1467,8 +1467,8 @@ mod pin_tests {
 
     #[test]
     fn serving_trunk_pins_two_banks_of_userptr_arenas() {
-        // 2 x (A 8192x2880 + GdnIn C 272,629,760 + QsaIn C 230,686,720 + three 4 KiB pages).
-        assert_eq!(trunk_pin_bytes(), 1_053_843_456);
+        // 2 x (A 8192x2880 + GdnIn C 272,629,760 + QsaIn C 230,686,720 + five 4 KiB pages).
+        assert_eq!(trunk_pin_bytes(), 1_053_859_840);
         assert_eq!(bounded_memlock_bytes(trunk_pin_bytes()), 1_318_060_032);
     }
 }
