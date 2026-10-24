@@ -308,7 +308,106 @@ pub fn kernel_record(
         differential: cross_check(facts, meta),
         pm_obligations: BTreeMap::new(),
         pm_analyze_error: None,
+        guard_flag: None,
     }
+}
+
+/// #867 kernel-guard certificate for one lifted kernel: the kernarg offset
+/// of its ControlWord pointer, or `None` when the kernel does not open with
+/// the certified guard prologue. The entry block must be exactly
+///
+/// ```text
+/// s_load_b64 s[P:P+1], s[0:1], <flag offset>   ; s[0:1] = kernarg pointer
+/// s_waitcnt lgkmcnt(0)
+/// s_load_b32 sF, s[P:P+1], 0
+/// s_waitcnt lgkmcnt(0)
+/// s_cmp_eq_u32 sF, 0
+/// s_cbranch_scc0 <body> | s_cbranch_scc1 <exit>
+/// ```
+///
+/// (plus `s_delay_alu` hints), with the SCC-set successor a block holding
+/// only `s_endpgm`. The block is scalar, so every wave of a launch takes the
+/// same edge, and its only memory accesses are those two loads: a clear flag
+/// ends the launch with no store, atomic or other load. gfx11 only (the
+/// `s_waitcnt` encoding); gfx12 objects get no certificate.
+pub fn guard_flag(kernel: &Kernel, arch: Arch) -> Option<u32> {
+    use peacemaker_ir::cfg::{Cond, Terminator};
+    let (Arch::Gfx1100 | Arch::Gfx1151) = arch else {
+        return None;
+    };
+    let Abi::Hsa { descriptor, .. } = &kernel.abi else {
+        return None;
+    };
+    // Only the kernarg-segment-pointer user SGPR is enabled ahead of the
+    // others, so it is s[0:1].
+    if descriptor.kernel_code_properties.0 & 0xf != 0x8 {
+        return None;
+    }
+    let body = &kernel.body;
+    let text = |block: usize| -> Option<Vec<String>> {
+        let (start, end) = body.blocks.get(block)?.range;
+        body.layout[start..end]
+            .iter()
+            .map(|&id| body.insts.get(id)?.text(arch).ok())
+            .filter(|t| !t.as_deref().is_some_and(|t| t.starts_with("s_delay_alu")))
+            .collect()
+    };
+    let entry = text(0)?;
+    // gfx11 `s_waitcnt` simm16: lgkmcnt is bits 9:4 (gfx12 has `s_wait_kmcnt`).
+    let lgkm_drained = |t: &str| {
+        t.strip_prefix("s_waitcnt ")
+            .and_then(|n| n.parse::<i16>().ok())
+            .is_some_and(|n| (n as u16 >> 4) & 0x3f == 0)
+    };
+    let Terminator::Branch {
+        cond,
+        taken,
+        fallthrough,
+    } = body.blocks[0].term
+    else {
+        return None;
+    };
+    let exit = match cond {
+        Cond::Scc0 => fallthrough,
+        Cond::Scc1 => taken,
+        _ => return None,
+    };
+    if text(exit.0)? != ["s_endpgm"] || body.blocks[exit.0].term != Terminator::EndPgm {
+        return None;
+    }
+    let [load_ptr, wait0, load_flag, wait1, cmp, _branch] = &entry[..] else {
+        return None;
+    };
+    let offset = |t: &str| match t {
+        "null" | "0" | "0x0" => Some(0),
+        t => match t.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => t.parse().ok(),
+        },
+    };
+    let (ptr, flag_offset) = load_ptr
+        .strip_prefix("s_load_b64 ")?
+        .split_once(", s[0:1], ")?;
+    let flag_offset = offset(flag_offset)?;
+    let (flag, zero) = load_flag
+        .strip_prefix("s_load_b32 ")?
+        .split_once(&format!(", {ptr}, "))?;
+    let ptr_ok = ptr
+        .strip_prefix("s[")
+        .and_then(|p| p.strip_suffix(']'))
+        .and_then(|p| p.split_once(':'))
+        .and_then(|(lo, hi)| Some((lo.parse::<u32>().ok()?, hi.parse::<u32>().ok()?)))
+        .is_some_and(|(lo, hi)| hi == lo + 1);
+    let flag_ok = flag
+        .strip_prefix('s')
+        .is_some_and(|n| n.parse::<u32>().is_ok());
+    (ptr_ok
+        && flag_ok
+        && offset(zero) == Some(0)
+        && lgkm_drained(wait0)
+        && lgkm_drained(wait1)
+        && *cmp == format!("s_cmp_eq_u32 {flag}, 0"))
+    .then_some(flag_offset)
 }
 
 /// `.actual_access` per argument from the kernel's own metadata note.
@@ -580,6 +679,7 @@ pub fn certify(bytes: &[u8], sidecar: Option<&str>) -> Result<Receipt, CertError
         let mut record = kernel_record(kernel, &facts, &meta);
         record.pm_obligations = pm;
         record.pm_analyze_error = pm_error;
+        record.guard_flag = guard_flag(kernel, arch);
         if facts.args.iter().any(|a| a.bound.is_some()) {
             obligations.insert("InBoundsNoAlias".to_owned());
         }

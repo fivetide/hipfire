@@ -169,4 +169,10 @@ pub struct KernelRecord {
     pub pm_obligations: BTreeMap<String, usize>,
     /// `edit::analyze` failed; facts come from the kernargs pass alone.
     pub pm_analyze_error: Option<String>,
+    /// #867 kernel guard: the kernarg offset of the ControlWord pointer whose
+    /// clear flag (`u32` zero) ends every wave before any other instruction
+    /// that touches memory (`railgun_cert::guard_flag`). Absent from receipts
+    /// written before the field and from unguarded kernels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_flag: Option<u32>,
 }

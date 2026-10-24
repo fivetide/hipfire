@@ -181,6 +181,9 @@ pub struct KernelFacts {
     pub hidden_grid_live: Vec<String>,
     /// G8: A1 ⊆ metadata-conservative (`pass`, `fail`, `not_applicable`).
     pub differential: String,
+    /// #867: kernarg offset of the ControlWord pointer whose clear flag makes
+    /// the launch a certified no-op (`railgun_cert::guard_flag`).
+    pub guard_flag: Option<u32>,
 }
 
 impl KernelFacts {
@@ -270,6 +273,7 @@ impl KernelFacts {
             hidden,
             hidden_grid_live: record.implicit.hidden_grid_live.clone(),
             differential: record.differential.status.clone(),
+            guard_flag: record.guard_flag,
         })
     }
 
@@ -464,6 +468,10 @@ pub struct KernelNode {
     pub effects: Vec<RegionEffect>,
     pub read_cache: ReadCache,
     pub lowering: Lowering,
+    /// #867: the ControlWord resource whose clear flag makes this launch a
+    /// no-op, from the object's guard certificate (`KernelFacts::guard_flag`)
+    /// with its pointer bound to the start of that resource.
+    pub guard: Option<ResourceId>,
 }
 
 /// A word of the program and where it is patched.
@@ -484,6 +492,33 @@ pub struct KernelProgram {
     pub resources: Vec<Binding>,
     pub words: Vec<ProgramWord>,
     pub nodes: Vec<KernelNode>,
+    /// #867 IF bodies, disjoint and in node order
+    /// ([`KernelProgram::add_conditional`]).
+    pub conditionals: Vec<Conditional>,
+}
+
+/// #867: how a [`Conditional`] body is skipped when its flag is clear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CondLowering {
+    /// The tape is unchanged: every body node is a guarded kernel whose
+    /// certified no-op path the clear flag takes (hot path).
+    KernelGuard,
+    /// `COND_EXEC` discards the body's command dwords, behind a
+    /// `RELEASE_MEM`/`WAIT_REG_MEM` fence that makes the flag fresh (coarse
+    /// segments only: the fence drains the queue).
+    CpSkip,
+}
+
+/// #867 IF on a device-written ControlWord: nodes `body` take effect only
+/// when the first `u32` of `flag` is nonzero when the body starts. A clear
+/// flag leaves every byte the body would write unchanged. The planner
+/// treats the body as executed either way (its effects stay in every edge).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Conditional {
+    pub flag: ResourceId,
+    pub body: std::ops::Range<usize>,
+    pub lowering: CondLowering,
 }
 
 /// Author the program for `launches`, in order (§1.1, §2.1).
@@ -672,6 +707,15 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
         } else {
             Lowering::Pm4
         };
+        let guard = f.guard_flag.and_then(|at| {
+            args.iter().find_map(|(offset, arg)| match arg {
+                Arg::Resource {
+                    resource,
+                    interior: 0,
+                } if *offset == at => Some(*resource),
+                _ => None,
+            })
+        });
         nodes.push(KernelNode {
             symbol: launch.symbol.clone(),
             kref: Some(facts.kref.clone()),
@@ -685,6 +729,7 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
             effects,
             read_cache: f.read_cache,
             lowering,
+            guard,
         });
     }
     KernelProgram {
@@ -692,6 +737,7 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
         resources,
         words,
         nodes,
+        conditionals: Vec::new(),
     }
 }
 
@@ -709,10 +755,112 @@ fn uncertified_node(launch: &LaunchRecord, reason: String) -> KernelNode {
         effects: Vec::new(),
         read_cache: ReadCache::Unknown,
         lowering: Lowering::HipDirect { reason },
+        guard: None,
     }
 }
 
 impl KernelProgram {
+    /// Make `c.body` an IF on `c.flag` (#867). Refused unless: the body is
+    /// non-empty, in range and disjoint from every other conditional (no
+    /// nesting); `flag` is a resource of at least 4 bytes; every body node
+    /// is PM4. `KernelGuard` also needs every body node's certified guard on
+    /// `flag` and no body node but the last writing `flag` (each node reads
+    /// it at its own start, so earlier writes would split the decision).
+    /// `CpSkip` needs [`crate::plan::cp_skip_admitted`] for the arch.
+    pub fn add_conditional(&mut self, c: Conditional) -> Result<(), String> {
+        let Conditional {
+            flag,
+            ref body,
+            lowering,
+        } = c;
+        if body.is_empty() || body.end > self.nodes.len() {
+            return Err(format!(
+                "conditional body {body:?} is empty or past {} nodes",
+                self.nodes.len()
+            ));
+        }
+        if let Some(other) = self
+            .conditionals
+            .iter()
+            .find(|o| o.body.start < body.end && body.start < o.body.end)
+        {
+            return Err(format!(
+                "conditional body {body:?} overlaps {:?} (nesting is not supported)",
+                other.body
+            ));
+        }
+        if self
+            .resources
+            .get(flag.0 as usize)
+            .is_none_or(|b| b.bytes < 4)
+        {
+            return Err(format!(
+                "flag resource {} is not a 4-byte ControlWord",
+                flag.0
+            ));
+        }
+        for (i, node) in self.nodes[body.clone()].iter().enumerate() {
+            let j = body.start + i;
+            if !node.lowering.is_pm4() {
+                return Err(format!(
+                    "node {j} ({}) in a conditional body is not PM4",
+                    node.symbol
+                ));
+            }
+            if lowering == CondLowering::KernelGuard {
+                if node.guard != Some(flag) {
+                    return Err(format!(
+                        "node {j} ({}) has no certified guard on flag resource {}",
+                        node.symbol, flag.0
+                    ));
+                }
+                if j + 1 < body.end
+                    && node
+                        .effects
+                        .iter()
+                        .any(|e| e.resource == flag && e.writes())
+                {
+                    return Err(format!(
+                        "node {j} ({}) writes the flag before the body's last node",
+                        node.symbol
+                    ));
+                }
+            }
+        }
+        if lowering == CondLowering::CpSkip && !crate::plan::cp_skip_admitted(&self.arch) {
+            return Err(format!("COND_EXEC skip is not verified on {}", self.arch));
+        }
+        let at = self
+            .conditionals
+            .partition_point(|o| o.body.start < body.start);
+        self.conditionals.insert(at, c);
+        Ok(())
+    }
+
+    /// #867 bounded WHILE: `iterations` copies of a `len`-node body laid out
+    /// back to back from node `first`, each an IF on `flag`. The body's last
+    /// node writes the continue decision into `flag`; once it is clear every
+    /// later copy is skipped, so the copies run while the flag stays set, at
+    /// most `iterations` times.
+    pub fn bounded_while(
+        &mut self,
+        flag: ResourceId,
+        first: usize,
+        len: usize,
+        iterations: usize,
+        lowering: CondLowering,
+    ) -> Result<(), String> {
+        for k in 0..iterations {
+            let start = first + k * len;
+            self.add_conditional(Conditional {
+                flag,
+                body: start..start + len,
+                lowering,
+            })?;
+        }
+        Ok(())
+    }
+
     /// The node's full kernarg segment as the loaded object lays it out
     /// (`loader_bytes`, which must equal the certified segment): explicit
     /// arguments re-encoded from the program (resources from their bindings,
@@ -819,6 +967,7 @@ pub(crate) mod tests {
                 hidden: Vec::new(),
                 hidden_grid_live: Vec::new(),
                 differential: "pass".into(),
+                guard_flag: None,
             },
         })
     }
@@ -982,5 +1131,64 @@ pub(crate) mod tests {
         assert!(
             matches!(&program.nodes[0].lowering, Lowering::HipDirect { reason } if reason.contains("hidden_queue_ptr"))
         );
+    }
+
+    /// `l` with a guard certificate on its pointer at +0.
+    pub(crate) fn guarded(mut l: LaunchRecord) -> LaunchRecord {
+        let mut f = (*l.facts.clone().unwrap()).clone();
+        f.facts.guard_flag = Some(0);
+        l.facts = Ok(Arc::new(f));
+        l
+    }
+
+    #[test]
+    fn kernel_guard_needs_the_certificate_on_the_flag_and_a_last_writer() {
+        let (flag, x, y) = (0x7000_0000u64, 0x7100_0000u64, 0x7200_0000u64);
+        let body = vec![
+            ptr(0, &[MemClass::SmemLoad]),
+            ptr(8, &[MemClass::VmemStore]),
+        ];
+        let step = vec![ptr(0, &[MemClass::SmemLoad, MemClass::VmemStore])];
+        let launches = vec![
+            guarded(launch(&[(0, flag), (8, y)], 16, body.clone())),
+            guarded(launch(&[(0, flag)], 8, step.clone())),
+            launch(&[(0, flag), (8, x)], 16, body.clone()),
+            guarded(launch(&[(0, x), (8, y)], 16, body)),
+        ];
+        let mut p = author("gfx1151", &launches);
+        let f = p.nodes[0].guard.unwrap();
+        assert_eq!(p.nodes[1].guard, Some(f));
+        assert_eq!(p.nodes[2].guard, None, "no certificate");
+        assert_ne!(p.nodes[3].guard, Some(f), "certified on another resource");
+        let c = |body: std::ops::Range<usize>, lowering| Conditional {
+            flag: f,
+            body,
+            lowering,
+        };
+        for refused in [2..3, 3..4, 1..3, 0..0, 3..5] {
+            assert!(
+                p.add_conditional(c(refused.clone(), CondLowering::KernelGuard))
+                    .is_err(),
+                "{refused:?}"
+            );
+        }
+        // The flag writer may end the body, not open it.
+        let mut swapped = author("gfx1151", &[launches[1].clone(), launches[0].clone()]);
+        assert!(swapped
+            .add_conditional(c(0..2, CondLowering::KernelGuard))
+            .is_err());
+        p.add_conditional(c(0..2, CondLowering::KernelGuard))
+            .unwrap();
+        assert!(
+            p.add_conditional(c(1..3, CondLowering::CpSkip)).is_err(),
+            "overlap"
+        );
+        p.add_conditional(c(2..4, CondLowering::CpSkip)).unwrap();
+        assert_eq!(p.conditionals.len(), 2);
+
+        let mut gfx12 = author("gfx1201", &launches);
+        assert!(gfx12
+            .add_conditional(c(2..4, CondLowering::CpSkip))
+            .is_err());
     }
 }

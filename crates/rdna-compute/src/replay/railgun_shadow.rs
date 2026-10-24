@@ -651,6 +651,11 @@ fn lower(
                     buffers.push(buffer);
                 }
                 Pm4Op::Exit => commands.trailing_release()?,
+                // Recorded tapes author no conditionals, and gfx12 has no
+                // COND_EXEC receipt (`rp::cp_skip_admitted`).
+                Pm4Op::SkipBegin(_) | Pm4Op::SkipEnd => {
+                    return Err("railgun M1 lowers no CP-skip conditionals".into())
+                }
             }
         }
         let ib = commands
@@ -763,6 +768,9 @@ fn lower_executable(
                     .map_err(|e| format!("{}: {e}", node.symbol))?;
             }
             Pm4Op::Exit => commands.trailing_release()?,
+            Pm4Op::SkipBegin(_) | Pm4Op::SkipEnd => {
+                return Err("railgun M1 lowers no CP-skip conditionals".into())
+            }
         }
     }
     let ours = commands

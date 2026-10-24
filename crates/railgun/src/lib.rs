@@ -90,7 +90,7 @@ impl Formula {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct ResourceId(pub u32);
 
 /// §1.1 `Resource.kind`.
