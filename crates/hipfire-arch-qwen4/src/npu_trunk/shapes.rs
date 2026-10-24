@@ -94,7 +94,7 @@ impl From<FamilyMask> for FamilySet {
 
 impl From<FamilySet> for FamilyMask {
     fn from(set: FamilySet) -> Self {
-        FamilyMask::from_bits(set.0 as u8)
+        FamilyMask::from_bits(u8::try_from(set.0).expect("Flash-Next has 8 families"))
     }
 }
 

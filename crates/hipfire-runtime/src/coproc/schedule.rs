@@ -9,7 +9,8 @@
 //!
 //! The order is layer-major: while the GPU runs one bank's layer, the co-processor computes the other bank's
 //! projections. Bank B's own initialization (embedding) is queued after bank A's first kick, so the first chain
-//! (the pipeline fill) does not wait behind it. [`pair_edges`] lists every dependency the order must respect.
+//! (the pipeline fill) does not wait behind it; that placement is a latency choice, not a dependency.
+//! [`pair_edges`] lists every dependency the order must respect.
 
 /// One step of the pair schedule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

@@ -484,6 +484,16 @@ impl NpuForward {
                         }
                     }
                 }
+                // The planner prices the map's layer counts and K: they must be this model's.
+                let kinds: Vec<usize> = bundle
+                    .weights
+                    .layer_refs
+                    .iter()
+                    .map(|l| usize::from(l.gdn.is_none()))
+                    .collect();
+                FLASH_NEXT
+                    .check_model(&kinds, bundle.config.hidden_size)
+                    .map_err(fail)?;
                 if mode == NpuTrunkMode::Auto {
                     // Reject the memory rung downgrade before downloading stock rows.
                     let (free, _) = gpu.device_mem_info()?;
@@ -2272,9 +2282,9 @@ impl NpuForward {
                             last_seq[bank] = seq[bank];
                         }
                     }
-                    // Same stream: prepare(0, A) is enqueued before bank B's
-                    // initialization overwrites the shared init buffers (Footprint table).
-                    PairOp::Init { .. } => {
+                    // Bank A initialized before the pair; bank B's init follows kick(0, A) only as the
+                    // pipeline fill (NPU(0, A) does not wait behind bank B's embedding/PLE staging).
+                    PairOp::Init { bank: 1 } => {
                         let bank_b_tokens = &tokens[rows[0]..];
                         initialize(
                             gpu,
@@ -2327,6 +2337,9 @@ impl NpuForward {
                             Step::IndexedAttention(_) => slots[bank].1 += 1,
                             _ => unreachable!("typed mixer"),
                         }
+                    }
+                    PairOp::Init { bank } => {
+                        unreachable!("the pair schedule initializes bank B only, not {bank}")
                     }
                 }
             }

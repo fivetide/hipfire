@@ -120,12 +120,25 @@ pub struct StageMap {
 impl StageMap {
     /// Structural invariants: kinds name distinct layers, every family belongs to exactly one group of its kind,
     /// and each group's families are adjacent in fused order (so an owned group is one contiguous column range).
+    /// Group and out-family names are distinct: they key one `families` table of the calibration.
     pub fn validate(&self) -> Result<(), String> {
         if self.families.is_empty() || self.families.len() > 32 {
             return Err(format!("{}: 1..=32 families required", self.tag));
         }
         if self.kinds[0].name == self.kinds[1].name || self.kinds.iter().any(|k| k.in_k == 0) {
             return Err(format!("{}: invalid layer kinds", self.tag));
+        }
+        let names: Vec<&str> = self
+            .groups
+            .iter()
+            .map(|g| g.name)
+            .chain(self.kinds.iter().map(|k| k.out_family))
+            .collect();
+        if (1..names.len()).any(|i| names[..i].contains(&names[i])) {
+            return Err(format!(
+                "{}: group and out-family names must be distinct",
+                self.tag
+            ));
         }
         for (i, f) in self.families.iter().enumerate() {
             if f.kind >= KINDS || f.cols == 0 {
@@ -143,7 +156,7 @@ impl StageMap {
             let contiguous = members.windows(2).all(|w| w[1] == w[0] + 1);
             if g.kind >= KINDS
                 || members.is_empty()
-                || g.families >> self.families.len() != 0
+                || g.families & !self.all().0 != 0
                 || covered & g.families != 0
                 || !contiguous
                 || members.iter().any(|&i| self.families[i].kind != g.kind)
@@ -158,9 +171,35 @@ impl StageMap {
         Ok(())
     }
 
-    /// Every family.
+    /// The map against a loaded model: `layer_kinds[l]` is the kind of layer `l` (from the model's mixers) and
+    /// `hidden` the width every input projection reduces over. The planner prices `kinds[k].layers` and `in_k`, so
+    /// a mismatch would mis-price every plan; the caller leaves the route off with this reason.
+    pub fn check_model(&self, layer_kinds: &[usize], hidden: usize) -> Result<(), String> {
+        for (k, kind) in self.kinds.iter().enumerate() {
+            let layers = layer_kinds.iter().filter(|&&l| l == k).count();
+            if layers != kind.layers {
+                return Err(format!(
+                    "stage map declares {} {} layers, the model has {layers}",
+                    kind.layers, kind.name
+                ));
+            }
+            if kind.in_k != hidden {
+                return Err(format!(
+                    "stage map declares {} in-projection K = {}, the model's hidden size is {hidden}",
+                    kind.name, kind.in_k
+                ));
+            }
+        }
+        if let Some(&k) = layer_kinds.iter().find(|&&k| k >= KINDS) {
+            return Err(format!("layer kind {k} is not in the stage map"));
+        }
+        Ok(())
+    }
+
+    /// Every family (none for an empty map).
     pub fn all(&self) -> FamilySet {
-        FamilySet(u32::MAX >> (32 - self.families.len()))
+        let shift = 32u32.saturating_sub(self.families.len() as u32);
+        FamilySet(u32::MAX.checked_shr(shift).unwrap_or(0))
     }
 
     /// Union of the groups whose bit is set in `bits` (bit `i` = `groups[i]`).
@@ -329,6 +368,35 @@ pub(crate) mod tests {
         let mut orphan = DENSE;
         orphan.groups[3].families = 0x20; // v in no group
         assert!(orphan.validate().is_err());
+        // Group and out-family names key one calibration table.
+        let mut twice = DENSE;
+        twice.groups[3].name = "q";
+        assert!(twice.validate().is_err());
+        let mut clash = DENSE;
+        clash.groups[3].name = "fa.o";
+        assert!(clash.validate().is_err());
+        let empty = StageMap {
+            families: &[],
+            ..DENSE
+        };
+        assert_eq!(empty.all(), FamilySet::NONE);
+        assert!(empty.validate().is_err());
+    }
+
+    #[test]
+    fn the_map_must_match_the_loaded_models_layers_and_width() {
+        let stack: Vec<usize> = (0..64).map(|l| usize::from(l % 4 == 3)).collect();
+        DENSE.check_model(&stack, 5120).unwrap();
+        let err = DENSE.check_model(&stack[..60], 5120).unwrap_err();
+        assert_eq!(err, "stage map declares 48 gdn layers, the model has 45");
+        let err = DENSE.check_model(&stack, 2560).unwrap_err();
+        assert!(
+            err.contains("K = 5120") && err.ends_with("hidden size is 2560"),
+            "{err}"
+        );
+        let mut odd = stack.clone();
+        odd.push(2);
+        assert!(DENSE.check_model(&odd, 5120).is_err());
     }
 
     #[test]

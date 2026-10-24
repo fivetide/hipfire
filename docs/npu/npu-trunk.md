@@ -458,7 +458,23 @@ one (layer, bank) visit.
   `Run(l,A)`, `Prepare(l+1,A)`, `Run(l,B)`, `Prepare(l+1,B)`. `pair_edges` lists the
   dependencies the order respects (activation pack to the NPU and its result
   back, A-arena reuse after retire, residual rows, layer state A before B); the
-  Flash-Next pair executor iterates `pair_schedule`.
+  Flash-Next pair executor iterates `pair_schedule`. Placing `Init(B)` after the
+  first kick is a latency choice (the pipeline fill), not a dependency.
+* **Model check.** At open, `StageMap::check_model` compares each kind's layer count
+  with the loaded model's mixers and `in_k` with its hidden size. A mismatch leaves
+  the route off with that reason (`on`: load error), so a map can never price
+  another model's plans.
+
+Limits of the stage as it stands (a third kind or a fifth group is a schema change):
+
+* Exactly two layer kinds (`KINDS = 2`) and four ownership groups (`GROUPS = 4`);
+  the planner enumerates the 15 nonempty group subsets.
+* Kind 1 is the attention mixer: the `qsa_*` GPU terms, `qsa_order` and the
+  attention out-family order stall price it; kind 0 takes `gdn_core_per_layer_ms`.
+* A pair's fill is the first bank-A chain of kind 0 when kind 0 moves anything,
+  else of kind 1 (the layer stack is assumed to start with kind 0).
+* A map with more natural families than four groups must merge them; the dense
+  27B test map owns FA `k` and `v` as one `kv` group.
 
 ## Stored calibration and deterministic planning (0.4.2)
 
