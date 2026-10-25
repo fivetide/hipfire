@@ -332,6 +332,42 @@ fn try_a8_hin_prepared(
         .map(Some)
 }
 
+/// F1-lite A8 gate/up from the int8 x sidecar `xq`: on gfx1151 the epilogue
+/// also writes w_down's sidecar (`A8Down`, no h); else h into
+/// `gate_ffn_batch` for [`try_a8_hin_prepared`] (`A8H`).
+fn a8_gate_up_silu(
+    gpu: &mut Gpu,
+    layer: &FfnLayerView<'_>,
+    pbs: &BatchScratch<'_>,
+    xq: *mut std::ffi::c_void,
+    n: usize,
+) -> HipResult<FfnGateOutput> {
+    let (m, k) = (layer.w_gate.m, layer.w_gate.k);
+    if let Some(awq) = layer.w_down.awq_scale {
+        if let Some(prep) = gpu.gemm_gate_up_silu_a8_mq4g256v2_i8_prequant(
+            &layer.w_gate.buf,
+            &layer.w_up.buf,
+            xq,
+            awq,
+            m,
+            k,
+            n,
+        )? {
+            return Ok(FfnGateOutput::A8Down(prep));
+        }
+    }
+    gpu.gemm_gate_up_silu_mq4g256v2_i8_prequant(
+        &layer.w_gate.buf,
+        &layer.w_up.buf,
+        xq,
+        &pbs.gate_ffn_batch,
+        m,
+        k,
+        n,
+    )?;
+    Ok(FfnGateOutput::A8H)
+}
+
 /// C2: when MQ4V2 + IU4 producer sidecar is live, emit block_i4_128 from
 /// RMSNorm/FWHT and return a prepared handle. `None` → caller keeps the
 /// incumbent fused_rmsnorm + standalone-quantizer path.
@@ -466,6 +502,9 @@ enum FfnGateOutput {
     Iu4H,
     Fp8H,
     A8H,
+    /// The A8 gate/up epilogue wrote the w_down `block_i8_128` sidecar
+    /// (`int8_mmq_down_scratch`); h was not written.
+    A8Down(rdna_compute::Int8MmqPrepared),
 }
 
 fn packed_mq4_down_admitted(
@@ -1968,16 +2007,7 @@ fn swiglu_ffn_gate_up_batched(
     if let Some(prep) = &a8_prep {
         let xq = gpu.int8_mmq_prepared_ptr(prep, layer.w_gate.k, n)?;
         if f1lite {
-            gpu.gemm_gate_up_silu_mq4g256v2_i8_prequant(
-                &layer.w_gate.buf,
-                &layer.w_up.buf,
-                xq,
-                &pbs.gate_ffn_batch,
-                layer.w_gate.m,
-                layer.w_gate.k,
-                n,
-            )?;
-            return Ok(FfnGateOutput::A8H);
+            return a8_gate_up_silu(gpu, layer, pbs, xq, n);
         }
         gpu.gemm_mq4g256v2_mmq_set_prequant_i8(
             &layer.w_gate.buf,
@@ -1997,16 +2027,7 @@ fn swiglu_ffn_gate_up_batched(
         )?;
     } else if f1lite && iu4_prep.is_none() && gpu.a8_prefill_active(n, layer.w_gate.k) {
         let xq = gpu.ensure_int8_mmq_x(&pbs.x_rot_batch, n, layer.w_gate.k)?;
-        gpu.gemm_gate_up_silu_mq4g256v2_i8_prequant(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
-            xq,
-            &pbs.gate_ffn_batch,
-            layer.w_gate.m,
-            layer.w_gate.k,
-            n,
-        )?;
-        return Ok(FfnGateOutput::A8H);
+        return a8_gate_up_silu(gpu, layer, pbs, xq, n);
     } else if let Some(prep) = &iu4_prep {
         // F1-lite: one GEMM v2 launch emits h; else the SET pair below.
         // A4 fusion (gfx1151 V2B only, default on; `HIPFIRE_V2B_A4_EPI=0` opts out): the epilogue
@@ -2371,6 +2392,18 @@ fn swiglu_ffn_down_batched(
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
+    // F1-lite implies the Residual epilogue and an MQ4G256V2 w_down.
+    if let FfnGateOutput::A8Down(prep) = h_source {
+        let xq = gpu.int8_mmq_down_prepared_ptr(&prep, hidden_dim, n)?;
+        return gpu.gemm_mq4g256v2_mmq_add_prequant_i8(
+            &layer.w_down.buf,
+            xq,
+            &pbs.x_batch,
+            layer.w_down.m,
+            hidden_dim,
+            n,
+        );
+    }
     if h_source == FfnGateOutput::A8H
         && gpu.a8_prefill_active(n, hidden_dim)
         && layer.w_down.dtype == DType::MQ4G256V2

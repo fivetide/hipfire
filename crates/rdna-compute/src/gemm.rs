@@ -22637,6 +22637,102 @@ impl Gpu {
         result
     }
 
+    /// [`Self::gemm_gate_up_silu_mq4g256v2_i8_prequant`] whose epilogue also
+    /// runs w_down's A8 hin producer on its own h (AWQ divide, signs1,
+    /// FWHT-256, signs2, `block_i8_128` quantize) and writes the sidecar into
+    /// `int8_mmq_down_scratch`, byte-identical to
+    /// [`Self::fused_silu_hin_rotate_mq_i8_batched`] on that h; h is not
+    /// stored. `awq` is w_down's AWQ scale (f32[m]). The 512 x 128 CTA owns
+    /// whole 256-row FWHT groups, so `m % 256 == 0`. `Ok(None)` without
+    /// launching off exact gfx1151 (the only arch it was measured on) or
+    /// off-shape; the caller then runs the h + hin pair.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_gate_up_silu_a8_mq4g256v2_i8_prequant(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        xq: *mut c_void,
+        awq: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<Option<crate::scratch::Int8MmqPrepared>> {
+        if self.arch != "gfx1151"
+            || !self.mq4v2_symmetric
+            || m == 0
+            || m % 256 != 0
+            || k % 256 != 0
+            || n == 0
+        {
+            return Ok(None);
+        }
+        const MODULE: &str = "gemm_mq4g256v2_gate_up_silu_a8_mmq_i8_gfx11";
+        const KERNEL: &str = "gemm_mq4g256v2_gate_up_silu_a8_mmq_i8";
+        self.bind_thread()?;
+        self.flush_residual_fold()?;
+        self.ensure_mq_signs()?;
+        let res = self.reserve_int8_mmq_down(m, n)?;
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_MQ4G256V2_GATE_UP_SILU_A8_MMQ_I8_GFX11_SRC,
+            KERNEL,
+        )?;
+        let mut gp = gate.buf.as_ptr();
+        let mut up = up.buf.as_ptr();
+        let mut xp = xq;
+        let mut awp = awq.buf.as_ptr();
+        let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let mut yp = res.ptr();
+        let mut mv = m as i32;
+        let mut kv = k as i32;
+        let mut nv = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gp as *mut _ as *mut c_void,
+            &mut up as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut awp as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mv as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemm",
+            KERNEL,
+            2 * m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + (m / 128) * n * 136,
+        );
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [(2 * m / 512) as u32, n.div_ceil(128) as u32, 1],
+            [1024, 1, 1],
+            55296,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp);
+                b.push_ptr(up);
+                b.push_ptr(xp);
+                b.push_ptr(awp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        Ok(Some(crate::scratch::Int8MmqPrepared::from_reservation(res)))
+    }
+
     /// ADD-epilogue fold, caller side. Offers `delta` (f32, >= n*m elements,
     /// otherwise dead until the next RMSNorm) to the next residual GEMM. When
     /// that GEMM takes the gfx1151 V2B route it writes its sum into `delta`

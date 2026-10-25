@@ -5487,6 +5487,17 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX11_T256_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx11.hip")
 );
+/// gfx1100/gfx1151 A8 gate/up SiLU + w_down sidecar (entry
+/// `gemm_mq4g256v2_gate_up_silu_a8_mmq_i8`, `I8_A8_EPI` build of the same
+/// file: 512 x 128 CTA, 1024 threads, LDS 55296): the epilogue runs the A8
+/// hin producer on its own h and writes `block_i8_128` byte-identical to
+/// `fused_silu_mul_mq_rotate_awq_i8_hin_gfx11`; h is never stored.
+pub const GEMM_MQ4G256V2_GATE_UP_SILU_A8_MMQ_I8_GFX11_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n#define I8_A8_EPI 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/block_i8_128_emit.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx11.hip")
+);
 /// gfx1100/gfx1151 exact-INT8 MQ6G256V2 prefill GEMM (`gemm_mq6g256v2_mmq_i8_set{,_bf16}_gfx11`,
 /// 128x128 tile, 512 threads; dynamic LDS `MQ6_I8_GFX11_LDS_BYTES` = 32768): the `block_i8_128`
 /// prelude without its standalone quantizer, then the kernel.

@@ -490,6 +490,99 @@ fn check(
     }
 }
 
+/// EPI=1: the fused gate/up + w_down A8 sidecar entry
+/// (`Gpu::gemm_gate_up_silu_a8_mq4g256v2_i8_prequant`) against the production
+/// pair it replaces (`gemm_gate_up_silu_mq4g256v2_i8_prequant` h, then
+/// `fused_silu_hin_rotate_mq_i8_batched`) on the same int8 x, byte for byte
+/// over every `block_i8_128` of the sidecar, plus a repeat launch. Every 37th
+/// token is all-zero (zero h, d = 0 blocks).
+#[allow(clippy::too_many_arguments)]
+fn check_epi(
+    gpu: &mut Gpu,
+    tally: &mut Tally,
+    label: &str,
+    gate: &Matrix,
+    up: &Matrix,
+    awq: &GpuTensor,
+    n: usize,
+    salt: u32,
+) {
+    let (m, k) = (gate.0, gate.1);
+    let mut x = activation(n, k, salt);
+    for t in (5..n).step_by(37) {
+        x[t * k..(t + 1) * k].fill(0.0);
+    }
+    let d_x = gpu.upload_f32(&x, &[n, k]).expect("upload X");
+    let d_xq = quantize_gpu(gpu, &d_x, n, k);
+    let d_g = gpu
+        .upload_raw(&gate.2, &[gate.2.len()])
+        .expect("upload gate");
+    let d_u = gpu.upload_raw(&up.2, &[up.2.len()]).expect("upload up");
+    let h = gpu.zeros(&[n * m], DType::F32).expect("alloc h");
+    let xq = d_xq.buf.as_ptr();
+    let bytes = (m / 128) * n * BLOCK_BYTES;
+    gpu.gemm_gate_up_silu_mq4g256v2_i8_prequant(&d_g, &d_u, xq, &h, m, k, n)
+        .expect("reference gate/up");
+    let res = gpu.reserve_int8_mmq(m, n).expect("reserve x sidecar");
+    gpu.fused_silu_hin_rotate_mq_i8_batched(&h, awq, res, m, n)
+        .expect("reference hin");
+    gpu.hip.device_synchronize().expect("sync reference");
+    let mut reference = vec![0u8; bytes];
+    gpu.hip
+        .memcpy_dtoh(
+            &mut reference,
+            gpu.scratch.int8_mmq_x_scratch.as_ref().unwrap(),
+        )
+        .expect("download reference");
+    let run = |gpu: &mut Gpu| -> Vec<u8> {
+        let prep = gpu
+            .gemm_gate_up_silu_a8_mq4g256v2_i8_prequant(&d_g, &d_u, xq, awq, m, k, n)
+            .expect("fused gate/up")
+            .expect("fused gate/up admitted");
+        gpu.int8_mmq_down_prepared_ptr(&prep, m, n)
+            .expect("down handle");
+        gpu.hip.device_synchronize().expect("sync fused");
+        let mut out = vec![0x5au8; bytes];
+        gpu.hip
+            .memcpy_dtoh(
+                &mut out,
+                gpu.scratch.int8_mmq_down_scratch.as_ref().unwrap(),
+            )
+            .expect("download fused");
+        out
+    };
+    let candidate = run(gpu);
+    let repeat = run(gpu);
+    let blocks = |a: &[u8], b: &[u8]| {
+        a.chunks(BLOCK_BYTES)
+            .zip(b.chunks(BLOCK_BYTES))
+            .filter(|(x, y)| x != y)
+            .count()
+    };
+    let differing = blocks(&reference, &candidate);
+    let repeated = blocks(&candidate, &repeat);
+    if let Some(i) = (0..bytes / BLOCK_BYTES).find(|&i| {
+        reference[i * BLOCK_BYTES..][..BLOCK_BYTES] != candidate[i * BLOCK_BYTES..][..BLOCK_BYTES]
+    }) {
+        eprintln!(
+            "  {label} first differing block {i} (k128 {} token {})",
+            i / n,
+            i % n
+        );
+    }
+    eprintln!(
+        "EPI {label} N={n} M={m} K={k} blocks={} differing={differing} repeat_differing={repeated}",
+        bytes / BLOCK_BYTES
+    );
+    tally.cases += 1;
+    tally.outputs += bytes / BLOCK_BYTES;
+    tally.gemm_diffs += differing;
+    tally.repeat_diffs += repeated;
+    for t in [d_x, d_xq, d_g, d_u, h] {
+        gpu.free_tensor(t).expect("free");
+    }
+}
+
 /// halo hwmon (amdgpu): sclk in Hz and power in uW, sampled every 20 ms
 /// while a burst runs; returns the medians (MHz, W).
 fn hwmon_dir() -> Option<std::path::PathBuf> {
@@ -655,6 +748,30 @@ fn timed(
                         }
                     })
                 }
+                // Gate shape only, production launchers: `a8hin` = SiLU GEMM
+                // writing h + the A8 hin producer; `a8epi` = the fused entry.
+                _ if arm == "a8hin" || arm == "a8epi" => {
+                    let du = d_u.as_ref().expect("a8hin/a8epi time the gate shape");
+                    let awq = awq.expect("gate arm needs w_down awq");
+                    let (da, yt, xq) = (&d_a, &y, xp8 as *mut c_void);
+                    let epi = arm == "a8epi";
+                    Box::new(move |g: &mut Gpu| {
+                        if epi {
+                            let r = g
+                                .gemm_gate_up_silu_a8_mq4g256v2_i8_prequant(
+                                    da, du, xq, awq, m, k, n,
+                                )
+                                .expect("a8epi gate/up");
+                            assert!(r.is_some(), "a8epi not admitted at N={n}");
+                        } else {
+                            g.gemm_gate_up_silu_mq4g256v2_i8_prequant(da, du, xq, yt, m, k, n)
+                                .expect("a8 gate/up");
+                            let res = g.reserve_int8_mmq(m, n).expect("reserve");
+                            g.fused_silu_hin_rotate_mq_i8_batched(yt, awq, res, m, n)
+                                .expect("a8 hin");
+                        }
+                    })
+                }
                 _ => panic!("arm {arm}"),
             };
             samples[ai].push(burst(gpu, &mut *call));
@@ -805,6 +922,44 @@ fn main() {
 
     let mut tally = Tally::default();
     let quick = std::env::var("QUICK").ok().as_deref() == Some("1");
+    if std::env::var("EPI").ok().as_deref() == Some("1") {
+        let layers: &[usize] = if quick { &[0] } else { &[0, 31, 63] };
+        let ns: &[usize] = if quick {
+            &[64, 333, 512]
+        } else {
+            &[48, 64, 100, 128, 200, 333, 511, 512, 1024, 4096]
+        };
+        for &layer in layers {
+            let gate = weight(&hfq, layer, &["mlp.gate_proj"]);
+            let up = weight(&hfq, layer, &["mlp.up_proj"]);
+            let down = format!("{MODEL_PREFIX}{layer}.mlp.down_proj.weight");
+            let awq = hipfire_runtime::hfq::load_awq_scale(&hfq, &gpu, &down, gate.0)
+                .expect("w_down AWQ scale");
+            for &n in ns {
+                check_epi(
+                    &mut gpu,
+                    &mut tally,
+                    &format!("gate-up-a8/layer{layer}"),
+                    &gate,
+                    &up,
+                    &awq,
+                    n,
+                    0x9000 + layer as u32 + n as u32,
+                );
+            }
+            gpu.free_tensor(awq).expect("free awq");
+        }
+        eprintln!(
+            "EPI SUMMARY cases={} blocks_compared={} differing={} repeat_differing={}",
+            tally.cases, tally.outputs, tally.gemm_diffs, tally.repeat_diffs
+        );
+        if tally.gemm_diffs + tally.repeat_diffs != 0 {
+            eprintln!("GFX11-A8 EPI ORACLE FAIL");
+            std::process::exit(1);
+        }
+        eprintln!("GFX11-A8 EPI ORACLE PASS");
+        return;
+    }
     let ns: &[usize] = if quick {
         &[48, 200, 512]
     } else {

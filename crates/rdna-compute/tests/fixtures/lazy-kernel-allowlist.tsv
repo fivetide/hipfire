@@ -559,6 +559,7 @@ module	gemm_mq4g256_lloyd_residual_wmma_mb4_k4_gfx1151	codec-outside-core-rungs	
 module	gemm_mq4g256_lloyd_residual_wmma_mb4_rdna3	codec-outside-core-rungs	Dense MQ4G256Lloyd/MQ4Lloyd route absent from admitted core artifact rungs; rdna-compute/src/gemm.rs:2031-2700
 module	gemm_mq4g256_lloyd_residual_wmma_rdna3	codec-outside-core-rungs	Dense MQ4G256Lloyd/MQ4Lloyd route absent from admitted core artifact rungs; rdna-compute/src/gemm.rs:2031-2700
 module	gemm_mq4g256_lloyd_residual_wmma_rdna4	codec-outside-core-rungs	Dense MQ4G256Lloyd/MQ4Lloyd route absent from admitted core artifact rungs; rdna-compute/src/gemm.rs:2031-2700
+module	gemm_mq4g256v2_gate_up_silu_a8_mmq_i8_gfx11	config-opt-in	Non-default configuration: kernel.gfx11_a8_prefill (gfx1151 F1-lite gate/up + w_down A8 sidecar); rdna-compute/src/gemm.rs:22650-22700
 module	gemm_mq4g256v2_moe_grouped_top10_simt	codec-outside-core-rungs	Non-slab MQ4G256V2 layout absent from core XTS artifact rungs; rdna-compute/src/gemm.rs:47813-47830
 module	gemm_mq4g256v2_residual_iu4_v2c_gfx11	developer-opt-in	Non-default developer override: HIPFIRE_GFX1100_PM_GEMM; rdna-compute/src/gemm.rs:956-967
 module	gemm_mq4g256v2_residual_mmq_i8_gfx11	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemm.rs:1650-1680

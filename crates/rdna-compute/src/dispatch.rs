@@ -2890,6 +2890,9 @@ impl Gpu {
                 int8_mmq_x_scratch: None,
                 int8_mmq_x_scratch_bytes: 0,
                 int8_mmq_generation: 0,
+                int8_mmq_down_scratch: None,
+                int8_mmq_down_scratch_bytes: 0,
+                int8_mmq_down_generation: 0,
                 qwen4_moe_group_scratch: None,
                 qwen4_moe_group_scratch_bytes: 0,
                 qwen4_moe_down_i4_scratch: None,
@@ -5449,6 +5452,38 @@ impl Gpu {
         n: usize,
     ) -> HipResult<*mut c_void> {
         let (generation, ptr) = self.scratch.int8_mmq_live();
+        prepared.checked_ptr(generation, ptr, k, n)
+    }
+
+    /// [`Self::reserve_int8_mmq`] for the A8 gate/up epilogue's w_down
+    /// sidecar (`int8_mmq_down_scratch`); never aliases the x sidecar.
+    pub fn reserve_int8_mmq_down(
+        &mut self,
+        k: usize,
+        n: usize,
+    ) -> HipResult<crate::scratch::Int8MmqReservation> {
+        self.bind_thread()?;
+        if k != 0 && n != 0 && k % 256 == 0 {
+            let needed = crate::scratch::int8_mmq_x_needed(k, n);
+            if crate::scratch::scratch_will_grow(
+                self.scratch.int8_mmq_down_scratch_bytes,
+                self.scratch.int8_mmq_down_scratch.is_some(),
+                needed,
+            ) {
+                self.invalidate_for_scratch_growth();
+            }
+        }
+        self.scratch.reserve_int8_mmq_down(&self.hip, k, n)
+    }
+
+    pub fn int8_mmq_down_prepared_ptr(
+        &self,
+        prepared: &crate::scratch::Int8MmqPrepared,
+        k: usize,
+        n: usize,
+    ) -> HipResult<*mut c_void> {
+        // bind_thread: skip — host-side handle check, touches no device state.
+        let (generation, ptr) = self.scratch.int8_mmq_down_live();
         prepared.checked_ptr(generation, ptr, k, n)
     }
 

@@ -287,7 +287,7 @@ impl Int8MmqReservation {
 }
 
 /// Valid only until the next int8 sidecar reservation or quantization.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Int8MmqPrepared {
     ptr: *mut c_void,
     k: usize,
@@ -431,6 +431,12 @@ pub struct ScratchState {
     pub int8_mmq_x_scratch: Option<DeviceBuffer>,
     pub int8_mmq_x_scratch_bytes: usize,
     pub int8_mmq_generation: u64,
+    /// w_down `block_i8_128` sidecar written by the A8 gate/up SiLU epilogue
+    /// (`gemm_mq4g256v2_gate_up_silu_a8_mmq_i8`) while it reads its input
+    /// from `int8_mmq_x_scratch`; its own generation.
+    pub int8_mmq_down_scratch: Option<DeviceBuffer>,
+    pub int8_mmq_down_scratch_bytes: usize,
+    pub int8_mmq_down_generation: u64,
     /// Qwen4 symmetric IU4 MoE stable-grouping scratch: `[L]` local ranks,
     /// `[E, C]` per-chunk counts and `[E, C + 1]` chunk prefixes (`C =
     /// ceil(L / 256)`), one allocation laid out by [`qwen4_moe_group_layout`].
@@ -3387,6 +3393,44 @@ impl ScratchState {
         (
             self.int8_mmq_generation,
             self.int8_mmq_x_scratch
+                .as_ref()
+                .map_or(std::ptr::null_mut(), |b| b.as_ptr()),
+        )
+    }
+
+    /// [`Self::reserve_int8_mmq`] for `int8_mmq_down_scratch` (the A8 gate/up
+    /// epilogue's w_down sidecar); never touches `int8_mmq_x_scratch`.
+    pub fn reserve_int8_mmq_down(
+        &mut self,
+        hip: &HipRuntime,
+        k: usize,
+        n: usize,
+    ) -> HipResult<Int8MmqReservation> {
+        if k == 0 || n == 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "reserve_int8_mmq_down: need k%256==0 and n>0",
+            ));
+        }
+        grow_scratch_buffer(
+            hip,
+            &mut self.int8_mmq_down_scratch,
+            &mut self.int8_mmq_down_scratch_bytes,
+            int8_mmq_x_needed(k, n),
+        )?;
+        self.int8_mmq_down_generation = self.int8_mmq_down_generation.wrapping_add(1);
+        Ok(Int8MmqReservation {
+            ptr: self.int8_mmq_down_scratch.as_ref().unwrap().as_ptr(),
+            k,
+            n,
+            generation: self.int8_mmq_down_generation,
+        })
+    }
+
+    pub fn int8_mmq_down_live(&self) -> (u64, *mut c_void) {
+        (
+            self.int8_mmq_down_generation,
+            self.int8_mmq_down_scratch
                 .as_ref()
                 .map_or(std::ptr::null_mut(), |b| b.as_ptr()),
         )
