@@ -120,6 +120,7 @@ pub mod mtp_spec;
 /// core). Deltanet-gated — it touches `ModelSlot` + `MtpSpecState`.
 #[cfg(feature = "deltanet")]
 pub mod mtp_speculator;
+pub mod npu_trunk;
 #[cfg(feature = "deltanet")]
 pub(crate) mod paro_moe;
 #[cfg(feature = "deltanet")]
