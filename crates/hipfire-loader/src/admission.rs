@@ -397,7 +397,13 @@ pub(crate) fn qwen4_mtp_with_host_mapped_experts(
     host_mapped_experts: usize,
 ) -> bool {
     let mode = hipfire_config::MtpMode::from_tri_state(spec.mtp);
-    hipfire_config::mtp_host_spill_policy(mode, host_mapped_experts, gpu_arch, &["gfx1100", "gfx1201"]).attach
+    hipfire_config::mtp_host_spill_policy(
+        mode,
+        host_mapped_experts,
+        gpu_arch,
+        &["gfx1100", "gfx1201"],
+    )
+    .attach
 }
 
 /// Fail-closed list for partial GPU offload, raised where the arch is dispatched.
