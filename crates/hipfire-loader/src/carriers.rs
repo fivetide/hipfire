@@ -2335,7 +2335,7 @@ fn qwen4_placement_inputs(
 > {
     // Every placement host-maps at least the MTP layer's routed experts, so
     // the head is still attached after it only where the host-mapped policy
-    // keeps it (exact gfx1201, or an explicit `--spec mtp`); only then does
+    // keeps it (exact gfx1100 or gfx1201, or an explicit `--spec mtp`); only then does
     // it need VRAM.
     let mtp_kept = native_mtp
         && crate::admission::qwen4_mtp_with_host_mapped_experts(

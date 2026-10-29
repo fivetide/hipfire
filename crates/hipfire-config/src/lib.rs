@@ -4860,7 +4860,7 @@ pub struct MtpHostSpillPolicy {
 
 /// Whether an MTP head stays attached once `host_mapped_expert_blobs` routed
 /// experts sit in host RAM. The arch's admitted list is data: an arch that
-/// keeps `auto` armed on a measured GPU names it (qwen4's `&["gfx1201"]`),
+/// keeps `auto` armed on a measured GPU names it (qwen4's `&["gfx1100", "gfx1201"]`),
 /// one with no such measurement passes none (qwen35's `&[]`). `On` always
 /// attaches (explicit opt-in); `Off` never does; a fully resident placement
 /// (`blobs == 0`) always attaches.
@@ -8041,9 +8041,9 @@ mod tests {
     #[test]
     fn mtp_host_spill_policy_truth_table() {
         // (mode, blobs, arch, admitted) -> attach. qwen35 passes &[] (never
-        // attaches on a spill under auto); qwen4 passes &["gfx1201"].
+        // attaches on a spill under auto); qwen4 passes &["gfx1100", "gfx1201"].
         let qwen35: &[&str] = &[];
-        let qwen4: &[&str] = &["gfx1201"];
+        let qwen4: &[&str] = &["gfx1100", "gfx1201"];
         // Fully resident: attaches unless explicitly off.
         assert!(mtp_host_spill_policy(MtpMode::Auto, 0, "gfx1100", qwen35).attach);
         assert!(mtp_host_spill_policy(MtpMode::On, 0, "gfx1100", qwen35).attach);
@@ -8062,7 +8062,7 @@ mod tests {
         }
         // qwen4 under auto: attaches only on the admitted arch.
         assert!(mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1201", qwen4).attach);
-        assert!(!mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1100", qwen4).attach);
+        assert!(mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1100", qwen4).attach);
         assert!(!mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1151", qwen4).attach);
         // Attached verdicts carry no reason; the decline line words it once.
         assert_eq!(

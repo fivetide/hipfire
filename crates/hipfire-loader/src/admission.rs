@@ -378,15 +378,17 @@ pub(crate) fn qwen4_developer_ple_policy(
 /// Whether an admitted Qwen4 native MTP head stays attached once
 /// `host_mapped_experts` routed-expert tensors were placed in pinned host RAM
 /// (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`). Device-resident loads (Strix Halo:
-/// MTP text = AR on 8/8, 1.41x) and exact gfx1201 (R9700, `auto` placement:
-/// greedy MTP text = AR on 8/8 prompts, faster on every one) keep the `auto`
-/// default on; other arches with host-mapped experts are unmeasured, so
+/// MTP text = AR on 8/8, 1.41x), exact gfx1201 (R9700, `auto` placement:
+/// greedy MTP text = AR on 8/8 prompts, faster on every one) and exact gfx1100
+/// (7900 XTX, trunk D2 CPU arm plus the MTP head D2 executor: +17.8% / +18.9% /
+/// +19.8% over AR at 32K / 131K / 250K, target ids identical, per-request AR
+/// floor still guards) keep the `auto` default on; other arches with host-mapped experts are unmeasured, so
 /// `auto` keeps AR there and only an explicit `speculation.mtp = "on"`
 /// (`--spec mtp`) attaches the head. `speculation.mtp = "off"` always keeps
 /// AR (the admitted head is never attached then).
 ///
 /// Thin twin over the shared [`hipfire_config::mtp_host_spill_policy`]: the
-/// qwen4 admitted list is `&["gfx1201"]` (the arch clause is data, not a
+/// qwen4 admitted list is `&["gfx1100", "gfx1201"]` (the arch clause is data, not a
 /// second function). Kept so the two policy call sites in `carriers.rs` keep
 /// their typed-`SpecLoadCfg` spelling.
 pub(crate) fn qwen4_mtp_with_host_mapped_experts(
@@ -395,7 +397,7 @@ pub(crate) fn qwen4_mtp_with_host_mapped_experts(
     host_mapped_experts: usize,
 ) -> bool {
     let mode = hipfire_config::MtpMode::from_tri_state(spec.mtp);
-    hipfire_config::mtp_host_spill_policy(mode, host_mapped_experts, gpu_arch, &["gfx1201"]).attach
+    hipfire_config::mtp_host_spill_policy(mode, host_mapped_experts, gpu_arch, &["gfx1100", "gfx1201"]).attach
 }
 
 /// Fail-closed list for partial GPU offload, raised where the arch is dispatched.
@@ -3996,10 +3998,20 @@ mod tests {
         };
         // Device-resident experts: the admitted head stays on under `auto`.
         assert!(qwen4_mtp_with_host_mapped_experts(with(None), "gfx1100", 0));
-        // Host-mapped experts: `auto` keeps AR off gfx1201, an explicit `on`
-        // keeps MTP everywhere, and gfx1201 keeps the head under `auto`.
+        // Host-mapped experts: `auto` keeps AR off gfx1100/gfx1201, an explicit `on`
+        // keeps MTP everywhere, and gfx1100/gfx1201 keep the head under `auto`.
+        assert!(qwen4_mtp_with_host_mapped_experts(
+            with(None),
+            "gfx1100",
+            21
+        ));
         assert!(!qwen4_mtp_with_host_mapped_experts(
             with(None),
+            "gfx1151",
+            21
+        ));
+        assert!(!qwen4_mtp_with_host_mapped_experts(
+            with(Some(false)),
             "gfx1100",
             21
         ));
@@ -6379,14 +6391,14 @@ mod qwen4_pp_admission_tests {
                 "{arch}"
             );
         }
-        // Host-mapped experts: `auto` keeps the head only on the admitted gfx1201;
+        // Host-mapped experts: `auto` keeps the head only on the admitted gfx1100/gfx1201;
         // explicit `on` attaches everywhere; `off` never.
         assert!(qwen4_mtp_with_host_mapped_experts(
             with(None),
             "gfx1201",
             24
         ));
-        assert!(!qwen4_mtp_with_host_mapped_experts(
+        assert!(qwen4_mtp_with_host_mapped_experts(
             with(None),
             "gfx1100",
             24
