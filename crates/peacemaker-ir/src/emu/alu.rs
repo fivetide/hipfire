@@ -75,10 +75,6 @@
 //! stage for every denominator `1..=2^24`; see [`udiv_scalar_float`] and [`udiv_scalar_rcp`]. Anything outside that
 //! domain is a hard error.
 //!
-//! RDNA4 SALU float opcodes (`s_add_f32`, `s_sub_f32`, `s_fmamk_f32`, `s_cmp_ngt_f32`, `s_cmp_nlt_f32`, `s_cvt_i32_f32`,
-//! `s_rndne_f32`) and `v_s_exp_f32` have exactly the numerics of their VALU twins (`v_add_f32`, `v_sub_f32`,
-//! `v_fmamk_f32`, unordered-true `v_cmp_ngt/nlt_f32`, `v_cvt_i32_f32`, `v_rndne_f32`, `v_exp_f32`); see [`scalar_float`].
-//!
 //! Descriptor float mode must be round to nearest even, allow input/output denormals,
 //! use FP16_OVFL=0, and on gfx1151 use IEEE_MODE=1/DX10_CLAMP=1; `State::new` checks it.
 //! F8_MODE has no descriptor field: FP8 conversion assumes the normal launch default
@@ -265,19 +261,6 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
     if let FormFields::Vopd { y_op, x_operands } = i.fields {
         let y = y_op.name(arch).ok_or("unknown VOPD Y opcode")?;
         return vopd(arch, name, y, usize::from(x_operands), i, s);
-    }
-    if matches!(
-        name,
-        "s_add_f32"
-            | "s_sub_f32"
-            | "s_fmamk_f32"
-            | "s_cmp_ngt_f32"
-            | "s_cmp_nlt_f32"
-            | "s_cvt_i32_f32"
-            | "s_rndne_f32"
-            | "v_s_exp_f32"
-    ) {
-        return scalar_float(arch, name, i, s);
     }
     if matches!(name, "s_cvt_f32_u32" | "s_cvt_u32_f32" | "s_mul_f32") {
         return udiv_scalar_float(arch, name, i, s);
@@ -1009,7 +992,21 @@ fn vector(
         // Saturating, truncating, NaN -> 0 (ISA: "NAN is converted to 0").
         "v_cvt_i32_f32" => (Class::FloatToInt, convert::f32_to_i32(f(0)?)),
         "v_cvt_u32_f32" => (Class::FloatToInt, convert::f32_to_u32(f(0)?)),
-        "v_rndne_f32" => (Class::F32, rndne_bits(arch, g(0, false)?)?),
+        "v_rndne_f32" => {
+            let bits = g(0, false)?;
+            if is_nan(bits) {
+                if !edge_qualified(arch) {
+                    return Err(NAN_IN.into());
+                }
+                (Class::F32, bits | QUIET)
+            } else {
+                let r = f32::from_bits(bits).round_ties_even();
+                if bits >> 31 != 0 && r == 0.0 && !edge_qualified(arch) {
+                    return Err("v_rndne_f32 of a negative input rounding to zero: pseudocode gives +0, IEEE gives -0; only gfx1151 and gfx1201 are measured (-0)".into());
+                }
+                (Class::F32, r.to_bits())
+            }
+        }
         "v_cvt_f32_f16" => {
             let h = half_src(s, o.get(1).ok_or("missing vector operand")?, i, lane, 0)?;
             if h & 0x7c00 == 0x7c00 && h & 0x3ff != 0 {
@@ -2309,10 +2306,8 @@ fn udiv_scalar_float(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result<
             let (a, b) = (rd(s, 1)?, rd(s, 2)?);
             let p = (f32::from_bits(a) * f32::from_bits(b)).to_bits();
             if !normal(a) || !normal(b) || !normal(p) {
-                // Worded as a domain refusal ("not measured", no "overflow"): consumers such as the
-                // lane_rows_bf16 tests treat an unmeasured float domain as a skip and "overflow" as a defect.
                 return Err(format!(
-                    "{name}: {a:#x} * {b:#x} needs a zero, denormal, NaN, infinite or out-of-range operand or product; not measured"
+                    "{name}: {a:#x} * {b:#x} needs a zero, denormal, NaN, infinite or overflowing value; not measured"
                 ));
             }
             p
@@ -2355,79 +2350,6 @@ fn udiv_scalar_rcp(arch: Arch, i: &Inst, s: &mut State) -> Result<()> {
         ));
     }
     s.put(&o[0], 0, 0, super::trans::rcp_f32(arch, a))
-}
-
-/// `v_rndne_f32`/`s_rndne_f32` of a post-modifier word: round half to even. A NaN is quieted (sign and payload kept);
-/// a negative input that rounds to zero gives `-0` (measured on gfx1151/gfx1201; the ISA pseudocode's `+0` is wrong).
-fn rndne_bits(arch: Arch, bits: u32) -> Result<u32> {
-    if is_nan(bits) {
-        if !edge_qualified(arch) {
-            return Err(NAN_IN.into());
-        }
-        return Ok(bits | QUIET);
-    }
-    let r = f32::from_bits(bits).round_ties_even();
-    if bits >> 31 != 0 && r == 0.0 && !edge_qualified(arch) {
-        return Err("v_rndne_f32 of a negative input rounding to zero: pseudocode gives +0, IEEE gives -0; only gfx1151 and gfx1201 are measured (-0)".into());
-    }
-    Ok(r.to_bits())
-}
-
-/// RDNA4 SALU float opcodes and `v_s_exp_f32`, with exactly the numerics of their VALU twins (no source modifiers,
-/// omod or clamp exist on these forms; denormal inputs and outputs are kept, as the descriptor float mode requires):
-/// * `s_add_f32`/`s_sub_f32`: [`add_bits`] (`s_sub_f32` negates `S1` before the NaN pick, like `v_sub_f32`).
-/// * `s_fmamk_f32`: `D = S0 * K + S1` through [`fma_bits`] (NaN order `S0`, `K`, `S1`, like `v_fmamk_f32`).
-/// * `s_cmp_ngt_f32`/`s_cmp_nlt_f32`: SCC = `!(S0 > S1)` / `!(S0 < S1)`; unordered (a NaN operand) is true.
-/// * `s_cvt_i32_f32`: truncate toward zero, saturate, NaN -> 0 ([`convert::f32_to_i32`], as `v_cvt_i32_f32`).
-/// * `s_rndne_f32`: [`rndne_bits`].
-/// * `v_s_exp_f32 SDST, SSRC`: [`super::trans::exp_f32`], the `v_exp_f32` model, executed once (full EXEC only).
-fn scalar_float(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result<()> {
-    let o = &i.operands;
-    let rd = |s: &State, n: usize| -> Result<u32> {
-        s.read(o.get(n).ok_or("missing scalar operand")?, 0, 0)
-    };
-    if let Some(p) = name.strip_prefix("s_cmp_") {
-        let (a, b) = (f32::from_bits(rd(s, 0)?), f32::from_bits(rd(s, 1)?));
-        let ord = a.partial_cmp(&b);
-        s.scc = match p {
-            "ngt_f32" => ord != Some(std::cmp::Ordering::Greater),
-            "nlt_f32" => ord != Some(std::cmp::Ordering::Less),
-            _ => return Err(format!("unsupported scalar compare {name}")),
-        };
-        return Ok(());
-    }
-    let value = match name {
-        "s_add_f32" => add_bits(arch, rd(s, 1)?, rd(s, 2)?)?,
-        "s_sub_f32" => add_bits(arch, rd(s, 1)?, rd(s, 2)? ^ SIGN)?,
-        "s_fmamk_f32" => {
-            // Decoded form: [D, S0, S1] + literal K; asm order [D, S0, K, S1] when K is an operand.
-            let (k, s1) = if o.len() > 3 {
-                (rd(s, 2)?, rd(s, 3)?)
-            } else {
-                (
-                    i.literal.ok_or("s_fmamk_f32: missing literal constant")?,
-                    rd(s, 2)?,
-                )
-            };
-            fma_bits(arch, rd(s, 1)?, k, s1)?
-        }
-        "s_cvt_i32_f32" => convert::f32_to_i32(rd(s, 1)?),
-        "s_rndne_f32" => rndne_bits(arch, rd(s, 1)?)?,
-        _ => {
-            if !matches!(arch, Arch::Gfx1151 | Arch::Gfx1201) {
-                return Err(format!("unqualified numerical architecture {arch:?}"));
-            }
-            let m = &i.mods;
-            if m.neg != 0 || m.abs != 0 || m.omod != Omod::None || m.clamp {
-                return Err("v_s_exp_f32: neg/abs/omod/clamp are not modeled".into());
-            }
-            if s.exec != s.lane_mask() {
-                return Err("v_s_exp_f32 with a partial EXEC is not modeled".into());
-            }
-            super::trans::exp_f32(arch, rd(s, 1)?)
-        }
-    };
-    s.put(&o[0], 0, 0, value)
 }
 
 fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
@@ -5306,268 +5228,6 @@ mod tests {
         assert_eq!(st.s[0], (-(f32::EPSILON * f32::EPSILON)).to_bits());
         st.s[1] = f32::NAN.to_bits();
         assert!(execute(arch, "s_fmaak_f32", &build(1f32), &mut st).is_err());
-    }
-
-    /// SCC of the two-operand scalar float compare `name` on `a`, `b`, starting from `scc`.
-    fn cmp_f32(arch: Arch, name: &str, a: u32, b: u32, scc: bool) -> bool {
-        let i = insn_on(arch, name, vec![sreg(0), sreg(1)]);
-        let mut st = state();
-        st.s[0] = a;
-        st.s[1] = b;
-        st.scc = scc;
-        execute(arch, name, &i, &mut st).unwrap();
-        st.scc
-    }
-
-    #[test]
-    fn gfx12_scalar_add_sub_follow_the_valu_rules() {
-        let one = 1f32.to_bits();
-        for arch in EDGE {
-            let run = |n, a, b| scalar_on(arch, n, &[a, b], 0xdead_beef, true);
-            assert_eq!(
-                run("s_add_f32", 1.5f32.to_bits(), 2.25f32.to_bits()),
-                Ok((3.75f32.to_bits(), true))
-            );
-            assert_eq!(
-                run("s_sub_f32", 1.5f32.to_bits(), 2.25f32.to_bits()),
-                Ok(((-0.75f32).to_bits(), true))
-            );
-            // Denormals are kept on input and output.
-            assert_eq!(run("s_add_f32", 1, 1), Ok((2, true)));
-            assert_eq!(run("s_sub_f32", 2, 1), Ok((1, true)));
-            assert_eq!(
-                run("s_sub_f32", 0x0080_0000, 0x007f_ffff),
-                Ok((1, true)),
-                "smallest normal minus the largest denormal"
-            );
-            // Round to nearest even: 1 + 2^-24 ties to 1; 1 + 3*2^-24 ties up to 1 + 2^-22.
-            assert_eq!(run("s_add_f32", one, 0x3380_0000), Ok((one, true)));
-            assert_eq!(run("s_add_f32", one, 0x3440_0000), Ok((0x3f80_0002, true)));
-            // Signed zeros: +0 + -0 = +0, -0 + -0 = -0; x - x = +0.
-            assert_eq!(run("s_add_f32", 0, SIGN), Ok((0, true)));
-            assert_eq!(run("s_add_f32", SIGN, SIGN), Ok((SIGN, true)));
-            assert_eq!(run("s_sub_f32", one, one), Ok((0, true)));
-            // Overflow rounds to infinity; infinities pass through.
-            assert_eq!(run("s_add_f32", 0x7f7f_ffff, 0x7f7f_ffff), Ok((INF, true)));
-            assert_eq!(run("s_add_f32", INF, one), Ok((INF, true)));
-            assert_eq!(run("s_sub_f32", INF, one), Ok((INF, true)));
-            // Invalid operations give the default NaN.
-            assert_eq!(run("s_sub_f32", INF, INF), Ok((DEFAULT_NAN, true)));
-            assert_eq!(run("s_add_f32", INF, INF | SIGN), Ok((DEFAULT_NAN, true)));
-            // NaN: the first NaN in source order wins, quieted, payload and sign kept; s_sub_f32 flips a NaN S1.
-            assert_eq!(
-                run("s_add_f32", 0x7fa0_0001, 0xffa0_0002),
-                Ok((0x7fe0_0001, true))
-            );
-            assert_eq!(run("s_add_f32", one, 0xffa0_0002), Ok((0xffe0_0002, true)));
-            assert_eq!(run("s_sub_f32", one, 0x7fc0_0000), Ok((0xffc0_0000, true)));
-            assert_eq!(
-                run("s_sub_f32", 0x7fc0_1234, 0x7fc0_0000),
-                Ok((0x7fc0_1234, true))
-            );
-        }
-    }
-
-    #[test]
-    fn gfx12_scalar_fmamk_is_s0_times_k_plus_s1() {
-        for arch in EDGE {
-            let r = table(arch)
-                .iter()
-                .find(|r| r.name == "s_fmamk_f32")
-                .unwrap();
-            let run = |s0: u32, k: u32, s1: u32| {
-                let i = Inst::from_parts(
-                    arch,
-                    r.op,
-                    r.form,
-                    Default::default(),
-                    vec![sreg(0), sreg(1), sreg(2)].into_iter().collect(),
-                    Default::default(),
-                    Some(k),
-                    Default::default(),
-                )
-                .unwrap();
-                let mut st = state();
-                st.s[0] = 0x1234_5678;
-                st.s[1] = s0;
-                st.s[2] = s1;
-                execute(arch, "s_fmamk_f32", &i, &mut st).map(|_| st.s[0])
-            };
-            let f = |x: f32| x.to_bits();
-            // Operand order: 2 * 3 + 4 = 10 (S0*S1+K would give 11).
-            assert_eq!(run(f(2.0), f(3.0), f(4.0)), Ok(f(10.0)));
-            // Single rounding: (1+e)(1-e) - 1 = -e^2 exactly (a rounded product would give 0).
-            assert_eq!(
-                run(f(1.0 + f32::EPSILON), f(1.0 - f32::EPSILON), f(-1.0)),
-                Ok(f(-(f32::EPSILON * f32::EPSILON)))
-            );
-            // Denormals: minsub * 1 + minsub = 2 * minsub; minsub * 0.5 + 0 rounds to even (0).
-            assert_eq!(run(1, f(1.0), 1), Ok(2));
-            assert_eq!(run(1, f(0.5), 0), Ok(0));
-            // Infinities and invalid operations.
-            assert_eq!(run(INF, f(2.0), f(1.0)), Ok(INF));
-            assert_eq!(run(INF, 0, f(1.0)), Ok(DEFAULT_NAN));
-            assert_eq!(run(INF, f(1.0), INF | SIGN), Ok(DEFAULT_NAN));
-            // inf * 0 beats a NaN addend.
-            assert_eq!(run(INF, 0, 0x7fc0_0001), Ok(DEFAULT_NAN));
-            // NaN order S0, K, S1; quieted, sign and payload kept.
-            assert_eq!(run(0x7fa0_0001, 0xffc0_0002, 0xffc0_0003), Ok(0x7fe0_0001));
-            assert_eq!(run(f(1.0), 0xffa0_0002, 0x7fc0_0003), Ok(0xffe0_0002));
-            assert_eq!(run(f(1.0), f(1.0), 0xffa0_0003), Ok(0xffe0_0003));
-        }
-    }
-
-    #[test]
-    fn gfx12_scalar_ngt_nlt_are_unordered_true() {
-        let f = |x: f32| x.to_bits();
-        let nan = [0x7fc0_0000, 0x7fa0_0001, 0xffc0_0000];
-        for arch in EDGE {
-            for scc in [false, true] {
-                // (a, b, NGT = !(a > b), NLT = !(a < b))
-                let mut rows = vec![
-                    (f(1.0), f(2.0), true, false),
-                    (f(2.0), f(1.0), false, true),
-                    (f(1.0), f(1.0), true, true),
-                    (0, SIGN, true, true), // +0 and -0 are equal
-                    (SIGN, 0, true, true),
-                    (1, 0, false, true), // denormal > 0
-                    (0, 1, true, false),
-                    (SIGN | 1, 0, true, false),    // -denormal < 0
-                    (1, 0x0080_0000, true, false), // denormal < smallest normal
-                    (INF, f(1.0), false, true),
-                    (INF, INF, true, true),
-                    (INF | SIGN, INF, true, false),
-                    (INF, INF | SIGN, false, true),
-                ];
-                for n in nan {
-                    rows.push((n, f(1.0), true, true));
-                    rows.push((f(1.0), n, true, true));
-                    rows.push((n, n, true, true));
-                    rows.push((n, INF, true, true));
-                }
-                for (a, b, ngt, nlt) in rows {
-                    assert_eq!(
-                        cmp_f32(arch, "s_cmp_ngt_f32", a, b, scc),
-                        ngt,
-                        "{arch:?} ngt {a:#x} {b:#x}"
-                    );
-                    assert_eq!(
-                        cmp_f32(arch, "s_cmp_nlt_f32", a, b, scc),
-                        nlt,
-                        "{arch:?} nlt {a:#x} {b:#x}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn gfx12_scalar_cvt_i32_and_rndne() {
-        let f = |x: f32| x.to_bits();
-        for arch in EDGE {
-            let cvt = |a| scalar_on(arch, "s_cvt_i32_f32", &[a], 0xdead_beef, true);
-            let want = |x: i32| Ok((x as u32, true));
-            assert_eq!(cvt(f(2.9)), want(2));
-            assert_eq!(cvt(f(-2.9)), want(-2));
-            assert_eq!(cvt(f(0.99)), want(0));
-            assert_eq!(cvt(f(-0.99)), want(0));
-            assert_eq!(cvt(SIGN), want(0));
-            assert_eq!(cvt(1), want(0), "denormal");
-            assert_eq!(cvt(SIGN | 1), want(0), "-denormal");
-            assert_eq!(cvt(f(2147483520.0)), want(2147483520));
-            assert_eq!(cvt(f(2147483648.0)), want(i32::MAX), "2^31 saturates");
-            assert_eq!(cvt(f(-2147483648.0)), want(i32::MIN));
-            assert_eq!(cvt(f(-3e9)), want(i32::MIN));
-            assert_eq!(cvt(INF), want(i32::MAX));
-            assert_eq!(cvt(INF | SIGN), want(i32::MIN));
-            assert_eq!(cvt(0x7fc0_0000), want(0), "NaN -> 0");
-            assert_eq!(cvt(0xffa0_0001), want(0), "sNaN -> 0");
-            // The VALU twin agrees on every probe.
-            for a in [f(2.9), f(-2.9), f(3e9), f(-3e9), INF, 0x7fc0_0000, 1] {
-                assert_eq!(
-                    lane_on(arch, "v_cvt_i32_f32_e32", &[a], 0, |_| {}),
-                    Ok(scalar_on(arch, "s_cvt_i32_f32", &[a], 0, false).unwrap().0)
-                );
-            }
-
-            let rn = |a| scalar_on(arch, "s_rndne_f32", &[a], 0xdead_beef, true);
-            let ok = |x: u32| Ok((x, true));
-            assert_eq!(rn(f(2.5)), ok(f(2.0)), "ties to even down");
-            assert_eq!(rn(f(3.5)), ok(f(4.0)), "ties to even up");
-            assert_eq!(rn(f(-2.5)), ok(f(-2.0)));
-            assert_eq!(rn(f(2.4999998)), ok(f(2.0)));
-            assert_eq!(rn(f(0.5)), ok(0));
-            assert_eq!(rn(f(-0.5)), ok(SIGN), "-0.5 rounds to -0");
-            assert_eq!(rn(f(-0.25)), ok(SIGN));
-            assert_eq!(rn(SIGN), ok(SIGN));
-            assert_eq!(rn(1), ok(0), "denormal -> +0");
-            assert_eq!(rn(SIGN | 1), ok(SIGN), "-denormal -> -0");
-            assert_eq!(rn(f(8388609.0)), ok(f(8388609.0)), "integers are unchanged");
-            assert_eq!(rn(INF), ok(INF));
-            assert_eq!(rn(INF | SIGN), ok(INF | SIGN));
-            assert_eq!(rn(0x7fa0_0001), ok(0x7fe0_0001), "sNaN quieted");
-            assert_eq!(rn(0xffc0_0005), ok(0xffc0_0005));
-            for a in [f(2.5), f(-0.25), SIGN | 1, INF, 0x7fa0_0001] {
-                assert_eq!(
-                    lane_on(arch, "v_rndne_f32_e32", &[a], 0, |_| {}),
-                    Ok(scalar_on(arch, "s_rndne_f32", &[a], 0, false).unwrap().0)
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn gfx1201_v_s_exp_f32_is_the_valu_exp_model_in_an_sgpr() {
-        let arch = Arch::Gfx1201;
-        let f = |x: f32| x.to_bits();
-        let run = |a: u32| {
-            let i = insn_on(arch, "v_s_exp_f32", vec![sreg(0), sreg(1)]);
-            let mut st = state();
-            st.s[0] = 0xdead_beef;
-            st.s[1] = a;
-            execute(arch, "v_s_exp_f32", &i, &mut st).map(|_| st.s[0])
-        };
-        assert_eq!(run(0), Ok(f(1.0)));
-        assert_eq!(run(f(1.0)), Ok(f(2.0)));
-        assert_eq!(run(f(-1.0)), Ok(f(0.5)));
-        assert_eq!(run(f(10.0)), Ok(f(1024.0)));
-        assert_eq!(run(INF), Ok(INF));
-        assert_eq!(run(INF | SIGN), Ok(0));
-        assert_eq!(run(f(200.0)), Ok(INF), "overflow");
-        assert_eq!(run(f(-200.0)), Ok(0), "underflow");
-        // Bit-identical to the VALU v_exp_f32 model on normals, denormals, zeros, infinities and NaNs.
-        for a in [
-            0,
-            SIGN,
-            1,
-            SIGN | 1,
-            0x007f_ffff,
-            0x0080_0000,
-            f(0.3),
-            f(-0.3),
-            f(-126.5),
-            f(-127.5),
-            f(127.9),
-            f(128.0),
-            f(1e-20),
-            INF,
-            INF | SIGN,
-            0x7fc0_0000,
-            0x7fa0_0001,
-            0xffc0_1234,
-        ] {
-            assert_eq!(
-                run(a),
-                lane_on(arch, "v_exp_f32_e32", &[a], 0, |_| {}),
-                "{a:#x}"
-            );
-            assert_eq!(run(a), Ok(super::super::trans::exp_f32(arch, a)), "{a:#x}");
-        }
-        // A partial EXEC is not modeled.
-        let i = insn_on(arch, "v_s_exp_f32", vec![sreg(0), sreg(1)]);
-        let mut st = state();
-        st.exec = 1;
-        assert!(execute(arch, "v_s_exp_f32", &i, &mut st).is_err());
     }
 
     #[test]
