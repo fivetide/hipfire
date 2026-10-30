@@ -129,7 +129,7 @@ fn bf16_view_end(v: &LatentRows<'_>, n_heads: usize, max_rows: usize, what: &str
 /// `width` channels: `n_heads * width` int8 codes followed by `n_heads` F16
 /// scales (one per head). Head `h`'s codes start at byte `h * width`, its scale
 /// at byte `n_heads * width + 2 * h`.
-pub const fn q8_plane_row_bytes(n_heads: usize, width: usize) -> usize {
+pub fn q8_plane_row_bytes(n_heads: usize, width: usize) -> usize {
     n_heads * (width + 2)
 }
 

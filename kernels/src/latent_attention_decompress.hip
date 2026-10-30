@@ -150,36 +150,43 @@ extern "C" __global__ __launch_bounds__(256) void latent_attention_decompress_de
 // from F32 (no intermediate BF16 rounding).
 // ---------------------------------------------------------------------------
 
-#define LA_Q8_THREADS 128
+// One wave32 per (row, head, plane): a 64-thread block holds the K_nope wave and
+// the V wave of one (row, head). No LDS and no barriers (shuffle max reduction),
+// 16-byte vector loads / 4-byte code stores, so the launch is latency-light even
+// for the one-row decode step. wave32 targets only (gfx11 / gfx12).
+#define LA_Q8_WAVE 32
+#define LA_Q8_THREADS 64
 
-// Quantize one `n`-element vector of F32 (strided source `src`) to int8 codes at
-// `dst` and an F16 scale at `sdst`. Block-wide: every thread of the 128-thread
-// block takes part; `red` is a 128-float LDS scratch. Ends with a barrier, so
-// `red` may be reused immediately.
-static __device__ __forceinline__ void la_q8_quant(
-    const float* __restrict__ src, int n, int8_t* __restrict__ dst,
-    _Float16* __restrict__ sdst, float* red
+// Quantize one `n`-element F32 vector (n a multiple of 4, `src` 16-byte aligned,
+// `dst` 4-byte aligned) to int8 codes at `dst` and an F16 scale at `sdst`; the
+// calling wave owns the vector.
+static __device__ __forceinline__ void la_q8_quant_wave(
+    const float* __restrict__ src, int n, int8_t* __restrict__ dst, _Float16* __restrict__ sdst
 ) {
-    const int tid = threadIdx.x;
+    const int lane = threadIdx.x & (LA_Q8_WAVE - 1);
     float m = 0.0f;
-    for (int e = tid; e < n; e += LA_Q8_THREADS) m = fmaxf(m, fabsf(src[e]));
-    red[tid] = m;
-    __syncthreads();
-    for (int s = LA_Q8_THREADS / 2; s > 0; s >>= 1) {
-        if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
-        __syncthreads();
+    for (int e = 4 * lane; e < n; e += 4 * LA_Q8_WAVE) {
+        const float4 x = *(const float4*)(src + e);
+        m = fmaxf(m, fmaxf(fmaxf(fabsf(x.x), fabsf(x.y)), fmaxf(fabsf(x.z), fabsf(x.w))));
     }
-    float sc = red[0] / 127.0f;
-    sc = fminf(sc, 65504.0f);
+#pragma unroll
+    for (int o = LA_Q8_WAVE / 2; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor(m, o, LA_Q8_WAVE));
+    const float sc = fminf(m / 127.0f, 65504.0f);
     const _Float16 s16 = (_Float16)sc;
     const float sf = (float)s16;
-    for (int e = tid; e < n; e += LA_Q8_THREADS) {
-        float q = 0.0f;
-        if (sf > 0.0f) q = fminf(fmaxf(rintf(src[e] / sf), -127.0f), 127.0f);
-        dst[e] = (int8_t)(int)q;
+    for (int e = 4 * lane; e < n; e += 4 * LA_Q8_WAVE) {
+        const float4 x = *(const float4*)(src + e);
+        const float xs[4] = {x.x, x.y, x.z, x.w};
+        uint32_t w = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float q = 0.0f;
+            if (sf > 0.0f) q = fminf(fmaxf(rintf(xs[j] / sf), -127.0f), 127.0f);
+            w |= ((uint32_t)(int)q & 0xffu) << (8 * j);
+        }
+        *(uint32_t*)(dst + e) = w;
     }
-    if (tid == 0) *sdst = s16;
-    __syncthreads();
+    if (lane == 0) *sdst = s16;
 }
 
 extern "C" __global__ __launch_bounds__(LA_Q8_THREADS) void latent_attention_scatter_expanded_q8(
@@ -189,7 +196,6 @@ extern "C" __global__ __launch_bounds__(LA_Q8_THREADS) void latent_attention_sca
     const int* __restrict__ base_ptr,    // nullable device scalar
     int row0, int n_rows, int n_heads, int nope, int v, int cap
 ) {
-    __shared__ float red[LA_Q8_THREADS];
     const int per = nope + v;
     const int blk = blockIdx.x;                 // (row i, head h)
     const int i = blk / n_heads;
@@ -198,10 +204,13 @@ extern "C" __global__ __launch_bounds__(LA_Q8_THREADS) void latent_attention_sca
     const int row = (base_ptr ? *base_ptr : 0) + row0 + i;
     if (row < 0 || row >= cap) return;          // block-uniform
     const float* src = proj + ((size_t)i * n_heads + h) * per;
-    uint8_t* krow = knope + (size_t)row * ((size_t)n_heads * (nope + 2));
-    uint8_t* vrow = vmir + (size_t)row * ((size_t)n_heads * (v + 2));
-    la_q8_quant(src, nope, (int8_t*)(krow + (size_t)h * nope),
-                (_Float16*)(krow + (size_t)n_heads * nope + 2 * (size_t)h), red);
-    la_q8_quant(src + nope, v, (int8_t*)(vrow + (size_t)h * v),
-                (_Float16*)(vrow + (size_t)n_heads * v + 2 * (size_t)h), red);
+    if (threadIdx.x < LA_Q8_WAVE) {
+        uint8_t* krow = knope + (size_t)row * ((size_t)n_heads * (nope + 2));
+        la_q8_quant_wave(src, nope, (int8_t*)(krow + (size_t)h * nope),
+                         (_Float16*)(krow + (size_t)n_heads * nope + 2 * (size_t)h));
+    } else {
+        uint8_t* vrow = vmir + (size_t)row * ((size_t)n_heads * (v + 2));
+        la_q8_quant_wave(src + nope, v, (int8_t*)(vrow + (size_t)h * v),
+                         (_Float16*)(vrow + (size_t)n_heads * v + 2 * (size_t)h));
+    }
 }

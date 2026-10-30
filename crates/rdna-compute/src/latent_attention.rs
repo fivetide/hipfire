@@ -476,6 +476,20 @@ impl Gpu {
         if blocks > i32::MAX as usize {
             return Err(err("latent_attention: scatter q8 grid exceeds i32"));
         }
+        // Kernel contract: 16-byte vector loads of the F32 projector rows, 4-byte code stores.
+        if nope % 4 != 0
+            || v % 4 != 0
+            || (n_heads * (nope + 2)) % 4 != 0
+            || (n_heads * (v + 2)) % 4 != 0
+            || (proj.buf.as_ptr() as usize) % 16 != 0
+            || (knope.buf.as_ptr() as usize) % 4 != 0
+            || (vmir.buf.as_ptr() as usize) % 4 != 0
+        {
+            return Err(err(
+                "latent_attention: scatter q8 needs nope and v multiples of 4, plane rows \
+                 multiples of 4 bytes and a 16-byte aligned projector plane",
+            ));
+        }
         self.bind_thread()?;
         self.ensure_kernel(
             DECOMPRESS_MODULE,
@@ -503,7 +517,7 @@ impl Gpu {
         self.launch_maybe_blob(
             "latent_attention_scatter_expanded_q8",
             [blocks as u32, 1, 1],
-            [128, 1, 1],
+            [64, 1, 1],
             0,
             &mut params,
             || {
