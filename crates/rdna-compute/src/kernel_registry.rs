@@ -5080,6 +5080,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMM_F32_SRC,
             ["gemm_f32_batched"]
         );
+        add!(
+            "gemm_f32_tiled_rows",
+            kernels::GEMM_F32_TILED_ROWS_SRC,
+            ["gemm_f32_tiled_rows", "gemm_f32_tiled_rows_mp4"]
+        );
     }
     // lm_head rm2 muse tile (`gemm_hfq4g256_residual_muse_gfx1100_rm` rm=2):
     // gfx1151 at batch % 96 == 0 and (m/32)*(batch/96) >= 256 (default DFlash

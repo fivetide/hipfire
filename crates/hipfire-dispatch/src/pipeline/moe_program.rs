@@ -7298,7 +7298,8 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
     let protocol = op.protocol.resolve(rows);
 
     // Router: FP32 linear of the (BF16-valued) F32 input, then device top-k.
-    hip!(gpu.gemm_f32_batched(
+    hip!(crate::pipeline::stream_mix::f32_rows_gemm(
+        gpu,
         op.router.weight,
         op.x,
         s.router_logits,
