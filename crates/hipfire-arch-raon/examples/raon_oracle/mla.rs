@@ -83,8 +83,11 @@ const LONG_CASES: [(usize, usize); 7] = [
 const LONG_SEED: u64 = 0x4D4C_4152_414F_4E31;
 /// Standard deviation of the generated queries (latent/tail rows are N(0,1)).
 const LONG_QUERY_STD: f64 = 3.0;
-/// Planted key tail = this * mean-over-heads tail of the last query row.
-const LONG_NEEDLE_GAIN: f32 = 2.6;
+/// Planted key tail = this * mean-over-heads tail of the last query row. Tuned
+/// by scanning {2.6, 6, 10, 20, 40}: 2.6 never produced a planted peak above 0.3
+/// softmax mass; 20 gives a far-range planted peak (mass > 0.3) to 24-27 of 40
+/// heads at N=1 and to 27-32% of (row, head) tasks at N>1.
+const LONG_NEEDLE_GAIN: f32 = 20.0;
 const LONG_WEIGHTS: &str = "weights_raon.safetensors";
 /// Decompress tile (rows per absolute-range launch) of the long cases.
 const LONG_TILE: usize = 1024;
@@ -740,9 +743,18 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value, routes: Routes) -> Result<V
             &valid_rows(&v_a, h, v, total),
             &valid_rows(&v_c, h, v, total),
         ));
+        for t in [plane, d_proj, kn_c, vm_c] {
+            let _ = gpu.free_tensor(t);
+        }
     }
 
     rd.free(gpu);
+    for t in [
+        cache_t, knope, vmir, pos, d_qa, d_kva, d_qg, d_kg, d_q, d_w, d_g, d_qlat, d_y, d_y2,
+        d_gated, d_yt1, d_yt2, d_gated_t, d_ya, kn_b, vm_b,
+    ] {
+        let _ = gpu.free_tensor(t);
+    }
     let (pass, check_json) = finish_checks(checks);
     Ok(json!({
         "name": name, "pass": pass,
@@ -1017,6 +1029,8 @@ struct CpuRef {
     /// Max / mean over tasks of the softmax mass on the planted rows.
     planted_mass_max: f64,
     planted_mass_mean: f64,
+    /// (row, head) tasks with more than 0.3 softmax mass on the planted rows.
+    planted_mass_gt_0_3: usize,
 }
 
 /// `wq`: BF16-rounded expansion weight `[H*(nope+v), latent]`. Scores
@@ -1108,7 +1122,7 @@ fn cpu_reference(
     let results = results.into_inner().unwrap();
     let mut y = vec![0f32; n * h * v];
     let (mut max_prob, mut sum_prob, mut peak_on_planted) = (0f64, 0f64, 0usize);
-    let (mut pm_max, mut pm_sum) = (0f64, 0f64);
+    let (mut pm_max, mut pm_sum, mut pm_gt) = (0f64, 0f64, 0usize);
     for (idx, yv, pmax, on_planted, pm) in &results {
         y[idx * v..(idx + 1) * v].copy_from_slice(yv);
         max_prob = max_prob.max(*pmax);
@@ -1116,6 +1130,7 @@ fn cpu_reference(
         peak_on_planted += *on_planted as usize;
         pm_max = pm_max.max(*pm);
         pm_sum += pm;
+        pm_gt += (*pm > 0.3) as usize;
     }
     let cnt = results.len().max(1) as f64;
     CpuRef {
@@ -1126,6 +1141,7 @@ fn cpu_reference(
         peak_on_planted,
         planted_mass_max: pm_max,
         planted_mass_mean: pm_sum / cnt,
+        planted_mass_gt_0_3: pm_gt,
     }
 }
 
@@ -1227,6 +1243,19 @@ fn run_long_case(
             c
         };
         let mut checks: Vec<Cmp> = Vec::new();
+        let needle_ok = cpu.planted_mass_gt_0_3 > 0;
+        checks.push(lab(
+            Cmp {
+                ok: needle_ok,
+                json: json!({
+                    "tensor": "needle_peak_present", "pass": needle_ok,
+                    "tasks_with_planted_mass_gt_0_3": cpu.planted_mass_gt_0_3,
+                    "peak_on_planted": cpu.peak_on_planted, "tasks": cpu.tasks,
+                }),
+            },
+            "cpu",
+            false,
+        ));
         checks.push(lab(compare("attn_y_reference_vs_cpu", &yr, &cpu.y), "reference", false));
         let mut yt1 = Vec::new();
         if routes.tiled {
@@ -1281,6 +1310,7 @@ fn run_long_case(
             "peak_on_planted": cpu.peak_on_planted,
             "planted_mass_max": cpu.planted_mass_max,
             "planted_mass_mean": cpu.planted_mass_mean,
+            "planted_mass_gt_0_3_tasks": cpu.planted_mass_gt_0_3,
         },
         "routes": routes.names(),
         "checks": check_json,
