@@ -85,11 +85,8 @@ pub struct RaonWork {
 }
 
 impl RaonWork {
-    /// Allocate the module scratch for at most `rows` rows.
-    pub fn new(gpu: &mut Gpu, cfg: &RaonConfig, rows: usize) -> Result<Self, String> {
-        if rows == 0 {
-            return Err("raon work: rows == 0".into());
-        }
+    /// Module geometries every work buffer is derived from.
+    fn shapes(cfg: &RaonConfig) -> Result<(RaonMhcShape, RdaGeometry, RaonMoeDims), String> {
         let mhc_shape = RaonMhcShape {
             streams: cfg.mhc_streams,
             width: cfg.hidden,
@@ -123,6 +120,30 @@ impl RaonWork {
             router_scale: cfg.routed_scale,
         };
         moe_dims.validate()?;
+        Ok((mhc_shape, rda_geom, moe_dims))
+    }
+
+    /// Device bytes of the work for `rows` rows once the bundle is assembled
+    /// (every module buffer plus the packed absorbed MLA weights): what the
+    /// prefill chunk admission charges against free memory.
+    pub fn required_bytes(cfg: &RaonConfig, rows: usize) -> Result<usize, String> {
+        if rows == 0 {
+            return Err("raon work: rows == 0".into());
+        }
+        let (mhc_shape, rda_geom, moe_dims) = Self::shapes(cfg)?;
+        Ok(RaonMhcWork::required_bytes(&mhc_shape, rows)
+            + RdaScratch::required_bytes(&rda_geom, rows)
+            + RaonMoeScratch::required_bytes(&moe_dims, rows)?
+            + RaonDenseScratch::required_bytes(&moe_dims, rows)?
+            + RaonMlaWork::required_bytes(cfg, rows)?)
+    }
+
+    /// Allocate the module scratch for at most `rows` rows.
+    pub fn new(gpu: &mut Gpu, cfg: &RaonConfig, rows: usize) -> Result<Self, String> {
+        if rows == 0 {
+            return Err("raon work: rows == 0".into());
+        }
+        let (mhc_shape, rda_geom, moe_dims) = Self::shapes(cfg)?;
         let mhc = RaonMhcWork::new(gpu, &mhc_shape, rows)?;
         let rda = match RdaScratch::new(gpu, &rda_geom, rows) {
             Ok(r) => r,
@@ -540,16 +561,41 @@ fn mla_mixer(
         },
     )?;
     if let Some(dm) = dmirror {
-        mla_expand(
-            gpu,
-            cfg,
-            w,
-            scratch,
-            cache,
-            dm,
-            RowRange::NewRows { count: rows },
-            rows,
-        )?;
+        if rows <= MLA_TILE_ROWS {
+            mla_expand(
+                gpu,
+                cfg,
+                w,
+                scratch,
+                cache,
+                dm,
+                RowRange::NewRows { count: rows },
+                rows,
+            )?;
+        } else {
+            // A chunk wider than the decompression tile: expand the new rows
+            // tile by tile at their absolute positions (`start` is the host
+            // copy of the device position `NewRows` would read). Prefill only,
+            // never captured.
+            let mut done = 0;
+            while done < rows {
+                let count = MLA_TILE_ROWS.min(rows - done);
+                mla_expand(
+                    gpu,
+                    cfg,
+                    w,
+                    scratch,
+                    cache,
+                    dm,
+                    RowRange::Absolute {
+                        start: start + done,
+                        count,
+                    },
+                    count,
+                )?;
+                done += count;
+            }
+        }
     }
     run_latent(
         gpu,
@@ -845,11 +891,6 @@ fn forward_impl(
             "raon1_mini: weights hold {} layers, config {}",
             w.layers.len(),
             cfg.n_layers
-        ));
-    }
-    if cfg.n_mla() > 0 && rows > MLA_TILE_ROWS {
-        return Err(format!(
-            "raon1_mini: {rows} rows exceed the {MLA_TILE_ROWS}-row MLA decompression tile"
         ));
     }
     let start = start_pos as usize;

@@ -10,7 +10,7 @@ use crate::forward::{
     admit_decode_context, decode_binding, decode_body, forward_rows, forward_token,
     stage_decode_token, stage_decode_token_on_stream, RaonWork,
 };
-use crate::state::{RaonPrefillScratch, RaonState, MLA_TILE_ROWS};
+use crate::state::{RaonPrefillScratch, RaonState};
 use crate::weights::RaonWeights;
 
 /// Decode-step execution route (`HIPFIRE_GRAPH`, PLAN §3.6).
@@ -73,9 +73,10 @@ struct DecodeGraph {
     launch_secs: f64,
 }
 
-/// Upper bound of token rows one batched prefill call stages (the scratch is
-/// sized for this, so a longer prompt is processed in chunks of at most this
-/// many rows).
+/// Rows of the smallest prefill chunk the loader admits (the floor of the
+/// admission ladder `4096 / 2048 / 1024 / 512`, see
+/// `carrier::admit_prefill_rows`). The admitted chunk is
+/// [`RaonBundle::prefill_chunk_rows`].
 pub const PREFILL_SCRATCH_ROWS: usize = 512;
 
 /// Prefill route. `Batched` is the product route (N rows per module call);
@@ -243,6 +244,13 @@ impl RaonBundle {
         self.prefill_mode
     }
 
+    /// Rows of one batched prefill chunk: the admitted scratch/work rows (see
+    /// `carrier::admit_prefill_rows`; at least [`PREFILL_SCRATCH_ROWS`] unless
+    /// the reserved context is shorter).
+    pub fn prefill_chunk_rows(&self) -> usize {
+        self.scratch.rows.min(self.work.rows())
+    }
+
     /// Override the load-time route (oracle/control use).
     pub fn set_prefill_mode(&mut self, mode: PrefillMode) {
         self.prefill_mode = mode;
@@ -319,7 +327,7 @@ impl RaonBundle {
         }
         let chunk = match self.prefill_mode {
             PrefillMode::Serial => 1,
-            PrefillMode::Batched => self.scratch.rows.min(self.work.rows()).min(MLA_TILE_ROWS),
+            PrefillMode::Batched => self.prefill_chunk_rows(),
         };
         let n_chunks = tokens.len().div_ceil(chunk);
         for (ci, piece) in tokens.chunks(chunk).enumerate() {

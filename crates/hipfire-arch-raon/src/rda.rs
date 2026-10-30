@@ -150,6 +150,16 @@ impl RdaScratch {
             y: plane(gpu, p)?,
         })
     }
+
+    /// Device bytes [`Self::new`] allocates for `max_rows` rows (pool allocations
+    /// are exact, minimum 256 B each).
+    pub fn required_bytes(geom: &RdaGeometry, max_rows: usize) -> usize {
+        let p = geom.proj();
+        // qconv, kconv, vconv, q, k, vprime, log_alpha, y: `[rows, P]`; beta: `[rows, heads]`.
+        let mut elems = [max_rows * p; 8].to_vec();
+        elems.push(max_rows * geom.n_heads);
+        elems.into_iter().map(|e| (e * 4).max(256)).sum()
+    }
 }
 
 /// Run one RDA layer over `n` rows. Writes `gated [N, P]` (input of the output

@@ -805,6 +805,7 @@ All developer-only, read once at load through the `[developer]` namespace (`hipf
 | Variable | Default / sense | Notes |
 |---|---|---|
 | `HIPFIRE_RAON_PREFILL` | **`batched`**; `serial` | Prefill route (`crates/hipfire-arch-raon/src/bundle.rs`). `batched` is the product route (N rows per module call); `serial` (one `forward_token` per prompt token) is the explicit oracle/control. |
+| `HIPFIRE_RAON_PREFILL_CHUNK_ROWS` | **unset / `auto`**; `512`, `1024`, `2048`, `4096` | Rows of one batched prefill chunk (`crates/hipfire-arch-raon/src/carrier.rs`, read once at load). Auto admits the widest of 4096 / 2048 / 1024 / 512 (each capped at the reserved context `max_seq`) whose scratch + module-work bytes fit the free VRAM after the weights and still leave an expanded-mirror budget at least as large as the 512-row policy's for the same `max_seq` (or large enough to cover the whole reserved context); 512 is the floor and is always taken when nothing wider fits, so a 20 GB card degrades to 512/1024 and never fails to load. An explicit value forces that cap: the mirror comparison is skipped, but a rung whose bytes do not fit is a named load error (512 is never an error). A wider chunk streams the routed-expert weights once per chunk instead of once per 512 rows; the MLA decompression tile stays 512 rows and wider chunks expand their new rows tile by tile. The admitted rows and the projected mirror budget are logged once at load (`raon1_mini: prefill chunk rows requested=… admitted=…`). Any other value is a named error. |
 | `HIPFIRE_RAON_PREFILL_PRECISION` | **`f16`**; `a8`, `a4` | Activation precision of batched qt44 projections (`bundle.rs`). `a8` admits only the int8-activation prefill GEMMs; `a4` the device's default symmetric IU4 route. Neither is bit-equivalent to `f16`; both stay opt-in. |
 | `HIPFIRE_RAON_ATTN_TILED` | **`1`**; `0` | MLA tiled causal prefill + split-KV decode kernels (`crates/hipfire-arch-raon/src/mla.rs`). `0` selects the serial reference kernel. |
 | `HIPFIRE_RAON_MLA_ABSORB` | **`1`**; `0` | Attend over the latent cache (absorbed algebra) once a context exceeds the expanded-mirror budget. Not bit-exact to the decompressed route (KLD matched). `0` refuses contexts past the budget. |
@@ -2419,6 +2420,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_RAON_MIRROR_Q8` | crates/hipfire-arch-raon/src/bundle.rs, crates/hipfire-arch-raon/src/mla.rs | developer |
 | `HIPFIRE_RAON_MLA_ABSORB` | crates/hipfire-arch-raon/examples/raon_oracle/generate.rs, crates/hipfire-arch-raon/examples/raon_oracle/logits.rs | developer |
 | `HIPFIRE_RAON_PREFILL` | crates/hipfire-arch-raon/src/bundle.rs | developer |
+| `HIPFIRE_RAON_PREFILL_CHUNK_ROWS` | crates/hipfire-arch-raon/src/carrier.rs | developer |
 | `HIPFIRE_RAON_PREFILL_PRECISION` | crates/hipfire-arch-raon/src/bundle.rs | developer |
 | `HIPFIRE_RAON_TOKENIZER` | crates/hipfire-runtime/src/tokenizer.rs, scripts/check-env-docs.py | developer |
 | `HIPFIRE_RCCL_LIB` | crates/hip-bridge/src/rccl.rs | developer |

@@ -314,7 +314,7 @@ pub fn generate_raon(
             bundle.reset(device)?;
             let total = tokens.len();
             let mut done = 0usize;
-            for chunk in tokens.chunks(hipfire_arch_raon::PREFILL_SCRATCH_ROWS) {
+            for chunk in tokens.chunks(bundle.prefill_chunk_rows()) {
                 bundle.prefill(device, chunk)?;
                 done += chunk.len();
                 hipfire_runtime::prefill_progress::report(done, total);

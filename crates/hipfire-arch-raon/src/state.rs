@@ -1106,23 +1106,52 @@ impl RaonState {
     /// 1-2% faster), and Q8 is chosen otherwise (it backs about twice the rows).
     /// The choice is made here, once, before any mirror memory exists.
     pub fn fit_mirror_budget(&mut self, gpu: &Gpu) -> Result<usize, String> {
+        let usable = self.mirror_available_bytes(gpu)?;
+        let (q8, rows) = self.plan_mirror(usable);
+        self.dims.mirror_q8 = q8;
+        self.mirror_budget_rows = rows;
+        Ok(self.mirror_budget_rows)
+    }
+
+    /// Device bytes the expanded mirror, the prefill scratch and the module work
+    /// buffers may still claim together right now: free memory minus the latent
+    /// growth to `max_seq`, [`ADMISSION_HEADROOM_BYTES`] and
+    /// [`MIRROR_POST_ASSEMBLY_RESERVE_BYTES`]. The chunk admission subtracts a
+    /// candidate's scratch+work bytes from this and asks
+    /// [`Self::projected_mirror_budget_rows`] what is left for the mirror.
+    pub fn mirror_available_bytes(&self, gpu: &Gpu) -> Result<usize, String> {
         let (free, _) = hip(gpu.device_mem_info(), "query device memory")?;
-        let usable = free
+        Ok(free
             .saturating_sub(self.pending_latent_bytes(gpu))
             .saturating_sub(ADMISSION_HEADROOM_BYTES)
-            .saturating_sub(MIRROR_POST_ASSEMBLY_RESERVE_BYTES);
-        if self.dims.mirror_q8 && self.mirror.is_none() {
+            .saturating_sub(MIRROR_POST_ASSEMBLY_RESERVE_BYTES))
+    }
+
+    /// Mirror budget in rows [`Self::fit_mirror_budget`] would settle on if
+    /// `usable` bytes were available to it (pure: no device query, no state
+    /// change; same capacity-based BF16/Q8 choice).
+    pub fn projected_mirror_budget_rows(&self, usable: usize) -> usize {
+        self.plan_mirror(usable).1
+    }
+
+    /// `(mirror is Q8, budget rows)` for `usable` bytes.
+    fn plan_mirror(&self, usable: usize) -> (bool, usize) {
+        let mut q8 = self.dims.mirror_q8;
+        if q8 && self.mirror.is_none() {
             let bf16 = RaonStateDims {
                 mirror_q8: false,
                 ..self.dims.clone()
             };
             if mirror_rows_for_budget(&bf16, usable) >= self.max_seq {
-                self.dims.mirror_q8 = false;
+                q8 = false;
             }
         }
-        let rows = self.mirror_backed_rows() + mirror_rows_for_budget(&self.dims, usable);
-        self.mirror_budget_rows = rows.min(self.max_seq);
-        Ok(self.mirror_budget_rows)
+        let dims = RaonStateDims {
+            mirror_q8: q8,
+            ..self.dims.clone()
+        };
+        let rows = self.mirror_backed_rows() + mirror_rows_for_budget(&dims, usable);
+        (q8, rows.min(self.max_seq))
     }
 
     /// Override the admission-time budget (oracle/test control: a lower value
