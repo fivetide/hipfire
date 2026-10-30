@@ -968,6 +968,19 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
         "clocks_at_start": clocks_json(&pci),
     });
     let mut bundle = load_bundle(&mut gpu, ModelSource::Hfq(hfq), &model, max_seq)?;
+    // `--mirror-budget-rows N`: force the decompressed-route mirror budget so the absorbed route
+    // serves the rows beyond it (emulates a smaller card; recorded in the result JSON).
+    let forced_budget = match opts.get("mirror-budget-rows") {
+        Some(v) => {
+            let rows = v
+                .parse::<usize>()
+                .map_err(|e| format!("--mirror-budget-rows `{v}`: {e}"))?;
+            bundle.state.set_mirror_budget_rows(rows);
+            Some(rows)
+        }
+        None => None,
+    };
+    eprintln!("bench: mirror budget {} rows", bundle.state.mirror_budget_rows());
     let result = (|| -> Result<Value, String> {
         bundle.set_prefill_mode(mode);
         let mut pass = true;
@@ -1054,6 +1067,8 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
                 "prefill_precision": precision,
                 "decode_route": "RaonBundle::decode_step (as built; see env for graph/eager controls)",
                 "max_seq": max_seq,
+                "mirror_budget_rows": bundle.state.mirror_budget_rows(),
+                "mirror_budget_forced": forced_budget,
                 "env": env_controls(),
             },
             "prompt": {
