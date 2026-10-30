@@ -232,41 +232,34 @@ impl Gpu {
             "gated_delta_net_vector_serial_f32",
             bytes,
         );
-        let result = self.launch_maybe_blob(
-            func,
-            grid,
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = KernargBlob::new();
-                b.push_ptr(qp);
-                b.push_ptr(kp);
-                b.push_ptr(vp);
-                b.push_ptr(lp);
-                b.push_ptr(bp);
-                b.push_ptr(sp);
-                b.push_ptr(op);
-                b.push_ptr(sip);
-                b.push_ptr(ndp);
-                b.push_i32(n_tokens);
-                b.push_i32(n_heads);
-                b.push_i32(qk_group);
-                b.push_i32(per_key);
-                b.push_i32(round);
-                b.push_i32(slot);
-                b.push_i32(qrs);
-                b.push_i32(krs);
-                b.push_i32(vrs);
-                b.push_i32(drs);
-                b.push_i32(brs);
-                b.push_i32(ors);
-                b.push_i32(shs);
-                b.push_i32(srs);
-                b.push_u64(sss);
-                b
-            },
-        );
+        let result = self.launch_maybe_blob(func, grid, [32, 1, 1], 0, &mut params, || {
+            let mut b = KernargBlob::new();
+            b.push_ptr(qp);
+            b.push_ptr(kp);
+            b.push_ptr(vp);
+            b.push_ptr(lp);
+            b.push_ptr(bp);
+            b.push_ptr(sp);
+            b.push_ptr(op);
+            b.push_ptr(sip);
+            b.push_ptr(ndp);
+            b.push_i32(n_tokens);
+            b.push_i32(n_heads);
+            b.push_i32(qk_group);
+            b.push_i32(per_key);
+            b.push_i32(round);
+            b.push_i32(slot);
+            b.push_i32(qrs);
+            b.push_i32(krs);
+            b.push_i32(vrs);
+            b.push_i32(drs);
+            b.push_i32(brs);
+            b.push_i32(ors);
+            b.push_i32(shs);
+            b.push_i32(srs);
+            b.push_u64(sss);
+            b
+        });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -419,25 +412,18 @@ impl Gpu {
             "causal_conv_depthwise_silu_rows_f32",
             bytes,
         );
-        let result = self.launch_maybe_blob(
-            func,
-            grid,
-            [block, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = KernargBlob::new();
-                b.push_ptr(op);
-                b.push_ptr(ip);
-                b.push_ptr(wp);
-                b.push_ptr(hip_);
-                b.push_ptr(hop);
-                for v in [n_rows, n_ch, ks, rpc, irs, ors, wcs, wts, hts, silu, round] {
-                    b.push_i32(v);
-                }
-                b
-            },
-        );
+        let result = self.launch_maybe_blob(func, grid, [block, 1, 1], 0, &mut params, || {
+            let mut b = KernargBlob::new();
+            b.push_ptr(op);
+            b.push_ptr(ip);
+            b.push_ptr(wp);
+            b.push_ptr(hip_);
+            b.push_ptr(hop);
+            for v in [n_rows, n_ch, ks, rpc, irs, ors, wcs, wts, hts, silu, round] {
+                b.push_i32(v);
+            }
+            b
+        });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

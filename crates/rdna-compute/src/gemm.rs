@@ -15976,27 +15976,20 @@ impl Gpu {
         let bytes =
             m_total * k * 2 + (m_total * m) * 4 + (crate::profile::gemv_hfq4g256_bytes(m, k));
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = self.launch_maybe_blob(
-            func,
-            grid,
-            block,
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ep);
-                b.push_ptr(tp);
-                b.push_ptr(sp);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(xrd_val);
-                b.push_i32(mt_val);
-                b.push_i32(n_experts_val);
-                b
-            },
-        );
+        let result = self.launch_maybe_blob(func, grid, block, 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(ep);
+            b.push_ptr(tp);
+            b.push_ptr(sp);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b.push_i32(xrd_val);
+            b.push_i32(mt_val);
+            b.push_i32(n_experts_val);
+            b
+        });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

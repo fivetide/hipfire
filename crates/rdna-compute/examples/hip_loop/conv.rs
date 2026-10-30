@@ -85,7 +85,9 @@ fn hist_slice(v: Option<&str>) -> Result<bool> {
     match v {
         None | Some("last") => Ok(false),
         Some("first") => Ok(true),
-        Some(o) => Err(format!("hip_loop header: hist_slice={o} must be first|last")),
+        Some(o) => Err(format!(
+            "hip_loop header: hist_slice={o} must be first|last"
+        )),
     }
 }
 
@@ -125,7 +127,9 @@ impl ConvRows {
             }
         }
         if n.checked_mul(c).is_none_or(|v| v > i32::MAX as usize) {
-            return Err(format!("conv_rows: n*c = {n}*{c} overflows the i32 row offsets"));
+            return Err(format!(
+                "conv_rows: n*c = {n}*{c} overflows the i32 row offsets"
+            ));
         }
         let label = if s_is_default(shape) {
             label.to_owned()
@@ -369,7 +373,10 @@ impl Node for ConvRows {
             (None, None)
         } else {
             let hs = Self::sentinel(self.hist_words());
-            (Some(Buf::from_bytes(gpu, &hs)?), Some(Buf::from_bytes(gpu, &hs)?))
+            (
+                Some(Buf::from_bytes(gpu, &hs)?),
+                Some(Buf::from_bytes(gpu, &hs)?),
+            )
         };
         self.st = Some(State {
             inp: Buf::from_bytes(gpu, &x)?,
@@ -510,7 +517,13 @@ mod tests {
         let sig = &sig[..sig.find(") {").unwrap()];
         let names: Vec<&str> = sig
             .split(',')
-            .map(|p| p.trim().rsplit([' ', '*']).next().unwrap().trim_end_matches('('))
+            .map(|p| {
+                p.trim()
+                    .rsplit([' ', '*'])
+                    .next()
+                    .unwrap()
+                    .trim_end_matches('(')
+            })
             .collect();
         let want = [
             "out",

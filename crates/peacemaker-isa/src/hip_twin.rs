@@ -68,15 +68,21 @@ fn device_elf(input: &[u8], arch: Arch) -> Result<&[u8], String> {
 }
 
 fn kernel_of<'a>(p: &'a Program, symbol: &str) -> Result<&'a Kernel, String> {
-    p.kernels.iter().find(|k| k.symbol.0 == symbol).ok_or_else(|| {
-        let have: Vec<&str> = p.kernels.iter().map(|k| k.symbol.0.as_str()).collect();
-        format!("kernel `{symbol}` not found; object has {have:?}")
-    })
+    p.kernels
+        .iter()
+        .find(|k| k.symbol.0 == symbol)
+        .ok_or_else(|| {
+            let have: Vec<&str> = p.kernels.iter().map(|k| k.symbol.0.as_str()).collect();
+            format!("kernel `{symbol}` not found; object has {have:?}")
+        })
 }
 
 fn hsa(k: &Kernel) -> Result<(&peacemaker_ir::descriptor::KernelDescriptor, &KernelMeta), String> {
     match &k.abi {
-        Abi::Hsa { descriptor, metadata } => Ok((descriptor, &metadata.parsed)),
+        Abi::Hsa {
+            descriptor,
+            metadata,
+        } => Ok((descriptor, &metadata.parsed)),
         Abi::Raw(_) => Err(format!("{}: not an HSA kernel", k.symbol.0)),
     }
 }
@@ -101,7 +107,11 @@ fn abi_diff(twin: &KernelMeta, inc: &KernelMeta) -> Option<String> {
     let (t, i) = (explicit_args(twin), explicit_args(inc));
     let mut out = Vec::new();
     if t.len() != i.len() {
-        out.push(format!("explicit arg count: twin {} vs incumbent {}", t.len(), i.len()));
+        out.push(format!(
+            "explicit arg count: twin {} vs incumbent {}",
+            t.len(),
+            i.len()
+        ));
     }
     for (n, (a, b)) in t.iter().zip(&i).enumerate() {
         if a != b {
@@ -150,7 +160,8 @@ pub fn seal(
             arch.name()
         ));
     }
-    let (emitted, _) = emit::checked(&lifted.program, OPTS).map_err(|e| format!("emit::checked: {e}"))?;
+    let (emitted, _) =
+        emit::checked(&lifted.program, OPTS).map_err(|e| format!("emit::checked: {e}"))?;
     if emitted != elf {
         let at = emitted
             .iter()
@@ -173,7 +184,10 @@ pub fn seal(
     let mut hz_err = Vec::new();
     if matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
         let findings = check_kernel(kernel, ir, true);
-        let blocking: Vec<_> = findings.iter().filter(|f| f.severity != Severity::Advisory).collect();
+        let blocking: Vec<_> = findings
+            .iter()
+            .filter(|f| f.severity != Severity::Advisory)
+            .collect();
         let pm = hazards::analyze(&kernel.body, ir, kernel.wave)
             .map(|a| a.obligations.len())
             .map_err(|e| e.to_string());
@@ -190,7 +204,10 @@ pub fn seal(
                     "pm_ir_obligations": pm.clone().unwrap_or(usize::MAX)});
     }
     if !hz_err.is_empty() {
-        return Err(format!("static hazards in `{symbol}`: {}", hz_err.join(" | ")));
+        return Err(format!(
+            "static hazards in `{symbol}`: {}",
+            hz_err.join(" | ")
+        ));
     }
 
     if arch == Arch::Gfx1100 {
@@ -205,7 +222,9 @@ pub fn seal(
         let inc_k = kernel_of(&inc.program, inc_sym).map_err(|e| format!("abi-ref: {e}"))?;
         let (_, inc_meta) = hsa(inc_k)?;
         if let Some(d) = abi_diff(meta, inc_meta) {
-            return Err(format!("kernarg ABI mismatch vs incumbent `{inc_sym}`: {d}"));
+            return Err(format!(
+                "kernarg ABI mismatch vs incumbent `{inc_sym}`: {d}"
+            ));
         }
         abi["compared_to_incumbent"] = json!(true);
         abi["incumbent_symbol"] = json!(inc_sym);
@@ -213,7 +232,9 @@ pub fn seal(
     }
 
     let hxaco = native::bundle(elf, arch, HOST_TRIPLE);
-    let vgprs = desc.compute_pgm_rsrc1.next_free_vgpr(kernel.wave == Wave::Wave32);
+    let vgprs = desc
+        .compute_pgm_rsrc1
+        .next_free_vgpr(kernel.wave == Wave::Wave32);
     let user_sgprs = (desc.compute_pgm_rsrc2.0 >> 1) & 0x1f;
     let mut s = Sealed {
         elf_sha256: hex(elf),
@@ -248,8 +269,15 @@ pub fn verify_hxaco(hxaco: &[u8], arch: Arch, symbol: &str) -> Result<Sealed, St
     }
     let s = seal(hxaco, arch, symbol, None)?;
     if s.hxaco != hxaco {
-        let at = s.hxaco.iter().zip(hxaco).position(|(a, b)| a != b).unwrap_or(s.hxaco.len().min(hxaco.len()));
-        return Err(format!("re-bundling differs from the hxaco at byte offset {at:#x}"));
+        let at = s
+            .hxaco
+            .iter()
+            .zip(hxaco)
+            .position(|(a, b)| a != b)
+            .unwrap_or(s.hxaco.len().min(hxaco.len()));
+        return Err(format!(
+            "re-bundling differs from the hxaco at byte offset {at:#x}"
+        ));
     }
     Ok(s)
 }
@@ -265,7 +293,11 @@ pub struct KernelSpec<'a> {
 /// [`seal`] every kernel of one object into a single `.hxaco`: each kernel gets its own lift
 /// proof, hazard, SGPR and ABI checks; the returned [`Sealed`]s (one per spec, in order) share
 /// the same bundle bytes. At least one spec is required and symbols must be distinct.
-pub fn seal_many(input: &[u8], arch: Arch, specs: &[KernelSpec<'_>]) -> Result<Vec<Sealed>, String> {
+pub fn seal_many(
+    input: &[u8],
+    arch: Arch,
+    specs: &[KernelSpec<'_>],
+) -> Result<Vec<Sealed>, String> {
     if specs.is_empty() {
         return Err("seal_many: no kernels".into());
     }
@@ -288,6 +320,13 @@ pub fn seal_many(input: &[u8], arch: Arch, specs: &[KernelSpec<'_>]) -> Result<V
 }
 
 /// [`verify_hxaco`] for every symbol of a multi-kernel `hxaco`.
-pub fn verify_hxaco_many(hxaco: &[u8], arch: Arch, symbols: &[&str]) -> Result<Vec<Sealed>, String> {
-    symbols.iter().map(|s| verify_hxaco(hxaco, arch, s)).collect()
+pub fn verify_hxaco_many(
+    hxaco: &[u8],
+    arch: Arch,
+    symbols: &[&str],
+) -> Result<Vec<Sealed>, String> {
+    symbols
+        .iter()
+        .map(|s| verify_hxaco(hxaco, arch, s))
+        .collect()
 }

@@ -70,9 +70,7 @@ impl GatedDeltaVectorPmRefusal {
         };
         static REFUSALS: [std::sync::Once; 2] = [std::sync::Once::new(), std::sync::Once::new()];
         REFUSALS[index].call_once(|| {
-            eprintln!(
-                "[gated-delta-vector-pm] refused: {self}; keeping the hipcc kernel"
-            );
+            eprintln!("[gated-delta-vector-pm] refused: {self}; keeping the hipcc kernel");
         });
     }
 }

@@ -13,9 +13,12 @@ use peacemaker_isa::hip_twin::{verify_hxaco, verify_hxaco_many, Sealed};
 use sha2::{Digest, Sha256};
 
 const RDA_CONV: &[u8] = include_bytes!("../../../kernels/gated_delta_vector_pm_gfx1100.hxaco");
-const RDA_CONV_SHA: &str = include_str!("../../../kernels/gated_delta_vector_pm_gfx1100.hxaco.sha256");
-const MOE: &[u8] = include_bytes!("../../../kernels/gemm_mq4g256v2_moe_grouped_k2_pm_gfx1100.hxaco");
-const MOE_SHA: &str = include_str!("../../../kernels/gemm_mq4g256v2_moe_grouped_k2_pm_gfx1100.hxaco.sha256");
+const RDA_CONV_SHA: &str =
+    include_str!("../../../kernels/gated_delta_vector_pm_gfx1100.hxaco.sha256");
+const MOE: &[u8] =
+    include_bytes!("../../../kernels/gemm_mq4g256v2_moe_grouped_k2_pm_gfx1100.hxaco");
+const MOE_SHA: &str =
+    include_str!("../../../kernels/gemm_mq4g256v2_moe_grouped_k2_pm_gfx1100.hxaco.sha256");
 
 const RDA: &str = "gated_delta_net_vector_serial_f32_pm_gfx1100";
 const CONV: &str = "causal_conv_depthwise_silu_rows_f32_pm_gfx1100";
@@ -49,7 +52,11 @@ fn explicit(s: &Sealed) -> Vec<(u32, u32, bool)> {
 }
 
 fn assert_sha(bytes: &[u8], pinned: &str) {
-    assert_eq!(format!("{:x}", Sha256::digest(bytes)), pinned, "pinned .sha256 differs");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(bytes)),
+        pinned,
+        "pinned .sha256 differs"
+    );
     assert_eq!(pinned.len(), 64, "sha file must be bare lowercase hex");
 }
 

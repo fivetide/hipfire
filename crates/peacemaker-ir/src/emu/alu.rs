@@ -5409,10 +5409,7 @@ mod tests {
             // inf * 0 beats a NaN addend.
             assert_eq!(run(INF, 0, 0x7fc0_0001), Ok(DEFAULT_NAN));
             // NaN order S0, K, S1; quieted, sign and payload kept.
-            assert_eq!(
-                run(0x7fa0_0001, 0xffc0_0002, 0xffc0_0003),
-                Ok(0x7fe0_0001)
-            );
+            assert_eq!(run(0x7fa0_0001, 0xffc0_0002, 0xffc0_0003), Ok(0x7fe0_0001));
             assert_eq!(run(f(1.0), 0xffa0_0002, 0x7fc0_0003), Ok(0xffe0_0002));
             assert_eq!(run(f(1.0), f(1.0), 0xffa0_0003), Ok(0xffe0_0003));
         }

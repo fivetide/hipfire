@@ -658,7 +658,14 @@ pub fn gate(
         }
     }
     order.reverse();
-    let r = run_arm("candidate-reversed", cand.0, symbol, cand.1, case, &WgSel::List(&order));
+    let r = run_arm(
+        "candidate-reversed",
+        cand.0,
+        symbol,
+        cand.1,
+        case,
+        &WgSel::List(&order),
+    );
     let verdict = match &r {
         Err(f) => Err(format!("candidate with reversed workgroup order: {}", f.reason)),
         Ok(a) => match diff(&c.out, &a.out) {

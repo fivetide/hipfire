@@ -336,7 +336,9 @@ pub fn single_tables(rows: usize) -> Routing {
     let pad = rows.div_ceil(BLOCK_M) * BLOCK_M;
     Routing {
         topk: Vec::new(),
-        sorted: (0..pad).map(|i| if i < rows { i as i32 } else { -1 }).collect(),
+        sorted: (0..pad)
+            .map(|i| if i < rows { i as i32 } else { -1 })
+            .collect(),
         tiles: vec![0; pad / BLOCK_M],
         offsets: vec![0, pad as i32],
         live: pad,
@@ -489,7 +491,9 @@ impl MoeK2 {
         let slots = tokens
             .checked_mul(top_k)
             .filter(|v| v.saturating_add(experts * BLOCK_M) < i32::MAX as usize)
-            .ok_or_else(|| format!("moe_k2: tokens*top_k = {tokens}*{top_k} overflows the i32 slot indices"))?;
+            .ok_or_else(|| {
+                format!("moe_k2: tokens*top_k = {tokens}*{top_k} overflows the i32 slot indices")
+            })?;
         let routing = match pr.kind {
             Kind::Single => single_tables(tokens),
             _ => {
@@ -771,7 +775,13 @@ impl Node for MoeK2 {
             vec![self.set_bytes()]
         };
         let mut sizes = wsizes.clone();
-        sizes.extend([x.len(), tiles.len(), sorted.len(), 8 * self.experts, y.len()]);
+        sizes.extend([
+            x.len(),
+            tiles.len(),
+            sorted.len(),
+            8 * self.experts,
+            y.len(),
+        ]);
         let bases = bump_bases(&sizes, crate::emu::GUARD_BYTES);
         let table: Vec<u8> = (0..self.experts)
             .flat_map(|e| {
@@ -803,11 +813,26 @@ impl Node for MoeK2 {
         }
         let nw = bufs.len();
         bufs.extend([
-            EmuBuf { name: "x", bytes: x },
-            EmuBuf { name: "tiles", bytes: tiles },
-            EmuBuf { name: "sorted", bytes: sorted },
-            EmuBuf { name: "ptrs", bytes: table },
-            EmuBuf { name: "y", bytes: y },
+            EmuBuf {
+                name: "x",
+                bytes: x,
+            },
+            EmuBuf {
+                name: "tiles",
+                bytes: tiles,
+            },
+            EmuBuf {
+                name: "sorted",
+                bytes: sorted,
+            },
+            EmuBuf {
+                name: "ptrs",
+                bytes: table,
+            },
+            EmuBuf {
+                name: "y",
+                bytes: y,
+            },
         ]);
         let mut args = vec![
             EmuArg::Buf(nw + 3),
@@ -942,7 +967,14 @@ mod tests {
         );
         let sd = node("sd512");
         assert_eq!(
-            (sd.m, sd.k, sd.x_row_div(), sd.x_src_rows(), sd.m_total(), sd.experts),
+            (
+                sd.m,
+                sd.k,
+                sd.x_row_div(),
+                sd.x_src_rows(),
+                sd.m_total(),
+                sd.experts
+            ),
             (2560, 1280, 1, 512, 512, 1)
         );
         assert_eq!(gu.expert_bytes(), 2_959_360);
@@ -960,9 +992,19 @@ mod tests {
 
     #[test]
     fn shape_grammar_and_refusals() {
-        let n = node("gu512,tokens=64,experts=16,top_k=3,M=128,K=512,route=uniform,skew=0.5,route_seed=9");
+        let n = node(
+            "gu512,tokens=64,experts=16,top_k=3,M=128,K=512,route=uniform,skew=0.5,route_seed=9",
+        );
         assert_eq!(
-            (n.tokens, n.experts, n.top_k, n.m, n.k, n.route, n.route_seed),
+            (
+                n.tokens,
+                n.experts,
+                n.top_k,
+                n.m,
+                n.k,
+                n.route,
+                n.route_seed
+            ),
             (64, 16, 3, 128, 512, Route::Uniform, 9)
         );
         assert_eq!(n.skew, 0.5);
@@ -993,7 +1035,10 @@ mod tests {
         }
         // a one-expert preset may still resize tokens and dims
         let s = node("sg512,tokens=100,M=48");
-        assert_eq!((s.tokens, s.m_total(), s.geometry().grid), (100, 100, [3, 7, 1]));
+        assert_eq!(
+            (s.tokens, s.m_total(), s.geometry().grid),
+            (100, 100, [3, 7, 1])
+        );
         assert_eq!(s.routing().tiles.len(), 7);
         assert_eq!(s.routing().sorted[99], 99);
         assert_eq!(s.routing().sorted[100], -1);
@@ -1005,8 +1050,10 @@ mod tests {
         let mut h = Header::parse("// hip_loop: rows_per_block=64").unwrap();
         let g = n.geometry_with(&mut h).unwrap();
         assert_eq!((g.grid, g.block, g.lds), ([34, 312, 1], [128, 1, 1], 0));
-        let mut h = Header::parse("// hip_loop: rows_per_block=32 slots_per_tile=32 block=64 lds_dynamic=4096")
-            .unwrap();
+        let mut h = Header::parse(
+            "// hip_loop: rows_per_block=32 slots_per_tile=32 block=64 lds_dynamic=4096",
+        )
+        .unwrap();
         let g = n.geometry_with(&mut h).unwrap();
         assert_eq!((g.grid, g.block, g.lds), ([68, 156, 1], [64, 1, 1], 4096));
         // M = 96 under a 64-row block: ragged, still covered
@@ -1048,7 +1095,10 @@ mod tests {
         assert_eq!(&r.sorted[16..18], &[3, -1]);
         assert_eq!(&r.sorted[32..36], &[0, 2, 5, -1]);
         assert!(r.sorted[48..].iter().all(|&s| s == -1));
-        assert_eq!((r.live_tiles(), r.touched_experts(), r.partial_tiles()), (3, 3, 3));
+        assert_eq!(
+            (r.live_tiles(), r.touched_experts(), r.partial_tiles()),
+            (3, 3, 3)
+        );
         assert!(scatter(&topk, 3, 32).is_err());
         assert!(scatter(&topk, 3, 20).is_err());
         // every slot appears exactly once, in its own expert's range
@@ -1086,7 +1136,10 @@ mod tests {
             h.sort_unstable();
             h
         };
-        let (sk, un) = (hist(&a), hist(&route_topk(512, 6, 128, Route::Uniform, 1.0, 7)));
+        let (sk, un) = (
+            hist(&a),
+            hist(&route_topk(512, 6, 128, Route::Uniform, 1.0, 7)),
+        );
         // skew: a hot expert far above the 24-slot mean, many cold ones; uniform stays near the mean
         assert!(sk[127] > 3 * 24 && sk[0] < 24 / 2, "{sk:?}");
         assert!(un[127] < 2 * 24 + 16 && un[0] > 4, "{un:?}");
@@ -1268,7 +1321,11 @@ mod tests {
         assert_eq!(cb.bufs[0].bytes.len(), 20 * 96 * 2 * 136);
         let mut mem = peacemaker_ir::emu::Memory::default();
         let b0 = mem
-            .map_guarded("w".into(), cb.bufs[0].bytes.clone(), crate::emu::GUARD_BYTES)
+            .map_guarded(
+                "w".into(),
+                cb.bufs[0].bytes.clone(),
+                crate::emu::GUARD_BYTES,
+            )
             .unwrap();
         let t = &cb.bufs[4].bytes;
         for e in 0..20usize {
@@ -1301,7 +1358,9 @@ mod tests {
         // 5 pointers (0..40) then 5 i32 (40..60): the order of the incumbent's declaration.
         let n = node("emu");
         let src = n.incumbent().unwrap().source;
-        let at = src.find(&format!("void {SYMBOL}(")).expect("the kernel definition");
+        let at = src
+            .find(&format!("void {SYMBOL}("))
+            .expect("the kernel definition");
         let sig = &src[at + format!("void {SYMBOL}(").len()..];
         let sig = &sig[..sig.find(") {").unwrap()];
         let sig: String = sig
@@ -1338,7 +1397,8 @@ mod tests {
     }
 
     fn expected_layout() -> Vec<(u64, u64, String)> {
-        let mut v: Vec<(u64, u64, String)> = (0..5).map(|i| (8 * i, 8, "pointer".to_owned())).collect();
+        let mut v: Vec<(u64, u64, String)> =
+            (0..5).map(|i| (8 * i, 8, "pointer".to_owned())).collect();
         v.extend((0..5).map(|i| (40 + 4 * i, 4, "value".to_owned())));
         v
     }
@@ -1434,7 +1494,10 @@ mod tests {
         );
         assert!(!pass);
         assert!(
-            rec["reason"].as_str().unwrap().contains("unmapped memory access"),
+            rec["reason"]
+                .as_str()
+                .unwrap()
+                .contains("unmapped memory access"),
             "{rec}"
         );
     }
@@ -1455,7 +1518,10 @@ mod tests {
             let o = own(t * 16 * m + 3 * 64 + 5);
             assert_eq!(o[0], 3);
             let y = o[1] as usize;
-            assert!(y <= t && t - y < 4 && r.tiles[y] as usize == e && (y - first) % 4 == 0, "tile {t}");
+            assert!(
+                y <= t && t - y < 4 && r.tiles[y] as usize == e && (y - first) % 4 == 0,
+                "tile {t}"
+            );
             leaders.insert(y);
         }
         // a run of at most four tiles per leader: fewer leaders than tiles on a skewed table

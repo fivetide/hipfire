@@ -9,8 +9,8 @@
 //! attach to the preceding `--kernel`. One kernel prints its report object, several print an
 //! array of reports in `--kernel` order.
 
-use peacemaker_isa::hip_twin::{self, KernelSpec};
 use peacemaker_isa::arch::Arch;
+use peacemaker_isa::hip_twin::{self, KernelSpec};
 
 struct Kern {
     symbol: String,
@@ -32,11 +32,21 @@ fn run() -> Result<(), String> {
             "--arch" => arch = Some(val()?),
             "--out" => out = Some(val()?),
             "--report" => rep = Some(val()?),
-            "--kernel" => kernels.push(Kern { symbol: val()?, aref: None, asym: None }),
+            "--kernel" => kernels.push(Kern {
+                symbol: val()?,
+                aref: None,
+                asym: None,
+            }),
             "--abi-ref" | "--abi-ref-symbol" => {
                 let v = val()?;
-                let k = kernels.last_mut().ok_or(format!("{a} must follow a --kernel"))?;
-                let slot = if a == "--abi-ref" { &mut k.aref } else { &mut k.asym };
+                let k = kernels
+                    .last_mut()
+                    .ok_or(format!("{a} must follow a --kernel"))?;
+                let slot = if a == "--abi-ref" {
+                    &mut k.aref
+                } else {
+                    &mut k.asym
+                };
                 if slot.replace(v).is_some() {
                     return Err(format!("{a} given twice for kernel {}", k.symbol));
                 }
@@ -56,9 +66,17 @@ fn run() -> Result<(), String> {
     let mut refs: Vec<Option<(Vec<u8>, String)>> = Vec::new();
     for k in &kernels {
         refs.push(match (&k.aref, &k.asym) {
-            (Some(p), Some(s)) => Some((std::fs::read(p).map_err(|e| format!("{p}: {e}"))?, s.clone())),
+            (Some(p), Some(s)) => Some((
+                std::fs::read(p).map_err(|e| format!("{p}: {e}"))?,
+                s.clone(),
+            )),
             (None, None) => None,
-            _ => return Err(format!("kernel {}: --abi-ref and --abi-ref-symbol go together", k.symbol)),
+            _ => {
+                return Err(format!(
+                    "kernel {}: --abi-ref and --abi-ref-symbol go together",
+                    k.symbol
+                ))
+            }
         });
     }
     let specs: Vec<KernelSpec<'_>> = kernels

@@ -37,7 +37,7 @@ hipcc_compile() { # src out
   "$ROCM/bin/hipcc" "${HIPCC_FLAGS[@]}" "-fmacro-prefix-map=$(dirname "$src")/=" -o "$out" "$src"
 }
 
-( cd "$REPO" && cargo build --release -p peacemaker-isa --example hip_twin )
+( cd "$REPO" && cargo build --release -p peacemaker-isa --features lab --example hip_twin )
 TWIN_BIN="${CARGO_TARGET_DIR:-$REPO/target}/release/examples/hip_twin"
 
 # seal_module <module> <twin-src> <spec>...   spec = twin_sym:incumbent_src:incumbent_sym:judge_dir:judge_sym

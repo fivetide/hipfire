@@ -156,6 +156,8 @@
 mod abba;
 #[path = "support/cold.rs"]
 mod cold;
+#[path = "hip_loop/conv.rs"]
+mod conv;
 #[path = "hip_loop/elf.rs"]
 mod elf;
 #[path = "hip_loop/emu.rs"]
@@ -172,6 +174,8 @@ mod lane_proj;
 mod lane_ref;
 #[path = "hip_loop/lane_wo.rs"]
 mod lane_wo;
+#[path = "hip_loop/moe.rs"]
+mod moe;
 #[path = "hip_loop/mq6.rs"]
 mod mq6;
 #[path = "hip_loop/node.rs"]
@@ -180,10 +184,6 @@ mod node;
 mod qsa;
 #[path = "hip_loop/rda.rs"]
 mod rda;
-#[path = "hip_loop/conv.rs"]
-mod conv;
-#[path = "hip_loop/moe.rs"]
-mod moe;
 
 use node::{err, Geometry, Header, Incumbent, Node, Result, ShapeSpec, ARCH};
 use serde_json::{json, Value};
@@ -1739,7 +1739,10 @@ mod tests {
             );
             assert_eq!(rec["baseline"]["max_flat_workgroup_size"], 1024);
             assert_eq!(rec["baseline"]["spill"], 0);
-            assert_eq!(rec["baseline"]["code_sha256"], rec["candidate"]["code_sha256"]);
+            assert_eq!(
+                rec["baseline"]["code_sha256"],
+                rec["candidate"]["code_sha256"]
+            );
             assert_eq!(rec["baseline"]["code_sha256"].as_str().unwrap().len(), 64);
         }
     }

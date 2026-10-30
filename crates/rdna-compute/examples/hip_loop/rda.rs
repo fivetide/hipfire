@@ -194,7 +194,9 @@ impl Rda {
             ));
         }
         if slots == 0 || slot >= slots {
-            return Err(format!("rda_serial: slot={slot} must be below slots={slots}"));
+            return Err(format!(
+                "rda_serial: slot={slot} must be below slots={slots}"
+            ));
         }
         Ok(Self {
             label,
@@ -267,7 +269,10 @@ impl Rda {
         }
         let mut beta = Vec::with_capacity(t * self.beta_stride() * 4);
         for _ in 0..t * self.beta_stride() {
-            push_f32(&mut beta, ((rb.next_u64() >> 40) as f32 + 0.5) / 16_777_216.0);
+            push_f32(
+                &mut beta,
+                ((rb.next_u64() >> 40) as f32 + 0.5) / 16_777_216.0,
+            );
         }
         let mut state0 = Vec::with_capacity(self.slots * self.slot_words() * 4);
         for _ in 0..self.slots * self.slot_words() {
@@ -410,10 +415,14 @@ impl Node for Rda {
         } else {
             format!(",arch={}", self.arch)
         };
-        ["pp512", "pp512,dev=1", "t=64,slot=1,slots=2,per_key=0,round=0"]
-            .iter()
-            .map(|s| format!("{s}{arch}"))
-            .collect()
+        [
+            "pp512",
+            "pp512,dev=1",
+            "t=64,slot=1,slots=2,per_key=0,round=0",
+        ]
+        .iter()
+        .map(|s| format!("{s}{arch}"))
+        .collect()
     }
     fn out_owner<'a>(&'a self, hdr: &Header) -> Result<Box<dyn Fn(usize) -> [u32; 3] + 'a>> {
         let rows = self.rows_per_wg(hdr)?;
@@ -562,7 +571,9 @@ impl Node for Rda {
     }
     fn teardown(&mut self, gpu: &rdna_compute::Gpu) {
         if let Some(s) = self.st.take() {
-            for b in [s.q, s.k, s.v, s.decay, s.beta, s.state, s.state0, s.out, s.out0] {
+            for b in [
+                s.q, s.k, s.v, s.decay, s.beta, s.state, s.state0, s.out, s.out0,
+            ] {
                 b.free(gpu);
             }
             for b in [s.slot_idx, s.n_dev].into_iter().flatten() {
@@ -596,7 +607,8 @@ mod tests {
         assert_eq!(node("tg").t, 1);
         let e = node("emu");
         assert_eq!((e.t, e.h, e.slot, e.slots), (7, 3, 1, 2));
-        let n = node("pp512,t=9,h=6,qk_group=2,per_key=0,round=0,slot=1,slots=3,dev=1,arch=gfx1201");
+        let n =
+            node("pp512,t=9,h=6,qk_group=2,per_key=0,round=0,slot=1,slots=3,dev=1,arch=gfx1201");
         assert_eq!((n.t, n.h, n.qk_group, n.slot, n.slots), (9, 6, 2, 1, 3));
         assert!(!n.per_key && !n.round && n.dev);
         assert_eq!(n.arch(), "gfx1201");
@@ -657,7 +669,9 @@ mod tests {
         }
         // n_tokens n_heads qk_group per_key round slot, then q k v decay beta out strides, then
         // state head/row strides, then the u64 slot stride.
-        let want = [512, 40, 1, 1, 1, 0, 5120, 5120, 5120, 5120, 40, 5120, 16384, 128];
+        let want = [
+            512, 40, 1, 1, 1, 0, 5120, 5120, 5120, 5120, 40, 5120, 16384, 128,
+        ];
         for (i, v) in want.iter().enumerate() {
             assert_eq!(w(72 + i * 4), *v, "arg {i}");
         }
@@ -723,7 +737,11 @@ mod tests {
         let s = n.extent_shapes();
         assert_eq!(
             s,
-            ["pp512", "pp512,dev=1", "t=64,slot=1,slots=2,per_key=0,round=0"]
+            [
+                "pp512",
+                "pp512,dev=1",
+                "t=64,slot=1,slots=2,per_key=0,round=0"
+            ]
         );
         for x in &s {
             Rda::new(&ShapeSpec::parse(Some(x)).unwrap()).unwrap();
@@ -750,10 +768,14 @@ mod tests {
 
     /// sha256 of the runtime-compiled incumbent OBJECTS (`KernelCompiler`, module
     /// `gated_delta_net_vector_serial`) and of the kernel `.text`, per arch.
-    const OBJ_SHA_GFX1100: &str = "93c1fdefae1636a090479e2e19fddf192729168f2ef151cd86e940f7c0853709";
-    const OBJ_SHA_GFX1201: &str = "03bd53b1ebf18f633699cdfd828eff91b5ddd9316d2a56170bae43ec0d212b4b";
-    const TEXT_SHA_GFX1100: &str = "d3526da88204b1c484755b6dc38a137ab7c3a349e9eb493a131bcb3db6d52eed";
-    const TEXT_SHA_GFX1201: &str = "3b38fe30b526bf3f922e3d26d65fbc8ce0db8f639e8ff309a57389118afbf6aa";
+    const OBJ_SHA_GFX1100: &str =
+        "93c1fdefae1636a090479e2e19fddf192729168f2ef151cd86e940f7c0853709";
+    const OBJ_SHA_GFX1201: &str =
+        "03bd53b1ebf18f633699cdfd828eff91b5ddd9316d2a56170bae43ec0d212b4b";
+    const TEXT_SHA_GFX1100: &str =
+        "d3526da88204b1c484755b6dc38a137ab7c3a349e9eb493a131bcb3db6d52eed";
+    const TEXT_SHA_GFX1201: &str =
+        "3b38fe30b526bf3f922e3d26d65fbc8ce0db8f639e8ff309a57389118afbf6aa";
 
     fn tmp(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("hip_loop-rda-{}-{tag}", std::process::id()));
@@ -824,19 +846,32 @@ mod tests {
         }
         let src = node("pp512").incumbent().unwrap().source;
         for (arch, text) in [("gfx1100", TEXT_SHA_GFX1100), ("gfx1201", TEXT_SHA_GFX1201)] {
-            let (r, o) = run_opts(&format!("pp512,arch={arch}"), &src, &format!("off-{arch}"), false);
+            let (r, o) = run_opts(
+                &format!("pp512,arch={arch}"),
+                &src,
+                &format!("off-{arch}"),
+                false,
+            );
             assert_eq!(o, crate::Outcome::Ok, "{}", r["error"]);
             assert_eq!(r["arch"], arch);
             assert_eq!(r["identical_code"], true);
             assert_eq!(r["baseline"]["code_sha256"], text);
             assert_eq!(r["candidate"]["code_sha256"], text);
-            assert_eq!(r["baseline"]["geometry"]["grid_workgroups"], json!([40, 16, 1]));
+            assert_eq!(
+                r["baseline"]["geometry"]["grid_workgroups"],
+                json!([40, 16, 1])
+            );
         }
         let hdr = format!("// hip_loop: rows_per_wg=16 block=64\n{src}");
         let (r, _) = run_opts("pp512", &hdr, "off-hdr", false);
-        assert_eq!(r["candidate"]["geometry"]["grid_workgroups"], json!([40, 8, 1]));
+        assert_eq!(
+            r["candidate"]["geometry"]["grid_workgroups"],
+            json!([40, 8, 1])
+        );
         assert_eq!(r["same_geometry"], false);
-        let bad = src.replace("o > 0; o >>= 1", "o < 32; o <<= 1").replace("int o = 16", "int o = 1");
+        let bad = src
+            .replace("o > 0; o >>= 1", "o < 32; o <<= 1")
+            .replace("int o = 16", "int o = 1");
         assert_ne!(bad, src);
         let (r, _) = run_opts("pp512", &bad, "off-mut", false);
         assert_eq!(r["identical_code"], false);
