@@ -877,7 +877,8 @@ fn ffn_block(
                 &m.expert_down_ptrs,
                 m.gate_up_awq.as_ref(),
                 m.expert_down_awq_ptrs.as_ref(),
-            );
+            )
+            .with_iu4_symmetric(m.iu4_symmetric);
             forward_moe(
                 gpu,
                 ctx,

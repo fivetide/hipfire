@@ -1898,6 +1898,7 @@ fn gpu_moe_run_inner(
         gate_up_awq: wd.awq_gu.as_ref(),
         down_awq_ptrs: wd.awq_down_ptrs.as_ref(),
         shared: shared_refs,
+        iu4_symmetric: false,
     };
     let mut op = raon_moe_op(
         ctx,

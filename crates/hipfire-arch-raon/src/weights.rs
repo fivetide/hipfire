@@ -170,6 +170,9 @@ pub struct MoeFfnWeights {
     /// Load-time expert identity for the shared sealed-MoE executor.
     pub table: ExpertTable,
     pub cache: ExpertBindingCache,
+    /// Every routed gate/up and down header is symmetric (`zp == -8 * sc`), verified on the device
+    /// at load (gfx1201 only); admits the grouped W4A4 expert core when the IU4 route is enabled.
+    pub iu4_symmetric: bool,
 }
 
 pub enum RaonMixer {
@@ -292,6 +295,7 @@ impl MoeFfnWeights {
             expert_down_awq,
             table: _,
             cache: _,
+            iu4_symmetric: _,
         } = self;
         router.free_all(gpu);
         free_t(gpu, e_bias);
@@ -1442,6 +1446,32 @@ fn seal_experts(
     Ok((gu, dn, table, cache))
 }
 
+/// Whether every routed gate/up and down group header obeys `zp == -8 * sc` (the symmetric qt44
+/// contract the grouped W4A4 core reads: `w = sc * (u - 8)`), checked on the device with the
+/// route's header checker. `false` off gfx1201, for non-qt44 experts, or when the checker is
+/// unavailable; never an error (the route simply stays off).
+fn verify_symmetric_headers(
+    gpu: &mut Gpu,
+    experts: &[ExpertWeights],
+    gu: &GpuTensor,
+    dn: &GpuTensor,
+) -> bool {
+    let Some(first) = experts.first() else {
+        return false;
+    };
+    if gpu.arch != "gfx1201"
+        || !experts.iter().all(|x| {
+            x.gate_up.gpu_dtype == DType::MQ4G256V2 && x.down.gpu_dtype == DType::MQ4G256V2
+        })
+    {
+        return false;
+    }
+    let n = experts.len();
+    let gu_ok = gpu.qwen4_moe_sym_check(gu, first.gate_up.m, first.gate_up.k, n, 136);
+    let dn_ok = gpu.qwen4_moe_sym_check(dn, first.down.m, first.down.k, n, 136);
+    matches!((gu_ok, dn_ok), (Ok(true), Ok(true)))
+}
+
 fn build_moe(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -1540,6 +1570,7 @@ fn build_moe(
         cleanup(gpu, experts, owners);
         return Err(er);
     }
+    let iu4_symmetric = verify_symmetric_headers(gpu, &experts, &gu, &dn);
     Ok(MoeFfnWeights {
         router: pool.take_mat(&format!("{m}.gate.weight")),
         e_bias: pool.take_vec(&format!("{m}.gate.e_score_correction_bias")),
@@ -1550,6 +1581,7 @@ fn build_moe(
         gate_up_awq,
         expert_down_awq_ptrs: down_ptrs_table,
         expert_down_awq: owners,
+        iu4_symmetric,
         table,
         cache,
     })

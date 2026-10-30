@@ -148,6 +148,9 @@ pub struct RaonMoeLayerRefs<'a> {
     /// Shared expert projections (qt44): gate/up `[logical_mi, hidden]`, down
     /// `[hidden, down_k]`. Gate/up `awq_scale` equals `gate_up_awq`.
     pub shared: GroupedMoeShared<'a>,
+    /// Every routed gate/up and down header is loader-verified symmetric
+    /// (`zp == -8 * sc`); with the IU4 prefill route on, admits the grouped W4A4 core.
+    pub iu4_symmetric: bool,
 }
 
 impl<'a> RaonMoeLayerRefs<'a> {
@@ -183,7 +186,14 @@ impl<'a> RaonMoeLayerRefs<'a> {
                 up,
                 down: shared_down.dispatch_ref(),
             },
+            iu4_symmetric: false,
         }
+    }
+
+    /// Bind the loader's symmetric-header verdict ([`MoeFfnWeights::iu4_symmetric`](crate::weights::MoeFfnWeights)).
+    pub fn with_iu4_symmetric(mut self, verified: bool) -> Self {
+        self.iu4_symmetric = verified;
+        self
     }
 }
 
@@ -479,6 +489,7 @@ pub fn raon_moe_op<'a>(
             down_ptrs: layer.down_ptrs,
             input_awq: layer.gate_up_awq,
             down_awq_ptrs: layer.down_awq_ptrs,
+            iu4_symmetric_verified: layer.iu4_symmetric,
         },
         shared: Some(layer.shared),
         scratch: scratch.view(),
