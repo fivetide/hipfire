@@ -218,7 +218,9 @@ fn run(cli: &Cli) -> Result<(bool, Value), String> {
         }
         "logits" => {
             require(&cli.opts, "model")?;
-            require(&cli.opts, "tokens")?;
+            if !cli.opts.contains_key("kld") {
+                require(&cli.opts, "tokens")?;
+            }
             if !cli.opts.contains_key("teacher") && !cli.opts.contains_key("kld") {
                 return Err("logits needs --teacher F or --kld REF.kldref.bin".into());
             }
