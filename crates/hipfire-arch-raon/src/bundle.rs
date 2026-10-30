@@ -162,7 +162,7 @@ pub struct RaonBundle {
     pub weights: RaonWeights,
     /// Mutable per-session state (RDA recurrent state, conv history, MLA latent caches).
     pub state: RaonState,
-    /// Bounded prefill scratch (`PREFILL_SCRATCH_ROWS` rows).
+    /// Prefill scratch sized for the admitted chunk rows (`prefill_chunk_rows`).
     pub scratch: RaonPrefillScratch,
     /// Module work buffers (mHC controls, RDA, MoE, dense FFN) matching `scratch`.
     pub work: RaonWork,

@@ -234,8 +234,12 @@ impl RaonMlaWork {
         if policy.absorb {
             bytes += (rows * cfg.n_heads * (cfg.kv_lora + cfg.qk_rope) * 4).max(256);
             bytes += (rows * cfg.n_heads * cfg.kv_lora * 4).max(256);
-            let packed =
-                latent_attention_absorb_packed_elems(cfg.n_heads, cfg.qk_nope, cfg.v_head, cfg.kv_lora);
+            let packed = latent_attention_absorb_packed_elems(
+                cfg.n_heads,
+                cfg.qk_nope,
+                cfg.v_head,
+                cfg.kv_lora,
+            );
             bytes += cfg.mla_layers().len() * (packed * 2).max(256);
         }
         Ok(bytes)

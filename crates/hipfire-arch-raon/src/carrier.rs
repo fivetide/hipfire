@@ -63,6 +63,8 @@ pub fn load_raon_bundle(src: ModelSource, ctx: &mut LoadCtx<'_>) -> Result<RaonB
             ctx.max_seq, config.max_position
         ));
     }
+    // Resolved before any device allocation so a malformed value fails fast.
+    let forced_rows = forced_chunk_rows()?;
     let weights = load_raon_weights(&hfq, ctx.gpu, &config)?;
     let dims = config.state_dims();
     let state = match RaonState::new(ctx.gpu, &dims, ctx.max_seq) {
@@ -72,7 +74,7 @@ pub fn load_raon_bundle(src: ModelSource, ctx: &mut LoadCtx<'_>) -> Result<RaonB
             return Err(format!("raon1_mini: RaonState::new failed: {e}"));
         }
     };
-    let rows = match admit_prefill_rows(ctx.gpu, &config, &dims, &state) {
+    let rows = match admit_prefill_rows(ctx.gpu, &config, &dims, &state, forced_rows) {
         Ok(rows) => rows,
         Err(e) => {
             if let Err(fe) = state.free_gpu(ctx.gpu) {
@@ -104,9 +106,13 @@ pub const PREFILL_CHUNK_LADDER: [usize; 4] = [4096, 2048, 1024, PREFILL_SCRATCH_
 /// the widest rung that fits); `512`, `1024`, `2048` or `4096` -> that rung.
 /// Anything else is a named error, never a silent fallback. Read once, at load.
 fn forced_chunk_rows() -> Result<Option<usize>, String> {
-    let Ok(raw) = hipfire_config::developer_var("HIPFIRE_RAON_PREFILL_CHUNK_ROWS") else {
-        return Ok(None);
-    };
+    match hipfire_config::developer_var("HIPFIRE_RAON_PREFILL_CHUNK_ROWS") {
+        Err(_) => Ok(None),
+        Ok(raw) => parse_chunk_rows(&raw),
+    }
+}
+
+fn parse_chunk_rows(raw: &str) -> Result<Option<usize>, String> {
     let v = raw.trim().to_ascii_lowercase();
     if v.is_empty() || v == "auto" {
         return Ok(None);
@@ -165,7 +171,11 @@ fn select_prefill_rows(
     };
     if let Some(f) = forced {
         let rows = f.min(max_seq);
-        let e = if rows == base_rows { base_extra } else { extra(rows)? };
+        let e = if rows == base_rows {
+            base_extra
+        } else {
+            extra(rows)?
+        };
         if rows > base_rows && e > available {
             return Err(format!(
                 "raon1_mini: HIPFIRE_RAON_PREFILL_CHUNK_ROWS={f} cannot be admitted: {rows} rows need \
@@ -207,19 +217,16 @@ fn admit_prefill_rows(
     config: &RaonConfig,
     dims: &RaonStateDims,
     state: &RaonState,
+    forced: Option<usize>,
 ) -> Result<usize, String> {
-    let forced = forced_chunk_rows()?;
     let available = state.mirror_available_bytes(gpu)?;
     let mut extra = |rows: usize| -> Result<usize, String> {
-        Ok(RaonPrefillScratch::required_bytes(dims, rows)? + RaonWork::required_bytes(config, rows)?)
+        Ok(RaonPrefillScratch::required_bytes(dims, rows)?
+            + RaonWork::required_bytes(config, rows)?)
     };
-    let adm = select_prefill_rows(
-        state.max_seq(),
-        forced,
-        available,
-        &mut extra,
-        &|usable| state.projected_mirror_budget_rows(usable),
-    )?;
+    let adm = select_prefill_rows(state.max_seq(), forced, available, &mut extra, &|usable| {
+        state.projected_mirror_budget_rows(usable)
+    })?;
     eprintln!(
         "raon1_mini: prefill chunk rows requested={} admitted={} (scratch+work {:.0} MiB; \
          projected expanded K/V mirror budget {} rows of {} reserved context, 512-row policy {} rows)",
@@ -240,7 +247,11 @@ mod tests {
     const MIB: usize = 1 << 20;
 
     /// 1 MiB of scratch+work per row, 1 MiB of mirror per row.
-    fn pick(max_seq: usize, forced: Option<usize>, available_mib: usize) -> Result<ChunkAdmission, String> {
+    fn pick(
+        max_seq: usize,
+        forced: Option<usize>,
+        available_mib: usize,
+    ) -> Result<ChunkAdmission, String> {
         select_prefill_rows(
             max_seq,
             forced,
@@ -288,6 +299,19 @@ mod tests {
         assert_eq!(pick(50000, Some(512), 100).unwrap().rows, 512);
         // A forced rung wider than the context is capped, not refused.
         assert_eq!(pick(2000, Some(4096), 5000).unwrap().rows, 2000);
+    }
+
+    #[test]
+    fn chunk_rows_env_parsing() {
+        assert_eq!(parse_chunk_rows(""), Ok(None));
+        assert_eq!(parse_chunk_rows(" AUTO "), Ok(None));
+        for n in PREFILL_CHUNK_LADDER {
+            assert_eq!(parse_chunk_rows(&n.to_string()), Ok(Some(n)));
+        }
+        for bad in ["0", "256", "3000", "8192", "-1", "4096rows", "max"] {
+            let e = parse_chunk_rows(bad).unwrap_err();
+            assert!(e.contains("HIPFIRE_RAON_PREFILL_CHUNK_ROWS"), "{e}");
+        }
     }
 
     #[test]
