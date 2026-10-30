@@ -450,7 +450,7 @@ fn attention(
         AttentionRoute::Absorbed { ops, workspace } => {
             let packed_ok = ops.packed.dtype == rdna_compute::DType::BF16
                 && ops.packed.numel()
-                    >= Gpu::latent_attention_absorb_packed_elems(g.n_heads, g.nope, g.v_dim, g.latent);
+                    >= rdna_compute::latent_attention_absorb::latent_attention_absorb_packed_elems(g.n_heads, g.nope, g.v_dim, g.latent);
             if !packed_ok {
                 return Err(refuse("absorbed route: packed expansion weight is missing or undersized".into()));
             }
