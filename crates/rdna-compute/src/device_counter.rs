@@ -12,7 +12,8 @@ use hip_bridge::{HipError, HipResult, KernargBlob};
 
 use crate::dispatch::{DType, Gpu, GpuTensor};
 
-pub const DEVICE_COUNTER_ADD_SRC: &str = include_str!("../../../kernels/src/device_counter_add.hip");
+pub const DEVICE_COUNTER_ADD_SRC: &str =
+    include_str!("../../../kernels/src/device_counter_add.hip");
 const MODULE: &str = "device_counter_add";
 const FUNC: &str = "device_counter_add_i32";
 
@@ -20,12 +21,18 @@ impl Gpu {
     /// `*counter += delta` where `counter` holds a device i32 (first 4 bytes).
     pub fn device_counter_add_i32(&mut self, counter: &GpuTensor, delta: i32) -> HipResult<()> {
         if counter.byte_size() < 4 {
-            return Err(HipError::new(0, "device_counter_add_i32: counter must hold a 4-byte device i32"));
+            return Err(HipError::new(
+                0,
+                "device_counter_add_i32: counter must hold a 4-byte device i32",
+            ));
         }
         if !matches!(counter.dtype, DType::Raw | DType::F32) {
             return Err(HipError::new(
                 0,
-                &format!("device_counter_add_i32: counter dtype {:?} is not a raw 4-byte scalar", counter.dtype),
+                &format!(
+                    "device_counter_add_i32: counter dtype {:?} is not a raw 4-byte scalar",
+                    counter.dtype
+                ),
             ));
         }
         self.bind_thread()?;
