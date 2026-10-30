@@ -1492,6 +1492,9 @@ pub fn load_raon_weights(hfq: &HfqFile, gpu: &mut Gpu, cfg: &RaonConfig) -> Resu
                 .into(),
         );
     }
+    // The verified zero contract admits the device's symmetric-only routes
+    // (A8/IU4 prefill); whether they run is the bundle's precision policy.
+    gpu.mq4v2_symmetric = hfq.mq4v2_symmetric();
 
     // Stage 1: upload everything except routed experts into the pool.
     let mut pool = Pool::default();

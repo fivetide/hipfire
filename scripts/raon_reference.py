@@ -278,7 +278,7 @@ class Fixtures:
         for k in sorted(tensors):
             t = tensors[k]
             out[k] = (t.to(torch.bfloat16) if bf16 else f32c(t)).contiguous()
-        save_file(out, str(d / fname), metadata={"kind": "weights", "module": module})
+        save_file(out, str(d / fname), metadata={"raon": json.dumps({"kind": "weights", "module": module}, sort_keys=True)})
         return fname
 
     def add(self, module, name, dims, mode, inputs, outputs, *, weights=None, params=None,
@@ -296,16 +296,12 @@ class Fixtures:
             tensors[k] = t
         d = self._dir(module, negative)
         path = d / f"{name}.safetensors"
-        meta = {
-            "schema_version": str(SCHEMA_VERSION),
-            "module": module,
-            "case": name,
-            "mode": mode,
-            "dims": json.dumps(dims, sort_keys=True),
-            "inputs": json.dumps(sorted(inputs)),
-            "outputs": json.dumps(sorted(outputs)),
-            "ref_modeling_sha256": self.ref.sha["modeling_raon1_mini.py"],
-        }
+        # one metadata key holding sorted JSON: safetensors serialises multi-key metadata in
+        # hash-map order, which would make reruns differ byte-wise
+        meta = {"raon": json.dumps({
+            "schema_version": SCHEMA_VERSION, "module": module, "case": name, "mode": mode, "dims": dims,
+            "inputs": sorted(inputs), "outputs": sorted(outputs),
+            "ref_modeling_sha256": self.ref.sha["modeling_raon1_mini.py"]}, sort_keys=True)}
         save_file({k: tensors[k] for k in sorted(tensors)}, str(path), metadata=meta)
         entry = {
             "name": name,
@@ -1715,7 +1711,7 @@ def cmd_layer_dump(a):
                 kva = cap["mla_kv_a"][0]
                 t["mla_latent"] = f32c(torch.cat([c, kva[:, c.shape[-1]:]], dim=-1))
             fn = f"layer{i:02d}.safetensors"
-        save_file(t, str(out / fn), metadata={"tokens": str(len(toks)), "kind": "layer-dump"})
+        save_file(t, str(out / fn), metadata={"raon": json.dumps({"tokens": len(toks), "kind": "layer-dump"}, sort_keys=True)})
         files[fn] = sha256_file(out / fn)
 
     res = sm.run(toks, on_layer=on_layer)
@@ -1723,7 +1719,7 @@ def cmd_layer_dump(a):
     pos = list(range(len(toks))) if a.all_logits else [len(toks) - 1]
     t["logits"] = f32c(sm.logits(res["h"], pos))
     t["logit_positions"] = f32c(torch.tensor(pos, dtype=torch.float32))
-    save_file(t, str(out / "final.safetensors"), metadata={"kind": "layer-dump"})
+    save_file(t, str(out / "final.safetensors"), metadata={"raon": json.dumps({"kind": "layer-dump"}, sort_keys=True)})
     files["final.safetensors"] = sha256_file(out / "final.safetensors")
     (out / "dump.json").write_text(json.dumps({
         "schema_version": SCHEMA_VERSION, "n_tokens": len(toks), "tokens": toks,

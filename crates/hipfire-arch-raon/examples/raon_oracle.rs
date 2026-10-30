@@ -13,7 +13,7 @@
 //! raon_oracle module --module mhc|rda|mla|moe|norm|head --fixtures DIR --out FILE [--negative] [--k v ...]
 //! raon_oracle state  --model M --tokens F --mode serial|batched|graph|state-only --out FILE [--k v ...]
 //! raon_oracle logits --model M --tokens F (--teacher F | --kld REF.kldref.bin) --out FILE [--k v ...]
-//! raon_oracle generate --model M [--k v ...]   (text to stdout, exit 0/1; no --out, no verdict JSON)
+//! raon_oracle generate --model M [--k v ...]   (generate::run streams text to stdout, exit 0/1; `--json 1` also prints the result object; no --out)
 //! raon_oracle bench  --model M --pp 512,8192 --tg 128 --out FILE [--k v ...]
 //! ```
 //!
@@ -44,8 +44,8 @@ type RunFn = fn(&Path, &BTreeMap<String, String>) -> Result<Value, String>;
 const USAGE: &str = "usage:
   raon_oracle module --module mhc|rda|mla|moe|norm|head --fixtures DIR --out FILE [--negative]
   raon_oracle state  --model M --tokens F --mode serial|batched|graph|state-only --out FILE
-  raon_oracle logits --model M --tokens F (--teacher F | --kld REF.kldref.bin) --out FILE
-  raon_oracle generate --model M ... (prints text to stdout; no --out)
+  raon_oracle logits --model M (--tokens F --teacher F | --kld REF.kldref.bin) --out FILE
+  raon_oracle generate --model M ... (streams text to stdout; no --out)
   raon_oracle bench  --model M --pp 512,8192 --tg 128 --out FILE
 (extra `--key value` pairs are forwarded to the module as opts)";
 
@@ -175,9 +175,9 @@ fn run_generate(cli: &Cli) -> Result<bool, String> {
     require(&cli.opts, "model")?;
     let fixtures = PathBuf::from(cli.opts.get("fixtures").map(String::as_str).unwrap_or("."));
     let result = raon_oracle::generate::run(&fixtures, &cli.opts).map_err(|e| format!("generate: {e}"))?;
-    match result.get("text").and_then(Value::as_str) {
-        Some(t) => println!("{t}"),
-        None => println!("{}", serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?),
+    // generate::run streams its own text; `--json 1` additionally prints the result object.
+    if cli.opts.get("json").map(String::as_str) == Some("1") {
+        println!("{}", serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?);
     }
     Ok(result.get("pass").and_then(Value::as_bool).unwrap_or(true))
 }

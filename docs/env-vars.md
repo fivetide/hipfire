@@ -472,7 +472,7 @@ refused at load under PP; Single and EP session behavior is unchanged.
 
 | Variable | Notes |
 |---|---|
-| `HIPFIRE_GRAPH` | hipGraph capture opt-in (quality caveats; AR-oriented) |
+| `HIPFIRE_GRAPH` | hipGraph capture opt-in (quality caveats; AR-oriented). Raon-1-mini (arch 19) decode defaults to a captured graph (one per admitted context bucket, replayed per token; re-recorded when the latent mapping or K/V mirror grows); `HIPFIRE_GRAPH=0` is the per-launch eager control. A failed capture is an error, never a silent eager fallback. |
 | `HIPFIRE_GEMMA4_GRAPH` | Gemma4 per-model decode graph: `1` enables, `0` disables (kill switch). Hand carrier defaults on. Lowered carrier: this switch wins, then `HIPFIRE_GRAPH=0/1`, then the arch default, which is on for exact gfx1201 and off for every other arch (gfx1100, gfx1151, gfx1200, …). Lowered captures after one eager warm-up, stages position on-device before replay, and re-captures when KV/weight/scratch allocations or shapes change. Dense bodies and indexed MoE with HFQ4G128 expert down are admitted; CPU expert fallback and atomic Q8 expert down remain eager. |
 | `HIPFIRE_GRAPH_MOE` | MoE graph opt-in |
 | `HIPFIRE_VERIFY_GRAPH` / `_TIMING` / `_TREE` | verify-side graph diag |
