@@ -64,11 +64,12 @@ const DEFAULT_PROMPT: &str = concat!(
 );
 
 /// Bucket order of every report (the residual is appended last).
-const BUCKETS: [&str; 15] = [
+const BUCKETS: [&str; 16] = [
     "moe_grouped",
     "moe_indexed",
     "moe_route",
     "trunk_gemm",
+    "act_rotate",
     "rda_recurrence",
     "conv_prepare",
     "mla_attention",
@@ -521,7 +522,7 @@ pub fn bucket_of(kernel: &str) -> &'static str {
             "mla_decompress"
         };
     }
-    if has("moe") || has("expert") || has("topk") || has("ffn_situ") || (has("grouped") && has("ffn")) {
+    if has("moe") || has("expert") || has("topk") || (has("ffn_situ") && has("grouped")) || (has("grouped") && has("ffn")) {
         if has("router") || has("topk") || (has("scatter") && !has("unscatter")) || has("histogram")
             || has("offsets") || has("permute") || has("combine_order") || has("sorted")
         {
@@ -540,6 +541,12 @@ pub fn bucket_of(kernel: &str) -> &'static str {
     }
     if has("norm") {
         return "norms";
+    }
+    if has("rotate") {
+        return "act_rotate";
+    }
+    if has("ffn_") {
+        return "elementwise";
     }
     if has("embedding") {
         return "embed";
@@ -591,39 +598,49 @@ fn section_report(
     units: f64,
     unit_name: &str,
     head_launches: usize,
+    floor_us: f64,
 ) -> Value {
-    let kernel_sum_us: f64 = table.values().map(|v| v.1).sum();
-    let kernel_sum_ms = kernel_sum_us / 1e3;
+    // Every launch-level span carries a fixed event/dispatch floor (a launch of
+    // an empty-ish kernel measures `floor_us`); it is not kernel work and, over
+    // thousands of ~10 us decode launches, it dominates. Buckets report
+    // floor-corrected time; raw spans are kept beside it.
+    let corrected = |calls: u64, us: f64| (us - calls as f64 * floor_us).max(0.0);
+    let raw_sum_us: f64 = table.values().map(|v| v.1).sum();
+    let kernel_sum_ms: f64 = table.values().map(|v| corrected(v.0, v.1)).sum::<f64>() / 1e3;
     let launches: u64 = table.values().map(|v| v.0).sum();
-    let mut bucket_us: BTreeMap<&'static str, (u64, f64)> = BTreeMap::new();
+    let mut bucket_us: BTreeMap<&'static str, (u64, f64, f64)> = BTreeMap::new();
     let mut rows: Vec<Value> = Vec::new();
     let mut entries: Vec<(&(String, bool), &(u64, f64))> = table.iter().collect();
     entries.sort_by(|a, b| b.1 .1.total_cmp(&a.1 .1));
     for ((kernel, is_head), (calls, us)) in entries {
         let bucket = if *is_head { "head" } else { bucket_of(kernel) };
-        let b = bucket_us.entry(bucket).or_insert((0, 0.0));
+        let c = corrected(*calls, *us);
+        let b = bucket_us.entry(bucket).or_insert((0, 0.0, 0.0));
         b.0 += calls;
-        b.1 += us;
+        b.1 += c;
+        b.2 += us;
         rows.push(json!({
             "name": kernel,
             "head": is_head,
             "bucket": bucket,
             "calls": calls,
             "total_us": us,
+            "corrected_us": c,
         }));
     }
     let gap_ms = wall_ms - kernel_sum_ms;
     let mut buckets = Vec::new();
     for b in BUCKETS {
-        let (calls, ms) = if b == "launch_gaps_untimed" {
-            (0, gap_ms)
+        let (calls, ms, raw_ms) = if b == "launch_gaps_untimed" {
+            (0, gap_ms, Value::Null)
         } else {
-            let (c, us) = bucket_us.get(b).copied().unwrap_or((0, 0.0));
-            (c, us / 1e3)
+            let (c, us, raw) = bucket_us.get(b).copied().unwrap_or((0, 0.0, 0.0));
+            (c, us / 1e3, json!(raw / 1e3))
         };
         buckets.push(json!({
             "bucket": b,
             "ms": ms,
+            "raw_span_ms": raw_ms,
             "frac_of_wall": ms / wall_ms,
             "frac_of_kernel_sum": if b == "launch_gaps_untimed" { Value::Null } else { json!(ms / kernel_sum_ms) },
             "launches": calls,
@@ -636,6 +653,8 @@ fn section_report(
         "units": units,
         "wall_unprofiled_ms": wall_ms,
         "wall_profiled_ms": profiled_wall_ms,
+        "launch_span_floor_us": floor_us,
+        "kernel_sum_raw_ms": raw_sum_us / 1e3,
         "kernel_sum_ms": kernel_sum_ms,
         "launches": launches,
         "head_launches_per_forward": head_launches,
@@ -647,10 +666,34 @@ fn section_report(
         "legacy_timer_coverage_of_kernel_sum": legacy_sum_ms / kernel_sum_ms,
         "buckets": buckets,
         "kernels": rows,
-        "note": "kernel_sum = launch-level hipEvent spans (each launch synchronized); \
+        "note": "kernel_sum = launch-level hipEvent spans minus the per-launch floor (each launch synchronized); \
                  residual = unprofiled wall - kernel_sum: launch gaps, idle GPU, host work, \
                  copies and launches outside the funnels. Profiled wall is inflated by the per-launch syncs.",
     })
+}
+
+/// Median span of a minimal launch through the funnel: the fixed cost every
+/// launch-level span carries regardless of kernel work.
+fn launch_floor_us(gpu: &mut Gpu) -> Result<f64, String> {
+    let t = hip(gpu.alloc_tensor(&[64], DType::F32), "alloc floor probe")?;
+    for _ in 0..16 {
+        hip(gpu.bf16_round_trip_f32_strided(&t, 1, 0, 64, 64), "floor warmup")?;
+    }
+    sync(gpu)?;
+    rdna_compute::profile::start_launches();
+    let mut r = Ok(());
+    for _ in 0..512 {
+        r = r.and_then(|_| hip(gpu.bf16_round_trip_f32_strided(&t, 1, 0, 64, 64), "floor probe"));
+    }
+    let entries = rdna_compute::profile::stop_launches().unwrap_or_default();
+    let _ = gpu.free_tensor(t);
+    r?;
+    let mut us: Vec<f64> = entries.iter().map(|e| e.time_us).collect();
+    if us.is_empty() {
+        return Err("floor probe recorded no launches".into());
+    }
+    us.sort_by(|a, b| a.total_cmp(b));
+    Ok(percentile(&us, 0.5))
 }
 
 /// Kernel names of one standalone `readout_logits` (final norm + lm_head of a
@@ -685,6 +728,7 @@ fn profile_pp(
     gpu: &mut Gpu,
     stream: &Stream,
     n: usize,
+    floor_us: f64,
 ) -> Result<Value, String> {
     let ids = stream.ids(n);
     check_tokens(&ids, bundle.config.vocab, "profile pp ids")?;
@@ -719,6 +763,7 @@ fn profile_pp(
         n as f64,
         "token",
         head.len(),
+        floor_us,
     );
     rep["n"] = json!(n);
     rep["ids_md5"] = json!(ids_md5(&ids));
@@ -732,6 +777,7 @@ fn profile_tg(
     stream: &Stream,
     tg: usize,
     prompt_tokens: usize,
+    floor_us: f64,
 ) -> Result<Value, String> {
     let prompt = stream.ids(prompt_tokens);
     check_tokens(&prompt, bundle.config.vocab, "profile tg prompt")?;
@@ -778,6 +824,7 @@ fn profile_tg(
         tg as f64,
         "token",
         head.len(),
+        floor_us,
     );
     rep["tokens"] = json!(tg);
     rep["prompt_tokens"] = json!(prompt_tokens);
@@ -821,6 +868,7 @@ fn rebucket(path: &str) -> Result<Value, String> {
             f("units").max(1.0),
             s.get("unit").and_then(Value::as_str).unwrap_or("token"),
             f("head_launches_per_forward") as usize,
+            f("launch_span_floor_us"),
         ));
     }
     Ok(json!({
@@ -949,9 +997,10 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
         }
         let mut profile_json = Value::Null;
         if profile {
+            let floor_us = launch_floor_us(&mut gpu)?;
             let mut sections = Vec::new();
             for &n in &pps {
-                match profile_pp(&mut bundle, &mut gpu, &stream, n) {
+                match profile_pp(&mut bundle, &mut gpu, &stream, n, floor_us) {
                     Ok(v) => sections.push(v),
                     Err(e) => {
                         eprintln!("bench: profile pp{n}: ERROR {e}");
@@ -961,7 +1010,7 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
                 }
             }
             if tg > 0 {
-                match profile_tg(&mut bundle, &mut gpu, &stream, tg, tg_prompt) {
+                match profile_tg(&mut bundle, &mut gpu, &stream, tg, tg_prompt, floor_us) {
                     Ok(v) => sections.push(v),
                     Err(e) => {
                         eprintln!("bench: profile tg{tg}: ERROR {e}");
