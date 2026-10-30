@@ -2500,7 +2500,15 @@ fn gpu_shared_only(
     let g = c.geom;
     let n = c.n;
     let mut ts: Vec<GpuTensor> = Vec::new();
-    for words in [n * g.c, n * g.i, n * g.i, n * g.ipad, n * g.ipad, n * g.c] {
+    for words in [
+        n * g.c,
+        n * g.i,
+        n * g.i,
+        n * g.ipad,
+        n * g.ipad,
+        n * g.c,
+        rdna_compute::ffn_activation::single_expert_table_words(n),
+    ] {
         match alloc_f32(gpu, words) {
             Ok(t) => ts.push(t),
             Err(e) => {
@@ -2537,6 +2545,7 @@ fn gpu_shared_only(
                 act: &ts[3],
                 rot: &ts[4],
                 out: &ts[5],
+                tables: &ts[6],
             },
             out: &ts[5],
         };

@@ -847,6 +847,94 @@ impl Gpu {
             },
         )
     }
+
+    /// Fill the single-expert grouping tables of `tables`
+    /// (`single_expert_table_words(rows)` F32/i32 words, layout in
+    /// `ffn_grouped_activation_pad.hip`) for the three dense weights `w`.
+    pub fn ffn_single_expert_tables(
+        &mut self,
+        tables: &GpuTensor,
+        rows: usize,
+        w: [&GpuTensor; 3],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        require_f32(tables, "ffn_single_expert_tables tables")?;
+        require_words(
+            tables,
+            single_expert_table_words(rows),
+            "ffn_single_expert_tables extent",
+        )?;
+        if rows == 0 {
+            return Ok(());
+        }
+        let rows_pad = rows.div_ceil(16) * 16;
+        let rows_i = as_i32(rows, "ffn_single_expert_tables rows")?;
+        let pad_i = as_i32(rows_pad, "ffn_single_expert_tables rows_pad")?;
+        self.ensure_kernel(GROUPED_MODULE, GROUPED_SRC, ENTRY_SINGLE_TABLES)?;
+        let tp = tables.buf.as_ptr();
+        let (w0, w1, w2) = (w[0].buf.as_ptr(), w[1].buf.as_ptr(), w[2].buf.as_ptr());
+        let mut params = [
+            &tp as *const _ as *mut c_void,
+            &rows_i as *const _ as *mut c_void,
+            &pad_i as *const _ as *mut c_void,
+            &w0 as *const _ as *mut c_void,
+            &w1 as *const _ as *mut c_void,
+            &w2 as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            ENTRY_SINGLE_TABLES,
+            [rows_pad.div_ceil(256).max(1) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(tp);
+                b.push_i32(rows_i);
+                b.push_i32(pad_i);
+                b.push_ptr(w0);
+                b.push_ptr(w1);
+                b.push_ptr(w2);
+                b
+            },
+        )
+    }
+
+    /// Views of the single-expert tables of [`Self::ffn_single_expert_tables`]
+    /// for `rows` rows: `(ptr tables [gate, up, down] one entry each, expert
+    /// index [rows_pad], sorted_slot_index [rows_pad], expert_tile_ids
+    /// [rows_pad / 16])`.
+    pub fn single_expert_views(tables: &GpuTensor, rows: usize) -> SingleExpertViews {
+        let rows_pad = rows.div_ceil(16) * 16;
+        SingleExpertViews {
+            gate_ptr: tables.sub_offset(0, 2),
+            up_ptr: tables.sub_offset(2, 2),
+            down_ptr: tables.sub_offset(4, 2),
+            index: tables.sub_offset(6, rows_pad),
+            sorted: tables.sub_offset(6 + rows_pad, rows_pad),
+            tiles: tables.sub_offset(6 + 2 * rows_pad, rows_pad / 16),
+            rows_pad,
+        }
+    }
+}
+
+const ENTRY_SINGLE_TABLES: &str = "ffn_single_expert_tables";
+
+/// Words of the single-expert grouping tables for `rows` rows.
+pub fn single_expert_table_words(rows: usize) -> usize {
+    let rows_pad = rows.div_ceil(16) * 16;
+    6 + 2 * rows_pad + rows_pad / 16
+}
+
+/// Borrow-free views into the tables of [`Gpu::ffn_single_expert_tables`].
+pub struct SingleExpertViews {
+    pub gate_ptr: GpuTensor,
+    pub up_ptr: GpuTensor,
+    pub down_ptr: GpuTensor,
+    pub index: GpuTensor,
+    pub sorted: GpuTensor,
+    pub tiles: GpuTensor,
+    pub rows_pad: usize,
 }
 
 // ---------------------------------------------------------------------------
