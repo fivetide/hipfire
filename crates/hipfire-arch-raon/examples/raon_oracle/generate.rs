@@ -97,6 +97,15 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
     let mut gpu = Gpu::init().map_err(|e| format!("generate: gpu init: {e:?}"))?;
     let max_seq = (prompt.len() + n_new + 64).max(512);
     let mut bundle = load_bundle(&mut gpu, ModelSource::Hfq(hfq), &model, max_seq)?;
+    // `--mirror-budget-rows N`: force the decompressed-route mirror budget (rows) so the
+    // beyond-budget routes (capacity refusal / absorbed with HIPFIRE_RAON_MLA_ABSORB=1) run
+    // at test-sized contexts.
+    if let Some(v) = opts.get("mirror-budget-rows") {
+        let rows = v
+            .parse::<usize>()
+            .map_err(|e| format!("--mirror-budget-rows `{v}`: {e}"))?;
+        bundle.state.set_mirror_budget_rows(rows);
+    }
     let r = (|| -> Result<Value, String> {
         check_tokens(&prompt, bundle.config.vocab, "prompt")?;
         bundle.set_prefill_mode(mode);
