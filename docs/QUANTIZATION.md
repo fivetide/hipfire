@@ -119,11 +119,15 @@ Flash-Next bench fixture”) and the registry rows in [MODELS.md](MODELS.md).
   PLE rows can be read from `.ple-q4` / `.ple-q8` sidecars (see
   [QUANTIZE.md](QUANTIZE.md#qwen4-flash-next-streaming-producer)).
 
-- **Raon-1-mini-preview XTS** (arch 19, `raon-1-mini-preview.sym-mq4v2.hfq`) by tensor
+- **Raon-1-mini-preview XTS** (arch 19, `raon-1-mini-preview.mq4-xts`) by tensor
   class: the attention classes (MLA and RDA projections, including the RDA gates and
-  the MLA/RDA LoRA factors) are promoted to Q8F16 (qt 3); `lm_head` is Q8; the routed
-  experts are symmetric MQ4V2 XT (qt 44) with the XTS refit (per-group AWQ alpha plus
-  GPTQ scale refit), so the int4-activation prefill and sealed MoE routes apply.
+  the MLA/RDA LoRA factors) are promoted to Q8F16 (qt 3); `lm_head` is Q8; the routed,
+  shared and dense-MLP experts are symmetric MQ4V2 XT (qt 44) with the XTS refit
+  (per-group AWQ alpha plus GPTQ scale refit), so the int4-activation prefill and
+  sealed MoE routes apply. The shared-expert gate/up carry the routed experts' `moe_in`
+  AWQ scale, because the runtime feeds both from one rotated activation (the loader
+  rejects a file whose shared gate/up sidecar differs). KLD vs the BF16 teacher:
+  WT2 0.081, code24 0.0138 (the RTN control with the same Q8 attention: 0.102 / 0.019).
   Prefill activation precision resolves once at load via
   `HIPFIRE_RAON_PREFILL_PRECISION` (default f16; A4 is opt-in).
 
