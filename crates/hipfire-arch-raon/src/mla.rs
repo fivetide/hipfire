@@ -131,9 +131,11 @@ pub struct MlaPolicy {
     /// `HIPFIRE_RAON_ATTN_TILED` (default 1): tiled causal prefill and
     /// split-KV decode kernels. `0` selects the serial reference kernel.
     pub tiled: bool,
-    /// `HIPFIRE_RAON_MLA_ABSORB` (default 0): attend over the latent cache
+    /// `HIPFIRE_RAON_MLA_ABSORB` (default 1): attend over the latent cache
     /// (absorbed algebra) once a context exceeds the expanded-mirror budget,
-    /// instead of refusing it. Not bit-exact to the decompressed route.
+    /// instead of refusing it. Not bit-exact to the decompressed route; its
+    /// KLD vs the BF16 teacher matched the decompressed route (code24 0.0610
+    /// vs 0.0612, WT2 0.2016 vs 0.2018, gfx1201). `0` refuses past the budget.
     pub absorb: bool,
 }
 
@@ -159,7 +161,7 @@ fn parse_flag(name: &str, default: bool) -> Result<bool, String> {
 }
 
 impl MlaPolicy {
-    pub const DEFAULT: Self = Self { tiled: true, absorb: false };
+    pub const DEFAULT: Self = Self { tiled: true, absorb: true };
 
     pub fn from_env() -> Result<Self, String> {
         Ok(Self {
