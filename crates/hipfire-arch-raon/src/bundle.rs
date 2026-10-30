@@ -179,10 +179,16 @@ impl PrefillPrecision {
         let label = match self {
             Self::F16 => return,
             Self::Default => {
-                let (verified, total) = weights.layers.iter().fold((0usize, 0usize), |(v, t), l| match &l.ffn {
-                    crate::weights::RaonFfn::Moe(m) => (v + usize::from(m.iu4_symmetric), t + 1),
-                    _ => (v, t),
-                });
+                let (verified, total) =
+                    weights
+                        .layers
+                        .iter()
+                        .fold((0usize, 0usize), |(v, t), l| match &l.ffn {
+                            crate::weights::RaonFfn::Moe(m) => {
+                                (v + usize::from(m.iu4_symmetric), t + 1)
+                            }
+                            _ => (v, t),
+                        });
                 eprintln!(
                     "raon1_mini: routed experts run W4A8 (grouped int8-activation GEMMs) on {verified} of {total} MoE layers \
                      (gfx1201 [{arch}] + loader-verified symmetric qt44); shared experts, the dense layer and \

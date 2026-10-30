@@ -24,8 +24,8 @@ use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::moe::{GroupedMoeGeometry, MOE_GROUPED_MAX_TOP_K};
 use hipfire_dispatch::pipeline::{
     execute_gated_ffn, execute_grouped_moe, CastPolicy, CombineOrder, FfnActivation, GatedFfnOp,
-    GroupedMoeGroupedScratch, GroupedMoeIndexedScratch, GroupedMoeOp, GroupedMoePolicy,
-    GroupedMoeActTier, GroupedMoeProtocol, GroupedMoeRouted, GroupedMoeRouter, GroupedMoeScratch,
+    GroupedMoeActTier, GroupedMoeGroupedScratch, GroupedMoeIndexedScratch, GroupedMoeOp,
+    GroupedMoePolicy, GroupedMoeProtocol, GroupedMoeRouted, GroupedMoeRouter, GroupedMoeScratch,
     GroupedMoeScratchPlan, GroupedMoeShared, GroupedMoeSharedScratch, RouterKind,
     SharedExpertPolicy,
 };

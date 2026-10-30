@@ -7466,7 +7466,8 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
                 MOE_GROUPED_BLOCK_M,
             ))?;
             if tier_gu == GroupedMoeActTier::A8 {
-                let (nt, rf) = rdna_compute::moe_grouped_qt44_iu4::select_entry_a8(m_total, 2 * g.logical_mi);
+                let (nt, rf) =
+                    rdna_compute::moe_grouped_qt44_iu4::select_entry_a8(m_total, 2 * g.logical_mi);
                 let xq = hip!(gpu.ensure_int8_mmq_x(s.x_rot, rows, g.hidden))?;
                 hip!(gpu.gemm_mq4g256v2_moe_grouped_a8_sym(
                     op.routed.gate_up_ptrs,
@@ -7484,7 +7485,8 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
                     rf,
                 ))?;
             } else if tier_gu == GroupedMoeActTier::A4 {
-                let (nt, rf) = rdna_compute::moe_grouped_qt44_iu4::select_entry(m_total, 2 * g.logical_mi);
+                let (nt, rf) =
+                    rdna_compute::moe_grouped_qt44_iu4::select_entry(m_total, 2 * g.logical_mi);
                 let xq = hip!(gpu.ensure_int4_mmq_x(s.x_rot, rows, g.hidden))?;
                 hip!(gpu.gemm_mq4g256v2_moe_grouped_iu4_sym(
                     op.routed.gate_up_ptrs,
@@ -7532,7 +7534,8 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
             }))?;
             hip!(gpu.rotate_x_mq_batched(s.act, s.rot, g.down_k, slots))?;
             if tier_dn == GroupedMoeActTier::A8 {
-                let (nt, rf) = rdna_compute::moe_grouped_qt44_iu4::select_entry_a8(m_total, g.hidden);
+                let (nt, rf) =
+                    rdna_compute::moe_grouped_qt44_iu4::select_entry_a8(m_total, g.hidden);
                 let xq = hip!(gpu.ensure_int8_mmq_x(s.rot, slots, g.down_k))?;
                 hip!(gpu.gemm_mq4g256v2_moe_grouped_a8_sym(
                     op.routed.down_ptrs,
@@ -7650,11 +7653,26 @@ mod grouped_moe_tests {
         let g = raon_geometry();
         assert!(grouped_moe_iu4_shape_admits(&g, 4096));
         assert!(grouped_moe_iu4_shape_admits(&g, GROUPED_MOE_IU4_MIN_ROWS));
-        assert!(!grouped_moe_iu4_shape_admits(&g, GROUPED_MOE_IU4_MIN_ROWS - 1));
+        assert!(!grouped_moe_iu4_shape_admits(
+            &g,
+            GROUPED_MOE_IU4_MIN_ROWS - 1
+        ));
         // down K must be whole qt44 groups (the logical 1088 is padded to 1280).
-        assert!(!grouped_moe_iu4_shape_admits(&GroupedMoeGeometry { down_k: 1088, ..g }, 4096));
-        assert!(!grouped_moe_iu4_shape_admits(&GroupedMoeGeometry { hidden: 2688, ..g }, 4096));
-        assert!(!grouped_moe_iu4_shape_admits(&GroupedMoeGeometry { logical_mi: 1040, ..g }, 4096));
+        assert!(!grouped_moe_iu4_shape_admits(
+            &GroupedMoeGeometry { down_k: 1088, ..g },
+            4096
+        ));
+        assert!(!grouped_moe_iu4_shape_admits(
+            &GroupedMoeGeometry { hidden: 2688, ..g },
+            4096
+        ));
+        assert!(!grouped_moe_iu4_shape_admits(
+            &GroupedMoeGeometry {
+                logical_mi: 1040,
+                ..g
+            },
+            4096
+        ));
     }
 
     #[test]

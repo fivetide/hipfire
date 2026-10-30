@@ -197,17 +197,32 @@ fn compare(reference: &[f32], got: &[f32], m: usize, sorted: &[i32]) -> Stats {
             n += 1.0;
         }
     }
-    Stats { max_abs: mx, mean_abs: sa / n, rms_ref: (sr / n).sqrt(), rms_err: (se / n).sqrt() }
+    Stats {
+        max_abs: mx,
+        mean_abs: sa / n,
+        rms_ref: (sr / n).sqrt(),
+        rms_err: (se / n).sqrt(),
+    }
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |k: &str, d: &str| -> String {
-        args.iter().position(|a| a == k).map(|i| args[i + 1].clone()).unwrap_or_else(|| d.into())
+        args.iter()
+            .position(|a| a == k)
+            .map(|i| args[i + 1].clone())
+            .unwrap_or_else(|| d.into())
     };
-    let tokens: Vec<usize> = arg("--tokens", "512,4096").split(',').map(|s| s.parse().unwrap()).collect();
+    let tokens: Vec<usize> = arg("--tokens", "512,4096")
+        .split(',')
+        .map(|s| s.parse().unwrap())
+        .collect();
     let reps: usize = arg("--reps", "15").parse().unwrap();
-    let sigma = if arg("--route", "skew") == "uniform" { 0.0 } else { 1.0 };
+    let sigma = if arg("--route", "skew") == "uniform" {
+        0.0
+    } else {
+        1.0
+    };
     let out_path = arg("--out", "");
     const E: usize = 128;
     const TOP_K: usize = 6;
@@ -252,7 +267,10 @@ fn main() {
         let sorted_t = gpu.zeros(&[bound], DType::F32).unwrap();
         let tiles_t = gpu.zeros(&[bound / 16], DType::F32).unwrap();
         let inv = gpu.zeros(&[slots], DType::F32).unwrap();
-        gpu.moe_scatter_fused_k8(&topk, &counts, &offsets, &sorted_t, &tiles_t, &inv, slots, E, bound, 16).unwrap();
+        gpu.moe_scatter_fused_k8(
+            &topk, &counts, &offsets, &sorted_t, &tiles_t, &inv, slots, E, bound, 16,
+        )
+        .unwrap();
         let sorted = dl_i32(&gpu, &sorted_t);
         let tiles = dl_i32(&gpu, &tiles_t);
         let offs = dl_i32(&gpu, &offsets);
@@ -275,12 +293,16 @@ fn main() {
 
             // F16 route, with and without its per-call convert.
             let (f16_med, f16_min) = time_us(&mut gpu, reps, |gpu| {
-                gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(ptrs, &tiles_t, &sorted_t, &x32, &y_f16, m, k, x_row_div, bound, x_rows)
-                    .unwrap();
+                gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(
+                    ptrs, &tiles_t, &sorted_t, &x32, &y_f16, m, k, x_row_div, bound, x_rows,
+                )
+                .unwrap();
             });
             let (f16g_med, f16g_min) = time_us(&mut gpu, reps, |gpu| {
-                gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(ptrs, &tiles_t, &sorted_t, &x16, &y_f16, m, k, x_row_div, bound, x_rows)
-                    .unwrap();
+                gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(
+                    ptrs, &tiles_t, &sorted_t, &x16, &y_f16, m, k, x_row_div, bound, x_rows,
+                )
+                .unwrap();
             });
             let yref = gpu.download_f32(&y_f16).unwrap();
 
@@ -292,7 +314,12 @@ fn main() {
             gpu.hip.device_synchronize().unwrap();
             let xq_bytes = (k / 128) * x_rows * 72;
             let mut xq_host = vec![0u8; xq_bytes];
-            gpu.hip.memcpy_dtoh(&mut xq_host, gpu.scratch.int4_mmq_x_scratch.as_ref().unwrap()).unwrap();
+            gpu.hip
+                .memcpy_dtoh(
+                    &mut xq_host,
+                    gpu.scratch.int4_mmq_x_scratch.as_ref().unwrap(),
+                )
+                .unwrap();
 
             let mut first: Option<Vec<f32>> = None;
             let mut entry_rows = Vec::new();
@@ -302,7 +329,19 @@ fn main() {
                 }
                 let y = gpu.zeros(&[bound, m], DType::F32).unwrap();
                 let r = gpu.gemm_mq4g256v2_moe_grouped_iu4_sym(
-                    &gu_ptrs_or(ptrs), &tiles_t, &offsets, &sorted_t, xq, &y, m, k, x_row_div, bound, x_rows, nt, rf,
+                    &gu_ptrs_or(ptrs),
+                    &tiles_t,
+                    &offsets,
+                    &sorted_t,
+                    xq,
+                    &y,
+                    m,
+                    k,
+                    x_row_div,
+                    bound,
+                    x_rows,
+                    nt,
+                    rf,
                 );
                 if let Err(e) = r {
                     println!("  {proj} nt{nt}r{rf}: launch error {e:?}");
@@ -310,7 +349,19 @@ fn main() {
                 }
                 let (med, mn) = time_us(&mut gpu, reps, |gpu| {
                     gpu.gemm_mq4g256v2_moe_grouped_iu4_sym(
-                        &gu_ptrs_or(ptrs), &tiles_t, &offsets, &sorted_t, xq, &y, m, k, x_row_div, bound, x_rows, nt, rf,
+                        &gu_ptrs_or(ptrs),
+                        &tiles_t,
+                        &offsets,
+                        &sorted_t,
+                        xq,
+                        &y,
+                        m,
+                        k,
+                        x_row_div,
+                        bound,
+                        x_rows,
+                        nt,
+                        rf,
                     )
                     .unwrap();
                 });
@@ -344,7 +395,12 @@ fn main() {
             let xq8 = gpu.ensure_int8_mmq_x(&x32, x_rows, k).unwrap();
             gpu.hip.device_synchronize().unwrap();
             let mut xq8_host = vec![0u8; (k / 128) * x_rows * 136];
-            gpu.hip.memcpy_dtoh(&mut xq8_host, gpu.scratch.int8_mmq_x_scratch.as_ref().unwrap()).unwrap();
+            gpu.hip
+                .memcpy_dtoh(
+                    &mut xq8_host,
+                    gpu.scratch.int8_mmq_x_scratch.as_ref().unwrap(),
+                )
+                .unwrap();
             let mut a8_first: Option<Vec<f32>> = None;
             let mut a8_rows = Vec::new();
             for &(nt, rf) in &rdna_compute::moe_grouped_qt44_iu4::A8_ENTRIES {
@@ -353,14 +409,16 @@ fn main() {
                 }
                 let y = gpu.zeros(&[bound, m], DType::F32).unwrap();
                 if let Err(e) = gpu.gemm_mq4g256v2_moe_grouped_a8_sym(
-                    ptrs, &tiles_t, &offsets, &sorted_t, xq8, &y, m, k, x_row_div, bound, x_rows, nt, rf,
+                    ptrs, &tiles_t, &offsets, &sorted_t, xq8, &y, m, k, x_row_div, bound, x_rows,
+                    nt, rf,
                 ) {
                     println!("  {proj} a8 nt{nt}r{rf}: launch error {e:?}");
                     continue;
                 }
                 let (med, mn) = time_us(&mut gpu, reps, |gpu| {
                     gpu.gemm_mq4g256v2_moe_grouped_a8_sym(
-                        ptrs, &tiles_t, &offsets, &sorted_t, xq8, &y, m, k, x_row_div, bound, x_rows, nt, rf,
+                        ptrs, &tiles_t, &offsets, &sorted_t, xq8, &y, m, k, x_row_div, bound,
+                        x_rows, nt, rf,
                     )
                     .unwrap();
                 });
@@ -370,7 +428,11 @@ fn main() {
                         a8_first = Some(yv.clone());
                         true
                     }
-                    Some(f) => f.iter().zip(yv.iter()).enumerate().all(|(i, (a, b))| sorted[i / m] < 0 || a.to_bits() == b.to_bits()),
+                    Some(f) => f
+                        .iter()
+                        .zip(yv.iter())
+                        .enumerate()
+                        .all(|(i, (a, b))| sorted[i / m] < 0 || a.to_bits() == b.to_bits()),
                 };
                 let st = compare(&yref, &yv, m, &sorted);
                 let ops = 2.0 * (m_total as f64) * m as f64 * k as f64;
@@ -390,10 +452,16 @@ fn main() {
             let mut checked = 0usize;
             let mut exact = 0usize;
             let wblob = |e: usize, row: usize, g: usize, buf: &mut Vec<u8>| {
-                let t = if proj == "gate_up" { &gu_t[e] } else { &dn_t[e] };
+                let t = if proj == "gate_up" {
+                    &gu_t[e]
+                } else {
+                    &dn_t[e]
+                };
                 let rb = (k / 256) * 136;
                 let mut tmp = vec![0u8; 136];
-                gpu.hip.memcpy_dtoh_at(&mut tmp, &t.buf, row * rb + g * 136).unwrap();
+                gpu.hip
+                    .memcpy_dtoh_at(&mut tmp, &t.buf, row * rb + g * 136)
+                    .unwrap();
                 buf.clear();
                 buf.extend_from_slice(&tmp);
             };
@@ -444,7 +512,8 @@ fn main() {
                     let mut sum = 0f32;
                     for h in 0..k / 128 {
                         wblob(e, row, h / 2, &mut gb);
-                        let sc = f16_to_f32(u16::from_le_bytes([gb[4 * (h & 1)], gb[4 * (h & 1) + 1]]));
+                        let sc =
+                            f16_to_f32(u16::from_le_bytes([gb[4 * (h & 1)], gb[4 * (h & 1) + 1]]));
                         let o = (h * x_rows + xrow) * 136;
                         let blk = &xq8_host[o..o + 136];
                         let d = f32::from_le_bytes([blk[0], blk[1], blk[2], blk[3]]);
@@ -479,7 +548,12 @@ fn main() {
         }
     }
     if !out_path.is_empty() {
-        std::fs::write(&out_path, serde_json::to_string_pretty(&serde_json::json!({"sigma": sigma, "results": results})).unwrap()).unwrap();
+        std::fs::write(
+            &out_path,
+            serde_json::to_string_pretty(&serde_json::json!({"sigma": sigma, "results": results}))
+                .unwrap(),
+        )
+        .unwrap();
     }
 }
 

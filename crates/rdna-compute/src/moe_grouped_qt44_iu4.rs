@@ -96,8 +96,20 @@ impl Gpu {
         rf: usize,
     ) -> HipResult<()> {
         self.grouped_sym_launch(
-            false, expert_weight_ptrs, expert_tile_ids, expert_offsets, sorted_slot_index, xq, y_grouped, m, k,
-            x_row_div, m_total, x_src_rows, nt, rf,
+            false,
+            expert_weight_ptrs,
+            expert_tile_ids,
+            expert_offsets,
+            sorted_slot_index,
+            xq,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            x_src_rows,
+            nt,
+            rf,
         )
     }
 
@@ -121,8 +133,20 @@ impl Gpu {
         rf: usize,
     ) -> HipResult<()> {
         self.grouped_sym_launch(
-            true, expert_weight_ptrs, expert_tile_ids, expert_offsets, sorted_slot_index, xq, y_grouped, m, k,
-            x_row_div, m_total, x_src_rows, nt, rf,
+            true,
+            expert_weight_ptrs,
+            expert_tile_ids,
+            expert_offsets,
+            sorted_slot_index,
+            xq,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            x_src_rows,
+            nt,
+            rf,
         )
     }
 
@@ -155,11 +179,21 @@ impl Gpu {
             (symbol(nt, rf), MODULE, SRC)
         };
         let func = func.ok_or_else(|| err("grouped qt44 symmetric GEMM: unbuilt (nt, rf)"))?;
-        if m == 0 || m % (64 * rf) != 0 || k == 0 || k % 256 != 0 || m_total % 16 != 0 || x_row_div == 0 {
-            return Err(err("grouped qt44 symmetric GEMM: shape (M % 64*rf, K % 256, m_total % 16)"));
+        if m == 0
+            || m % (64 * rf) != 0
+            || k == 0
+            || k % 256 != 0
+            || m_total % 16 != 0
+            || x_row_div == 0
+        {
+            return Err(err(
+                "grouped qt44 symmetric GEMM: shape (M % 64*rf, K % 256, m_total % 16)",
+            ));
         }
         if m_total.max(x_src_rows).max(m) > (i32::MAX as usize) / 2 {
-            return Err(err("grouped qt44 symmetric GEMM: extent exceeds 32-bit slot indices"));
+            return Err(err(
+                "grouped qt44 symmetric GEMM: extent exceeds 32-bit slot indices",
+            ));
         }
         self.ensure_kernel(module, src, func)?;
         let ep = expert_weight_ptrs.buf.as_ptr();
@@ -167,7 +201,13 @@ impl Gpu {
         let op = expert_offsets.buf.as_ptr();
         let sp = sorted_slot_index.buf.as_ptr();
         let yp = y_grouped.buf.as_ptr();
-        let (mv, kv, dv, mt, xs) = (m as i32, k as i32, x_row_div as i32, m_total as i32, x_src_rows as i32);
+        let (mv, kv, dv, mt, xs) = (
+            m as i32,
+            k as i32,
+            x_row_div as i32,
+            m_total as i32,
+            x_src_rows as i32,
+        );
         let nev = moe_expert_table_len(expert_weight_ptrs);
         let mut params: Vec<*mut c_void> = vec![
             &ep as *const _ as *mut c_void,
