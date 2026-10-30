@@ -16,9 +16,10 @@ use crate::weights::RaonWeights;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeMode {
     /// Whole decode step (all layers + head) recorded once per admitted
-    /// context bucket and replayed per token. Product default.
+    /// context bucket and replayed per token (`HIPFIRE_GRAPH=1`; default except
+    /// on exact gfx1201).
     Graph,
-    /// Per-launch dispatch (`HIPFIRE_GRAPH=0`): the oracle/control route.
+    /// Per-launch dispatch (`HIPFIRE_GRAPH=0`; default on exact gfx1201).
     Eager,
 }
 
@@ -30,12 +31,21 @@ impl DecodeMode {
         }
     }
 
-    /// Resolve once at load: an explicit `HIPFIRE_GRAPH=0|1` wins, otherwise
-    /// graph. Retained replay (Redline) owning the launch stream or CPU-executed
-    /// weights make capture impossible, which is reported as `Eager`.
+    /// Resolve once at load. An explicit `HIPFIRE_GRAPH=0|1` wins. Otherwise
+    /// exact gfx1201 (R9700) decodes eager and every other arch graph: on gfx1201
+    /// a replayed decode graph runs at 82 tok/s in most fresh processes but at
+    /// 40 tok/s (2x the device time per step, host idle in the launch call) in a
+    /// sizeable fraction of them, in whole processes or in phases that flip
+    /// mid-process, while eager is a steady 77-78 tok/s in every process
+    /// measured. Retained replay (Redline) owning the launch stream or
+    /// CPU-executed weights make capture impossible, which is reported as
+    /// `Eager`.
     fn resolve(gpu: &Gpu) -> Self {
-        if gpu.flags.graph_forward == Some(false) {
-            return DecodeMode::Eager;
+        match gpu.flags.graph_forward {
+            Some(false) => return DecodeMode::Eager,
+            Some(true) => {}
+            None if gpu.arch == "gfx1201" => return DecodeMode::Eager,
+            None => {}
         }
         if gpu.replay.is_enabled() {
             eprintln!("raon1_mini: retained replay owns the launch stream; decode stays eager");
@@ -62,6 +72,8 @@ struct DecodeGraph {
     replays: u64,
     /// Kernel nodes in the current recording.
     kernel_nodes: usize,
+    /// Host seconds spent inside `hipGraphLaunch` since load.
+    launch_secs: f64,
 }
 
 /// Upper bound of token rows one batched prefill call stages (the scratch is
@@ -245,6 +257,12 @@ impl RaonBundle {
         (self.graph.captures, self.graph.replays)
     }
 
+    /// Host seconds spent inside `hipGraphLaunch` since load (a graph replay
+    /// that costs host time comparable to the step is launch-bound).
+    pub fn decode_graph_launch_secs(&self) -> f64 {
+        self.graph.launch_secs
+    }
+
     /// Kernel launches recorded in the current decode graph (0 = none).
     pub fn decode_graph_kernel_nodes(&self) -> usize {
         self.graph.kernel_nodes
@@ -390,9 +408,11 @@ impl RaonBundle {
             self.graph.replays += 1;
         }
         let stream = gpu.active_stream.as_ref().expect("decode graph stream just ensured");
+        let t_launch = std::time::Instant::now();
         gpu.graphs
             .graph_launch(&gpu.hip, gpu.device_id, stream)
             .map_err(|e| format!("raon1_mini: decode graph launch: {e:?}"))?;
+        self.graph.launch_secs += t_launch.elapsed().as_secs_f64();
         // The recorded step advanced the device `seq_len`; mirror it on the host.
         self.state.note_host_tokens(1);
         Ok(())

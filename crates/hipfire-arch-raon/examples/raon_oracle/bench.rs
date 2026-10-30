@@ -380,6 +380,8 @@ struct DeviceLoopRep {
     /// Graph captures / replays during the rep's decode steps.
     captures: u64,
     replays: u64,
+    /// Host ms spent inside `hipGraphLaunch` per replayed step (0 when eager).
+    launch_ms_per_step: f64,
     /// Host-side duration of every `decode_step` call (ms).
     step_ms: Vec<f64>,
     /// Unix seconds at the first decode step and after the closing synchronize.
@@ -399,6 +401,7 @@ fn device_loop_rep(
     bundle.prefill(gpu, prompt)?;
     sync(gpu)?;
     let (c0, r0) = bundle.decode_graph_stats();
+    let l0 = bundle.decode_graph_launch_secs();
     let mut step_ms = Vec::with_capacity(ids.len());
     let unix_now = || {
         std::time::SystemTime::now()
@@ -416,7 +419,10 @@ fn device_loop_rep(
     let secs = t0.elapsed().as_secs_f64();
     let t_end_unix = unix_now();
     let (c1, r1) = bundle.decode_graph_stats();
+    let launched = (c1 - c0 + r1 - r0).max(1) as f64;
+    let launch_ms_per_step = (bundle.decode_graph_launch_secs() - l0) * 1e3 / launched;
     Ok(DeviceLoopRep {
+        launch_ms_per_step,
         t_start_unix,
         t_end_unix,
         secs,
@@ -536,6 +542,7 @@ fn bench_tg(
             "graph_captures": d.captures,
             "graph_replays": d.replays,
             "tok_s": tg as f64 / d.secs.max(1e-12),
+            "graph_launch_ms_per_step": d.launch_ms_per_step,
             "t_start_unix": d.t_start_unix,
             "t_end_unix": d.t_end_unix,
             "step_ms": {"mean": mean(&d.step_ms), "p50": percentile(&sm, 0.5), "max": sm.last()},
