@@ -1149,6 +1149,23 @@ and EP2 mq4; see the stage-policy bullet below); the serve figures are in the
   HC/router/shared routes, and the resident MQ4/E8P MoE route with per-expert
   `DecodeGemv` capability admission.
 
+  *PP mq3 MoE row.* The PP MoE stage has a second row for the resident
+  MQ4-XTS + MQ3-I4 expert-slab class (`LaneExpertRoute::ResidentMq3Slab`: every
+  owned layer a complete slab arena of the model's `num_experts` MQ4-XTS and MQ3-I4 experts,
+  at least one MQ3-I4, no E8P, W2, absent or host-mapped expert; the
+  classification is `lane::slab_layer_cold_experts`), with BF16 router/shared
+  routes and per-expert `DecodeGemv` capability admission. It carries
+  `GFX1201_PP2_MQ3_RECEIPT` (`mgmtp/pponce-runs/proof-pp2-mq3`, 2026-10-30,
+  `fn_mesh_lane_oracle` on 2x R9700, PP2 mq3-xts 25/23 at prefill chunk 1024,
+  model sha256 541cfb55d6d6, 8 prompts x 64 tokens, K=1..8): with every stage per
+  lane, with only the MoE stage shared and with the full shared-stage policy,
+  every lane's ids and every logits row were byte-identical to the serialized
+  PP singleton under adaptive, 4 decode micro-batches and with overlap off. The
+  non-MoE stages of the mq3 artifact bind the same routes as the mq2 rows, so
+  `moe=once` is admitted by default and the policy log names both receipts. A
+  band mixing E8P-I4 and MQ3-I4 experts, or any other route, keeps the MoE
+  stage per lane.
+
   *EP rows.* The EP rows (`[Ep]` domain) are twelve: eleven non-MoE rows
   (embedding, PLE rows, HC read, HC write, GDN in/out projections, QSA in/out
   projections, final HC read, head and argmax) and one MoE row. All carry
