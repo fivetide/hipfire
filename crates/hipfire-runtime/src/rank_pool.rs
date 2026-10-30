@@ -102,11 +102,10 @@ impl Latch {
 /// First-failure record shared by the caller and every worker.
 struct Shared {
     poison: Mutex<Option<String>>,
-    /// Releases every rank blocked on a barrier. Installed once the transports
-    /// exist; a later install REPLACES the earlier callback (the mesh installs
-    /// one covering every transport it has built so far, and widens it as
-    /// transports are added).
-    abort: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Releases every rank blocked on a barrier: one callback per registered
+    /// barrier family (row gather, tile exchange, trunk split, ...), all run on
+    /// every abort. Callbacks must be idempotent.
+    aborts: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Shared {
@@ -118,14 +117,14 @@ impl Shared {
                 *poison = Some(format!("rank {rank}: {message}"));
             }
         }
-        self.run_abort();
+        self.run_aborts();
     }
 
-    /// Run the installed abort callback (outside the lock: it only flips
-    /// atomics, but a callback may never hold the pool's state).
-    fn run_abort(&self) {
-        let abort = lock(&self.abort).clone();
-        if let Some(abort) = abort {
+    /// Run every registered abort callback, outside the registry lock so a
+    /// callback may register or abort again without deadlocking.
+    fn run_aborts(&self) {
+        let aborts = lock(&self.aborts).clone();
+        for abort in aborts {
             abort();
         }
     }
@@ -143,7 +142,7 @@ impl Shared {
                 *poison = Some(message.to_string());
             }
         }
-        self.run_abort();
+        self.run_aborts();
     }
 }
 
@@ -272,7 +271,7 @@ impl<P: 'static> RankPool<P> {
     ) -> Result<Self, String> {
         let shared = Arc::new(Shared {
             poison: Mutex::new(None),
-            abort: Mutex::new(None),
+            aborts: Mutex::new(Vec::new()),
         });
         let (ready_tx, ready_rx) = channel();
         let baton = Arc::new(Baton {
@@ -321,13 +320,13 @@ impl<P: 'static> RankPool<P> {
         }
     }
 
-    /// Install the barrier-abort callback. A later call replaces the earlier
-    /// one, so a caller that builds several transports in turn installs a
-    /// callback that aborts all of them each time (an earlier `OnceLock` kept
-    /// only the first, leaving the tile exchange and trunk-split barriers
-    /// un-aborted on a rank failure until their own 30 s timeouts).
+    /// Register a barrier-abort callback. Every registered callback runs on every
+    /// failure or mesh poison, so each barrier family (row gather, tile exchange,
+    /// trunk split) registers its own and none is left waiting out its timeout.
+    /// Callbacks must be idempotent: a later registration does not replace
+    /// earlier ones, and one failure may run them repeatedly.
     pub fn set_abort(&self, abort: impl Fn() + Send + Sync + 'static) {
-        *lock(&self.shared.abort) = Some(Arc::new(abort));
+        lock(&self.shared.aborts).push(Arc::new(abort));
     }
 
     /// The first recorded failure, if the pool is poisoned.
@@ -833,25 +832,29 @@ mod tests {
     }
 
     #[test]
-    fn a_later_abort_callback_replaces_the_earlier_one() {
-        // The mesh installs a gather-only callback first and a wider one once
-        // the tile exchange and trunk split exist; a rank failure must run the
-        // wider one (an earlier `OnceLock` silently kept only the first).
+    fn every_registered_abort_callback_runs_on_each_failure() {
         let pool = pool(1);
-        let first = Arc::new(AtomicUsize::new(0));
-        let second = Arc::new(AtomicUsize::new(0));
-        let (a, b) = (first.clone(), second.clone());
-        pool.set_abort(move || {
-            a.fetch_add(1, Ordering::SeqCst);
-        });
-        pool.set_abort(move || {
-            b.fetch_add(1, Ordering::SeqCst);
-        });
-        pool.run_all(|| Ok(()), &|_, _: &mut Fake| Err::<(), _>("boom".to_string()))
-            .expect_err("the peer fails");
-        assert_eq!(first.load(Ordering::SeqCst), 0, "replaced callback never runs");
-        assert!(second.load(Ordering::SeqCst) >= 1, "the installed callback runs");
+        let counts: Vec<Arc<AtomicUsize>> = (0..3).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+        for count in &counts {
+            let count = count.clone();
+            pool.set_abort(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        pool.run_all(|| Ok(()), &|_, _: &mut Fake| {
+            Err::<(), _>("boom".to_string())
+        })
+        .expect_err("the peer fails");
+        for count in &counts {
+            assert!(count.load(Ordering::SeqCst) >= 1, "every family is aborted");
+        }
+        let before: Vec<usize> = counts.iter().map(|c| c.load(Ordering::SeqCst)).collect();
         pool.poison_mesh("diverged");
-        assert!(second.load(Ordering::SeqCst) >= 2, "a mesh poison aborts too");
+        for (count, before) in counts.iter().zip(before) {
+            assert!(
+                count.load(Ordering::SeqCst) > before,
+                "a mesh poison aborts too"
+            );
+        }
     }
 }

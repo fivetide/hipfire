@@ -43,7 +43,7 @@ the `reserve` subcommand and leave the invocation above untouched:
     fn_ep_compare.py reserve c1 MANIFEST.json [--min-pairs 3] [--json OUT.json]
     fn_ep_compare.py reserve harvest LOG OUT_DIR
 
-`arms` takes the two oracle directories of ONE binary (switch unset vs =1, same EP2 ranks) and requires the
+`arms` takes the two oracle directories of ONE binary (switch =0 vs =1, same EP2 ranks) and requires the
 usual byte-exact logits/mirror/state equality plus a `reserve-receipt.json` in each (schema ep-reserve-receipt/1):
 per-rank plan receipts, per-prompt chunk/bank/restore records, and committed id arrays. `perf` evaluates the
 pp32K kill rule (throughput ratio < 0.95 or restore-inclusive latency ratio > 1.05) and `c1` the weighted

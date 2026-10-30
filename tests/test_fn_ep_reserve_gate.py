@@ -897,7 +897,7 @@ class DocsAndScriptTest(unittest.TestCase):
         for needle in ("--mode reserve", "HIPFIRE_EP_RESERVE_DECOUPLE", "ep2-off", "ep2-on", "--boundary-dir", "--min-resident"):
             self.assertIn(needle, helped.stdout)
 
-    def test_docs_state_opt_in_and_ordinary_fallback(self):
+    def test_docs_state_default_on_kill_switch_and_ordinary_fallback(self):
         multi = (REPO_ROOT / "docs" / "multi-gpu.md").read_text()
         env = (REPO_ROOT / "docs" / "env-vars.md").read_text()
         changelog = (REPO_ROOT / "CHANGELOG.md").read_text()
@@ -907,7 +907,8 @@ class DocsAndScriptTest(unittest.TestCase):
         start = multi.index("### Flash-Next EP: EP reserve decoupling")
         section = multi[start:multi.index("\n### ", start + 10)]
         self.assertIn("ordinary", section)
-        self.assertIn("unmeasured", section)
+        self.assertIn("kill switch", section)
+        self.assertIn("HIPFIRE_EP_RESERVE_DECOUPLE=0", section)
         self.assertNotIn("not supported", section.lower())
 
 

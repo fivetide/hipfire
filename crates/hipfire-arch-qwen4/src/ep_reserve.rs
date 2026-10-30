@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! EP2 reserve decoupling (`HIPFIRE_EP_RESERVE_DECOUPLE=1`): pure admission,
+//! EP2 reserve decoupling (default on; `HIPFIRE_EP_RESERVE_DECOUPLE=0` is the kill switch): pure admission,
 //! immutable plan and receipt types, and the deterministic packing and capacity
 //! arithmetic. Nothing here allocates on a device or reads the environment
 //! after a plan is frozen.
@@ -24,7 +24,9 @@ use crate::gpu_forward::{
 };
 use std::fmt;
 
-/// Developer switch; unset or anything but `1` is today's path.
+/// Kill switch of the default-on route: exact `0` is the ordinary placement
+/// byte for byte; `1` forces the route (a refused capacity plan fails the
+/// load); unset or any other value is the default route.
 pub const EP_RESERVE_DECOUPLE_ENV: &str = "HIPFIRE_EP_RESERVE_DECOUPLE";
 
 /// Prompt chunk of an admitted load; it is never lowered.
@@ -47,16 +49,40 @@ pub const EP2_DOWN_EXPERT_BYTES: u64 = 870_400;
 
 const MIB: u64 = 1 << 20;
 
-/// Whether the opt-in switch asks for the experiment (`value` is the variable's
-/// content; read it once at load).
-pub fn ep_reserve_decouple_requested(value: Option<&str>) -> bool {
-    matches!(value.map(str::trim), Some("1"))
+/// How [`EP_RESERVE_DECOUPLE_ENV`] asks for the decoupled reserve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpReserveRequest {
+    /// `HIPFIRE_EP_RESERVE_DECOUPLE=0`: the ordinary placement and reserve.
+    Off,
+    /// Unset (or any value but `0`/`1`): admitted loads take the decoupled
+    /// reserve; a load that cannot (admission or capacity refusal) keeps the
+    /// ordinary placement with a note, exactly as before the route existed.
+    Default,
+    /// `=1`: as `Default`, but a capacity refusal fails the load before any
+    /// allocation.
+    Forced,
 }
 
-/// [`ep_reserve_decouple_requested`] of the process environment. Call once at
-/// load admission; the frozen plan never re-reads it.
-pub fn ep_reserve_decouple_requested_from_env() -> bool {
-    ep_reserve_decouple_requested(std::env::var(EP_RESERVE_DECOUPLE_ENV).ok().as_deref())
+impl EpReserveRequest {
+    /// Whether any decoupling attempt is made.
+    pub fn attempts(self) -> bool {
+        self != Self::Off
+    }
+}
+
+/// The request `value` (the variable's content) makes; read it once at load.
+pub fn ep_reserve_request(value: Option<&str>) -> EpReserveRequest {
+    match value.map(str::trim) {
+        Some("0") => EpReserveRequest::Off,
+        Some("1") => EpReserveRequest::Forced,
+        _ => EpReserveRequest::Default,
+    }
+}
+
+/// [`ep_reserve_request`] of the process environment. Call once at load
+/// admission; the frozen plan never re-reads it.
+pub fn ep_reserve_request_from_env() -> EpReserveRequest {
+    ep_reserve_request(std::env::var(EP_RESERVE_DECOUPLE_ENV).ok().as_deref())
 }
 
 /// Why the experiment is not admitted or a plan cannot be made. The load
@@ -244,7 +270,10 @@ pub struct EpReserveForwardPlan {
 }
 
 fn is_persistent(field: ScratchField) -> bool {
-    matches!(field, ScratchField::TokenIds | ScratchField::MoeYDownGrouped)
+    matches!(
+        field,
+        ScratchField::TokenIds | ScratchField::MoeYDownGrouped
+    )
 }
 
 fn checked_sum(values: impl IntoIterator<Item = u64>) -> Option<u64> {
@@ -302,7 +331,9 @@ impl EpReserveForwardPlan {
     ) -> Result<Self, Refusal> {
         let specs = |rows: usize| {
             ep_reserve_scratch(config, mode, rows).ok_or_else(|| {
-                Refusal::new(format!("the {rows}-row scratch plan overflows or is refused"))
+                Refusal::new(format!(
+                    "the {rows}-row scratch plan overflows or is refused"
+                ))
             })
         };
         let spec_bytes = ep_reserve_spec_bytes(config, EP_RESERVE_PROMPT_ROWS)
@@ -471,8 +502,11 @@ pub(crate) fn pack_roots(
     roots: &[(ScratchField, u64)],
     segment_caps: &[u64],
 ) -> Option<Vec<(ScratchField, usize, u64, u64)>> {
-    let mut order: Vec<(ScratchField, u64)> =
-        roots.iter().copied().filter(|&(_, bytes)| bytes > 0).collect();
+    let mut order: Vec<(ScratchField, u64)> = roots
+        .iter()
+        .copied()
+        .filter(|&(_, bytes)| bytes > 0)
+        .collect();
     order.sort_by(|a, b| b.1.cmp(&a.1).then((a.0 as usize).cmp(&(b.0 as usize))));
     let mut cursor = vec![0u64; segment_caps.len()];
     let mut placed = Vec::with_capacity(order.len());
@@ -724,7 +758,13 @@ pub fn plan_ep_reserve(
         .free_per_rank
         .iter()
         .map(|&free| {
-            rank_layers(geometry, free, capacity.non_expert_bytes, layer_bytes, reserve)
+            rank_layers(
+                geometry,
+                free,
+                capacity.non_expert_bytes,
+                layer_bytes,
+                reserve,
+            )
         })
         .min()
         .unwrap_or(0);
@@ -977,12 +1017,8 @@ mod tests {
     }
 
     fn forward() -> EpReserveForwardPlan {
-        EpReserveForwardPlan::from_config(
-            &compact_test_config(),
-            Qwen4ForwardScratchMode::Full,
-            0,
-        )
-        .expect("pinned forward plan")
+        EpReserveForwardPlan::from_config(&compact_test_config(), Qwen4ForwardScratchMode::Full, 0)
+            .expect("pinned forward plan")
     }
 
     fn geometry() -> EpRankGeometry {
@@ -1020,7 +1056,10 @@ mod tests {
                 Box::new(|f| f.scratch_mode = Qwen4ForwardScratchMode::FnSymGfx1201),
             ),
             ("chunk", Box::new(|f| f.prompt_rows = 1024)),
-            ("explicit chunk", Box::new(|f| f.explicit_chunk_override = true)),
+            (
+                "explicit chunk",
+                Box::new(|f| f.explicit_chunk_override = true),
+            ),
             ("placement", Box::new(|f| f.whole_layer_placement = false)),
             ("pp", Box::new(|f| f.pipeline_parallel = true)),
             ("tier", Box::new(|f| f.expert_tier = true)),
@@ -1047,13 +1086,16 @@ mod tests {
     }
 
     #[test]
-    fn switch_is_opt_in_only() {
-        assert!(!ep_reserve_decouple_requested(None));
-        assert!(!ep_reserve_decouple_requested(Some("")));
-        assert!(!ep_reserve_decouple_requested(Some("0")));
-        assert!(!ep_reserve_decouple_requested(Some("true")));
-        assert!(ep_reserve_decouple_requested(Some("1")));
-        assert!(ep_reserve_decouple_requested(Some(" 1 ")));
+    fn switch_is_default_on_with_a_zero_kill_switch() {
+        use EpReserveRequest::{Default, Forced, Off};
+        assert_eq!(ep_reserve_request(None), Default);
+        assert_eq!(ep_reserve_request(Some("")), Default);
+        assert_eq!(ep_reserve_request(Some("true")), Default);
+        assert_eq!(ep_reserve_request(Some("0")), Off);
+        assert_eq!(ep_reserve_request(Some(" 0 ")), Off);
+        assert_eq!(ep_reserve_request(Some("1")), Forced);
+        assert_eq!(ep_reserve_request(Some(" 1 ")), Forced);
+        assert!(Default.attempts() && Forced.attempts() && !Off.attempts());
     }
 
     #[test]
@@ -1061,7 +1103,9 @@ mod tests {
         let fwd = forward();
         assert_eq!(fwd.persistent_prompt_bytes(F::MoeYDownGrouped), 475 * MIB);
         assert_eq!(fwd.persistent_resident_bytes(F::MoeYDownGrouped), 125 * MIB);
-        assert!(fwd.persistent_prompt_bytes(F::TokenIds) >= fwd.persistent_resident_bytes(F::TokenIds));
+        assert!(
+            fwd.persistent_prompt_bytes(F::TokenIds) >= fwd.persistent_resident_bytes(F::TokenIds)
+        );
         // Neither persistent root is a donor-packing input.
         assert!(fwd
             .remaining_roots
@@ -1114,17 +1158,22 @@ mod tests {
         let mode = Qwen4ForwardScratchMode::Full;
         let fwd = forward();
         let charged = fwd.charged_forward_bytes().unwrap();
-        let baseline =
-            crate::gpu_forward::qwen4_forward_device_bytes(&config, 4096, mode).unwrap();
+        let baseline = crate::gpu_forward::qwen4_forward_device_bytes(&config, 4096, mode).unwrap();
         assert!(charged < baseline);
         let context = crate::Qwen4ContextCommit::legacy(16384);
         let layout = crate::Qwen4StateFormat::F32.layout();
-        let ordinary = auto_vram_reserve_with_forward(
-            &config, &context, 4096, mode, layout, None, None, None,
-        )
-        .unwrap();
+        let ordinary =
+            auto_vram_reserve_with_forward(&config, &context, 4096, mode, layout, None, None, None)
+                .unwrap();
         let decoupled = auto_vram_reserve_with_forward(
-            &config, &context, 4096, mode, layout, None, None, Some(charged),
+            &config,
+            &context,
+            4096,
+            mode,
+            layout,
+            None,
+            None,
+            Some(charged),
         )
         .unwrap();
         assert_eq!(ordinary - decoupled, baseline - charged);
@@ -1157,7 +1206,10 @@ mod tests {
             let segment = plan.segments[placement.segment];
             assert_eq!(placement.offset % EP_RESERVE_ROOT_ALIGN, 0);
             assert!(placement.offset + placement.bytes <= segment.capacity);
-            assert_eq!((placement.layer, placement.slot), (segment.layer, segment.slot));
+            assert_eq!(
+                (placement.layer, placement.slot),
+                (segment.layer, segment.slot)
+            );
         }
         for list in &by_segment {
             for pair in list.windows(2) {
@@ -1166,7 +1218,11 @@ mod tests {
         }
         // Every remaining root is placed exactly once, nothing else is.
         let mut placed: Vec<usize> = plan.placements.iter().map(|p| p.field as usize).collect();
-        let mut wanted: Vec<usize> = fwd.remaining_roots.iter().map(|r| r.field as usize).collect();
+        let mut wanted: Vec<usize> = fwd
+            .remaining_roots
+            .iter()
+            .map(|r| r.field as usize)
+            .collect();
         placed.sort();
         wanted.sort();
         assert_eq!(placed, wanted);
@@ -1195,11 +1251,12 @@ mod tests {
         assert!(pack_roots(&[(F::MoeGateUp, 10)], &[]).is_none());
         assert!(pack_roots(&[(F::MoeGateUp, u64::MAX)], &[u64::MAX]).is_none());
         // Zero-byte roots are skipped; alignment advances the next start.
-        let placed = pack_roots(&[(F::MoeUp, 10), (F::MoeGate, 20), (F::MoeHidden, 0)], &[1024]).unwrap();
-        assert_eq!(
-            placed,
-            vec![(F::MoeGate, 0, 0, 20), (F::MoeUp, 0, 256, 10)]
-        );
+        let placed = pack_roots(
+            &[(F::MoeUp, 10), (F::MoeGate, 20), (F::MoeHidden, 0)],
+            &[1024],
+        )
+        .unwrap();
+        assert_eq!(placed, vec![(F::MoeGate, 0, 0, 20), (F::MoeUp, 0, 256, 10)]);
         // No straddling: two 600-byte roots cannot share one 1024-byte segment.
         assert!(pack_roots(&[(F::MoeGate, 600), (F::MoeUp, 600)], &[1024]).is_none());
         assert!(pack_roots(&[(F::MoeGate, 600), (F::MoeUp, 600)], &[1024, 1024]).is_some());
@@ -1250,14 +1307,25 @@ mod tests {
         assert_eq!(s2, [24, 25]);
         assert_eq!(plan.s2_donor_layers[0] % 2, 0);
         // S2 donors are disjoint from scratch donors.
-        assert!(plan.s2_donor_layers.iter().all(|l| !plan.donor_layers.contains(l)));
+        assert!(plan
+            .s2_donor_layers
+            .iter()
+            .all(|l| !plan.donor_layers.contains(l)));
         assert_eq!(plan.mirror_bytes_per_rank, 7 * g.layer_bytes().unwrap());
         // Four layers cannot be proven by six donors: a smaller packing set
         // refuses (D=6 would need exactly these roots in 12 segments).
-        let caps: Vec<u64> = (0..6).flat_map(|_| [g.gate_up_bytes, g.down_bytes]).collect();
-        let roots: Vec<_> = fwd.remaining_roots.iter().map(|r| (r.field, r.bytes)).collect();
+        let caps: Vec<u64> = (0..6)
+            .flat_map(|_| [g.gate_up_bytes, g.down_bytes])
+            .collect();
+        let roots: Vec<_> = fwd
+            .remaining_roots
+            .iter()
+            .map(|r| (r.field, r.bytes))
+            .collect();
         assert!(pack_roots(&roots, &caps).is_none());
-        let caps: Vec<u64> = (0..7).flat_map(|_| [g.gate_up_bytes, g.down_bytes]).collect();
+        let caps: Vec<u64> = (0..7)
+            .flat_map(|_| [g.gate_up_bytes, g.down_bytes])
+            .collect();
         assert!(pack_roots(&roots, &caps).is_some());
     }
 
@@ -1271,7 +1339,9 @@ mod tests {
         assert_eq!(plan.resident_layers, 33);
         cap.free_per_rank.reverse();
         assert_eq!(
-            plan_ep_reserve(&fwd, &geometry(), &cap).unwrap().resident_layers,
+            plan_ep_reserve(&fwd, &geometry(), &cap)
+                .unwrap()
+                .resident_layers,
             33
         );
         // Wrong rank count fails closed.
@@ -1361,7 +1431,8 @@ mod tests {
         assert!(split_specs(&dup, 1).is_err());
         let missing = [(F::TokenIds, 8, true)];
         assert!(split_specs(&missing, 1).is_err());
-        let full = ep_reserve_scratch(&compact_test_config(), Qwen4ForwardScratchMode::Full, 4096).unwrap();
+        let full = ep_reserve_scratch(&compact_test_config(), Qwen4ForwardScratchMode::Full, 4096)
+            .unwrap();
         assert!(EpReserveForwardPlan::from_specs(
             Qwen4ForwardScratchMode::FnSymGfx1201,
             4096,

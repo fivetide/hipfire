@@ -535,12 +535,10 @@ fn replica_spec_advance(
     crate::ep::bracket_prompt(
         (bundle, gpu),
         |(bundle, _)| bundle.share_prompt_begin(),
-        |(bundle, gpu)| {
-            match bundle.spec_advance(gpu, tokens, start_pos, reset, &|| false, None)? {
-                SpecAdvance::Ready { last_argmax, .. } => Ok(last_argmax),
-                SpecAdvance::Aborted => {
-                    Err("Qwen4 spec_advance aborted inside an EP fan-out".to_string())
-                }
+        |(bundle, gpu)| match bundle.spec_advance(gpu, tokens, start_pos, reset, &|| false, None)? {
+            SpecAdvance::Ready { last_argmax, .. } => Ok(last_argmax),
+            SpecAdvance::Aborted => {
+                Err("Qwen4 spec_advance aborted inside an EP fan-out".to_string())
             }
         },
         |(bundle, gpu), ok| {
@@ -9121,9 +9119,11 @@ impl Qwen4MtpDrafter {
         // reserve, and fails closed if one is somehow loaded.
         let single = !ops.is_mesh();
         if !single && Self::bundle(target)?.ep_reserve_active() {
-            return Err("Qwen4 native-MTP prefill over a PP mesh cannot run on an EP \
+            return Err(
+                "Qwen4 native-MTP prefill over a PP mesh cannot run on an EP \
                         reserve-sharing load"
-                .to_string());
+                    .to_string(),
+            );
         }
         if single {
             Self::bundle(target)?.share_prompt_begin_mtp_fill();

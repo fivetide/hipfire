@@ -461,7 +461,8 @@ impl GpuLoanDevice<'_> {
         // host owner this loan keeps alive until `release`; nothing writes the
         // mirror after materialization. The slice never outlives the
         // enclosing operation.
-        let src = unsafe { std::slice::from_raw_parts((region.mirror_cpu + offset) as *const u8, len) };
+        let src =
+            unsafe { std::slice::from_raw_parts((region.mirror_cpu + offset) as *const u8, len) };
         Ok((dst, src, region))
     }
 }
@@ -533,7 +534,8 @@ impl LoanDevice for GpuLoanDevice<'_> {
 
     fn verify_piece(&mut self, piece: LoanPiece) -> Result<(), String> {
         let (_, _, region) = self.view(piece)?;
-        let (layer, slot, base, mirror) = (region.layer, region.slot, region.base, region.mirror_cpu);
+        let (layer, slot, base, mirror) =
+            (region.layer, region.slot, region.base, region.mirror_cpu);
         let (_, offset, len) = checked_span(self.regions, piece)?;
         let mut host = vec![0u8; len.min(VERIFY_CHUNK_BYTES)];
         let mut done = 0usize;
@@ -541,14 +543,22 @@ impl LoanDevice for GpuLoanDevice<'_> {
             let n = (len - done).min(VERIFY_CHUNK_BYTES);
             // SAFETY: inside the checked donor range (see `view`).
             let src = unsafe {
-                hip_bridge::DeviceBuffer::from_raw((base + offset + done) as *mut std::ffi::c_void, n)
+                hip_bridge::DeviceBuffer::from_raw(
+                    (base + offset + done) as *mut std::ffi::c_void,
+                    n,
+                )
             };
             self.gpu
                 .memcpy_dtoh_auto(&mut host[..n], &src)
                 .map_err(|error| error.to_string())?;
             // SAFETY: inside the checked mirror range (see `view`).
-            let want = unsafe { std::slice::from_raw_parts((mirror + offset + done) as *const u8, n) };
-            if let Some(at) = host[..n].iter().zip(want).position(|(got, want)| got != want) {
+            let want =
+                unsafe { std::slice::from_raw_parts((mirror + offset + done) as *const u8, n) };
+            if let Some(at) = host[..n]
+                .iter()
+                .zip(want)
+                .position(|(got, want)| got != want)
+            {
                 return Err(format!(
                     "donor layer {layer} {slot:?} byte {} holds {:#04x}, its mirror {:#04x}",
                     offset + done + at,
@@ -576,7 +586,10 @@ pub(crate) struct EpReserveLoan {
 
 /// Read one donor tensor back once into a pinned host-mapped mirror; returns
 /// the mirror and its CPU address.
-fn mirror_donor(gpu: &mut Gpu, owner: &GpuTensor) -> Result<(GpuTensor, usize), Qwen4GpuForwardError> {
+fn mirror_donor(
+    gpu: &mut Gpu,
+    owner: &GpuTensor,
+) -> Result<(GpuTensor, usize), Qwen4GpuForwardError> {
     let bytes = owner.buf.size();
     let mut host = vec![0u8; bytes];
     // The mirror reads the loaded bytes back once, at load.
@@ -839,9 +852,21 @@ mod ep_reserve_loan_tests {
     /// [64,96) -> r1, [96,144) -> r2; r3 is a donor with nothing touched.
     fn extents() -> Vec<LoanPiece> {
         vec![
-            LoanPiece { region: 0, offset: 0, len: 64 },
-            LoanPiece { region: 1, offset: 0, len: 32 },
-            LoanPiece { region: 2, offset: 0, len: 48 },
+            LoanPiece {
+                region: 0,
+                offset: 0,
+                len: 64,
+            },
+            LoanPiece {
+                region: 1,
+                offset: 0,
+                len: 32,
+            },
+            LoanPiece {
+                region: 2,
+                offset: 0,
+                len: 48,
+            },
         ]
     }
 
@@ -850,7 +875,11 @@ mod ep_reserve_loan_tests {
     }
 
     fn piece(region: usize, offset: u64, len: u64) -> LoanPiece {
-        LoanPiece { region, offset, len }
+        LoanPiece {
+            region,
+            offset,
+            len,
+        }
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -885,7 +914,11 @@ mod ep_reserve_loan_tests {
             let mirror: Vec<Vec<u8>> = REGION_BYTES
                 .iter()
                 .enumerate()
-                .map(|(r, &n)| (0..n).map(|i| ((r as u64 * 37 + i) % 251 + 1) as u8).collect())
+                .map(|(r, &n)| {
+                    (0..n)
+                        .map(|i| ((r as u64 * 37 + i) % 251 + 1) as u8)
+                        .collect()
+                })
                 .collect();
             Self {
                 device: mirror.clone(),
@@ -1078,8 +1111,11 @@ mod ep_reserve_loan_tests {
         assert!(ExtentMap::new(&REGION_BYTES, &[piece(0, 0, 0)]).is_err());
         assert!(ExtentMap::new(&REGION_BYTES, &[piece(0, 90, 11)]).is_err());
         assert!(ExtentMap::new(&REGION_BYTES, &[piece(0, u64::MAX, 2)]).is_err());
-        assert!(ExtentMap::new(&REGION_BYTES, &[piece(0, 0, 40), piece(1, 0, 8), piece(0, 30, 10)])
-            .is_err());
+        assert!(ExtentMap::new(
+            &REGION_BYTES,
+            &[piece(0, 0, 40), piece(1, 0, 8), piece(0, 30, 10)]
+        )
+        .is_err());
     }
 
     #[test]
@@ -1090,8 +1126,18 @@ mod ep_reserve_loan_tests {
             (6, EpDonorSlot::GateUp, 100),
         ];
         let touched = [
-            EpReserveTouchedExtent { layer: 6, slot: EpDonorSlot::GateUp, offset: 0, len: 48 },
-            EpReserveTouchedExtent { layer: 5, slot: EpDonorSlot::Down, offset: 0, len: 32 },
+            EpReserveTouchedExtent {
+                layer: 6,
+                slot: EpDonorSlot::GateUp,
+                offset: 0,
+                len: 48,
+            },
+            EpReserveTouchedExtent {
+                layer: 5,
+                slot: EpDonorSlot::Down,
+                offset: 0,
+                len: 32,
+            },
         ];
         let map = build_map(&donors, &touched).unwrap();
         assert_eq!(
@@ -1099,12 +1145,22 @@ mod ep_reserve_loan_tests {
             &[piece(2, 0, 48), piece(1, 0, 32)],
             "plan order, tensor index by (layer, slot)"
         );
-        let unknown = [EpReserveTouchedExtent { layer: 6, slot: EpDonorSlot::Down, offset: 0, len: 8 }];
+        let unknown = [EpReserveTouchedExtent {
+            layer: 6,
+            slot: EpDonorSlot::Down,
+            offset: 0,
+            len: 8,
+        }];
         assert!(build_map(&donors, &unknown).is_err());
         let duplicate = [donors[0], donors[0]];
         assert!(build_map(&duplicate, &[]).is_err());
         // A touched extent past the ACTUAL loaded size refuses.
-        let oversize = [EpReserveTouchedExtent { layer: 5, slot: EpDonorSlot::Down, offset: 0, len: 64 }];
+        let oversize = [EpReserveTouchedExtent {
+            layer: 5,
+            slot: EpDonorSlot::Down,
+            offset: 0,
+            len: 64,
+        }];
         assert!(build_map(&donors, &oversize).is_err());
     }
 
@@ -1199,7 +1255,14 @@ mod ep_reserve_loan_tests {
         // capture query is the failing zero, and recovery drained first.
         assert!(matches!(
             rig.fake.log.as_slice(),
-            [Op::Capturing, Op::Zero(_), Op::Zero(_), Op::Capturing, Op::Sync, ..]
+            [
+                Op::Capturing,
+                Op::Zero(_),
+                Op::Zero(_),
+                Op::Capturing,
+                Op::Sync,
+                ..
+            ]
         ));
     }
 
@@ -1229,7 +1292,10 @@ mod ep_reserve_loan_tests {
         rig.acquire(144).unwrap();
         rig.fake.scribble(144);
         rig.fake.fail_once.push(("record", 1));
-        assert!(rig.finish(true).unwrap_err().contains("enqueue donor restore"));
+        assert!(rig
+            .finish(true)
+            .unwrap_err()
+            .contains("enqueue donor restore"));
         assert!(rig.fake.whole());
         assert!(rig.controller.is_resident());
 
@@ -1270,7 +1336,10 @@ mod ep_reserve_loan_tests {
         assert!(error.contains("poisoned"), "{error}");
         assert!(error.contains("verification after restore"), "{error}");
         assert!(matches!(rig.controller.state(), LoanState::Poisoned(_)));
-        assert!(rig.stats.verified_bytes <= 64, "stops at the first bad piece");
+        assert!(
+            rig.stats.verified_bytes <= 64,
+            "stops at the first bad piece"
+        );
         assert!(rig.acquire(8).is_err());
 
         // With the oracle off the same lost copy is not looked for, and a
@@ -1380,7 +1449,10 @@ mod ep_reserve_loan_tests {
             assert!(rig.fake.whole());
         }
         let counters = rig.controller.counters();
-        assert_eq!((counters.epochs, counters.tiles, counters.restores), (2, 4, 2));
+        assert_eq!(
+            (counters.epochs, counters.tiles, counters.restores),
+            (2, 4, 2)
+        );
         // Zero filled once per epoch (no re-zero between full tiles).
         assert_eq!(rig.stats.zeroed_bytes, 288);
         assert_eq!(rig.stats.async_restore_bytes, 288);

@@ -18,10 +18,10 @@
 //! rank-generic over EP2..=EP8 (`attach_ep_mesh` admits `1 + peers` of 2..=8).
 
 use crate::bundle::{BundleError, Qwen4Bundle};
+use crate::ep_reserve::EpReserveMeshReceipt;
 use crate::ep_trunk_split::{
     agree_layouts, split_buffer_bytes, split_census, SplitWeight, TrunkSplitMode, TrunkSplitRank,
 };
-use crate::ep_reserve::EpReserveMeshReceipt;
 use crate::gpu_forward::{
     Qwen4BalancedPlan, Qwen4PeerExpertSource, QWEN4_EP_GATHER_BUFFERS, QWEN4_EP_GATHER_MAX_ROWS,
 };

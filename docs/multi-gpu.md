@@ -658,16 +658,17 @@ entered and crossed, how long ago it crossed and what its host thread is doing. 
   transport's line in the peer's own timeout message.
 
 A rank failure aborts the row-gather, tile-exchange and trunk-split barriers together (`RankPool::set_abort`
-replaces the earlier callback; it once kept only the first).
+keeps every registered callback and runs all of them; it once kept only the first).
 
-### Flash-Next EP: EP reserve decoupling (opt-in, unmeasured)
+### Flash-Next EP: EP reserve decoupling (default on, `=0` kill switch)
 
-**Status: opt-in qualification experiment, no measurement, no default change.** `HIPFIRE_EP_RESERVE_DECOUPLE=1`
+**Status: default for the admitted configuration; `HIPFIRE_EP_RESERVE_DECOUPLE=0` is the kill switch.** Measured on the C1
+driver (Gate 3, `release-0.4.3/r9700x2-par/RESULT.md` lever 3): +5.9% median, +7.4% to +8.5% paired. Unset or `1`
 asks an EP2 load to stop sizing its whole forward scratch for the 4096-row prompt chunk, so the freed reserve can
 hold more resident expert layers per rank (the qualification target is at least 33; fewer is a kill, and the
-reserve estimate behind it is source-derived, not measured). Unset or `0` is today's path, byte for byte. This page
-records **no** throughput, latency or layer-count result for it: those need the gates below on cards, and until then
-nothing here is a performance claim. The design, its frozen interfaces and the abandonment gates are
+reserve estimate behind it is source-derived). `0` is today's path, byte for byte. Unset keeps the ordinary placement
+(with a logged note) when the load is not admitted or the capacity plan cannot be met; `=1` fails the latter load before
+any allocation. The gates below are the qualification record. The design, its frozen interfaces and the abandonment gates are
 `mgfn/ep-reserve/DECISION.md` of the release-0.4.3 campaign.
 
 What the switch does when it is admitted:
@@ -791,7 +792,7 @@ usage problem. It is supporting manual evidence, not a
 [Qualify a box](#qualify-a-box-fn-ep-gate-mode-pp).
 
 `--mode reserve` runs the EP2 reserve-decoupling pair instead; see
-[EP reserve decoupling](#flash-next-ep-ep-reserve-decoupling-opt-in-unmeasured).
+[EP reserve decoupling](#flash-next-ep-ep-reserve-decoupling-default-on-0-kill-switch).
 
 `crates/hipfire-runtime/examples/ep_transport_oracle.rs` (feature `lab`) is a
 separate no-model synthetic oracle for the row-gather and tile launchers. Without

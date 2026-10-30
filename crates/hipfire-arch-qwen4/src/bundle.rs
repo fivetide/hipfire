@@ -6251,7 +6251,9 @@ impl Qwen4Bundle {
     ) -> Result<(), BundleError> {
         let fail = |message: String| BundleError::Forward(format!("EP reserve attach: {message}"));
         if self.execution.is_some() {
-            return Err(fail("Qwen4 forward resources are already attached".to_string()));
+            return Err(fail(
+                "Qwen4 forward resources are already attached".to_string(),
+            ));
         }
         let rows = plan.forward.prompt_rows;
         if max_chunk != rows
@@ -6286,18 +6288,22 @@ impl Qwen4Bundle {
         if let Some(qsa) = self.state.qsa.first().filter(|qsa| qsa.f16_arena.is_none()) {
             let heads = self.config.num_key_value_heads;
             match self.state.qsa_backend() {
-                Qwen4KvBackend::Legacy => rdna_compute::tensor_ops::reserve_qsa_gathered_wmma_scratch(
-                    gpu,
-                    qsa.format,
-                    heads,
-                    qsa.full_capacity,
-                ),
-                Qwen4KvBackend::Vmm => rdna_compute::tensor_ops::reserve_qsa_gathered_wmma_workspace(
-                    gpu,
-                    qsa.format,
-                    heads,
-                    qsa.full_capacity,
-                ),
+                Qwen4KvBackend::Legacy => {
+                    rdna_compute::tensor_ops::reserve_qsa_gathered_wmma_scratch(
+                        gpu,
+                        qsa.format,
+                        heads,
+                        qsa.full_capacity,
+                    )
+                }
+                Qwen4KvBackend::Vmm => {
+                    rdna_compute::tensor_ops::reserve_qsa_gathered_wmma_workspace(
+                        gpu,
+                        qsa.format,
+                        heads,
+                        qsa.full_capacity,
+                    )
+                }
             }
             .map_err(BundleError::Hip)?;
         }

@@ -10518,10 +10518,8 @@ impl Qwen4GpuForward {
                                 crate::ep_reserve::EpDonorSlot::GateUp,
                                 &weights.experts_gate_up,
                             )?;
-                            let down = typed(
-                                crate::ep_reserve::EpDonorSlot::Down,
-                                &weights.experts_down,
-                            )?;
+                            let down =
+                                typed(crate::ep_reserve::EpDonorSlot::Down, &weights.experts_down)?;
                             Qwen4MoeLayerRuntime::from_moe_ep_mirror(
                                 gpu,
                                 &bundle.weights,
@@ -10829,7 +10827,9 @@ impl Qwen4GpuForward {
             // every peer's experts are mapped.)
             // Owner-routed chunk MoE (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`): its grouped-row
             // buffer, masked tile ids and sym scratch exist before the mesh enables peers.
-            let exchange = reserve.as_ref().map(|reserve| reserve.banks.exchange_capacity());
+            let exchange = reserve
+                .as_ref()
+                .map(|reserve| reserve.banks.exchange_capacity());
             if let Some(state) = ep.as_mut() {
                 if qwen4_ep_owner_routed_prefill_enabled() {
                     state.tile = Qwen4TileRoute::admit(
@@ -11720,7 +11720,9 @@ impl Qwen4GpuForward {
         let root = self
             .ep_reserve
             .as_ref()
-            .map_or(&self.scratch.moe_y_down_grouped, |reserve| &reserve.exchange_root);
+            .map_or(&self.scratch.moe_y_down_grouped, |reserve| {
+                &reserve.exchange_root
+            });
         Some((root, route.max_tiles))
     }
 

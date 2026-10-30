@@ -541,7 +541,7 @@ if mode == "reserve":
         evaluations.append(item)
     receipt["mode"] = "reserve"
     receipt["reserve"] = {
-        "switch": "HIPFIRE_EP_RESERVE_DECOUPLE", "off_arm": "unset", "on_arm": "=1", "arms": arm_names,
+        "switch": "HIPFIRE_EP_RESERVE_DECOUPLE", "off_arm": "=0", "on_arm": "=1", "arms": arm_names,
         "prompt_chunk_rows": 4096, "min_resident_layers": int(E.get("GATE_MIN_RESIDENT", "0") or 0),
         "gates_evaluated": sorted({i.get("gate") for i in evaluations}), "evaluations": evaluations,
         "performance_claim": None,
@@ -600,7 +600,7 @@ if mode == "pp":
         "one card (host-mapped experts by default)" if ref_ranks == 1 else "PP%d on the first %d cards, uniform bands" % (ref_ranks, ref_ranks)))
     lines.append("ref_ranks=%d  mtp exactness pair: %s" % (ref_ranks, "on" if mtp else "off"))
 elif mode == "reserve":
-    lines.append("mode=reserve  arch=%s  EP%s  hipfire devices: %s  (off arm: switch unset; on arm: HIPFIRE_EP_RESERVE_DECOUPLE=1; one binary)" % (E.get("GATE_ARCH"), n, E.get("GATE_DEVS")))
+    lines.append("mode=reserve  arch=%s  EP%s  hipfire devices: %s  (off arm: HIPFIRE_EP_RESERVE_DECOUPLE=0; on arm: HIPFIRE_EP_RESERVE_DECOUPLE=1; one binary)" % (E.get("GATE_ARCH"), n, E.get("GATE_DEVS")))
     lines.append("prompt chunk rows 4096 (never lowered)  min resident layers/rank %s  arms: %s" % (E.get("GATE_MIN_RESIDENT"), " ".join(arm_names)))
     for item in receipt["reserve"]["evaluations"]:
         lines.append("  %-16s %-10s %s" % (item.get("gate"), item.get("verdict") or item.get("state"), "; ".join(item.get("reasons") or [])[:300]))
@@ -1002,7 +1002,7 @@ arm_env() {
       -u HIPFIRE_QWEN4_TURN_SNAPSHOTS -u HIPFIRE_MTP_AR_FLOOR -u HIPFIRE_MTP_INCREMENTAL -u HIPFIRE_MTP_NGRAM)
   fi
   if [[ $MODE == reserve ]]; then
-    # Reserve arms: the switch is unset (off) or set last (on), the chunk override is cleared so the prompt chunk stays 4096.
+    # Reserve arms: the switch is set last (=0 off, =1 on), the chunk override is cleared so the prompt chunk stays 4096.
     unset_pp=(-u HIPFIRE_EP_RESERVE_DECOUPLE -u HIPFIRE_EP_RESERVE_RECEIPT -u HIPFIRE_PREFILL_CHUNK_ROWS
       -u HIPFIRE_MTP_AR_FLOOR -u HIPFIRE_MTP_INCREMENTAL -u HIPFIRE_MTP_NGRAM)
   fi
@@ -1035,7 +1035,12 @@ arm_env() {
   fi
   # Every reserve arm prints receipts (the off arm's come from its ordinary load); only the on arms switch decoupling on.
   [[ $MODE != reserve ]] || ARM_ENV+=(HIPFIRE_EP_RESERVE_RECEIPT=1)
-  ((reserve == 0)) || ARM_ENV+=(HIPFIRE_EP_RESERVE_DECOUPLE=1)
+  # The route is default on: a reserve-mode off arm sets the kill switch explicitly.
+  if ((reserve != 0)); then
+    ARM_ENV+=(HIPFIRE_EP_RESERVE_DECOUPLE=1)
+  elif [[ $MODE == reserve ]]; then
+    ARM_ENV+=(HIPFIRE_EP_RESERVE_DECOUPLE=0)
+  fi
   # The native-MTP policy is pinned last so EXTRA_ENV cannot change the window schedule of an exactness arm.
   ((mtp == 0)) || ARM_ENV+=("${PP_PINNED_MTP[@]}")
 }

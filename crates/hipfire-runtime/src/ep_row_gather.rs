@@ -903,10 +903,8 @@ impl EpRowGather {
             }
         }
         let mine = &self.ranks[rank];
-        mine.crossed_at_ms.store(
-            self.started.elapsed().as_millis() as u64,
-            Ordering::Relaxed,
-        );
+        mine.crossed_at_ms
+            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
         mine.crossed.store(tag.0, Ordering::Release);
         Ok(())
     }
@@ -1111,7 +1109,7 @@ impl Drop for EpRowGather {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn spec(ranks: usize, slots: usize, row_bytes: usize) -> EpRowGatherSpec {
@@ -1245,7 +1243,7 @@ mod tests {
     // ── crossing tags: the protocol half of `exchange_layer`, no device ──
 
     /// A transport with no device state: only the barrier and tag protocol runs.
-    fn bare(ranks: usize, timeout: Duration) -> Arc<EpRowGather> {
+    pub(crate) fn bare(ranks: usize, timeout: Duration) -> Arc<EpRowGather> {
         let states = (0..ranks)
             .map(|rank| RankState {
                 device_id: rank as i32,
@@ -1272,7 +1270,7 @@ mod tests {
     }
 
     /// One rank's crossing of `exchange_layer` without its device half.
-    fn cross_once(
+    pub(crate) fn cross_once(
         gather: &EpRowGather,
         rank: usize,
         kind: GatherKind,
@@ -1298,7 +1296,10 @@ mod tests {
         // The sequence wraps at 24 bits without disturbing the other fields.
         let wrapped = CrossingTag::new(GatherKind::ExpertModulo, 1, 5, 10, (1 << 24) + 7);
         assert_eq!(wrapped.seq(), 7);
-        assert_eq!((wrapped.kind(), wrapped.buffer(), wrapped.layer()), (1, 1, 5));
+        assert_eq!(
+            (wrapped.kind(), wrapped.buffer(), wrapped.layer()),
+            (1, 1, 5)
+        );
         assert_eq!(CrossingTag::NONE.to_string(), "none");
         assert_ne!(CrossingTag::NONE, tag);
         let unnamed = CrossingTag::new(GatherKind::ExpertModulo, 0, NO_LAYER, 10, 0);
@@ -1364,15 +1365,24 @@ mod tests {
             "failed after {:?}, not after the 30 s barrier timeout",
             started.elapsed()
         );
-        for e in [&a, &b] {
-            let text = e.to_string();
-            assert!(text.contains("different gathers"), "{text}");
-            assert!(
-                text.contains("layer 3") && text.contains("layer 4"),
-                "names both tags: {text}"
-            );
+        // The skipped gather desynchronises the ranks by one crossing, so which
+        // layers meet at the barrier depends on scheduling. Whichever rank
+        // compares first names both ranks' tags and aborts; the other may see
+        // that abort before its own comparison, so it fails either way.
+        let texts = [a.to_string(), b.to_string()];
+        for text in &texts {
             assert!(!text.contains("timed out"), "{text}");
+            assert!(
+                text.contains("different gathers") || text.contains("aborted"),
+                "{text}"
+            );
         }
+        assert!(
+            texts.iter().any(|text| text.contains("different gathers")
+                && text.contains("entered [expert_modulo layer")
+                && text.contains("slot for buffer")),
+            "one rank names both tags: {texts:?}"
+        );
         assert!(gather.is_aborted());
     }
 
@@ -1384,9 +1394,7 @@ mod tests {
         ] {
             let gather = bare(2, Duration::from_secs(30));
             let other = gather.clone();
-            let peer = std::thread::spawn(move || {
-                cross_once(&other, 1, kind_b, 7, slots_b)
-            });
+            let peer = std::thread::spawn(move || cross_once(&other, 1, kind_b, 7, slots_b));
             let mine = cross_once(&gather, 0, GatherKind::ExpertModulo, 7, 50);
             let theirs = peer.join().expect("peer");
             for result in [mine, theirs] {
@@ -1450,7 +1458,9 @@ mod tests {
             "{report}"
         );
         assert!(
-            !report.contains("rank 0 has entered no crossing (last entered [none], last crossed [none]; now"),
+            !report.contains(
+                "rank 0 has entered no crossing (last entered [none], last crossed [none]; now"
+            ),
             "an idle rank reports no phase: {report}"
         );
         for (phase, text) in [

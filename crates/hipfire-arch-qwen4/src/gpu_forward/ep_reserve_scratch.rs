@@ -1232,7 +1232,10 @@ mod tests {
         // other size); the resident plan's smaller grouped-down need is a row count.
         assert_eq!(resident.moe_y_down_grouped.buf.size(), bytes);
         assert_eq!(borrowed.moe_y_down_grouped.buf.size(), bytes);
-        assert_eq!(resident.moe_y_down_grouped.numel(), borrowed.moe_y_down_grouped.numel());
+        assert_eq!(
+            resident.moe_y_down_grouped.numel(),
+            borrowed.moe_y_down_grouped.numel()
+        );
         assert_eq!(resident.max_chunk, EP_RESERVE_RESIDENT_ROWS);
         assert_eq!(borrowed.max_chunk, PROMPT);
         // Both banks are non-owning: neither would free anything.

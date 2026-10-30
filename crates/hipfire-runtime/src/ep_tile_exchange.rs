@@ -775,10 +775,8 @@ impl EpTileExchange {
                 return Err(err(text));
             }
         }
-        me.crossed_at_ms.store(
-            self.started.elapsed().as_millis() as u64,
-            Ordering::Relaxed,
-        );
+        me.crossed_at_ms
+            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
         me.crossed.store(tag.0, Ordering::Release);
         Ok(())
     }
@@ -863,7 +861,7 @@ impl Drop for EpTileExchange {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn spec(max_tiles: usize) -> EpTileExchangeSpec {
@@ -1066,7 +1064,7 @@ mod tests {
     // ── crossing tags: the barrier protocol half of the transport, no device ──
 
     /// A transport with no device state: only the barrier and tag protocol runs.
-    fn bare(ranks: usize, timeout: Duration) -> Arc<EpTileExchange> {
+    pub(crate) fn bare(ranks: usize, timeout: Duration) -> Arc<EpTileExchange> {
         let states = (0..ranks)
             .map(|rank| RankState {
                 device_id: rank as i32,
@@ -1094,7 +1092,7 @@ mod tests {
 
     /// The two barriers of rank `rank`'s exchange `k` of `layer`, without the
     /// device half in between.
-    fn exchange_barriers(
+    pub(crate) fn exchange_barriers(
         t: &EpTileExchange,
         rank: usize,
         k: u64,
@@ -1117,9 +1115,15 @@ mod tests {
     #[test]
     fn crossing_tags_format_every_kind() {
         let publish = TileCrossing::exchange(TileCrossing::PUBLISH, 5, 40, 12);
-        assert_eq!(publish.to_string(), "exchange publish layer 5 tiles 40 k 12");
+        assert_eq!(
+            publish.to_string(),
+            "exchange publish layer 5 tiles 40 k 12"
+        );
         let completion = TileCrossing::exchange(TileCrossing::COMPLETION, NO_LAYER, 40, 12);
-        assert_eq!(completion.to_string(), "exchange completion layer ? tiles 40 k 12");
+        assert_eq!(
+            completion.to_string(),
+            "exchange completion layer ? tiles 40 k 12"
+        );
         let host = TileCrossing::host(HOST_RESERVE_RESTORE, 6, 41);
         assert_eq!(host.to_string(), "host rendezvous what 2 epoch 6 n 41");
         assert_eq!(TileCrossing(0).to_string(), "none");
@@ -1211,7 +1215,10 @@ mod tests {
             .to_string();
         peer.join().expect("peer");
         assert!(error.contains("timed out"), "{error}");
-        assert!(error.contains("at [host rendezvous what 1 epoch 1"), "{error}");
+        assert!(
+            error.contains("at [host rendezvous what 1 epoch 1"),
+            "{error}"
+        );
         assert!(
             error.contains("rank 1 is between crossings")
                 && error.contains("last crossed [exchange completion layer 0"),

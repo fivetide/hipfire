@@ -111,7 +111,11 @@ impl EpReceiptOrdinals {
     /// the rank's own entry sequence, the prompt when no scope is set.
     fn next_key(&mut self, seq: u64, mtp_fill: bool) -> (u64, EpReceiptPhase, u64) {
         let prompt = receipt_scope().unwrap_or(seq);
-        let phase = if mtp_fill { EpReceiptPhase::MtpFill } else { EpReceiptPhase::Target };
+        let phase = if mtp_fill {
+            EpReceiptPhase::MtpFill
+        } else {
+            EpReceiptPhase::Target
+        };
         let count = self.0.entry((prompt, phase)).or_insert(0);
         let ordinal = *count;
         *count += 1;
@@ -378,7 +382,11 @@ pub(crate) fn check_stage_plan(plan: &EpReservePlan) -> Result<(), String> {
             first - 1
         ));
     }
-    if plan.donor_layers.iter().any(|layer| plan.s2_donor_layers.contains(layer)) {
+    if plan
+        .donor_layers
+        .iter()
+        .any(|layer| plan.s2_donor_layers.contains(layer))
+    {
         return Err("a layer is both a scratch donor and an S2 donor".to_string());
     }
     Ok(())
@@ -402,14 +410,19 @@ impl EpStageHostSources {
         for &layer in &plan.donor_layers {
             let span = |slot: EpDonorSlot| -> Result<(usize, usize), Qwen4GpuForwardError> {
                 let mirror = loan.mirror(layer, slot).ok_or_else(|| {
-                    invalid(format!("EP reserve loan has no mirror of layer {layer} {slot:?}"))
-                })?;
-                let host = gpu.host_bytes(mirror.tensor).filter(|host| host.len() == mirror.bytes);
-                host.map(|host| (host.as_ptr() as usize, host.len())).ok_or_else(|| {
                     invalid(format!(
-                        "EP reserve mirror of layer {layer} {slot:?} has no pinned host bytes"
+                        "EP reserve loan has no mirror of layer {layer} {slot:?}"
                     ))
-                })
+                })?;
+                let host = gpu
+                    .host_bytes(mirror.tensor)
+                    .filter(|host| host.len() == mirror.bytes);
+                host.map(|host| (host.as_ptr() as usize, host.len()))
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "EP reserve mirror of layer {layer} {slot:?} has no pinned host bytes"
+                        ))
+                    })
             };
             spans.push([span(EpDonorSlot::GateUp)?, span(EpDonorSlot::Down)?]);
         }
@@ -428,9 +441,11 @@ impl EpStageHostSources {
         // after the stage that reads these bytes is freed); nothing writes a
         // mirror after materialization, and the slice lives only as long as
         // this borrow of the forward-owned resolver.
-        Some(spans.map(|(address, len)| unsafe {
-            std::slice::from_raw_parts(address as *const u8, len)
-        }))
+        Some(
+            spans.map(|(address, len)| unsafe {
+                std::slice::from_raw_parts(address as *const u8, len)
+            }),
+        )
     }
 }
 
@@ -444,10 +459,7 @@ pub(crate) fn typed_mirror_source(mirror: &EpLoanMirror<'_>, dtype: DType) -> Gp
         // owned by the loan; the descriptor marks the bytes host-mapped (they
         // are) and is dropped by the runtime builder without being freed.
         buf: unsafe {
-            hip_bridge::DeviceBuffer::from_host_mapped(
-                mirror.tensor.buf.as_ptr(),
-                mirror.bytes,
-            )
+            hip_bridge::DeviceBuffer::from_host_mapped(mirror.tensor.buf.as_ptr(), mirror.bytes)
         },
         shape: vec![mirror.bytes],
         dtype,
@@ -682,7 +694,9 @@ impl EpReserveForward {
         if banks.prompt_rows() != plan.forward.prompt_rows
             || banks.resident_rows() != plan.forward.resident_rows
         {
-            return Err(invalid("EP reserve banks disagree with the plan's row counts"));
+            return Err(invalid(
+                "EP reserve banks disagree with the plan's row counts",
+            ));
         }
         let seal = bundle.ep_seal().ok_or_else(|| {
             invalid(
@@ -716,7 +730,9 @@ impl EpReserveForward {
             // SAFETY: a `Borrowed` alias of the persistent grouped-down root
             // `EpReserveBanks` owns until its `release`; the view is dropped
             // with the forward and never reaches a free path.
-            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(address as *mut std::ffi::c_void, bytes) },
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(address as *mut std::ffi::c_void, bytes)
+            },
             shape: vec![slot.elements],
             dtype: slot.dtype,
         };
@@ -774,7 +790,12 @@ impl EpReserveForward {
     }
 
     /// One `rank` receipt record (and its header) of the admitted load.
-    pub(crate) fn rank_receipt_json(&self, rank: usize, s1: bool, s2: bool) -> [serde_json::Value; 2] {
+    pub(crate) fn rank_receipt_json(
+        &self,
+        rank: usize,
+        s1: bool,
+        s2: bool,
+    ) -> [serde_json::Value; 2] {
         let receipt = self.plan.mesh_receipt(self.source_generation, s1, s2);
         let (address, bytes) = self.banks.registered_grouped_down();
         [
@@ -916,7 +937,9 @@ impl Qwen4GpuForward {
             .as_ref()
             .and_then(|ep| ep.tile.as_ref())
             .and_then(|route| route.hook.as_ref())
-            .ok_or_else(|| invalid("the EP reserve rendezvous needs the installed tile exchange"))?;
+            .ok_or_else(|| {
+                invalid("the EP reserve rendezvous needs the installed tile exchange")
+            })?;
         hook.host_barrier(what, self.ep_reserve_epoch())
             .map_err(|error| invalid(format!("EP reserve barrier: {error}")))
     }
@@ -998,7 +1021,11 @@ impl Qwen4GpuForward {
     /// previous work and cross the all-rank barrier BEFORE any rank overwrites
     /// donor bytes, then mark the loan dirty and zero the touched extents. Every
     /// borrowed call re-enters the loan (capture refusal, counters).
-    fn ep_reserve_acquire(&mut self, gpu: &mut Gpu, barrier: bool) -> Result<(), Qwen4GpuForwardError> {
+    fn ep_reserve_acquire(
+        &mut self,
+        gpu: &mut Gpu,
+        barrier: bool,
+    ) -> Result<(), Qwen4GpuForwardError> {
         if Self::ep_reserve_capturing(gpu)? {
             return Err(invalid(
                 "an EP reserve borrowed tile cannot run inside a stream capture (its scratch \
@@ -1121,18 +1148,22 @@ impl Qwen4GpuForward {
         );
         self.borrow_runtimes_active = false;
         let reserve = self.ep_reserve.as_mut().expect("an EP reserve forward");
-        let swapped = reserve
-            .banks
-            .swap_out(&mut self.scratch)
-            .map(|_| ());
-        let after = reserve.loan.after_tile(gpu, result.is_ok()).map_err(invalid);
+        let swapped = reserve.banks.swap_out(&mut self.scratch).map(|_| ());
+        let after = reserve
+            .loan
+            .after_tile(gpu, result.is_ok())
+            .map_err(invalid);
         let merged = merge_share_result(merge_share_result(result, swapped), after);
         self.ep_reserve_note_result(&merged);
         merged
     }
 
     fn ep_reserve_note_call(&mut self, rows: usize, bank: EpBankKind) {
-        if let Some(prompt) = self.ep_reserve.as_mut().and_then(|reserve| reserve.prompt.as_mut()) {
+        if let Some(prompt) = self
+            .ep_reserve
+            .as_mut()
+            .and_then(|reserve| reserve.prompt.as_mut())
+        {
             prompt.chunk_rows.push(rows);
             prompt.banks.push(bank);
         }
@@ -1183,7 +1214,10 @@ impl Qwen4GpuForward {
     /// A whole-prompt entry begins on this rank (no-op without an EP reserve).
     pub(super) fn ep_reserve_prompt_begin(&mut self) {
         let mtp_fill = self.receipt_mtp_fill;
-        let address = self.ep_reserve.as_ref().map(|reserve| reserve.banks.registered_grouped_down().0);
+        let address = self
+            .ep_reserve
+            .as_ref()
+            .map(|reserve| reserve.banks.registered_grouped_down().0);
         let (Some(reserve), Some(address)) = (self.ep_reserve.as_mut(), address) else {
             self.ep_ordinary_prompt_begin(mtp_fill);
             return;
@@ -1364,13 +1398,13 @@ impl Qwen4GpuForward {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ep_reserve_scratch::EpScratchDevice;
     use super::*;
     use crate::config::compact_test_config;
     use crate::ep_reserve::{
         plan_ep_reserve, EpRankGeometry, EpReserveCapacity, EpReserveForwardPlan,
         EP_RESERVE_MIN_RESIDENT_LAYERS,
     };
-    use super::super::ep_reserve_scratch::EpScratchDevice;
     use std::collections::BTreeMap;
 
     const GIB: u64 = 1 << 30;
@@ -1416,7 +1450,10 @@ mod tests {
 
     /// Run `prompt` (the forward row sequence of ONE outer prompt) with the given
     /// route of every call; `routes` defaults to the tile exchange.
-    fn drive(prompt: &[usize], route_of: impl Fn(usize) -> EpBankRoute) -> Result<Vec<Event>, String> {
+    fn drive(
+        prompt: &[usize],
+        route_of: impl Fn(usize) -> EpBankRoute,
+    ) -> Result<Vec<Event>, String> {
         let mut epoch = EpEpoch::default();
         let mut events = Vec::new();
         epoch.begin_prompt();
@@ -1530,10 +1567,19 @@ mod tests {
             events,
             vec![
                 Event::Acquire,
-                Event::Call { rows: 4096, bank: Bank::Borrowed },
-                Event::Call { rows: 4096, bank: Bank::Borrowed },
+                Event::Call {
+                    rows: 4096,
+                    bank: Bank::Borrowed
+                },
+                Event::Call {
+                    rows: 4096,
+                    bank: Bank::Borrowed
+                },
                 Event::Restore { before: 2 },
-                Event::Call { rows: 12, bank: Bank::Resident },
+                Event::Call {
+                    rows: 12,
+                    bank: Bank::Resident
+                },
             ],
             "one acquire, none between tiles, one restore before the tail, none at completion"
         );
@@ -1546,9 +1592,15 @@ mod tests {
             events,
             vec![
                 Event::Acquire,
-                Event::Call { rows: 4096, bank: Bank::Borrowed },
+                Event::Call {
+                    rows: 4096,
+                    bank: Bank::Borrowed
+                },
                 Event::Restore { before: 1 },
-                Event::Call { rows: 512, bank: Bank::Resident },
+                Event::Call {
+                    rows: 512,
+                    bank: Bank::Resident
+                },
             ]
         );
     }
@@ -1560,17 +1612,20 @@ mod tests {
             events,
             vec![
                 Event::Acquire,
-                Event::Call { rows: 4096, bank: Bank::Borrowed },
-                Event::Call { rows: 4096, bank: Bank::Borrowed },
+                Event::Call {
+                    rows: 4096,
+                    bank: Bank::Borrowed
+                },
+                Event::Call {
+                    rows: 4096,
+                    bank: Bank::Borrowed
+                },
                 Event::Completion,
             ]
         );
         // A prompt that is all borrowed restores once; many tiles never restore per tile.
         let long = drive(&[4096; 16], |_| TILE).unwrap();
-        assert_eq!(
-            long.iter().filter(|e| **e == Event::Acquire).count(),
-            1
-        );
+        assert_eq!(long.iter().filter(|e| **e == Event::Acquire).count(), 1);
         assert_eq!(
             long.iter()
                 .filter(|e| matches!(e, Event::Restore { .. } | Event::Completion))
@@ -1630,10 +1685,12 @@ mod tests {
             );
         }
         epoch.acquired();
-        assert!(epoch
-            .plan_call(1, RESIDENT, PROMPT, TILE)
-            .unwrap()
-            .restore_first);
+        assert!(
+            epoch
+                .plan_call(1, RESIDENT, PROMPT, TILE)
+                .unwrap()
+                .restore_first
+        );
     }
 
     #[test]
@@ -1703,7 +1760,10 @@ mod tests {
         let first_host = plan.donor_first_layer;
         for donor in plan.s2_donor_layers {
             let chain: Vec<usize> = (donor + 2..plan.trunk_layers).step_by(2).collect();
-            assert_eq!(chain[0], first_host + (donor % 2 != first_host % 2) as usize);
+            assert_eq!(
+                chain[0],
+                first_host + (donor % 2 != first_host % 2) as usize
+            );
             assert!(chain.iter().all(|&layer| layer >= first_host));
         }
         let mut staged: Vec<usize> = plan
@@ -1769,10 +1829,8 @@ mod tests {
                     (mirror.gate_up_base..mirror.gate_up_base + mirror.gate_up_bytes)
                         .contains(&entry.gate_up_ptr)
                 );
-                assert!(
-                    (mirror.down_base..mirror.down_base + mirror.down_bytes)
-                        .contains(&entry.down_ptr)
-                );
+                assert!((mirror.down_base..mirror.down_base + mirror.down_bytes)
+                    .contains(&entry.down_ptr));
             } else {
                 assert_eq!(entry.origin, Qwen4ExpertOrigin::Dummy);
                 assert_eq!(entry.gate_up_ptr, dummy.gate_up_base);
@@ -1809,7 +1867,9 @@ mod tests {
     fn layout_resolves_every_segment_inside_its_owner() {
         let plan = plan();
         let address = |layer: usize, slot: EpDonorSlot| {
-            0x10_0000_0000usize + layer * (4 << 30) + usize::from(slot == EpDonorSlot::Down) * (2 << 30)
+            0x10_0000_0000usize
+                + layer * (4 << 30)
+                + usize::from(slot == EpDonorSlot::Down) * (2 << 30)
         };
         let (segments, placements) = ep_reserve_layout(&plan, |layer, slot| {
             let bytes = match slot {
@@ -1822,7 +1882,10 @@ mod tests {
         assert_eq!(segments.len(), plan.segments.len());
         assert_eq!(placements.len(), plan.placements.len());
         for (segment, plan_segment) in segments.iter().zip(&plan.segments) {
-            assert_eq!(segment.address, address(plan_segment.layer, plan_segment.slot));
+            assert_eq!(
+                segment.address,
+                address(plan_segment.layer, plan_segment.slot)
+            );
             assert_eq!(segment.bytes, plan_segment.capacity);
         }
         // An owner smaller than the lent capacity, or a null address, is refused.
@@ -1898,7 +1961,9 @@ mod tests {
         route: EpBankRoute,
         body: impl FnOnce(&Qwen4GpuForwardScratch) -> Result<R, String>,
     ) -> Result<R, String> {
-        banks.select(scratch, rows, route).map_err(|e| e.to_string())?;
+        banks
+            .select(scratch, rows, route)
+            .map_err(|e| e.to_string())?;
         let result = body(scratch);
         banks.swap_out(scratch).map_err(|e| e.to_string())?;
         result
@@ -1960,8 +2025,7 @@ mod tests {
         assert_eq!(capacity.tile_ids, 3_040);
         assert_eq!(exchange_max_tiles(&capacity, hidden), 3_040);
         // The resident bank's own ids hold far fewer; the registration must not use them.
-        let resident_tiles =
-            scratch.moe_expert_tile_ids.buf.size() / std::mem::size_of::<i32>();
+        let resident_tiles = scratch.moe_expert_tile_ids.buf.size() / std::mem::size_of::<i32>();
         assert_eq!(resident_tiles, 12_800 / 16);
         assert!(resident_tiles < capacity.tile_ids);
         // The registered view spans the whole 475 MiB root in both banks.
@@ -1986,7 +2050,10 @@ mod tests {
         ep_reserve_receipt_scope(None);
         assert_eq!(receipt_scope(), None);
         // Another rank's counters are independent.
-        assert_eq!(EpReceiptOrdinals::default().next_key(0, false), (0, EpReceiptPhase::Target, 0));
+        assert_eq!(
+            EpReceiptOrdinals::default().next_key(0, false),
+            (0, EpReceiptPhase::Target, 0)
+        );
         assert_eq!(EpReceiptPhase::MtpFill.name(), "mtp_fill");
         assert_eq!(EpReceiptPhase::Target.name(), "target");
     }
@@ -2014,7 +2081,14 @@ mod tests {
             exchange_before: Some(0xabc000),
             hash_before: Some("00ff".to_string()),
         };
-        let json = prompt_rank_json(1, &record, 1, Duration::from_millis(40), Some(0xabc000), Some("00ff".to_string()));
+        let json = prompt_rank_json(
+            1,
+            &record,
+            1,
+            Duration::from_millis(40),
+            Some(0xabc000),
+            Some("00ff".to_string()),
+        );
         assert_eq!(json["prompt"], 3);
         assert_eq!(json["phase"], "mtp_fill");
         assert_eq!(json["ordinal"], 2);
@@ -2024,7 +2098,10 @@ mod tests {
         assert_eq!(json["banks"], serde_json::json!(["borrowed", "resident"]));
         assert_eq!(json["restores"][0]["before_chunk"], 1);
         assert_eq!(json["restores"][0]["bytes"], 1u64 << 30);
-        assert_eq!(json["exchange_address_before"], json["exchange_address_after"]);
+        assert_eq!(
+            json["exchange_address_before"],
+            json["exchange_address_after"]
+        );
         assert_eq!(json["donor_hash_before"], json["donor_hash_after"]);
         // Without hashes the keys are absent (the gate then rejects the record).
         let bare = prompt_rank_json(0, &record, 1, Duration::from_millis(1), Some(1), None);
