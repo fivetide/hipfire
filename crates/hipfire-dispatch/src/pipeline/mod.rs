@@ -32,6 +32,13 @@ pub mod slab_route;
 pub mod slowlink_prefill;
 pub mod sp_layer;
 pub use moe_program::{MoeStage, SealedMoeOp};
+pub use moe_program::{
+    execute_gated_ffn, execute_grouped_moe, CastPolicy, CombineOrder, FfnActivation, GatedFfnOp,
+    GroupedMoeGroupedScratch, GroupedMoeIndexedScratch, GroupedMoeOp, GroupedMoePolicy,
+    GroupedMoeProtocol, GroupedMoeRouted, GroupedMoeRouter, GroupedMoeScratch,
+    GroupedMoeScratchPlan, GroupedMoeShared, GroupedMoeSharedScratch, RouterKind,
+    SharedExpertPolicy,
+};
 pub(crate) mod draft_head;
 pub mod moe_dump;
 pub(crate) mod norm_fold;
