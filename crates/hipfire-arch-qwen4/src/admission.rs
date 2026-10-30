@@ -1177,9 +1177,7 @@ fn balance_order(a: &FitCandidate, b: &FitCandidate) -> std::cmp::Ordering {
 /// earlier bands. A strict total order on distinct splits.
 fn balanced_before(a: &FitCandidate, b: &FitCandidate, admitted: &[usize]) -> bool {
     balance_order(a, b)
-        .then_with(|| {
-            split_distance(&a.counts, admitted).cmp(&split_distance(&b.counts, admitted))
-        })
+        .then_with(|| split_distance(&a.counts, admitted).cmp(&split_distance(&b.counts, admitted)))
         .then_with(|| b.counts.cmp(&a.counts))
         .is_lt()
 }
@@ -1192,9 +1190,7 @@ fn nearer_before(a: &FitCandidate, b: &FitCandidate, admitted: &[usize]) -> bool
         .1
         .cmp(&b.worst_shortfall().1)
         .then_with(|| b.chunk_rows.cmp(&a.chunk_rows))
-        .then_with(|| {
-            split_distance(&a.counts, admitted).cmp(&split_distance(&b.counts, admitted))
-        })
+        .then_with(|| split_distance(&a.counts, admitted).cmp(&split_distance(&b.counts, admitted)))
         .then_with(|| b.counts.cmp(&a.counts))
         .is_lt()
 }
@@ -2024,7 +2020,12 @@ mod tests {
 
         type Calls = RefCell<Vec<(Vec<usize>, usize)>>;
 
-        fn line(stage: usize, band: std::ops::Range<usize>, required: u64, free: u64) -> Qwen4PpRankFit {
+        fn line(
+            stage: usize,
+            band: std::ops::Range<usize>,
+            required: u64,
+            free: u64,
+        ) -> Qwen4PpRankFit {
             Qwen4PpRankFit {
                 stage,
                 band,
@@ -2041,7 +2042,12 @@ mod tests {
         }
 
         /// The two ranks' lines of the measured fixture.
-        fn measured_free(counts: &[usize], chunk: usize, context: u64, free: u64) -> Vec<Qwen4PpRankFit> {
+        fn measured_free(
+            counts: &[usize],
+            chunk: usize,
+            context: u64,
+            free: u64,
+        ) -> Vec<Qwen4PpRankFit> {
             let cut = (4096 - chunk) as u64;
             let rank0 = R0_UNIFORM_4096 + counts[0] as u64 * LAYER + context
                 - 24 * LAYER
@@ -2070,10 +2076,17 @@ mod tests {
             free: u64,
             calls: &Calls,
         ) -> Result<Qwen4PpAutoFit, String> {
-            qwen4_pp_auto_fit(admitted, explicit, first_min, requested, pinned, |counts, chunk| {
-                calls.borrow_mut().push((counts.to_vec(), chunk));
-                Ok(measured_free(counts, chunk, context, free))
-            })
+            qwen4_pp_auto_fit(
+                admitted,
+                explicit,
+                first_min,
+                requested,
+                pinned,
+                |counts, chunk| {
+                    calls.borrow_mut().push((counts.to_vec(), chunk));
+                    Ok(measured_free(counts, chunk, context, free))
+                },
+            )
         }
 
         fn fits_at(counts: &[usize], chunk: usize, context: u64) -> bool {
@@ -2093,7 +2106,10 @@ mod tests {
             assert!(uniform[0].fits());
             // The hand-tuned 25,23 at 1024 is the measured MiB, and fits.
             let hand = measured(&[25, 23], 1024, 0);
-            assert_eq!([hand[0].required, hand[1].required], [R0_HAND_1024, R1_HAND_1024]);
+            assert_eq!(
+                [hand[0].required, hand[1].required],
+                [R0_HAND_1024, R1_HAND_1024]
+            );
             assert!(hand.iter().all(Qwen4PpRankFit::fits));
             assert!(!fits_at(&[24, 24], 1024, 0));
             // At 16K no split fits at 4096 or 2048 and only 25,23 fits at 1024.
@@ -2178,13 +2194,19 @@ mod tests {
         fn a_pinned_chunk_searches_only_the_split() {
             let calls = Calls::default();
             let fit = search(&[24, 24], false, 2, 1024, true, 0, FREE, &calls).unwrap();
-            assert_eq!((fit.counts.as_slice(), fit.chunk_rows), (&[25, 23][..], 1024));
+            assert_eq!(
+                (fit.counts.as_slice(), fit.chunk_rows),
+                (&[25, 23][..], 1024)
+            );
             assert!(calls.borrow().iter().all(|(_, chunk)| *chunk == 1024));
             // A pinned chunk no split fits is the refusal, naming only that chunk.
             let calls = Calls::default();
             let error = search(&[24, 24], false, 2, 4096, true, 0, FREE, &calls).unwrap_err();
             assert!(calls.borrow().iter().all(|(_, chunk)| *chunk == 4096));
-            assert!(error.contains("auto-fit searched chunk rows 4096 and"), "{error}");
+            assert!(
+                error.contains("auto-fit searched chunk rows 4096 and"),
+                "{error}"
+            );
         }
 
         #[test]
@@ -2205,7 +2227,10 @@ mod tests {
             // An explicit split that fits is taken as given.
             let calls = Calls::default();
             let fit = search(&[25, 23], true, 2, 1024, true, 0, FREE, &calls).unwrap();
-            assert_eq!((fit.counts.as_slice(), fit.chunk_rows), (&[25, 23][..], 1024));
+            assert_eq!(
+                (fit.counts.as_slice(), fit.chunk_rows),
+                (&[25, 23][..], 1024)
+            );
             assert!(fit.moved_from.is_none());
             assert_eq!(calls.borrow().len(), 1);
         }
@@ -2213,7 +2238,8 @@ mod tests {
         #[test]
         fn nothing_fitting_reports_the_nearest_candidate() {
             let calls = Calls::default();
-            let error = search(&[24, 24], false, 2, 4096, false, 0, 20_000_000_000, &calls).unwrap_err();
+            let error =
+                search(&[24, 24], false, 2, 4096, false, 0, 20_000_000_000, &calls).unwrap_err();
             for part in [
                 "topology.pp = 2",
                 "band does not fit device memory",
@@ -2240,7 +2266,12 @@ mod tests {
         fn four_stages_walk_to_the_most_balanced_fitting_split() {
             // Band cost = a fixed part + 1 GB per layer; the first and last
             // bands carry the embedding side and the head.
-            let base = [6_000_000_000u64, 2_000_000_000, 2_000_000_000, 8_000_000_000];
+            let base = [
+                6_000_000_000u64,
+                2_000_000_000,
+                2_000_000_000,
+                8_000_000_000,
+            ];
             let lines = |counts: &[usize], free: u64| -> Vec<Qwen4PpRankFit> {
                 counts
                     .iter()
@@ -2343,7 +2374,10 @@ mod tests {
                 at(counts, chunk, &exact)
             })
             .unwrap();
-            assert_eq!((kept.counts.as_slice(), kept.chunk_rows), (&[24, 24][..], 4096));
+            assert_eq!(
+                (kept.counts.as_slice(), kept.chunk_rows),
+                (&[24, 24][..], 4096)
+            );
             assert!(kept.moved_from.is_none());
             // One byte short on the heavier rank: the search moves; an oracle
             // over every split at every rung, largest chunk first, agrees.
@@ -2383,7 +2417,11 @@ mod tests {
                 .filter(|(_, max)| *max == best)
                 .map(|(counts, _)| counts)
                 .collect();
-            assert!(balanced.contains(&&moved.counts), "{:?} vs {balanced:?}", moved.counts);
+            assert!(
+                balanced.contains(&&moved.counts),
+                "{:?} vs {balanced:?}",
+                moved.counts
+            );
             assert_eq!(search(), Ok(moved));
             // An explicit split is never searched: today's refusal, verbatim.
             let error = qwen4_pp_auto_fit(&[30, 18], true, 2, 4096, false, |counts, chunk| {

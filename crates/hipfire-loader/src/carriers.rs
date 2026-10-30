@@ -7906,18 +7906,17 @@ fn load_qwen4_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedMode
         tokenizer: &meta.tokenizer,
         chat_template: meta.chat_template.as_deref(),
     });
-    let (bundle, gpus, native_mtp) =
-        load_qwen4_pp_bundle(
-            ctx.gpu,
-            admitted,
-            placement,
-            // `HIPFIRE_PP_LAYERS` (admission's `explicit_counts`): the
-            // operator's split is never searched.
-            ctx.pp_layer_counts.is_some(),
-            &shared,
-            session,
-            src,
-        )?;
+    let (bundle, gpus, native_mtp) = load_qwen4_pp_bundle(
+        ctx.gpu,
+        admitted,
+        placement,
+        // `HIPFIRE_PP_LAYERS` (admission's `explicit_counts`): the
+        // operator's split is never searched.
+        ctx.pp_layer_counts.is_some(),
+        &shared,
+        session,
+        src,
+    )?;
     let max_seq = ctx.max_seq;
     let speculator = native_mtp.then(|| {
         // PP mesh: unsupported shape for the measured descriptor; the drafter
