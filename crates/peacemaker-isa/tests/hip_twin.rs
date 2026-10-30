@@ -64,3 +64,36 @@ fn hxaco_rebundle_mismatch_errs() {
     bad[at..at + 4].copy_from_slice(b"hosu");
     assert!(verify_hxaco(&bad, Arch::Gfx1100, "twin_saxpy").is_err());
 }
+
+#[test]
+fn seal_many_seals_every_kernel_into_one_bundle() {
+    use peacemaker_isa::hip_twin::{seal_many, verify_hxaco_many, KernelSpec};
+    let specs = [
+        KernelSpec { symbol: "twin_saxpy", abi_ref: Some((CO, "twin_saxpy")) },
+        KernelSpec { symbol: "twin_saxpy2", abi_ref: None },
+    ];
+    let all = seal_many(CO, Arch::Gfx1100, &specs).expect("seal_many");
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].hxaco, all[1].hxaco);
+    assert_eq!(all[0].hxaco_sha256, all[1].hxaco_sha256);
+    assert_ne!(all[0].report["kernel"], all[1].report["kernel"]);
+    let one = seal(CO, Arch::Gfx1100, "twin_saxpy", None).unwrap();
+    assert_eq!(all[0].hxaco, one.hxaco);
+    assert_eq!(all[0].text_sha256, one.text_sha256);
+    let v = verify_hxaco_many(&all[0].hxaco, Arch::Gfx1100, &["twin_saxpy", "twin_saxpy2"]).expect("verify");
+    assert_eq!(v[1].text_sha256, all[1].text_sha256);
+}
+
+#[test]
+fn seal_many_rejects_empty_duplicate_and_bad_member() {
+    use peacemaker_isa::hip_twin::{seal_many, KernelSpec};
+    let k = |symbol| KernelSpec { symbol, abi_ref: None };
+    assert!(seal_many(CO, Arch::Gfx1100, &[]).unwrap_err().contains("no kernels"));
+    let e = seal_many(CO, Arch::Gfx1100, &[k("twin_saxpy"), k("twin_saxpy")]).unwrap_err();
+    assert!(e.contains("duplicate"), "{e}");
+    let e = seal_many(CO, Arch::Gfx1100, &[k("twin_saxpy"), k("nope")]).unwrap_err();
+    assert!(e.contains("not found"), "{e}");
+    let bad = KernelSpec { symbol: "twin_saxpy", abi_ref: Some((CO, "twin_saxpy2")) };
+    let e = seal_many(CO, Arch::Gfx1100, &[k("twin_saxpy2"), bad]).unwrap_err();
+    assert!(e.contains("ABI mismatch"), "{e}");
+}

@@ -253,3 +253,41 @@ pub fn verify_hxaco(hxaco: &[u8], arch: Arch, symbol: &str) -> Result<Sealed, St
     }
     Ok(s)
 }
+
+/// One kernel of a multi-kernel module for [`seal_many`]: its symbol and, optionally, the
+/// incumbent object bytes and symbol whose explicit kernarg layout it must match.
+#[derive(Clone, Copy, Debug)]
+pub struct KernelSpec<'a> {
+    pub symbol: &'a str,
+    pub abi_ref: Option<(&'a [u8], &'a str)>,
+}
+
+/// [`seal`] every kernel of one object into a single `.hxaco`: each kernel gets its own lift
+/// proof, hazard, SGPR and ABI checks; the returned [`Sealed`]s (one per spec, in order) share
+/// the same bundle bytes. At least one spec is required and symbols must be distinct.
+pub fn seal_many(input: &[u8], arch: Arch, specs: &[KernelSpec<'_>]) -> Result<Vec<Sealed>, String> {
+    if specs.is_empty() {
+        return Err("seal_many: no kernels".into());
+    }
+    for (i, s) in specs.iter().enumerate() {
+        if specs[..i].iter().any(|p| p.symbol == s.symbol) {
+            return Err(format!("seal_many: duplicate kernel `{}`", s.symbol));
+        }
+    }
+    let mut out: Vec<Sealed> = Vec::with_capacity(specs.len());
+    for s in specs {
+        let sealed = seal(input, arch, s.symbol, s.abi_ref)?;
+        if let Some(first) = out.first() {
+            if first.hxaco != sealed.hxaco {
+                return Err("seal_many: kernels sealed to different bundles".into());
+            }
+        }
+        out.push(sealed);
+    }
+    Ok(out)
+}
+
+/// [`verify_hxaco`] for every symbol of a multi-kernel `hxaco`.
+pub fn verify_hxaco_many(hxaco: &[u8], arch: Arch, symbols: &[&str]) -> Result<Vec<Sealed>, String> {
+    symbols.iter().map(|s| verify_hxaco(hxaco, arch, s)).collect()
+}
