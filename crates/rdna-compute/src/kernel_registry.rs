@@ -10776,6 +10776,20 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // x-stationary tiled F32 GEMM for the mHC selector and grouped-MoE router.
+        const F32_TILED_ROWS_ADDED_MODULES: [&str; 1] = ["gemm_f32_tiled_rows"];
+        for module in F32_TILED_ROWS_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing F32 tiled rows module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         // A3B VMM exact batch route: lane-batched multi-weight projection GEMV (gfx1201 only).
         const A3B_LANE_PROJ_ADDED_MODULES: [&str; 1] = ["gemv_mq4g256v2_lane_proj_k2048_gfx1201"];
         for module in A3B_LANE_PROJ_ADDED_MODULES {
@@ -10846,7 +10860,8 @@ mod tests {
                 + A3B_HEAD_LANES_ADDED_MODULES.len()
                 + A3B_LANE_WO_ADDED_MODULES.len()
                 + A3B_MOE_DEDUP_ADDED_MODULES.len()
-                + A3B_LANE_PROJ_ADDED_MODULES.len(),
+                + A3B_LANE_PROJ_ADDED_MODULES.len()
+                + F32_TILED_ROWS_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
