@@ -309,7 +309,8 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value) -> Result<Value, String> {
     let (width, dqk) = (g.row_width(), g.qk_dim());
     let (h, v, per) = (g.n_heads, g.v_dim, g.nope + g.v_dim);
     let total = p + n;
-    let cap = total + 37; // poison rows beyond the live length
+    let cap = total + 37; // latent-cache rows (poison beyond the live length)
+    let mcap = total + 11; // mirror rows: independent of the cache capacity
     let scale = g.default_scale();
 
     let q_a_out = t.get("q_a_out", n * qlora)?.to_vec();
@@ -339,8 +340,8 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value) -> Result<Value, String> {
             .collect();
         gpu.memcpy_htod_auto(&cache_t.buf, &bytes).map_err(he)?;
     }
-    let knope = poison_bf16(gpu, &[h, cap, g.nope])?;
-    let vmir = poison_bf16(gpu, &[h, cap, v])?;
+    let knope = poison_bf16(gpu, &[h, mcap, g.nope])?;
+    let vmir = poison_bf16(gpu, &[h, mcap, v])?;
     let pos = gpu.alloc_tensor(&[1], DType::F32).map_err(he)?;
     set_pos(gpu, &pos, p)?;
 
@@ -357,7 +358,7 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value) -> Result<Value, String> {
     let d_gated = gpu.zeros(&[n, h * v], DType::F32).map_err(he)?;
 
     let cache = LatentCache { rows: &cache_t, capacity_rows: cap, pos: &pos, host_pos: Some(p) };
-    let mirror = ExpandedMirror { knope: &knope, vmir: &vmir, capacity_rows: cap };
+    let mirror = ExpandedMirror { knope: &knope, vmir: &vmir, capacity_rows: mcap };
     let dense = KvExpansion::Dense { weight: &d_w };
     let run = |gpu: &mut Gpu, op: LatentAttentionOp<'_>| -> Result<(), String> {
         execute_latent_attention(gpu, &op).map_err(he)
@@ -425,7 +426,7 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value) -> Result<Value, String> {
         })
         .collect();
     checks.push(exact("cache_tail_raw", &got_tail, &new_tail));
-    let exp_a = expand_mirror(&k_a, &v_a, &g, cap, total);
+    let exp_a = expand_mirror(&k_a, &v_a, &g, mcap, total);
     checks.push(compare("kv_expanded", &exp_a, r_exp));
     checks.push(compare("attn_y", &y1, r_y));
     checks.push(compare("gated", &gated, r_gated));
@@ -436,9 +437,9 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value) -> Result<Value, String> {
     ));
 
     // 5. schedule B: every live row in one absolute call, fresh mirrors.
-    let kn_b = poison_bf16(gpu, &[h, cap, g.nope])?;
-    let vm_b = poison_bf16(gpu, &[h, cap, v])?;
-    let mirror_b = ExpandedMirror { knope: &kn_b, vmir: &vm_b, capacity_rows: cap };
+    let kn_b = poison_bf16(gpu, &[h, mcap, g.nope])?;
+    let vm_b = poison_bf16(gpu, &[h, mcap, v])?;
+    let mirror_b = ExpandedMirror { knope: &kn_b, vmir: &vm_b, capacity_rows: mcap };
     run(gpu, LatentAttentionOp::Decompress {
         geometry: g, cache, mirror: mirror_b, expansion: dense,
         range: RowRange::Absolute { start: 0, count: total },
@@ -448,13 +449,13 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value) -> Result<Value, String> {
     let v_b = gpu.download_raw_bytes(&vm_b).map_err(he)?;
     checks.push(exact(
         "mirror_k_schedules_bitwise",
-        &valid_rows(&k_a, h, cap, g.nope, total),
-        &valid_rows(&k_b, h, cap, g.nope, total),
+        &valid_rows(&k_a, h, mcap, g.nope, total),
+        &valid_rows(&k_b, h, mcap, g.nope, total),
     ));
     checks.push(exact(
         "mirror_v_schedules_bitwise",
-        &valid_rows(&v_a, h, cap, v, total),
-        &valid_rows(&v_b, h, cap, v, total),
+        &valid_rows(&v_a, h, mcap, v, total),
+        &valid_rows(&v_b, h, mcap, v, total),
     ));
 
     // 6. gather -> external projector (host, ascending-k fma) -> scatter.
@@ -477,9 +478,9 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value) -> Result<Value, String> {
             }
         }
         let d_proj = up_f32(gpu, &proj, &[total, h * per])?;
-        let kn_c = poison_bf16(gpu, &[h, cap, g.nope])?;
-        let vm_c = poison_bf16(gpu, &[h, cap, v])?;
-        let mirror_c = ExpandedMirror { knope: &kn_c, vmir: &vm_c, capacity_rows: cap };
+        let kn_c = poison_bf16(gpu, &[h, mcap, g.nope])?;
+        let vm_c = poison_bf16(gpu, &[h, mcap, v])?;
+        let mirror_c = ExpandedMirror { knope: &kn_c, vmir: &vm_c, capacity_rows: mcap };
         run(gpu, LatentAttentionOp::Decompress {
             geometry: g, cache, mirror: mirror_c,
             expansion: KvExpansion::External { projected: &d_proj },
@@ -490,13 +491,13 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value) -> Result<Value, String> {
         let v_c = gpu.download_raw_bytes(&vm_c).map_err(he)?;
         checks.push(exact(
             "mirror_k_external_bitwise",
-            &valid_rows(&k_a, h, cap, g.nope, total),
-            &valid_rows(&k_c, h, cap, g.nope, total),
+            &valid_rows(&k_a, h, mcap, g.nope, total),
+            &valid_rows(&k_c, h, mcap, g.nope, total),
         ));
         checks.push(exact(
             "mirror_v_external_bitwise",
-            &valid_rows(&v_a, h, cap, v, total),
-            &valid_rows(&v_c, h, cap, v, total),
+            &valid_rows(&v_a, h, mcap, v, total),
+            &valid_rows(&v_c, h, mcap, v, total),
         ));
     }
 

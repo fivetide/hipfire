@@ -7,7 +7,7 @@
 
 // Latent-attention decompression: cache rows [latent || tail] -> per-head
 // expanded K_nope / V rows (BF16), head-major mirrors
-//     knope[h][t][nope]   vmir[h][t][v]      (row stride = cap)
+//     knope[h][t][nope]   vmir[h][t][v]      (row stride = mirror capacity)
 // The shared tail channels are NOT copied per head: attention reads them
 // directly from the latent cache row (shared across heads).
 //
@@ -88,7 +88,7 @@ extern "C" __global__ __launch_bounds__(256) void latent_attention_decompress_de
     uint16_t* __restrict__ knope,        // [H, cap, nope]
     uint16_t* __restrict__ vmir,         // [H, cap, v]
     int row0, int n_rows, int n_heads, int nope, int v, int latent, int tail,
-    int cap, int w_bf16
+    int cap, int w_bf16, int mcap
 ) {
     __shared__ float cs[LA_TM][LA_TK + 1];
     __shared__ float ws[LA_TN][LA_TK + 1];
@@ -128,10 +128,10 @@ extern "C" __global__ __launch_bounds__(256) void latent_attention_decompress_de
     const int ri = row_base + ty;
     const int o = col_base + tx;
     const int row = base + row0 + ri;
-    if (ri >= n_rows || o >= n_out || row < 0 || row >= cap) return;
+    if (ri >= n_rows || o >= n_out || row < 0 || row >= cap || row >= mcap) return;
     const int h = o / per;
     const int e = o % per;
     const uint16_t b = la_f32_to_bf16(acc);
-    if (e < nope) knope[((size_t)h * cap + row) * nope + e] = b;
-    else vmir[((size_t)h * cap + row) * v + (e - nope)] = b;
+    if (e < nope) knope[((size_t)h * mcap + row) * nope + e] = b;
+    else vmir[((size_t)h * mcap + row) * v + (e - nope)] = b;
 }
