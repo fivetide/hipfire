@@ -43,11 +43,13 @@ impl PrefillMode {
 
 /// Activation precision of batched qt44 projections (`HIPFIRE_RAON_PREFILL_PRECISION`,
 /// PLAN §3.6). `F16` (default) keeps FP16 activations at every qt44 GEMM;
-/// `A4` admits the shared symmetric IU4/A8 activation-quantized prefill
-/// routes, which are not bit-equivalent and stay opt-in pending review.
+/// `A8` admits only the int8-activation prefill GEMMs (gfx1201 `a8_prefill`,
+/// gfx11 `gfx11_a8_prefill`); `A4` admits the device's default symmetric
+/// IU4 route. Both are not bit-equivalent and stay opt-in pending review.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefillPrecision {
     F16,
+    A8,
     A4,
 }
 
@@ -57,9 +59,10 @@ impl PrefillPrecision {
             Err(_) => Ok(Self::F16),
             Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
                 "" | "f16" => Ok(Self::F16),
+                "a8" => Ok(Self::A8),
                 "a4" => Ok(Self::A4),
                 other => Err(format!(
-                    "HIPFIRE_RAON_PREFILL_PRECISION={other:?}: expected `f16` or `a4`"
+                    "HIPFIRE_RAON_PREFILL_PRECISION={other:?}: expected `f16`, `a8` or `a4`"
                 )),
             },
         }
@@ -67,15 +70,24 @@ impl PrefillPrecision {
 
     /// Resolve the policy onto the device's feature flags once, at load.
     /// `F16` turns off every activation-quantized prefill route for this
-    /// process's device; `A4` leaves the device defaults untouched.
+    /// process's device; `A8` turns IU4 off and int8 on; `A4` leaves the
+    /// device defaults untouched.
     fn apply(self, gpu: &mut Gpu) {
-        if self == Self::F16 {
-            let mut flags = (*gpu.flags).clone();
-            flags.iu4_prefill = Some(false);
-            flags.a8_prefill = false;
-            flags.gfx11_a8_prefill = false;
-            gpu.flags = std::sync::Arc::new(flags);
+        let mut flags = (*gpu.flags).clone();
+        match self {
+            Self::F16 => {
+                flags.iu4_prefill = Some(false);
+                flags.a8_prefill = false;
+                flags.gfx11_a8_prefill = false;
+            }
+            Self::A8 => {
+                flags.iu4_prefill = Some(false);
+                flags.a8_prefill = true;
+                flags.gfx11_a8_prefill = true;
+            }
+            Self::A4 => return,
         }
+        gpu.flags = std::sync::Arc::new(flags);
     }
 }
 
