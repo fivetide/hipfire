@@ -315,7 +315,7 @@ fn class_map_matches_plan_table() {
     use Storage::*;
     let cases: &[(&str, Storage)] = &[
         ("model.embed_tokens.weight", Q8F16),
-        ("lm_head.weight", Qt44),
+        ("lm_head.weight", Q8F16),
         ("model.norm.weight", Lossless),
         ("model.layers.3.moe.experts.127.gate_proj.weight", Qt44),
         ("model.layers.3.moe.experts.0.up_proj.weight", Qt44),
@@ -331,14 +331,14 @@ fn class_map_matches_plan_table() {
         ("model.layers.0.mlp.down_proj.weight", Qt44),
         ("model.layers.3.moe.gate.weight", F32),
         ("model.layers.3.moe.gate.e_score_correction_bias", F32),
-        ("model.layers.1.self_attn.q_proj.weight", Qt44),
-        ("model.layers.1.self_attn.k_proj.weight", Qt44),
-        ("model.layers.1.self_attn.v_proj.weight", Qt44),
-        ("model.layers.1.self_attn.g_proj.weight", Qt44),
-        ("model.layers.1.self_attn.o_proj.weight", Qt44),
-        ("model.layers.3.self_attn.q_a_proj.weight", Qt44),
-        ("model.layers.3.self_attn.kv_a_proj_with_mqa.weight", Qt44),
-        ("model.layers.3.self_attn.kv_b_proj.weight", Qt44),
+        ("model.layers.1.self_attn.q_proj.weight", Q8F16),
+        ("model.layers.1.self_attn.k_proj.weight", Q8F16),
+        ("model.layers.1.self_attn.v_proj.weight", Q8F16),
+        ("model.layers.1.self_attn.g_proj.weight", Q8F16),
+        ("model.layers.1.self_attn.o_proj.weight", Q8F16),
+        ("model.layers.3.self_attn.q_a_proj.weight", Q8F16),
+        ("model.layers.3.self_attn.kv_a_proj_with_mqa.weight", Q8F16),
+        ("model.layers.3.self_attn.kv_b_proj.weight", Q8F16),
         ("model.layers.3.self_attn.q_b_proj.weight", Q8F16),
         ("model.layers.1.self_attn.f_a_proj.weight", Q8F16),
         ("model.layers.1.self_attn.f_b_proj.weight", Q8F16),
@@ -826,7 +826,7 @@ fn end_to_end_synthetic_artifact_matches_class_table_and_is_reproducible() {
     let shape = |n: &str| by[n].shape.clone();
     let p = "model.layers.1.";
     assert_eq!(qt("model.embed_tokens.weight"), 3);
-    assert_eq!(qt("lm_head.weight"), 44);
+    assert_eq!(qt("lm_head.weight"), 3);
     assert_eq!(qt(&format!("{p}moe.experts.1.gate_proj.weight")), 44);
     assert_eq!(
         shape(&format!("{p}moe.experts.1.gate_proj.weight")),
@@ -846,11 +846,16 @@ fn end_to_end_synthetic_artifact_matches_class_table_and_is_reproducible() {
         vec![1088, 256]
     );
     assert_eq!(shape("model.layers.0.mlp.down_proj.weight"), vec![256, 512]);
-    assert_eq!(qt(&format!("{p}self_attn.q_proj.weight")), 44);
+    assert_eq!(qt(&format!("{p}self_attn.q_proj.weight")), 3);
     assert_eq!(qt(&format!("{p}self_attn.f_b_proj.weight")), 3);
     assert_eq!(qt(&format!("{p}self_attn.rda_w_proj.weight")), 3);
     assert_eq!(qt("model.layers.2.self_attn.q_b_proj.weight"), 3);
-    assert_eq!(qt("model.layers.2.self_attn.kv_b_proj.weight"), 44);
+    assert_eq!(qt("model.layers.2.self_attn.kv_b_proj.weight"), 3);
+    assert!(
+        !by.keys().any(|n| n.contains("self_attn") && n.ends_with(".awq_scale.weight")),
+        "no sidecars for Q8 attention tensors"
+    );
+    assert!(!by.contains_key("lm_head.awq_scale.weight"), "no sidecar for Q8 lm_head");
     assert_eq!(qt(&format!("{p}moe.gate.weight")), 2);
     assert_eq!(
         by[format!("{p}moe.gate.weight").as_str()].shape,
@@ -923,14 +928,14 @@ fn end_to_end_synthetic_artifact_matches_class_table_and_is_reproducible() {
 
     // Tampering with any symmetric header is caught by the readback pass.
     let mut bytes = std::fs::read(&out).unwrap();
-    let info = by["lm_head.weight"];
+    let info = by["model.layers.0.mlp.gate_proj.weight"];
     bytes[info.data_offset + 2] ^= 0x01;
     let tampered = dir.path().join("tampered.hfq");
     std::fs::write(&tampered, bytes).unwrap();
     let e = verify_artifact(&tampered, true).unwrap_err();
     // The runtime loader itself rejects a non-symmetric header on open.
     assert!(
-        e.contains("lm_head.weight") && e.contains("symmetric"),
+        e.contains("model.layers.0.mlp.gate_proj.weight") && e.contains("symmetric"),
         "{e}"
     );
 }
