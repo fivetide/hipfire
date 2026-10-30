@@ -28,12 +28,20 @@ pub enum OutRound {
     Bf16,
 }
 
-fn check(w: &WeightTensor, x: &GpuTensor, y: &GpuTensor, rows: usize, what: &str) -> Result<(), String> {
+fn check(
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    rows: usize,
+    what: &str,
+) -> Result<(), String> {
     if rows == 0 {
         return Err(format!("raon projection {what}: zero rows"));
     }
     if x.dtype != DType::F32 || y.dtype != DType::F32 {
-        return Err(format!("raon projection {what}: activations must be F32 planes"));
+        return Err(format!(
+            "raon projection {what}: activations must be F32 planes"
+        ));
     }
     let need_x = rows
         .checked_mul(w.k)
@@ -59,7 +67,12 @@ fn check(w: &WeightTensor, x: &GpuTensor, y: &GpuTensor, rows: usize, what: &str
 }
 
 /// Round `rows * width` contiguous F32 elements of `t` to BF16, in place.
-pub fn round_bf16_rows(gpu: &mut Gpu, t: &GpuTensor, rows: usize, width: usize) -> Result<(), String> {
+pub fn round_bf16_rows(
+    gpu: &mut Gpu,
+    t: &GpuTensor,
+    rows: usize,
+    width: usize,
+) -> Result<(), String> {
     gpu.bf16_round_trip_f32_strided(t, rows, 0, width, width)
         .map_err(|e| format!("raon bf16 round: {e:?}"))
 }

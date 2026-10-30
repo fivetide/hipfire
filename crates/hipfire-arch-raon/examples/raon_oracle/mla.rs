@@ -92,8 +92,13 @@ const LONG_WEIGHTS: &str = "weights_raon.safetensors";
 /// Decompress tile (rows per absolute-range launch) of the long cases.
 const LONG_TILE: usize = 1024;
 /// Raon-1-mini MLA geometry (matches the `weights_raon` manifest dims).
-const RAON_GEOMETRY: LatentGeometry =
-    LatentGeometry { n_heads: 40, nope: 128, tail: 64, v_dim: 128, latent: 512 };
+const RAON_GEOMETRY: LatentGeometry = LatentGeometry {
+    n_heads: 40,
+    nope: 128,
+    tail: 64,
+    v_dim: 128,
+    latent: 512,
+};
 
 // ── safetensors (F32 / BF16 / F16 → f32) ────────────────────────────────────
 
@@ -163,7 +168,9 @@ impl Tensors {
                 .iter()
                 .map(|v| v.as_u64().unwrap_or(0) as usize)
                 .collect();
-            let off = meta["data_offsets"].as_array().ok_or("data_offsets missing")?;
+            let off = meta["data_offsets"]
+                .as_array()
+                .ok_or("data_offsets missing")?;
             let (a, b) = (
                 off[0].as_u64().ok_or("offset")? as usize,
                 off[1].as_u64().ok_or("offset")? as usize,
@@ -206,7 +213,10 @@ impl Tensors {
             .get(name)
             .ok_or_else(|| format!("fixture tensor `{name}` missing"))?;
         if v.len() != expect {
-            return Err(format!("fixture tensor `{name}` has {} values, expected {expect}", v.len()));
+            return Err(format!(
+                "fixture tensor `{name}` has {} values, expected {expect}",
+                v.len()
+            ));
         }
         Ok(v)
     }
@@ -236,8 +246,16 @@ fn compare(name: &str, got: &[f32], want: &[f32]) -> Cmp {
         max_abs = max_abs.max(d.abs());
         max_ref = max_ref.max(w.abs());
     }
-    let rel = if den > 0.0 { (num / den).sqrt() } else { num.sqrt() };
-    let cos = if den > 0.0 && gg > 0.0 { dot / (den.sqrt() * gg.sqrt()) } else { 1.0 };
+    let rel = if den > 0.0 {
+        (num / den).sqrt()
+    } else {
+        num.sqrt()
+    };
+    let cos = if den > 0.0 && gg > 0.0 {
+        dot / (den.sqrt() * gg.sqrt())
+    } else {
+        1.0
+    };
     let tol = 2e-5 + BF16_MAX_ABS_FRAC * max_ref;
     let first = got
         .iter()
@@ -283,7 +301,10 @@ fn up_f32(gpu: &mut Gpu, v: &[f32], shape: &[usize]) -> Result<GpuTensor, String
 
 fn up_bf16(gpu: &mut Gpu, v: &[f32], shape: &[usize]) -> Result<GpuTensor, String> {
     let t = gpu.alloc_tensor(shape, DType::BF16).map_err(he)?;
-    let bytes: Vec<u8> = v.iter().flat_map(|f| f32_to_bf16(*f).to_le_bytes()).collect();
+    let bytes: Vec<u8> = v
+        .iter()
+        .flat_map(|f| f32_to_bf16(*f).to_le_bytes())
+        .collect();
     gpu.memcpy_htod_auto(&t.buf, &bytes).map_err(he)?;
     Ok(t)
 }
@@ -303,7 +324,8 @@ fn bytes_bf16(b: &[u8]) -> Vec<f32> {
 }
 
 fn set_pos(gpu: &mut Gpu, pos: &GpuTensor, p: usize) -> Result<(), String> {
-    gpu.memcpy_htod_auto(&pos.buf, &(p as i32).to_le_bytes()).map_err(he)
+    gpu.memcpy_htod_auto(&pos.buf, &(p as i32).to_le_bytes())
+        .map_err(he)
 }
 
 /// Token-major mirrors `knope[t][h][nope]`, `vmir[t][h][v]` → `[rows, H, nope+v]`
@@ -356,11 +378,25 @@ struct Routes {
 impl Routes {
     fn parse(opts: &BTreeMap<String, String>) -> Result<Self, String> {
         match opts.get("route").map(String::as_str).unwrap_or("all") {
-            "all" => Ok(Self { tiled: true, absorbed: true }),
-            "reference" => Ok(Self { tiled: false, absorbed: false }),
-            "tiled" => Ok(Self { tiled: true, absorbed: false }),
-            "absorbed" => Ok(Self { tiled: false, absorbed: true }),
-            other => Err(format!("--route `{other}`: expected reference|tiled|absorbed|all")),
+            "all" => Ok(Self {
+                tiled: true,
+                absorbed: true,
+            }),
+            "reference" => Ok(Self {
+                tiled: false,
+                absorbed: false,
+            }),
+            "tiled" => Ok(Self {
+                tiled: true,
+                absorbed: false,
+            }),
+            "absorbed" => Ok(Self {
+                tiled: false,
+                absorbed: true,
+            }),
+            other => Err(format!(
+                "--route `{other}`: expected reference|tiled|absorbed|all"
+            )),
         }
     }
 
@@ -395,7 +431,12 @@ impl RouteDev {
         routes: Routes,
         kv_b: &[f32],
     ) -> Result<Self, String> {
-        let mut me = Self { ws: None, packed: None, q_abs: None, z: None };
+        let mut me = Self {
+            ws: None,
+            packed: None,
+            q_abs: None,
+            z: None,
+        };
         if routes.tiled || routes.absorbed {
             let elems = latent_attention_decode_workspace_elems(g.n_heads, g.latent.max(g.v_dim));
             me.ws = Some(gpu.zeros(&[elems], DType::F32).map_err(he)?);
@@ -404,7 +445,11 @@ impl RouteDev {
             let (h, latent) = (g.n_heads, g.latent);
             let n_out = h * (g.nope + g.v_dim);
             if kv_b.len() != n_out * latent {
-                return Err(format!("absorbed pack: kv_b has {} values, expected {}", kv_b.len(), n_out * latent));
+                return Err(format!(
+                    "absorbed pack: kv_b has {} values, expected {}",
+                    kv_b.len(),
+                    n_out * latent
+                ));
             }
             // w_t row c = column c of the expansion weight W[n_out, latent].
             let mut wt = vec![0f32; latent * n_out];
@@ -421,14 +466,19 @@ impl RouteDev {
             gpu.hip.device_synchronize().map_err(he)?;
             gpu.free_tensor(d_wt).map_err(he)?;
             me.packed = Some(packed);
-            me.q_abs = Some(gpu.zeros(&[rows, h, latent + g.tail], DType::F32).map_err(he)?);
+            me.q_abs = Some(
+                gpu.zeros(&[rows, h, latent + g.tail], DType::F32)
+                    .map_err(he)?,
+            );
             me.z = Some(gpu.zeros(&[rows, h, latent], DType::F32).map_err(he)?);
         }
         Ok(me)
     }
 
     fn tiled(&self) -> AttentionRoute<'_> {
-        AttentionRoute::Tiled { workspace: self.ws.as_ref() }
+        AttentionRoute::Tiled {
+            workspace: self.ws.as_ref(),
+        }
     }
 
     fn absorbed(&self) -> Result<AttentionRoute<'_>, String> {
@@ -442,7 +492,10 @@ impl RouteDev {
     }
 
     fn free(self, gpu: &mut Gpu) {
-        for t in [self.ws, self.packed, self.q_abs, self.z].into_iter().flatten() {
+        for t in [self.ws, self.packed, self.q_abs, self.z]
+            .into_iter()
+            .flatten()
+        {
             let _ = gpu.free_tensor(t);
         }
     }
@@ -463,7 +516,16 @@ fn attn(
 ) -> Result<(), String> {
     execute_latent_attention(
         gpu,
-        &LatentAttentionOp::Attention { geometry: *g, cache, mirror, q, y, rows, scale, route },
+        &LatentAttentionOp::Attention {
+            geometry: *g,
+            cache,
+            mirror,
+            q,
+            y,
+            rows,
+            scale,
+            route,
+        },
     )
     .map_err(he)
 }
@@ -478,9 +540,14 @@ fn dim(dims: &Value, k: &str) -> Result<usize, String> {
 // ── one case ────────────────────────────────────────────────────────────────
 
 fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value, routes: Routes) -> Result<Value, String> {
-    let name = case["name"].as_str().ok_or("case name missing")?.to_string();
+    let name = case["name"]
+        .as_str()
+        .ok_or("case name missing")?
+        .to_string();
     if case.get("mode").and_then(Value::as_str).unwrap_or("bf16") != "bf16" {
-        return Err(format!("case {name}: only mode \"bf16\" is implemented for mla"));
+        return Err(format!(
+            "case {name}: only mode \"bf16\" is implemented for mla"
+        ));
     }
     let dims = case.get("dims").ok_or("case dims missing")?;
     let (n, p) = (dim(dims, "N")?, dim(dims, "P")?);
@@ -552,44 +619,109 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value, routes: Routes) -> Result<V
     let d_gated_t = gpu.zeros(&[n, h * v], DType::F32).map_err(he)?;
     let d_ya = gpu.zeros(&[n, h * v], DType::F32).map_err(he)?;
 
-    let cache = LatentCache { rows: &cache_t, capacity_rows: cap, pos: &pos, host_pos: Some(p) };
-    let mirror = ExpandedMirror { knope: &knope, vmir: &vmir, capacity_rows: mcap };
+    let cache = LatentCache {
+        rows: &cache_t,
+        capacity_rows: cap,
+        pos: &pos,
+        host_pos: Some(p),
+    };
+    let mirror = ExpandedMirror {
+        knope: &knope,
+        vmir: &vmir,
+        capacity_rows: mcap,
+    };
     let dense = KvExpansion::Dense { weight: &d_w };
     let run = |gpu: &mut Gpu, op: LatentAttentionOp<'_>| -> Result<(), String> {
         execute_latent_attention(gpu, &op).map_err(he)
     };
 
     // 1. q latent norm; 2. split into cache at device position P.
-    run(gpu, LatentAttentionOp::NormRows {
-        x: &d_qa, gamma: &d_qg, out: &d_qlat, rows: n, width: qlora, eps: 1e-6,
-    })?;
-    run(gpu, LatentAttentionOp::SplitKv {
-        geometry: g, cache, kv_a: &d_kva, gamma: &d_kg, rows: n, eps: 1e-6,
-    })?;
+    run(
+        gpu,
+        LatentAttentionOp::NormRows {
+            x: &d_qa,
+            gamma: &d_qg,
+            out: &d_qlat,
+            rows: n,
+            width: qlora,
+            eps: 1e-6,
+        },
+    )?;
+    run(
+        gpu,
+        LatentAttentionOp::SplitKv {
+            geometry: g,
+            cache,
+            kv_a: &d_kva,
+            gamma: &d_kg,
+            rows: n,
+            eps: 1e-6,
+        },
+    )?;
     // 3. schedule A: prefix rows in 37-row absolute tiles, new rows via device base.
     let mut s = 0;
     while s < p {
         let c = 37.min(p - s);
-        run(gpu, LatentAttentionOp::Decompress {
-            geometry: g, cache, mirror, expansion: dense, range: RowRange::Absolute { start: s, count: c },
-        })?;
+        run(
+            gpu,
+            LatentAttentionOp::Decompress {
+                geometry: g,
+                cache,
+                mirror,
+                expansion: dense,
+                range: RowRange::Absolute { start: s, count: c },
+            },
+        )?;
         s += c;
     }
-    run(gpu, LatentAttentionOp::Decompress {
-        geometry: g, cache, mirror, expansion: dense, range: RowRange::NewRows { count: n },
-    })?;
+    run(
+        gpu,
+        LatentAttentionOp::Decompress {
+            geometry: g,
+            cache,
+            mirror,
+            expansion: dense,
+            range: RowRange::NewRows { count: n },
+        },
+    )?;
     // 4. attention (twice, for byte determinism) and gate.
     for y in [&d_y, &d_y2] {
-        attn(gpu, &g, cache, Some(mirror), &d_q, y, n, scale, AttentionRoute::Reference)?;
+        attn(
+            gpu,
+            &g,
+            cache,
+            Some(mirror),
+            &d_q,
+            y,
+            n,
+            scale,
+            AttentionRoute::Reference,
+        )?;
     }
-    run(gpu, LatentAttentionOp::Gate { y: &d_y, g: &d_g, out: &d_gated, elements: n * h * v })?;
+    run(
+        gpu,
+        LatentAttentionOp::Gate {
+            y: &d_y,
+            g: &d_g,
+            out: &d_gated,
+            elements: n * h * v,
+        },
+    )?;
     // 4b. tiled (same mirror) and absorbed (no mirror) routes.
     let rd = RouteDev::new(gpu, &g, n, routes, &kv_b)?;
     if routes.tiled {
         for y in [&d_yt1, &d_yt2] {
             attn(gpu, &g, cache, Some(mirror), &d_q, y, n, scale, rd.tiled())?;
         }
-        run(gpu, LatentAttentionOp::Gate { y: &d_yt1, g: &d_g, out: &d_gated_t, elements: n * h * v })?;
+        run(
+            gpu,
+            LatentAttentionOp::Gate {
+                y: &d_yt1,
+                g: &d_g,
+                out: &d_gated_t,
+                elements: n * h * v,
+            },
+        )?;
     }
     if routes.absorbed {
         attn(gpu, &g, cache, None, &d_q, &d_ya, n, scale, rd.absorbed()?)?;
@@ -627,7 +759,11 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value, routes: Routes) -> Result<V
         .iter()
         .flat_map(|f| f32_to_bf16(*f).to_le_bytes())
         .collect();
-    checks.push(exact("cache_prefix_preserved", &cache_bytes[..p * width * 2], &prefix_expect));
+    checks.push(exact(
+        "cache_prefix_preserved",
+        &cache_bytes[..p * width * 2],
+        &prefix_expect,
+    ));
     // Tail channels of the new rows are the raw kv_a tail (never normalized).
     let new_tail: Vec<u8> = (0..n)
         .flat_map(|i| {
@@ -647,7 +783,11 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value, routes: Routes) -> Result<V
     let exp_a = expand_mirror(&k_a, &v_a, &g, total);
     checks.push(compare("kv_expanded", &exp_a, r_exp));
     checks.push(labeled(compare("attn_y", &y1, r_y), "reference", false));
-    checks.push(labeled(compare("gated", &gated, r_gated), "reference", false));
+    checks.push(labeled(
+        compare("gated", &gated, r_gated),
+        "reference",
+        false,
+    ));
     checks.push(labeled(
         exact("attn_y_repeat_bytewise", &f32_bytes(&y1), &f32_bytes(&y2)),
         "reference",
@@ -656,20 +796,36 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value, routes: Routes) -> Result<V
     if routes.tiled {
         checks.push(labeled(compare("attn_y_tiled", &yt1, r_y), "tiled", false));
         checks.push(labeled(
-            exact("attn_y_tiled_repeat_bytewise", &f32_bytes(&yt1), &f32_bytes(&yt2)),
+            exact(
+                "attn_y_tiled_repeat_bytewise",
+                &f32_bytes(&yt1),
+                &f32_bytes(&yt2),
+            ),
             "tiled",
             true,
         ));
-        checks.push(labeled(compare("gated_tiled", &gated_t, r_gated), "tiled", false));
+        checks.push(labeled(
+            compare("gated_tiled", &gated_t, r_gated),
+            "tiled",
+            false,
+        ));
     }
     if routes.absorbed {
         // The absorbed route computes the unrounded math (no intermediate BF16
         // K/V), so it is gated against the unrounded-f64 CPU reference; the
         // fixture's own BF16-K/V numbers are reported, non-gating.
         let wq: Vec<f32> = kv_b.iter().map(|f| bf16r(*f)).collect();
-        let data = LongData { cache: r_cache.to_vec(), q: q_proj.clone(), planted: Vec::new() };
+        let data = LongData {
+            cache: r_cache.to_vec(),
+            q: q_proj.clone(),
+            planted: Vec::new(),
+        };
         let exact_y = cpu_reference(&g, p, n, &data, &wq, true).y;
-        checks.push(labeled(compare("attn_y_absorbed", &ya, &exact_y), "absorbed", false));
+        checks.push(labeled(
+            compare("attn_y_absorbed", &ya, &exact_y),
+            "absorbed",
+            false,
+        ));
         checks.push(informational(labeled(
             compare("attn_y_absorbed_vs_fixture", &ya, r_y),
             "absorbed",
@@ -677,17 +833,34 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value, routes: Routes) -> Result<V
         )));
     }
     if routes.tiled && routes.absorbed {
-        checks.push(labeled(band_no_outlier(compare("absorbed_vs_tiled", &ya, &yt1)), "absorbed", false));
+        checks.push(labeled(
+            band_no_outlier(compare("absorbed_vs_tiled", &ya, &yt1)),
+            "absorbed",
+            false,
+        ));
     }
 
     // 5. schedule B: every live row in one absolute call, fresh mirrors.
     let kn_b = poison_bf16(gpu, &[mcap, h, g.nope])?;
     let vm_b = poison_bf16(gpu, &[mcap, h, v])?;
-    let mirror_b = ExpandedMirror { knope: &kn_b, vmir: &vm_b, capacity_rows: mcap };
-    run(gpu, LatentAttentionOp::Decompress {
-        geometry: g, cache, mirror: mirror_b, expansion: dense,
-        range: RowRange::Absolute { start: 0, count: total },
-    })?;
+    let mirror_b = ExpandedMirror {
+        knope: &kn_b,
+        vmir: &vm_b,
+        capacity_rows: mcap,
+    };
+    run(
+        gpu,
+        LatentAttentionOp::Decompress {
+            geometry: g,
+            cache,
+            mirror: mirror_b,
+            expansion: dense,
+            range: RowRange::Absolute {
+                start: 0,
+                count: total,
+            },
+        },
+    )?;
     gpu.hip.device_synchronize().map_err(he)?;
     let k_b = gpu.download_raw_bytes(&kn_b).map_err(he)?;
     let v_b = gpu.download_raw_bytes(&vm_b).map_err(he)?;
@@ -705,9 +878,18 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value, routes: Routes) -> Result<V
     // 6. gather -> external projector (host, ascending-k fma) -> scatter.
     if total <= EXTERNAL_ROW_LIMIT {
         let plane = gpu.zeros(&[total, g.latent], DType::F32).map_err(he)?;
-        run(gpu, LatentAttentionOp::GatherLatent {
-            geometry: g, cache, range: RowRange::Absolute { start: 0, count: total }, out: &plane,
-        })?;
+        run(
+            gpu,
+            LatentAttentionOp::GatherLatent {
+                geometry: g,
+                cache,
+                range: RowRange::Absolute {
+                    start: 0,
+                    count: total,
+                },
+                out: &plane,
+            },
+        )?;
         gpu.hip.device_synchronize().map_err(he)?;
         let lat = gpu.download_f32(&plane).map_err(he)?;
         let wq: Vec<f32> = kv_b.iter().map(|f| bf16_to_f32(f32_to_bf16(*f))).collect();
@@ -724,12 +906,24 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value, routes: Routes) -> Result<V
         let d_proj = up_f32(gpu, &proj, &[total, h * per])?;
         let kn_c = poison_bf16(gpu, &[mcap, h, g.nope])?;
         let vm_c = poison_bf16(gpu, &[mcap, h, v])?;
-        let mirror_c = ExpandedMirror { knope: &kn_c, vmir: &vm_c, capacity_rows: mcap };
-        run(gpu, LatentAttentionOp::Decompress {
-            geometry: g, cache, mirror: mirror_c,
-            expansion: KvExpansion::External { projected: &d_proj },
-            range: RowRange::Absolute { start: 0, count: total },
-        })?;
+        let mirror_c = ExpandedMirror {
+            knope: &kn_c,
+            vmir: &vm_c,
+            capacity_rows: mcap,
+        };
+        run(
+            gpu,
+            LatentAttentionOp::Decompress {
+                geometry: g,
+                cache,
+                mirror: mirror_c,
+                expansion: KvExpansion::External { projected: &d_proj },
+                range: RowRange::Absolute {
+                    start: 0,
+                    count: total,
+                },
+            },
+        )?;
         gpu.hip.device_synchronize().map_err(he)?;
         let k_c = gpu.download_raw_bytes(&kn_c).map_err(he)?;
         let v_c = gpu.download_raw_bytes(&vm_c).map_err(he)?;
@@ -774,7 +968,14 @@ struct Rng {
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        Self { s: if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed }, spare: None }
+        Self {
+            s: if seed == 0 {
+                0x9E37_79B9_7F4A_7C15
+            } else {
+                seed
+            },
+            spare: None,
+        }
     }
 
     fn next_u64(&mut self) -> u64 {
@@ -851,7 +1052,10 @@ fn gen_long(g: &LatentGeometry, p: usize, n: usize) -> LongData {
 }
 
 fn worker_count() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(64)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(64)
 }
 
 /// Report a check but keep it out of the case verdict (`"gating": false`); its
@@ -965,7 +1169,13 @@ fn expand_rows_body(x: &Expand<'_>, head: usize, r0: usize, kout: &mut [f32], vo
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "fma")]
-unsafe fn expand_rows_fma(x: &Expand<'_>, head: usize, r0: usize, kout: &mut [f32], vout: &mut [f32]) {
+unsafe fn expand_rows_fma(
+    x: &Expand<'_>,
+    head: usize,
+    r0: usize,
+    kout: &mut [f32],
+    vout: &mut [f32],
+) {
     expand_rows_body(x, head, r0, kout, vout)
 }
 
@@ -996,7 +1206,11 @@ fn cpu_expand(x: &Expand<'_>, total: usize) -> (Vec<f32>, Vec<f32>) {
         .zip(vexp.chunks_mut(total * g.v_dim))
         .enumerate()
     {
-        for (b, (kb, vb)) in kh.chunks_mut(RB * g.nope).zip(vh.chunks_mut(RB * g.v_dim)).enumerate() {
+        for (b, (kb, vb)) in kh
+            .chunks_mut(RB * g.nope)
+            .zip(vh.chunks_mut(RB * g.v_dim))
+            .enumerate()
+        {
             tasks.push((hh, b * RB, kb, vb));
         }
     }
@@ -1043,10 +1257,25 @@ fn cpu_reference(
     wq: &[f32],
     exact: bool,
 ) -> CpuRef {
-    let (h, nope, tail, v, latent, width, dqk) =
-        (g.n_heads, g.nope, g.tail, g.v_dim, g.latent, g.row_width(), g.qk_dim());
+    let (h, nope, tail, v, latent, width, dqk) = (
+        g.n_heads,
+        g.nope,
+        g.tail,
+        g.v_dim,
+        g.latent,
+        g.row_width(),
+        g.qk_dim(),
+    );
     let total = p + n;
-    let (kexp, vexp) = cpu_expand(&Expand { g, cache: &d.cache, wq, round_kv: !exact }, total);
+    let (kexp, vexp) = cpu_expand(
+        &Expand {
+            g,
+            cache: &d.cache,
+            wq,
+            round_kv: !exact,
+        },
+        total,
+    );
     let scale = (dqk as f64).powf(-0.5);
     let tasks_n = n * h;
     let next = AtomicUsize::new(0);
@@ -1099,7 +1328,11 @@ fn cpu_reference(
                         .iter()
                         .map(|a| {
                             let y = (a / sum) as f32;
-                            if exact { y } else { bf16r(y) }
+                            if exact {
+                                y
+                            } else {
+                                bf16r(y)
+                            }
                         })
                         .collect();
                     let planted_mass = d
@@ -1153,7 +1386,8 @@ fn long_weights<'a>(dir: &Path, slot: &'a mut Option<Vec<f32>>) -> Result<&'a [f
         let kv_b = t.get("kv_b", g.expanded_width() * g.latent)?;
         *slot = Some(kv_b.iter().map(|f| bf16r(*f)).collect());
     }
-    slot.as_deref().ok_or_else(|| "long-case weights missing".to_string())
+    slot.as_deref()
+        .ok_or_else(|| "long-case weights missing".to_string())
 }
 
 fn run_long_case(
@@ -1179,7 +1413,10 @@ fn run_long_case(
     let cpu_exact = routes
         .absorbed
         .then(|| cpu_reference(&g, p, n, &data, kv_b, true));
-    eprintln!("mla {name}: CPU reference done in {:.1}s", t0.elapsed().as_secs_f64());
+    eprintln!(
+        "mla {name}: CPU reference done in {:.1}s",
+        t0.elapsed().as_secs_f64()
+    );
 
     // Device state: poisoned cache/mirrors; all P+N rows uploaded directly.
     let cache_t = poison_bf16(gpu, &[cap, width])?;
@@ -1203,9 +1440,17 @@ fn run_long_case(
     let rd = RouteDev::new(gpu, &g, n, routes, kv_b)?;
 
     let outcome = (|| -> Result<Vec<Cmp>, String> {
-        let cache =
-            LatentCache { rows: &cache_t, capacity_rows: cap, pos: &pos, host_pos: Some(p) };
-        let mirror = ExpandedMirror { knope: &knope, vmir: &vmir, capacity_rows: mcap };
+        let cache = LatentCache {
+            rows: &cache_t,
+            capacity_rows: cap,
+            pos: &pos,
+            host_pos: Some(p),
+        };
+        let mirror = ExpandedMirror {
+            knope: &knope,
+            vmir: &vmir,
+            capacity_rows: mcap,
+        };
         let dense = KvExpansion::Dense { weight: &d_w };
         // Production Decompress over absolute row tiles (all P+N rows).
         let mut s = 0;
@@ -1224,7 +1469,17 @@ fn run_long_case(
             .map_err(he)?;
             s += c;
         }
-        attn(gpu, &g, cache, Some(mirror), &d_q, &d_yr, n, scale, AttentionRoute::Reference)?;
+        attn(
+            gpu,
+            &g,
+            cache,
+            Some(mirror),
+            &d_q,
+            &d_yr,
+            n,
+            scale,
+            AttentionRoute::Reference,
+        )?;
         if routes.tiled {
             for y in [&d_yt1, &d_yt2] {
                 attn(gpu, &g, cache, Some(mirror), &d_q, y, n, scale, rd.tiled())?;
@@ -1256,37 +1511,63 @@ fn run_long_case(
             "cpu",
             false,
         ));
-        checks.push(lab(compare("attn_y_reference_vs_cpu", &yr, &cpu.y), "reference", false));
+        checks.push(lab(
+            compare("attn_y_reference_vs_cpu", &yr, &cpu.y),
+            "reference",
+            false,
+        ));
         let mut yt1 = Vec::new();
         if routes.tiled {
             yt1 = gpu.download_f32(&d_yt1).map_err(he)?;
             let yt2 = gpu.download_f32(&d_yt2).map_err(he)?;
-            checks.push(lab(compare("attn_y_tiled_vs_cpu", &yt1, &cpu.y), "tiled", false));
             checks.push(lab(
-                exact("attn_y_tiled_repeat_bytewise", &f32_bytes(&yt1), &f32_bytes(&yt2)),
+                compare("attn_y_tiled_vs_cpu", &yt1, &cpu.y),
+                "tiled",
+                false,
+            ));
+            checks.push(lab(
+                exact(
+                    "attn_y_tiled_repeat_bytewise",
+                    &f32_bytes(&yt1),
+                    &f32_bytes(&yt2),
+                ),
                 "tiled",
                 true,
             ));
-            checks.push(lab(compare("reference_vs_tiled", &yt1, &yr), "tiled", false));
+            checks.push(lab(
+                compare("reference_vs_tiled", &yt1, &yr),
+                "tiled",
+                false,
+            ));
         }
         if routes.absorbed {
             let ya = gpu.download_f32(&d_ya).map_err(he)?;
             let exact_y = cpu_exact.as_ref().map(|c| &c.y[..]).unwrap_or(&[]);
-            checks.push(lab(compare("attn_y_absorbed_vs_cpu", &ya, exact_y), "absorbed", false));
+            checks.push(lab(
+                compare("attn_y_absorbed_vs_cpu", &ya, exact_y),
+                "absorbed",
+                false,
+            ));
             checks.push(informational(lab(
                 compare("attn_y_absorbed_vs_cpu_bf16kv", &ya, &cpu.y),
                 "absorbed",
                 false,
             )));
             if routes.tiled {
-                checks.push(lab(band_no_outlier(compare("absorbed_vs_tiled", &ya, &yt1)), "absorbed", false));
+                checks.push(lab(
+                    band_no_outlier(compare("absorbed_vs_tiled", &ya, &yt1)),
+                    "absorbed",
+                    false,
+                ));
             }
         }
         Ok(checks)
     })();
 
     rd.free(gpu);
-    for t in [cache_t, knope, vmir, pos, d_q, d_w, d_yr, d_yt1, d_yt2, d_ya] {
+    for t in [
+        cache_t, knope, vmir, pos, d_q, d_w, d_yr, d_yt1, d_yt2, d_ya,
+    ] {
         let _ = gpu.free_tensor(t);
     }
     let checks = outcome?;
@@ -1336,7 +1617,9 @@ pub fn run(fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, St
             .map_err(|e| format!("{}: {e}", dir.join("manifest.json").display()))?,
     )
     .map_err(|e| format!("mla manifest.json: {e}"))?;
-    let cases = manifest["cases"].as_array().ok_or("manifest.cases missing")?;
+    let cases = manifest["cases"]
+        .as_array()
+        .ok_or("manifest.cases missing")?;
     if cases.is_empty() {
         return Err("mla manifest has no cases".into());
     }

@@ -12,8 +12,8 @@
 
 use std::time::Instant;
 
-use rdna_compute::latent_attention_flash::LATENT_ATTENTION_FLASH_SRC;
 use rdna_compute::latent_attention_absorb::latent_attention_absorb_packed_elems;
+use rdna_compute::latent_attention_flash::LATENT_ATTENTION_FLASH_SRC;
 use rdna_compute::latent_attention_tiled::{LatentRows, TiledAttention};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -30,13 +30,18 @@ fn fill_bf16(gpu: &mut Gpu, n: usize, seed: u64, amp: f32) -> GpuTensor {
         })
         .collect();
     gpu.hip
-        .memcpy_htod(&t.buf, unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) })
+        .memcpy_htod(&t.buf, unsafe {
+            std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2)
+        })
         .expect("htod");
     t
 }
 
 fn fill_f32(gpu: &mut Gpu, n: usize, amp: f32) -> GpuTensor {
-    let v: Vec<f32> = (0..n).map(|i| (((i * 2654435761usize) >> 7) % 2001) as f32 / 1000.0 - 1.0).map(|f| f * amp).collect();
+    let v: Vec<f32> = (0..n)
+        .map(|i| (((i * 2654435761usize) >> 7) % 2001) as f32 / 1000.0 - 1.0)
+        .map(|f| f * amp)
+        .collect();
     gpu.upload_f32(&v, &[n]).expect("upload")
 }
 
@@ -52,7 +57,10 @@ fn time<F: FnMut(&mut Gpu)>(gpu: &mut Gpu, iters: usize, mut f: F) -> f64 {
 }
 
 fn main() {
-    let a: Vec<usize> = std::env::args().skip(1).map(|s| s.parse().expect("number")).collect();
+    let a: Vec<usize> = std::env::args()
+        .skip(1)
+        .map(|s| s.parse().expect("number"))
+        .collect();
     let rows = a.first().copied().unwrap_or(512);
     let pos = a.get(1).copied().unwrap_or(12000);
     let heads = a.get(2).copied().unwrap_or(40);
@@ -67,19 +75,46 @@ fn main() {
     let vmir = fill_bf16(&mut gpu, total * heads * v, 13, 1.0);
     let q = fill_f32(&mut gpu, rows * heads * (nope + tail), 3.0);
     let y = gpu.zeros(&[rows * heads * v], DType::F32).expect("y");
-    let q_abs = gpu.zeros(&[rows * heads * width], DType::F32).expect("q_abs");
+    let q_abs = gpu
+        .zeros(&[rows * heads * width], DType::F32)
+        .expect("q_abs");
     let z = gpu.zeros(&[rows * heads * latent], DType::F32).expect("z");
-    let packed = fill_bf16(&mut gpu, latent_attention_absorb_packed_elems(heads, nope, v, latent), 14, 0.05);
+    let packed = fill_bf16(
+        &mut gpu,
+        latent_attention_absorb_packed_elems(heads, nope, v, latent),
+        14,
+        0.05,
+    );
     let posb = gpu.alloc_tensor(&[1], DType::F32).expect("pos");
-    gpu.hip.memcpy_htod(&posb.buf, &(pos as i32).to_le_bytes()).expect("pos");
+    gpu.hip
+        .memcpy_htod(&posb.buf, &(pos as i32).to_le_bytes())
+        .expect("pos");
     let scale = (192f32).powf(-0.5);
 
     let dec = TiledAttention {
         q: &q,
         y: &y,
-        k_a: LatentRows { buf: &knope, offset: 0, tok_stride: heads * nope, head_stride: nope, width: nope },
-        k_b: LatentRows { buf: &cache, offset: latent, tok_stride: width, head_stride: 0, width: tail },
-        v: LatentRows { buf: &vmir, offset: 0, tok_stride: heads * v, head_stride: v, width: v },
+        k_a: LatentRows {
+            buf: &knope,
+            offset: 0,
+            tok_stride: heads * nope,
+            head_stride: nope,
+            width: nope,
+        },
+        k_b: LatentRows {
+            buf: &cache,
+            offset: latent,
+            tok_stride: width,
+            head_stride: 0,
+            width: tail,
+        },
+        v: LatentRows {
+            buf: &vmir,
+            offset: 0,
+            tok_stride: heads * v,
+            head_stride: v,
+            width: v,
+        },
         pos: &posb,
         pos_offset: 0,
         n_rows: rows,
@@ -91,9 +126,27 @@ fn main() {
     let abs = TiledAttention {
         q: &q_abs,
         y: &z,
-        k_a: LatentRows { buf: &cache, offset: 0, tok_stride: width, head_stride: 0, width: latent },
-        k_b: LatentRows { buf: &cache, offset: latent, tok_stride: width, head_stride: 0, width: tail },
-        v: LatentRows { buf: &cache, offset: 0, tok_stride: width, head_stride: 0, width: latent },
+        k_a: LatentRows {
+            buf: &cache,
+            offset: 0,
+            tok_stride: width,
+            head_stride: 0,
+            width: latent,
+        },
+        k_b: LatentRows {
+            buf: &cache,
+            offset: latent,
+            tok_stride: width,
+            head_stride: 0,
+            width: tail,
+        },
+        v: LatentRows {
+            buf: &cache,
+            offset: 0,
+            tok_stride: width,
+            head_stride: 0,
+            width: latent,
+        },
         pos: &posb,
         pos_offset: 0,
         n_rows: rows,
@@ -104,14 +157,21 @@ fn main() {
     };
 
     let avg_keys = pos as f64 + rows as f64 / 2.0;
-    let flop = |dq: usize, dv: usize| rows as f64 * avg_keys * heads as f64 * (dq + dv) as f64 * 2.0;
-    let t_dec = time(&mut gpu, iters, |g| g.latent_attention_flash_prefill(&dec).expect("flash dec"));
-    let t_q = time(&mut gpu, iters, |g| {
-        g.latent_attention_absorb_q(&q, &packed, &q_abs, rows, heads, nope, tail, v, latent).expect("absorb_q")
+    let flop =
+        |dq: usize, dv: usize| rows as f64 * avg_keys * heads as f64 * (dq + dv) as f64 * 2.0;
+    let t_dec = time(&mut gpu, iters, |g| {
+        g.latent_attention_flash_prefill(&dec).expect("flash dec")
     });
-    let t_abs = time(&mut gpu, iters, |g| g.latent_attention_flash_prefill(&abs).expect("flash abs"));
+    let t_q = time(&mut gpu, iters, |g| {
+        g.latent_attention_absorb_q(&q, &packed, &q_abs, rows, heads, nope, tail, v, latent)
+            .expect("absorb_q")
+    });
+    let t_abs = time(&mut gpu, iters, |g| {
+        g.latent_attention_flash_prefill(&abs).expect("flash abs")
+    });
     let t_v = time(&mut gpu, iters, |g| {
-        g.latent_attention_absorb_v(&z, &packed, &y, rows, heads, nope, v, latent, true).expect("absorb_v")
+        g.latent_attention_absorb_v(&z, &packed, &y, rows, heads, nope, v, latent, true)
+            .expect("absorb_v")
     });
     // Optional kernel-source variants for tuning: LAW_DEFS="LAW_VPF=2,LAW_VPF=8" (comma list of
     // `-D`-style definitions, each timed on the absorbed shape).
@@ -125,7 +185,8 @@ fn main() {
             );
             let module = format!("latent_attention_flash_var{vi}");
             let t = time(&mut gpu, iters, |g| {
-                g.latent_attention_flash_prefill_with_source(&abs, &module, &func, &src).expect("variant")
+                g.latent_attention_flash_prefill_with_source(&abs, &module, &func, &src)
+                    .expect("variant")
             });
             variants.push((def.to_string(), t));
         }
@@ -134,9 +195,19 @@ fn main() {
     for (d, t) in &variants {
         println!("variant {d:<24}: {t:8.3} ms");
     }
-    println!("decompressed flash : {t_dec:8.3} ms  {:6.1} TFLOP/s (nominal 192/128)", flop(192, 128) / t_dec / 1e9);
+    println!(
+        "decompressed flash : {t_dec:8.3} ms  {:6.1} TFLOP/s (nominal 192/128)",
+        flop(192, 128) / t_dec / 1e9
+    );
     println!("absorb_q           : {t_q:8.3} ms");
-    println!("absorbed flash     : {t_abs:8.3} ms  {:6.1} TFLOP/s (nominal 576/512)", flop(576, 512) / t_abs / 1e9);
+    println!(
+        "absorbed flash     : {t_abs:8.3} ms  {:6.1} TFLOP/s (nominal 576/512)",
+        flop(576, 512) / t_abs / 1e9
+    );
     println!("absorb_v           : {t_v:8.3} ms");
-    println!("absorbed total     : {:8.3} ms  ({:.2}x decompressed)", t_q + t_abs + t_v, (t_q + t_abs + t_v) / t_dec);
+    println!(
+        "absorbed total     : {:8.3} ms  ({:.2}x decompressed)",
+        t_q + t_abs + t_v,
+        (t_q + t_abs + t_v) / t_dec
+    );
 }

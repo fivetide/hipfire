@@ -95,7 +95,7 @@ pub(crate) fn is_routed_expert_weight(name: &str) -> bool {
 /// `lm_head.weight` storage: Q8F16 by default; `HIPFIRE_RAON_LM_HEAD=qt44`
 /// keeps the symmetric qt44 head (smaller artifact).
 pub(crate) fn lm_head_storage() -> Storage {
-    match std::env::var("HIPFIRE_RAON_LM_HEAD").as_deref() {
+    match hipfire_config::developer_var("HIPFIRE_RAON_LM_HEAD").as_deref() {
         Ok("qt44") => Storage::Qt44,
         _ => Storage::Q8F16,
     }

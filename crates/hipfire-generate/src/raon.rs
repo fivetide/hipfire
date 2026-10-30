@@ -33,7 +33,7 @@ use hipfire_runtime::prompt_frame::{AssistantPrefix, JinjaChatFrame, Message, Ro
 use hipfire_runtime::tokenizer::Tokenizer;
 use std::io::Write;
 
-use crate::ar::{GenerationRoute, generate_ar_with_forward};
+use crate::ar::{generate_ar_with_forward, GenerationRoute};
 use hipfire_engine::emit::render_assistant_prefix;
 
 /// Request sampling knobs exactly as `generate` received them.
@@ -241,7 +241,12 @@ pub fn generate_raon(
         }
     };
     if prompt_tokens.is_empty() {
-        raon_error(stdout, id, "raon prompt rendered to zero tokens", "validation");
+        raon_error(
+            stdout,
+            id,
+            "raon prompt rendered to zero tokens",
+            "validation",
+        );
         return;
     }
     // One decode forward per committed token, including the last: +1 trailer.
@@ -361,7 +366,10 @@ mod tests {
         include_str!("../../hipfire-runtime/tests/fixtures/raon_tokenizer/chat_template.jinja");
 
     fn byte_char(b: u8) -> char {
-        let mut bs: Vec<u32> = (0x21..=0x7E).chain(0xA1..=0xAC).chain(0xAE..=0xFF).collect();
+        let mut bs: Vec<u32> = (0x21..=0x7E)
+            .chain(0xA1..=0xAC)
+            .chain(0xAE..=0xFF)
+            .collect();
         let mut cs = bs.clone();
         let mut n = 0;
         for b in 0u32..256 {
@@ -449,7 +457,8 @@ mod tests {
             GenerationRoute::RaonAr
         );
         // A speculator, greedy temp or sampling penalties never change the route.
-        for (has_speculator, temp, pen) in [(true, 0.0, false), (false, 0.0, true), (true, 1.0, true)]
+        for (has_speculator, temp, pen) in
+            [(true, 0.0, false), (false, 0.0, true), (true, 1.0, true)]
         {
             let i = GenerationRouteInputs {
                 has_speculator,
@@ -468,21 +477,29 @@ mod tests {
         assert_eq!(adapter.route, GenerationRoute::RaonAr);
         // No other arch lands on the Raon route.
         for arch in [0, 5, 6, 9, 11, 15, 16, 17, 18, 20] {
-            assert_ne!(select_generation_route(&inputs(arch)), GenerationRoute::RaonAr);
+            assert_ne!(
+                select_generation_route(&inputs(arch)),
+                GenerationRoute::RaonAr
+            );
         }
     }
 
     #[test]
     fn raon_thinking_on_prefix_opens_think_and_off_is_closed_visible() {
         let on = render(true, None);
-        assert!(on.text.ends_with("<|im_start|>assistant\n<think>\n"), "{:?}", on.text);
+        assert!(
+            on.text.ends_with("<|im_start|>assistant\n<think>\n"),
+            "{:?}",
+            on.text
+        );
         assert!(on.started_in_think);
         assert_eq!(on.text.matches("<think>").count(), 1, "no second opener");
         assert!(!on.tokens.is_empty());
 
         let off = render(false, None);
         assert!(
-            off.text.ends_with("<|im_start|>assistant\n<think></think>\n\n"),
+            off.text
+                .ends_with("<|im_start|>assistant\n<think></think>\n\n"),
             "{:?}",
             off.text
         );
@@ -502,11 +519,27 @@ mod tests {
             },
             message(Role::User, "thanks"),
         ];
-        let off = render_raon_prompt(&tokenizer(), TEMPLATE, None, "thanks", Some(&history), None, false)
-            .unwrap();
+        let off = render_raon_prompt(
+            &tokenizer(),
+            TEMPLATE,
+            None,
+            "thanks",
+            Some(&history),
+            None,
+            false,
+        )
+        .unwrap();
         assert!(!off.started_in_think);
-        let on = render_raon_prompt(&tokenizer(), TEMPLATE, None, "thanks", Some(&history), None, true)
-            .unwrap();
+        let on = render_raon_prompt(
+            &tokenizer(),
+            TEMPLATE,
+            None,
+            "thanks",
+            Some(&history),
+            None,
+            true,
+        )
+        .unwrap();
         assert!(on.started_in_think);
     }
 
@@ -548,10 +581,18 @@ mod tests {
         let r = g.resolve(&d, 256);
         assert_eq!((r.top_k, r.presence_penalty), (None, 0.0));
         // Explicit controls win, including an explicit presence of 0.
-        let e = RaonSampling { user_explicit: true, top_k: Some(40), ..base };
+        let e = RaonSampling {
+            user_explicit: true,
+            top_k: Some(40),
+            ..base
+        };
         let r = e.resolve(&d, 256);
         assert_eq!((r.top_k, r.presence_penalty), (Some(40), 0.0));
-        let e = RaonSampling { user_explicit: true, presence_penalty: 0.5, ..base };
+        let e = RaonSampling {
+            user_explicit: true,
+            presence_penalty: 0.5,
+            ..base
+        };
         assert_eq!(e.resolve(&d, 256).presence_penalty, 0.5);
     }
 
@@ -577,7 +618,10 @@ mod tests {
         );
         let mut gen_only = base.clone();
         let t_gen = sample_cpu(&mut gen_only, &generated, &cfg);
-        assert_eq!(t_prompt, 3, "prompt token 7 penalized when prompt is in history");
+        assert_eq!(
+            t_prompt, 3,
+            "prompt token 7 penalized when prompt is in history"
+        );
         assert_eq!(gen_only[7], 1.9, "prompt-only token untouched");
         assert_eq!(gen_only[3], 0.5, "generated token penalized by presence");
         assert_eq!(t_gen, 7);
@@ -679,15 +723,14 @@ mod tests {
             assert_eq!(first["attempt_id"], 93_001);
             assert_eq!(first["started_in_think"], started_in_think);
             assert_eq!(
-                run.events.iter().filter(|e| e["type"] == "gen_start").count(),
+                run.events
+                    .iter()
+                    .filter(|e| e["type"] == "gen_start")
+                    .count(),
                 1
             );
             // Nothing precedes gen_start; exactly one correlated terminal.
-            let terminals: Vec<_> = run
-                .events
-                .iter()
-                .filter(|e| e["type"] == "done")
-                .collect();
+            let terminals: Vec<_> = run.events.iter().filter(|e| e["type"] == "done").collect();
             assert_eq!(terminals.len(), 1, "{:?}", run.events);
             assert_eq!(terminals[0]["attempt_id"], 93_001);
             assert_eq!(run.events.last().unwrap()["type"], "done");
@@ -733,7 +776,11 @@ mod tests {
             &["still thinking <tool_call> not a call", " and more"],
             true,
         );
-        assert!(cut.events.iter().all(|e| e["type"] != "token"), "{:?}", cut.events);
+        assert!(
+            cut.events.iter().all(|e| e["type"] != "token"),
+            "{:?}",
+            cut.events
+        );
         assert!(cut.events.iter().any(|e| e["type"] == "reasoning"));
         assert_eq!(cut.finish_reason, "length");
         assert!(cut.calls.is_empty());
@@ -832,9 +879,17 @@ mod tests {
     /// advertise the matching contract and no Qwen DFlash/batch capability.
     #[test]
     fn raon_carrier_caps_match_the_route_producer() {
-        assert_eq!(crate::common::gen_start_contract_version_for_arch(19), Some(2));
-        let caps = hipfire_loader::carrier_for(19).expect("raon carrier").caps();
-        assert!(!caps.is_qwen_dflash(), "arch 19 must never look like Qwen DFlash");
+        assert_eq!(
+            crate::common::gen_start_contract_version_for_arch(19),
+            Some(2)
+        );
+        let caps = hipfire_loader::carrier_for(19)
+            .expect("raon carrier")
+            .caps();
+        assert!(
+            !caps.is_qwen_dflash(),
+            "arch 19 must never look like Qwen DFlash"
+        );
         assert!(!caps.supports_continuous_batch);
     }
 }

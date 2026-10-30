@@ -132,8 +132,18 @@ impl Gpu {
         need(p.query, "query", n, p.q_row_stride, hq * d)?;
         need(p.key, "key", n, p.k_row_stride, hq * d)?;
         need(p.value, "value", n, p.v_row_stride, p.n_heads * d)?;
-        let decay_extent = if p.decay_per_key { p.n_heads * d } else { p.n_heads };
-        need(p.log_decay, "log_decay", n, p.decay_row_stride, decay_extent)?;
+        let decay_extent = if p.decay_per_key {
+            p.n_heads * d
+        } else {
+            p.n_heads
+        };
+        need(
+            p.log_decay,
+            "log_decay",
+            n,
+            p.decay_row_stride,
+            decay_extent,
+        )?;
         need(p.beta, "beta", n, p.beta_row_stride, p.n_heads)?;
         need(p.output, "output", n, p.out_row_stride, p.n_heads * d)?;
         let slots_needed = if p.slot_idx.is_some() { 1 } else { p.slot + 1 };
@@ -305,8 +315,20 @@ impl Gpu {
             g.w_ch_stride,
             (g.ksize - 1) * g.w_tap_stride + 1,
         )?;
-        need(hist_in, "conv hist_in", km1, g.hist_tap_stride, g.n_channels)?;
-        need(hist_out, "conv hist_out", km1, g.hist_tap_stride, g.n_channels)?;
+        need(
+            hist_in,
+            "conv hist_in",
+            km1,
+            g.hist_tap_stride,
+            g.n_channels,
+        )?;
+        need(
+            hist_out,
+            "conv hist_out",
+            km1,
+            g.hist_tap_stride,
+            g.n_channels,
+        )?;
 
         self.bind_thread()?;
         self.ensure_kernel(
@@ -320,7 +342,11 @@ impl Gpu {
         let hip_ = hist_in.buf.as_ptr();
         let hop = hist_out.buf.as_ptr();
         let in_place = hip_ == hop;
-        let rows_per_chunk = if in_place { g.n_rows } else { CONV_ROWS_PER_CHUNK };
+        let rows_per_chunk = if in_place {
+            g.n_rows
+        } else {
+            CONV_ROWS_PER_CHUNK
+        };
         let chunks = (g.n_rows + rows_per_chunk - 1) / rows_per_chunk;
         let n_rows = i32_of(g.n_rows, "n_rows")?;
         let n_ch = i32_of(g.n_channels, "n_channels")?;
@@ -352,7 +378,11 @@ impl Gpu {
             &round as *const _ as *mut c_void,
         ];
         let block = 128u32;
-        let grid = [((g.n_channels as u32) + block - 1) / block, chunks as u32, 1];
+        let grid = [
+            ((g.n_channels as u32) + block - 1) / block,
+            chunks as u32,
+            1,
+        ];
         let bytes = g.n_rows * g.n_channels * 4 * 2;
         let timer = profile::begin_timer(
             &self.hip,
@@ -457,12 +487,8 @@ impl Gpu {
             &round as *const _ as *mut c_void,
         ];
         let bytes = g.n_rows * ext * 4 * 3;
-        let timer = profile::begin_timer(
-            &self.hip,
-            "norm",
-            "gated_rmsnorm_sigmoid_rows_f32",
-            bytes,
-        );
+        let timer =
+            profile::begin_timer(&self.hip, "norm", "gated_rmsnorm_sigmoid_rows_f32", bytes);
         let result = self.launch_maybe_blob(
             "gated_rmsnorm_sigmoid_rows_f32",
             [g.n_heads as u32, g.n_rows as u32, 1],
@@ -554,7 +580,11 @@ impl Gpu {
         need(p.beta_out, "beta_out", n, p.beta_row_stride, p.n_heads)?;
 
         self.bind_thread()?;
-        self.ensure_kernel("raon_rda_prepare", RAON_RDA_PREPARE_SRC, "raon_rda_prepare_f32")?;
+        self.ensure_kernel(
+            "raon_rda_prepare",
+            RAON_RDA_PREPARE_SRC,
+            "raon_rda_prepare_f32",
+        )?;
         let ptrs = [
             p.q_out.buf.as_ptr(),
             p.k_out.buf.as_ptr(),

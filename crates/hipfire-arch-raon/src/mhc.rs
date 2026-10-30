@@ -97,7 +97,9 @@ pub struct RaonMhcHost<'a> {
 
 /// Lossless BF16 -> F32 widening of checkpoint bits.
 pub fn bf16_bits_to_f32(bits: &[u16]) -> Vec<f32> {
-    bits.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect()
+    bits.iter()
+        .map(|&b| f32::from_bits((b as u32) << 16))
+        .collect()
 }
 
 /// Device parameters of one mHC site (attention or MLP).
@@ -170,7 +172,11 @@ impl RaonMhcWork {
 
 impl RaonMhcSite {
     /// Uploads one site's parameters. Refuses wrong lengths and non-finite values.
-    pub fn upload(gpu: &mut Gpu, shape: &RaonMhcShape, host: &RaonMhcHost<'_>) -> Result<Self, String> {
+    pub fn upload(
+        gpu: &mut Gpu,
+        shape: &RaonMhcShape,
+        host: &RaonMhcHost<'_>,
+    ) -> Result<Self, String> {
         shape.check()?;
         let (n, w) = (shape.streams, shape.width);
         let nm2 = (n - 1) * (n - 1);
@@ -221,8 +227,10 @@ impl RaonMhcSite {
     }
 
     pub fn free(self, gpu: &mut Gpu) -> Result<(), String> {
-        gpu.free_tensor(self.selector).map_err(|e| herr("mhc free", e))?;
-        gpu.free_tensor(self.params).map_err(|e| herr("mhc free", e))
+        gpu.free_tensor(self.selector)
+            .map_err(|e| herr("mhc free", e))?;
+        gpu.free_tensor(self.params)
+            .map_err(|e| herr("mhc free", e))
     }
 
     fn op<'a>(&self, rows: usize, stage: StreamMixStage<'a>) -> StreamMixOp<'a> {

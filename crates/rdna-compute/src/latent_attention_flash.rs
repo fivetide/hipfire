@@ -142,21 +142,30 @@ impl Gpu {
             )));
         }
         if a.n_heads > 65535 {
-            return Err(err("latent_attention flash: n_heads exceeds 65535 (grid.y)"));
+            return Err(err(
+                "latent_attention flash: n_heads exceeds 65535 (grid.y)",
+            ));
         }
         let ka_p = view_ptr(&a.k_a, "k_a")?;
         let kb_p = view_ptr(&a.k_b, "k_b")?;
         let v_p = view_ptr(&a.v, "v")?;
         let (qp, yp, pp) = (a.q.buf.as_ptr(), a.y.buf.as_ptr(), a.pos.buf.as_ptr());
         if (qp as usize) % 16 != 0 || (yp as usize) % 16 != 0 {
-            return Err(err("latent_attention flash: q/y base pointers must be 16-byte aligned"));
+            return Err(err(
+                "latent_attention flash: q/y base pointers must be 16-byte aligned",
+            ));
         }
         let wide = dv > FLASH_DV_CHUNK
             && dv % 64 == 0
             && dv <= WIDE_MAX_DV
             && wide_lds_bytes(dq, dv) <= LATENT_ATTENTION_FLASH_LDS_LIMIT;
         let (waves, shared, func, grid_z) = if wide {
-            (4usize, wide_lds_bytes(dq, dv) as u32, wide_func.as_str(), 1usize)
+            (
+                4usize,
+                wide_lds_bytes(dq, dv) as u32,
+                wide_func.as_str(),
+                1usize,
+            )
         } else {
             let waves = [4usize, 2, 1]
                 .into_iter()

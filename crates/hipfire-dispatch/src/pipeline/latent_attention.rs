@@ -258,7 +258,10 @@ fn resolve_range(
             Ok((true, 0, count))
         }
         RowRange::Absolute { start, count } => {
-            if start.checked_add(count).map_or(true, |e| e > c.capacity_rows) {
+            if start
+                .checked_add(count)
+                .map_or(true, |e| e > c.capacity_rows)
+            {
                 return Err(refuse(format!(
                     "row range {start}+{count} exceeds cache capacity {}",
                     c.capacity_rows
@@ -275,10 +278,24 @@ pub fn execute_latent_attention(
     op: &LatentAttentionOp<'_>,
 ) -> Result<(), DispatchError> {
     match op {
-        LatentAttentionOp::NormRows { x, gamma, out, rows, width, eps } => gpu
+        LatentAttentionOp::NormRows {
+            x,
+            gamma,
+            out,
+            rows,
+            width,
+            eps,
+        } => gpu
             .latent_attention_rms_rows(x, gamma, out, *rows, *width, *eps)
             .map_err(hip),
-        LatentAttentionOp::SplitKv { geometry, cache, kv_a, gamma, rows, eps } => {
+        LatentAttentionOp::SplitKv {
+            geometry,
+            cache,
+            kv_a,
+            gamma,
+            rows,
+            eps,
+        } => {
             check_geometry(geometry)?;
             check_cache(cache, *rows)?;
             gpu.latent_attention_split_kv(
@@ -294,7 +311,12 @@ pub fn execute_latent_attention(
             )
             .map_err(hip)
         }
-        LatentAttentionOp::GatherLatent { geometry, cache, range, out } => {
+        LatentAttentionOp::GatherLatent {
+            geometry,
+            cache,
+            range,
+            out,
+        } => {
             check_geometry(geometry)?;
             let (dev_base, row0, count) = resolve_range(cache, *range)?;
             gpu.latent_attention_gather_latent(
@@ -309,7 +331,13 @@ pub fn execute_latent_attention(
             )
             .map_err(hip)
         }
-        LatentAttentionOp::Decompress { geometry, cache, mirror, expansion, range } => {
+        LatentAttentionOp::Decompress {
+            geometry,
+            cache,
+            mirror,
+            expansion,
+            range,
+        } => {
             check_geometry(geometry)?;
             let mirror_end = match range {
                 RowRange::Absolute { start, count } => start.checked_add(*count),
@@ -353,14 +381,36 @@ pub fn execute_latent_attention(
                     .map_err(hip),
             }
         }
-        LatentAttentionOp::Attention { geometry, cache, mirror, q, y, rows, scale, route } => {
+        LatentAttentionOp::Attention {
+            geometry,
+            cache,
+            mirror,
+            q,
+            y,
+            rows,
+            scale,
+            route,
+        } => {
             check_geometry(geometry)?;
             check_cache(cache, *rows)?;
-            attention(gpu, geometry, cache, mirror.as_ref(), q, y, *rows, *scale, route)
+            attention(
+                gpu,
+                geometry,
+                cache,
+                mirror.as_ref(),
+                q,
+                y,
+                *rows,
+                *scale,
+                route,
+            )
         }
-        LatentAttentionOp::Gate { y, g, out, elements } => gpu
-            .latent_attention_gate(y, g, out, *elements)
-            .map_err(hip),
+        LatentAttentionOp::Gate {
+            y,
+            g,
+            out,
+            elements,
+        } => gpu.latent_attention_gate(y, g, out, *elements).map_err(hip),
     }
 }
 
@@ -370,7 +420,11 @@ fn need_mirror<'m, 'a>(
     rows: usize,
     route: &str,
 ) -> Result<&'m ExpandedMirror<'a>, DispatchError> {
-    let m = mirror.ok_or_else(|| refuse(format!("the {route} attention route needs the expanded mirror")))?;
+    let m = mirror.ok_or_else(|| {
+        refuse(format!(
+            "the {route} attention route needs the expanded mirror"
+        ))
+    })?;
     check_mirror(m, cache.host_pos.map(|p| p + rows))?;
     Ok(m)
 }
@@ -450,9 +504,13 @@ fn attention(
         AttentionRoute::Absorbed { ops, workspace } => {
             let packed_ok = ops.packed.dtype == rdna_compute::DType::BF16
                 && ops.packed.numel()
-                    >= rdna_compute::latent_attention_absorb::latent_attention_absorb_packed_elems(g.n_heads, g.nope, g.v_dim, g.latent);
+                    >= rdna_compute::latent_attention_absorb::latent_attention_absorb_packed_elems(
+                        g.n_heads, g.nope, g.v_dim, g.latent,
+                    );
             if !packed_ok {
-                return Err(refuse("absorbed route: packed expansion weight is missing or undersized".into()));
+                return Err(refuse(
+                    "absorbed route: packed expansion weight is missing or undersized".into(),
+                ));
             }
             gpu.latent_attention_absorb_q(
                 q, ops.packed, ops.q_abs, rows, g.n_heads, g.nope, g.tail, g.v_dim, g.latent,
@@ -506,8 +564,8 @@ fn run_tiled(
     workspace: Option<&GpuTensor>,
 ) -> Result<(), DispatchError> {
     if a.n_rows == 1 {
-        let ws = workspace
-            .ok_or_else(|| refuse("tiled decode needs the split-KV workspace".into()))?;
+        let ws =
+            workspace.ok_or_else(|| refuse("tiled decode needs the split-KV workspace".into()))?;
         gpu.latent_attention_decode_split(a, ws).map_err(hip)
     } else {
         gpu.latent_attention_flash_prefill(a).map_err(hip)

@@ -50,8 +50,13 @@ fn read_text(path: &str, what: &str) -> Result<String, String> {
 }
 
 pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, String> {
-    let model = opts.get("model").ok_or("generate: missing --model")?.clone();
-    let prompt_file = opts.get("prompt-file").ok_or("generate: missing --prompt-file")?;
+    let model = opts
+        .get("model")
+        .ok_or("generate: missing --model")?
+        .clone();
+    let prompt_file = opts
+        .get("prompt-file")
+        .ok_or("generate: missing --prompt-file")?;
     let user = read_text(prompt_file, "prompt")?;
     let system = match opts.get("system-file") {
         Some(p) => Some(read_text(p, "system")?),
@@ -132,7 +137,10 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
                 .download_f32(bundle.logits())
                 .map_err(|e| format!("download logits: {e:?}"))?;
             if logits.iter().any(|x| !x.is_finite()) {
-                return Err(format!("non-finite logits at generated token {}", generated.len()));
+                return Err(format!(
+                    "non-finite logits at generated token {}",
+                    generated.len()
+                ));
             }
             let tok = argmax(&logits) as u32;
             if bundle.is_eos(tok) {
@@ -157,7 +165,12 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
             text.push_str(&tail);
         }
         writeln!(out).map_err(w)?;
-        writeln!(out, "=== end ({} tokens, stop: {stop}) ===", generated.len()).map_err(w)?;
+        writeln!(
+            out,
+            "=== end ({} tokens, stop: {stop}) ===",
+            generated.len()
+        )
+        .map_err(w)?;
         out.flush().map_err(w)?;
         let decode_secs = t1.elapsed().as_secs_f64();
         let (captures, replays) = bundle.decode_graph_stats();

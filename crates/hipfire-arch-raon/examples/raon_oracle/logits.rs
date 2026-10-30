@@ -46,7 +46,9 @@ use std::time::Instant;
 
 use hipfire_arch_raon::bundle::{PrefillMode, RaonBundle};
 use hipfire_arch_raon::config::MHC_STREAMS;
-use hipfire_arch_raon::forward::{forward_rows, forward_rows_tapped, forward_token, readout_logits, TapSite};
+use hipfire_arch_raon::forward::{
+    forward_rows, forward_rows_tapped, forward_token, readout_logits, TapSite,
+};
 use hipfire_arch_raon::load_raon_bundle;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
@@ -67,9 +69,12 @@ pub fn read_tokens(path: &str) -> Result<Vec<u32>, String> {
     if bytes.is_empty() {
         return Err(format!("tokens {path}: empty file"));
     }
-    let texty = bytes
-        .iter()
-        .all(|b| matches!(b, b'0'..=b'9' | b',' | b' ' | b'\t' | b'\r' | b'\n' | b'[' | b']'));
+    let texty = bytes.iter().all(|b| {
+        matches!(
+            b,
+            b'0'..=b'9' | b',' | b' ' | b'\t' | b'\r' | b'\n' | b'[' | b']'
+        )
+    });
     let ids: Vec<u32> = if texty {
         let s = std::str::from_utf8(&bytes).map_err(|e| format!("tokens {path}: {e}"))?;
         let mut v = Vec::new();
@@ -77,7 +82,10 @@ pub fn read_tokens(path: &str) -> Result<Vec<u32>, String> {
             .split(|c: char| c.is_whitespace() || matches!(c, ',' | '[' | ']'))
             .filter(|t| !t.is_empty())
         {
-            v.push(t.parse::<u32>().map_err(|e| format!("tokens {path}: bad id {t:?}: {e}"))?);
+            v.push(
+                t.parse::<u32>()
+                    .map_err(|e| format!("tokens {path}: bad id {t:?}: {e}"))?,
+            );
         }
         v
     } else if bytes.len() % 4 == 0 {
@@ -99,14 +107,23 @@ pub fn read_tokens(path: &str) -> Result<Vec<u32>, String> {
 
 /// Every id must index the vocabulary.
 pub fn check_tokens(tokens: &[u32], vocab: usize, label: &str) -> Result<(), String> {
-    if let Some((i, &t)) = tokens.iter().enumerate().find(|(_, &t)| t as usize >= vocab) {
+    if let Some((i, &t)) = tokens
+        .iter()
+        .enumerate()
+        .find(|(_, &t)| t as usize >= vocab)
+    {
         return Err(format!("{label}: token[{i}] = {t} >= vocab {vocab}"));
     }
     Ok(())
 }
 
 /// Production carrier load at an explicit `max_seq`, PP=1, no drafter/vision.
-pub fn load_bundle(gpu: &mut Gpu, src: ModelSource, path: &str, max_seq: usize) -> Result<RaonBundle, String> {
+pub fn load_bundle(
+    gpu: &mut Gpu,
+    src: ModelSource,
+    path: &str,
+    max_seq: usize,
+) -> Result<RaonBundle, String> {
     let cask = CaskConfig::default();
     let mut ctx = LoadCtx {
         path,
@@ -166,7 +183,9 @@ fn sync(gpu: &Gpu) -> Result<(), String> {
 
 fn opt_usize(opts: &BTreeMap<String, String>, key: &str, default: usize) -> Result<usize, String> {
     match opts.get(key) {
-        Some(s) => s.parse::<usize>().map_err(|e| format!("--{key} `{s}`: {e}")),
+        Some(s) => s
+            .parse::<usize>()
+            .map_err(|e| format!("--{key} `{s}`: {e}")),
         None => Ok(default),
     }
 }
@@ -197,7 +216,10 @@ pub fn run(fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, St
     let dump_dir = opts.get("dump-layers").cloned();
     let kld_path = opts.get("kld").cloned();
     if teacher.is_none() && dump_dir.is_none() && kld_path.is_none() {
-        return Err("logits: need at least one of --teacher F, --dump-layers DIR, --kld REF.kldref.bin".into());
+        return Err(
+            "logits: need at least one of --teacher F, --dump-layers DIR, --kld REF.kldref.bin"
+                .into(),
+        );
     }
     let mode = parse_prefill(opts)?;
     let topk = opt_usize(opts, "topk", 5)?.max(1);
@@ -276,7 +298,16 @@ fn run_checks(
         out["n_tokens"] = json!(t.len());
     }
     if let (Some(tok), Some(tp)) = (tokens, teacher) {
-        let r = logits_check(fixtures, gpu, bundle, tok, &resolve(fixtures, tp), mode, topk, opts)?;
+        let r = logits_check(
+            fixtures,
+            gpu,
+            bundle,
+            tok,
+            &resolve(fixtures, tp),
+            mode,
+            topk,
+            opts,
+        )?;
         pass &= r["pass"].as_bool() == Some(true);
         out["logits"] = r;
     }
@@ -287,7 +318,10 @@ fn run_checks(
     }
     if let Some(k) = kref {
         let max_chunks = match opts.get("max-chunks") {
-            Some(s) => Some(s.parse::<usize>().map_err(|e| format!("--max-chunks `{s}`: {e}"))?),
+            Some(s) => Some(
+                s.parse::<usize>()
+                    .map_err(|e| format!("--max-chunks `{s}`: {e}"))?,
+            ),
             None => None,
         };
         let r = kld_check(gpu, bundle, k, mode, max_chunks)?;
@@ -360,7 +394,9 @@ fn npz_member<'a>(zip: &'a [u8], name: &str) -> Result<&'a [u8], String> {
                 ));
             }
             if csize != usize_ {
-                return Err(format!("npz member {name}: stored size mismatch {csize} != {usize_}"));
+                return Err(format!(
+                    "npz member {name}: stored size mismatch {csize} != {usize_}"
+                ));
             }
             if zip.get(lh..lh + 4) != Some(&[0x50, 0x4b, 0x03, 0x04][..]) {
                 return Err(format!("npz member {name}: bad local header at {lh}"));
@@ -420,8 +456,15 @@ fn parse_npy(raw: &[u8]) -> Result<Npy<'_>, String> {
     let open = rest.find('(').ok_or("npy: shape tuple missing")?;
     let close = rest.find(')').ok_or("npy: shape tuple unterminated")?;
     let mut shape = Vec::new();
-    for t in rest[open + 1..close].split(',').map(str::trim).filter(|t| !t.is_empty()) {
-        shape.push(t.parse::<usize>().map_err(|e| format!("npy shape {t:?}: {e}"))?);
+    for t in rest[open + 1..close]
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        shape.push(
+            t.parse::<usize>()
+                .map_err(|e| format!("npy shape {t:?}: {e}"))?,
+        );
     }
     Ok(Npy {
         descr,
@@ -438,7 +481,10 @@ fn load_teacher(path: &Path, vocab: usize) -> Result<(Vec<f32>, Option<Vec<i64>>
         return Err(format!("teacher logits dtype {} != <f4", lg.descr));
     }
     if lg.shape.len() != 2 || lg.shape[1] != vocab || lg.shape[0] == 0 {
-        return Err(format!("teacher logits shape {:?}, want [T, {vocab}]", lg.shape));
+        return Err(format!(
+            "teacher logits shape {:?}, want [T, {vocab}]",
+            lg.shape
+        ));
     }
     let rows = lg.shape[0];
     let row_bytes = vocab * 4;
@@ -509,7 +555,11 @@ fn log_sum_exp(v: &[f32]) -> f64 {
 }
 
 fn top_json(v: &[f32], idx: &[usize]) -> Value {
-    Value::Array(idx.iter().map(|&i| json!({"id": i, "logit": v[i]})).collect())
+    Value::Array(
+        idx.iter()
+            .map(|&i| json!({"id": i, "logit": v[i]}))
+            .collect(),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -552,11 +602,18 @@ fn logits_check(
     sync(gpu)?;
     let secs = t0.elapsed().as_secs_f64();
     if bundle.n_tokens() != tokens.len() {
-        return Err(format!("state advanced to {} tokens, expected {}", bundle.n_tokens(), tokens.len()));
+        return Err(format!(
+            "state advanced to {} tokens, expected {}",
+            bundle.n_tokens(),
+            tokens.len()
+        ));
     }
     let ours = hip_str(gpu.download_f32(bundle.logits()), "download logits")?;
     if ours.len() != vocab {
-        return Err(format!("device logits have {} elements, vocab is {vocab}", ours.len()));
+        return Err(format!(
+            "device logits have {} elements, vocab is {vocab}",
+            ours.len()
+        ));
     }
     let nonfinite = ours.iter().filter(|x| !x.is_finite()).count();
 
@@ -644,7 +701,11 @@ struct StFile {
 
 impl StFile {
     /// `tensors`: (name, shape) in file order; row = product of trailing dims.
-    fn create(path: &Path, tensors: &[(&str, Vec<usize>)], meta: &[(&str, String)]) -> Result<Self, String> {
+    fn create(
+        path: &Path,
+        tensors: &[(&str, Vec<usize>)],
+        meta: &[(&str, String)],
+    ) -> Result<Self, String> {
         let mut header = Map::new();
         let mut m = Map::new();
         for (k, v) in meta {
@@ -702,7 +763,12 @@ impl StFile {
     }
 }
 
-fn dump_layers(gpu: &mut Gpu, bundle: &mut RaonBundle, tokens: &[u32], dir: &Path) -> Result<Value, String> {
+fn dump_layers(
+    gpu: &mut Gpu,
+    bundle: &mut RaonBundle,
+    tokens: &[u32],
+    dir: &Path,
+) -> Result<Value, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let n = tokens.len();
     let hidden = bundle.config.hidden;
@@ -710,10 +776,18 @@ fn dump_layers(gpu: &mut Gpu, bundle: &mut RaonBundle, tokens: &[u32], dir: &Pat
     let vocab = bundle.config.vocab;
     let row_bytes = MHC_STREAMS * hidden * 4;
     let piece = bundle.scratch.rows.min(512);
-    let meta = [("tokens", n.to_string()), ("kind", "layer-dump".to_string()), ("producer", "raon_oracle logits".to_string())];
+    let meta = [
+        ("tokens", n.to_string()),
+        ("kind", "layer-dump".to_string()),
+        ("producer", "raon_oracle logits".to_string()),
+    ];
     let shape = vec![n, MHC_STREAMS, hidden];
 
-    let embed = StFile::create(&dir.join("embed.safetensors"), &[("stream", shape.clone())], &meta)?;
+    let embed = StFile::create(
+        &dir.join("embed.safetensors"),
+        &[("stream", shape.clone())],
+        &meta,
+    )?;
     let mut layers = Vec::with_capacity(n_layers);
     for l in 0..n_layers {
         layers.push(StFile::create(
@@ -732,25 +806,39 @@ fn dump_layers(gpu: &mut Gpu, bundle: &mut RaonBundle, tokens: &[u32], dir: &Pat
         let len = (n - pos).min(piece);
         let last = pos + len == n;
         let row0 = pos;
-        let mut tap = |g: &mut Gpu, site: TapSite, streams: &GpuTensor, rows: usize| -> Result<(), String> {
-            if rows != len {
-                return Err(format!("tap {site:?}: {rows} rows, piece has {len}"));
-            }
-            let nbytes = rows * row_bytes;
-            if streams.buf.size() < nbytes {
-                return Err(format!("tap {site:?}: stream tensor {} B < {nbytes} B", streams.buf.size()));
-            }
-            hip_str(g.hip.device_synchronize(), "tap synchronize")?;
-            host.resize(nbytes, 0);
-            let view = streams.buf.byte_view(0, nbytes);
-            hip_str(g.hip.memcpy_dtoh(&mut host, &view), "tap download")?;
-            let (file, t) = match site {
-                TapSite::Embedding => (&embed, 0),
-                TapSite::Attn(l) => (layers.get(l).ok_or_else(|| format!("tap layer {l} out of range"))?, 0),
-                TapSite::Ffn(l) => (layers.get(l).ok_or_else(|| format!("tap layer {l} out of range"))?, 1),
+        let mut tap =
+            |g: &mut Gpu, site: TapSite, streams: &GpuTensor, rows: usize| -> Result<(), String> {
+                if rows != len {
+                    return Err(format!("tap {site:?}: {rows} rows, piece has {len}"));
+                }
+                let nbytes = rows * row_bytes;
+                if streams.buf.size() < nbytes {
+                    return Err(format!(
+                        "tap {site:?}: stream tensor {} B < {nbytes} B",
+                        streams.buf.size()
+                    ));
+                }
+                hip_str(g.hip.device_synchronize(), "tap synchronize")?;
+                host.resize(nbytes, 0);
+                let view = streams.buf.byte_view(0, nbytes);
+                hip_str(g.hip.memcpy_dtoh(&mut host, &view), "tap download")?;
+                let (file, t) = match site {
+                    TapSite::Embedding => (&embed, 0),
+                    TapSite::Attn(l) => (
+                        layers
+                            .get(l)
+                            .ok_or_else(|| format!("tap layer {l} out of range"))?,
+                        0,
+                    ),
+                    TapSite::Ffn(l) => (
+                        layers
+                            .get(l)
+                            .ok_or_else(|| format!("tap layer {l} out of range"))?,
+                        1,
+                    ),
+                };
+                file.write_rows(t, row0, &host)
             };
-            file.write_rows(t, row0, &host)
-        };
         forward_rows_tapped(
             &bundle.config,
             &bundle.weights,
@@ -767,12 +855,22 @@ fn dump_layers(gpu: &mut Gpu, bundle: &mut RaonBundle, tokens: &[u32], dir: &Pat
     }
     sync(gpu)?;
     let secs = t0.elapsed().as_secs_f64();
-    let logits = hip_str(gpu.download_f32(&bundle.scratch.logits), "download final logits")?;
+    let logits = hip_str(
+        gpu.download_f32(&bundle.scratch.logits),
+        "download final logits",
+    )?;
     if logits.len() != vocab {
-        return Err(format!("final logits have {} elements, vocab is {vocab}", logits.len()));
+        return Err(format!(
+            "final logits have {} elements, vocab is {vocab}",
+            logits.len()
+        ));
     }
     let finite = logits.iter().all(|x| x.is_finite());
-    let fin = StFile::create(&dir.join("final.safetensors"), &[("logits", vec![1, vocab])], &meta)?;
+    let fin = StFile::create(
+        &dir.join("final.safetensors"),
+        &[("logits", vec![1, vocab])],
+        &meta,
+    )?;
     let bytes: Vec<u8> = logits.iter().flat_map(|x| x.to_le_bytes()).collect();
     fin.write_rows(0, 0, &bytes)?;
 
@@ -815,22 +913,32 @@ fn open_kldref(path: &Path) -> Result<KldRef, String> {
     if &hdr[..8] != b"HFKLDR\0\0" {
         return Err(format!("{}: bad magic {:?}", path.display(), &hdr[..8]));
     }
-    let u32_at = |o: usize| u32::from_le_bytes([hdr[o], hdr[o + 1], hdr[o + 2], hdr[o + 3]]) as usize;
+    let u32_at =
+        |o: usize| u32::from_le_bytes([hdr[o], hdr[o + 1], hdr[o + 2], hdr[o + 3]]) as usize;
     let version = u32_at(8);
     if version != 1 {
-        return Err(format!("{}: unsupported HFKLDR version {version} (this reader is v1)", path.display()));
+        return Err(format!(
+            "{}: unsupported HFKLDR version {version} (this reader is v1)",
+            path.display()
+        ));
     }
     let n_ctx = u32_at(12);
     let n_vocab = u32_at(16);
     let n_chunk = u32_at(20);
     let top_k = u16::from_le_bytes([hdr[24], hdr[25]]) as usize;
     if n_ctx < 4 || n_chunk == 0 || top_k == 0 {
-        return Err(format!("{}: degenerate header n_ctx={n_ctx} n_chunk={n_chunk} top_k={top_k}", path.display()));
+        return Err(format!(
+            "{}: degenerate header n_ctx={n_ctx} n_chunk={n_chunk} top_k={top_k}",
+            path.display()
+        ));
     }
     let scored = n_ctx - 1 - n_ctx / 2;
     let expect = 32 + (n_ctx * n_chunk * 4) as u64 + (n_chunk * scored * (8 + 8 * top_k)) as u64;
     if len != expect {
-        return Err(format!("{}: size {len} != expected {expect} for the declared header", path.display()));
+        return Err(format!(
+            "{}: size {len} != expected {expect} for the declared header",
+            path.display()
+        ));
     }
     let mut raw = vec![0u8; n_ctx * n_chunk * 4];
     r.read_exact(&mut raw)
@@ -862,7 +970,14 @@ fn parse_block(buf: &[u8], k: usize) -> Block {
         .collect();
     let lo = k * 4;
     let lp = (0..k)
-        .map(|j| f32::from_le_bytes([buf[lo + j * 4], buf[lo + j * 4 + 1], buf[lo + j * 4 + 2], buf[lo + j * 4 + 3]]))
+        .map(|j| {
+            f32::from_le_bytes([
+                buf[lo + j * 4],
+                buf[lo + j * 4 + 1],
+                buf[lo + j * 4 + 2],
+                buf[lo + j * 4 + 3],
+            ])
+        })
         .collect();
     let ro = k * 8;
     let resid = f32::from_le_bytes([buf[ro], buf[ro + 1], buf[ro + 2], buf[ro + 3]]);
@@ -943,7 +1058,11 @@ fn score_batch(rows: &[f32], vocab: usize, blocks: &[Block], actual: &[usize]) -
             s.spawn(move || {
                 for (j, slot) in chunk.iter_mut().enumerate() {
                     let i = base + j;
-                    *slot = Some(score_row(&rows[i * vocab..(i + 1) * vocab], &blocks[i], actual[i]));
+                    *slot = Some(score_row(
+                        &rows[i * vocab..(i + 1) * vocab],
+                        &blocks[i],
+                        actual[i],
+                    ));
                 }
             });
         }
@@ -973,7 +1092,11 @@ fn kld_check(
 ) -> Result<Value, String> {
     let vocab = bundle.config.vocab;
     if kref.n_vocab != vocab {
-        return Err(format!("{}: ref n_vocab {} != model vocab {vocab}", kref.path.display(), kref.n_vocab));
+        return Err(format!(
+            "{}: ref n_vocab {} != model vocab {vocab}",
+            kref.path.display(),
+            kref.n_vocab
+        ));
     }
     check_tokens(&kref.tokens, vocab, "kld ref tokens")?;
     let n_ctx = kref.n_ctx;
@@ -990,7 +1113,10 @@ fn kld_check(
     let batched = mode == PrefillMode::Batched;
     let out_rows = KLD_READOUT_ROWS.min(rows_cap).max(1);
     let readout = if batched {
-        Some(hip_str(gpu.alloc_tensor(&[out_rows, vocab], DType::F32), "alloc readout tensor")?)
+        Some(hip_str(
+            gpu.alloc_tensor(&[out_rows, vocab], DType::F32),
+            "alloc readout tensor",
+        )?)
     } else {
         None
     };
@@ -1086,17 +1212,26 @@ fn kld_check(
                     if !scored {
                         continue;
                     }
-                    let host = hip_str(gpu.download_f32(&bundle.scratch.logits), "download logits")?;
+                    let host =
+                        hip_str(gpu.download_f32(&bundle.scratch.logits), "download logits")?;
                     kref.reader
                         .read_exact(&mut block_buf)
                         .map_err(|e| format!("{}: ref block: {e}", kref.path.display()))?;
                     let blocks = [parse_block(&block_buf, kref.top_k)];
-                    take(score_batch(&host, vocab, &blocks, &[chunk[pos + 1] as usize]));
+                    take(score_batch(
+                        &host,
+                        vocab,
+                        &blocks,
+                        &[chunk[pos + 1] as usize],
+                    ));
                 }
             }
 
             if ck_kld.len() != scored_per_chunk {
-                return Err(format!("chunk {c}: scored {} positions, expected {scored_per_chunk}", ck_kld.len()));
+                return Err(format!(
+                    "chunk {c}: scored {} positions, expected {scored_per_chunk}",
+                    ck_kld.len()
+                ));
             }
             let mut sorted = ck_kld.clone();
             sorted.sort_by(f64::total_cmp);

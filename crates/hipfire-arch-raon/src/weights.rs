@@ -425,7 +425,10 @@ impl TensorSpec {
     fn is_matrix_proj(&self) -> bool {
         matches!(
             self.class,
-            TensorClass::Proj | TensorClass::ExpertGate | TensorClass::ExpertUp | TensorClass::ExpertDown
+            TensorClass::Proj
+                | TensorClass::ExpertGate
+                | TensorClass::ExpertUp
+                | TensorClass::ExpertDown
         )
     }
 }
@@ -442,16 +445,56 @@ fn mhc_specs(out: &mut Vec<TensorSpec>, p: &str, cfg: &RaonConfig) {
     let n = cfg.mhc_streams;
     let w = n * cfg.hidden;
     let m = (n - 1) * (n - 1);
-    out.push(TensorSpec::new(format!("{p}.phi_pre"), TensorClass::HostF32, &[n, w]));
-    out.push(TensorSpec::new(format!("{p}.phi_post"), TensorClass::HostF32, &[n, w]));
-    out.push(TensorSpec::new(format!("{p}.res.phi_z"), TensorClass::HostF32, &[m, w]));
-    out.push(TensorSpec::new(format!("{p}.alpha_pre"), TensorClass::HostF32, &[]));
-    out.push(TensorSpec::new(format!("{p}.alpha_post"), TensorClass::HostF32, &[]));
-    out.push(TensorSpec::new(format!("{p}.res.alpha_z"), TensorClass::HostF32, &[]));
-    out.push(TensorSpec::new(format!("{p}.res.eta"), TensorClass::HostF32, &[]));
-    out.push(TensorSpec::new(format!("{p}.b_pre"), TensorClass::HostF32, &[n]));
-    out.push(TensorSpec::new(format!("{p}.b_post"), TensorClass::HostF32, &[n]));
-    out.push(TensorSpec::new(format!("{p}.res.b_z"), TensorClass::HostF32, &[m]));
+    out.push(TensorSpec::new(
+        format!("{p}.phi_pre"),
+        TensorClass::HostF32,
+        &[n, w],
+    ));
+    out.push(TensorSpec::new(
+        format!("{p}.phi_post"),
+        TensorClass::HostF32,
+        &[n, w],
+    ));
+    out.push(TensorSpec::new(
+        format!("{p}.res.phi_z"),
+        TensorClass::HostF32,
+        &[m, w],
+    ));
+    out.push(TensorSpec::new(
+        format!("{p}.alpha_pre"),
+        TensorClass::HostF32,
+        &[],
+    ));
+    out.push(TensorSpec::new(
+        format!("{p}.alpha_post"),
+        TensorClass::HostF32,
+        &[],
+    ));
+    out.push(TensorSpec::new(
+        format!("{p}.res.alpha_z"),
+        TensorClass::HostF32,
+        &[],
+    ));
+    out.push(TensorSpec::new(
+        format!("{p}.res.eta"),
+        TensorClass::HostF32,
+        &[],
+    ));
+    out.push(TensorSpec::new(
+        format!("{p}.b_pre"),
+        TensorClass::HostF32,
+        &[n],
+    ));
+    out.push(TensorSpec::new(
+        format!("{p}.b_post"),
+        TensorClass::HostF32,
+        &[n],
+    ));
+    out.push(TensorSpec::new(
+        format!("{p}.res.b_z"),
+        TensorClass::HostF32,
+        &[m],
+    ));
 }
 
 /// Every tensor the artifact must carry for `cfg`, with original HF names
@@ -461,13 +504,25 @@ pub fn tensor_inventory(cfg: &RaonConfig) -> Vec<TensorSpec> {
     let c = cfg.hidden;
     let p = cfg.rda_proj;
     let mut v = Vec::new();
-    v.push(TensorSpec::new("model.embed_tokens.weight", Embedding, &[cfg.vocab, c]));
+    v.push(TensorSpec::new(
+        "model.embed_tokens.weight",
+        Embedding,
+        &[cfg.vocab, c],
+    ));
     v.push(TensorSpec::new("model.norm.weight", F32Vec, &[c]));
     v.push(TensorSpec::new("lm_head.weight", Proj, &[cfg.vocab, c]));
     for l in 0..cfg.n_layers {
         let lp = format!("model.layers.{l}");
-        v.push(TensorSpec::new(format!("{lp}.input_layernorm.weight"), F32Vec, &[c]));
-        v.push(TensorSpec::new(format!("{lp}.post_attention_layernorm.weight"), F32Vec, &[c]));
+        v.push(TensorSpec::new(
+            format!("{lp}.input_layernorm.weight"),
+            F32Vec,
+            &[c],
+        ));
+        v.push(TensorSpec::new(
+            format!("{lp}.post_attention_layernorm.weight"),
+            F32Vec,
+            &[c],
+        ));
         mhc_specs(&mut v, &format!("{lp}.self_attn_raon_mhc"), cfg);
         mhc_specs(&mut v, &format!("{lp}.mlp_raon_mhc"), cfg);
         let a = format!("{lp}.self_attn");
@@ -487,8 +542,16 @@ pub fn tensor_inventory(cfg: &RaonConfig) -> Vec<TensorSpec> {
                     Proj,
                     &[p, cfg.rda_decay_rank],
                 ));
-                v.push(TensorSpec::new(format!("{a}.b_proj.weight"), Proj, &[cfg.n_heads, c]));
-                v.push(TensorSpec::new(format!("{a}.rda_w_proj.weight"), Proj, &[cfg.n_heads, c]));
+                v.push(TensorSpec::new(
+                    format!("{a}.b_proj.weight"),
+                    Proj,
+                    &[cfg.n_heads, c],
+                ));
+                v.push(TensorSpec::new(
+                    format!("{a}.rda_w_proj.weight"),
+                    Proj,
+                    &[cfg.n_heads, c],
+                ));
                 for n in ["q_conv1d", "k_conv1d", "v_conv1d"] {
                     v.push(TensorSpec::new(
                         format!("{a}.{n}.weight"),
@@ -496,13 +559,29 @@ pub fn tensor_inventory(cfg: &RaonConfig) -> Vec<TensorSpec> {
                         &[p, cfg.rda_conv_kernel],
                     ));
                 }
-                v.push(TensorSpec::new(format!("{a}.A_log"), F32Vec, &[cfg.n_heads]));
+                v.push(TensorSpec::new(
+                    format!("{a}.A_log"),
+                    F32Vec,
+                    &[cfg.n_heads],
+                ));
                 v.push(TensorSpec::new(format!("{a}.dt_bias"), F32Vec, &[p]));
-                v.push(TensorSpec::new(format!("{a}.o_norm.weight"), F32Vec, &[cfg.head_dim]));
+                v.push(TensorSpec::new(
+                    format!("{a}.o_norm.weight"),
+                    F32Vec,
+                    &[cfg.head_dim],
+                ));
             }
             LayerKind::Mla => {
-                v.push(TensorSpec::new(format!("{a}.q_a_proj.weight"), Proj, &[cfg.q_lora, c]));
-                v.push(TensorSpec::new(format!("{a}.q_a_layernorm.weight"), F32Vec, &[cfg.q_lora]));
+                v.push(TensorSpec::new(
+                    format!("{a}.q_a_proj.weight"),
+                    Proj,
+                    &[cfg.q_lora, c],
+                ));
+                v.push(TensorSpec::new(
+                    format!("{a}.q_a_layernorm.weight"),
+                    F32Vec,
+                    &[cfg.q_lora],
+                ));
                 v.push(TensorSpec::new(
                     format!("{a}.q_b_proj.weight"),
                     Proj,
@@ -513,7 +592,11 @@ pub fn tensor_inventory(cfg: &RaonConfig) -> Vec<TensorSpec> {
                     Proj,
                     &[cfg.kv_lora + cfg.qk_rope, c],
                 ));
-                v.push(TensorSpec::new(format!("{a}.kv_a_layernorm.weight"), F32Vec, &[cfg.kv_lora]));
+                v.push(TensorSpec::new(
+                    format!("{a}.kv_a_layernorm.weight"),
+                    F32Vec,
+                    &[cfg.kv_lora],
+                ));
                 v.push(TensorSpec::new(
                     format!("{a}.kv_b_proj.weight"),
                     Proj,
@@ -534,13 +617,29 @@ pub fn tensor_inventory(cfg: &RaonConfig) -> Vec<TensorSpec> {
         match cfg.ffn_kinds[l] {
             FfnKind::Dense => {
                 let m = format!("{lp}.mlp");
-                v.push(TensorSpec::new(format!("{m}.gate_proj.weight"), Proj, &[cfg.dense_inter, c]));
-                v.push(TensorSpec::new(format!("{m}.up_proj.weight"), Proj, &[cfg.dense_inter, c]));
-                v.push(TensorSpec::new(format!("{m}.down_proj.weight"), Proj, &[c, cfg.dense_inter]));
+                v.push(TensorSpec::new(
+                    format!("{m}.gate_proj.weight"),
+                    Proj,
+                    &[cfg.dense_inter, c],
+                ));
+                v.push(TensorSpec::new(
+                    format!("{m}.up_proj.weight"),
+                    Proj,
+                    &[cfg.dense_inter, c],
+                ));
+                v.push(TensorSpec::new(
+                    format!("{m}.down_proj.weight"),
+                    Proj,
+                    &[c, cfg.dense_inter],
+                ));
             }
             FfnKind::Moe => {
                 let m = format!("{lp}.moe");
-                v.push(TensorSpec::new(format!("{m}.gate.weight"), Router, &[cfg.n_experts, c]));
+                v.push(TensorSpec::new(
+                    format!("{m}.gate.weight"),
+                    Router,
+                    &[cfg.n_experts, c],
+                ));
                 v.push(TensorSpec::new(
                     format!("{m}.gate.e_score_correction_bias"),
                     F32Vec,
@@ -548,9 +647,21 @@ pub fn tensor_inventory(cfg: &RaonConfig) -> Vec<TensorSpec> {
                 ));
                 let si = cfg.shared_inter();
                 let sk = cfg.shared_down_k();
-                v.push(TensorSpec::new(format!("{m}.shared_experts.gate_proj.weight"), Proj, &[si, c]));
-                v.push(TensorSpec::new(format!("{m}.shared_experts.up_proj.weight"), Proj, &[si, c]));
-                v.push(TensorSpec::new(format!("{m}.shared_experts.down_proj.weight"), Proj, &[c, sk]));
+                v.push(TensorSpec::new(
+                    format!("{m}.shared_experts.gate_proj.weight"),
+                    Proj,
+                    &[si, c],
+                ));
+                v.push(TensorSpec::new(
+                    format!("{m}.shared_experts.up_proj.weight"),
+                    Proj,
+                    &[si, c],
+                ));
+                v.push(TensorSpec::new(
+                    format!("{m}.shared_experts.down_proj.weight"),
+                    Proj,
+                    &[c, sk],
+                ));
                 for e in 0..cfg.n_experts {
                     let ep = format!("{m}.experts.{e}");
                     v.push(TensorSpec::new(
@@ -637,7 +748,11 @@ fn list_cap(items: &[String]) -> String {
     if items.len() <= CAP {
         items.join(", ")
     } else {
-        format!("{}, … (+{} more)", items[..CAP].join(", "), items.len() - CAP)
+        format!(
+            "{}, … (+{} more)",
+            items[..CAP].join(", "),
+            items.len() - CAP
+        )
     }
 }
 
@@ -723,7 +838,10 @@ pub fn check_inventory(specs: &[TensorSpec], index: &[IndexEntry]) -> Result<(),
                         "{sc}: AWQ sidecar on a {} weight (only qt44 consumes AWQ scales)",
                         qt_name(e.quant_type)
                     ));
-                } else if side.quant_type != QT_F16 || side.shape != [cols] || side.data_size != 2 * cols {
+                } else if side.quant_type != QT_F16
+                    || side.shape != [cols]
+                    || side.data_size != 2 * cols
+                {
                     bad.push(format!(
                         "{sc}: sidecar must be F16 [{cols}] (got qt {} shape {:?}, {} B)",
                         side.quant_type, side.shape, side.data_size
@@ -740,10 +858,18 @@ pub fn check_inventory(specs: &[TensorSpec], index: &[IndexEntry]) -> Result<(),
     unconsumed.sort();
     let mut errs = Vec::new();
     if !missing.is_empty() {
-        errs.push(format!("missing {} tensor(s): {}", missing.len(), list_cap(&missing)));
+        errs.push(format!(
+            "missing {} tensor(s): {}",
+            missing.len(),
+            list_cap(&missing)
+        ));
     }
     if !bad.is_empty() {
-        errs.push(format!("{} malformed tensor(s): {}", bad.len(), list_cap(&bad)));
+        errs.push(format!(
+            "{} malformed tensor(s): {}",
+            bad.len(),
+            list_cap(&bad)
+        ));
     }
     if !unconsumed.is_empty() {
         errs.push(format!(
@@ -829,7 +955,12 @@ fn read_awq_host(hfq: &HfqFile, weight_name: &str, k: usize) -> Result<Option<Ve
     })
 }
 
-fn upload_f32_named(gpu: &mut Gpu, data: &[f32], shape: &[usize], name: &str) -> Result<GpuTensor, String> {
+fn upload_f32_named(
+    gpu: &mut Gpu,
+    data: &[f32],
+    shape: &[usize],
+    name: &str,
+) -> Result<GpuTensor, String> {
     gpu.upload_f32(data, shape)
         .map_err(|e| format!("raon1_mini weights: upload {name}: {e:?}"))
 }
@@ -894,7 +1025,13 @@ impl Pool {
     }
 }
 
-fn f32_weight(gpu: &mut Gpu, data: &[f32], m: usize, k: usize, name: &str) -> Result<WeightTensor, String> {
+fn f32_weight(
+    gpu: &mut Gpu,
+    data: &[f32],
+    m: usize,
+    k: usize,
+    name: &str,
+) -> Result<WeightTensor, String> {
     let buf = upload_f32_named(gpu, data, &[m, k], name)?;
     Ok(WeightTensor {
         buf,
@@ -910,7 +1047,13 @@ fn f32_weight(gpu: &mut Gpu, data: &[f32], m: usize, k: usize, name: &str) -> Re
     })
 }
 
-fn load_proj(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> Result<WeightTensor, String> {
+fn load_proj(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+) -> Result<WeightTensor, String> {
     let mut wt = read_bytes(hfq, name, |info, data| match info.quant_type {
         qt @ (QT_MQ4V2 | QT_Q8F16) => dequant_weight_raw(gpu, qt, data, m, k, MemoryTarget::Device)
             .map_err(|e| format!("raon1_mini weights: upload {name}: {e:?}")),
@@ -962,7 +1105,9 @@ fn load_pool_item(
 ) -> Result<Option<Loaded>, String> {
     let name = spec.name.as_str();
     Ok(Some(match spec.class {
-        TensorClass::ExpertGate | TensorClass::ExpertUp | TensorClass::ExpertDown => return Ok(None),
+        TensorClass::ExpertGate | TensorClass::ExpertUp | TensorClass::ExpertDown => {
+            return Ok(None)
+        }
         TensorClass::Embedding => {
             let (buf, fmt) = read_bytes(hfq, name, |info, data| {
                 load_embedding(gpu, info.quant_type, data, cfg.vocab, cfg.hidden)
@@ -992,7 +1137,12 @@ fn load_pool_item(
     }))
 }
 
-fn load_mhc_site(gpu: &mut Gpu, pool: &mut Pool, p: &str, cfg: &RaonConfig) -> Result<MhcSiteWeights, String> {
+fn load_mhc_site(
+    gpu: &mut Gpu,
+    pool: &mut Pool,
+    p: &str,
+    cfg: &RaonConfig,
+) -> Result<MhcSiteWeights, String> {
     let n = cfg.mhc_streams;
     let w = n * cfg.hidden;
     let m = (n - 1) * (n - 1);
@@ -1131,7 +1281,11 @@ fn check_moe_awq(hfq: &HfqFile, cfg: &RaonConfig, m: &str) -> Result<ExpertAwqHo
             cfg.n_experts
         ));
     }
-    if let Some(v) = read_awq_host(hfq, &format!("{m}.shared_experts.down_proj.weight"), cfg.shared_down_k())? {
+    if let Some(v) = read_awq_host(
+        hfq,
+        &format!("{m}.shared_experts.down_proj.weight"),
+        cfg.shared_down_k(),
+    )? {
         if v[cfg.shared_inter()..].iter().any(|x| *x != 1.0) {
             return Err(format!(
                 "raon1_mini weights: {m}.shared_experts.down_proj: padded AWQ channels must be exactly 1.0"
@@ -1227,10 +1381,9 @@ fn seal_experts(
     let mut metadata = Vec::with_capacity(experts.len());
     for (e, expert) in experts.iter().enumerate() {
         let resource = |name: &str, w: &WeightTensor| {
-            let row = w
-                .gpu_dtype
-                .row_bytes(w.k)
-                .ok_or_else(|| format!("raon1_mini L{layer}: no row layout for {:?}", w.gpu_dtype))?;
+            let row = w.gpu_dtype.row_bytes(w.k).ok_or_else(|| {
+                format!("raon1_mini L{layer}: no row layout for {:?}", w.gpu_dtype)
+            })?;
             ExpertResource::new(
                 format!("model.layers.{layer}.moe.experts.{e}.{name}"),
                 "raon1-resident-v1",
@@ -1258,8 +1411,14 @@ fn seal_experts(
     let mut cache = table
         .prepare_binding(0, 1, gpu.device_id)
         .map_err(|err| format!("raon1_mini L{layer}: expert binding: {err:?}"))?;
-    let gu_ptrs: Vec<u64> = experts.iter().map(|x| x.gate_up.buf.buf.as_ptr() as u64).collect();
-    let dn_ptrs: Vec<u64> = experts.iter().map(|x| x.down.buf.buf.as_ptr() as u64).collect();
+    let gu_ptrs: Vec<u64> = experts
+        .iter()
+        .map(|x| x.gate_up.buf.buf.as_ptr() as u64)
+        .collect();
+    let dn_ptrs: Vec<u64> = experts
+        .iter()
+        .map(|x| x.down.buf.buf.as_ptr() as u64)
+        .collect();
     let gu = ptr_table(gpu, &gu_ptrs, "gate_up ptrs")?;
     let dn = match ptr_table(gpu, &dn_ptrs, "down ptrs") {
         Ok(t) => t,
@@ -1268,7 +1427,14 @@ fn seal_experts(
             return Err(e);
         }
     };
-    if let Err(err) = cache.bind_live(&table, &ResidentExperts(experts), &gu, &dn, down_awq_ptrs, None) {
+    if let Err(err) = cache.bind_live(
+        &table,
+        &ResidentExperts(experts),
+        &gu,
+        &dn,
+        down_awq_ptrs,
+        None,
+    ) {
         free_t(gpu, gu);
         free_t(gpu, dn);
         return Err(format!("raon1_mini L{layer}: bind live experts: {err:?}"));
@@ -1300,7 +1466,12 @@ fn build_moe(
     if awq.down.iter().all(|d| d.is_some()) && cfg.n_experts > 0 {
         for (e, d) in awq.down.iter().enumerate() {
             let v = d.as_ref().expect("checked");
-            match upload_f32_named(gpu, v, &[cfg.moe_down_k], &format!("{m}.experts.{e}.down awq")) {
+            match upload_f32_named(
+                gpu,
+                v,
+                &[cfg.moe_down_k],
+                &format!("{m}.experts.{e}.down awq"),
+            ) {
                 Ok(t) => owners.push(t),
                 Err(er) => {
                     cleanup(gpu, experts, owners);
@@ -1412,7 +1583,12 @@ fn build_layer(
         FfnKind::Moe => RaonFfn::Moe(build_moe(hfq, gpu, cfg, pool, layer)?),
         FfnKind::Dense => {
             let mlp = format!("{lp}.mlp");
-            check_pair_awq_host(hfq, &format!("{mlp}.gate_proj.weight"), &format!("{mlp}.up_proj.weight"), cfg.hidden)?;
+            check_pair_awq_host(
+                hfq,
+                &format!("{mlp}.gate_proj.weight"),
+                &format!("{mlp}.up_proj.weight"),
+                cfg.hidden,
+            )?;
             let g = take_gated(pool, &mlp);
             RaonFfn::Dense(g)
         }
@@ -1479,7 +1655,11 @@ fn build_layer(
 /// the symmetric-MQ4V2 marker (`"mq4v2.symmetric": 1`, header-sampled at
 /// `HfqFile::open`) whenever qt44 tensors are present. On any later error every
 /// buffer uploaded so far is freed.
-pub fn load_raon_weights(hfq: &HfqFile, gpu: &mut Gpu, cfg: &RaonConfig) -> Result<RaonWeights, String> {
+pub fn load_raon_weights(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    cfg: &RaonConfig,
+) -> Result<RaonWeights, String> {
     cfg.validate()?;
     let specs = tensor_inventory(cfg);
     let index: Vec<IndexEntry> = hfq.tensors().iter().map(IndexEntry::from_info).collect();
@@ -1541,7 +1721,10 @@ pub fn load_raon_weights(hfq: &HfqFile, gpu: &mut Gpu, cfg: &RaonConfig) -> Resu
         }
     }
     // Globals: verified present by the gate above (non-layer specs).
-    for s in specs.iter().filter(|s| !s.name.starts_with("model.layers.")) {
+    for s in specs
+        .iter()
+        .filter(|s| !s.name.starts_with("model.layers."))
+    {
         if !pool.kind_ok(s) {
             for built in layers {
                 built.free_gpu(gpu);
@@ -1559,7 +1742,9 @@ pub fn load_raon_weights(hfq: &HfqFile, gpu: &mut Gpu, cfg: &RaonConfig) -> Resu
     };
     let final_norm = pool.take_vec("model.norm.weight");
     let lm_head = pool.take_mat("lm_head.weight");
-    debug_assert!(pool.items.is_empty() || pool.items.keys().all(|k| !pool.has("") || k.is_empty()));
+    debug_assert!(
+        pool.items.is_empty() || pool.items.keys().all(|k| !pool.has("") || k.is_empty())
+    );
     let leftover: Vec<String> = pool.items.keys().cloned().collect();
     if !leftover.is_empty() {
         // Every declared non-expert tensor must have been consumed by assembly.
@@ -1610,7 +1795,9 @@ mod tests {
                             QT_Q8F16
                         }
                     }
-                    TensorClass::ExpertGate | TensorClass::ExpertUp | TensorClass::ExpertDown => QT_MQ4V2,
+                    TensorClass::ExpertGate | TensorClass::ExpertUp | TensorClass::ExpertDown => {
+                        QT_MQ4V2
+                    }
                     _ => QT_BF16,
                 };
                 let (m, k) = match s.shape.as_slice() {
@@ -1679,13 +1866,19 @@ mod tests {
         let specs = tensor_inventory(&released());
         let declared: HashSet<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         for name in &declared {
-            assert!(map.contains_key(*name), "declared {name} not in official index");
+            assert!(
+                map.contains_key(*name),
+                "declared {name} not in official index"
+            );
         }
         for name in map.keys() {
             if name.ends_with(".weight_scale_inv") {
                 continue; // consumed by the quantizer, not part of the HFQ
             }
-            assert!(declared.contains(name.as_str()), "official tensor {name} not declared");
+            assert!(
+                declared.contains(name.as_str()),
+                "official tensor {name} not declared"
+            );
         }
     }
 
@@ -1704,7 +1897,10 @@ mod tests {
         });
         let err = check_inventory(&specs, &idx).unwrap_err();
         assert!(err.contains("missing 2 tensor(s)"), "{err}");
-        assert!(err.contains("model.layers.7.self_attn.kv_b_proj.weight"), "{err}");
+        assert!(
+            err.contains("model.layers.7.self_attn.kv_b_proj.weight"),
+            "{err}"
+        );
         assert!(err.contains("lm_head.weight"), "{err}");
     }
 
@@ -1722,7 +1918,10 @@ mod tests {
             data_size: 5120 * 10 * 136,
         });
         let err = check_inventory(&specs, &idx).unwrap_err();
-        assert!(err.contains("missing") && err.contains("unconsumed"), "{err}");
+        assert!(
+            err.contains("missing") && err.contains("unconsumed"),
+            "{err}"
+        );
         assert!(err.contains("layers.3.self_attn.q_proj.weight"), "{err}");
         // Unpadded routed down.
         let mut idx = good_index(&specs);
@@ -1736,10 +1935,15 @@ mod tests {
         // Wrong payload size.
         let mut idx = good_index(&specs);
         idx.iter_mut()
-            .find(|e| e.name == "model.layers.2.mlp.gate_proj.weight" || e.name == "model.layers.0.mlp.gate_proj.weight")
+            .find(|e| {
+                e.name == "model.layers.2.mlp.gate_proj.weight"
+                    || e.name == "model.layers.0.mlp.gate_proj.weight"
+            })
             .unwrap()
             .data_size -= 136;
-        assert!(check_inventory(&specs, &idx).unwrap_err().contains("payload"));
+        assert!(check_inventory(&specs, &idx)
+            .unwrap_err()
+            .contains("payload"));
         // qt44 on q_b (K=576 not a group multiple) cannot encode.
         let mut idx = good_index(&specs);
         let e = idx
@@ -1747,7 +1951,9 @@ mod tests {
             .find(|e| e.name == "model.layers.3.self_attn.q_b_proj.weight")
             .unwrap();
         e.quant_type = QT_MQ4V2;
-        assert!(check_inventory(&specs, &idx).unwrap_err().contains("cannot encode"));
+        assert!(check_inventory(&specs, &idx)
+            .unwrap_err()
+            .contains("cannot encode"));
         // Non-qt44 routed expert.
         let mut idx = good_index(&specs);
         let e = idx
@@ -1755,7 +1961,9 @@ mod tests {
             .find(|e| e.name == "model.layers.1.moe.experts.0.gate_proj.weight")
             .unwrap();
         e.quant_type = QT_Q8F16;
-        assert!(check_inventory(&specs, &idx).unwrap_err().contains("not admitted"));
+        assert!(check_inventory(&specs, &idx)
+            .unwrap_err()
+            .contains("not admitted"));
     }
 
     #[test]
@@ -1769,7 +1977,10 @@ mod tests {
             data_size: 1088 * 80,
         });
         let err = check_inventory(&specs, &idx).unwrap_err();
-        assert!(err.contains("weight_scale_inv") && err.contains("hipfire quantize"), "{err}");
+        assert!(
+            err.contains("weight_scale_inv") && err.contains("hipfire quantize"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1787,7 +1998,9 @@ mod tests {
         // Wrong width.
         idx.last_mut().unwrap().shape = vec![1088];
         idx.last_mut().unwrap().data_size = 2176;
-        assert!(check_inventory(&specs, &idx).unwrap_err().contains("sidecar must be F16"));
+        assert!(check_inventory(&specs, &idx)
+            .unwrap_err()
+            .contains("sidecar must be F16"));
         // Sidecar on a Q8F16 weight is refused.
         let mut idx = good_index(&specs);
         idx.push(IndexEntry {
@@ -1796,7 +2009,9 @@ mod tests {
             shape: vec![576],
             data_size: 1152,
         });
-        assert!(check_inventory(&specs, &idx).unwrap_err().contains("only qt44"));
+        assert!(check_inventory(&specs, &idx)
+            .unwrap_err()
+            .contains("only qt44"));
         // Orphan sidecar (no weight) is unconsumed.
         let mut idx = good_index(&specs);
         idx.push(IndexEntry {
@@ -1805,7 +2020,9 @@ mod tests {
             shape: vec![2560],
             data_size: 5120,
         });
-        assert!(check_inventory(&specs, &idx).unwrap_err().contains("unconsumed"));
+        assert!(check_inventory(&specs, &idx)
+            .unwrap_err()
+            .contains("unconsumed"));
     }
 
     #[test]

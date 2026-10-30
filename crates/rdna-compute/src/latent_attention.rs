@@ -577,7 +577,9 @@ impl Gpu {
             return Ok(());
         }
         if n_heads == 0 || nope + tail == 0 || v == 0 {
-            return Err(err("latent_attention: heads/query width/value width must be nonzero"));
+            return Err(err(
+                "latent_attention: heads/query width/value width must be nonzero",
+            ));
         }
         if v > LATENT_ATTENTION_SERIAL_MAX_V {
             return Err(err(format!(
@@ -585,12 +587,18 @@ impl Gpu {
             )));
         }
         if n_rows > 65535 || n_heads > 65535 {
-            return Err(err("latent_attention: serial grid (heads, rows) exceeds 65535"));
+            return Err(err(
+                "latent_attention: serial grid (heads, rows) exceeds 65535",
+            ));
         }
         let dqk = nope + tail;
         let width = latent + tail;
         need_dtype(q, DType::F32, "query plane")?;
-        need_numel(q, product(product(n_rows, n_heads, "q")?, dqk, "q")?, "query plane")?;
+        need_numel(
+            q,
+            product(product(n_rows, n_heads, "q")?, dqk, "q")?,
+            "query plane",
+        )?;
         need_dtype(y, DType::F32, "attention output plane")?;
         need_numel(
             y,

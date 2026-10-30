@@ -7,7 +7,8 @@ use rdna_compute::{Gpu, GpuTensor};
 
 use crate::config::RaonConfig;
 use crate::forward::{
-    admit_decode_context, decode_binding, decode_body, forward_rows, forward_token, stage_decode_token, RaonWork,
+    admit_decode_context, decode_binding, decode_body, forward_rows, forward_token,
+    stage_decode_token, RaonWork,
 };
 use crate::state::{RaonPrefillScratch, RaonState, MLA_TILE_ROWS};
 use crate::weights::RaonWeights;
@@ -373,10 +374,25 @@ impl RaonBundle {
     /// is loaded before a capture.
     fn decode_step_graph(&mut self, gpu: &mut Gpu, token: u32, pos: usize) -> Result<(), String> {
         let end = pos + 1;
-        admit_decode_context(&self.config, &self.weights, &mut self.state, &self.scratch, &self.work, gpu, end)?;
+        admit_decode_context(
+            &self.config,
+            &self.weights,
+            &mut self.state,
+            &self.scratch,
+            &self.work,
+            gpu,
+            end,
+        )?;
         stage_decode_token(&self.config, &self.scratch, gpu, token)?;
         if !self.graph.warmed {
-            decode_body(&self.config, &self.weights, &self.state, &self.scratch, &self.work, gpu)?;
+            decode_body(
+                &self.config,
+                &self.weights,
+                &self.state,
+                &self.scratch,
+                &self.work,
+                gpu,
+            )?;
             self.graph.warmed = true;
             return self.state.set_n_tokens(gpu, end);
         }
@@ -397,7 +413,10 @@ impl RaonBundle {
         } else {
             self.graph.replays += 1;
         }
-        let stream = gpu.active_stream.as_ref().expect("decode graph stream just ensured");
+        let stream = gpu
+            .active_stream
+            .as_ref()
+            .expect("decode graph stream just ensured");
         gpu.graphs
             .graph_launch(&gpu.hip, gpu.device_id, stream)
             .map_err(|e| format!("raon1_mini: decode graph launch: {e:?}"))?;
@@ -409,15 +428,31 @@ impl RaonBundle {
     fn record_decode_graph(&mut self, gpu: &mut Gpu, binding: u64) -> Result<(), String> {
         gpu.graphs.drop_captured_graph(&gpu.hip, gpu.device_id);
         self.graph.binding = 0;
-        let stream = gpu.active_stream.as_ref().expect("decode graph stream ensured by caller");
+        let stream = gpu
+            .active_stream
+            .as_ref()
+            .expect("decode graph stream ensured by caller");
         gpu.graphs
             .begin_graph_capture(&gpu.hip, gpu.device_id, stream)
             .map_err(|e| format!("raon1_mini: begin decode graph capture: {e:?}"))?;
-        let body = decode_body(&self.config, &self.weights, &self.state, &self.scratch, &self.work, gpu);
-        let stream = gpu.active_stream.as_ref().expect("decode graph stream ensured by caller");
+        let body = decode_body(
+            &self.config,
+            &self.weights,
+            &self.state,
+            &self.scratch,
+            &self.work,
+            gpu,
+        );
+        let stream = gpu
+            .active_stream
+            .as_ref()
+            .expect("decode graph stream ensured by caller");
         if let Err(e) = body {
-            gpu.graphs.abort_graph_capture(&gpu.hip, gpu.device_id, stream);
-            return Err(format!("raon1_mini: decode graph capture failed (no eager fallback): {e}"));
+            gpu.graphs
+                .abort_graph_capture(&gpu.hip, gpu.device_id, stream);
+            return Err(format!(
+                "raon1_mini: decode graph capture failed (no eager fallback): {e}"
+            ));
         }
         gpu.graphs
             .end_graph_capture(&gpu.hip, gpu.device_id, stream)

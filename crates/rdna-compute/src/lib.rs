@@ -31,17 +31,17 @@ pub mod expert_capabilities;
 pub mod fa_prefill_pm;
 pub mod fa_qprep_pm;
 pub mod feature_flags;
+pub mod ffn_activation;
 #[cfg(feature = "flash-attn-ck")]
 pub mod flash_attn_ck;
 pub mod flux_fused;
-pub mod ffn_activation;
 #[cfg(feature = "deltanet")]
 pub mod fn_gdn_dense;
 pub mod fp8_e4m3;
 pub mod gap_timing;
-pub mod gdn_chunk_prep_pm;
 #[cfg(feature = "deltanet")]
 pub mod gated_delta_vector;
+pub mod gdn_chunk_prep_pm;
 #[cfg(test)]
 mod gdn_q8ef_reference;
 pub mod gemm;
@@ -64,12 +64,6 @@ pub mod hc_row_fold;
 pub mod head_lanes;
 pub mod iu4_c8_pm;
 mod kernel_abi;
-pub mod latent_attention;
-pub mod latent_attention_absorb;
-pub mod latent_attention_decode;
-pub mod latent_attention_flash;
-pub mod latent_attention_tiled;
-pub mod stream_mix;
 pub mod kernel_pack;
 pub mod kernel_registry;
 pub mod kernels;
@@ -78,6 +72,11 @@ pub mod lane_fa;
 pub mod lane_gdn;
 pub mod lane_proj;
 pub mod lane_rows_pm;
+pub mod latent_attention;
+pub mod latent_attention_absorb;
+pub mod latent_attention_decode;
+pub mod latent_attention_flash;
+pub mod latent_attention_tiled;
 pub mod load_phases;
 mod loaded_code_check;
 pub mod moe;
@@ -88,6 +87,7 @@ pub mod moe_slot_ops;
 pub mod norm_fold;
 pub mod residual_lanes;
 pub mod slab_admission;
+pub mod stream_mix;
 pub use slab_admission::{
     qwen4_slab_codec_admitted, qwen4_slab_default_cold_codec, qwen4_slab_layer_cold_codec,
     SlabLayerCodecError,

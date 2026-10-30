@@ -500,12 +500,7 @@ fn copy_d2d(
     }
 }
 
-fn check_free(
-    gpu: &Gpu,
-    need: usize,
-    headroom: usize,
-    what: &str,
-) -> Result<(), String> {
+fn check_free(gpu: &Gpu, need: usize, headroom: usize, what: &str) -> Result<(), String> {
     let (free, total) = hip(gpu.device_mem_info(), "query device memory")?;
     let required = need
         .checked_add(headroom)
@@ -522,7 +517,13 @@ fn check_free(
     Ok(())
 }
 
-fn slab_view(slab: &GpuTensor, off: usize, bytes: usize, dtype: DType, shape: Vec<usize>) -> GpuTensor {
+fn slab_view(
+    slab: &GpuTensor,
+    off: usize,
+    bytes: usize,
+    dtype: DType,
+    shape: Vec<usize>,
+) -> GpuTensor {
     GpuTensor {
         buf: slab.buf.byte_view(off, bytes),
         shape,
@@ -776,7 +777,11 @@ impl RaonState {
         let mut conv_v = Vec::with_capacity(dims.n_rda);
         let plane_bytes = conv_plane_bytes(dims)?;
         let plane_elems = dims.conv_plane_elems();
-        let plane_cols = [dims.heads * dims.k_dim, dims.heads * dims.k_dim, dims.heads * dims.v_dim];
+        let plane_cols = [
+            dims.heads * dims.k_dim,
+            dims.heads * dims.k_dim,
+            dims.heads * dims.v_dim,
+        ];
         for i in 0..dims.n_rda {
             rda.push(slab_view(
                 &persist,
@@ -1137,7 +1142,10 @@ impl RaonState {
         // The old planes are released only after the new ones exist; the
         // free-memory check counts them as reclaimable so a growth near the
         // budget is not refused for the transient overlap alone.
-        let old = self.mirror.as_ref().map_or(0, |m| m.rows * mirror_row_bytes(&d));
+        let old = self
+            .mirror
+            .as_ref()
+            .map_or(0, |m| m.rows * mirror_row_bytes(&d));
         check_free(
             gpu,
             need.saturating_sub(old),
@@ -1166,7 +1174,12 @@ impl RaonState {
             return Err(e);
         }
         self.release_expanded_mirror(gpu)?;
-        self.mirror = Some(ExpandedMirror { rows: target, knope, vmir, plans: None });
+        self.mirror = Some(ExpandedMirror {
+            rows: target,
+            knope,
+            vmir,
+            plans: None,
+        });
         self.mirror_valid_rows = 0;
         Ok(true)
     }
@@ -1224,7 +1237,12 @@ impl RaonState {
                 }
                 return Err(e);
             }
-            self.mirror = Some(ExpandedMirror { rows: 0, knope, vmir, plans: Some(plans) });
+            self.mirror = Some(ExpandedMirror {
+                rows: 0,
+                knope,
+                vmir,
+                plans: Some(plans),
+            });
         }
         let m = self.mirror.as_mut().expect("mirror just reserved");
         let plans = m.plans.expect("VMM mirror has growth plans");

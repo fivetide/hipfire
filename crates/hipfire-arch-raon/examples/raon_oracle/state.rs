@@ -35,8 +35,8 @@ use std::time::Instant;
 
 use super::logits::{check_tokens, load_bundle, read_tokens};
 use hipfire_arch_raon::state::{
-    auto_backend, expanded_mirror_bytes, scratch_plan, state_budget, LatentBackend, RaonPrefillScratch,
-    RaonState, RaonStateDims, ADMISSION_HEADROOM_BYTES,
+    auto_backend, expanded_mirror_bytes, scratch_plan, state_budget, LatentBackend,
+    RaonPrefillScratch, RaonState, RaonStateDims, ADMISSION_HEADROOM_BYTES,
 };
 use rdna_compute::{DType, Gpu};
 use serde_json::{json, Value};
@@ -52,12 +52,20 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
     let forward_mode = match mode {
         "state-only" | "state" => None,
         "serial" | "batched" | "graph" => Some(mode),
-        other => return Err(format!("state: unknown --mode {other} (serial|batched|graph|state-only)")),
+        other => {
+            return Err(format!(
+                "state: unknown --mode {other} (serial|batched|graph|state-only)"
+            ))
+        }
     };
     let ctxs = match opts.get("ctxs") {
         Some(s) => s
             .split(',')
-            .map(|x| x.trim().parse::<usize>().map_err(|e| format!("state: bad ctx {x:?}: {e}")))
+            .map(|x| {
+                x.trim()
+                    .parse::<usize>()
+                    .map_err(|e| format!("state: bad ctx {x:?}: {e}"))
+            })
             .collect::<Result<Vec<_>, _>>()?,
         None => DEFAULT_CTXS.to_vec(),
     };
@@ -73,7 +81,10 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
         });
     };
 
-    record("slot_isolation".into(), check_slot_isolation(&mut gpu, &dims));
+    record(
+        "slot_isolation".into(),
+        check_slot_isolation(&mut gpu, &dims),
+    );
     let mut recurrent_bytes: Vec<(usize, usize)> = Vec::new();
     for &ctx in &ctxs {
         let r = check_ctx_reservation(&mut gpu, &dims, ctx, &mut recurrent_bytes);
@@ -83,16 +94,28 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
         "rda_bytes_constant_in_max_seq".into(),
         check_recurrent_constant(&recurrent_bytes),
     );
-    record("admission_refusal".into(), check_admission_refusal(&mut gpu, &dims));
-    record("admission_262144".into(), check_admission_262144(&mut gpu, &dims));
+    record(
+        "admission_refusal".into(),
+        check_admission_refusal(&mut gpu, &dims),
+    );
+    record(
+        "admission_262144".into(),
+        check_admission_262144(&mut gpu, &dims),
+    );
     record(
         "admission_growth_under_pressure".into(),
         check_growth_pressure(&mut gpu, &dims),
     );
     for rows in [1usize, 512, 1024] {
-        record(format!("scratch_{rows}"), check_scratch(&mut gpu, &dims, rows));
+        record(
+            format!("scratch_{rows}"),
+            check_scratch(&mut gpu, &dims, rows),
+        );
     }
-    record("scratch_rows_limit".into(), check_scratch_limit(&mut gpu, &dims));
+    record(
+        "scratch_rows_limit".into(),
+        check_scratch_limit(&mut gpu, &dims),
+    );
     record("expanded_mirror".into(), check_mirror(&mut gpu, &dims));
     gpu.drain_pool();
     record("vmm_owner_table".into(), check_vmm_clean(&mut gpu));
@@ -152,11 +175,18 @@ pub fn run_forward_mode(
     if mode != "serial" && mode != "batched" && mode != "graph" {
         return Err(format!("forward mode `{mode}`: serial|batched|graph"));
     }
-    let model = opts.get("model").ok_or("state --mode serial|batched|graph: missing --model")?;
-    let tok_path = opts.get("tokens").ok_or("state --mode serial|batched|graph: missing --tokens")?;
+    let model = opts
+        .get("model")
+        .ok_or("state --mode serial|batched|graph: missing --model")?;
+    let tok_path = opts
+        .get("tokens")
+        .ok_or("state --mode serial|batched|graph: missing --tokens")?;
     let tokens = read_tokens(tok_path)?;
     let steps = match opts.get("steps") {
-        Some(s) => s.trim().parse::<usize>().map_err(|e| format!("state: bad --steps {s:?}: {e}"))?,
+        Some(s) => s
+            .trim()
+            .parse::<usize>()
+            .map_err(|e| format!("state: bad --steps {s:?}: {e}"))?,
         None => 256,
     };
     if mode == "graph" && steps == 0 {
@@ -202,7 +232,12 @@ struct FwdSnap {
     secs: f64,
 }
 
-fn fwd_mode_inner(gpu: &mut Gpu, bundle: &mut RaonBundle, mode: &str, tokens: &[u32]) -> Result<Value, String> {
+fn fwd_mode_inner(
+    gpu: &mut Gpu,
+    bundle: &mut RaonBundle,
+    mode: &str,
+    tokens: &[u32],
+) -> Result<Value, String> {
     check_tokens(tokens, bundle.config.vocab, "tokens")?;
     let n = tokens.len();
     let mut out = json!({
@@ -256,7 +291,12 @@ fn fwd_mode_inner(gpu: &mut Gpu, bundle: &mut RaonBundle, mode: &str, tokens: &[
 }
 
 /// Reset, run `tokens` through `route`, synchronize and capture the state.
-fn fwd_run_route(gpu: &mut Gpu, b: &mut RaonBundle, tokens: &[u32], route: FwdRoute) -> Result<FwdSnap, String> {
+fn fwd_run_route(
+    gpu: &mut Gpu,
+    b: &mut RaonBundle,
+    tokens: &[u32],
+    route: FwdRoute,
+) -> Result<FwdSnap, String> {
     b.reset(gpu)?;
     b.state.ensure_capacity(gpu, tokens.len())?;
     let t0 = Instant::now();
@@ -353,7 +393,11 @@ fn decode_arm(
         captures: 0,
         replays: 0,
         decode_secs: 0.0,
-        snap: FwdSnap { items: Vec::new(), n_tokens: 0, secs: 0.0 },
+        snap: FwdSnap {
+            items: Vec::new(),
+            n_tokens: 0,
+            secs: 0.0,
+        },
     };
     let record = |arm: &mut DecodeArm, logits: &[f32]| -> Vec<u8> {
         let bytes: Vec<u8> = logits.iter().flat_map(|x| x.to_le_bytes()).collect();
@@ -367,7 +411,10 @@ fn decode_arm(
         }
         bytes
     };
-    let mut logits = hip_err(gpu.download_f32(&b.scratch.logits), "download prefill logits")?;
+    let mut logits = hip_err(
+        gpu.download_f32(&b.scratch.logits),
+        "download prefill logits",
+    )?;
     let bytes = record(&mut arm, &logits);
     if reference.is_none() {
         arm.kept_logits.push(bytes);
@@ -377,7 +424,10 @@ fn decode_arm(
         let tok = first_argmax(&logits);
         arm.tokens.push(tok);
         b.decode_step(gpu, tok)?;
-        logits = hip_err(gpu.download_f32(&b.scratch.logits), "download decode logits")?;
+        logits = hip_err(
+            gpu.download_f32(&b.scratch.logits),
+            "download decode logits",
+        )?;
         let bytes = record(&mut arm, &logits);
         if reference.is_none() {
             arm.kept_logits.push(bytes);
@@ -421,7 +471,10 @@ fn decode_loop_secs(
     for _ in 0..2 {
         b.decode_step(gpu, tok)?;
     }
-    hip_err(gpu.hip.device_synchronize(), "synchronize before timed loop")?;
+    hip_err(
+        gpu.hip.device_synchronize(),
+        "synchronize before timed loop",
+    )?;
     let t0 = Instant::now();
     for _ in 0..n {
         b.decode_step(gpu, tok)?;
@@ -456,7 +509,12 @@ fn arm_json(a: &DecodeArm) -> Value {
 ///   must replay (zero new captures when the bucket did not change).
 /// * `short_after_reset`: half the prompt, `min(steps, 64)` steps, same
 ///   recording; a stale position or length would diverge the logits.
-fn fwd_graph(gpu: &mut Gpu, bundle: &mut RaonBundle, tokens: &[u32], steps: usize) -> Result<Value, String> {
+fn fwd_graph(
+    gpu: &mut Gpu,
+    bundle: &mut RaonBundle,
+    tokens: &[u32],
+    steps: usize,
+) -> Result<Value, String> {
     check_tokens(tokens, bundle.config.vocab, "tokens")?;
     let mut cases = Vec::new();
     let mut pass = true;
@@ -468,7 +526,15 @@ fn fwd_graph(gpu: &mut Gpu, bundle: &mut RaonBundle, tokens: &[u32], steps: usiz
     ];
     for (name, prompt, n_steps, fresh) in plan {
         let eager = decode_arm(gpu, bundle, prompt, n_steps, DecodeMode::Eager, fresh, None)?;
-        let arm = decode_arm(gpu, bundle, prompt, n_steps, DecodeMode::Graph, fresh, Some(&eager.kept_logits))?;
+        let arm = decode_arm(
+            gpu,
+            bundle,
+            prompt,
+            n_steps,
+            DecodeMode::Graph,
+            fresh,
+            Some(&eager.kept_logits),
+        )?;
         let state = fwd_compare(&eager.snap, &arm.snap)?;
         let state_equal = state["bitwise_equal"].as_bool() == Some(true);
         let tokens_equal = arm.tokens == eager.tokens;
@@ -540,11 +606,20 @@ fn fwd_capture(gpu: &Gpu, b: &RaonBundle, secs: f64) -> Result<FwdSnap, String> 
             elem: FwdElem::F32,
             bytes: read_bytes(gpu, r, 0, r.size(), &format!("capture rda[{i}]"))?,
         });
-        for (p, c) in [&st.conv_q[i], &st.conv_k[i], &st.conv_v[i]].into_iter().enumerate() {
+        for (p, c) in [&st.conv_q[i], &st.conv_k[i], &st.conv_v[i]]
+            .into_iter()
+            .enumerate()
+        {
             items.push(FwdItem {
                 name: format!("conv_{}[{i}]", ["q", "k", "v"][p]),
                 elem: FwdElem::F32,
-                bytes: read_bytes(gpu, &c.buf, 0, c.buf.size(), &format!("capture conv{p}[{i}]"))?,
+                bytes: read_bytes(
+                    gpu,
+                    &c.buf,
+                    0,
+                    c.buf.size(),
+                    &format!("capture conv{p}[{i}]"),
+                )?,
             });
         }
     }
@@ -553,7 +628,13 @@ fn fwd_capture(gpu: &Gpu, b: &RaonBundle, secs: f64) -> Result<FwdSnap, String> 
         items.push(FwdItem {
             name: format!("latent[{l}]"),
             elem: FwdElem::Bf16,
-            bytes: read_bytes(gpu, &t.buf, 0, n * rb, &format!("capture latent[{l}] rows [0,{n})"))?,
+            bytes: read_bytes(
+                gpu,
+                &t.buf,
+                0,
+                n * rb,
+                &format!("capture latent[{l}] rows [0,{n})"),
+            )?,
         });
     }
     let logits = hip_err(gpu.download_f32(&b.scratch.logits), "capture logits")?;
@@ -589,7 +670,10 @@ fn fwd_values(elem: FwdElem, bytes: &[u8]) -> impl Iterator<Item = f32> + '_ {
 fn fwd_route_json(s: &FwdSnap) -> Value {
     let mut fp = serde_json::Map::new();
     for it in &s.items {
-        fp.insert(it.name.clone(), json!(format!("{:016x}", fwd_fnv1a(&it.bytes))));
+        fp.insert(
+            it.name.clone(),
+            json!(format!("{:016x}", fwd_fnv1a(&it.bytes))),
+        );
     }
     json!({
         "n_tokens": s.n_tokens,
@@ -642,7 +726,11 @@ fn fwd_logits_cross(a: &FwdSnap, b: &FwdSnap) -> Result<(f64, bool, bool), Strin
 /// Per-tensor comparison of two snapshots (names/sizes must match).
 fn fwd_compare(a: &FwdSnap, b: &FwdSnap) -> Result<Value, String> {
     if a.items.len() != b.items.len() {
-        return Err(format!("snapshots differ in tensor count: {} vs {}", a.items.len(), b.items.len()));
+        return Err(format!(
+            "snapshots differ in tensor count: {} vs {}",
+            a.items.len(),
+            b.items.len()
+        ));
     }
     let mut all_equal = true;
     let mut differing = 0usize;
@@ -651,10 +739,17 @@ fn fwd_compare(a: &FwdSnap, b: &FwdSnap) -> Result<Value, String> {
     let mut tensors = Vec::with_capacity(a.items.len());
     for (x, y) in a.items.iter().zip(&b.items) {
         if x.name != y.name || x.elem != y.elem || x.bytes.len() != y.bytes.len() {
-            return Err(format!("snapshot tensor mismatch: {} ({} B) vs {} ({} B)", x.name, x.bytes.len(), y.name, y.bytes.len()));
+            return Err(format!(
+                "snapshot tensor mismatch: {} ({} B) vs {} ({} B)",
+                x.name,
+                x.bytes.len(),
+                y.name,
+                y.bytes.len()
+            ));
         }
         let equal = x.bytes == y.bytes;
-        let (mut max_abs, mut peak, mut dd, mut bb, mut nonfinite) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0usize);
+        let (mut max_abs, mut peak, mut dd, mut bb, mut nonfinite) =
+            (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0usize);
         if !equal {
             for (p, q) in fwd_values(x.elem, &x.bytes).zip(fwd_values(y.elem, &y.bytes)) {
                 if !p.is_finite() || !q.is_finite() {
@@ -736,13 +831,26 @@ fn write_pat(
     hip_err(gpu.hip.memcpy_htod(&v, &host), label)
 }
 
-fn fill_const(gpu: &Gpu, buf: &DeviceBuffer, off: usize, len: usize, val: u8, label: &str) -> Result<(), String> {
+fn fill_const(
+    gpu: &Gpu,
+    buf: &DeviceBuffer,
+    off: usize,
+    len: usize,
+    val: u8,
+    label: &str,
+) -> Result<(), String> {
     let host = vec![val; len];
     let v = view(buf, off, len, label)?;
     hip_err(gpu.hip.memcpy_htod(&v, &host), label)
 }
 
-fn read_bytes(gpu: &Gpu, buf: &DeviceBuffer, off: usize, len: usize, label: &str) -> Result<Vec<u8>, String> {
+fn read_bytes(
+    gpu: &Gpu,
+    buf: &DeviceBuffer,
+    off: usize,
+    len: usize,
+    label: &str,
+) -> Result<Vec<u8>, String> {
     let v = view(buf, off, len, label)?;
     let mut host = vec![0u8; len];
     hip_err(gpu.hip.memcpy_dtoh(&mut host, &v), label)?;
@@ -771,7 +879,14 @@ fn check_pat(
     Ok(())
 }
 
-fn check_const(gpu: &Gpu, buf: &DeviceBuffer, off: usize, len: usize, val: u8, label: &str) -> Result<(), String> {
+fn check_const(
+    gpu: &Gpu,
+    buf: &DeviceBuffer,
+    off: usize,
+    len: usize,
+    val: u8,
+    label: &str,
+) -> Result<(), String> {
     let host = read_bytes(gpu, buf, off, len, label)?;
     if let Some(k) = host.iter().position(|&b| b != val) {
         return Err(format!(
@@ -800,10 +915,29 @@ fn row_seed(slot: u64, layer: usize) -> u64 {
 fn fill_recurrent(gpu: &Gpu, st: &RaonState, slot: u64) -> Result<(), String> {
     for i in 0..st.dims().n_rda {
         let r = &st.rda[i].buf;
-        write_pat(gpu, r, 0, r.size(), rda_seed(slot, i), 0, &format!("fill rda[{i}]"))?;
-        for (p, c) in [&st.conv_q[i], &st.conv_k[i], &st.conv_v[i]].into_iter().enumerate() {
+        write_pat(
+            gpu,
+            r,
+            0,
+            r.size(),
+            rda_seed(slot, i),
+            0,
+            &format!("fill rda[{i}]"),
+        )?;
+        for (p, c) in [&st.conv_q[i], &st.conv_k[i], &st.conv_v[i]]
+            .into_iter()
+            .enumerate()
+        {
             let c = &c.buf;
-            write_pat(gpu, c, 0, c.size(), conv_seed(slot, i) ^ ((p as u64) << 40), 0, &format!("fill conv{p}[{i}]"))?;
+            write_pat(
+                gpu,
+                c,
+                0,
+                c.size(),
+                conv_seed(slot, i) ^ ((p as u64) << 40),
+                0,
+                &format!("fill conv{p}[{i}]"),
+            )?;
         }
     }
     Ok(())
@@ -812,10 +946,29 @@ fn fill_recurrent(gpu: &Gpu, st: &RaonState, slot: u64) -> Result<(), String> {
 fn verify_recurrent(gpu: &Gpu, st: &RaonState, slot: u64, label: &str) -> Result<(), String> {
     for i in 0..st.dims().n_rda {
         let r = &st.rda[i].buf;
-        check_pat(gpu, r, 0, r.size(), rda_seed(slot, i), 0, &format!("{label}: rda[{i}]"))?;
-        for (p, c) in [&st.conv_q[i], &st.conv_k[i], &st.conv_v[i]].into_iter().enumerate() {
+        check_pat(
+            gpu,
+            r,
+            0,
+            r.size(),
+            rda_seed(slot, i),
+            0,
+            &format!("{label}: rda[{i}]"),
+        )?;
+        for (p, c) in [&st.conv_q[i], &st.conv_k[i], &st.conv_v[i]]
+            .into_iter()
+            .enumerate()
+        {
             let c = &c.buf;
-            check_pat(gpu, c, 0, c.size(), conv_seed(slot, i) ^ ((p as u64) << 40), 0, &format!("{label}: conv{p}[{i}]"))?;
+            check_pat(
+                gpu,
+                c,
+                0,
+                c.size(),
+                conv_seed(slot, i) ^ ((p as u64) << 40),
+                0,
+                &format!("{label}: conv{p}[{i}]"),
+            )?;
         }
     }
     Ok(())
@@ -825,7 +978,10 @@ fn verify_recurrent_zero(gpu: &Gpu, st: &RaonState, label: &str) -> Result<(), S
     for i in 0..st.dims().n_rda {
         let r = &st.rda[i].buf;
         check_const(gpu, r, 0, r.size(), 0, &format!("{label}: rda[{i}]"))?;
-        for (p, c) in [&st.conv_q[i], &st.conv_k[i], &st.conv_v[i]].into_iter().enumerate() {
+        for (p, c) in [&st.conv_q[i], &st.conv_k[i], &st.conv_v[i]]
+            .into_iter()
+            .enumerate()
+        {
             let c = &c.buf;
             check_const(gpu, c, 0, c.size(), 0, &format!("{label}: conv{p}[{i}]"))?;
         }
@@ -833,7 +989,13 @@ fn verify_recurrent_zero(gpu: &Gpu, st: &RaonState, label: &str) -> Result<(), S
     Ok(())
 }
 
-fn write_rows(gpu: &Gpu, st: &RaonState, slot: u64, row0: usize, nrows: usize) -> Result<(), String> {
+fn write_rows(
+    gpu: &Gpu,
+    st: &RaonState,
+    slot: u64,
+    row0: usize,
+    nrows: usize,
+) -> Result<(), String> {
     let rb = st.dims().latent_row_bytes();
     for (l, t) in st.mla_cache.iter().enumerate() {
         write_pat(
@@ -849,7 +1011,14 @@ fn write_rows(gpu: &Gpu, st: &RaonState, slot: u64, row0: usize, nrows: usize) -
     Ok(())
 }
 
-fn verify_rows(gpu: &Gpu, st: &RaonState, slot: u64, row0: usize, nrows: usize, label: &str) -> Result<(), String> {
+fn verify_rows(
+    gpu: &Gpu,
+    st: &RaonState,
+    slot: u64,
+    row0: usize,
+    nrows: usize,
+    label: &str,
+) -> Result<(), String> {
     let rb = st.dims().latent_row_bytes();
     for (l, t) in st.mla_cache.iter().enumerate() {
         check_pat(
@@ -868,15 +1037,35 @@ fn verify_rows(gpu: &Gpu, st: &RaonState, slot: u64, row0: usize, nrows: usize, 
 fn poison_rows(gpu: &Gpu, st: &RaonState, row0: usize, row1: usize) -> Result<(), String> {
     let rb = st.dims().latent_row_bytes();
     for (l, t) in st.mla_cache.iter().enumerate() {
-        fill_const(gpu, &t.buf, row0 * rb, (row1 - row0) * rb, 0xFF, &format!("poison l{l}"))?;
+        fill_const(
+            gpu,
+            &t.buf,
+            row0 * rb,
+            (row1 - row0) * rb,
+            0xFF,
+            &format!("poison l{l}"),
+        )?;
     }
     Ok(())
 }
 
-fn verify_poison(gpu: &Gpu, st: &RaonState, row0: usize, row1: usize, label: &str) -> Result<(), String> {
+fn verify_poison(
+    gpu: &Gpu,
+    st: &RaonState,
+    row0: usize,
+    row1: usize,
+    label: &str,
+) -> Result<(), String> {
     let rb = st.dims().latent_row_bytes();
     for (l, t) in st.mla_cache.iter().enumerate() {
-        check_const(gpu, &t.buf, row0 * rb, (row1 - row0) * rb, 0xFF, &format!("{label}: poison l{l}"))?;
+        check_const(
+            gpu,
+            &t.buf,
+            row0 * rb,
+            (row1 - row0) * rb,
+            0xFF,
+            &format!("{label}: poison l{l}"),
+        )?;
     }
     Ok(())
 }
@@ -911,10 +1100,18 @@ fn free_bytes(gpu: &Gpu) -> Result<usize, String> {
 /// Physical delta must cover the ledger and not exceed it by more than
 /// allocator rounding. Skipped on unified-memory parts whose free figure is a
 /// host-RAM estimate.
-fn check_delta(gpu: &Gpu, before: usize, after: usize, ledger_physical: usize, label: &str) -> Result<Value, String> {
+fn check_delta(
+    gpu: &Gpu,
+    before: usize,
+    after: usize,
+    ledger_physical: usize,
+    label: &str,
+) -> Result<Value, String> {
     let delta = before.saturating_sub(after);
     if gpu.arch == "gfx1151" {
-        return Ok(json!({"label": label, "delta_bytes": delta, "ledger_bytes": ledger_physical, "enforced": false}));
+        return Ok(
+            json!({"label": label, "delta_bytes": delta, "ledger_bytes": ledger_physical, "enforced": false}),
+        );
     }
     let slack = 64 * MIB;
     if delta + 4 * MIB < ledger_physical || delta > ledger_physical + slack {
@@ -922,7 +1119,9 @@ fn check_delta(gpu: &Gpu, before: usize, after: usize, ledger_physical: usize, l
             "{label}: physical delta {delta} B vs ledger {ledger_physical} B (allowed -4 MiB..+64 MiB)"
         ));
     }
-    Ok(json!({"label": label, "delta_bytes": delta, "ledger_bytes": ledger_physical, "enforced": true}))
+    Ok(
+        json!({"label": label, "delta_bytes": delta, "ledger_bytes": ledger_physical, "enforced": true}),
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -968,7 +1167,15 @@ fn check_slot_isolation(gpu: &mut Gpu, dims: &RaonStateDims) -> Check {
             write_rows(gpu, &a, A, la_now, 1)?;
             la_now += 1;
             a.set_n_tokens(gpu, la_now)?;
-            write_pat(gpu, &a.rda[0].buf, 0, a.rda[0].buf.size(), rda_seed(A, 0) ^ (s as u64 + 1), 0, "a rda step")?;
+            write_pat(
+                gpu,
+                &a.rda[0].buf,
+                0,
+                a.rda[0].buf.size(),
+                rda_seed(A, 0) ^ (s as u64 + 1),
+                0,
+                "a rda step",
+            )?;
             write_rows(gpu, &b, B, lb_now, 1)?;
             lb_now += 1;
             b.set_n_tokens(gpu, lb_now)?;
@@ -980,7 +1187,15 @@ fn check_slot_isolation(gpu: &mut Gpu, dims: &RaonStateDims) -> Check {
             }
         }
         // restore a's layer-0 expected content for the plain verify below.
-        write_pat(gpu, &a.rda[0].buf, 0, a.rda[0].buf.size(), rda_seed(A, 0), 0, "a rda restore")?;
+        write_pat(
+            gpu,
+            &a.rda[0].buf,
+            0,
+            a.rda[0].buf.size(),
+            rda_seed(A, 0),
+            0,
+            "a rda restore",
+        )?;
         expect_seq(gpu, &a, la_now, "a after interleave")?;
         expect_seq(gpu, &b, lb_now, "b after interleave")?;
         if la_now == lb_now {
@@ -1005,10 +1220,18 @@ fn check_slot_isolation(gpu: &mut Gpu, dims: &RaonStateDims) -> Check {
 
         // Failed admission: beyond the reservation. Slot is untouched.
         let mapped_a = mapped_bytes(gpu, &a);
-        let ptrs_a: Vec<usize> = a.mla_cache.iter().map(|t| t.buf.as_ptr() as usize).collect();
+        let ptrs_a: Vec<usize> = a
+            .mla_cache
+            .iter()
+            .map(|t| t.buf.as_ptr() as usize)
+            .collect();
         match a.ensure_capacity(gpu, max_seq + 1) {
             Err(e) if e.contains("max_seq") => {}
-            other => return Err(format!("ensure_capacity beyond reservation must be refused, got {other:?}")),
+            other => {
+                return Err(format!(
+                    "ensure_capacity beyond reservation must be refused, got {other:?}"
+                ))
+            }
         }
         if a.set_n_tokens(gpu, max_seq + 1).is_ok() {
             return Err("set_n_tokens beyond reservation must be refused".into());
@@ -1023,26 +1246,46 @@ fn check_slot_isolation(gpu: &mut Gpu, dims: &RaonStateDims) -> Check {
         // Abort/reset b: recurrent+conv zero, length 0, mappings and addresses
         // unchanged, neighbor a bit-identical.
         let mapped_b = mapped_bytes(gpu, &b);
-        let ptrs_b: Vec<usize> = b.mla_cache.iter().map(|t| t.buf.as_ptr() as usize).collect();
+        let ptrs_b: Vec<usize> = b
+            .mla_cache
+            .iter()
+            .map(|t| t.buf.as_ptr() as usize)
+            .collect();
         b.reset(gpu)?;
         expect_seq(gpu, &b, 0, "b after reset")?;
         verify_recurrent_zero(gpu, &b, "b after reset")?;
         if mapped_bytes(gpu, &b) != mapped_b
-            || b.mla_cache.iter().map(|t| t.buf.as_ptr() as usize).collect::<Vec<_>>() != ptrs_b
+            || b.mla_cache
+                .iter()
+                .map(|t| t.buf.as_ptr() as usize)
+                .collect::<Vec<_>>()
+                != ptrs_b
         {
             return Err("reset unmapped or moved a latent cache".into());
         }
         verify_recurrent(gpu, &a, A, "a after b reset")?;
         verify_rows(gpu, &a, A, 0, la_now, "a rows after b reset")?;
         expect_seq(gpu, &a, la_now, "a after b reset")?;
-        if a.mla_cache.iter().map(|t| t.buf.as_ptr() as usize).collect::<Vec<_>>() != ptrs_a {
+        if a.mla_cache
+            .iter()
+            .map(|t| t.buf.as_ptr() as usize)
+            .collect::<Vec<_>>()
+            != ptrs_a
+        {
             return Err("a latent cache address moved".into());
         }
         // Reuse b for a short new request and make sure nothing of the old
         // request is visible through the recurrent block, then scrub.
         b.scrub_latent(gpu)?;
         let cb2 = b.capacity_rows();
-        check_const(gpu, &b.mla_cache[0].buf, 0, cb2 * dims.latent_row_bytes(), 0, "b scrub")?;
+        check_const(
+            gpu,
+            &b.mla_cache[0].buf,
+            0,
+            cb2 * dims.latent_row_bytes(),
+            0,
+            "b scrub",
+        )?;
         write_rows(gpu, &b, B ^ 0x99, 0, 2)?;
         b.set_n_tokens(gpu, 2)?;
         verify_rows(gpu, &b, B ^ 0x99, 0, 2, "b new request")?;
@@ -1097,7 +1340,8 @@ fn check_ctx_reservation(
             ));
         }
         let delta_initial = check_delta(gpu, free0, free1, initial, "initial")?;
-        let rda_conv = ledger.physical_with_prefix("rda_state") + ledger.physical_with_prefix("conv_history");
+        let rda_conv =
+            ledger.physical_with_prefix("rda_state") + ledger.physical_with_prefix("conv_history");
         recurrent.push((ctx, rda_conv));
         let latent_virtual: usize = (0..dims.n_mla)
             .map(|i| {
@@ -1138,12 +1382,22 @@ fn check_ctx_reservation(
             verify_rows(gpu, &st, 0x52, cap0, 1, "first new row")?;
             st.ensure_capacity(gpu, ctx)?;
             if st.capacity_rows() != ctx {
-                return Err(format!("capacity {} != ctx {ctx} after full growth", st.capacity_rows()));
+                return Err(format!(
+                    "capacity {} != ctx {ctx} after full growth",
+                    st.capacity_rows()
+                ));
             }
             write_rows(gpu, &st, 0x53, ctx - 1, 1)?;
             verify_rows(gpu, &st, 0x53, ctx - 1, 1, "last row")?;
             verify_rows(gpu, &st, 0x51, 0, head, "head after full growth")?;
-            verify_rows(gpu, &st, 0x51, cap0 - 1, 1, "boundary row after full growth")?;
+            verify_rows(
+                gpu,
+                &st,
+                0x51,
+                cap0 - 1,
+                1,
+                "boundary row after full growth",
+            )?;
             verify_rows(gpu, &st, 0x52, cap0, 1, "first new row after full growth")?;
             if st.ensure_capacity(gpu, ctx + 1).is_ok() {
                 return Err("ensure_capacity(ctx+1) must be refused".into());
@@ -1200,10 +1454,15 @@ fn check_recurrent_constant(per_ctx: &[(usize, usize)]) -> Check {
     }
     for &(ctx, b) in per_ctx {
         if b != first {
-            return Err(format!("recurrent bytes at ctx {ctx} = {b}, at ctx {} = {first}", per_ctx[0].0));
+            return Err(format!(
+                "recurrent bytes at ctx {ctx} = {b}, at ctx {} = {first}",
+                per_ctx[0].0
+            ));
         }
     }
-    Ok(json!({"rda_plus_conv_bytes": first, "rda_bytes": expected_rda, "ctxs": per_ctx.iter().map(|c| c.0).collect::<Vec<_>>()}))
+    Ok(
+        json!({"rda_plus_conv_bytes": first, "rda_bytes": expected_rda, "ctxs": per_ctx.iter().map(|c| c.0).collect::<Vec<_>>()}),
+    )
 }
 
 fn check_admission_refusal(gpu: &mut Gpu, dims: &RaonStateDims) -> Check {
@@ -1213,7 +1472,11 @@ fn check_admission_refusal(gpu: &mut Gpu, dims: &RaonStateDims) -> Check {
     match RaonState::new(gpu, dims, ctx) {
         Ok(st) => {
             let _ = st.free_gpu(gpu);
-            Err(format!("max_seq {ctx} ({} MiB latent) must be refused with {} MiB free", ctx * row_all / MIB, free0 / MIB))
+            Err(format!(
+                "max_seq {ctx} ({} MiB latent) must be refused with {} MiB free",
+                ctx * row_all / MIB,
+                free0 / MIB
+            ))
         }
         Err(e) => {
             if !e.contains("refused") {
@@ -1221,7 +1484,9 @@ fn check_admission_refusal(gpu: &mut Gpu, dims: &RaonStateDims) -> Check {
             }
             let free1 = free_bytes(gpu)?;
             if free0.abs_diff(free1) > 16 * MIB {
-                return Err(format!("refused admission changed free memory {free0} -> {free1}"));
+                return Err(format!(
+                    "refused admission changed free memory {free0} -> {free1}"
+                ));
             }
             Ok(json!({"max_seq": ctx, "message": e}))
         }
@@ -1232,7 +1497,9 @@ fn check_admission_262144(gpu: &mut Gpu, dims: &RaonStateDims) -> Check {
     let ctx = 262_144;
     let backend = auto_backend(gpu);
     let gran = match backend {
-        LatentBackend::Vmm => gpu.vmm_recommended_granularity().map_err(|e| format!("granularity: {e:?}"))?,
+        LatentBackend::Vmm => gpu
+            .vmm_recommended_granularity()
+            .map_err(|e| format!("granularity: {e:?}"))?,
         LatentBackend::Dense => 1,
     };
     let budget = state_budget(dims, ctx, backend, gran)?;
@@ -1244,7 +1511,9 @@ fn check_admission_262144(gpu: &mut Gpu, dims: &RaonStateDims) -> Check {
         Ok(mut st) => {
             if !supported && gpu.arch != "gfx1151" {
                 let _ = st.free_gpu(gpu);
-                return Err(format!("262144 admitted although need {need} B > free {free} B"));
+                return Err(format!(
+                    "262144 admitted although need {need} B > free {free} B"
+                ));
             }
             let r = (|| -> Check {
                 st.ensure_capacity(gpu, ctx)?;
@@ -1253,7 +1522,9 @@ fn check_admission_262144(gpu: &mut Gpu, dims: &RaonStateDims) -> Check {
                 }
                 write_rows(gpu, &st, 0x262, ctx - 1, 1)?;
                 verify_rows(gpu, &st, 0x262, ctx - 1, 1, "row 262143")?;
-                Ok(json!({"outcome": "admitted", "need_bytes": need, "free_bytes": free, "latent_mib": st.bytes_ledger(gpu).physical_with_prefix("latent_cache") / MIB}))
+                Ok(
+                    json!({"outcome": "admitted", "need_bytes": need, "free_bytes": free, "latent_mib": st.bytes_ledger(gpu).physical_with_prefix("latent_cache") / MIB}),
+                )
             })();
             let f = st.free_gpu(gpu);
             gpu.drain_pool();
@@ -1265,7 +1536,9 @@ fn check_admission_262144(gpu: &mut Gpu, dims: &RaonStateDims) -> Check {
         }
         Err(e) => {
             if supported {
-                return Err(format!("262144 refused although need {need} B <= free {free} B: {e}"));
+                return Err(format!(
+                    "262144 refused although need {need} B <= free {free} B: {e}"
+                ));
             }
             if !e.contains("refused") {
                 return Err(format!("262144 refusal is not a named refusal: {e}"));
@@ -1295,16 +1568,25 @@ fn check_growth_pressure(gpu: &mut Gpu, dims: &RaonStateDims) -> Check {
         let free_now = free_bytes(gpu)?;
         let keep = needed / 2 + 64 * MIB;
         if free_now <= keep + 64 * MIB || gpu.arch == "gfx1151" {
-            return Ok(json!({"skipped": "not enough free memory for a ballast test or UMA device", "free_bytes": free_now}));
+            return Ok(
+                json!({"skipped": "not enough free memory for a ballast test or UMA device", "free_bytes": free_now}),
+            );
         }
-        let ballast = hip_err(gpu.alloc_tensor_exact(&[free_now - keep], DType::Raw), "alloc ballast")?;
+        let ballast = hip_err(
+            gpu.alloc_tensor_exact(&[free_now - keep], DType::Raw),
+            "alloc ballast",
+        )?;
         let outcome = (|| -> Check {
             let before = mapped_bytes(gpu, &st);
             let cap = st.capacity_rows();
             write_rows(gpu, &st, 0x77, 0, 4)?;
             match st.ensure_capacity(gpu, ctx) {
                 Err(e) if e.contains("refused") => {}
-                other => return Err(format!("growth under pressure must be refused, got {other:?}")),
+                other => {
+                    return Err(format!(
+                        "growth under pressure must be refused, got {other:?}"
+                    ))
+                }
             }
             if mapped_bytes(gpu, &st) != before || st.capacity_rows() != cap {
                 return Err("refused growth mutated the mapped extent".into());
@@ -1338,31 +1620,97 @@ fn check_scratch(gpu: &mut Gpu, dims: &RaonStateDims, rows: usize) -> Check {
     let sc = RaonPrefillScratch::new(gpu, dims, rows)?;
     let r = (|| -> Check {
         let free1 = free_bytes(gpu)?;
-        if sc.bytes() != plan.total_bytes || sc.bytes() != RaonPrefillScratch::required_bytes(dims, rows)? {
+        if sc.bytes() != plan.total_bytes
+            || sc.bytes() != RaonPrefillScratch::required_bytes(dims, rows)?
+        {
             return Err("scratch bytes != plan bytes".into());
         }
         let delta = check_delta(gpu, free0, free1, sc.bytes(), "scratch")?;
         // Views follow the plan and start zeroed.
         let base = sc.token_ids.buf.as_ptr() as usize;
         for (name, ptr, len) in [
-            ("positions", sc.positions.buf.as_ptr() as usize, sc.positions.buf.size()),
-            ("stream_a", sc.stream_a.buf.as_ptr() as usize, sc.stream_a.buf.size()),
-            ("stream_b", sc.stream_b.buf.as_ptr() as usize, sc.stream_b.buf.size()),
-            ("mla_kv_tile", sc.mla_kv_tile.buf.as_ptr() as usize, sc.mla_kv_tile.buf.size()),
-            ("logits", sc.logits.buf.as_ptr() as usize, sc.logits.buf.size()),
+            (
+                "positions",
+                sc.positions.buf.as_ptr() as usize,
+                sc.positions.buf.size(),
+            ),
+            (
+                "stream_a",
+                sc.stream_a.buf.as_ptr() as usize,
+                sc.stream_a.buf.size(),
+            ),
+            (
+                "stream_b",
+                sc.stream_b.buf.as_ptr() as usize,
+                sc.stream_b.buf.size(),
+            ),
+            (
+                "mla_kv_tile",
+                sc.mla_kv_tile.buf.as_ptr() as usize,
+                sc.mla_kv_tile.buf.size(),
+            ),
+            (
+                "logits",
+                sc.logits.buf.as_ptr() as usize,
+                sc.logits.buf.size(),
+            ),
         ] {
-            let e = plan.entry(name).ok_or_else(|| format!("plan lacks {name}"))?;
+            let e = plan
+                .entry(name)
+                .ok_or_else(|| format!("plan lacks {name}"))?;
             if ptr != base + e.offset || len != e.bytes {
-                return Err(format!("{name}: view does not match plan (ptr off {} vs {}, len {len} vs {})", ptr.wrapping_sub(base), e.offset, e.bytes));
+                return Err(format!(
+                    "{name}: view does not match plan (ptr off {} vs {}, len {len} vs {})",
+                    ptr.wrapping_sub(base),
+                    e.offset,
+                    e.bytes
+                ));
             }
         }
-        check_const(gpu, &sc.logits.buf, 0, sc.logits.buf.size(), 0, "logits zero-init")?;
-        check_const(gpu, &sc.mla_kv_tile.buf, 0, sc.mla_kv_tile.buf.size(), 0, "mla_kv_tile zero-init")?;
+        check_const(
+            gpu,
+            &sc.logits.buf,
+            0,
+            sc.logits.buf.size(),
+            0,
+            "logits zero-init",
+        )?;
+        check_const(
+            gpu,
+            &sc.mla_kv_tile.buf,
+            0,
+            sc.mla_kv_tile.buf.size(),
+            0,
+            "mla_kv_tile zero-init",
+        )?;
         // A write to one buffer must not leak into a neighbor.
-        fill_const(gpu, &sc.stream_a.buf, 0, sc.stream_a.buf.size(), 0xAB, "stream_a fill")?;
-        check_const(gpu, &sc.stream_b.buf, 0, sc.stream_b.buf.size(), 0, "stream_b untouched")?;
-        check_const(gpu, &sc.positions.buf, 0, sc.positions.buf.size(), 0, "positions untouched")?;
-        Ok(json!({"rows": rows, "bytes": sc.bytes(), "mib": sc.bytes() / MIB, "delta": delta, "buffers": plan.entries.len()}))
+        fill_const(
+            gpu,
+            &sc.stream_a.buf,
+            0,
+            sc.stream_a.buf.size(),
+            0xAB,
+            "stream_a fill",
+        )?;
+        check_const(
+            gpu,
+            &sc.stream_b.buf,
+            0,
+            sc.stream_b.buf.size(),
+            0,
+            "stream_b untouched",
+        )?;
+        check_const(
+            gpu,
+            &sc.positions.buf,
+            0,
+            sc.positions.buf.size(),
+            0,
+            "positions untouched",
+        )?;
+        Ok(
+            json!({"rows": rows, "bytes": sc.bytes(), "mib": sc.bytes() / MIB, "delta": delta, "buffers": plan.entries.len()}),
+        )
     })();
     let f = sc.free_gpu(gpu);
     gpu.drain_pool();
@@ -1389,14 +1737,20 @@ fn check_mirror(gpu: &mut Gpu, dims: &RaonStateDims) -> Check {
     let r = (|| -> Check {
         let budget = st.mirror_budget_rows();
         if budget == 0 || budget > 16_384 {
-            return Err(format!("mirror admission budget {budget} rows outside 1..=16384"));
+            return Err(format!(
+                "mirror admission budget {budget} rows outside 1..=16384"
+            ));
         }
         // A forced low budget makes everything above it a clear capacity refusal.
         st.set_mirror_budget_rows(4096);
         match st.ensure_mirror_rows(gpu, 4097) {
             Ok(_) => return Err("mirror above the admission budget must be refused".into()),
             Err(e) if e.contains("maximum context of 4096 tokens") => {}
-            Err(e) => return Err(format!("capacity refusal does not state the maximum context: {e}")),
+            Err(e) => {
+                return Err(format!(
+                    "capacity refusal does not state the maximum context: {e}"
+                ))
+            }
         }
         if st.ensure_mirror_rows(gpu, 0)? {
             return Err("0-row mirror request must be a no-op".into());
@@ -1410,28 +1764,66 @@ fn check_mirror(gpu: &mut Gpu, dims: &RaonStateDims) -> Check {
         st.ensure_mirror_rows(gpu, rows)?;
         let after = st.bytes_ledger(gpu);
         let mirror = after.physical_with_prefix("expanded_mirror");
-        if mirror < bytes || mirror > bytes + 64 * 1024 * 1024 || after.physical_total() != before + mirror {
-            return Err(format!("mirror ledger {mirror} B not within one growth chunk of {bytes} B"));
+        if mirror < bytes
+            || mirror > bytes + 64 * 1024 * 1024
+            || after.physical_total() != before + mirror
+        {
+            return Err(format!(
+                "mirror ledger {mirror} B not within one growth chunk of {bytes} B"
+            ));
         }
         let ptrs: Vec<usize> = {
             let m = st.expanded_mirror().ok_or("mirror missing after ensure")?;
             if m.knope.len() != dims.n_mla || m.vmir.len() != dims.n_mla || m.rows < rows {
                 return Err("mirror view count/rows mismatch".into());
             }
-            if m.knope[0].shape != vec![16_384, dims.heads, 128] || m.vmir[0].shape != vec![16_384, dims.heads, 128] {
+            if m.knope[0].shape != vec![16_384, dims.heads, 128]
+                || m.vmir[0].shape != vec![16_384, dims.heads, 128]
+            {
                 return Err("mirror views are not token-major [rows, heads, 128]".into());
             }
             let tok = dims.heads * 128 * 2;
-            write_pat(gpu, &m.knope[3].buf, 0, rows * tok, 0x3C, 0, "mirror knope write")?;
-            check_const(gpu, &m.vmir[3].buf, 0, rows * tok, 0, "mirror vmir untouched")?;
-            check_const(gpu, &m.knope[4].buf, 0, rows * tok, 0, "mirror next-layer knope untouched")?;
-            m.knope.iter().chain(&m.vmir).map(|t| t.buf.as_ptr() as usize).collect()
+            write_pat(
+                gpu,
+                &m.knope[3].buf,
+                0,
+                rows * tok,
+                0x3C,
+                0,
+                "mirror knope write",
+            )?;
+            check_const(
+                gpu,
+                &m.vmir[3].buf,
+                0,
+                rows * tok,
+                0,
+                "mirror vmir untouched",
+            )?;
+            check_const(
+                gpu,
+                &m.knope[4].buf,
+                0,
+                rows * tok,
+                0,
+                "mirror next-layer knope untouched",
+            )?;
+            m.knope
+                .iter()
+                .chain(&m.vmir)
+                .map(|t| t.buf.as_ptr() as usize)
+                .collect()
         };
         // Growth maps in place: no address moves, earlier rows survive.
         st.ensure_mirror_rows(gpu, 4096)?;
         {
             let m = st.expanded_mirror().ok_or("mirror missing after growth")?;
-            let now: Vec<usize> = m.knope.iter().chain(&m.vmir).map(|t| t.buf.as_ptr() as usize).collect();
+            let now: Vec<usize> = m
+                .knope
+                .iter()
+                .chain(&m.vmir)
+                .map(|t| t.buf.as_ptr() as usize)
+                .collect();
             if now != ptrs {
                 return Err("mirror growth moved a plane address".into());
             }
@@ -1439,13 +1831,23 @@ fn check_mirror(gpu: &mut Gpu, dims: &RaonStateDims) -> Check {
                 return Err(format!("mirror backs {} rows after growth to 4096", m.rows));
             }
             let tok = dims.heads * 128 * 2;
-            check_pat(gpu, &m.knope[3].buf, 0, rows * tok, 0x3C, 0, "mirror rows survive growth")?;
+            check_pat(
+                gpu,
+                &m.knope[3].buf,
+                0,
+                rows * tok,
+                0x3C,
+                0,
+                "mirror rows survive growth",
+            )?;
         }
         st.release_expanded_mirror(gpu)?;
         if st.expanded_mirror().is_some() || st.bytes_ledger(gpu).physical_total() != before {
             return Err("mirror release did not return the ledger".into());
         }
-        Ok(json!({"rows": rows, "bytes": bytes, "per_token_bytes": bytes / rows, "budget_rows_default": budget}))
+        Ok(
+            json!({"rows": rows, "bytes": bytes, "per_token_bytes": bytes / rows, "budget_rows_default": budget}),
+        )
     })();
     let f = st.free_gpu(gpu);
     gpu.drain_pool();

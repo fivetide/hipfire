@@ -162,7 +162,12 @@ impl Geo {
 }
 
 fn spec(row: usize, amp: f32, bias: f32, spike: bool) -> BufSpec {
-    BufSpec { row, amp, bias, spike }
+    BufSpec {
+        row,
+        amp,
+        bias,
+        spike,
+    }
 }
 
 fn all_positions() -> Vec<usize> {
@@ -176,10 +181,29 @@ fn geometries() -> Vec<Geo> {
         Geo {
             name: "raon-decomp H40 128+64/128",
             heads: 40,
-            bufs: vec![spec(5120, 1.0, 0.0, true), spec(576, 1.0, 0.1, true), spec(5120, 1.0, 0.3, false)],
-            ka: View { buf: 0, offset: 0, head: 128, width: 128 },
-            kb: View { buf: 1, offset: 512, head: 0, width: 64 },
-            v: View { buf: 2, offset: 0, head: 128, width: 128 },
+            bufs: vec![
+                spec(5120, 1.0, 0.0, true),
+                spec(576, 1.0, 0.1, true),
+                spec(5120, 1.0, 0.3, false),
+            ],
+            ka: View {
+                buf: 0,
+                offset: 0,
+                head: 128,
+                width: 128,
+            },
+            kb: View {
+                buf: 1,
+                offset: 512,
+                head: 0,
+                width: 64,
+            },
+            v: View {
+                buf: 2,
+                offset: 0,
+                head: 128,
+                width: 128,
+            },
             positions: all_positions(),
             scale_mults: vec![1.0],
             seed: 0x1001,
@@ -189,9 +213,24 @@ fn geometries() -> Vec<Geo> {
             name: "raon-absorbed H4 512+64/512",
             heads: 4,
             bufs: vec![spec(576, 1.0, 0.2, true)],
-            ka: View { buf: 0, offset: 0, head: 0, width: 512 },
-            kb: View { buf: 0, offset: 512, head: 0, width: 64 },
-            v: View { buf: 0, offset: 0, head: 0, width: 512 },
+            ka: View {
+                buf: 0,
+                offset: 0,
+                head: 0,
+                width: 512,
+            },
+            kb: View {
+                buf: 0,
+                offset: 512,
+                head: 0,
+                width: 64,
+            },
+            v: View {
+                buf: 0,
+                offset: 0,
+                head: 0,
+                width: 512,
+            },
             positions: all_positions(),
             scale_mults: vec![1.0],
             seed: 0x1002,
@@ -200,10 +239,29 @@ fn geometries() -> Vec<Geo> {
         Geo {
             name: "fixture-decomp H8 64+32/96",
             heads: 8,
-            bufs: vec![spec(512, 1.0, 0.0, true), spec(288, 1.0, 0.1, true), spec(768, 1.0, 0.3, false)],
-            ka: View { buf: 0, offset: 0, head: 64, width: 64 },
-            kb: View { buf: 1, offset: 256, head: 0, width: 32 },
-            v: View { buf: 2, offset: 0, head: 96, width: 96 },
+            bufs: vec![
+                spec(512, 1.0, 0.0, true),
+                spec(288, 1.0, 0.1, true),
+                spec(768, 1.0, 0.3, false),
+            ],
+            ka: View {
+                buf: 0,
+                offset: 0,
+                head: 64,
+                width: 64,
+            },
+            kb: View {
+                buf: 1,
+                offset: 256,
+                head: 0,
+                width: 32,
+            },
+            v: View {
+                buf: 2,
+                offset: 0,
+                head: 96,
+                width: 96,
+            },
             positions: vec![0, 1, 16, 17, 64, 65, 200, 1000, 4000],
             scale_mults: vec![1.0],
             seed: 0x1003,
@@ -212,9 +270,24 @@ fn geometries() -> Vec<Geo> {
             name: "fixture-absorbed H8 256+32/256",
             heads: 8,
             bufs: vec![spec(288, 1.0, 0.2, true)],
-            ka: View { buf: 0, offset: 0, head: 0, width: 256 },
-            kb: View { buf: 0, offset: 256, head: 0, width: 32 },
-            v: View { buf: 0, offset: 0, head: 0, width: 256 },
+            ka: View {
+                buf: 0,
+                offset: 0,
+                head: 0,
+                width: 256,
+            },
+            kb: View {
+                buf: 0,
+                offset: 256,
+                head: 0,
+                width: 32,
+            },
+            v: View {
+                buf: 0,
+                offset: 0,
+                head: 0,
+                width: 256,
+            },
             positions: vec![0, 1, 16, 17, 64, 65, 200, 1000, 4000],
             scale_mults: vec![1.0],
             seed: 0x1004,
@@ -224,10 +297,29 @@ fn geometries() -> Vec<Geo> {
         Geo {
             name: "odd H3 32+16/48 padded per-head-tail",
             heads: 3,
-            bufs: vec![spec(104, 1.0, 0.0, true), spec(48, 1.0, 0.1, true), spec(160, 1.0, 0.3, false)],
-            ka: View { buf: 0, offset: 8, head: 32, width: 32 },
-            kb: View { buf: 1, offset: 0, head: 16, width: 16 },
-            v: View { buf: 2, offset: 16, head: 48, width: 48 },
+            bufs: vec![
+                spec(104, 1.0, 0.0, true),
+                spec(48, 1.0, 0.1, true),
+                spec(160, 1.0, 0.3, false),
+            ],
+            ka: View {
+                buf: 0,
+                offset: 8,
+                head: 32,
+                width: 32,
+            },
+            kb: View {
+                buf: 1,
+                offset: 0,
+                head: 16,
+                width: 16,
+            },
+            v: View {
+                buf: 2,
+                offset: 16,
+                head: 48,
+                width: 48,
+            },
             positions: all_positions(),
             scale_mults: vec![1.0, 4.0, 0.0],
             seed: 0x1005,
@@ -236,10 +328,29 @@ fn geometries() -> Vec<Geo> {
         Geo {
             name: "odd8 H2 24+8/40",
             heads: 2,
-            bufs: vec![spec(48, 1.0, 0.0, true), spec(24, 1.0, 0.1, true), spec(80, 1.0, 0.3, false)],
-            ka: View { buf: 0, offset: 0, head: 24, width: 24 },
-            kb: View { buf: 1, offset: 16, head: 0, width: 8 },
-            v: View { buf: 2, offset: 0, head: 40, width: 40 },
+            bufs: vec![
+                spec(48, 1.0, 0.0, true),
+                spec(24, 1.0, 0.1, true),
+                spec(80, 1.0, 0.3, false),
+            ],
+            ka: View {
+                buf: 0,
+                offset: 0,
+                head: 24,
+                width: 24,
+            },
+            kb: View {
+                buf: 1,
+                offset: 16,
+                head: 0,
+                width: 8,
+            },
+            v: View {
+                buf: 2,
+                offset: 0,
+                head: 40,
+                width: 40,
+            },
             positions: vec![0, 1, 15, 16, 17, 64, 65, 300],
             scale_mults: vec![1.0],
             seed: 0x1006,
@@ -248,10 +359,29 @@ fn geometries() -> Vec<Geo> {
         Geo {
             name: "odd-vg H2 64+16/200",
             heads: 2,
-            bufs: vec![spec(136, 1.0, 0.0, true), spec(32, 1.0, 0.1, true), spec(400, 1.0, 0.3, false)],
-            ka: View { buf: 0, offset: 8, head: 64, width: 64 },
-            kb: View { buf: 1, offset: 0, head: 16, width: 16 },
-            v: View { buf: 2, offset: 0, head: 200, width: 200 },
+            bufs: vec![
+                spec(136, 1.0, 0.0, true),
+                spec(32, 1.0, 0.1, true),
+                spec(400, 1.0, 0.3, false),
+            ],
+            ka: View {
+                buf: 0,
+                offset: 8,
+                head: 64,
+                width: 64,
+            },
+            kb: View {
+                buf: 1,
+                offset: 0,
+                head: 16,
+                width: 16,
+            },
+            v: View {
+                buf: 2,
+                offset: 0,
+                head: 200,
+                width: 200,
+            },
             positions: vec![0, 1, 17, 65, 300],
             scale_mults: vec![1.0],
             seed: 0x1007,
@@ -260,10 +390,29 @@ fn geometries() -> Vec<Geo> {
         Geo {
             name: "wide-dv H2 256+64/1024",
             heads: 2,
-            bufs: vec![spec(512, 1.0, 0.0, true), spec(64, 1.0, 0.1, true), spec(2048, 1.0, 0.3, false)],
-            ka: View { buf: 0, offset: 0, head: 256, width: 256 },
-            kb: View { buf: 1, offset: 0, head: 0, width: 64 },
-            v: View { buf: 2, offset: 0, head: 1024, width: 1024 },
+            bufs: vec![
+                spec(512, 1.0, 0.0, true),
+                spec(64, 1.0, 0.1, true),
+                spec(2048, 1.0, 0.3, false),
+            ],
+            ka: View {
+                buf: 0,
+                offset: 0,
+                head: 256,
+                width: 256,
+            },
+            kb: View {
+                buf: 1,
+                offset: 0,
+                head: 0,
+                width: 64,
+            },
+            v: View {
+                buf: 2,
+                offset: 0,
+                head: 1024,
+                width: 1024,
+            },
             positions: vec![0, 1, 17, 65, 300, 1000],
             scale_mults: vec![1.0],
             seed: 0x1008,
@@ -272,10 +421,29 @@ fn geometries() -> Vec<Geo> {
         Geo {
             name: "max H2 1536+512/2048",
             heads: 2,
-            bufs: vec![spec(3072, 1.0, 0.0, true), spec(512, 1.0, 0.1, true), spec(4096, 1.0, 0.3, false)],
-            ka: View { buf: 0, offset: 0, head: 1536, width: 1536 },
-            kb: View { buf: 1, offset: 0, head: 0, width: 512 },
-            v: View { buf: 2, offset: 0, head: 2048, width: 2048 },
+            bufs: vec![
+                spec(3072, 1.0, 0.0, true),
+                spec(512, 1.0, 0.1, true),
+                spec(4096, 1.0, 0.3, false),
+            ],
+            ka: View {
+                buf: 0,
+                offset: 0,
+                head: 1536,
+                width: 1536,
+            },
+            kb: View {
+                buf: 1,
+                offset: 0,
+                head: 0,
+                width: 512,
+            },
+            v: View {
+                buf: 2,
+                offset: 0,
+                head: 2048,
+                width: 2048,
+            },
             positions: vec![0, 1, 17, 65, 300],
             scale_mults: vec![1.0],
             seed: 0x1009,
@@ -301,11 +469,9 @@ fn gen_host_buf(geo: &Geo, b: usize, rows_total: usize, data_rows: usize) -> Vec
             }
             continue;
         }
-        let mut rng = Rng(
-            geo.seed
-                ^ (b as u64 + 1).wrapping_mul(0xD6E8_FEB8_6659_FD93)
-                ^ (t as u64 + 1).wrapping_mul(0xA076_1D64_78BD_642F),
-        );
+        let mut rng = Rng(geo.seed
+            ^ (b as u64 + 1).wrapping_mul(0xD6E8_FEB8_6659_FD93)
+            ^ (t as u64 + 1).wrapping_mul(0xA076_1D64_78BD_642F));
         let amp = s.amp * if s.spike && t % 53 == 7 { 3.0 } else { 1.0 };
         for (c, e) in row.iter_mut().enumerate() {
             let u = rng.unit();
@@ -383,8 +549,16 @@ fn metrics(got: &[f32], want: &[f64]) -> (f64, f64, f64) {
         gg += g * g;
         maxabs = maxabs.max(d.abs());
     }
-    let rel = if den > 0.0 { (num / den).sqrt() } else { num.sqrt() };
-    let cos = if gg > 0.0 && den > 0.0 { dot / (gg.sqrt() * den.sqrt()) } else { 1.0 };
+    let rel = if den > 0.0 {
+        (num / den).sqrt()
+    } else {
+        num.sqrt()
+    };
+    let cos = if gg > 0.0 && den > 0.0 {
+        dot / (gg.sqrt() * den.sqrt())
+    } else {
+        1.0
+    };
     (rel, cos, maxabs)
 }
 
@@ -392,10 +566,14 @@ fn metrics(got: &[f32], want: &[f64]) -> (f64, f64, f64) {
 // Device helpers
 
 fn upload_bf16(gpu: &mut Gpu, data: &[u16]) -> GpuTensor {
-    let t = gpu.alloc_tensor(&[data.len()], DType::BF16).expect("alloc bf16");
+    let t = gpu
+        .alloc_tensor(&[data.len()], DType::BF16)
+        .expect("alloc bf16");
     // SAFETY: u16 -> u8 view of the same bytes; the host is little endian.
     let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
-    gpu.hip.device_synchronize().expect("sync before bf16 upload");
+    gpu.hip
+        .device_synchronize()
+        .expect("sync before bf16 upload");
     gpu.hip.memcpy_htod(&t.buf, bytes).expect("upload bf16");
     t
 }
@@ -408,12 +586,18 @@ fn fill_words(gpu: &Gpu, t: &GpuTensor, word: u32) {
 
 fn set_pos(gpu: &Gpu, pos: &GpuTensor, v: i32) {
     gpu.hip.device_synchronize().expect("sync before pos write");
-    gpu.hip.memcpy_htod(&pos.buf, &v.to_le_bytes()).expect("pos write");
+    gpu.hip
+        .memcpy_htod(&pos.buf, &v.to_le_bytes())
+        .expect("pos write");
 }
 
 fn fetch_bits(gpu: &Gpu, t: &GpuTensor) -> Vec<u32> {
     gpu.hip.device_synchronize().expect("sync before fetch");
-    gpu.download_f32(t).expect("download").iter().map(|v| v.to_bits()).collect()
+    gpu.download_f32(t)
+        .expect("download")
+        .iter()
+        .map(|v| v.to_bits())
+        .collect()
 }
 
 fn to_f32(bits: &[u32]) -> Vec<f32> {
@@ -463,15 +647,51 @@ struct Scn {
 fn scenarios(p: usize) -> Vec<Scn> {
     let len = p + 1;
     let mut v = vec![
-        Scn { tag: "pad", pos_dev: p as i32, pos_offset: 0, max_rows: len + 37, cap: len + 37 + 13 },
-        Scn { tag: "offset", pos_dev: p as i32 - 3, pos_offset: 3, max_rows: len + 5, cap: len + 5 },
-        Scn { tag: "tight", pos_dev: p as i32, pos_offset: 0, max_rows: len, cap: len },
-        Scn { tag: "trunc", pos_dev: p as i32 + 500, pos_offset: 0, max_rows: len, cap: len + 70 },
-        Scn { tag: "off-only", pos_dev: 0, pos_offset: p, max_rows: len + 9, cap: len + 9 },
+        Scn {
+            tag: "pad",
+            pos_dev: p as i32,
+            pos_offset: 0,
+            max_rows: len + 37,
+            cap: len + 37 + 13,
+        },
+        Scn {
+            tag: "offset",
+            pos_dev: p as i32 - 3,
+            pos_offset: 3,
+            max_rows: len + 5,
+            cap: len + 5,
+        },
+        Scn {
+            tag: "tight",
+            pos_dev: p as i32,
+            pos_offset: 0,
+            max_rows: len,
+            cap: len,
+        },
+        Scn {
+            tag: "trunc",
+            pos_dev: p as i32 + 500,
+            pos_offset: 0,
+            max_rows: len,
+            cap: len + 70,
+        },
+        Scn {
+            tag: "off-only",
+            pos_dev: 0,
+            pos_offset: p,
+            max_rows: len + 9,
+            cap: len + 9,
+        },
     ];
     if p <= 1000 {
         let big = 2 * len + 4096;
-        v.push(Scn { tag: "enlarged", pos_dev: p as i32, pos_offset: 0, max_rows: big, cap: big });
+        v.push(Scn {
+            tag: "enlarged",
+            pos_dev: p as i32,
+            pos_offset: 0,
+            max_rows: big,
+            cap: big,
+        });
     }
     v
 }
@@ -503,11 +723,20 @@ fn run_scn(
         .collect();
     set_pos(gpu, pos_t, scn.pos_dev);
     let yn = geo.heads * geo.dv();
-    let y = gpu.alloc_tensor(&[yn + GUARD], DType::F32).map_err(|e| e.to_string())?;
+    let y = gpu
+        .alloc_tensor(&[yn + GUARD], DType::F32)
+        .map_err(|e| e.to_string())?;
     let ws_need = latent_attention_decode_workspace_elems(geo.heads, geo.dv());
-    let ws = gpu.alloc_tensor(&[ws_need + GUARD], DType::F32).map_err(|e| e.to_string())?;
+    let ws = gpu
+        .alloc_tensor(&[ws_need + GUARD], DType::F32)
+        .map_err(|e| e.to_string())?;
     let mut runs: Vec<(bool, u32, Vec<u32>)> = Vec::new();
-    for (round, fill) in [(false, WS_FILL_NAN), (false, WS_FILL_BIG), (true, WS_FILL_NAN), (true, WS_FILL_BIG)] {
+    for (round, fill) in [
+        (false, WS_FILL_NAN),
+        (false, WS_FILL_BIG),
+        (true, WS_FILL_NAN),
+        (true, WS_FILL_BIG),
+    ] {
         fill_words(gpu, &ws, fill);
         fill_words(gpu, &y, SENTINEL);
         let a = TiledAttention {
@@ -524,12 +753,17 @@ fn run_scn(
             max_rows: scn.max_rows,
             round_y_bf16: round,
         };
-        gpu.latent_attention_decode_split(&a, &ws).map_err(|e| e.to_string())?;
+        gpu.latent_attention_decode_split(&a, &ws)
+            .map_err(|e| e.to_string())?;
         st.launches += 1;
         let bits = fetch_bits(gpu, &y);
         let ws_bits = fetch_bits(gpu, &ws);
-        st.check(bits[yn..].iter().all(|b| *b == SENTINEL), || format!("{label}: output guard overwritten"));
-        st.check(ws_bits[ws_need..].iter().all(|b| *b == fill), || format!("{label}: workspace guard overwritten"));
+        st.check(bits[yn..].iter().all(|b| *b == SENTINEL), || {
+            format!("{label}: output guard overwritten")
+        });
+        st.check(ws_bits[ws_need..].iter().all(|b| *b == fill), || {
+            format!("{label}: workspace guard overwritten")
+        });
         runs.push((round, fill, bits[..yn].to_vec()));
     }
     for t in dev {
@@ -537,8 +771,12 @@ fn run_scn(
     }
     gpu.free_tensor(y).map_err(|e| e.to_string())?;
     gpu.free_tensor(ws).map_err(|e| e.to_string())?;
-    st.check(runs[0].2 == runs[1].2, || format!("{label}: repeat (fp32) not byte-identical"));
-    st.check(runs[2].2 == runs[3].2, || format!("{label}: repeat (bf16) not byte-identical"));
+    st.check(runs[0].2 == runs[1].2, || {
+        format!("{label}: repeat (fp32) not byte-identical")
+    });
+    st.check(runs[2].2 == runs[3].2, || {
+        format!("{label}: repeat (bf16) not byte-identical")
+    });
     st.identical_comparisons += 2;
     let (noround, round) = (runs[0].2.clone(), runs[2].2.clone());
     Ok(Outs { noround, round })
@@ -547,10 +785,14 @@ fn run_scn(
 fn check_vs_reference(st: &mut Stats, label: &str, outs: &Outs, want: &[f64], len: usize) {
     let got = to_f32(&outs.noround);
     let got_r = to_f32(&outs.round);
-    st.check(got.iter().chain(&got_r).all(|v| v.is_finite()), || format!("{label}: non-finite output"));
+    st.check(got.iter().chain(&got_r).all(|v| v.is_finite()), || {
+        format!("{label}: non-finite output")
+    });
     // BF16 output rounding is the RNE of the unrounded F32 result, bit for bit.
     st.check(
-        got.iter().zip(&got_r).all(|(a, b)| round_bf16(*a).to_bits() == b.to_bits()),
+        got.iter()
+            .zip(&got_r)
+            .all(|(a, b)| round_bf16(*a).to_bits() == b.to_bits()),
         || format!("{label}: round_y_bf16 output is not bf16(unrounded)"),
     );
     if len == 0 {
@@ -568,7 +810,11 @@ fn check_vs_reference(st: &mut Stats, label: &str, outs: &Outs, want: &[f64], le
     let want_r: Vec<f64> = want.iter().map(|w| round_bf16(*w as f32) as f64).collect();
     let (rel_r, cos_r, maxabs_r) = metrics(&got_r, &want_r);
     st.worst_rel_bf16 = st.worst_rel_bf16.max(rel_r);
-    st.worst_cos_bf16 = if st.worst_cos_bf16 == 0.0 { cos_r } else { st.worst_cos_bf16.min(cos_r) };
+    st.worst_cos_bf16 = if st.worst_cos_bf16 == 0.0 {
+        cos_r
+    } else {
+        st.worst_cos_bf16.min(cos_r)
+    };
     st.check(rel_r <= BF16_REL_L2 && cos_r >= BF16_COS, || {
         format!("{label}: bf16 rel_l2 {rel_r:.3e} cos {cos_r:.9} max_abs {maxabs_r:.3e} outside the band")
     });
@@ -590,12 +836,26 @@ fn run_geo(gpu: &mut Gpu, st: &mut Stats, geo: &Geo, pos_t: &GpuTensor) {
 
     // len == 0: nothing is visible (all rows poison).
     {
-        let host: Vec<Vec<u16>> = (0..geo.bufs.len()).map(|b| gen_host_buf(geo, b, 13, 0)).collect();
+        let host: Vec<Vec<u16>> = (0..geo.bufs.len())
+            .map(|b| gen_host_buf(geo, b, 13, 0))
+            .collect();
         let q = gen_q(geo, 0);
         let q_dev = gpu.upload_f32(&q, &[q.len()]).expect("upload q");
         for scn in [
-            Scn { tag: "empty:pos=-1", pos_dev: -1, pos_offset: 0, max_rows: 9, cap: 9 },
-            Scn { tag: "empty:neg", pos_dev: -5, pos_offset: 2, max_rows: 9, cap: 13 },
+            Scn {
+                tag: "empty:pos=-1",
+                pos_dev: -1,
+                pos_offset: 0,
+                max_rows: 9,
+                cap: 9,
+            },
+            Scn {
+                tag: "empty:neg",
+                pos_dev: -5,
+                pos_offset: 2,
+                max_rows: 9,
+                cap: 13,
+            },
         ] {
             let label = format!("{} / {}", geo.name, scn.tag);
             match run_scn(gpu, st, geo, &host, &q_dev, pos_t, &scn, base_scale, &label) {
@@ -610,7 +870,9 @@ fn run_geo(gpu: &mut Gpu, st: &mut Stats, geo: &Geo, pos_t: &GpuTensor) {
         let len = p + 1;
         let scns = scenarios(p);
         let cap_max = scns.iter().map(|s| s.cap).max().unwrap();
-        let host: Vec<Vec<u16>> = (0..geo.bufs.len()).map(|b| gen_host_buf(geo, b, cap_max, len)).collect();
+        let host: Vec<Vec<u16>> = (0..geo.bufs.len())
+            .map(|b| gen_host_buf(geo, b, cap_max, len))
+            .collect();
         let q = gen_q(geo, p);
         let q_dev = gpu.upload_f32(&q, &[q.len()]).expect("upload q");
         for &mult in &geo.scale_mults {
@@ -624,34 +886,44 @@ fn run_geo(gpu: &mut Gpu, st: &mut Stats, geo: &Geo, pos_t: &GpuTensor) {
                 let label = format!("{} / pos={p} x{mult} / {}", geo.name, scn.tag);
                 match run_scn(gpu, st, geo, &host, &q_dev, pos_t, scn, scale, &label) {
                     Err(e) => st.check(false, || format!("{label}: launcher error: {e}")),
-                    Ok(outs) => match &baseline {
-                        None => {
-                            check_vs_reference(st, &label, &outs, &want, len);
-                            baseline = Some(outs);
-                        }
-                        Some(b) => {
-                            // Same len through a different (pos, offset, max_rows, capacity).
-                            st.check(outs.noround == b.noround, || {
+                    Ok(outs) => {
+                        match &baseline {
+                            None => {
+                                check_vs_reference(st, &label, &outs, &want, len);
+                                baseline = Some(outs);
+                            }
+                            Some(b) => {
+                                // Same len through a different (pos, offset, max_rows, capacity).
+                                st.check(outs.noround == b.noround, || {
                                 format!("{label}: fp32 bytes differ from the `pad` split (same len)")
                             });
-                            st.check(outs.round == b.round, || {
+                                st.check(outs.round == b.round, || {
                                 format!("{label}: bf16 bytes differ from the `pad` split (same len)")
                             });
-                            st.identical_comparisons += 2;
+                                st.identical_comparisons += 2;
+                            }
                         }
-                    },
+                    }
                 }
             }
             // Negative control: make 5 poison rows visible; the harness must
             // see the difference (else the poison checks above prove nothing).
             if (p == 17 || p == 200) && mult == 1.0 {
-                let scn = Scn { tag: "control(reads-poison)", pos_dev: p as i32 + 5, pos_offset: 0, max_rows: len + 37, cap: len + 37 + 13 };
+                let scn = Scn {
+                    tag: "control(reads-poison)",
+                    pos_dev: p as i32 + 5,
+                    pos_offset: 0,
+                    max_rows: len + 37,
+                    cap: len + 37 + 13,
+                };
                 let label = format!("{} / pos={p} / {}", geo.name, scn.tag);
                 match run_scn(gpu, st, geo, &host, &q_dev, pos_t, &scn, scale, &label) {
                     Err(e) => st.check(false, || format!("{label}: launcher error: {e}")),
                     Ok(outs) => {
                         let differs = baseline.as_ref().is_some_and(|b| outs.noround != b.noround);
-                        st.check(differs, || format!("{label}: poison rows made visible did not change the output"));
+                        st.check(differs, || {
+                            format!("{label}: poison rows made visible did not change the output")
+                        });
                     }
                 }
             }
@@ -663,12 +935,23 @@ fn run_geo(gpu: &mut Gpu, st: &mut Stats, geo: &Geo, pos_t: &GpuTensor) {
 // ---------------------------------------------------------------------------
 // Refusals
 
-fn expect_refusal(gpu: &mut Gpu, st: &mut Stats, what: &str, needle: &str, a: &TiledAttention<'_>, ws: &GpuTensor) {
+fn expect_refusal(
+    gpu: &mut Gpu,
+    st: &mut Stats,
+    what: &str,
+    needle: &str,
+    a: &TiledAttention<'_>,
+    ws: &GpuTensor,
+) {
     match gpu.latent_attention_decode_split(a, ws) {
-        Ok(()) => st.check(false, || format!("refusal `{what}`: launcher accepted the call")),
+        Ok(()) => st.check(false, || {
+            format!("refusal `{what}`: launcher accepted the call")
+        }),
         Err(e) => {
             let msg = e.to_string();
-            st.check(msg.contains(needle), || format!("refusal `{what}`: message `{msg}` lacks `{needle}`"));
+            st.check(msg.contains(needle), || {
+                format!("refusal `{what}`: message `{msg}` lacks `{needle}`")
+            });
             println!("  refused `{what}`: {msg}");
         }
     }
@@ -685,7 +968,13 @@ fn refusal_checks(gpu: &mut Gpu, st: &mut Stats) {
     set_pos(gpu, &pos, 1);
     let ws_need = latent_attention_decode_workspace_elems(1, 16);
     let ws = gpu.upload_f32(&vec![0.0f32; ws_need], &[ws_need]).unwrap();
-    let view = |offset: usize, width: usize| LatentRows { buf: &buf, offset, tok_stride: row, head_stride: 0, width };
+    let view = |offset: usize, width: usize| LatentRows {
+        buf: &buf,
+        offset,
+        tok_stride: row,
+        head_stride: 0,
+        width,
+    };
     let base = TiledAttention {
         q: &q,
         y: &y,
@@ -701,20 +990,62 @@ fn refusal_checks(gpu: &mut Gpu, st: &mut Stats) {
         round_y_bf16: false,
     };
     // Control: the unmodified call is accepted.
-    st.check(gpu.latent_attention_decode_split(&base, &ws).is_ok(), || "refusal control: base call rejected".into());
+    st.check(
+        gpu.latent_attention_decode_split(&base, &ws).is_ok(),
+        || "refusal control: base call rejected".into(),
+    );
 
-    expect_refusal(gpu, st, "n_rows = 2", "one query row", &TiledAttention { n_rows: 2, ..base }, &ws);
-    let ws_small = gpu.upload_f32(&vec![0.0f32; ws_need - 1], &[ws_need - 1]).unwrap();
-    expect_refusal(gpu, st, "workspace too small", "workspace holds", &base, &ws_small);
+    expect_refusal(
+        gpu,
+        st,
+        "n_rows = 2",
+        "one query row",
+        &TiledAttention { n_rows: 2, ..base },
+        &ws,
+    );
+    let ws_small = gpu
+        .upload_f32(&vec![0.0f32; ws_need - 1], &[ws_need - 1])
+        .unwrap();
+    expect_refusal(
+        gpu,
+        st,
+        "workspace too small",
+        "workspace holds",
+        &base,
+        &ws_small,
+    );
     let ws_bf16 = upload_bf16(gpu, &vec![0u16; ws_need * 2]);
-    expect_refusal(gpu, st, "workspace not F32", "workspace must be F32", &base, &ws_bf16);
-    expect_refusal(gpu, st, "k_a offset 4", "offset", &TiledAttention { k_a: view(4, 16), ..base }, &ws);
+    expect_refusal(
+        gpu,
+        st,
+        "workspace not F32",
+        "workspace must be F32",
+        &base,
+        &ws_bf16,
+    );
+    expect_refusal(
+        gpu,
+        st,
+        "k_a offset 4",
+        "offset",
+        &TiledAttention {
+            k_a: view(4, 16),
+            ..base
+        },
+        &ws,
+    );
     expect_refusal(
         gpu,
         st,
         "k_b tok_stride 44",
         "tok_stride",
-        &TiledAttention { k_b: LatentRows { tok_stride: 44, ..view(16, 16) }, ..base },
+        &TiledAttention {
+            k_b: LatentRows {
+                tok_stride: 44,
+                ..view(16, 16)
+            },
+            ..base
+        },
         &ws,
     );
     expect_refusal(
@@ -722,23 +1053,77 @@ fn refusal_checks(gpu: &mut Gpu, st: &mut Stats) {
         st,
         "v head_stride 4",
         "head_stride",
-        &TiledAttention { v: LatentRows { head_stride: 4, ..view(32, 16) }, ..base },
+        &TiledAttention {
+            v: LatentRows {
+                head_stride: 4,
+                ..view(32, 16)
+            },
+            ..base
+        },
         &ws,
     );
-    expect_refusal(gpu, st, "k_a width 12", "width", &TiledAttention { k_a: view(0, 12), ..base }, &ws);
-    expect_refusal(gpu, st, "v width 20", "width", &TiledAttention { v: view(28, 20), ..base }, &ws);
-    expect_refusal(gpu, st, "max_rows 0", "max_rows", &TiledAttention { max_rows: 0, ..base }, &ws);
-    expect_refusal(gpu, st, "max_rows beyond the view", "view needs", &TiledAttention { max_rows: rows + 1, ..base }, &ws);
+    expect_refusal(
+        gpu,
+        st,
+        "k_a width 12",
+        "width",
+        &TiledAttention {
+            k_a: view(0, 12),
+            ..base
+        },
+        &ws,
+    );
+    expect_refusal(
+        gpu,
+        st,
+        "v width 20",
+        "width",
+        &TiledAttention {
+            v: view(28, 20),
+            ..base
+        },
+        &ws,
+    );
+    expect_refusal(
+        gpu,
+        st,
+        "max_rows 0",
+        "max_rows",
+        &TiledAttention {
+            max_rows: 0,
+            ..base
+        },
+        &ws,
+    );
+    expect_refusal(
+        gpu,
+        st,
+        "max_rows beyond the view",
+        "view needs",
+        &TiledAttention {
+            max_rows: rows + 1,
+            ..base
+        },
+        &ws,
+    );
 
     // Width maxima: one past the limit is refused, the limit itself is
     // exercised by the `max` geometry.
     let wide_row = 2112usize;
     let wide = upload_bf16(gpu, &vec![0x3f80u16; 2 * wide_row]);
-    let wview = |offset: usize, width: usize| LatentRows { buf: &wide, offset, tok_stride: wide_row, head_stride: 0, width };
+    let wview = |offset: usize, width: usize| LatentRows {
+        buf: &wide,
+        offset,
+        tok_stride: wide_row,
+        head_stride: 0,
+        width,
+    };
     let wq = gpu.upload_f32(&vec![0.5f32; 4200], &[4200]).unwrap();
     let wy = gpu.upload_f32(&vec![0.0f32; 4200], &[4200]).unwrap();
     let wide_ws_n = latent_attention_decode_workspace_elems(1, 2056);
-    let wide_ws = gpu.upload_f32(&vec![0.0f32; wide_ws_n], &[wide_ws_n]).unwrap();
+    let wide_ws = gpu
+        .upload_f32(&vec![0.0f32; wide_ws_n], &[wide_ws_n])
+        .unwrap();
     let wbase = TiledAttention {
         q: &wq,
         y: &wy,
@@ -766,7 +1151,12 @@ fn refusal_checks(gpu: &mut Gpu, st: &mut Stats) {
         st,
         &format!("dv 2056 > {LATENT_DECODE_MAX_DV}"),
         "value width",
-        &TiledAttention { k_a: wview(0, 16), k_b: wview(16, 16), v: wview(0, 2056), ..wbase },
+        &TiledAttention {
+            k_a: wview(0, 16),
+            k_b: wview(16, 16),
+            v: wview(0, 2056),
+            ..wbase
+        },
         &wide_ws,
     );
 
@@ -783,7 +1173,9 @@ fn graph_check(gpu: &mut Gpu, st: &mut Stats, pos_t: &GpuTensor) {
     let geos = geometries();
     let geo = &geos[0];
     let cap = 1100usize;
-    let host: Vec<Vec<u16>> = (0..geo.bufs.len()).map(|b| gen_host_buf(geo, b, cap, cap)).collect();
+    let host: Vec<Vec<u16>> = (0..geo.bufs.len())
+        .map(|b| gen_host_buf(geo, b, cap, cap))
+        .collect();
     let dev: Vec<GpuTensor> = host.iter().map(|h| upload_bf16(gpu, h)).collect();
     let q = gen_q(geo, 4242);
     let q_dev = gpu.upload_f32(&q, &[q.len()]).unwrap();
@@ -809,20 +1201,33 @@ fn graph_check(gpu: &mut Gpu, st: &mut Stats, pos_t: &GpuTensor) {
     // Warm the kernels up (a compile mid-capture is forbidden), then capture
     // while the device scalar holds some unrelated value.
     set_pos(gpu, pos_t, 300);
-    gpu.latent_attention_decode_split(&a, &ws).expect("eager warm-up");
+    gpu.latent_attention_decode_split(&a, &ws)
+        .expect("eager warm-up");
     gpu.ensure_capture_stream().expect("capture stream");
     gpu.hip.device_synchronize().expect("sync");
     let dev_id = gpu.device_id;
     gpu.graphs
-        .begin_graph_capture(&gpu.hip, dev_id, gpu.active_stream.as_ref().expect("stream"))
+        .begin_graph_capture(
+            &gpu.hip,
+            dev_id,
+            gpu.active_stream.as_ref().expect("stream"),
+        )
         .expect("begin capture");
     let captured = gpu.latent_attention_decode_split(&a, &ws);
     if captured.is_err() {
-        gpu.graphs.abort_graph_capture(&gpu.hip, dev_id, gpu.active_stream.as_ref().expect("stream"));
+        gpu.graphs.abort_graph_capture(
+            &gpu.hip,
+            dev_id,
+            gpu.active_stream.as_ref().expect("stream"),
+        );
     }
     captured.expect("captured launch");
     gpu.graphs
-        .end_graph_capture(&gpu.hip, dev_id, gpu.active_stream.as_ref().expect("stream"))
+        .end_graph_capture(
+            &gpu.hip,
+            dev_id,
+            gpu.active_stream.as_ref().expect("stream"),
+        )
         .expect("end capture");
     for p in [300usize, 1099, 17, 0, 700, 1099] {
         let label = format!("graph pos={p}");
@@ -830,22 +1235,37 @@ fn graph_check(gpu: &mut Gpu, st: &mut Stats, pos_t: &GpuTensor) {
         fill_words(gpu, &y, SENTINEL);
         fill_words(gpu, &ws, WS_FILL_NAN);
         gpu.graphs
-            .graph_launch(&gpu.hip, dev_id, gpu.active_stream.as_ref().expect("stream"))
+            .graph_launch(
+                &gpu.hip,
+                dev_id,
+                gpu.active_stream.as_ref().expect("stream"),
+            )
             .expect("graph replay");
         let g_bits = fetch_bits(gpu, &y);
         fill_words(gpu, &y, SENTINEL);
         fill_words(gpu, &ws, WS_FILL_BIG);
-        gpu.latent_attention_decode_split(&a, &ws).expect("eager launch");
+        gpu.latent_attention_decode_split(&a, &ws)
+            .expect("eager launch");
         let e_bits = fetch_bits(gpu, &y);
         st.launches += 2;
-        st.check(g_bits == e_bits, || format!("{label}: graph replay bytes differ from the eager launch"));
+        st.check(g_bits == e_bits, || {
+            format!("{label}: graph replay bytes differ from the eager launch")
+        });
         st.identical_comparisons += 1;
-        st.check(g_bits[yn..].iter().all(|b| *b == SENTINEL), || format!("{label}: output guard overwritten"));
+        st.check(g_bits[yn..].iter().all(|b| *b == SENTINEL), || {
+            format!("{label}: output guard overwritten")
+        });
         let want = reference(geo, &host, &q, p + 1, scale);
         let (rel, cos, _) = metrics(&to_f32(&g_bits[..yn]), &want);
         st.worst_rel_fp32 = st.worst_rel_fp32.max(rel);
-        st.check(rel <= FP32_REL_L2, || format!("{label}: rel_l2 {rel:.3e} (cos {cos:.9})"));
-        println!("  {label}: len={} graph==eager bytes={} rel_l2={rel:.2e} cos={cos:.9}", p + 1, g_bits == e_bits);
+        st.check(rel <= FP32_REL_L2, || {
+            format!("{label}: rel_l2 {rel:.3e} (cos {cos:.9})")
+        });
+        println!(
+            "  {label}: len={} graph==eager bytes={} rel_l2={rel:.2e} cos={cos:.9}",
+            p + 1,
+            g_bits == e_bits
+        );
     }
     gpu.graphs.drop_captured_graph(&gpu.hip, dev_id);
     for t in dev {

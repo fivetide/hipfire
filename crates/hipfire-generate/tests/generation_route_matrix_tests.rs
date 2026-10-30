@@ -1239,7 +1239,13 @@ fn stop_sequences_are_honoured_exactly_on_the_qwen_semantic_producers() {
     with_stop.sort_unstable();
     assert_eq!(
         with_stop,
-        ["qwen4_ar", "qwen4_spec", "qwen_ar", "qwen_dflash", "raon_ar"]
+        [
+            "qwen4_ar",
+            "qwen4_spec",
+            "qwen_ar",
+            "qwen_dflash",
+            "raon_ar"
+        ]
     );
     // Both Qwen4 routes a Flash-Next load can select carry tools AND stop, so
     // attaching MTP never changes which request shapes are accepted.

@@ -852,10 +852,14 @@ fn end_to_end_synthetic_artifact_matches_class_table_and_is_reproducible() {
     assert_eq!(qt("model.layers.2.self_attn.q_b_proj.weight"), 3);
     assert_eq!(qt("model.layers.2.self_attn.kv_b_proj.weight"), 3);
     assert!(
-        !by.keys().any(|n| n.contains("self_attn") && n.ends_with(".awq_scale.weight")),
+        !by.keys()
+            .any(|n| n.contains("self_attn") && n.ends_with(".awq_scale.weight")),
         "no sidecars for Q8 attention tensors"
     );
-    assert!(!by.contains_key("lm_head.awq_scale.weight"), "no sidecar for Q8 lm_head");
+    assert!(
+        !by.contains_key("lm_head.awq_scale.weight"),
+        "no sidecar for Q8 lm_head"
+    );
     assert_eq!(qt(&format!("{p}moe.gate.weight")), 2);
     assert_eq!(
         by[format!("{p}moe.gate.weight").as_str()].shape,

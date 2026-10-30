@@ -111,7 +111,11 @@ fn bf16_view_end(v: &LatentRows<'_>, n_heads: usize, max_rows: usize, what: &str
         })
         .and_then(|a| a.checked_add(v.offset))
         .and_then(|a| a.checked_add(v.width))
-        .ok_or_else(|| err(format!("latent_attention tiled: {what} extent overflows usize")))?;
+        .ok_or_else(|| {
+            err(format!(
+                "latent_attention tiled: {what} extent overflows usize"
+            ))
+        })?;
     if end > v.buf.numel() {
         return Err(err(format!(
             "latent_attention tiled: {what} view needs {end} elements, tensor holds {}",
@@ -136,15 +140,27 @@ impl TiledAttention<'_> {
     /// check kernel-specific alignment; launchers add their own.
     pub fn validate(&self) -> HipResult<()> {
         if self.n_rows == 0 || self.n_heads == 0 {
-            return Err(err("latent_attention tiled: rows and heads must be nonzero"));
+            return Err(err(
+                "latent_attention tiled: rows and heads must be nonzero",
+            ));
         }
         if self.max_rows == 0 {
             return Err(err("latent_attention tiled: max_rows must be nonzero"));
         }
         let (dq, dv) = (self.dq(), self.dv());
         for (t, d, what, n) in [
-            (self.q, DType::F32, "query plane", self.n_rows * self.n_heads * dq),
-            (self.y, DType::F32, "output plane", self.n_rows * self.n_heads * dv),
+            (
+                self.q,
+                DType::F32,
+                "query plane",
+                self.n_rows * self.n_heads * dq,
+            ),
+            (
+                self.y,
+                DType::F32,
+                "output plane",
+                self.n_rows * self.n_heads * dv,
+            ),
         ] {
             if t.dtype != d {
                 return Err(err(format!(
@@ -160,7 +176,9 @@ impl TiledAttention<'_> {
             }
         }
         if self.pos.byte_size() < 4 {
-            return Err(err("latent_attention tiled: pos must hold a 4-byte device scalar"));
+            return Err(err(
+                "latent_attention tiled: pos must hold a 4-byte device scalar",
+            ));
         }
         bf16_view_end(&self.k_a, self.n_heads, self.max_rows, "k_a")?;
         bf16_view_end(&self.k_b, self.n_heads, self.max_rows, "k_b")?;
