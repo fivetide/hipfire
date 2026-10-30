@@ -65,6 +65,7 @@ pub mod head_lanes;
 pub mod iu4_c8_pm;
 mod kernel_abi;
 pub mod latent_attention;
+pub mod device_counter;
 pub mod stream_mix;
 pub mod kernel_pack;
 pub mod kernel_registry;

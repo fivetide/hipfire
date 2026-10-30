@@ -770,10 +770,12 @@ pub fn stage_decode_token(
     stage_tokens(cfg, scratch, gpu, &[token])
 }
 
-/// Device-only decode body (`rows == 1`, logits wanted, no tap): embedding of
-/// the staged token id, all layers, head. Issues kernel launches that read
+/// Device-only decode step (`rows == 1`, logits wanted, no tap): embedding of
+/// the staged token id, all layers, head, then a device-side `seq_len += 1`
+/// after every kernel that reads it. Issues kernel launches that read and write
 /// stable device buffers only (token id, `seq_len`, state, scratch), so it is
-/// recordable into a hipGraph. Does NOT advance `seq_len`/`n_tokens`.
+/// recordable into a hipGraph and a replay advances the length with no host
+/// write. The host mirror (`RaonState::note_host_tokens`) is the caller's.
 pub fn decode_body(
     cfg: &RaonConfig,
     w: &RaonWeights,
@@ -782,7 +784,9 @@ pub fn decode_body(
     work: &RaonWork,
     gpu: &mut Gpu,
 ) -> Result<(), String> {
-    forward_body(cfg, w, s, scratch, work, gpu, 1, s.n_tokens(), true, &mut None)
+    forward_body(cfg, w, s, scratch, work, gpu, 1, s.n_tokens(), true, &mut None)?;
+    gpu.device_counter_add_i32(&s.seq_len, 1)
+        .map_err(|e| format!("raon1_mini: device seq_len advance: {e:?}"))
 }
 
 /// Identity of every device address and baked extent the decode body reads:

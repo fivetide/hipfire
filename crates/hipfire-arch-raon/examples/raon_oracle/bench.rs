@@ -372,23 +372,69 @@ fn greedy_run(
     })
 }
 
+/// One device-loop rep: wall seconds plus how the decode steps were served.
+struct DeviceLoopRep {
+    secs: f64,
+    /// `RaonBundle::decode_mode()` at the time of the rep.
+    mode: &'static str,
+    /// Graph captures / replays during the rep's decode steps.
+    captures: u64,
+    replays: u64,
+    /// Host-side duration of every `decode_step` call (ms).
+    step_ms: Vec<f64>,
+    /// Unix seconds at the first decode step and after the closing synchronize.
+    t_start_unix: f64,
+    t_end_unix: f64,
+}
+
 /// Cold slot, prefill `prompt`, then replay `ids` with no readback; the timer
-/// brackets the decode steps and one synchronize. Seconds.
+/// brackets the decode steps and one synchronize.
+fn device_loop_rep(
+    bundle: &mut RaonBundle,
+    gpu: &mut Gpu,
+    prompt: &[u32],
+    ids: &[u32],
+) -> Result<DeviceLoopRep, String> {
+    cold(bundle, gpu)?;
+    bundle.prefill(gpu, prompt)?;
+    sync(gpu)?;
+    let (c0, r0) = bundle.decode_graph_stats();
+    let mut step_ms = Vec::with_capacity(ids.len());
+    let unix_now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64())
+    };
+    let t_start_unix = unix_now();
+    let t0 = Instant::now();
+    for &t in ids {
+        let s0 = Instant::now();
+        bundle.decode_step(gpu, t)?;
+        step_ms.push(s0.elapsed().as_secs_f64() * 1e3);
+    }
+    sync(gpu)?;
+    let secs = t0.elapsed().as_secs_f64();
+    let t_end_unix = unix_now();
+    let (c1, r1) = bundle.decode_graph_stats();
+    Ok(DeviceLoopRep {
+        t_start_unix,
+        t_end_unix,
+        secs,
+        mode: bundle.decode_mode(),
+        captures: c1 - c0,
+        replays: r1 - r0,
+        step_ms,
+    })
+}
+
+/// Cold slot, prefill `prompt`, then replay `ids` with no readback; seconds.
 fn device_loop(
     bundle: &mut RaonBundle,
     gpu: &mut Gpu,
     prompt: &[u32],
     ids: &[u32],
 ) -> Result<f64, String> {
-    cold(bundle, gpu)?;
-    bundle.prefill(gpu, prompt)?;
-    sync(gpu)?;
-    let t0 = Instant::now();
-    for &t in ids {
-        bundle.decode_step(gpu, t)?;
-    }
-    sync(gpu)?;
-    Ok(t0.elapsed().as_secs_f64())
+    device_loop_rep(bundle, gpu, prompt, ids).map(|r| r.secs)
 }
 
 // ───────────────────────── throughput ─────────────────────────
@@ -459,11 +505,21 @@ fn bench_tg(
     let clocks_before = clocks_json(pci);
     let mut greedy_tok_s = Vec::new();
     let mut device_tok_s = Vec::new();
+    let mut device_reps: Vec<Value> = Vec::new();
     let mut last_token_ms: Vec<f64> = Vec::new();
+    let mut greedy_reps: Vec<Value> = Vec::new();
     for _ in 0..reps {
+        let (gc0, gr0) = bundle.decode_graph_stats();
         let g = greedy_run(bundle, gpu, &prompt, tg)?;
+        let (gc1, gr1) = bundle.decode_graph_stats();
         let total: f64 = g.token_secs.iter().sum();
         greedy_tok_s.push(tg as f64 / total.max(1e-12));
+        greedy_reps.push(json!({
+            "decode_mode": bundle.decode_mode(),
+            "graph_captures": gc1 - gc0,
+            "graph_replays": gr1 - gr0,
+            "tok_s": tg as f64 / total.max(1e-12),
+        }));
         finite &= g.finite;
         eos_seen |= g.eos_seen;
         match &first_ids {
@@ -471,8 +527,20 @@ fn bench_tg(
             Some(f) => deterministic &= *f == g.ids,
         }
         last_token_ms = g.token_secs.iter().map(|s| s * 1e3).collect();
-        let d = device_loop(bundle, gpu, &prompt, &g.ids)?;
-        device_tok_s.push(tg as f64 / d.max(1e-12));
+        let d = device_loop_rep(bundle, gpu, &prompt, &g.ids)?;
+        device_tok_s.push(tg as f64 / d.secs.max(1e-12));
+        let mut sm = d.step_ms.clone();
+        sm.sort_by(|a, b| a.total_cmp(b));
+        device_reps.push(json!({
+            "decode_mode": d.mode,
+            "graph_captures": d.captures,
+            "graph_replays": d.replays,
+            "tok_s": tg as f64 / d.secs.max(1e-12),
+            "t_start_unix": d.t_start_unix,
+            "t_end_unix": d.t_end_unix,
+            "step_ms": {"mean": mean(&d.step_ms), "p50": percentile(&sm, 0.5), "max": sm.last()},
+            "slow_steps_over_1p5x_p50": sm.get(sm.len() / 2).map_or(0, |p| d.step_ms.iter().filter(|m| **m > 1.5 * p).count()),
+        }));
     }
     let clocks_after = clocks_json(pci);
     let mut sorted = last_token_ms.clone();
@@ -492,6 +560,7 @@ fn bench_tg(
             "what": "per-token host timing: logits download + first-max argmax + decode_step",
             "tok_s": greedy_tok_s,
             "stats": stats(&greedy_tok_s),
+            "reps": greedy_reps,
             "last_rep_token_ms": {
                 "mean": mean(&last_token_ms),
                 "p50": percentile(&sorted, 0.5),
@@ -504,6 +573,7 @@ fn bench_tg(
             "what": "greedy ids replayed, no readback, one synchronize",
             "tok_s": device_tok_s,
             "stats": stats(&device_tok_s),
+            "reps": device_reps,
         },
         "clocks_before": clocks_before,
         "clocks_after": clocks_after,
@@ -1052,7 +1122,7 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
             "controls": {
                 "prefill_mode": mode_name(bundle.prefill_mode()),
                 "prefill_precision": precision,
-                "decode_route": "RaonBundle::decode_step (as built; see env for graph/eager controls)",
+                "decode_route": bundle.decode_mode(),
                 "max_seq": max_seq,
                 "env": env_controls(),
             },

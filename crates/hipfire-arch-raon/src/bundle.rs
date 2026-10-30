@@ -346,10 +346,11 @@ impl RaonBundle {
     ///
     /// Host work stays outside the recorded region: context admission (which
     /// may grow the latent mapping / expanded mirror and thereby change the
-    /// binding), the token id upload into the stable device id buffer, and the
-    /// single `seq_len` advance after the step. The recorded body reads the
-    /// token id and `seq_len` from device memory, so one recording replays
-    /// correctly at every later position of the same binding.
+    /// binding) and the token id upload into the stable device id buffer. The
+    /// recorded step reads the token id and `seq_len` from device memory and
+    /// advances `seq_len` itself (last kernel of the graph), so one recording
+    /// replays correctly at every later position of the same binding with no
+    /// per-token host write of the length.
     ///
     /// Recording executes nothing (HIP captures launches into the graph), so
     /// the capturing step launches the fresh graph once and consumes its token
@@ -363,7 +364,8 @@ impl RaonBundle {
         if !self.graph.warmed {
             decode_body(&self.config, &self.weights, &self.state, &self.scratch, &self.work, gpu)?;
             self.graph.warmed = true;
-            return self.state.set_n_tokens(gpu, end);
+            self.state.note_host_tokens(1);
+            return Ok(());
         }
         if gpu.active_stream.is_none() {
             let stream = gpu
@@ -386,7 +388,9 @@ impl RaonBundle {
         gpu.graphs
             .graph_launch(&gpu.hip, gpu.device_id, stream)
             .map_err(|e| format!("raon1_mini: decode graph launch: {e:?}"))?;
-        self.state.set_n_tokens(gpu, end)
+        // The recorded step advanced the device `seq_len`; mirror it on the host.
+        self.state.note_host_tokens(1);
+        Ok(())
     }
 
     /// Record the decode body into the generic AR graph slot, replacing any
