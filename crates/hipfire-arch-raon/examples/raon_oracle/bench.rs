@@ -956,6 +956,7 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
 
     let precision = match PrefillPrecision::from_env()? {
         PrefillPrecision::F16 => "f16",
+        PrefillPrecision::A8 => "a8",
         PrefillPrecision::A4 => "a4",
     };
     let mut gpu = Gpu::init().map_err(|e| format!("bench: gpu init: {e:?}"))?;
