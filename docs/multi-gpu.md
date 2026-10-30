@@ -1088,8 +1088,12 @@ and EP2 mq4; see the stage-policy bullet below); the serve figures are in the
   edge through pinned host memory (no peer access), exactly as the singleton
   PP forward. A decode step is cut into `G` contiguous, balanced, whole-lane
   micro-batches (a lane's rows are never split) that wavefront through the
-  bands with sender completion events gating each receiver upload
-  (`HIPFIRE_PP_LANE_OVERLAP=0` selects the sequential band walk). Prompt
+  bands with sender completion events gating each receiver upload. The
+  gate is a device-side stream wait on the sender's event: the one host
+  thread enqueues every group's launches without blocking on a sender, so the
+  receiver band's kernels are already queued when the edge event fires
+  (`HIPFIRE_PP_LANE_EDGE_HOST_WAIT=1` restores the host `hipEventSynchronize`
+  per edge; `HIPFIRE_PP_LANE_OVERLAP=0` selects the sequential band walk). Prompt
   tiles run as singleton PP tiles. Per-step token staging uses pinned host
   memory with event-fenced asynchronous uploads; it must stay byte-identical
   to a synchronous upload, and no speedup from it is measured or claimed here.
