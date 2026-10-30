@@ -1727,6 +1727,7 @@ dependencies = [
  "hipfire-arch-qwen35-embed",
  "hipfire-arch-qwen35-vl",
  "hipfire-arch-qwen4",
+ "hipfire-arch-raon",
  "hipfire-config",
  "hipfire-dispatch",
  "hipfire-engine",
