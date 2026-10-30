@@ -110,7 +110,12 @@ impl RaonBundle {
             .and_then(|m| PrefillPrecision::from_env().map(|p| (m, p)))
             .and_then(|(m, p)| {
                 p.apply(gpu);
-                RaonWork::new(gpu, &config, scratch.rows).map(|w| (m, w))
+                let mut work = RaonWork::new(gpu, &config, scratch.rows)?;
+                if let Err(e) = work.mla.pack_absorbed(gpu, &config, &weights) {
+                    work.free(gpu);
+                    return Err(e);
+                }
+                Ok((m, work))
             });
         match built {
             Ok((prefill_mode, work)) => {

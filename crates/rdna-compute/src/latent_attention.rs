@@ -14,9 +14,10 @@
 //! Storage contracts (frozen for callers):
 //! * latent cache: BF16, row-major `[cache_rows, latent + tail]`, one row per
 //!   token, normalized latent followed by the raw tail.
-//! * expanded mirrors (BF16, head-major, row stride `cap`):
-//!   `knope[h][t][nope]` and `vmir[h][t][v]`. The tail is not duplicated per
-//!   head; attention reads it from the latent cache.
+//! * expanded mirrors (BF16, token-major, so they grow by appending rows):
+//!   `knope[t][h][nope]` and `vmir[t][h][v]`; `mirror_cap` is the number of
+//!   rows the caller has backed (a bound, not a stride). The tail is not
+//!   duplicated per head; attention reads it from the latent cache.
 //! * activations (`kv_a`, `q`, `y`, `g`, …) are F32 planes holding
 //!   BF16-rounded values; kernels apply the BF16 rounding at the same points a
 //!   BF16 reference does.

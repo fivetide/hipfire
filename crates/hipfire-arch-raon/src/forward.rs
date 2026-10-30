@@ -46,7 +46,7 @@ use rdna_compute::{Gpu, GpuTensor};
 
 use crate::config::{LayerKind, RaonConfig};
 use crate::mhc::{broadcast_embedding, final_mean_norm, RaonMhcShape, RaonMhcWork};
-use crate::mla::{raon_mla_scale, RAON_MLA_EPS};
+use crate::mla::{raon_mla_scale, MlaRoute, RaonMlaWork, RAON_MLA_EPS};
 use crate::moe::{
     forward_dense, forward_moe, RaonDenseRefs, RaonDenseScratch, RaonMoeDims, RaonMoeLayerRefs,
     RaonMoeScratch,
@@ -55,7 +55,7 @@ use crate::projection::{project, OutRound};
 use crate::rda::{
     rda_forward_rows, RaonRdaLayer, RdaGeometry, RdaLayerState, RdaProjected, RdaScratch,
 };
-use crate::state::{RaonPrefillScratch, RaonState, EXPANDED_MIRROR_MAX_ROWS, MLA_TILE_ROWS};
+use crate::state::{RaonPrefillScratch, RaonState, MLA_TILE_ROWS};
 use crate::weights::{
     MhcSiteWeights, MlaWeights, RaonFfn, RaonLayerWeights, RaonMixer, RaonWeights, RdaWeights,
 };
@@ -74,6 +74,8 @@ pub struct RaonWork {
     moe_dims: RaonMoeDims,
     moe: RaonMoeScratch,
     dense: RaonDenseScratch,
+    /// MLA route controls, split-KV workspace and absorbed-route operands.
+    pub mla: RaonMlaWork,
 }
 
 impl RaonWork {
@@ -139,6 +141,16 @@ impl RaonWork {
                 return Err(e);
             }
         };
+        let mla = match RaonMlaWork::new(gpu, cfg, rows) {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = mhc.free(gpu);
+                free_rda_scratch(gpu, rda);
+                moe.free(gpu);
+                dense.free(gpu);
+                return Err(e);
+            }
+        };
         Ok(Self {
             rows,
             mhc_shape,
@@ -148,6 +160,7 @@ impl RaonWork {
             moe_dims,
             moe,
             dense,
+            mla,
         })
     }
 
@@ -164,6 +177,7 @@ impl RaonWork {
         free_rda_scratch(gpu, self.rda);
         self.moe.free(gpu);
         self.dense.free(gpu);
+        self.mla.free(gpu);
     }
 }
 
@@ -403,8 +417,16 @@ fn mla_expand(
     )
 }
 
-/// MLA layer: PLAN §1.6 with the expanded-mirror attention. Reads
-/// `scratch.branch_in`, writes `scratch.branch_out`.
+/// Route of a call that leaves `end` rows cached (pure: policy x admission
+/// budget, no device state).
+pub fn mla_route(work: &RaonWork, s: &RaonState, end: usize) -> MlaRoute {
+    work.mla.policy().route(end, s.mirror_budget_rows())
+}
+
+/// MLA layer: PLAN §1.6 over the expanded mirror (reference or tiled
+/// kernels) or, beyond the mirror budget with `HIPFIRE_RAON_MLA_ABSORB=1`,
+/// over the latent cache alone. Reads `scratch.branch_in`, writes
+/// `scratch.branch_out`.
 #[allow(clippy::too_many_arguments)]
 fn mla_mixer(
     gpu: &mut Gpu,
@@ -413,25 +435,32 @@ fn mla_mixer(
     mi: usize,
     s: &RaonState,
     scratch: &RaonPrefillScratch,
+    work: &RaonWork,
     rows: usize,
     start: usize,
 ) -> Result<(), String> {
     let x = &scratch.branch_in;
     let b = OutRound::Bf16;
     let geometry = latent_geometry(cfg);
-    let mirror = s
-        .expanded_mirror()
-        .ok_or("raon1_mini: MLA attention needs an admitted expanded K/V mirror")?;
+    let route = mla_route(work, s, start + rows);
+    let dmirror = match route {
+        MlaRoute::Decompressed => {
+            let mirror = s
+                .expanded_mirror()
+                .ok_or("raon1_mini: MLA attention needs a backed expanded K/V mirror")?;
+            Some(DMirror {
+                knope: &mirror.knope[mi],
+                vmir: &mirror.vmir[mi],
+                capacity_rows: mirror.rows,
+            })
+        }
+        MlaRoute::Absorbed => None,
+    };
     let cache = LatentCache {
         rows: &s.mla_cache[mi],
         capacity_rows: s.capacity_rows(),
         pos: &s.seq_len,
         host_pos: Some(start),
-    };
-    let dmirror = DMirror {
-        knope: &mirror.knope[mi],
-        vmir: &mirror.vmir[mi],
-        capacity_rows: mirror.rows,
     };
 
     project(gpu, &w.q_a_proj, x, &scratch.mla_qa, rows, b)?;
@@ -461,16 +490,9 @@ fn mla_mixer(
             eps: RAON_MLA_EPS,
         },
     )?;
-    mla_expand(
-        gpu,
-        cfg,
-        w,
-        scratch,
-        cache,
-        dmirror,
-        RowRange::NewRows { count: rows },
-        rows,
-    )?;
+    if let Some(dm) = dmirror {
+        mla_expand(gpu, cfg, w, scratch, cache, dm, RowRange::NewRows { count: rows }, rows)?;
+    }
     run_latent(
         gpu,
         LatentAttentionOp::Attention {
@@ -481,6 +503,7 @@ fn mla_mixer(
             y: &scratch.mla_attn,
             rows,
             scale: raon_mla_scale(&geometry),
+            route: work.mla.attention_route(route, mi)?,
         },
     )?;
     run_latent(
@@ -547,14 +570,19 @@ fn ffn_block(
 
 // ───────────────────────── mirror admission ─────────────────────────
 
-/// Make sure `s` can attend over `end` rows: map the latent caches ahead and
-/// size the expanded K/V mirror (growing it re-expands the live prefix from the
-/// latent cache through each layer's `kv_b`). Outside capture only.
+/// Make sure `s` can attend over `end` rows: map the latent caches ahead and,
+/// on the decompressed route, back the expanded K/V mirror (in place, VMM) and
+/// bring it level with the live prefix (rows `[valid, start)` are expanded
+/// from the latent cache through each layer's `kv_b`; rows of the call itself
+/// are expanded by the MLA mixers). A context beyond the mirror budget is
+/// refused with the maximum supported context unless the absorbed route is
+/// enabled, which needs no mirror. Outside capture only.
 fn ensure_context(
     cfg: &RaonConfig,
     w: &RaonWeights,
     s: &mut RaonState,
     scratch: &RaonPrefillScratch,
+    work: &RaonWork,
     gpu: &mut Gpu,
     end: usize,
 ) -> Result<(), String> {
@@ -562,57 +590,57 @@ fn ensure_context(
     if cfg.n_mla() == 0 {
         return Ok(());
     }
-    let have = s.expanded_mirror().map_or(0, |m| m.rows);
-    if end <= have {
-        return Ok(());
-    }
-    let cap = EXPANDED_MIRROR_MAX_ROWS.min(s.max_seq());
-    if end > cap {
-        return Err(format!(
-            "raon1_mini: context of {end} rows exceeds the {cap} rows the reference MLA attention can read \
-             (expanded K/V mirror limit {EXPANDED_MIRROR_MAX_ROWS}, max_seq {}); a tiled/absorbed MLA route is not admitted",
-            s.max_seq()
-        ));
-    }
-    let target = end.next_multiple_of(1024).min(cap).max(end);
-    let live = s.n_tokens();
-    s.admit_expanded_mirror(gpu, target)?;
-    if live == 0 {
-        return Ok(());
-    }
-    let mirror = s.expanded_mirror().expect("mirror just admitted");
-    for (mi, layer_idx) in cfg.mla_layers().into_iter().enumerate() {
-        let RaonMixer::Mla(mw) = &w.layers[layer_idx].mixer else {
-            return Err(format!("raon1_mini: layer {layer_idx} is not an MLA layer"));
-        };
-        let cache = LatentCache {
-            rows: &s.mla_cache[mi],
-            capacity_rows: s.capacity_rows(),
-            pos: &s.seq_len,
-            host_pos: None,
-        };
-        let dmirror = DMirror {
-            knope: &mirror.knope[mi],
-            vmir: &mirror.vmir[mi],
-            capacity_rows: mirror.rows,
-        };
-        let mut done = 0usize;
-        while done < live {
-            let count = MLA_TILE_ROWS.min(scratch.rows).min(live - done);
-            mla_expand(
-                gpu,
-                cfg,
-                mw,
-                scratch,
-                cache,
-                dmirror,
-                RowRange::Absolute { start: done, count },
-                count,
-            )?;
-            done += count;
+    let start = s.n_tokens();
+    // Rows at or beyond `start` are about to be rewritten.
+    s.clamp_mirror_valid_rows(start);
+    match mla_route(work, s, end) {
+        MlaRoute::Absorbed => {
+            if !work.mla.absorbed_ready() {
+                return Err("raon1_mini: absorbed MLA route selected but its packed weights are not built".into());
+            }
+            Ok(())
+        }
+        MlaRoute::Decompressed => {
+            s.ensure_mirror_rows(gpu, end)?;
+            let valid = s.mirror_valid_rows();
+            if valid < start {
+                let mirror = s.expanded_mirror().expect("mirror just backed");
+                for (mi, layer_idx) in cfg.mla_layers().into_iter().enumerate() {
+                    let RaonMixer::Mla(mw) = &w.layers[layer_idx].mixer else {
+                        return Err(format!("raon1_mini: layer {layer_idx} is not an MLA layer"));
+                    };
+                    let cache = LatentCache {
+                        rows: &s.mla_cache[mi],
+                        capacity_rows: s.capacity_rows(),
+                        pos: &s.seq_len,
+                        host_pos: None,
+                    };
+                    let dmirror = DMirror {
+                        knope: &mirror.knope[mi],
+                        vmir: &mirror.vmir[mi],
+                        capacity_rows: mirror.rows,
+                    };
+                    let mut done = valid;
+                    while done < start {
+                        let count = MLA_TILE_ROWS.min(scratch.rows).min(start - done);
+                        mla_expand(
+                            gpu,
+                            cfg,
+                            mw,
+                            scratch,
+                            cache,
+                            dmirror,
+                            RowRange::Absolute { start: done, count },
+                            count,
+                        )?;
+                        done += count;
+                    }
+                }
+            }
+            s.set_mirror_valid_rows(end);
+            Ok(())
         }
     }
-    Ok(())
 }
 
 // ───────────────────────── embedding / head ─────────────────────────
@@ -724,7 +752,7 @@ fn forward_impl(
         ));
     }
     let end = start + rows;
-    ensure_context(cfg, w, s, scratch, gpu, end)?;
+    ensure_context(cfg, w, s, scratch, work, gpu, end)?;
 
     embed_rows(cfg, w, scratch, work, gpu, tokens)?;
     fire(&mut tap, gpu, TapSite::Embedding, &scratch.stream_a, rows)?;
@@ -762,7 +790,7 @@ fn forward_impl(
                 }
                 (LayerKind::Mla, RaonMixer::Mla(mw)) => {
                     let mi = cfg.mla_index(l).ok_or_else(|| format!("raon1_mini: layer {l} has no MLA slot"))?;
-                    mla_mixer(gpu, cfg, mw, mi, s, scratch, rows, start)
+                    mla_mixer(gpu, cfg, mw, mi, s, scratch, work, rows, start)
                         .map_err(|e| format!("raon1_mini L{l} mla: {e}"))?;
                 }
                 _ => return Err(format!("raon1_mini: layer {l} weights do not match its configured mixer")),
