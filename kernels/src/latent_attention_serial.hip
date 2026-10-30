@@ -68,7 +68,7 @@ extern "C" __global__ __launch_bounds__(LA_KT) void latent_attention_serial_bf16
     float* __restrict__ y,               // [n_rows, H, dv]
     const int* __restrict__ pos_ptr,     // device scalar: rows cached before this call
     int n_rows, int n_heads, int nope, int tail, int dv, int latent, int cap,
-    float scale, int vec8
+    float scale, int vec8, int mcap
 ) {
     extern __shared__ float smem[];
     const int h = blockIdx.x;
@@ -82,6 +82,7 @@ extern "C" __global__ __launch_bounds__(LA_KT) void latent_attention_serial_bf16
 
     int len = *pos_ptr + i + 1;
     if (len > cap) len = cap;
+    if (len > mcap) len = mcap;
     if (len < 0) len = 0;
 
     const float* qr = q + ((size_t)i * n_heads + h) * dqk;
@@ -99,7 +100,7 @@ extern "C" __global__ __launch_bounds__(LA_KT) void latent_attention_serial_bf16
         const bool valid = j < len;
         float s = -INFINITY;
         if (valid) {
-            float a = la_dot_row(qs, knope + ((size_t)h * cap + j) * nope, nope, vec8, 0.0f);
+            float a = la_dot_row(qs, knope + ((size_t)h * mcap + j) * nope, nope, vec8, 0.0f);
             a = la_dot_row(qs + nope, cache + (size_t)j * width + latent, tail, vec8, a);
             s = a * scale;
         }
@@ -125,7 +126,7 @@ extern "C" __global__ __launch_bounds__(LA_KT) void latent_attention_serial_bf16
         l = l * corr + psum;
         m = m_new;
         const int cnt = (len - kt < LA_KT) ? (len - kt) : LA_KT;
-        const uint16_t* vbase = vmir + ((size_t)h * cap + kt) * dv;
+        const uint16_t* vbase = vmir + ((size_t)h * mcap + kt) * dv;
         #pragma unroll
         for (int r = 0; r < LA_DVQ; ++r) {
             const int d = tid + r * LA_KT;

@@ -436,6 +436,7 @@ impl Gpu {
         latent: usize,
         tail: usize,
         cap: usize,
+        mirror_cap: usize,
     ) -> HipResult<()> {
         if n_rows == 0 {
             return Ok(());
@@ -445,7 +446,8 @@ impl Gpu {
         need_dtype(cache, DType::BF16, "latent cache")?;
         need_numel(cache, product(cap, width, "cache")?, "latent cache")?;
         let w_bf16 = gamma_flag(w, product(n_out, latent, "kv_b")?, "expansion weight")?;
-        self.check_mirrors(knope, vmir, n_heads, nope, v, cap)?;
+        self.check_mirrors(knope, vmir, n_heads, nope, v, mirror_cap)?;
+        let mcap = i32_of(mirror_cap, "mirror capacity")?;
         if let Some(b) = base {
             need_scalar_i32(b, "row base")?;
         }
@@ -491,6 +493,7 @@ impl Gpu {
             &tl as *const _ as *mut c_void,
             &cp_rows as *const _ as *mut c_void,
             &w_bf16 as *const _ as *mut c_void,
+            &mcap as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             "latent_attention_decompress_dense",
@@ -514,6 +517,7 @@ impl Gpu {
                 b.push_i32(tl);
                 b.push_i32(cp_rows);
                 b.push_i32(w_bf16);
+                b.push_i32(mcap);
                 b
             },
         )
@@ -565,6 +569,7 @@ impl Gpu {
         v: usize,
         latent: usize,
         cap: usize,
+        mirror_cap: usize,
         scale: f32,
     ) -> HipResult<()> {
         if n_rows == 0 {
@@ -593,7 +598,8 @@ impl Gpu {
         )?;
         need_dtype(cache, DType::BF16, "latent cache")?;
         need_numel(cache, product(cap, width, "cache")?, "latent cache")?;
-        self.check_mirrors(knope, vmir, n_heads, nope, v, cap)?;
+        self.check_mirrors(knope, vmir, n_heads, nope, v, mirror_cap)?;
+        let mcap = i32_of(mirror_cap, "mirror capacity")?;
         need_scalar_i32(pos, "position")?;
         // 16-byte vector loads need every row start 16-byte aligned.
         let vec8 = nope % 8 == 0
@@ -642,6 +648,7 @@ impl Gpu {
             &cp_rows as *const _ as *mut c_void,
             &scale as *const _ as *mut c_void,
             &vec8_i as *const _ as *mut c_void,
+            &mcap as *const _ as *mut c_void,
         ];
         let shared = ((dqk + 2 * SERIAL_KEY_TILE) * 4) as u32;
         self.launch_maybe_blob(
@@ -667,6 +674,7 @@ impl Gpu {
                 b.push_i32(cp_rows);
                 b.push_f32(scale);
                 b.push_i32(vec8_i);
+                b.push_i32(mcap);
                 b
             },
         )

@@ -72,9 +72,10 @@ pub struct LatentCache<'a> {
     pub host_pos: Option<usize>,
 }
 
-/// Bounded expanded BF16 mirrors, head-major with row stride `capacity_rows`:
-/// `knope[h][t][nope]`, `vmir[h][t][v_dim]`. Sized by the caller; never an
-/// unconditional max-sequence allocation.
+/// Bounded expanded BF16 mirrors, head-major with row stride `capacity_rows`
+/// (the admitted mirror rows, independent of the latent cache's mapped
+/// capacity): `knope[h][t][nope]`, `vmir[h][t][v_dim]`, valid for `t < pos`.
+/// Sized by the caller; never an unconditional max-sequence allocation.
 #[derive(Clone, Copy)]
 pub struct ExpandedMirror<'a> {
     pub knope: &'a GpuTensor,
@@ -175,6 +176,23 @@ fn check_geometry(g: &LatentGeometry) -> Result<(), DispatchError> {
     Ok(())
 }
 
+/// Refuse when the host-known live length exceeds the mirror's admitted rows
+/// (device-side kernels additionally clamp, never read/write past the stride).
+fn check_mirror(m: &ExpandedMirror<'_>, end: Option<usize>) -> Result<(), DispatchError> {
+    if m.capacity_rows == 0 {
+        return Err(refuse("expanded mirror capacity is zero".into()));
+    }
+    if let Some(e) = end {
+        if e > m.capacity_rows {
+            return Err(refuse(format!(
+                "expanded mirror holds {} rows, live length needs {e}",
+                m.capacity_rows
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn check_cache(c: &LatentCache<'_>, rows: usize) -> Result<(), DispatchError> {
     if c.capacity_rows == 0 {
         return Err(refuse("latent cache capacity is zero".into()));
@@ -254,12 +272,11 @@ pub fn execute_latent_attention(
         }
         LatentAttentionOp::Decompress { geometry, cache, mirror, expansion, range } => {
             check_geometry(geometry)?;
-            if mirror.capacity_rows != cache.capacity_rows {
-                return Err(refuse(format!(
-                    "mirror capacity {} != cache capacity {}",
-                    mirror.capacity_rows, cache.capacity_rows
-                )));
-            }
+            let mirror_end = match range {
+                RowRange::Absolute { start, count } => start.checked_add(*count),
+                RowRange::NewRows { count } => cache.host_pos.map(|p| p + *count),
+            };
+            check_mirror(mirror, mirror_end)?;
             let (dev_base, row0, count) = resolve_range(cache, *range)?;
             let base = dev_base.then_some(cache.pos);
             match expansion {
@@ -278,6 +295,7 @@ pub fn execute_latent_attention(
                         geometry.latent,
                         geometry.tail,
                         cache.capacity_rows,
+                        mirror.capacity_rows,
                     )
                     .map_err(hip),
                 KvExpansion::External { projected } => gpu
@@ -291,7 +309,7 @@ pub fn execute_latent_attention(
                         geometry.n_heads,
                         geometry.nope,
                         geometry.v_dim,
-                        cache.capacity_rows,
+                        mirror.capacity_rows,
                     )
                     .map_err(hip),
             }
@@ -299,12 +317,7 @@ pub fn execute_latent_attention(
         LatentAttentionOp::Attention { geometry, cache, mirror, q, y, rows, scale } => {
             check_geometry(geometry)?;
             check_cache(cache, *rows)?;
-            if mirror.capacity_rows != cache.capacity_rows {
-                return Err(refuse(format!(
-                    "mirror capacity {} != cache capacity {}",
-                    mirror.capacity_rows, cache.capacity_rows
-                )));
-            }
+            check_mirror(mirror, cache.host_pos.map(|p| p + *rows))?;
             gpu.latent_attention_serial(
                 q,
                 cache.rows,
@@ -319,6 +332,7 @@ pub fn execute_latent_attention(
                 geometry.v_dim,
                 geometry.latent,
                 cache.capacity_rows,
+                mirror.capacity_rows,
                 *scale,
             )
             .map_err(hip)
