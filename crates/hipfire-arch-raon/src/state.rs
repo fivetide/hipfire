@@ -15,7 +15,11 @@
 //!   maps ahead, fallibly, before admission or graph capture. VMM owners are
 //!   released only through `Gpu::free_tensor` (arena release/quarantine/
 //!   retired-VA semantics), never pooled;
-//! * an optional expanded BF16 K/V mirror admitted only for short contexts.
+//! * an optional expanded BF16 K/V mirror (token-major, per MLA layer), also VMM-backed:
+//!   virtual maximum reserved lazily, physical rows mapped ahead on demand up to a
+//!   memory budget computed from the free device memory at slot admission (never
+//!   `max_seq` unconditionally); growth never moves an address, so it never
+//!   invalidates a captured graph's pointers.
 //!
 //! [`RaonPrefillScratch`] is a separate owner (per invocation, not per slot):
 //! one exact device slab carved into every intermediate the forward needs for
@@ -43,8 +47,12 @@ pub const INITIAL_LATENT_ROWS: usize = 1024;
 pub const ADMISSION_HEADROOM_BYTES: usize = 256 << 20;
 /// Free device bytes that must remain after a latent-cache growth.
 pub const GROWTH_HEADROOM_BYTES: usize = 64 << 20;
-/// Longest context for which an expanded BF16 K/V mirror can be admitted.
-pub const EXPANDED_MIRROR_MAX_ROWS: usize = 8192;
+/// Rows per growth step of the expanded K/V mirror's VMM planes.
+pub const MIRROR_CHUNK_ROWS: usize = 1024;
+/// Free device bytes held back from the mirror budget for scratch, work
+/// buffers, graph buffers and other tenants (on top of
+/// [`ADMISSION_HEADROOM_BYTES`]).
+pub const MIRROR_RESERVE_BYTES: usize = 2 << 30;
 /// Largest `max_rows` accepted by [`RaonPrefillScratch::new`].
 pub const MAX_SCRATCH_ROWS: usize = 4096;
 /// Rows of one bounded decompression tile (`mla_kv_tile`).
@@ -519,39 +527,45 @@ fn slab_view(slab: &GpuTensor, off: usize, bytes: usize, dtype: DType, shape: Ve
 // Expanded mirror
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Optional expanded BF16 K/V rows for short contexts, head-major with the
-/// shared key tail left in the latent cache (the layout the latent attention
-/// op reads): per MLA layer `knope [heads, rows, nope]` and
-/// `vmir [heads, rows, v]`, row stride = `rows`. Dense (never VMM) so its
-/// addresses are fixed for capture; admitted and dropped only outside capture.
-/// Row `t` is valid for `t < RaonState::n_tokens`.
+/// Optional expanded BF16 K/V rows, token-major with the shared key tail left
+/// in the latent cache (the layout the latent attention op reads): per MLA
+/// layer `knope [rows, heads, nope]` and `vmir [rows, heads, v]`. With the VMM
+/// backend every plane reserves `max_seq` rows of virtual space and maps
+/// physical chunks on demand ([`RaonState::ensure_mirror_rows`]); addresses
+/// never change, so growth never invalidates a captured graph's pointers. The
+/// dense fallback owns exactly `rows` rows and reallocates to grow (dropping
+/// the valid-row mark). Row `t` is valid for `t < RaonState::mirror_valid_rows`.
 pub struct ExpandedMirror {
-    slab: GpuTensor,
-    /// Row stride (capacity) of every head plane.
+    /// Rows every plane is physically backed for (the attention kernels'
+    /// clamp; a baked kernel argument, so a change must rebuild a graph).
     pub rows: usize,
     pub knope: Vec<GpuTensor>,
     pub vmir: Vec<GpuTensor>,
+    /// Growth plans of the K and V planes (`None` for dense planes).
+    plans: Option<[KvChunkPlan; 2]>,
 }
 
-impl ExpandedMirror {
-    pub fn bytes(&self) -> usize {
-        self.slab.buf.size()
-    }
-}
-
-fn mirror_plane_bytes(d: &RaonStateDims, rows: usize) -> Result<[usize; 2], String> {
+/// Bytes per token row of the K_nope and V planes of ONE layer.
+pub fn mirror_plane_row_bytes(d: &RaonStateDims) -> [usize; 2] {
     let nope = d.mla_qk_head - d.tail;
-    Ok([
-        align_up(mul(mul(d.heads, rows)?, nope * 2)?, SLAB_ALIGN)?,
-        align_up(mul(mul(d.heads, rows)?, d.mla_v_head * 2)?, SLAB_ALIGN)?,
-    ])
+    [d.heads * nope * 2, d.heads * d.mla_v_head * 2]
 }
 
-/// Bytes of an expanded mirror of `rows` rows over all MLA layers
-/// (`heads*(nope+v)*2` per row per layer).
+/// Exact bytes per token row of the mirror over all MLA layers
+/// (`n_mla * heads * (nope + v) * 2`; 143,360 for the released geometry).
+pub fn mirror_row_bytes(d: &RaonStateDims) -> usize {
+    let [k, v] = mirror_plane_row_bytes(d);
+    (k + v) * d.n_mla
+}
+
+/// Bytes of an expanded mirror of `rows` rows over all MLA layers.
 pub fn expanded_mirror_bytes(d: &RaonStateDims, rows: usize) -> Result<usize, String> {
-    let p = mirror_plane_bytes(d, rows)?;
-    mul(p[0] + p[1], d.n_mla)
+    mul(mirror_row_bytes(d), rows)
+}
+
+/// Rows of mirror that `budget_bytes` backs (floor).
+pub fn mirror_rows_for_budget(d: &RaonStateDims, budget_bytes: usize) -> usize {
+    budget_bytes / mirror_row_bytes(d).max(1)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -605,6 +619,12 @@ pub struct RaonState {
     /// Only the first [`RaonState::capacity_rows`] rows are mapped.
     pub mla_cache: Vec<GpuTensor>,
     mirror: Option<ExpandedMirror>,
+    /// Most rows the mirror may ever back on this device (admission-time
+    /// budget, `<= max_seq`).
+    mirror_budget_rows: usize,
+    /// Mirror rows `[0, mirror_valid_rows)` equal the expansion of the latent
+    /// cache rows with the same index.
+    mirror_valid_rows: usize,
     n_tokens: usize,
     capacity_rows: usize,
 }
@@ -792,10 +812,23 @@ impl RaonState {
             seq_len,
             mla_cache: caches,
             mirror: None,
+            mirror_budget_rows: 0,
+            mirror_valid_rows: 0,
             n_tokens: 0,
             capacity_rows: 0,
         };
         state.capacity_rows = state.query_capacity_rows(gpu);
+        // Mirror budget: what is free now, minus the latent growth this slot
+        // may still map up to `max_seq`, minus the fixed reserves.
+        let pending_latent = budget
+            .full_physical(dims)
+            .saturating_sub(budget.initial_physical(dims));
+        let (free, _) = hip(gpu.device_mem_info(), "query device memory")?;
+        let usable = free
+            .saturating_sub(pending_latent)
+            .saturating_sub(ADMISSION_HEADROOM_BYTES)
+            .saturating_sub(MIRROR_RESERVE_BYTES);
+        state.mirror_budget_rows = mirror_rows_for_budget(dims, usable).min(max_seq);
         Ok(state)
     }
 
@@ -928,6 +961,7 @@ impl RaonState {
         let r = hipfire_runtime::reset_core::note_hip_result(r, "raon::RaonState::reset");
         hip(r, "reset recurrent state")?;
         self.n_tokens = 0;
+        self.mirror_valid_rows = 0;
         Ok(())
     }
 
@@ -987,59 +1021,239 @@ impl RaonState {
         Ok(())
     }
 
-    /// Admit an expanded BF16 K/V mirror of `rows` rows. Refused above
-    /// [`EXPANDED_MIRROR_MAX_ROWS`], above `max_seq`, or when memory is short.
-    /// Replaces any existing mirror. Outside capture only: invalidates graphs
-    /// that read the previous addresses.
-    pub fn admit_expanded_mirror(&mut self, gpu: &mut Gpu, rows: usize) -> Result<(), String> {
-        if rows == 0 || rows > EXPANDED_MIRROR_MAX_ROWS || rows > self.max_seq {
-            return Err(format!(
-                "raon state: expanded mirror of {rows} rows refused (limit {} and max_seq {})",
-                EXPANDED_MIRROR_MAX_ROWS, self.max_seq
-            ));
+    /// Most rows the decompressed (mirror) MLA route can serve on this
+    /// device: fixed at slot admission from the free device memory.
+    pub fn mirror_budget_rows(&self) -> usize {
+        self.mirror_budget_rows
+    }
+
+    /// Override the admission-time budget (oracle/test control: a lower value
+    /// forces the beyond-budget routes; a higher one stays bounded by
+    /// `max_seq` and by the free-memory check of every growth).
+    pub fn set_mirror_budget_rows(&mut self, rows: usize) {
+        self.mirror_budget_rows = rows.min(self.max_seq);
+    }
+
+    /// Rows of the mirror that equal the expansion of the latent cache.
+    pub fn mirror_valid_rows(&self) -> usize {
+        self.mirror_valid_rows
+    }
+
+    pub fn set_mirror_valid_rows(&mut self, rows: usize) {
+        self.mirror_valid_rows = rows;
+    }
+
+    /// Rows at or beyond `n` are about to be rewritten: they stop being valid.
+    pub fn clamp_mirror_valid_rows(&mut self, n: usize) {
+        self.mirror_valid_rows = self.mirror_valid_rows.min(n);
+    }
+
+    /// Rows the mirror is physically backed for right now.
+    pub fn mirror_backed_rows(&self) -> usize {
+        self.mirror.as_ref().map_or(0, |m| m.rows)
+    }
+
+    /// Why a context of `rows` cannot be served by the mirror, naming the
+    /// maximum context the decompressed route supports on this device.
+    pub fn mirror_capacity_error(&self, rows: usize) -> String {
+        let max = self.mirror_budget_rows.min(self.max_seq);
+        format!(
+            "raon state: a context of {rows} rows exceeds the maximum context of {max} tokens the \
+             decompressed MLA route can hold on this device (expanded K/V mirror {} B/token, \
+             admission budget {max} rows, slot reserve {} rows); \
+             HIPFIRE_RAON_MLA_ABSORB=1 attends over the latent cache beyond it (opt-in, not bit-exact)",
+            mirror_row_bytes(&self.dims),
+            self.max_seq
+        )
+    }
+
+    /// Back the expanded mirror for `rows` rows (map-ahead). Outside capture
+    /// only. VMM planes grow in place; the dense fallback reallocates (and
+    /// drops the valid-row mark). Refuses with
+    /// [`Self::mirror_capacity_error`] above the admission budget and when the
+    /// growth does not fit the free device memory; a refusal leaves the mirror
+    /// usable at its previous size. Returns whether the backing grew.
+    pub fn ensure_mirror_rows(&mut self, gpu: &mut Gpu, rows: usize) -> Result<bool, String> {
+        if rows == 0 {
+            return Ok(false);
         }
-        self.release_expanded_mirror(gpu)?;
-        let d = &self.dims;
-        let bytes = expanded_mirror_bytes(d, rows)?;
-        check_free(gpu, bytes, ADMISSION_HEADROOM_BYTES, "expanded K/V mirror")?;
-        let slab = hip(
-            gpu.alloc_tensor_exact(&[bytes], DType::Raw),
-            "alloc expanded mirror",
-        )?;
-        if let Err(e) = zero_buf(gpu, &slab.buf, bytes) {
-            let _ = gpu.free_tensor(slab);
-            return Err(format!("raon state: zero expanded mirror: {e:?}"));
+        if rows > self.mirror_budget_rows {
+            return Err(self.mirror_capacity_error(rows));
         }
-        let planes = mirror_plane_bytes(d, rows)?;
+        if self.mirror.as_ref().is_some_and(|m| m.rows >= rows) {
+            return Ok(false);
+        }
+        match self.backend {
+            LatentBackend::Vmm => self.ensure_mirror_vmm(gpu, rows),
+            LatentBackend::Dense => self.ensure_mirror_dense(gpu, rows),
+        }
+    }
+
+    fn ensure_mirror_dense(&mut self, gpu: &mut Gpu, rows: usize) -> Result<bool, String> {
+        let target = rows
+            .next_multiple_of(MIRROR_CHUNK_ROWS)
+            .min(self.mirror_budget_rows)
+            .max(rows);
+        let d = self.dims.clone();
         let nope = d.mla_qk_head - d.tail;
+        let need = mul(mirror_row_bytes(&d), target)?;
+        // The old planes are released only after the new ones exist; the
+        // free-memory check counts them as reclaimable so a growth near the
+        // budget is not refused for the transient overlap alone.
+        let old = self.mirror.as_ref().map_or(0, |m| m.rows * mirror_row_bytes(&d));
+        check_free(
+            gpu,
+            need.saturating_sub(old),
+            GROWTH_HEADROOM_BYTES,
+            &format!("dense expanded mirror of {target} rows"),
+        )?;
         let mut knope = Vec::with_capacity(d.n_mla);
         let mut vmir = Vec::with_capacity(d.n_mla);
-        for l in 0..d.n_mla {
-            let base = l * (planes[0] + planes[1]);
-            knope.push(slab_view(
-                &slab,
-                base,
-                d.heads * rows * nope * 2,
-                DType::BF16,
-                vec![d.heads, rows, nope],
-            ));
-            vmir.push(slab_view(
-                &slab,
-                base + planes[0],
-                d.heads * rows * d.mla_v_head * 2,
-                DType::BF16,
-                vec![d.heads, rows, d.mla_v_head],
-            ));
+        let built = (|| -> Result<(), String> {
+            for _ in 0..d.n_mla {
+                knope.push(hip(
+                    gpu.zeros(&[target, d.heads, nope], DType::BF16),
+                    "alloc dense mirror K",
+                )?);
+                vmir.push(hip(
+                    gpu.zeros(&[target, d.heads, d.mla_v_head], DType::BF16),
+                    "alloc dense mirror V",
+                )?);
+            }
+            Ok(())
+        })();
+        if let Err(e) = built {
+            for t in knope.into_iter().chain(vmir) {
+                let _ = gpu.free_tensor(t);
+            }
+            return Err(e);
         }
-        self.mirror = Some(ExpandedMirror { slab, rows, knope, vmir });
-        Ok(())
+        self.release_expanded_mirror(gpu)?;
+        self.mirror = Some(ExpandedMirror { rows: target, knope, vmir, plans: None });
+        self.mirror_valid_rows = 0;
+        Ok(true)
+    }
+
+    fn ensure_mirror_vmm(&mut self, gpu: &mut Gpu, rows: usize) -> Result<bool, String> {
+        let d = self.dims.clone();
+        let nope = d.mla_qk_head - d.tail;
+        if self.mirror.is_none() {
+            let [kb, vb] = mirror_plane_row_bytes(&d);
+            let granularity = hip(gpu.vmm_recommended_granularity(), "VMM granularity")?;
+            let max_seq = self.max_seq;
+            let plan = |bytes: usize| {
+                KvChunkPlan::new(
+                    bytes,
+                    max_seq,
+                    MIRROR_CHUNK_ROWS.min(max_seq),
+                    granularity,
+                    DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
+                )
+                .map_err(|e| format!("raon state: mirror VMM growth plan: {e}"))
+            };
+            let plans = [plan(kb)?, plan(vb)?];
+            let mut knope: Vec<GpuTensor> = Vec::with_capacity(d.n_mla);
+            let mut vmir: Vec<GpuTensor> = Vec::with_capacity(d.n_mla);
+            let built = (|| -> Result<(), String> {
+                for _ in 0..d.n_mla {
+                    // SAFETY: nothing is mapped yet; every access stays within
+                    // the mapped prefix reported as `ExpandedMirror::rows`,
+                    // grown only below.
+                    let k = hip(
+                        unsafe {
+                            gpu.alloc_vmm_tensor(&[max_seq, d.heads, nope], DType::BF16, 0, &[])
+                        },
+                        "reserve mirror K VMM plane",
+                    )?;
+                    knope.push(k);
+                    let v = hip(
+                        unsafe {
+                            gpu.alloc_vmm_tensor(
+                                &[max_seq, d.heads, d.mla_v_head],
+                                DType::BF16,
+                                0,
+                                &[],
+                            )
+                        },
+                        "reserve mirror V VMM plane",
+                    )?;
+                    vmir.push(v);
+                }
+                Ok(())
+            })();
+            if let Err(e) = built {
+                for t in knope.into_iter().chain(vmir) {
+                    let _ = gpu.free_tensor(t);
+                }
+                return Err(e);
+            }
+            self.mirror = Some(ExpandedMirror { rows: 0, knope, vmir, plans: Some(plans) });
+        }
+        let m = self.mirror.as_mut().expect("mirror just reserved");
+        let plans = m.plans.expect("VMM mirror has growth plans");
+        let mut total = 0usize;
+        for (planes, plan) in [(&m.knope, plans[0]), (&m.vmir, plans[1])] {
+            for (i, t) in planes.iter().enumerate() {
+                let mapped = gpu
+                    .vmm_mapped_bytes(t)
+                    .ok_or_else(|| format!("raon state: mirror plane {i} is not a VMM owner"))?;
+                if let Some(g) = plan
+                    .growth(mapped, rows)
+                    .map_err(|e| format!("raon state: mirror plane {i} growth: {e}"))?
+                {
+                    total += g.size_bytes;
+                }
+            }
+        }
+        check_free(
+            gpu,
+            total,
+            GROWTH_HEADROOM_BYTES,
+            &format!("expanded mirror growth to {rows} rows"),
+        )?;
+        let mut result: Result<(), String> = Ok(());
+        'grow: for (planes, plan) in [(&mut m.knope, plans[0]), (&mut m.vmir, plans[1])] {
+            for (i, t) in planes.iter_mut().enumerate() {
+                let mapped = gpu
+                    .vmm_mapped_bytes(t)
+                    .ok_or_else(|| format!("raon state: mirror plane {i} is not a VMM owner"))?;
+                let growth = match plan.growth(mapped, rows) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        result = Err(format!("raon state: mirror plane {i} growth: {e}"));
+                        break 'grow;
+                    }
+                };
+                if let Some(g) = growth {
+                    if let Err(e) = gpu.grow_vmm_tensor(t, g.size_bytes, &[]) {
+                        result = Err(format!("raon state: map mirror plane {i}: {e:?}"));
+                        break 'grow;
+                    }
+                }
+            }
+        }
+        let mut backed = usize::MAX;
+        for (planes, plan) in [(&m.knope, plans[0]), (&m.vmir, plans[1])] {
+            for t in planes.iter() {
+                backed = backed.min(plan.token_capacity(gpu.vmm_mapped_bytes(t).unwrap_or(0)));
+            }
+        }
+        m.rows = if backed == usize::MAX { 0 } else { backed };
+        result.map(|()| true)
     }
 
     pub fn release_expanded_mirror(&mut self, gpu: &mut Gpu) -> Result<(), String> {
-        if let Some(m) = self.mirror.take() {
-            hip(gpu.free_tensor(m.slab), "free expanded mirror")?;
+        self.mirror_valid_rows = 0;
+        let Some(m) = self.mirror.take() else {
+            return Ok(());
+        };
+        let mut first: Option<String> = None;
+        for t in m.knope.into_iter().chain(m.vmir) {
+            if let Err(e) = gpu.free_tensor(t) {
+                first.get_or_insert(format!("raon state: free expanded mirror: {e:?}"));
+            }
         }
-        Ok(())
+        first.map_or(Ok(()), Err)
     }
 
     /// Per-owner physical/virtual bytes right now.
@@ -1078,10 +1292,24 @@ impl RaonState {
             });
         }
         if let Some(m) = &self.mirror {
+            let mut physical = 0usize;
+            let mut virt = 0usize;
+            for t in m.knope.iter().chain(m.vmir.iter()) {
+                match self.backend {
+                    LatentBackend::Vmm => {
+                        physical += gpu.vmm_mapped_bytes(t).unwrap_or(0);
+                        virt += gpu.vmm_reserved_bytes(t).unwrap_or(0);
+                    }
+                    LatentBackend::Dense => {
+                        physical += t.buf.size();
+                        virt += t.buf.size();
+                    }
+                }
+            }
             entries.push(LedgerEntry {
                 owner: "expanded_mirror".into(),
-                physical_bytes: m.bytes(),
-                virtual_bytes: m.bytes(),
+                physical_bytes: physical,
+                virtual_bytes: virt,
             });
         }
         StateLedger { entries }
@@ -1093,8 +1321,10 @@ impl RaonState {
     pub fn free_gpu(mut self, gpu: &mut Gpu) -> Result<(), String> {
         let mut first: Option<String> = None;
         if let Some(m) = self.mirror.take() {
-            if let Err(e) = gpu.free_tensor(m.slab) {
-                first.get_or_insert(format!("raon state: free expanded mirror: {e:?}"));
+            for t in m.knope.into_iter().chain(m.vmir) {
+                if let Err(e) = gpu.free_tensor(t) {
+                    first.get_or_insert(format!("raon state: free expanded mirror: {e:?}"));
+                }
             }
         }
         for (i, t) in self.mla_cache.drain(..).enumerate() {

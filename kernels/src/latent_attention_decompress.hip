@@ -6,8 +6,9 @@
 #include <stdint.h>
 
 // Latent-attention decompression: cache rows [latent || tail] -> per-head
-// expanded K_nope / V rows (BF16), head-major mirrors
-//     knope[h][t][nope]   vmir[h][t][v]      (row stride = mirror capacity)
+// expanded K_nope / V rows (BF16), token-major mirrors
+//     knope[t][h][nope]   vmir[t][h][v]      (a row is contiguous across heads,
+//                                             so the mirror grows by appending rows)
 // The shared tail channels are NOT copied per head: attention reads them
 // directly from the latent cache row (shared across heads).
 //
@@ -57,8 +58,8 @@ extern "C" __global__ void latent_attention_gather_latent_f32(
 
 extern "C" __global__ void latent_attention_scatter_expanded_bf16(
     const float* __restrict__ proj,      // [n_rows, H*(nope+v)]
-    uint16_t* __restrict__ knope,        // [H, cap, nope]
-    uint16_t* __restrict__ vmir,         // [H, cap, v]
+    uint16_t* __restrict__ knope,        // [cap, H, nope]
+    uint16_t* __restrict__ vmir,         // [cap, H, v]
     const int* __restrict__ base_ptr,    // nullable device scalar
     int row0, int n_rows, int n_heads, int nope, int v, int cap
 ) {
@@ -73,8 +74,8 @@ extern "C" __global__ void latent_attention_scatter_expanded_bf16(
     const int row = (base_ptr ? *base_ptr : 0) + row0 + i;
     if (row < 0 || row >= cap) return;
     const uint16_t b = la_f32_to_bf16(proj[idx]);
-    if (e < nope) knope[((size_t)h * cap + row) * nope + e] = b;
-    else vmir[((size_t)h * cap + row) * v + (e - nope)] = b;
+    if (e < nope) knope[((size_t)row * n_heads + h) * nope + e] = b;
+    else vmir[((size_t)row * n_heads + h) * v + (e - nope)] = b;
 }
 
 #define LA_TM 16
@@ -85,8 +86,8 @@ extern "C" __global__ __launch_bounds__(256) void latent_attention_decompress_de
     const uint16_t* __restrict__ cache,  // [cap, latent+tail] BF16
     const int* __restrict__ base_ptr,    // nullable device scalar
     const void* __restrict__ w,          // [H*(nope+v), latent] BF16 or F32
-    uint16_t* __restrict__ knope,        // [H, cap, nope]
-    uint16_t* __restrict__ vmir,         // [H, cap, v]
+    uint16_t* __restrict__ knope,        // [cap, H, nope]
+    uint16_t* __restrict__ vmir,         // [cap, H, v]
     int row0, int n_rows, int n_heads, int nope, int v, int latent, int tail,
     int cap, int w_bf16, int mcap
 ) {
@@ -132,6 +133,6 @@ extern "C" __global__ __launch_bounds__(256) void latent_attention_decompress_de
     const int h = o / per;
     const int e = o % per;
     const uint16_t b = la_f32_to_bf16(acc);
-    if (e < nope) knope[((size_t)h * mcap + row) * nope + e] = b;
-    else vmir[((size_t)h * mcap + row) * v + (e - nope)] = b;
+    if (e < nope) knope[((size_t)row * n_heads + h) * nope + e] = b;
+    else vmir[((size_t)row * n_heads + h) * v + (e - nope)] = b;
 }

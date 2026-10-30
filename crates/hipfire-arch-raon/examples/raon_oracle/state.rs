@@ -36,7 +36,7 @@ use std::time::Instant;
 use super::logits::{check_tokens, load_bundle, read_tokens};
 use hipfire_arch_raon::state::{
     auto_backend, expanded_mirror_bytes, scratch_plan, state_budget, LatentBackend, RaonPrefillScratch,
-    RaonState, RaonStateDims, ADMISSION_HEADROOM_BYTES, EXPANDED_MIRROR_MAX_ROWS,
+    RaonState, RaonStateDims, ADMISSION_HEADROOM_BYTES,
 };
 use rdna_compute::{DType, Gpu};
 use serde_json::{json, Value};
@@ -1387,38 +1387,65 @@ fn check_mirror(gpu: &mut Gpu, dims: &RaonStateDims) -> Check {
     gpu.drain_pool();
     let mut st = RaonState::new(gpu, dims, 16_384)?;
     let r = (|| -> Check {
-        if st.admit_expanded_mirror(gpu, EXPANDED_MIRROR_MAX_ROWS + 1).is_ok() {
-            return Err(format!("mirror above {EXPANDED_MIRROR_MAX_ROWS} rows must be refused"));
+        let budget = st.mirror_budget_rows();
+        if budget == 0 || budget > 16_384 {
+            return Err(format!("mirror admission budget {budget} rows outside 1..=16384"));
         }
-        if st.admit_expanded_mirror(gpu, 0).is_ok() {
-            return Err("0-row mirror must be refused".into());
+        // A forced low budget makes everything above it a clear capacity refusal.
+        st.set_mirror_budget_rows(4096);
+        match st.ensure_mirror_rows(gpu, 4097) {
+            Ok(_) => return Err("mirror above the admission budget must be refused".into()),
+            Err(e) if e.contains("maximum context of 4096 tokens") => {}
+            Err(e) => return Err(format!("capacity refusal does not state the maximum context: {e}")),
+        }
+        if st.ensure_mirror_rows(gpu, 0)? {
+            return Err("0-row mirror request must be a no-op".into());
+        }
+        if st.expanded_mirror().is_some() {
+            return Err("refused/no-op requests must not create a mirror".into());
         }
         let rows = 2048;
         let bytes = expanded_mirror_bytes(dims, rows)?;
         let before = st.bytes_ledger(gpu).physical_total();
-        st.admit_expanded_mirror(gpu, rows)?;
+        st.ensure_mirror_rows(gpu, rows)?;
         let after = st.bytes_ledger(gpu);
         let mirror = after.physical_with_prefix("expanded_mirror");
-        if mirror != bytes || after.physical_total() != before + bytes {
-            return Err(format!("mirror ledger {mirror} B != {bytes} B"));
+        if mirror < bytes || mirror > bytes + 64 * 1024 * 1024 || after.physical_total() != before + mirror {
+            return Err(format!("mirror ledger {mirror} B not within one growth chunk of {bytes} B"));
         }
-        {
-            let m = st.expanded_mirror().ok_or("mirror missing after admit")?;
-            if m.knope.len() != dims.n_mla || m.vmir.len() != dims.n_mla || m.rows != rows {
+        let ptrs: Vec<usize> = {
+            let m = st.expanded_mirror().ok_or("mirror missing after ensure")?;
+            if m.knope.len() != dims.n_mla || m.vmir.len() != dims.n_mla || m.rows < rows {
                 return Err("mirror view count/rows mismatch".into());
             }
-            if m.knope[0].shape != vec![dims.heads, rows, 128] || m.vmir[0].shape != vec![dims.heads, rows, 128] {
-                return Err("mirror views are not head-major [heads, rows, 128]".into());
+            if m.knope[0].shape != vec![16_384, dims.heads, 128] || m.vmir[0].shape != vec![16_384, dims.heads, 128] {
+                return Err("mirror views are not token-major [rows, heads, 128]".into());
             }
-            write_pat(gpu, &m.knope[3].buf, 0, m.knope[3].buf.size(), 0x3C, 0, "mirror knope write")?;
-            check_const(gpu, &m.vmir[3].buf, 0, m.vmir[3].buf.size(), 0, "mirror vmir untouched")?;
-            check_const(gpu, &m.knope[4].buf, 0, m.knope[4].buf.size(), 0, "mirror next-layer knope untouched")?;
+            let tok = dims.heads * 128 * 2;
+            write_pat(gpu, &m.knope[3].buf, 0, rows * tok, 0x3C, 0, "mirror knope write")?;
+            check_const(gpu, &m.vmir[3].buf, 0, rows * tok, 0, "mirror vmir untouched")?;
+            check_const(gpu, &m.knope[4].buf, 0, rows * tok, 0, "mirror next-layer knope untouched")?;
+            m.knope.iter().chain(&m.vmir).map(|t| t.buf.as_ptr() as usize).collect()
+        };
+        // Growth maps in place: no address moves, earlier rows survive.
+        st.ensure_mirror_rows(gpu, 4096)?;
+        {
+            let m = st.expanded_mirror().ok_or("mirror missing after growth")?;
+            let now: Vec<usize> = m.knope.iter().chain(&m.vmir).map(|t| t.buf.as_ptr() as usize).collect();
+            if now != ptrs {
+                return Err("mirror growth moved a plane address".into());
+            }
+            if m.rows < 4096 {
+                return Err(format!("mirror backs {} rows after growth to 4096", m.rows));
+            }
+            let tok = dims.heads * 128 * 2;
+            check_pat(gpu, &m.knope[3].buf, 0, rows * tok, 0x3C, 0, "mirror rows survive growth")?;
         }
         st.release_expanded_mirror(gpu)?;
         if st.expanded_mirror().is_some() || st.bytes_ledger(gpu).physical_total() != before {
             return Err("mirror release did not return the ledger".into());
         }
-        Ok(json!({"rows": rows, "bytes": bytes, "per_token_bytes": bytes / rows}))
+        Ok(json!({"rows": rows, "bytes": bytes, "per_token_bytes": bytes / rows, "budget_rows_default": budget}))
     })();
     let f = st.free_gpu(gpu);
     gpu.drain_pool();

@@ -227,6 +227,15 @@ pub fn run(fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, St
     let model_path = resolve(fixtures, &model).to_string_lossy().into_owned();
     let src = ModelSource::from_path(&model_path)?;
     let mut bundle = load_bundle(&mut gpu, src, &model_path, max_seq)?;
+    // `--mirror-budget-rows N`: force the decompressed-route mirror budget so
+    // the beyond-budget (absorbed, HIPFIRE_RAON_MLA_ABSORB=1) route can be
+    // scored on the KLD corpora.
+    if let Some(v) = opts.get("mirror-budget-rows") {
+        let rows = v
+            .parse::<usize>()
+            .map_err(|e| format!("--mirror-budget-rows `{v}`: {e}"))?;
+        bundle.state.set_mirror_budget_rows(rows);
+    }
     let result = run_checks(
         fixtures,
         &mut gpu,

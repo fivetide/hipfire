@@ -22,6 +22,7 @@
 //! every stage is graph-capture safe and performs no host readback/allocation.
 //! Decode is the `rows == 1` instance of the same route.
 
+use rdna_compute::latent_attention_tiled::{LatentRows, TiledAttention};
 use rdna_compute::{Gpu, GpuTensor};
 
 use crate::types::DispatchError;
@@ -72,10 +73,12 @@ pub struct LatentCache<'a> {
     pub host_pos: Option<usize>,
 }
 
-/// Bounded expanded BF16 mirrors, head-major with row stride `capacity_rows`
-/// (the admitted mirror rows, independent of the latent cache's mapped
-/// capacity): `knope[h][t][nope]`, `vmir[h][t][v_dim]`, valid for `t < pos`.
-/// Sized by the caller; never an unconditional max-sequence allocation.
+/// Bounded expanded BF16 mirrors, token-major: `knope[t][h][nope]`,
+/// `vmir[t][h][v_dim]`, valid for `t < pos`. `capacity_rows` is the number of
+/// rows the caller has physically backed (independent of the latent cache's
+/// mapped capacity, and a bound rather than a stride, so a mirror can grow by
+/// mapping more rows in place). Sized by the caller; never an unconditional
+/// max-sequence allocation.
 #[derive(Clone, Copy)]
 pub struct ExpandedMirror<'a> {
     pub knope: &'a GpuTensor,
@@ -102,6 +105,40 @@ pub enum KvExpansion<'a> {
     /// `projected` is `[count, n_heads*(nope+v_dim)]` F32. This stage only
     /// rounds to BF16 and scatters into the mirrors.
     External { projected: &'a GpuTensor },
+}
+
+/// Operands of the absorbed-latent route (PLAN §1.6). The expansion weight is
+/// absorbed into the query and the value instead of being applied to every
+/// cached row, so attention reads only the latent cache (`latent + tail`
+/// BF16 per token) and needs no expanded mirror. Not bit-exact to the
+/// decompressed route (different reduction order, no intermediate BF16 K/V
+/// rounding, BF16 query operand in the matrix-unit prefill kernel).
+#[derive(Clone, Copy)]
+pub struct AbsorbOperands<'a> {
+    /// BF16 packed expansion weight from `Gpu::latent_attention_absorb_pack`.
+    pub packed: &'a GpuTensor,
+    /// F32 `[rows, n_heads, latent + tail]` scratch: `[q_nope^T Wk || q_tail]`.
+    pub q_abs: &'a GpuTensor,
+    /// F32 `[rows, n_heads, latent]` scratch: latent-space context `z`.
+    pub z: &'a GpuTensor,
+}
+
+/// Which attention kernels serve an [`LatentAttentionOp::Attention`] stage.
+#[derive(Clone, Copy)]
+pub enum AttentionRoute<'a> {
+    /// Deterministic per-head serial kernel over the expanded mirror: the
+    /// oracle route.
+    Reference,
+    /// Tiled causal flash-style prefill (`rows > 1`) / split-KV decode
+    /// (`rows == 1`, needs `workspace`) over the expanded mirror. Reordered
+    /// arithmetic: inside the BF16 band, not bit-exact to `Reference`.
+    Tiled { workspace: Option<&'a GpuTensor> },
+    /// Absorbed latent attention (no mirror needed); the tiled kernels run in
+    /// latent space and the value expansion is applied to `z`.
+    Absorbed {
+        ops: AbsorbOperands<'a>,
+        workspace: Option<&'a GpuTensor>,
+    },
 }
 
 /// One stage of the latent attention pipeline.
@@ -140,17 +177,19 @@ pub enum LatentAttentionOp<'a> {
         expansion: KvExpansion<'a>,
         range: RowRange,
     },
-    /// Serial reference attention (query row `i` sees keys `j <= *pos + i`).
+    /// Attention (query row `i` sees keys `j <= *pos + i`) on the selected
+    /// [`AttentionRoute`]. `mirror` is required by `Reference` and `Tiled`.
     Attention {
         geometry: LatentGeometry,
         cache: LatentCache<'a>,
-        mirror: ExpandedMirror<'a>,
+        mirror: Option<ExpandedMirror<'a>>,
         /// `[rows, n_heads, nope+tail]` F32 (BF16-valued).
         q: &'a GpuTensor,
         /// `[rows, n_heads, v_dim]` F32 (BF16-valued).
         y: &'a GpuTensor,
         rows: usize,
         scale: f32,
+        route: AttentionRoute<'a>,
     },
     /// `out = bf16(y * bf16(sigmoid(g)))` (`out` may alias `y`).
     Gate {
@@ -314,31 +353,163 @@ pub fn execute_latent_attention(
                     .map_err(hip),
             }
         }
-        LatentAttentionOp::Attention { geometry, cache, mirror, q, y, rows, scale } => {
+        LatentAttentionOp::Attention { geometry, cache, mirror, q, y, rows, scale, route } => {
             check_geometry(geometry)?;
             check_cache(cache, *rows)?;
-            check_mirror(mirror, cache.host_pos.map(|p| p + *rows))?;
-            gpu.latent_attention_serial(
-                q,
-                cache.rows,
-                mirror.knope,
-                mirror.vmir,
-                y,
-                cache.pos,
-                *rows,
-                geometry.n_heads,
-                geometry.nope,
-                geometry.tail,
-                geometry.v_dim,
-                geometry.latent,
-                cache.capacity_rows,
-                mirror.capacity_rows,
-                *scale,
-            )
-            .map_err(hip)
+            attention(gpu, geometry, cache, mirror.as_ref(), q, y, *rows, *scale, route)
         }
         LatentAttentionOp::Gate { y, g, out, elements } => gpu
             .latent_attention_gate(y, g, out, *elements)
             .map_err(hip),
+    }
+}
+
+fn need_mirror<'m, 'a>(
+    mirror: Option<&'m ExpandedMirror<'a>>,
+    cache: &LatentCache<'_>,
+    rows: usize,
+    route: &str,
+) -> Result<&'m ExpandedMirror<'a>, DispatchError> {
+    let m = mirror.ok_or_else(|| refuse(format!("the {route} attention route needs the expanded mirror")))?;
+    check_mirror(m, cache.host_pos.map(|p| p + rows))?;
+    Ok(m)
+}
+
+/// Run the selected attention route for one stage.
+#[allow(clippy::too_many_arguments)]
+fn attention(
+    gpu: &mut Gpu,
+    g: &LatentGeometry,
+    cache: &LatentCache<'_>,
+    mirror: Option<&ExpandedMirror<'_>>,
+    q: &GpuTensor,
+    y: &GpuTensor,
+    rows: usize,
+    scale: f32,
+    route: &AttentionRoute<'_>,
+) -> Result<(), DispatchError> {
+    let width = g.row_width();
+    match route {
+        AttentionRoute::Reference => {
+            let m = need_mirror(mirror, cache, rows, "reference")?;
+            gpu.latent_attention_serial(
+                q,
+                cache.rows,
+                m.knope,
+                m.vmir,
+                y,
+                cache.pos,
+                rows,
+                g.n_heads,
+                g.nope,
+                g.tail,
+                g.v_dim,
+                g.latent,
+                cache.capacity_rows,
+                m.capacity_rows,
+                scale,
+            )
+            .map_err(hip)
+        }
+        AttentionRoute::Tiled { workspace } => {
+            let m = need_mirror(mirror, cache, rows, "tiled")?;
+            let a = TiledAttention {
+                q,
+                y,
+                k_a: LatentRows {
+                    buf: m.knope,
+                    offset: 0,
+                    tok_stride: g.n_heads * g.nope,
+                    head_stride: g.nope,
+                    width: g.nope,
+                },
+                k_b: LatentRows {
+                    buf: cache.rows,
+                    offset: g.latent,
+                    tok_stride: width,
+                    head_stride: 0,
+                    width: g.tail,
+                },
+                v: LatentRows {
+                    buf: m.vmir,
+                    offset: 0,
+                    tok_stride: g.n_heads * g.v_dim,
+                    head_stride: g.v_dim,
+                    width: g.v_dim,
+                },
+                pos: cache.pos,
+                pos_offset: 0,
+                n_rows: rows,
+                n_heads: g.n_heads,
+                scale,
+                max_rows: cache.capacity_rows.min(m.capacity_rows),
+                round_y_bf16: true,
+            };
+            run_tiled(gpu, &a, *workspace)
+        }
+        AttentionRoute::Absorbed { ops, workspace } => {
+            let packed_ok = ops.packed.dtype == rdna_compute::DType::BF16
+                && ops.packed.numel()
+                    >= rdna_compute::latent_attention_absorb::latent_attention_absorb_packed_elems(g.n_heads, g.nope, g.v_dim, g.latent);
+            if !packed_ok {
+                return Err(refuse("absorbed route: packed expansion weight is missing or undersized".into()));
+            }
+            gpu.latent_attention_absorb_q(
+                q, ops.packed, ops.q_abs, rows, g.n_heads, g.nope, g.tail, g.v_dim, g.latent,
+            )
+            .map_err(hip)?;
+            let a = TiledAttention {
+                q: ops.q_abs,
+                y: ops.z,
+                k_a: LatentRows {
+                    buf: cache.rows,
+                    offset: 0,
+                    tok_stride: width,
+                    head_stride: 0,
+                    width: g.latent,
+                },
+                k_b: LatentRows {
+                    buf: cache.rows,
+                    offset: g.latent,
+                    tok_stride: width,
+                    head_stride: 0,
+                    width: g.tail,
+                },
+                v: LatentRows {
+                    buf: cache.rows,
+                    offset: 0,
+                    tok_stride: width,
+                    head_stride: 0,
+                    width: g.latent,
+                },
+                pos: cache.pos,
+                pos_offset: 0,
+                n_rows: rows,
+                n_heads: g.n_heads,
+                scale,
+                max_rows: cache.capacity_rows,
+                round_y_bf16: false,
+            };
+            run_tiled(gpu, &a, *workspace)?;
+            gpu.latent_attention_absorb_v(
+                ops.z, ops.packed, y, rows, g.n_heads, g.nope, g.v_dim, g.latent, true,
+            )
+            .map_err(hip)
+        }
+    }
+}
+
+/// Prefill kernel for `rows > 1`, split-KV decode for `rows == 1`.
+fn run_tiled(
+    gpu: &mut Gpu,
+    a: &TiledAttention<'_>,
+    workspace: Option<&GpuTensor>,
+) -> Result<(), DispatchError> {
+    if a.n_rows == 1 {
+        let ws = workspace
+            .ok_or_else(|| refuse("tiled decode needs the split-KV workspace".into()))?;
+        gpu.latent_attention_decode_split(a, ws).map_err(hip)
+    } else {
+        gpu.latent_attention_flash_prefill(a).map_err(hip)
     }
 }
