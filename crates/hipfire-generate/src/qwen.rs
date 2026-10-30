@@ -10911,7 +10911,7 @@ pub fn generate_qwen4_ar(
         route,
         &prompt_tokens,
         vocab_size,
-        eos_token,
+        &[eos_token],
         temp,
         top_p,
         top_k,
@@ -10930,6 +10930,7 @@ pub fn generate_qwen4_ar(
         tools.is_some(),
         reused,
         decode_penalizes,
+        false,
         |model, device, tokens, logits| {
             // Prefill is never the retained body: the tape holds ordinary
             // single-token continuation only (docs/REDLINE.md §3). The Qwen4
