@@ -11,7 +11,7 @@ use crate::forward::{
     stage_decode_token, stage_decode_token_on_stream, RaonWork,
 };
 use crate::state::{RaonPrefillScratch, RaonState};
-use crate::weights::RaonWeights;
+use crate::weights::{RaonMixer, RaonWeights};
 
 /// Decode-step execution route (`HIPFIRE_GRAPH`, PLAN §3.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,6 +153,59 @@ impl PrefillPrecision {
         }
         gpu.flags = std::sync::Arc::new(flags);
     }
+
+    /// One load-time line per weight class that an `A8`/`A4` request does not
+    /// reach, so the setting never silently does nothing. Only qt44
+    /// (`MQ4G256V2`) attention-class projections go through the
+    /// activation-quantized batched GEMMs (device-dependent admission);
+    /// Q8F16/F32 projections have no such route, and every FFN class (dense
+    /// layer, shared and routed experts) runs the grouped F16-WMMA core.
+    fn report_coverage(self, weights: &RaonWeights) {
+        let label = match self {
+            Self::F16 => return,
+            Self::A8 => "a8",
+            Self::A4 => "a4",
+        };
+        let mut by_dtype: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut note = |w: &hipfire_runtime::llama::WeightTensor| {
+            *by_dtype.entry(format!("{:?}", w.gpu_dtype)).or_default() += 1;
+        };
+        for layer in &weights.layers {
+            match &layer.mixer {
+                RaonMixer::Rda(r) => {
+                    for w in [
+                        &r.q_proj, &r.k_proj, &r.v_proj, &r.g_proj, &r.o_proj, &r.f_a_proj,
+                        &r.f_b_proj, &r.b_proj, &r.rda_w_proj,
+                    ] {
+                        note(w);
+                    }
+                }
+                RaonMixer::Mla(m) => {
+                    for w in [
+                        &m.q_a_proj, &m.q_b_proj, &m.kv_a_proj, &m.kv_b_proj, &m.g_proj, &m.o_proj,
+                    ] {
+                        note(w);
+                    }
+                }
+            }
+        }
+        let eligible = by_dtype.remove("MQ4G256V2").unwrap_or(0);
+        eprintln!(
+            "raon1_mini: HIPFIRE_RAON_PREFILL_PRECISION={label}: {eligible} qt44 attention-class \
+             projections may take the activation-quantized prefill GEMM (device admission)"
+        );
+        for (dtype, n) in by_dtype {
+            eprintln!(
+                "raon1_mini: HIPFIRE_RAON_PREFILL_PRECISION={label}: {n} {dtype} attention-class \
+                 projections stay F16/F32 (no activation-quantized route for {dtype})"
+            );
+        }
+        eprintln!(
+            "raon1_mini: HIPFIRE_RAON_PREFILL_PRECISION={label}: dense, shared and routed expert FFNs \
+             stay on the grouped F16-WMMA core (no activation-quantized grouped route admits Raon's \
+             qt44 down K=1280 / intermediate 1088 / down-AWQ experts)"
+        );
+    }
 }
 
 /// Everything one loaded Raon-1-mini model owns on the device.
@@ -188,6 +241,7 @@ impl RaonBundle {
             .and_then(|m| PrefillPrecision::from_env().map(|p| (m, p)))
             .and_then(|(m, p)| {
                 p.apply(gpu);
+                p.report_coverage(&weights);
                 let mut work = RaonWork::new(gpu, &config, scratch.rows)?;
                 if let Err(e) = work.mla.pack_absorbed(gpu, &config, &weights) {
                     work.free(gpu);
