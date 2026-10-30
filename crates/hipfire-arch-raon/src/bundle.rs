@@ -31,9 +31,15 @@ impl DecodeMode {
         }
     }
 
-    /// Resolve once at load: an explicit `HIPFIRE_GRAPH=0|1` wins, otherwise
-    /// graph. Retained replay (Redline) owning the launch stream or CPU-executed
+    /// Resolve once at load: `HIPFIRE_GRAPH=0` selects eager, otherwise graph.
+    /// Retained replay (Redline) owning the launch stream or CPU-executed
     /// weights make capture impossible, which is reported as `Eager`.
+    ///
+    /// (gfx1201 note: decode there shows intermittent 2x-slow device time per
+    /// step, 40 vs 82 tok/s, in whole processes or in phases that flip
+    /// mid-process. It reproduces in eager decode and in llama.cpp on the same
+    /// card, so it is not a property of the graph route and graph stays the
+    /// default: it is the faster route when the card is in its fast state.)
     fn resolve(gpu: &Gpu) -> Self {
         if gpu.flags.graph_forward == Some(false) {
             return DecodeMode::Eager;
@@ -63,6 +69,8 @@ struct DecodeGraph {
     replays: u64,
     /// Kernel nodes in the current recording.
     kernel_nodes: usize,
+    /// Host seconds spent inside `hipGraphLaunch` since load.
+    launch_secs: f64,
 }
 
 /// Upper bound of token rows one batched prefill call stages (the scratch is
@@ -256,6 +264,12 @@ impl RaonBundle {
         (self.graph.captures, self.graph.replays)
     }
 
+    /// Host seconds spent inside `hipGraphLaunch` since load (a graph replay
+    /// that costs host time comparable to the step is launch-bound).
+    pub fn decode_graph_launch_secs(&self) -> f64 {
+        self.graph.launch_secs
+    }
+
     /// Kernel launches recorded in the current decode graph (0 = none).
     pub fn decode_graph_kernel_nodes(&self) -> usize {
         self.graph.kernel_nodes
@@ -362,10 +376,11 @@ impl RaonBundle {
     ///
     /// Host work stays outside the recorded region: context admission (which
     /// may grow the latent mapping / expanded mirror and thereby change the
-    /// binding), the token id upload into the stable device id buffer, and the
-    /// single `seq_len` advance after the step. The recorded body reads the
-    /// token id and `seq_len` from device memory, so one recording replays
-    /// correctly at every later position of the same binding.
+    /// binding) and the token id upload into the stable device id buffer. The
+    /// recorded step reads the token id and `seq_len` from device memory and
+    /// advances `seq_len` itself (last kernel of the graph), so one recording
+    /// replays correctly at every later position of the same binding with no
+    /// per-token host write of the length.
     ///
     /// Recording executes nothing (HIP captures launches into the graph), so
     /// the capturing step launches the fresh graph once and consumes its token
@@ -394,7 +409,8 @@ impl RaonBundle {
                 gpu,
             )?;
             self.graph.warmed = true;
-            return self.state.set_n_tokens(gpu, end);
+            self.state.note_host_tokens(1);
+            return Ok(());
         }
         if gpu.active_stream.is_none() {
             let stream = gpu
@@ -417,10 +433,14 @@ impl RaonBundle {
             .active_stream
             .as_ref()
             .expect("decode graph stream just ensured");
+        let t_launch = std::time::Instant::now();
         gpu.graphs
             .graph_launch(&gpu.hip, gpu.device_id, stream)
             .map_err(|e| format!("raon1_mini: decode graph launch: {e:?}"))?;
-        self.state.set_n_tokens(gpu, end)
+        self.graph.launch_secs += t_launch.elapsed().as_secs_f64();
+        // The recorded step advanced the device `seq_len`; mirror it on the host.
+        self.state.note_host_tokens(1);
+        Ok(())
     }
 
     /// Record the decode body into the generic AR graph slot, replacing any

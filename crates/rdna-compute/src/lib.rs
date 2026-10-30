@@ -12,6 +12,7 @@ pub mod cdna;
 pub mod code_object;
 pub mod compile_jobs;
 mod compiler;
+pub mod device_counter;
 pub mod device_wait;
 pub mod dflash_draft_fusion;
 pub mod dflash_gdn_pre;
