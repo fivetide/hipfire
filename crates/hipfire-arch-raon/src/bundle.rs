@@ -42,9 +42,18 @@ impl DecodeMode {
     /// CPU-executed weights make capture impossible, which is reported as
     /// `Eager`.
     fn resolve(gpu: &Gpu) -> Self {
-        match gpu.flags.graph_forward {
+        // The typed process config materializes its built-in default (`true`)
+        // into `gpu.flags.graph_forward`, so an explicit choice is only
+        // distinguishable from the default through the environment variable.
+        let explicit = std::env::var("HIPFIRE_GRAPH").ok().and_then(|v| match v.as_str() {
+            "1" | "true" | "TRUE" | "on" | "ON" => Some(true),
+            "0" | "false" | "FALSE" | "off" | "OFF" => Some(false),
+            _ => None,
+        });
+        match explicit {
             Some(false) => return DecodeMode::Eager,
             Some(true) => {}
+            None if gpu.flags.graph_forward == Some(false) => return DecodeMode::Eager,
             None if gpu.arch == "gfx1201" => return DecodeMode::Eager,
             None => {}
         }
