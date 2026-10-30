@@ -26,6 +26,12 @@
 //! (no host-baked lengths), RDA is position-free (no RoPE anywhere). The
 //! counter is advanced exactly once per call, after every layer consumed it.
 //!
+//! Decode graph: `forward_body` is device-only (the token ids are staged into
+//! `scratch.token_ids` by the host first), so the `rows == 1` instance is
+//! recorded into a hipGraph by [`decode_body`] and replayed per token by
+//! `RaonBundle::decode_step`; [`decode_binding`] names every baked address and
+//! extent so a graph is rebuilt exactly when one changes.
+//!
 //! Failure semantics: an `Err` after the first layer may leave RDA state and
 //! latent rows partially updated while `n_tokens` is unchanged; the caller must
 //! `reset` the slot before reusing it.
@@ -645,16 +651,11 @@ fn ensure_context(
 
 // ───────────────────────── embedding / head ─────────────────────────
 
-fn embed_rows(
-    cfg: &RaonConfig,
-    w: &RaonWeights,
-    scratch: &RaonPrefillScratch,
-    work: &RaonWork,
-    gpu: &mut Gpu,
-    tokens: &[u32],
-) -> Result<(), String> {
-    let rows = tokens.len();
-    let mut bytes = Vec::with_capacity(rows * 4);
+/// Validate `tokens` and upload them to the slot's stable device id buffer.
+/// Host side of the embedding: never part of a captured region (a captured
+/// graph reads the same buffer, which the caller refreshes before each replay).
+fn stage_tokens(cfg: &RaonConfig, scratch: &RaonPrefillScratch, gpu: &mut Gpu, tokens: &[u32]) -> Result<(), String> {
+    let mut bytes = Vec::with_capacity(tokens.len() * 4);
     for &t in tokens {
         if t as usize >= cfg.vocab {
             return Err(format!("raon1_mini: token id {t} outside vocab {}", cfg.vocab));
@@ -662,7 +663,19 @@ fn embed_rows(
         bytes.extend_from_slice(&t.to_le_bytes());
     }
     gpu.memcpy_htod_auto(&scratch.token_ids.buf, &bytes)
-        .map_err(|e| format!("raon1_mini: upload token ids: {e:?}"))?;
+        .map_err(|e| format!("raon1_mini: upload token ids: {e:?}"))
+}
+
+/// Embedding lookup of the first `rows` staged ids + stream broadcast. Device
+/// work only (reads `scratch.token_ids`); capture-safe.
+fn embed_staged(
+    cfg: &RaonConfig,
+    w: &RaonWeights,
+    scratch: &RaonPrefillScratch,
+    work: &RaonWork,
+    gpu: &mut Gpu,
+    rows: usize,
+) -> Result<(), String> {
     let res = match w.embed_format {
         EmbeddingFormat::Q8_0 => {
             gpu.embedding_lookup_q8_batched(&w.embed, &scratch.branch_out, &scratch.token_ids, rows, cfg.hidden)
@@ -753,9 +766,111 @@ fn forward_impl(
     }
     let end = start + rows;
     ensure_context(cfg, w, s, scratch, work, gpu, end)?;
+    stage_tokens(cfg, scratch, gpu, tokens)?;
+    forward_body(cfg, w, s, scratch, work, gpu, rows, start, want_logits, &mut tap)?;
+    // One advance per call, after every MLA layer consumed the old length.
+    s.set_n_tokens(gpu, end)
+}
 
-    embed_rows(cfg, w, scratch, work, gpu, tokens)?;
-    fire(&mut tap, gpu, TapSite::Embedding, &scratch.stream_a, rows)?;
+/// Admit `end` rows of context for a decode step: map the latent caches ahead
+/// and back the expanded K/V mirror (in place: mirror and latent addresses
+/// never move, but the mapped-row clamp and the route are baked into a
+/// captured graph, so the caller re-derives [`decode_binding`] afterwards).
+/// A context beyond the mirror budget is refused with the maximum supported
+/// context unless the absorbed route is enabled. Outside capture only.
+pub fn admit_decode_context(
+    cfg: &RaonConfig,
+    w: &RaonWeights,
+    s: &mut RaonState,
+    scratch: &RaonPrefillScratch,
+    work: &RaonWork,
+    gpu: &mut Gpu,
+    end: usize,
+) -> Result<(), String> {
+    ensure_context(cfg, w, s, scratch, work, gpu, end)
+}
+
+/// Upload the one decode token to the stable device id buffer (host work,
+/// outside any captured region; refreshed before every replay).
+pub fn stage_decode_token(
+    cfg: &RaonConfig,
+    scratch: &RaonPrefillScratch,
+    gpu: &mut Gpu,
+    token: u32,
+) -> Result<(), String> {
+    stage_tokens(cfg, scratch, gpu, &[token])
+}
+
+/// Device-only decode body (`rows == 1`, logits wanted, no tap): embedding of
+/// the staged token id, all layers, head. Issues kernel launches that read
+/// stable device buffers only (token id, `seq_len`, state, scratch), so it is
+/// recordable into a hipGraph. Does NOT advance `seq_len`/`n_tokens`.
+pub fn decode_body(
+    cfg: &RaonConfig,
+    w: &RaonWeights,
+    s: &RaonState,
+    scratch: &RaonPrefillScratch,
+    work: &RaonWork,
+    gpu: &mut Gpu,
+) -> Result<(), String> {
+    forward_body(cfg, w, s, scratch, work, gpu, 1, s.n_tokens(), true, &mut None)
+}
+
+/// Identity of every device address and baked extent the decode body reads:
+/// weights, state slab, latent caches and their mapped capacity, expanded
+/// mirror and its row stride, scratch and work planes. A captured graph is only
+/// valid for the binding it was recorded with. Never zero.
+pub fn decode_binding(
+    w: &RaonWeights,
+    s: &RaonState,
+    scratch: &RaonPrefillScratch,
+    work: &RaonWork,
+) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |v: u64| h = (h ^ v).wrapping_mul(0x100_0000_01b3);
+    mix(w.embed.buf.as_ptr() as u64);
+    mix(w.lm_head.buf.buf.as_ptr() as u64);
+    mix(s.seq_len.buf.as_ptr() as u64);
+    for t in s.rda.iter().chain(&s.conv_q).chain(&s.conv_k).chain(&s.conv_v).chain(&s.mla_cache) {
+        mix(t.buf.as_ptr() as u64);
+    }
+    mix(s.capacity_rows() as u64);
+    if let Some(m) = s.expanded_mirror() {
+        mix(m.rows as u64);
+        for t in m.knope.iter().chain(&m.vmir) {
+            mix(t.buf.as_ptr() as u64);
+        }
+    }
+    // Route (decompressed vs absorbed), split-KV workspace and absorbed operands.
+    mix(mla_route(work, s, s.n_tokens() + 1) as u64);
+    for a in work.mla.binding_key() {
+        mix(a as u64);
+    }
+    mix(scratch.token_ids.buf.as_ptr() as u64);
+    mix(scratch.logits.buf.as_ptr() as u64);
+    mix(scratch.stream_a.buf.as_ptr() as u64);
+    mix(scratch.stream_b.buf.as_ptr() as u64);
+    h | 1
+}
+
+/// Launch sequence of one forward over `rows` staged rows: embedding, layer
+/// schedule, head (last row). Pure device work apart from the optional `tap`
+/// observer (which downloads and is therefore never used under capture).
+#[allow(clippy::too_many_arguments)]
+fn forward_body(
+    cfg: &RaonConfig,
+    w: &RaonWeights,
+    s: &RaonState,
+    scratch: &RaonPrefillScratch,
+    work: &RaonWork,
+    gpu: &mut Gpu,
+    rows: usize,
+    start: usize,
+    want_logits: bool,
+    tap: &mut Option<LayerTap<'_>>,
+) -> Result<(), String> {
+    embed_staged(cfg, w, scratch, work, gpu, rows)?;
+    fire(tap, gpu, TapSite::Embedding, &scratch.stream_a, rows)?;
 
     let mut ctx = DispatchCtx::new(gpu);
     ctx.batch_size = rows;
@@ -799,7 +914,7 @@ fn forward_impl(
         }
         cur_is_a = !cur_is_a;
         fire(
-            &mut tap,
+            tap,
             gpu,
             TapSite::Attn(l),
             if cur_is_a { &scratch.stream_a } else { &scratch.stream_b },
@@ -827,7 +942,7 @@ fn forward_impl(
         }
         cur_is_a = !cur_is_a;
         fire(
-            &mut tap,
+            tap,
             gpu,
             TapSite::Ffn(l),
             if cur_is_a { &scratch.stream_a } else { &scratch.stream_b },
@@ -850,9 +965,7 @@ fn forward_impl(
         final_mean_norm(gpu, &work.mhc_shape, 1, &view, norm, &scratch.final_norm)?;
         project(gpu, &w.lm_head, &scratch.final_norm, &scratch.logits, 1, OutRound::Bf16)?;
     }
-
-    // One advance per call, after every MLA layer consumed the old length.
-    s.set_n_tokens(gpu, end)
+    Ok(())
 }
 
 /// One token at position `pos` (must equal `s.n_tokens()`); advances the slot by

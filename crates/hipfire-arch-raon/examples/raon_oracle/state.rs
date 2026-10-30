@@ -21,14 +21,14 @@
 //!
 //! `--mode serial|batched` additionally runs the integrated forward through
 //! [`run_forward_mode`] (route parity + same-route determinism on the real
-//! model); `--mode graph` is refused until slice G lands, so `run` reports
-//! `pass=false` for it — never a placeholder pass.
+//! model); `--mode graph` runs eager-vs-graph greedy decode and gates every
+//! logit byte and the final state bytes bitwise (see [`fwd_graph`]).
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use hip_bridge::DeviceBuffer;
-use hipfire_arch_raon::bundle::{PrefillMode, RaonBundle};
+use hipfire_arch_raon::bundle::{DecodeMode, PrefillMode, RaonBundle};
 use hipfire_arch_raon::forward::forward_token;
 use hipfire_runtime::loader_api::ModelSource;
 use std::time::Instant;
@@ -110,6 +110,7 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
     if let Some(m) = forward_mode {
         match run_forward_mode(&mut gpu, m, opts) {
             Ok(v) => {
+                pass &= v["pass"].as_bool() == Some(true);
                 out["forward"] = json!({"status": "ok", "result": v});
             }
             Err(e) => {
@@ -135,27 +136,41 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
 /// * `batched`: serial once, batched twice; batched determinism is bitwise,
 ///   cross-route logits must have cosine >= 0.999 and equal top-1. Cross-route
 ///   state differences are reported, never gated bitwise.
-/// * `graph`:   refused (slice G).
+/// * `graph`:   [`fwd_graph`]: `--steps` (default 256) greedy decode steps after
+///   the same batched prefill, eager (`HIPFIRE_GRAPH=0` route) vs graph replay;
+///   every step's logit bytes, the device `seq_len`, every RDA state / conv
+///   plane / live latent row at the end must be bitwise equal, at two request
+///   lengths through one recorded graph (reset in between).
 ///
-/// Opts: `model` (HFQ), `tokens` (u32le binary or text ids, see `logits.rs`).
+/// Opts: `model` (HFQ), `tokens` (u32le binary or text ids, see `logits.rs`),
+/// `steps` (graph mode only).
 pub fn run_forward_mode(
     gpu: &mut Gpu,
     mode: &str,
     opts: &BTreeMap<String, String>,
 ) -> Result<Value, String> {
-    if mode == "graph" {
-        return Err("graph mode not implemented (slice G)".to_string());
+    if mode != "serial" && mode != "batched" && mode != "graph" {
+        return Err(format!("forward mode `{mode}`: serial|batched|graph"));
     }
-    if mode != "serial" && mode != "batched" {
-        return Err(format!("forward mode `{mode}`: serial|batched (graph is slice G)"));
-    }
-    let model = opts.get("model").ok_or("state --mode serial|batched: missing --model")?;
-    let tok_path = opts.get("tokens").ok_or("state --mode serial|batched: missing --tokens")?;
+    let model = opts.get("model").ok_or("state --mode serial|batched|graph: missing --model")?;
+    let tok_path = opts.get("tokens").ok_or("state --mode serial|batched|graph: missing --tokens")?;
     let tokens = read_tokens(tok_path)?;
-    let max_seq = (tokens.len() + 64).max(512);
+    let steps = match opts.get("steps") {
+        Some(s) => s.trim().parse::<usize>().map_err(|e| format!("state: bad --steps {s:?}: {e}"))?,
+        None => 256,
+    };
+    if mode == "graph" && steps == 0 {
+        return Err("state --mode graph: --steps must be >= 1".into());
+    }
+    let extra = if mode == "graph" { steps } else { 0 };
+    let max_seq = (tokens.len() + extra + 64).max(512);
     let src = ModelSource::from_path(model)?;
     let mut bundle = load_bundle(gpu, src, model, max_seq)?;
-    let result = fwd_mode_inner(gpu, &mut bundle, mode, &tokens);
+    let result = if mode == "graph" {
+        fwd_graph(gpu, &mut bundle, &tokens, steps)
+    } else {
+        fwd_mode_inner(gpu, &mut bundle, mode, &tokens)
+    };
     bundle.free_all(gpu);
     result.map(|mut v| {
         v["model"] = json!(model);
@@ -277,6 +292,241 @@ fn fwd_run_route(gpu: &mut Gpu, b: &mut RaonBundle, tokens: &[u32], route: FwdRo
         ));
     }
     fwd_capture(gpu, b, secs)
+}
+
+/// One greedy decode run: reset, batched prefill of `prompt`, then `steps`
+/// decode steps each fed the previous step's argmax. Logits (index 0 = after
+/// the prefill, then one per step) are either kept (`reference == None`) or
+/// compared byte-for-byte against `reference` as they are produced.
+struct DecodeArm {
+    mode: &'static str,
+    kept_logits: Vec<Vec<u8>>,
+    tokens: Vec<u32>,
+    logit_sets: usize,
+    logit_mismatch_sets: usize,
+    first_logit_mismatch: Option<usize>,
+    seq_len_mismatches: usize,
+    captures: u64,
+    replays: u64,
+    decode_secs: f64,
+    snap: FwdSnap,
+}
+
+fn first_argmax(v: &[f32]) -> u32 {
+    let mut best = 0usize;
+    for (i, &x) in v.iter().enumerate() {
+        if x > v[best] {
+            best = i;
+        }
+    }
+    best as u32
+}
+
+fn decode_arm(
+    gpu: &mut Gpu,
+    b: &mut RaonBundle,
+    prompt: &[u32],
+    steps: usize,
+    mode: DecodeMode,
+    fresh_mirror: bool,
+    reference: Option<&[Vec<u8>]>,
+) -> Result<DecodeArm, String> {
+    b.reset(gpu)?;
+    if fresh_mirror {
+        // Same mirror history for every arm of a pair: growth re-expands the
+        // live prefix through the batched kv_b route, so an arm that starts with
+        // an already-grown mirror is not the same route as one that grows.
+        b.state.release_expanded_mirror(gpu)?;
+    }
+    b.set_prefill_mode(PrefillMode::Batched);
+    b.set_decode_mode(mode);
+    let (c0, r0) = b.decode_graph_stats();
+    b.prefill(gpu, prompt)?;
+    let mut arm = DecodeArm {
+        mode: mode.as_str(),
+        kept_logits: Vec::new(),
+        tokens: Vec::with_capacity(steps),
+        logit_sets: 0,
+        logit_mismatch_sets: 0,
+        first_logit_mismatch: None,
+        seq_len_mismatches: 0,
+        captures: 0,
+        replays: 0,
+        decode_secs: 0.0,
+        snap: FwdSnap { items: Vec::new(), n_tokens: 0, secs: 0.0 },
+    };
+    let record = |arm: &mut DecodeArm, logits: &[f32]| -> Vec<u8> {
+        let bytes: Vec<u8> = logits.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let idx = arm.logit_sets;
+        arm.logit_sets += 1;
+        if let Some(r) = reference {
+            if r.get(idx).is_none_or(|e| *e != bytes) {
+                arm.logit_mismatch_sets += 1;
+                arm.first_logit_mismatch.get_or_insert(idx);
+            }
+        }
+        bytes
+    };
+    let mut logits = hip_err(gpu.download_f32(&b.scratch.logits), "download prefill logits")?;
+    let bytes = record(&mut arm, &logits);
+    if reference.is_none() {
+        arm.kept_logits.push(bytes);
+    }
+    let t0 = Instant::now();
+    for _ in 0..steps {
+        let tok = first_argmax(&logits);
+        arm.tokens.push(tok);
+        b.decode_step(gpu, tok)?;
+        logits = hip_err(gpu.download_f32(&b.scratch.logits), "download decode logits")?;
+        let bytes = record(&mut arm, &logits);
+        if reference.is_none() {
+            arm.kept_logits.push(bytes);
+        }
+        if device_seq_len(gpu, &b.state)? as usize != b.state.n_tokens() {
+            arm.seq_len_mismatches += 1;
+        }
+    }
+    hip_err(gpu.hip.device_synchronize(), "synchronize after decode arm")?;
+    arm.decode_secs = t0.elapsed().as_secs_f64();
+    let (c1, r1) = b.decode_graph_stats();
+    arm.captures = c1 - c0;
+    arm.replays = r1 - r0;
+    if b.state.n_tokens() != prompt.len() + steps {
+        return Err(format!(
+            "decode arm advanced state to {} tokens, expected {}",
+            b.state.n_tokens(),
+            prompt.len() + steps
+        ));
+    }
+    arm.snap = fwd_capture(gpu, b, arm.decode_secs)?;
+    Ok(arm)
+}
+
+/// Informational decode-loop wall time: `n` steps of the same token with no
+/// per-step readback, one synchronize at the end (2 untimed warm steps first, so
+/// the graph arm is already recorded). Not a performance claim.
+fn decode_loop_secs(
+    gpu: &mut Gpu,
+    b: &mut RaonBundle,
+    prompt: &[u32],
+    n: usize,
+    mode: DecodeMode,
+) -> Result<f64, String> {
+    b.reset(gpu)?;
+    b.set_prefill_mode(PrefillMode::Batched);
+    b.set_decode_mode(mode);
+    b.prefill(gpu, prompt)?;
+    let logits = hip_err(gpu.download_f32(&b.scratch.logits), "download loop logits")?;
+    let tok = first_argmax(&logits);
+    for _ in 0..2 {
+        b.decode_step(gpu, tok)?;
+    }
+    hip_err(gpu.hip.device_synchronize(), "synchronize before timed loop")?;
+    let t0 = Instant::now();
+    for _ in 0..n {
+        b.decode_step(gpu, tok)?;
+    }
+    hip_err(gpu.hip.device_synchronize(), "synchronize after timed loop")?;
+    Ok(t0.elapsed().as_secs_f64())
+}
+
+fn arm_json(a: &DecodeArm) -> Value {
+    json!({
+        "decode_mode": a.mode,
+        "logit_sets": a.logit_sets,
+        "logit_sets_mismatching": a.logit_mismatch_sets,
+        "first_logit_mismatch": a.first_logit_mismatch,
+        "seq_len_mismatches": a.seq_len_mismatches,
+        "graph_captures": a.captures,
+        "graph_replays": a.replays,
+        "decode_secs_informational": a.decode_secs,
+    })
+}
+
+/// `--mode graph`: eager vs graph decode, same route, bitwise (PLAN §7 G gate).
+///
+/// Each case runs an eager arm and a graph arm from the same prompt with the
+/// same mirror history; every logit byte of every step, the device `seq_len`,
+/// every RDA state, conv plane and live latent row must be bitwise equal.
+///
+/// * `full_fresh_mirror`: the expanded mirror is released before each arm, so
+///   both arms admit it at prefill and grow it (and the graph arm re-records)
+///   at the same context length when `steps` crosses a growth boundary.
+/// * `full_reuse_recording`: after a reset, the recording from the previous case
+///   must replay (zero new captures when the bucket did not change).
+/// * `short_after_reset`: half the prompt, `min(steps, 64)` steps, same
+///   recording; a stale position or length would diverge the logits.
+fn fwd_graph(gpu: &mut Gpu, bundle: &mut RaonBundle, tokens: &[u32], steps: usize) -> Result<Value, String> {
+    check_tokens(tokens, bundle.config.vocab, "tokens")?;
+    let mut cases = Vec::new();
+    let mut pass = true;
+    let half = (tokens.len() / 2).max(1);
+    let plan: [(&str, &[u32], usize, bool); 3] = [
+        ("full_fresh_mirror", tokens, steps, true),
+        ("full_reuse_recording", tokens, steps, false),
+        ("short_after_reset", &tokens[..half], steps.min(64), false),
+    ];
+    for (name, prompt, n_steps, fresh) in plan {
+        let eager = decode_arm(gpu, bundle, prompt, n_steps, DecodeMode::Eager, fresh, None)?;
+        let arm = decode_arm(gpu, bundle, prompt, n_steps, DecodeMode::Graph, fresh, Some(&eager.kept_logits))?;
+        let state = fwd_compare(&eager.snap, &arm.snap)?;
+        let state_equal = state["bitwise_equal"].as_bool() == Some(true);
+        let tokens_equal = arm.tokens == eager.tokens;
+        let logits_equal = arm.logit_mismatch_sets == 0 && arm.logit_sets == eager.logit_sets;
+        // Not a placeholder pass: the arm must really have been served by a
+        // recording, and a reused recording must not have been re-captured.
+        let served_by_graph = arm.replays > 0;
+        let reuse_ok = fresh || arm.captures == 0;
+        let case_pass = state_equal
+            && tokens_equal
+            && logits_equal
+            && arm.seq_len_mismatches == 0
+            && eager.seq_len_mismatches == 0
+            && served_by_graph
+            && reuse_ok;
+        pass &= case_pass;
+        let mut graph_json = arm_json(&arm);
+        graph_json["state_bitwise_equal"] = json!(state_equal);
+        graph_json["tokens_equal"] = json!(tokens_equal);
+        graph_json["logits_bitwise_equal_every_step"] = json!(logits_equal);
+        graph_json["served_by_graph"] = json!(served_by_graph);
+        graph_json["recording_reused_without_recapture"] = json!(reuse_ok);
+        graph_json["state_vs_eager"] = state;
+        let mut case_json = json!({
+            "case": name,
+            "prompt_tokens": prompt.len(),
+            "steps": n_steps,
+            "fresh_mirror": fresh,
+            "eager": arm_json(&eager),
+            "graph": graph_json,
+            "pass": case_pass,
+        });
+        if name == "full_reuse_recording" {
+            let loop_n = n_steps.min(128);
+            let eager_secs = decode_loop_secs(gpu, bundle, prompt, loop_n, DecodeMode::Eager)?;
+            let graph_secs = decode_loop_secs(gpu, bundle, prompt, loop_n, DecodeMode::Graph)?;
+            case_json["decode_loop_informational"] = json!({
+                "steps": loop_n,
+                "eager_secs": eager_secs,
+                "graph_secs": graph_secs,
+                "graph_kernel_nodes": bundle.decode_graph_kernel_nodes(),
+                "note": "no per-step readback; correct-class job, not a timing claim",
+            });
+        }
+        cases.push(case_json);
+    }
+    Ok(json!({
+        "mode": "graph",
+        "n_tokens": tokens.len(),
+        "steps": steps,
+        "env_hipfire_graph": std::env::var("HIPFIRE_GRAPH").ok(),
+        "definitions": {
+            "bitwise_equal": "every captured byte identical to the eager arm of the same route",
+            "logits": "full [vocab] F32 logit vector after the prefill and after every decode step",
+        },
+        "cases": cases,
+        "pass": pass,
+    }))
 }
 
 fn fwd_capture(gpu: &Gpu, b: &RaonBundle, secs: f64) -> Result<FwdSnap, String> {
