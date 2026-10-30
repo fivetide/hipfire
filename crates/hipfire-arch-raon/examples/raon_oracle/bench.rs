@@ -929,6 +929,11 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
     }
     let stream = Stream { base };
 
+    // Launch-level timing observes funnel launches; a replayed hipGraph has none.
+    // Profiling therefore pins the eager decode route (recorded in `controls.env`).
+    if profile && std::env::var_os("HIPFIRE_GRAPH").is_none() {
+        std::env::set_var("HIPFIRE_GRAPH", "0");
+    }
     let max_pp = pps.iter().copied().max().unwrap_or(0);
     let need = max_pp.max(if tg > 0 { tg_prompt + tg } else { 0 });
     let max_seq = match opts.get("max-seq") {
