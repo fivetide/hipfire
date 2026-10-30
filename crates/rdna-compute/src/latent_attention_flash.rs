@@ -9,12 +9,18 @@
 //! `latent_attention_flash.hip` source serves gfx11 (wave32 WMMA, 16-wide
 //! operands) and gfx12 (8-wide operands); the arch split is compile-time.
 //!
-//! Decomposition: grid `[ceil(rows / (16 * waves)), heads, ceil(v.width / 128)]`,
-//! block `32 * waves` threads (one wave per 16 query rows). Every `z` block of
-//! a head recomputes the scores for its 128-column value chunk (the absorbed
-//! route has `v.width = 512`). Query tiles are launched heaviest (latest)
-//! first. `waves` is the largest of 4, 2, 1 whose LDS fits
-//! [`LATENT_ATTENTION_FLASH_LDS_LIMIT`].
+//! Decomposition (value width <= 128, or a width the wide kernel cannot take):
+//! grid `[ceil(rows / (16 * waves)), heads, ceil(v.width / 128)]`, block
+//! `32 * waves` threads (one wave per 16 query rows); every `z` block of a head
+//! recomputes the scores for its 128-column value chunk. Query tiles are
+//! launched heaviest (latest) first. `waves` is the largest of 4, 2, 1 whose LDS
+//! fits [`LATENT_ATTENTION_FLASH_LDS_LIMIT`].
+//!
+//! Wide values (`v.width` a multiple of 64 up to 512, the absorbed latent route
+//! has 512): one 4-wave block owns a 16-query tile of a head, the four waves
+//! split the score contraction and the value columns, and every score and value
+//! product is computed once (`latent_attention_flash_prefill_wide`; grid
+//! `[ceil(rows / 16), heads, 1]`, block 128).
 //!
 //! Numerics: queries are rounded once to BF16 at LDS staging; scores, softmax
 //! state and accumulation are FP32; probabilities are rounded to BF16 for the
@@ -77,6 +83,17 @@ fn view_ptr(v: &LatentRows<'_>, what: &str) -> HipResult<*mut c_void> {
     Ok(p as *mut c_void)
 }
 
+/// Words per transposed-value LDS row of the wide kernel.
+const WIDE_VP_WORDS: usize = 20;
+/// Score-partial exchange area of the wide kernel (4 waves x 8 x 32 lanes x 4 B).
+const WIDE_SP_BYTES: usize = 4096;
+/// Largest value width the wide kernel takes (4 waves x 128 columns).
+const WIDE_MAX_DV: usize = 512;
+
+fn wide_lds_bytes(dq: usize, dv: usize) -> usize {
+    16 * (dq + 8) * 2 + dv * WIDE_VP_WORDS * 4 + WIDE_SP_BYTES
+}
+
 fn flash_lds_bytes(waves: usize, dq: usize, dv: usize) -> usize {
     waves * 16 * (dq + 8) * 2 + dv.min(FLASH_DV_CHUNK) * FLASH_VP_WORDS * 4
 }
@@ -111,6 +128,7 @@ impl Gpu {
         src: &str,
     ) -> HipResult<()> {
         a.validate()?;
+        let wide_func = format!("{func}_wide");
         let (wa, wb, dv) = (a.k_a.width, a.k_b.width, a.v.width);
         let dq = wa + wb;
         if dq > LATENT_ATTENTION_FLASH_MAX_DQ {
@@ -133,16 +151,29 @@ impl Gpu {
         if (qp as usize) % 16 != 0 || (yp as usize) % 16 != 0 {
             return Err(err("latent_attention flash: q/y base pointers must be 16-byte aligned"));
         }
-        let waves = [4usize, 2, 1]
-            .into_iter()
-            .find(|&w| flash_lds_bytes(w, dq, dv) <= LATENT_ATTENTION_FLASH_LDS_LIMIT)
-            .ok_or_else(|| {
-                err(format!(
-                    "latent_attention flash: query width {dq} needs more than \
-                     {LATENT_ATTENTION_FLASH_LDS_LIMIT} bytes of LDS"
-                ))
-            })?;
-        let shared = flash_lds_bytes(waves, dq, dv) as u32;
+        let wide = dv > FLASH_DV_CHUNK
+            && dv % 64 == 0
+            && dv <= WIDE_MAX_DV
+            && wide_lds_bytes(dq, dv) <= LATENT_ATTENTION_FLASH_LDS_LIMIT;
+        let (waves, shared, func, grid_z) = if wide {
+            (4usize, wide_lds_bytes(dq, dv) as u32, wide_func.as_str(), 1usize)
+        } else {
+            let waves = [4usize, 2, 1]
+                .into_iter()
+                .find(|&w| flash_lds_bytes(w, dq, dv) <= LATENT_ATTENTION_FLASH_LDS_LIMIT)
+                .ok_or_else(|| {
+                    err(format!(
+                        "latent_attention flash: query width {dq} needs more than \
+                         {LATENT_ATTENTION_FLASH_LDS_LIMIT} bytes of LDS"
+                    ))
+                })?;
+            (
+                waves,
+                flash_lds_bytes(waves, dq, dv) as u32,
+                func,
+                dv.div_ceil(FLASH_DV_CHUNK),
+            )
+        };
         let (nr, nh, wai, wbi, dvi, po, mr) = (
             i32_of(a.n_rows, "rows")?,
             i32_of(a.n_heads, "heads")?,
@@ -189,8 +220,8 @@ impl Gpu {
             &scale as *const _ as *mut c_void,
             &round_y as *const _ as *mut c_void,
         ];
-        let tiles = a.n_rows.div_ceil(16 * waves);
-        let grid = [tiles as u32, a.n_heads as u32, dv.div_ceil(FLASH_DV_CHUNK) as u32];
+        let tiles = a.n_rows.div_ceil(if wide { 16 } else { 16 * waves });
+        let grid = [tiles as u32, a.n_heads as u32, grid_z as u32];
         self.launch_maybe_blob(
             func,
             grid,

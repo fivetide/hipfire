@@ -290,7 +290,8 @@ impl Runner<'_> {
         if self.emu {
             let src = format!(
                 "#define LAF_EMU_GFX11 1\n#define latent_attention_flash_prefill \
-                 latent_attention_flash_prefill_emu11\n{LATENT_ATTENTION_FLASH_SRC}"
+                 latent_attention_flash_prefill_emu11\n#define latent_attention_flash_prefill_wide \
+                 latent_attention_flash_prefill_emu11_wide\n{LATENT_ATTENTION_FLASH_SRC}"
             );
             self.gpu
                 .latent_attention_flash_prefill_with_source(
@@ -394,7 +395,18 @@ fn run_case(
             }
         }
         if y1.iter().any(|v| !v.is_finite()) {
-            note(tot, format!("round={round}: non-finite/unwritten outputs"));
+            let bad = y1.iter().filter(|v| !v.is_finite()).count();
+            let first = y1.iter().position(|v| !v.is_finite()).unwrap_or(0);
+            note(
+                tot,
+                format!(
+                    "round={round}: non-finite/unwritten outputs ({bad} of {}, first at {first} = row {} head {} col {})",
+                    y1.len(),
+                    first / (geo.h * dv),
+                    first / dv % geo.h,
+                    first % dv
+                ),
+            );
             continue;
         }
         // Rows with no visible key are exact zeros.
@@ -467,7 +479,9 @@ fn run_suite(r: &mut Runner<'_>, quick: bool, tag: &str) -> bool {
         geo_absorbed(4, 512, 64, "absorbed H4 512+64/512 head_stride 0"),
         geo_generic("generic H3 32+16/48", 3, 32, 16, 48),
         geo_oracle(),
-        geo_generic("multi-chunk H2 48+16/192", 2, 48, 16, 192),
+        geo_generic("multi-chunk H2 48+16/192 (wide kernel, 4 x 48 cols)", 2, 48, 16, 192),
+        geo_generic("multi-chunk H2 48+16/160 (chunked kernel, 128 + 32 cols)", 2, 48, 16, 160),
+        geo_generic("wide H2 64+64/512 (wide kernel, 4 x 128 cols)", 2, 64, 64, 512),
         geo_absorbed(2, 256, 32, "absorbed-small H2 256+32/256"),
     ];
     if !quick {

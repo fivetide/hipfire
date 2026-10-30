@@ -187,6 +187,16 @@ impl RaonBundle {
             });
         match built {
             Ok((prefill_mode, work)) => {
+                let mut state = state;
+                match state.fit_mirror_budget(gpu) {
+                    Ok(rows) => eprintln!(
+                        "raon1_mini: expanded K/V mirror budget {rows} rows of {} reserved context \
+                         ({} B/token); contexts beyond it use the absorbed route (HIPFIRE_RAON_MLA_ABSORB)",
+                        state.max_seq(),
+                        crate::state::mirror_row_bytes(state.dims())
+                    ),
+                    Err(e) => eprintln!("raon1_mini: mirror budget refit failed ({e}); keeping the admission estimate"),
+                }
                 let eos = config.eos_token_ids.clone();
                 Ok(Self {
                     config,
