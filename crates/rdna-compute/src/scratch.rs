@@ -433,6 +433,10 @@ pub struct ScratchState {
     /// wrote (`HIPFIRE_IU4_SLAB` planes, read only by the `_b1s` GEMMs).
     /// Every other generation holds token-order `block_i4_128` records.
     pub int4_mmq_slab_generation: Option<u64>,
+    /// W8A8 Q8_0 sidecar: int8 [N, K] followed by F32 scales [K/32, N]
+    /// (`quantize_x_q8_blk32`), laid out by [`q8_a8_x_layout`].
+    pub q8_a8_x_scratch: Option<DeviceBuffer>,
+    pub q8_a8_x_scratch_bytes: usize,
     /// A8 `block_i8_128` sidecar, [K/128, N] of 136-byte blocks.
     pub int8_mmq_x_scratch: Option<DeviceBuffer>,
     pub int8_mmq_x_scratch_bytes: usize,
@@ -1884,6 +1888,15 @@ pub fn qwen4_prefill_workspace_terms(
     ])
 }
 
+/// Byte layout of the W8A8 Q8_0 activation sidecar for `(k, n)`:
+/// `(scales_offset, total_bytes)`. int8 `[n, k]` at 0, F32 scales
+/// `[k / 32, n]` at a 256-byte aligned offset.
+#[inline]
+pub(crate) fn q8_a8_x_layout(k: usize, n: usize) -> (usize, usize) {
+    let scales_off = (n * k).next_multiple_of(256);
+    (scales_off, scales_off + n * (k / 32) * 4)
+}
+
 #[inline]
 pub(crate) fn int8_mmq_x_needed(k: usize, n: usize) -> usize {
     k.div_ceil(128) * n * 136
@@ -3305,6 +3318,27 @@ impl ScratchState {
             .map(|b| b.as_ptr())
             .unwrap_or(std::ptr::null_mut());
         (self.qwen4_moe_down_i4_generation, ptr)
+    }
+
+    /// Grow the W8A8 Q8_0 activation sidecar to hold `(k, n)` and return
+    /// `(xq, xs)` device pointers (int8 `[n, k]` and F32 scales `[k/32, n]`).
+    /// Callers invalidate graphs before growth (see
+    /// `Gpu::ensure_q8_a8_x`); the producer overwrites every byte it reads.
+    pub(crate) fn reserve_q8_a8_x(
+        &mut self,
+        hip: &HipRuntime,
+        k: usize,
+        n: usize,
+    ) -> HipResult<(*mut c_void, *mut c_void)> {
+        let (scales_off, needed) = q8_a8_x_layout(k, n);
+        grow_scratch_buffer(
+            hip,
+            &mut self.q8_a8_x_scratch,
+            &mut self.q8_a8_x_scratch_bytes,
+            needed,
+        )?;
+        let base = self.q8_a8_x_scratch.as_ref().unwrap().as_ptr();
+        Ok((base, (base as *mut u8).wrapping_add(scales_off) as *mut c_void))
     }
 
     /// Always re-quantize the f32 activation row into the dedicated A8 sidecar.

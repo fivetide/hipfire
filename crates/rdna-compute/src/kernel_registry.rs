@@ -4206,6 +4206,19 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ["gemm_q8_0_wmma_gfx12"]
         );
         add!(
+            "gemm_q8_0_mmq_i8_gfx12",
+            kernels::GEMM_Q8_0_MMQ_I8_GFX12_SRC,
+            [
+                "gemm_q8_0_mmq_i8_t128x128",
+                "gemm_q8_0_mmq_i8_t128x128_slow",
+                "gemm_q8_0_mmq_i8_t128x64",
+                "gemm_q8_0_mmq_i8_t128x64_slow",
+                "gemm_q8_0_mmq_i8_t64x64",
+                "gemm_q8_0_mmq_i8_t64x64_slow",
+                "quantize_x_q8_blk32",
+            ]
+        );
+        add!(
             "gemm_qkv_hfq6g256_wmma_gfx12",
             kernels::GEMM_QKV_HFQ6G256_WMMA_GFX12_SRC,
             ["gemm_qkv_hfq6g256_wmma_gfx12"]
