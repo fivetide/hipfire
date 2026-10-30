@@ -1744,6 +1744,7 @@ fn dims_of(c: &CaseData) -> RaonMoeDims {
         value_beta,
         router_eps: ROUTER_EPS,
         router_scale: ROUTER_SCALE,
+        routed_tier: hipfire_dispatch::pipeline::GroupedMoeActTier::F16,
     }
 }
 

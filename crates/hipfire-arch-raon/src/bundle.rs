@@ -3,6 +3,7 @@
 //! RaonBundle (config, weights, state, scratch, work, eos) and the generation
 //! entry points built on the forward. Owner: slice A/I.
 
+use hipfire_dispatch::pipeline::GroupedMoeActTier;
 use rdna_compute::{Gpu, GpuTensor};
 
 use crate::config::RaonConfig;
@@ -107,12 +108,14 @@ impl PrefillMode {
 }
 
 /// Activation precision of batched qt44 projections (`HIPFIRE_RAON_PREFILL_PRECISION`,
-/// PLAN §3.6). `F16` (default) keeps FP16 activations at every qt44 GEMM;
-/// `A8` admits only the int8-activation prefill GEMMs (gfx1201 `a8_prefill`,
-/// gfx11 `gfx11_a8_prefill`); `A4` admits the device's default symmetric
-/// IU4 route. Both are not bit-equivalent and stay opt-in pending review.
+/// PLAN §3.6). `Default` (unset) runs the grouped routed experts W4A8 on gfx1201 for
+/// symmetric-verified qt44 experts and keeps every other qt44 GEMM at FP16; `F16` is the kill
+/// switch (FP16 everywhere); `A8` additionally admits the int8-activation attention-class
+/// prefill GEMMs (gfx1201 `a8_prefill`, gfx11 `gfx11_a8_prefill`); `A4` admits the device's
+/// default symmetric IU4 route and W4A4 routed experts (fails the KLD gate, opt-in only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefillPrecision {
+    Default,
     F16,
     A8,
     A4,
@@ -121,9 +124,10 @@ pub enum PrefillPrecision {
 impl PrefillPrecision {
     pub fn from_env() -> Result<Self, String> {
         match hipfire_config::developer_var("HIPFIRE_RAON_PREFILL_PRECISION") {
-            Err(_) => Ok(Self::F16),
+            Err(_) => Ok(Self::Default),
             Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-                "" | "f16" => Ok(Self::F16),
+                "" => Ok(Self::Default),
+                "f16" => Ok(Self::F16),
                 "a8" => Ok(Self::A8),
                 "a4" => Ok(Self::A4),
                 other => Err(format!(
@@ -133,14 +137,24 @@ impl PrefillPrecision {
         }
     }
 
+    /// Activation tier of the grouped routed-expert GEMMs (`GroupedMoeRouted::act_tier`); admitted
+    /// only on gfx1201 for symmetric-verified qt44 experts, otherwise the F16 core runs.
+    pub fn routed_tier(self) -> GroupedMoeActTier {
+        match self {
+            Self::Default | Self::A8 => GroupedMoeActTier::A8,
+            Self::F16 => GroupedMoeActTier::F16,
+            Self::A4 => GroupedMoeActTier::A4,
+        }
+    }
+
     /// Resolve the policy onto the device's feature flags once, at load.
-    /// `F16` turns off every activation-quantized prefill route for this
-    /// process's device; `A8` turns IU4 off and int8 on; `A4` leaves the
-    /// device defaults untouched.
+    /// `Default` and `F16` turn off every activation-quantized prefill route for this
+    /// process's device (the routed-expert tier is separate, see [`Self::routed_tier`]); `A8`
+    /// turns IU4 off and int8 on; `A4` leaves the device defaults untouched.
     fn apply(self, gpu: &mut Gpu) {
         let mut flags = (*gpu.flags).clone();
         match self {
-            Self::F16 => {
+            Self::Default | Self::F16 => {
                 flags.iu4_prefill = Some(false);
                 flags.a8_prefill = false;
                 flags.gfx11_a8_prefill = false;
@@ -161,9 +175,21 @@ impl PrefillPrecision {
     /// activation-quantized batched GEMMs (device-dependent admission);
     /// Q8F16/F32 projections have no such route, and every FFN class (dense
     /// layer, shared and routed experts) runs the grouped F16-WMMA core.
-    fn report_coverage(self, weights: &RaonWeights) {
+    fn report_coverage(self, weights: &RaonWeights, arch: &str) {
         let label = match self {
             Self::F16 => return,
+            Self::Default => {
+                let (verified, total) = weights.layers.iter().fold((0usize, 0usize), |(v, t), l| match &l.ffn {
+                    crate::weights::RaonFfn::Moe(m) => (v + usize::from(m.iu4_symmetric), t + 1),
+                    _ => (v, t),
+                });
+                eprintln!(
+                    "raon1_mini: routed experts run W4A8 (grouped int8-activation GEMMs) on {verified} of {total} MoE layers \
+                     (gfx1201 [{arch}] + loader-verified symmetric qt44); shared experts, the dense layer and \
+                     attention-class projections stay F16; HIPFIRE_RAON_PREFILL_PRECISION=f16 restores all-F16"
+                );
+                return;
+            }
             Self::A8 => "a8",
             Self::A4 => "a4",
         };
@@ -214,9 +240,10 @@ impl PrefillPrecision {
             );
         }
         eprintln!(
-            "raon1_mini: HIPFIRE_RAON_PREFILL_PRECISION={label}: dense, shared and routed expert FFNs \
-             stay on the grouped F16-WMMA core (no activation-quantized grouped route admits Raon's \
-             qt44 down K=1280 / intermediate 1088 / down-AWQ experts)"
+            "raon1_mini: HIPFIRE_RAON_PREFILL_PRECISION={label}: routed experts run the grouped {} GEMMs \
+             on gfx1201 for symmetric-verified qt44 experts; the dense layer and shared experts stay on the \
+             grouped F16-WMMA core",
+            if label == "a4" { "W4A4 (fails the KLD gate)" } else { "W4A8" }
         );
     }
 }
@@ -257,8 +284,9 @@ impl RaonBundle {
             .and_then(|m| PrefillPrecision::from_env().map(|p| (m, p)))
             .and_then(|(m, p)| {
                 p.apply(gpu);
-                p.report_coverage(&weights);
+                p.report_coverage(&weights, &gpu.arch);
                 let mut work = RaonWork::new(gpu, &config, scratch.rows)?;
+                work.set_routed_tier(p.routed_tier());
                 if let Err(e) = work.mla.pack_absorbed(gpu, &config, &weights) {
                     work.free(gpu);
                     return Err(e);

@@ -25,7 +25,7 @@ use hipfire_dispatch::families::moe::{GroupedMoeGeometry, MOE_GROUPED_MAX_TOP_K}
 use hipfire_dispatch::pipeline::{
     execute_gated_ffn, execute_grouped_moe, CastPolicy, CombineOrder, FfnActivation, GatedFfnOp,
     GroupedMoeGroupedScratch, GroupedMoeIndexedScratch, GroupedMoeOp, GroupedMoePolicy,
-    GroupedMoeProtocol, GroupedMoeRouted, GroupedMoeRouter, GroupedMoeScratch,
+    GroupedMoeActTier, GroupedMoeProtocol, GroupedMoeRouted, GroupedMoeRouter, GroupedMoeScratch,
     GroupedMoeScratchPlan, GroupedMoeShared, GroupedMoeSharedScratch, RouterKind,
     SharedExpertPolicy,
 };
@@ -52,6 +52,9 @@ pub struct RaonMoeDims {
     pub value_beta: f32,
     pub router_eps: f32,
     pub router_scale: f32,
+    /// Activation tier of the grouped routed-expert GEMMs (`HIPFIRE_RAON_PREFILL_PRECISION`, set by the
+    /// bundle at load; `F16` = the F16 WMMA core).
+    pub routed_tier: GroupedMoeActTier,
 }
 
 impl RaonMoeDims {
@@ -70,6 +73,7 @@ impl RaonMoeDims {
             value_beta: 25.0,
             router_eps: 1e-20,
             router_scale: 1.0,
+            routed_tier: GroupedMoeActTier::F16,
         }
     }
 
@@ -149,7 +153,7 @@ pub struct RaonMoeLayerRefs<'a> {
     /// `[hidden, down_k]`. Gate/up `awq_scale` equals `gate_up_awq`.
     pub shared: GroupedMoeShared<'a>,
     /// Every routed gate/up and down header is loader-verified symmetric
-    /// (`zp == -8 * sc`); with the IU4 prefill route on, admits the grouped W4A4 core.
+    /// (`zp == -8 * sc`); with a quantized routed tier selected, admits the grouped W4A8/W4A4 core.
     pub iu4_symmetric: bool,
 }
 
@@ -490,6 +494,7 @@ pub fn raon_moe_op<'a>(
             input_awq: layer.gate_up_awq,
             down_awq_ptrs: layer.down_awq_ptrs,
             iu4_symmetric_verified: layer.iu4_symmetric,
+            act_tier: dims.routed_tier,
         },
         shared: Some(layer.shared),
         scratch: scratch.view(),

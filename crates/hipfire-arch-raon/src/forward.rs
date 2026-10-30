@@ -86,6 +86,11 @@ pub struct RaonWork {
 }
 
 impl RaonWork {
+    /// Select the activation tier of the grouped routed-expert GEMMs (bundle load, once).
+    pub fn set_routed_tier(&mut self, tier: hipfire_dispatch::pipeline::GroupedMoeActTier) {
+        self.moe_dims.routed_tier = tier;
+    }
+
     /// Module geometries every work buffer is derived from.
     fn shapes(cfg: &RaonConfig) -> Result<(RaonMhcShape, RdaGeometry, RaonMoeDims), String> {
         let mhc_shape = RaonMhcShape {
@@ -119,6 +124,7 @@ impl RaonWork {
             value_beta: cfg.situ_linear_beta,
             router_eps: cfg.router_eps,
             router_scale: cfg.routed_scale,
+            routed_tier: hipfire_dispatch::pipeline::GroupedMoeActTier::F16,
         };
         moe_dims.validate()?;
         Ok((mhc_shape, rda_geom, moe_dims))

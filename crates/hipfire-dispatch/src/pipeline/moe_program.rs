@@ -6755,6 +6755,10 @@ pub struct GroupedMoeRouted<'a> {
     /// Every routed gate/up and down group header obeys `zp == -8 * sc` (checked at load); admits
     /// the grouped W4A4 core ([`grouped_moe_iu4_admitted`]).
     pub iu4_symmetric_verified: bool,
+    /// Activation tier the caller selects for the grouped routed-expert GEMMs
+    /// ([`grouped_moe_site_tiers`]); `F16` keeps the F16 WMMA core (kill switch). Only honoured when
+    /// the capability admission holds, and overridable per site by `HIPFIRE_MOE_GROUPED_TIERS`.
+    pub act_tier: GroupedMoeActTier,
 }
 
 /// Gate/up/down projections of one gated FFN (shared expert or dense layer).
@@ -7295,24 +7299,12 @@ fn parse_site_tiers(s: &str) -> Option<(GroupedMoeActTier, GroupedMoeActTier)> {
     Some((GroupedMoeActTier::parse(g)?, GroupedMoeActTier::parse(d)?))
 }
 
-/// Tier the device flags select for the routed experts: A8 when the A8 prefill route is on
-/// (`HIPFIRE_RAON_PREFILL_PRECISION=a8`), else A4 when the IU4 prefill route is on (`a4`), else F16.
-pub fn grouped_moe_device_tier(flags: &rdna_compute::feature_flags::FeatureFlags) -> GroupedMoeActTier {
-    if flags.a8_prefill_enabled() {
-        GroupedMoeActTier::A8
-    } else if flags.iu4_prefill_enabled() {
-        GroupedMoeActTier::A4
-    } else {
-        GroupedMoeActTier::F16
-    }
-}
-
 /// Capability admission of the grouped symmetric quantized-activation routed-expert core of
 /// [`execute_grouped_moe`], resolved per site `(gate_up, down)`: the caller bound loader-verified
 /// symmetric headers (`zp == -8 * sc` on every gate/up and down group,
 /// [`GroupedMoeRouted::iu4_symmetric_verified`]), the device is gfx1201, the experts are qt44
 /// (`MQ4G256V2`) and the shape fits the kernels ([`grouped_moe_iu4_shape_admits`]). The tier of each
-/// site is the device tier ([`grouped_moe_device_tier`]) unless `HIPFIRE_MOE_GROUPED_TIERS` overrides
+/// site is the caller's [`GroupedMoeRouted::act_tier`] unless `HIPFIRE_MOE_GROUPED_TIERS` overrides
 /// it. AWQ (input vector, per-expert down table), the activation (SiLU/SiTU), the pad of the down K
 /// and the cast policy are handled by the stages around the two GEMMs and place no condition here. The
 /// route allocates only through the activation scratch, so it is refused under graph capture and
@@ -7340,8 +7332,8 @@ pub fn grouped_moe_site_tiers(
     if !admitted {
         return (F16, F16);
     }
-    let device = grouped_moe_device_tier(&gpu.flags);
-    OVERRIDE.unwrap_or((device, device))
+    let tier = op.routed.act_tier;
+    OVERRIDE.unwrap_or((tier, tier))
 }
 
 /// Shape half of [`grouped_moe_iu4_admitted`] (pure): at least [`GROUPED_MOE_IU4_MIN_ROWS`] rows,
@@ -7666,23 +7658,12 @@ mod grouped_moe_tests {
     }
 
     #[test]
-    fn site_tiers_parse_and_the_device_tier_follows_the_flags() {
+    fn site_tiers_parse() {
         use GroupedMoeActTier::{A4, A8, F16};
         assert_eq!(parse_site_tiers("a4,f16"), Some((A4, F16)));
         assert_eq!(parse_site_tiers(" F16 , A8 "), Some((F16, A8)));
         assert_eq!(parse_site_tiers("a4"), None);
         assert_eq!(parse_site_tiers("a4,a5"), None);
-        let mut f = rdna_compute::feature_flags::FeatureFlags::for_test("gfx1201");
-        f.iu4_prefill = Some(false);
-        assert_eq!(grouped_moe_device_tier(&f), F16);
-        f.iu4_prefill = None;
-        assert_eq!(grouped_moe_device_tier(&f), A4);
-        f.a8_prefill = true;
-        assert_eq!(grouped_moe_device_tier(&f), A8);
-        f.arch = "gfx1100".into();
-        f.a8_prefill = false;
-        f.iu4_prefill = Some(false);
-        assert_eq!(grouped_moe_device_tier(&f), F16);
     }
 
     #[test]
