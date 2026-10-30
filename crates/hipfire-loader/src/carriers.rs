@@ -10522,12 +10522,70 @@ impl Carrier for RaonCarrier {
         }
         Some(true)
     }
+    fn spec_target_guard<'m>(
+        &self,
+        state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        match state
+            .as_mut()
+            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<crate::RaonBundle>())
+        {
+            Some(bundle) => Ok(Box::new(InPlaceGuard { bundle })),
+            _ => Err("raon1_mini: spec target state mismatch".into()),
+        }
+    }
+    fn make_spec_emitter<'a>(
+        &self,
+        mut ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        // The Raon AR producer (`generate_ar_with_forward`) runs the shared
+        // think router, XML `<tool_call>` router, stop matcher and the
+        // template's own think close on a spent budget, with no tool-call
+        // grammar: the same emitter recipe as Qwen4, grammar forced off so a
+        // post-acceptance reject can never end a speculative turn the AR
+        // route continues. Greedy tool turns then commit the AR stream.
+        ctx.enable_grammar = false;
+        Ok(Qwen35Emit::from_ctx_template_think_close(ctx))
+    }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
-        let bundle = hipfire_arch_raon::load_raon_bundle(src, ctx)?;
+        // `load_raon_bundle` refuses every speculation request this arch
+        // cannot serve before allocating; only a DFlash2 draft under
+        // `speculation.dflash = on` reaches the builder below.
+        let mut bundle = hipfire_arch_raon::load_raon_bundle(src, ctx)?;
+        let speculator = match hipfire_arch_raon::carrier::dflash_draft(ctx.draft_path, ctx.spec)? {
+            Some(draft) => match hipfire_arch_raon::carrier::build_raon_dflash2_speculator(
+                ctx.gpu,
+                draft,
+                &mut bundle,
+                ctx.max_seq,
+                ctx.spec,
+            ) {
+                Ok(speculator) => {
+                    hipfire_config::load_summary::note(
+                        hipfire_config::load_summary::Facet::SpecOn,
+                        format!(
+                            "dflash (draft {})",
+                            std::path::Path::new(draft)
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| draft.to_string())
+                        ),
+                    );
+                    Some(speculator)
+                }
+                Err(error) => {
+                    bundle.free_all(ctx.gpu);
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
         Ok(LoadedModel {
             state: Some(Box::new(bundle)),
+            speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,
@@ -14926,5 +14984,33 @@ mod qwen4_ep_reserve_loader_tests {
             200 + per_rank
         );
         assert_eq!(plan.mirror_bytes_total, plan.mirror_bytes_per_rank * 2);
+    }
+}
+
+#[cfg(test)]
+mod raon_carrier_tests {
+    use super::RaonCarrier;
+    use crate::Carrier;
+
+    #[test]
+    fn spec_target_guard_refuses_a_state_that_is_not_a_raon_bundle() {
+        let mut empty: Option<Box<dyn hipfire_runtime::arch_model::ArchModel>> = None;
+        let error = RaonCarrier
+            .spec_target_guard(&mut empty, "raon.hfq")
+            .err()
+            .expect("an empty state is not a Raon bundle");
+        assert!(error.contains("raon1_mini"), "{error}");
+    }
+
+    /// DFlash2 is carried by the speculator (route `RaonSpec` reads
+    /// `speculator_is_dflash2`), not by a legacy Qwen/Llama DFlash kind, and
+    /// Raon never batches.
+    #[test]
+    fn caps_declare_no_legacy_dflash_kind_and_no_batching() {
+        let caps = RaonCarrier.caps();
+        assert!(caps.dflash.is_none());
+        assert!(!caps.supports_continuous_batch);
+        assert!(!caps.supports_mtp);
+        assert_eq!(caps.semantic_contract_version, Some(2));
     }
 }

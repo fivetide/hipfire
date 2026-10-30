@@ -621,6 +621,21 @@ pub fn mirror_rows_for_budget(d: &RaonStateDims, budget_bytes: usize) -> usize {
 // RaonState
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Uniform q/k/v conv-history geometry of the persistent slab, see
+/// [`RaonState::conv_slab_layout`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConvSlabLayout {
+    pub conv_off: usize,
+    /// Bytes between RDA layers' conv blocks.
+    pub layer_stride: usize,
+    /// Bytes between the q, k and v planes of one layer.
+    pub plane_pitch: usize,
+    /// Channels (F32 columns) per history row.
+    pub cols: usize,
+    /// History rows (`kernel - 1`).
+    pub hist: usize,
+}
+
 /// Snapshot of the recurrent block (RDA matrices, conv history, device token
 /// count) for graph warmup/capture: warm up, then [`RaonState::restore`].
 /// Latent cache rows are not copied: rows at or beyond the restored length are
@@ -637,6 +652,11 @@ impl RaonStateSnapshot {
     }
     pub fn n_tokens(&self) -> usize {
         self.n_tokens
+    }
+    /// The snapshot bytes: a verbatim copy of the persistent slab
+    /// ([`RaonState::persist_tensor`]), same offsets.
+    pub fn tensor(&self) -> &GpuTensor {
+        &self.buf
     }
     pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), String> {
         hip(gpu.free_tensor(self.buf), "free snapshot")
@@ -1060,7 +1080,10 @@ impl RaonState {
         Ok(())
     }
 
-    /// Restore the recurrent block and length from `snap`.
+    /// Restore the recurrent block and length from `snap`. Latent rows at or
+    /// beyond the restored length are dead, so the expanded mirror's valid-row
+    /// watermark drops to the restored length too (it never exceeds
+    /// `n_tokens`); the next forward re-expands anything it needs.
     pub fn restore(&mut self, gpu: &Gpu, snap: &RaonStateSnapshot) -> Result<(), String> {
         if snap.bytes != self.layout.total {
             return Err("raon state: snapshot was taken with different dims".into());
@@ -1071,7 +1094,54 @@ impl RaonState {
             "restore",
         )?;
         self.n_tokens = snap.n_tokens;
+        self.clamp_mirror_valid_rows(snap.n_tokens);
         Ok(())
+    }
+
+    /// The persistent slab (RDA matrices, conv histories, device `seq_len`).
+    pub fn persist_tensor(&self) -> &GpuTensor {
+        &self.persist
+    }
+
+    /// Uniform q/k/v conv-history layout of the slab (identical in any
+    /// [`RaonStateSnapshot`] of it): layer `ri`'s plane `p` (0 q, 1 k, 2 v)
+    /// starts at `conv_off + ri * layer_stride + p * plane_pitch` bytes and is
+    /// `[conv_hist, cols]` F32, oldest -> newest. The three planes share one
+    /// pitch and width (`heads*k_dim == heads*v_dim`), so one pitched copy
+    /// moves all three; any other geometry is refused.
+    pub fn conv_slab_layout(&self) -> Result<ConvSlabLayout, String> {
+        let d = &self.dims;
+        let planes = conv_plane_bytes(d)?;
+        let elems = d.conv_plane_elems();
+        if planes[0] != planes[1]
+            || planes[1] != planes[2]
+            || elems[0] != elems[1]
+            || elems[1] != elems[2]
+        {
+            return Err("raon state: q/k/v conv history planes differ in size".into());
+        }
+        Ok(ConvSlabLayout {
+            conv_off: self.layout.conv_off,
+            layer_stride: self.layout.conv_stride,
+            plane_pitch: planes[0],
+            cols: elems[0] / d.conv_hist,
+            hist: d.conv_hist,
+        })
+    }
+
+    /// Download the whole persistent slab (RDA matrices, conv histories, device
+    /// `seq_len`, alignment padding) after draining the device. Oracle use.
+    pub fn download_persist(&self, gpu: &Gpu) -> Result<Vec<u8>, String> {
+        hip(
+            gpu.hip.device_synchronize(),
+            "synchronize before slab download",
+        )?;
+        let mut out = vec![0u8; self.layout.total];
+        hip(
+            gpu.hip.memcpy_dtoh(&mut out, &self.persist.buf),
+            "download persistent slab",
+        )?;
+        Ok(out)
     }
 
     /// Most rows the decompressed (mirror) MLA route can serve on this

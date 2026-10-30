@@ -7,9 +7,10 @@ use rdna_compute::{Gpu, GpuTensor};
 
 use crate::config::RaonConfig;
 use crate::forward::{
-    admit_decode_context, decode_binding, decode_body, forward_rows, forward_token,
-    stage_decode_token, stage_decode_token_on_stream, RaonWork,
+    admit_decode_context, decode_binding, decode_body, forward_rows, forward_rows_captured,
+    forward_token, stage_decode_token, stage_decode_token_on_stream, RaonWork,
 };
+use crate::spec_impl::RaonSpecState;
 use crate::state::{RaonPrefillScratch, RaonState};
 use crate::weights::{RaonMixer, RaonWeights};
 
@@ -236,6 +237,9 @@ pub struct RaonBundle {
     prefill_mode: PrefillMode,
     decode_mode: DecodeMode,
     graph: DecodeGraph,
+    /// Speculative-decode state (DFlash2 capture, per-row verify head); empty
+    /// until a speculator arms it, never touched by AR prefill or decode.
+    pub(crate) spec: RaonSpecState,
 }
 
 impl RaonBundle {
@@ -285,6 +289,7 @@ impl RaonBundle {
                     prefill_mode,
                     decode_mode: DecodeMode::resolve(gpu),
                     graph: DecodeGraph::default(),
+                    spec: RaonSpecState::default(),
                 })
             }
             Err(e) => {
@@ -375,6 +380,71 @@ impl RaonBundle {
             .map_err(|e| format!("raon1_mini: download logits: {e:?}"))
     }
 
+    /// Token rows one prefill step stages: 1 on the serial control route, else
+    /// the admitted chunk ([`prefill_chunk_rows`](Self::prefill_chunk_rows)).
+    pub(crate) fn prefill_step_rows(&self) -> usize {
+        match self.prefill_mode {
+            PrefillMode::Serial => 1,
+            PrefillMode::Batched => self.prefill_chunk_rows(),
+        }
+    }
+
+    /// One prefill step: `piece` (1..=[`prefill_step_rows`](Self::prefill_step_rows)
+    /// rows) from the slot's current position. `want_logits` leaves the last
+    /// row's logits in [`logits`](Self::logits). `capture_row0 = Some(r)`
+    /// additionally lands the DFlash2 feature rows of `piece` in the
+    /// speculative capture buffer from row `r` ([`RaonSpecState`]); `None`
+    /// issues exactly the AR launch sequence.
+    pub(crate) fn forward_chunk(
+        &mut self,
+        gpu: &mut Gpu,
+        piece: &[u32],
+        want_logits: bool,
+        capture_row0: Option<usize>,
+    ) -> Result<(), String> {
+        let pos = self.state.n_tokens() as u32;
+        if let Some(row0) = capture_row0 {
+            let capture = self.spec.capture(row0)?;
+            return forward_rows_captured(
+                &self.config,
+                &self.weights,
+                &mut self.state,
+                &mut self.scratch,
+                &mut self.work,
+                gpu,
+                piece,
+                pos,
+                want_logits,
+                Some(&capture),
+            );
+        }
+        if piece.len() == 1 {
+            forward_token(
+                &self.config,
+                &self.weights,
+                &mut self.state,
+                &mut self.scratch,
+                &mut self.work,
+                gpu,
+                piece[0],
+                pos,
+                want_logits,
+            )
+        } else {
+            forward_rows(
+                &self.config,
+                &self.weights,
+                &mut self.state,
+                &mut self.scratch,
+                &mut self.work,
+                gpu,
+                piece,
+                pos,
+                want_logits,
+            )
+        }
+    }
+
     /// Append `tokens` to the slot starting at `n_tokens()`, in chunks of at
     /// most `scratch.rows`; the logits of the final token are left in
     /// [`logits`](Self::logits). A failure leaves the slot partially advanced:
@@ -391,39 +461,10 @@ impl RaonBundle {
                 self.state.max_seq()
             ));
         }
-        let chunk = match self.prefill_mode {
-            PrefillMode::Serial => 1,
-            PrefillMode::Batched => self.prefill_chunk_rows(),
-        };
+        let chunk = self.prefill_step_rows();
         let n_chunks = tokens.len().div_ceil(chunk);
         for (ci, piece) in tokens.chunks(chunk).enumerate() {
-            let pos = self.state.n_tokens() as u32;
-            let last = ci + 1 == n_chunks;
-            if chunk == 1 {
-                forward_token(
-                    &self.config,
-                    &self.weights,
-                    &mut self.state,
-                    &mut self.scratch,
-                    &mut self.work,
-                    gpu,
-                    piece[0],
-                    pos,
-                    last,
-                )?;
-            } else {
-                forward_rows(
-                    &self.config,
-                    &self.weights,
-                    &mut self.state,
-                    &mut self.scratch,
-                    &mut self.work,
-                    gpu,
-                    piece,
-                    pos,
-                    last,
-                )?;
-            }
+            self.forward_chunk(gpu, piece, ci + 1 == n_chunks, None)?;
         }
         Ok(())
     }
@@ -608,12 +649,14 @@ impl RaonBundle {
             prefill_mode: _,
             decode_mode: _,
             graph,
+            spec,
         } = self;
         // A recording of this bundle reads the buffers freed below.
         if graph.binding != 0 && gpu.graphs.ar_forward_binding == graph.binding {
             gpu.graphs.drop_captured_graph(&gpu.hip, gpu.device_id);
         }
         work.free(gpu);
+        spec.free(gpu);
         if let Err(e) = scratch.free_gpu(gpu) {
             eprintln!("raon1_mini: scratch free: {e}");
         }

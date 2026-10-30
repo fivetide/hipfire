@@ -6,7 +6,9 @@
 //! (arch 19 registration) calls [`load_raon_bundle`] and wraps the bundle in
 //! `LoadedModel`. This crate does not depend on the loader.
 
-use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
+use hipfire_runtime::dflash::DflashBlockPolicy;
+use hipfire_runtime::loader_api::{LoadCtx, ModelSource, SpecLoadCfg};
+use hipfire_runtime::spec::Speculator;
 use rdna_compute::Gpu;
 
 use crate::bundle::{RaonBundle, PREFILL_SCRATCH_ROWS};
@@ -15,14 +17,110 @@ use crate::forward::RaonWork;
 use crate::state::{RaonPrefillScratch, RaonState, RaonStateDims};
 use crate::weights::load_raon_weights;
 
+/// The DFlash2 draft a load asks for, or `None` for plain AR.
+///
+/// DFlash2 is opt-in: the draft runs only under `speculation.dflash = on` and
+/// needs its draft path. A draft without `dflash = on`, `dflash = on` without
+/// a draft, a second speculator beside it (native MTP, DSpark, n-gram) and
+/// any speculator this arch has no producer for are refused up front, before
+/// any allocation.
+pub fn dflash_draft<'a>(
+    draft_path: Option<&'a str>,
+    spec: SpecLoadCfg,
+) -> Result<Option<&'a str>, String> {
+    let dflash = spec.dflash == Some(true);
+    let other = [
+        (spec.mtp == Some(true), "native MTP (speculation.mtp)"),
+        (spec.dspark == Some(true), "DSpark (speculation.dspark)"),
+        (
+            spec.ngram_draft == Some(true),
+            "n-gram draft (speculation.ngram_draft)",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(set, name)| set.then_some(name))
+    .collect::<Vec<_>>();
+    if !other.is_empty() {
+        return Err(format!(
+            "raon1_mini: unsupported speculator(s): {}; the only speculator is a DFlash2 draft \
+             (--spec dflash --model-draft <draft>)",
+            other.join(", ")
+        ));
+    }
+    match (dflash, draft_path) {
+        (true, Some(draft)) => Ok(Some(draft)),
+        (true, None) => Err(
+            "raon1_mini: DFlash (speculation.dflash = on) needs a DFlash2 draft \
+             (--model-draft / params.draft)"
+                .into(),
+        ),
+        (false, Some(_)) => Err(
+            "raon1_mini: a draft model needs speculation.dflash = on (--spec dflash runs a \
+             DFlash2 draft)"
+                .into(),
+        ),
+        (false, None) => Ok(None),
+    }
+}
+
+/// The proposal width of a Raon DFlash2 load: an explicit
+/// `speculation.dflash_block`, else the `auto` width of an unbatched load
+/// (Raon has no continuous batching).
+fn dflash_block_for(spec: SpecLoadCfg) -> usize {
+    match spec.dflash_block {
+        Some(block) if !spec.dflash_block_auto => block,
+        _ => DflashBlockPolicy::Auto.resolve(false, 0),
+    }
+}
+
+/// The shared DFlash2 speculator (`--spec dflash --model-draft <draft>`) on a
+/// loaded Raon bundle. The draft must have been made for this model (hidden
+/// width and vocabulary); its stream width and extract layers are checked by
+/// the shared builder against `SpecTarget for RaonBundle`.
+pub fn build_raon_dflash2_speculator(
+    gpu: &mut rdna_compute::Gpu,
+    draft: &str,
+    bundle: &mut RaonBundle,
+    max_seq: usize,
+    spec: SpecLoadCfg,
+) -> Result<Box<dyn Speculator>, String> {
+    let draft_hfq = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(draft))
+        .map_err(|error| format!("raon1_mini: DFlash2 draft '{draft}': {error}"))?;
+    let config = hipfire_runtime::dflash::DflashConfig::from_hfq(&draft_hfq).ok_or_else(|| {
+        format!("raon1_mini: '{draft}' is not a DFlash draft (missing `dflash` metadata)")
+    })?;
+    drop(draft_hfq);
+    if config.hidden != bundle.config.hidden || config.vocab_size != bundle.config.vocab {
+        return Err(format!(
+            "raon1_mini: DFlash2 draft '{draft}' (hidden {}, vocab {}) was not made for this \
+             model (hidden {}, vocab {})",
+            config.hidden, config.vocab_size, bundle.config.hidden, bundle.config.vocab
+        ));
+    }
+    let block = dflash_block_for(spec);
+    let speculator =
+        hipfire_runtime::dflash2_spec::build_dflash2_speculator(gpu, draft, bundle, max_seq, block)
+            .map_err(|error| format!("raon1_mini: DFlash2 speculator: {error}"))?;
+    eprintln!(
+        "  raon1_mini DFlash2 speculator: {draft} (block {block}, target layers {:?}, \
+         {} stream(s) per layer)",
+        config.target_layer_ids, config.target_streams_per_layer
+    );
+    Ok(speculator)
+}
+
 /// Build the Raon GPU bundle from an HFQ source.
 ///
 /// Refused up front (before any allocation): pipeline/expert parallelism,
-/// a draft/speculation sidecar, a safetensors directory (the official MXFP8
+/// a speculation request this arch cannot serve ([`dflash_draft`]), a
+/// safetensors directory (the official MXFP8
 /// checkpoint is quantized offline by `hipfire quantize`, never half-loaded),
 /// a non-arch-19 container, and a context length outside `1..=max_position`.
 /// Tensor parallelism never reaches this carrier (it has its own route).
+/// The DFlash2 speculator, when requested, is built by the caller with
+/// [`build_raon_dflash2_speculator`] on the returned bundle.
 pub fn load_raon_bundle(src: ModelSource, ctx: &mut LoadCtx<'_>) -> Result<RaonBundle, String> {
+    dflash_draft(ctx.draft_path, ctx.spec)?;
     if ctx.pp > 1 {
         return Err(format!(
             "raon1_mini: pipeline parallelism (topology.pp = {}) is unsupported",
@@ -34,9 +132,6 @@ pub fn load_raon_bundle(src: ModelSource, ctx: &mut LoadCtx<'_>) -> Result<RaonB
         return Err(format!(
             "raon1_mini: expert parallelism (topology.ep = {ep}) is unsupported"
         ));
-    }
-    if ctx.draft_path.is_some() {
-        return Err("raon1_mini: speculative draft models are unsupported".into());
     }
     let hfq = match src {
         ModelSource::Hfq(hfq) => hfq,
@@ -327,5 +422,88 @@ mod tests {
         let b512 = RaonPrefillScratch::required_bytes(&d, 512).unwrap();
         let b4096 = RaonPrefillScratch::required_bytes(&d, 4096).unwrap();
         assert!(b4096 > 7 * b512 && b4096 < 9 * b512);
+    }
+}
+
+#[cfg(test)]
+mod dflash_tests {
+    use super::*;
+
+    fn cfg(f: impl FnOnce(&mut SpecLoadCfg)) -> SpecLoadCfg {
+        let mut spec = SpecLoadCfg::default();
+        f(&mut spec);
+        spec
+    }
+
+    #[test]
+    fn no_draft_and_no_dflash_is_plain_ar() {
+        assert_eq!(dflash_draft(None, SpecLoadCfg::default()), Ok(None));
+        // An explicit `off` / unrequested mechanism never arms a speculator.
+        let off = cfg(|s| {
+            s.dflash = Some(false);
+            s.mtp = Some(false);
+            s.dspark = Some(false);
+            s.ngram_draft = Some(false);
+        });
+        assert_eq!(dflash_draft(None, off), Ok(None));
+    }
+
+    #[test]
+    fn dflash_on_with_a_draft_runs_it() {
+        let on = cfg(|s| s.dflash = Some(true));
+        assert_eq!(dflash_draft(Some("d.hfq"), on), Ok(Some("d.hfq")));
+    }
+
+    #[test]
+    fn a_draft_without_dflash_on_is_refused() {
+        for dflash in [None, Some(false)] {
+            let spec = cfg(|s| s.dflash = dflash);
+            let error = dflash_draft(Some("d.hfq"), spec).unwrap_err();
+            assert!(error.contains("speculation.dflash = on"), "{error}");
+        }
+    }
+
+    #[test]
+    fn dflash_on_without_a_draft_is_refused() {
+        let on = cfg(|s| s.dflash = Some(true));
+        let error = dflash_draft(None, on).unwrap_err();
+        assert!(error.contains("needs a DFlash2 draft"), "{error}");
+    }
+
+    #[test]
+    fn other_speculators_are_refused_by_name() {
+        for (name, spec) in [
+            ("native MTP", cfg(|s| s.mtp = Some(true))),
+            ("DSpark", cfg(|s| s.dspark = Some(true))),
+            ("n-gram draft", cfg(|s| s.ngram_draft = Some(true))),
+            (
+                "native MTP",
+                cfg(|s| {
+                    s.dflash = Some(true);
+                    s.mtp = Some(true);
+                }),
+            ),
+        ] {
+            let error = dflash_draft(Some("d.hfq"), spec).unwrap_err();
+            assert!(error.contains(name), "{name}: {error}");
+            assert!(error.contains("unsupported speculator"), "{error}");
+        }
+    }
+
+    #[test]
+    fn block_is_the_explicit_width_else_the_unbatched_auto_width() {
+        let width = |dflash_block, dflash_block_auto| {
+            dflash_block_for(cfg(|s| {
+                s.dflash_block = dflash_block;
+                s.dflash_block_auto = dflash_block_auto;
+            }))
+        };
+        let auto = hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED;
+        assert_eq!(width(None, false), auto);
+        assert_eq!(width(None, true), auto);
+        assert_eq!(width(Some(8), false), 8);
+        // `auto` resolved by the daemon for a batching serve must not apply:
+        // Raon never batches.
+        assert_eq!(width(Some(8), true), auto);
     }
 }
