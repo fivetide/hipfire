@@ -516,6 +516,8 @@ pub struct RdaPrepareLaunch<'a> {
     pub q_scale: f32,
     pub norm_eps: f32,
     pub lower_bound: f32,
+    /// Model-dtype BF16 boundaries (true) or FP32 model dtype (false).
+    pub round_bf16: bool,
 }
 
 impl Gpu {
@@ -523,7 +525,8 @@ impl Gpu {
     /// `n_rows` rows in one launch. Kernel args: q_out,k_out,vprime_out,
     /// log_alpha_out,beta_out,qconv,kconv,vconv,f,b,delta,a_log,dt_bias (ptr);
     /// head_dim,n_heads,conv_row_stride,f_row_stride,bd_row_stride,
-    /// out_row_stride,beta_row_stride (i32); q_scale,norm_eps,lower_bound (f32).
+    /// out_row_stride,beta_row_stride (i32); q_scale,norm_eps,lower_bound (f32);
+    /// round_bf16 (i32).
     pub fn raon_rda_prepare_f32(&mut self, p: &RdaPrepareLaunch<'_>) -> HipResult<()> {
         if p.head_dim == 0 || p.head_dim > 256 || !p.head_dim.is_power_of_two() {
             return Err(refuse(format!(
@@ -577,7 +580,8 @@ impl Gpu {
             i32_of(p.beta_row_stride, "beta_row_stride")?,
         ];
         let floats = [p.q_scale, p.norm_eps, p.lower_bound];
-        let mut params: Vec<*mut c_void> = Vec::with_capacity(23);
+        let round = p.round_bf16 as i32;
+        let mut params: Vec<*mut c_void> = Vec::with_capacity(24);
         for v in &ptrs {
             params.push(v as *const _ as *mut c_void);
         }
@@ -587,6 +591,7 @@ impl Gpu {
         for v in &floats {
             params.push(v as *const _ as *mut c_void);
         }
+        params.push(&round as *const _ as *mut c_void);
         let bytes = p.n_rows * ext * 4 * 8;
         let timer = profile::begin_timer(&self.hip, "gated_delta", "raon_rda_prepare_f32", bytes);
         let result = self.launch_maybe_blob(
@@ -606,6 +611,7 @@ impl Gpu {
                 for v in floats {
                     b.push_f32(v);
                 }
+                b.push_i32(round);
                 b
             },
         );

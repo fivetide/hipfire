@@ -42,6 +42,9 @@ pub struct RdaGeometry {
     pub norm_eps: f32,
     /// `log_alpha = lower_bound * sigmoid(u)`.
     pub gate_lower_bound: f32,
+    /// Model dtype boundaries: true = BF16 rounding (checkpoint), false = FP32
+    /// model dtype (F32-mode oracle).
+    pub round_bf16: bool,
 }
 
 impl RdaGeometry {
@@ -54,6 +57,7 @@ impl RdaGeometry {
             rms_eps: 1e-5,
             norm_eps: 1e-6,
             gate_lower_bound: -5.0,
+            round_bf16: true,
         }
     }
 
@@ -192,7 +196,7 @@ pub fn rda_forward_rows(
             w_tap_stride: 1,
             hist_tap_stride: p,
             apply_silu: true,
-            round_bf16: true,
+            round_bf16: geom.round_bf16,
         };
         gpu.causal_conv_depthwise_silu_rows_f32(out, input, weight, hist, hist, &g)
             .map_err(|e| err(what, format!("{e:?}")))?;
@@ -223,6 +227,7 @@ pub fn rda_forward_rows(
         q_scale: (kd as f64).powf(-0.5) as f32,
         norm_eps: geom.norm_eps,
         lower_bound: geom.gate_lower_bound,
+        round_bf16: geom.round_bf16,
     })
     .map_err(|e| err("prepare", format!("{e:?}")))?;
 
@@ -246,7 +251,7 @@ pub fn rda_forward_rows(
             key_dim: kd,
             value_dim: kd,
             decay_axis: DecayAxis::PerKeyChannel,
-            round_output_bf16: true,
+            round_output_bf16: geom.round_bf16,
             slot: st.slot,
             strides,
         },
@@ -266,7 +271,7 @@ pub fn rda_forward_rows(
             gate_row_stride: p,
             out_row_stride: p,
             eps: geom.rms_eps,
-            round_bf16: true,
+            round_bf16: geom.round_bf16,
         },
     )
     .map_err(|e| err("output gate", format!("{e:?}")))
