@@ -4,8 +4,8 @@
 //!
 //! STUB created by slice O so the dispatcher compiles against the frozen
 //! `run(fixtures, opts)` signature; slice I REPLACES this body. It refuses
-//! (Err) rather than reporting a pass. Result: `{"text": "..", "pass": bool}`
-//! (text is printed to stdout by the dispatcher).
+//! (Err) rather than reporting a pass. `run` streams its own text; its result
+//! object carries `pass: bool` (printed by the dispatcher only with `--json 1`).
 
 pub fn run(
     _fixtures: &std::path::Path,
