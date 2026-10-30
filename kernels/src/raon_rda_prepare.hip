@@ -10,6 +10,7 @@
 //   u[k] = exp(A_log[h]) * (f[k] + dt_bias[h,k]);  log_alpha[k] = lower_bound * sigmoid(u[k])
 //   beta = bf16(sigmoid(b));  ratio = exp(logsigmoid(b+delta) - logsigmoid(b))
 //   vprime = bf16( vconv * ratio )
+// With round_bf16 = 0 (FP32 model dtype) every bf16() above is the identity.
 // One workgroup per (head, row); blockDim.x == head_dim (<= 256).
 // Credit: gate/ratio structure cross-checked against the contributor FP32 port
 // by u/Queasy_Asparagus69 (HF datayoda).
@@ -22,6 +23,8 @@ static __device__ __forceinline__ float rrp_bf16_rn(float x) {
     u += 0x7fffu + ((u >> 16) & 1u);
     return __uint_as_float(u & 0xffff0000u);
 }
+
+static __device__ __forceinline__ float rrp_rn(float x, int round) { return round ? rrp_bf16_rn(x) : x; }
 
 static __device__ __forceinline__ float rrp_logsigmoid(float x) {
     return fminf(x, 0.0f) - log1pf(expf(-fabsf(x)));
@@ -50,7 +53,8 @@ extern "C" __global__ void raon_rda_prepare_f32(
     int beta_row_stride,
     float q_scale,
     float norm_eps,
-    float lower_bound
+    float lower_bound,
+    int round_bf16                    // 1 = model dtype BF16 boundaries, 0 = FP32 model dtype
 ) {
     __shared__ float rq[256];
     __shared__ float rk[256];
@@ -70,8 +74,8 @@ extern "C" __global__ void raon_rda_prepare_f32(
     const float qn = fmaxf(sqrtf(rq[0]), norm_eps);
     const float kn = fmaxf(sqrtf(rk[0]), norm_eps);
     const long long ooff = (long long)row * out_row_stride + off;
-    q_out[ooff] = rrp_bf16_rn(rrp_bf16_rn(qv / qn) * q_scale);
-    k_out[ooff] = rrp_bf16_rn(kv / kn);
+    q_out[ooff] = rrp_rn(rrp_rn(qv / qn, round_bf16) * q_scale, round_bf16);
+    k_out[ooff] = rrp_rn(kv / kn, round_bf16);
 
     const float u = expf(a_log[h]) * (f[(long long)row * f_row_stride + off] + dt_bias[off]);
     log_alpha_out[ooff] = lower_bound * (1.0f / (1.0f + expf(-u)));
@@ -79,6 +83,6 @@ extern "C" __global__ void raon_rda_prepare_f32(
     const float bv = b[(long long)row * bd_row_stride + h];
     const float dv = delta[(long long)row * bd_row_stride + h];
     const float ratio = expf(rrp_logsigmoid(bv + dv) - rrp_logsigmoid(bv));
-    vprime_out[ooff] = rrp_bf16_rn(vconv[(long long)row * conv_row_stride + off] * ratio);
-    if (d == 0) beta_out[(long long)row * beta_row_stride + h] = rrp_bf16_rn(1.0f / (1.0f + expf(-bv)));
+    vprime_out[ooff] = rrp_rn(vconv[(long long)row * conv_row_stride + off] * ratio, round_bf16);
+    if (d == 0) beta_out[(long long)row * beta_row_stride + h] = rrp_rn(1.0f / (1.0f + expf(-bv)), round_bf16);
 }

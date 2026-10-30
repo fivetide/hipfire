@@ -114,6 +114,8 @@ enum Band {
     F32 { rel: f64 },
     /// BF16-boundary band: rel-L2 <= 1e-2, cosine >= .9999.
     Bf16,
+    /// Relative L2 only (FP32 state accumulated from BF16-boundary inputs).
+    Rel { rel: f64 },
     /// Byte-identical.
     Exact,
 }
@@ -157,6 +159,16 @@ fn compare(name: &str, got: &[f32], want: &[f32], band: Band) -> Value {
             (
                 rel <= 1e-2 && cos >= 0.9999 && got.iter().all(|v| v.is_finite()),
                 json!({"kind": "bf16", "rel_l2_max": 1e-2, "cos_min": 0.9999}),
+                first,
+            )
+        }
+        Band::Rel { rel: lim } => {
+            let first = got.iter().zip(want).position(|(g, w)| {
+                ((*g as f64) - (*w as f64)).abs() > lim * max_ref || !g.is_finite()
+            });
+            (
+                rel <= lim && got.iter().all(|v| v.is_finite()),
+                json!({"kind": "rel_l2", "rel_l2_max": lim}),
                 first,
             )
         }
@@ -321,6 +333,10 @@ fn module_case(gpu: &mut Gpu, case: &Value, t: &Tensors, out: &mut Vec<Value>) -
     let mut geom = RdaGeometry::raon();
     geom.n_heads = dims(case, "H")?;
     geom.head_dim = dims(case, "K")?;
+    // Model dtype follows the case mode: f32 cases have no BF16 boundaries.
+    let bf16 = case["mode"].as_str() != Some("f32");
+    geom.round_bf16 = bf16;
+    let bb = if bf16 { Band::Bf16 } else { Band::F32 { rel: 1e-4 } };
     let p = geom.proj();
     let h = geom.n_heads;
     let s0 = t.need("S0")?;
@@ -343,7 +359,7 @@ fn module_case(gpu: &mut Gpu, case: &Value, t: &Tensors, out: &mut Vec<Value>) -
         ] {
             if let Some(want) = t.get(name) {
                 let got = dl(gpu, tensor)?;
-                let band = if name == "log_alpha" { Band::F32 { rel: 1e-4 } } else { Band::Bf16 };
+                let band = if name == "log_alpha" { Band::F32 { rel: 1e-4 } } else { bb };
                 out.push(json!({"stage": "module", "cmp":
                     compare(name, &got[..want_len], want, band)}));
             }
@@ -352,12 +368,13 @@ fn module_case(gpu: &mut Gpu, case: &Value, t: &Tensors, out: &mut Vec<Value>) -
     if t.get("z").is_some() {
         if let Some(want) = t.get("gated") {
             out.push(json!({"stage": "module", "cmp":
-                compare("gated", &single.gated, want, Band::Bf16)}));
+                compare("gated", &single.gated, want, bb)}));
         }
     }
     if let Some(want) = t.get("S_out") {
         out.push(json!({"stage": "module", "cmp":
-            compare("S_out", &single.state, want, Band::F32 { rel: 1e-2 })}));
+            compare("S_out", &single.state, want,
+                if bf16 { Band::Rel { rel: 1e-2 } } else { Band::F32 { rel: state_rel } })}));
     }
     for (i, nm) in ["hist_out_q", "hist_out_k", "hist_out_v"].iter().enumerate() {
         let want = t.need(nm)?;
@@ -400,7 +417,7 @@ fn module_case(gpu: &mut Gpu, case: &Value, t: &Tensors, out: &mut Vec<Value>) -
                 key_dim: geom.head_dim,
                 value_dim: geom.head_dim,
                 decay_axis: DecayAxis::PerKeyChannel,
-                round_output_bf16: true,
+                round_output_bf16: bf16,
                 slot: 0,
                 strides: GatedDeltaStrides::contiguous(
                     h,
@@ -418,7 +435,7 @@ fn module_case(gpu: &mut Gpu, case: &Value, t: &Tensors, out: &mut Vec<Value>) -
         out.push(json!({"stage": "recurrence", "cmp":
             compare("S_out", &got_s, t.need("S_out")?, Band::F32 { rel: state_rel })}));
         if let Some(want) = t.get("y") {
-            out.push(json!({"stage": "recurrence", "cmp": compare("y", &got_y, want, Band::Bf16)}));
+            out.push(json!({"stage": "recurrence", "cmp": compare("y", &got_y, want, bb)}));
         }
         for v in pool.0.drain(..) {
             let _ = gpu.free_tensor(v);

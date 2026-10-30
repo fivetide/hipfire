@@ -99,6 +99,7 @@ impl RaonWork {
             rms_eps: cfg.rms_eps,
             norm_eps: cfg.qk_l2_eps,
             gate_lower_bound: lower_bound,
+            round_bf16: true,
         };
         let moe_dims = RaonMoeDims {
             hidden: cfg.hidden,
