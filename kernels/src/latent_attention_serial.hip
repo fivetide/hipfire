@@ -15,7 +15,7 @@
 //
 // Inputs:  q [n_rows, H, nope+tail] (BF16-valued F32), tail read straight from
 // the latent cache row (columns latent..latent+tail), K_nope / V from the
-// head-major BF16 mirrors written by latent_attention_decompress_*.
+// token-major BF16 mirrors written by latent_attention_decompress_*.
 // Output:  y [n_rows, H, dv] BF16-valued F32 (one BF16 rounding, as the
 // reference's BF16 attention output).
 //
@@ -63,8 +63,8 @@ static __device__ __forceinline__ float la_dot_row(
 extern "C" __global__ __launch_bounds__(LA_KT) void latent_attention_serial_bf16(
     const float* __restrict__ q,         // [n_rows, H, nope+tail]
     const uint16_t* __restrict__ cache,  // [cap, latent+tail] BF16
-    const uint16_t* __restrict__ knope,  // [H, cap, nope] BF16
-    const uint16_t* __restrict__ vmir,   // [H, cap, dv] BF16
+    const uint16_t* __restrict__ knope,  // [mcap, H, nope] BF16
+    const uint16_t* __restrict__ vmir,   // [mcap, H, dv] BF16
     float* __restrict__ y,               // [n_rows, H, dv]
     const int* __restrict__ pos_ptr,     // device scalar: rows cached before this call
     int n_rows, int n_heads, int nope, int tail, int dv, int latent, int cap,
@@ -100,7 +100,7 @@ extern "C" __global__ __launch_bounds__(LA_KT) void latent_attention_serial_bf16
         const bool valid = j < len;
         float s = -INFINITY;
         if (valid) {
-            float a = la_dot_row(qs, knope + ((size_t)h * mcap + j) * nope, nope, vec8, 0.0f);
+            float a = la_dot_row(qs, knope + ((size_t)j * n_heads + h) * nope, nope, vec8, 0.0f);
             a = la_dot_row(qs + nope, cache + (size_t)j * width + latent, tail, vec8, a);
             s = a * scale;
         }
@@ -126,14 +126,15 @@ extern "C" __global__ __launch_bounds__(LA_KT) void latent_attention_serial_bf16
         l = l * corr + psum;
         m = m_new;
         const int cnt = (len - kt < LA_KT) ? (len - kt) : LA_KT;
-        const uint16_t* vbase = vmir + ((size_t)h * mcap + kt) * dv;
+        const uint16_t* vbase = vmir + ((size_t)kt * n_heads + h) * dv;
+        const size_t vstride = (size_t)n_heads * dv;
         #pragma unroll
         for (int r = 0; r < LA_DVQ; ++r) {
             const int d = tid + r * LA_KT;
             if (d < dv) {
                 float a = acc[r] * corr;
                 for (int jj = 0; jj < cnt; ++jj)
-                    a = fmaf(ps[jj], la_bf16_to_f32(vbase[(size_t)jj * dv + d]), a);
+                    a = fmaf(ps[jj], la_bf16_to_f32(vbase[(size_t)jj * vstride + d]), a);
                 acc[r] = a;
             }
         }

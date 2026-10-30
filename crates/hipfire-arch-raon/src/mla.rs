@@ -22,11 +22,17 @@
 //! closure because it sits between the latent norm and the attention.
 
 use hipfire_dispatch::pipeline::latent_attention::{
-    execute_latent_attention, ExpandedMirror, KvExpansion, LatentAttentionOp, LatentCache,
-    LatentGeometry, RowRange,
+    execute_latent_attention, AbsorbOperands, AttentionRoute, ExpandedMirror, KvExpansion,
+    LatentAttentionOp, LatentCache, LatentGeometry, RowRange,
 };
 use hipfire_dispatch::types::DispatchError;
-use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::latent_attention_absorb::latent_attention_absorb_packed_elems;
+use rdna_compute::latent_attention_decode::latent_attention_decode_workspace_elems;
+use rdna_compute::{DType, Gpu, GpuTensor};
+
+use crate::config::RaonConfig;
+use crate::projection::{project, OutRound};
+use crate::weights::{RaonMixer, RaonWeights};
 
 /// Released geometry (config.json `q_lora_rank`, `kv_lora_rank`, `qk_*`, `v_head_dim`).
 pub const RAON_MLA_HEADS: usize = 40;
@@ -115,6 +121,245 @@ pub struct RaonMlaScratch<'a> {
     pub q: &'a GpuTensor,
     /// `[rows, 40*128]` attention output (gated in place).
     pub y: &'a GpuTensor,
+}
+
+// ───────────────────────── route policy ─────────────────────────
+
+/// Load-time MLA route controls (PLAN §3.6). Read once; never re-read per call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MlaPolicy {
+    /// `HIPFIRE_RAON_ATTN_TILED` (default 1): tiled causal prefill and
+    /// split-KV decode kernels. `0` selects the serial reference kernel.
+    pub tiled: bool,
+    /// `HIPFIRE_RAON_MLA_ABSORB` (default 0): attend over the latent cache
+    /// (absorbed algebra) once a context exceeds the expanded-mirror budget,
+    /// instead of refusing it. Not bit-exact to the decompressed route.
+    pub absorb: bool,
+}
+
+/// Which attention operands serve a call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MlaRoute {
+    /// Expanded K/V mirror (tiled or reference kernels per [`MlaPolicy`]).
+    Decompressed,
+    /// Latent-cache attention with the expansion weight absorbed.
+    Absorbed,
+}
+
+fn parse_flag(name: &str, default: bool) -> Result<bool, String> {
+    match hipfire_config::developer_var(name) {
+        Err(_) => Ok(default),
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(default),
+            "1" | "true" | "on" => Ok(true),
+            "0" | "false" | "off" => Ok(false),
+            other => Err(format!("{name}={other:?}: expected 0 or 1")),
+        },
+    }
+}
+
+impl MlaPolicy {
+    pub const DEFAULT: Self = Self { tiled: true, absorb: false };
+
+    pub fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            tiled: parse_flag("HIPFIRE_RAON_ATTN_TILED", Self::DEFAULT.tiled)?,
+            absorb: parse_flag("HIPFIRE_RAON_MLA_ABSORB", Self::DEFAULT.absorb)?,
+        })
+    }
+
+    /// Route for a call that leaves `end` rows cached, given the mirror's
+    /// admission budget in rows. Pure, host-side, independent of the
+    /// current device length for every `end` within the budget, so a decode
+    /// graph's route changes at most once (when the context crosses it).
+    pub fn route(&self, end: usize, mirror_budget_rows: usize) -> MlaRoute {
+        if self.absorb && end > mirror_budget_rows {
+            MlaRoute::Absorbed
+        } else {
+            MlaRoute::Decompressed
+        }
+    }
+}
+
+/// Per-bundle MLA work buffers: the split-KV decode workspace and, when the
+/// absorbed route is enabled, its scratch planes and packed expansion weights
+/// (one per MLA layer, built once at load).
+pub struct RaonMlaWork {
+    policy: MlaPolicy,
+    split_ws: GpuTensor,
+    absorb: Option<AbsorbWork>,
+}
+
+struct AbsorbWork {
+    q_abs: GpuTensor,
+    z: GpuTensor,
+    packed: Vec<GpuTensor>,
+}
+
+impl RaonMlaWork {
+    /// Allocate for at most `rows` rows per call. Reads the route controls.
+    pub fn new(gpu: &mut Gpu, cfg: &RaonConfig, rows: usize) -> Result<Self, String> {
+        Self::with_policy(gpu, cfg, rows, MlaPolicy::from_env()?)
+    }
+
+    pub fn with_policy(
+        gpu: &mut Gpu,
+        cfg: &RaonConfig,
+        rows: usize,
+        policy: MlaPolicy,
+    ) -> Result<Self, String> {
+        let hip = |e: hip_bridge::HipError| format!("raon mla work: {e:?}");
+        let v_width = if policy.absorb { cfg.kv_lora.max(cfg.v_head) } else { cfg.v_head };
+        let ws = latent_attention_decode_workspace_elems(cfg.n_heads, v_width);
+        let split_ws = gpu.zeros(&[ws], DType::F32).map_err(hip)?;
+        let absorb = if policy.absorb {
+            let q = gpu
+                .zeros(&[rows, cfg.n_heads, cfg.kv_lora + cfg.qk_rope], DType::F32)
+                .map_err(hip);
+            let z = q.and_then(|q| {
+                gpu.zeros(&[rows, cfg.n_heads, cfg.kv_lora], DType::F32)
+                    .map(|z| (q, z))
+                    .map_err(hip)
+            });
+            match z {
+                Ok((q_abs, z)) => Some(AbsorbWork { q_abs, z, packed: Vec::new() }),
+                Err(e) => {
+                    let _ = gpu.free_tensor(split_ws);
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+        Ok(Self { policy, split_ws, absorb })
+    }
+
+    pub fn policy(&self) -> MlaPolicy {
+        self.policy
+    }
+
+    /// Whether the absorbed route has its packed weights (always true when the
+    /// policy enables it and [`Self::pack_absorbed`] succeeded).
+    pub fn absorbed_ready(&self) -> bool {
+        self.absorb.as_ref().is_some_and(|a| !a.packed.is_empty())
+    }
+
+    /// Build the absorbed expansion weights of every MLA layer: run each
+    /// layer's own (quantized, basis-rotated) `kv_b` projector on the identity
+    /// plane, so the packed weight is exactly the operator the decompressed
+    /// route applies, then pack it. Outside capture; once, at load.
+    pub fn pack_absorbed(
+        &mut self,
+        gpu: &mut Gpu,
+        cfg: &RaonConfig,
+        w: &RaonWeights,
+    ) -> Result<(), String> {
+        let Some(ab) = self.absorb.as_mut() else {
+            return Ok(());
+        };
+        if !ab.packed.is_empty() {
+            return Ok(());
+        }
+        let hip = |e: hip_bridge::HipError| format!("raon mla absorb pack: {e:?}");
+        let (latent, n_out) = (cfg.kv_lora, cfg.n_heads * (cfg.qk_nope + cfg.v_head));
+        let mut eye = vec![0f32; latent * latent];
+        for c in 0..latent {
+            eye[c * latent + c] = 1.0;
+        }
+        let ident = gpu.upload_f32(&eye, &[latent, latent]).map_err(hip)?;
+        let plane = match gpu.zeros(&[latent, n_out], DType::F32) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = gpu.free_tensor(ident);
+                return Err(hip(e));
+            }
+        };
+        let elems = latent_attention_absorb_packed_elems(cfg.n_heads, cfg.qk_nope, cfg.v_head, latent);
+        let mut built: Vec<GpuTensor> = Vec::new();
+        let r = (|| -> Result<(), String> {
+            for layer_idx in cfg.mla_layers() {
+                let RaonMixer::Mla(mw) = &w.layers[layer_idx].mixer else {
+                    return Err(format!("layer {layer_idx} is not an MLA layer"));
+                };
+                project(gpu, &mw.kv_b_proj, &ident, &plane, latent, OutRound::Exact)?;
+                let packed = gpu.zeros(&[elems], DType::BF16).map_err(hip)?;
+                if let Err(e) = gpu.latent_attention_absorb_pack(
+                    &plane,
+                    &packed,
+                    cfg.n_heads,
+                    cfg.qk_nope,
+                    cfg.v_head,
+                    latent,
+                ) {
+                    let _ = gpu.free_tensor(packed);
+                    return Err(hip(e));
+                }
+                built.push(packed);
+            }
+            Ok(())
+        })();
+        let _ = gpu.free_tensor(ident);
+        let _ = gpu.free_tensor(plane);
+        match r {
+            Ok(()) => {
+                ab.packed = built;
+                Ok(())
+            }
+            Err(e) => {
+                for t in built {
+                    let _ = gpu.free_tensor(t);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Attention route operands for MLA layer ordinal `mi` under `route`.
+    pub fn attention_route(&self, route: MlaRoute, mi: usize) -> Result<AttentionRoute<'_>, String> {
+        let policy = self.policy;
+        let ws = Some(&self.split_ws);
+        match (route, policy.tiled) {
+            (MlaRoute::Decompressed, false) => Ok(AttentionRoute::Reference),
+            (MlaRoute::Decompressed, true) => Ok(AttentionRoute::Tiled { workspace: ws }),
+            (MlaRoute::Absorbed, _) => {
+                let ab = self
+                    .absorb
+                    .as_ref()
+                    .filter(|a| mi < a.packed.len())
+                    .ok_or("raon mla: absorbed route selected but its packed weights are not built")?;
+                Ok(AttentionRoute::Absorbed {
+                    ops: AbsorbOperands { packed: &ab.packed[mi], q_abs: &ab.q_abs, z: &ab.z },
+                    workspace: ws,
+                })
+            }
+        }
+    }
+
+    /// Every device address a captured graph bakes from this owner.
+    pub fn binding_key(&self) -> Vec<usize> {
+        let mut k = vec![
+            self.split_ws.buf.as_ptr() as usize,
+            self.policy.tiled as usize,
+            self.policy.absorb as usize,
+        ];
+        if let Some(a) = &self.absorb {
+            k.push(a.q_abs.buf.as_ptr() as usize);
+            k.push(a.z.buf.as_ptr() as usize);
+            k.extend(a.packed.iter().map(|t| t.buf.as_ptr() as usize));
+        }
+        k
+    }
+
+    pub fn free(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.split_ws);
+        if let Some(a) = self.absorb {
+            let _ = gpu.free_tensor(a.q_abs);
+            let _ = gpu.free_tensor(a.z);
+            for t in a.packed {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+    }
 }
 
 /// Bytes of the BF16 latent cache for `rows` rows of one layer/slot.
@@ -208,11 +453,12 @@ pub fn raon_mla_core(
         &LatentAttentionOp::Attention {
             geometry,
             cache: st.cache,
-            mirror: st.mirror,
+            mirror: Some(st.mirror),
             q: scratch.q,
             y: scratch.y,
             rows,
             scale: raon_mla_scale(&geometry),
+            route: AttentionRoute::Reference,
         },
     )?;
     execute_latent_attention(

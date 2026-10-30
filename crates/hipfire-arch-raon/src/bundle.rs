@@ -178,7 +178,12 @@ impl RaonBundle {
             .and_then(|m| PrefillPrecision::from_env().map(|p| (m, p)))
             .and_then(|(m, p)| {
                 p.apply(gpu);
-                RaonWork::new(gpu, &config, scratch.rows).map(|w| (m, w))
+                let mut work = RaonWork::new(gpu, &config, scratch.rows)?;
+                if let Err(e) = work.mla.pack_absorbed(gpu, &config, &weights) {
+                    work.free(gpu);
+                    return Err(e);
+                }
+                Ok((m, work))
             });
         match built {
             Ok((prefill_mode, work)) => {
@@ -358,7 +363,7 @@ impl RaonBundle {
     /// is loaded before a capture.
     fn decode_step_graph(&mut self, gpu: &mut Gpu, token: u32, pos: usize) -> Result<(), String> {
         let end = pos + 1;
-        admit_decode_context(&self.config, &self.weights, &mut self.state, &self.scratch, gpu, end)?;
+        admit_decode_context(&self.config, &self.weights, &mut self.state, &self.scratch, &self.work, gpu, end)?;
         stage_decode_token(&self.config, &self.scratch, gpu, token)?;
         if !self.graph.warmed {
             decode_body(&self.config, &self.weights, &self.state, &self.scratch, &self.work, gpu)?;
@@ -372,7 +377,7 @@ impl RaonBundle {
                 .map_err(|e| format!("raon1_mini: decode graph stream: {e:?}"))?;
             gpu.active_stream = Some(stream);
         }
-        let binding = decode_binding(&self.weights, &self.state, &self.scratch);
+        let binding = decode_binding(&self.weights, &self.state, &self.scratch, &self.work);
         let recorded = gpu.graphs.graph_exec.is_some()
             && self.graph.binding == binding
             && gpu.graphs.ar_forward_binding == binding;

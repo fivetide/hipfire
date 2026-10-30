@@ -19,14 +19,44 @@
 //! mirror built by two different decompression schedules and by the
 //! gather -> external projector -> scatter route; repeated attention
 //! byte-identical; cache poison beyond the live length never read.
+//!
+//! Attention routes (`--route reference|tiled|absorbed|all`, default all; the
+//! reference route always runs first, it is the oracle):
+//!   reference : per-head serial kernel over the expanded token-major mirror
+//!               (`knope[t][h][nope]`, `vmir[t][h][v]`).
+//!   tiled     : flash prefill (rows>1) / split-KV decode (rows==1) over the
+//!               same mirror; BF16 band + bytewise repeat.
+//!   absorbed  : opt-in absorbed-latent route, no mirror; NOT bit-exact to the
+//!               decompressed routes, so every absorbed check is labelled
+//!               `"route": "absorbed", "bit_exact": false`. It has no
+//!               intermediate BF16 K/V rounding, so it is GATED (BF16 band)
+//!               against an unrounded-f64 CPU reference computed from the
+//!               fixture cache/kv_b/q. The comparison against the fixture
+//!               `attn_y` (which carries the decompressed route's BF16 K/V
+//!               rounding) is reported but non-gating, and `absorbed_vs_tiled`
+//!               gates on rel_l2/cosine only (max_abs printed, not gating).
+//!               Every check JSON carries `"gating": true|false`.
+//!
+//! Generated long-context cases `long_p<P>_n<N>` (skipped with `--long 0` and
+//! in `--negative` mode; selectable with `--case`): Raon geometry and the real
+//! `weights_raon.safetensors` kv_b; the latent cache and the queries come from a
+//! fixed-seed PRNG (xorshift64* + Box-Muller, seed [`LONG_SEED`] xor P<<20 xor N)
+//! with a planted far-from-diagonal "needle"; the references are independent
+//! multi-threaded CPU attentions (f64 scores/softmax) over f32-fma-expanded,
+//! BF16-rounded K/V (decompressed routes) and over unrounded K/V (absorbed).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::Instant;
 
 use hipfire_dispatch::pipeline::latent_attention::{
-    execute_latent_attention, ExpandedMirror, KvExpansion, LatentAttentionOp, LatentCache,
-    LatentGeometry, RowRange,
+    execute_latent_attention, AbsorbOperands, AttentionRoute, ExpandedMirror, KvExpansion,
+    LatentAttentionOp, LatentCache, LatentGeometry, RowRange,
 };
+use rdna_compute::latent_attention_absorb::latent_attention_absorb_packed_elems;
+use rdna_compute::latent_attention_decode::latent_attention_decode_workspace_elems;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
 
@@ -37,6 +67,33 @@ const BF16_MAX_ABS_FRAC: f64 = 2e-2;
 /// BF16 bits of 1e30: finite, huge — any read of a poisoned row wrecks softmax.
 const POISON_BF16: u16 = 0x7149;
 const EXTERNAL_ROW_LIMIT: usize = 130;
+
+/// `(P, N)` of the generated long-context cases.
+const LONG_CASES: [(usize, usize); 7] = [
+    (8191, 1),
+    (8192, 1),
+    (8192, 17),
+    (16384, 1),
+    (16384, 33),
+    (27000, 1),
+    (27000, 17),
+];
+/// Base seed of the generated cases (ASCII "MLARAON1"); per case it is xored
+/// with `P << 20` and `N`, so every case is reproducible on its own.
+const LONG_SEED: u64 = 0x4D4C_4152_414F_4E31;
+/// Standard deviation of the generated queries (latent/tail rows are N(0,1)).
+const LONG_QUERY_STD: f64 = 3.0;
+/// Planted key tail = this * mean-over-heads tail of the last query row. Tuned
+/// by scanning {2.6, 6, 10, 20, 40}: 2.6 never produced a planted peak above 0.3
+/// softmax mass; 20 gives a far-range planted peak (mass > 0.3) to 24-27 of 40
+/// heads at N=1 and to 27-32% of (row, head) tasks at N>1.
+const LONG_NEEDLE_GAIN: f32 = 20.0;
+const LONG_WEIGHTS: &str = "weights_raon.safetensors";
+/// Decompress tile (rows per absolute-range launch) of the long cases.
+const LONG_TILE: usize = 1024;
+/// Raon-1-mini MLA geometry (matches the `weights_raon` manifest dims).
+const RAON_GEOMETRY: LatentGeometry =
+    LatentGeometry { n_heads: 40, nope: 128, tail: 64, v_dim: 128, latent: 512 };
 
 // ── safetensors (F32 / BF16 / F16 → f32) ────────────────────────────────────
 
@@ -249,8 +306,9 @@ fn set_pos(gpu: &mut Gpu, pos: &GpuTensor, p: usize) -> Result<(), String> {
     gpu.memcpy_htod_auto(&pos.buf, &(p as i32).to_le_bytes()).map_err(he)
 }
 
-/// Head-major mirrors → `[rows, H, nope+v]` F32 in the reference layout.
-fn expand_mirror(k: &[u8], v: &[u8], g: &LatentGeometry, cap: usize, rows: usize) -> Vec<f32> {
+/// Token-major mirrors `knope[t][h][nope]`, `vmir[t][h][v]` → `[rows, H, nope+v]`
+/// F32 in the reference layout.
+fn expand_mirror(k: &[u8], v: &[u8], g: &LatentGeometry, rows: usize) -> Vec<f32> {
     let kf = bytes_bf16(k);
     let vf = bytes_bf16(v);
     let per = g.nope + g.v_dim;
@@ -258,23 +316,156 @@ fn expand_mirror(k: &[u8], v: &[u8], g: &LatentGeometry, cap: usize, rows: usize
     for t in 0..rows {
         for h in 0..g.n_heads {
             let dst = (t * g.n_heads + h) * per;
-            let ks = (h * cap + t) * g.nope;
+            let ks = (t * g.n_heads + h) * g.nope;
             out[dst..dst + g.nope].copy_from_slice(&kf[ks..ks + g.nope]);
-            let vs = (h * cap + t) * g.v_dim;
+            let vs = (t * g.n_heads + h) * g.v_dim;
             out[dst + g.nope..dst + per].copy_from_slice(&vf[vs..vs + g.v_dim]);
         }
     }
     out
 }
 
-/// Bytes of the valid rows of one mirror ([H][cap][w], rows `0..rows`).
-fn valid_rows(bytes: &[u8], heads: usize, cap: usize, w: usize, rows: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(heads * rows * w * 2);
-    for h in 0..heads {
-        let s = h * cap * w * 2;
-        out.extend_from_slice(&bytes[s..s + rows * w * 2]);
+/// Bytes of the valid rows of one token-major mirror (`[cap][H][w]`, rows `0..rows`).
+fn valid_rows(bytes: &[u8], heads: usize, w: usize, rows: usize) -> Vec<u8> {
+    bytes[..rows * heads * w * 2].to_vec()
+}
+
+/// Label a check with the attention route it exercises and whether it is a
+/// bit-exact (byte-equality) claim.
+fn labeled(mut c: Cmp, route: &str, bit_exact: bool) -> Cmp {
+    c.json["route"] = json!(route);
+    c.json["bit_exact"] = json!(bit_exact);
+    c
+}
+
+fn f32_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+fn bf16r(f: f32) -> f32 {
+    bf16_to_f32(f32_to_bf16(f))
+}
+
+/// Which non-reference routes run (the reference route always runs first).
+#[derive(Clone, Copy)]
+struct Routes {
+    tiled: bool,
+    absorbed: bool,
+}
+
+impl Routes {
+    fn parse(opts: &BTreeMap<String, String>) -> Result<Self, String> {
+        match opts.get("route").map(String::as_str).unwrap_or("all") {
+            "all" => Ok(Self { tiled: true, absorbed: true }),
+            "reference" => Ok(Self { tiled: false, absorbed: false }),
+            "tiled" => Ok(Self { tiled: true, absorbed: false }),
+            "absorbed" => Ok(Self { tiled: false, absorbed: true }),
+            other => Err(format!("--route `{other}`: expected reference|tiled|absorbed|all")),
+        }
     }
-    out
+
+    fn names(self) -> Vec<&'static str> {
+        let mut v = vec!["reference"];
+        if self.tiled {
+            v.push("tiled");
+        }
+        if self.absorbed {
+            v.push("absorbed");
+        }
+        v
+    }
+}
+
+/// Device operands of the non-reference routes: the split-KV decode workspace
+/// and the absorbed operands (packed expansion weight + q_abs/z planes).
+struct RouteDev {
+    ws: Option<GpuTensor>,
+    packed: Option<GpuTensor>,
+    q_abs: Option<GpuTensor>,
+    z: Option<GpuTensor>,
+}
+
+impl RouteDev {
+    /// `kv_b`: `[H*(nope+v), latent]` expansion weight (BF16-rounded here, as
+    /// the device decompression reads it).
+    fn new(
+        gpu: &mut Gpu,
+        g: &LatentGeometry,
+        rows: usize,
+        routes: Routes,
+        kv_b: &[f32],
+    ) -> Result<Self, String> {
+        let mut me = Self { ws: None, packed: None, q_abs: None, z: None };
+        if routes.tiled || routes.absorbed {
+            let elems = latent_attention_decode_workspace_elems(g.n_heads, g.latent.max(g.v_dim));
+            me.ws = Some(gpu.zeros(&[elems], DType::F32).map_err(he)?);
+        }
+        if routes.absorbed {
+            let (h, latent) = (g.n_heads, g.latent);
+            let n_out = h * (g.nope + g.v_dim);
+            if kv_b.len() != n_out * latent {
+                return Err(format!("absorbed pack: kv_b has {} values, expected {}", kv_b.len(), n_out * latent));
+            }
+            // w_t row c = column c of the expansion weight W[n_out, latent].
+            let mut wt = vec![0f32; latent * n_out];
+            for o in 0..n_out {
+                for c in 0..latent {
+                    wt[c * n_out + o] = bf16r(kv_b[o * latent + c]);
+                }
+            }
+            let d_wt = up_f32(gpu, &wt, &[latent, n_out])?;
+            let elems = latent_attention_absorb_packed_elems(h, g.nope, g.v_dim, latent);
+            let packed = gpu.zeros(&[elems], DType::BF16).map_err(he)?;
+            gpu.latent_attention_absorb_pack(&d_wt, &packed, h, g.nope, g.v_dim, latent)
+                .map_err(he)?;
+            gpu.hip.device_synchronize().map_err(he)?;
+            gpu.free_tensor(d_wt).map_err(he)?;
+            me.packed = Some(packed);
+            me.q_abs = Some(gpu.zeros(&[rows, h, latent + g.tail], DType::F32).map_err(he)?);
+            me.z = Some(gpu.zeros(&[rows, h, latent], DType::F32).map_err(he)?);
+        }
+        Ok(me)
+    }
+
+    fn tiled(&self) -> AttentionRoute<'_> {
+        AttentionRoute::Tiled { workspace: self.ws.as_ref() }
+    }
+
+    fn absorbed(&self) -> Result<AttentionRoute<'_>, String> {
+        match (&self.packed, &self.q_abs, &self.z) {
+            (Some(packed), Some(q_abs), Some(z)) => Ok(AttentionRoute::Absorbed {
+                ops: AbsorbOperands { packed, q_abs, z },
+                workspace: self.ws.as_ref(),
+            }),
+            _ => Err("absorbed route operands were not built".into()),
+        }
+    }
+
+    fn free(self, gpu: &mut Gpu) {
+        for t in [self.ws, self.packed, self.q_abs, self.z].into_iter().flatten() {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
+/// One attention stage on the selected route.
+#[allow(clippy::too_many_arguments)]
+fn attn(
+    gpu: &mut Gpu,
+    g: &LatentGeometry,
+    cache: LatentCache<'_>,
+    mirror: Option<ExpandedMirror<'_>>,
+    q: &GpuTensor,
+    y: &GpuTensor,
+    rows: usize,
+    scale: f32,
+    route: AttentionRoute<'_>,
+) -> Result<(), String> {
+    execute_latent_attention(
+        gpu,
+        &LatentAttentionOp::Attention { geometry: *g, cache, mirror, q, y, rows, scale, route },
+    )
+    .map_err(he)
 }
 
 fn dim(dims: &Value, k: &str) -> Result<usize, String> {
@@ -286,7 +477,7 @@ fn dim(dims: &Value, k: &str) -> Result<usize, String> {
 
 // ── one case ────────────────────────────────────────────────────────────────
 
-fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value) -> Result<Value, String> {
+fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value, routes: Routes) -> Result<Value, String> {
     let name = case["name"].as_str().ok_or("case name missing")?.to_string();
     if case.get("mode").and_then(Value::as_str).unwrap_or("bf16") != "bf16" {
         return Err(format!("case {name}: only mode \"bf16\" is implemented for mla"));
@@ -340,8 +531,8 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value) -> Result<Value, String> {
             .collect();
         gpu.memcpy_htod_auto(&cache_t.buf, &bytes).map_err(he)?;
     }
-    let knope = poison_bf16(gpu, &[h, mcap, g.nope])?;
-    let vmir = poison_bf16(gpu, &[h, mcap, v])?;
+    let knope = poison_bf16(gpu, &[mcap, h, g.nope])?;
+    let vmir = poison_bf16(gpu, &[mcap, h, v])?;
     let pos = gpu.alloc_tensor(&[1], DType::F32).map_err(he)?;
     set_pos(gpu, &pos, p)?;
 
@@ -356,6 +547,10 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value) -> Result<Value, String> {
     let d_y = gpu.zeros(&[n, h * v], DType::F32).map_err(he)?;
     let d_y2 = gpu.zeros(&[n, h * v], DType::F32).map_err(he)?;
     let d_gated = gpu.zeros(&[n, h * v], DType::F32).map_err(he)?;
+    let d_yt1 = gpu.zeros(&[n, h * v], DType::F32).map_err(he)?;
+    let d_yt2 = gpu.zeros(&[n, h * v], DType::F32).map_err(he)?;
+    let d_gated_t = gpu.zeros(&[n, h * v], DType::F32).map_err(he)?;
+    let d_ya = gpu.zeros(&[n, h * v], DType::F32).map_err(he)?;
 
     let cache = LatentCache { rows: &cache_t, capacity_rows: cap, pos: &pos, host_pos: Some(p) };
     let mirror = ExpandedMirror { knope: &knope, vmir: &vmir, capacity_rows: mcap };
@@ -385,11 +580,20 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value) -> Result<Value, String> {
     })?;
     // 4. attention (twice, for byte determinism) and gate.
     for y in [&d_y, &d_y2] {
-        run(gpu, LatentAttentionOp::Attention {
-            geometry: g, cache, mirror, q: &d_q, y, rows: n, scale,
-        })?;
+        attn(gpu, &g, cache, Some(mirror), &d_q, y, n, scale, AttentionRoute::Reference)?;
     }
     run(gpu, LatentAttentionOp::Gate { y: &d_y, g: &d_g, out: &d_gated, elements: n * h * v })?;
+    // 4b. tiled (same mirror) and absorbed (no mirror) routes.
+    let rd = RouteDev::new(gpu, &g, n, routes, &kv_b)?;
+    if routes.tiled {
+        for y in [&d_yt1, &d_yt2] {
+            attn(gpu, &g, cache, Some(mirror), &d_q, y, n, scale, rd.tiled())?;
+        }
+        run(gpu, LatentAttentionOp::Gate { y: &d_yt1, g: &d_g, out: &d_gated_t, elements: n * h * v })?;
+    }
+    if routes.absorbed {
+        attn(gpu, &g, cache, None, &d_q, &d_ya, n, scale, rd.absorbed()?)?;
+    }
 
     gpu.hip.device_synchronize().map_err(he)?;
     let qlat = gpu.download_f32(&d_qlat).map_err(he)?;
@@ -399,6 +603,20 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value) -> Result<Value, String> {
     let y1 = gpu.download_f32(&d_y).map_err(he)?;
     let y2 = gpu.download_f32(&d_y2).map_err(he)?;
     let gated = gpu.download_f32(&d_gated).map_err(he)?;
+    let (yt1, yt2, gated_t) = if routes.tiled {
+        (
+            gpu.download_f32(&d_yt1).map_err(he)?,
+            gpu.download_f32(&d_yt2).map_err(he)?,
+            gpu.download_f32(&d_gated_t).map_err(he)?,
+        )
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
+    let ya = if routes.absorbed {
+        gpu.download_f32(&d_ya).map_err(he)?
+    } else {
+        Vec::new()
+    };
 
     let cache_f = bytes_bf16(&cache_bytes);
     let mut checks: Vec<Cmp> = Vec::new();
@@ -426,19 +644,45 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value) -> Result<Value, String> {
         })
         .collect();
     checks.push(exact("cache_tail_raw", &got_tail, &new_tail));
-    let exp_a = expand_mirror(&k_a, &v_a, &g, mcap, total);
+    let exp_a = expand_mirror(&k_a, &v_a, &g, total);
     checks.push(compare("kv_expanded", &exp_a, r_exp));
-    checks.push(compare("attn_y", &y1, r_y));
-    checks.push(compare("gated", &gated, r_gated));
-    checks.push(exact(
-        "attn_y_repeat_bytewise",
-        &y1.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>(),
-        &y2.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>(),
+    checks.push(labeled(compare("attn_y", &y1, r_y), "reference", false));
+    checks.push(labeled(compare("gated", &gated, r_gated), "reference", false));
+    checks.push(labeled(
+        exact("attn_y_repeat_bytewise", &f32_bytes(&y1), &f32_bytes(&y2)),
+        "reference",
+        true,
     ));
+    if routes.tiled {
+        checks.push(labeled(compare("attn_y_tiled", &yt1, r_y), "tiled", false));
+        checks.push(labeled(
+            exact("attn_y_tiled_repeat_bytewise", &f32_bytes(&yt1), &f32_bytes(&yt2)),
+            "tiled",
+            true,
+        ));
+        checks.push(labeled(compare("gated_tiled", &gated_t, r_gated), "tiled", false));
+    }
+    if routes.absorbed {
+        // The absorbed route computes the unrounded math (no intermediate BF16
+        // K/V), so it is gated against the unrounded-f64 CPU reference; the
+        // fixture's own BF16-K/V numbers are reported, non-gating.
+        let wq: Vec<f32> = kv_b.iter().map(|f| bf16r(*f)).collect();
+        let data = LongData { cache: r_cache.to_vec(), q: q_proj.clone(), planted: Vec::new() };
+        let exact_y = cpu_reference(&g, p, n, &data, &wq, true).y;
+        checks.push(labeled(compare("attn_y_absorbed", &ya, &exact_y), "absorbed", false));
+        checks.push(informational(labeled(
+            compare("attn_y_absorbed_vs_fixture", &ya, r_y),
+            "absorbed",
+            false,
+        )));
+    }
+    if routes.tiled && routes.absorbed {
+        checks.push(labeled(band_no_outlier(compare("absorbed_vs_tiled", &ya, &yt1)), "absorbed", false));
+    }
 
     // 5. schedule B: every live row in one absolute call, fresh mirrors.
-    let kn_b = poison_bf16(gpu, &[h, mcap, g.nope])?;
-    let vm_b = poison_bf16(gpu, &[h, mcap, v])?;
+    let kn_b = poison_bf16(gpu, &[mcap, h, g.nope])?;
+    let vm_b = poison_bf16(gpu, &[mcap, h, v])?;
     let mirror_b = ExpandedMirror { knope: &kn_b, vmir: &vm_b, capacity_rows: mcap };
     run(gpu, LatentAttentionOp::Decompress {
         geometry: g, cache, mirror: mirror_b, expansion: dense,
@@ -449,13 +693,13 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value) -> Result<Value, String> {
     let v_b = gpu.download_raw_bytes(&vm_b).map_err(he)?;
     checks.push(exact(
         "mirror_k_schedules_bitwise",
-        &valid_rows(&k_a, h, mcap, g.nope, total),
-        &valid_rows(&k_b, h, mcap, g.nope, total),
+        &valid_rows(&k_a, h, g.nope, total),
+        &valid_rows(&k_b, h, g.nope, total),
     ));
     checks.push(exact(
         "mirror_v_schedules_bitwise",
-        &valid_rows(&v_a, h, mcap, v, total),
-        &valid_rows(&v_b, h, mcap, v, total),
+        &valid_rows(&v_a, h, v, total),
+        &valid_rows(&v_b, h, v, total),
     ));
 
     // 6. gather -> external projector (host, ascending-k fma) -> scatter.
@@ -478,8 +722,8 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value) -> Result<Value, String> {
             }
         }
         let d_proj = up_f32(gpu, &proj, &[total, h * per])?;
-        let kn_c = poison_bf16(gpu, &[h, mcap, g.nope])?;
-        let vm_c = poison_bf16(gpu, &[h, mcap, v])?;
+        let kn_c = poison_bf16(gpu, &[mcap, h, g.nope])?;
+        let vm_c = poison_bf16(gpu, &[mcap, h, v])?;
         let mirror_c = ExpandedMirror { knope: &kn_c, vmir: &vm_c, capacity_rows: mcap };
         run(gpu, LatentAttentionOp::Decompress {
             geometry: g, cache, mirror: mirror_c,
@@ -491,23 +735,597 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value) -> Result<Value, String> {
         let v_c = gpu.download_raw_bytes(&vm_c).map_err(he)?;
         checks.push(exact(
             "mirror_k_external_bitwise",
-            &valid_rows(&k_a, h, mcap, g.nope, total),
-            &valid_rows(&k_c, h, mcap, g.nope, total),
+            &valid_rows(&k_a, h, g.nope, total),
+            &valid_rows(&k_c, h, g.nope, total),
         ));
         checks.push(exact(
             "mirror_v_external_bitwise",
-            &valid_rows(&v_a, h, mcap, v, total),
-            &valid_rows(&v_c, h, mcap, v, total),
+            &valid_rows(&v_a, h, v, total),
+            &valid_rows(&v_c, h, v, total),
         ));
+        for t in [plane, d_proj, kn_c, vm_c] {
+            let _ = gpu.free_tensor(t);
+        }
     }
 
-    let pass = checks.iter().all(|c| c.ok);
+    rd.free(gpu);
+    for t in [
+        cache_t, knope, vmir, pos, d_qa, d_kva, d_qg, d_kg, d_q, d_w, d_g, d_qlat, d_y, d_y2,
+        d_gated, d_yt1, d_yt2, d_gated_t, d_ya, kn_b, vm_b,
+    ] {
+        let _ = gpu.free_tensor(t);
+    }
+    let (pass, check_json) = finish_checks(checks);
     Ok(json!({
         "name": name, "pass": pass,
         "dims": {"N": n, "P": p, "H": h, "nope": g.nope, "tail": g.tail, "v": v,
                  "latent": g.latent, "qlora": qlora},
-        "checks": checks.into_iter().map(|c| c.json).collect::<Vec<_>>(),
+        "checks": check_json,
     }))
+}
+
+// ── generated long-context cases ────────────────────────────────────────────
+
+/// xorshift64* with a cached Box-Muller spare; fully deterministic from the seed.
+struct Rng {
+    s: u64,
+    spare: Option<f64>,
+}
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Self { s: if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed }, spare: None }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.s;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.s = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// Uniform in `(0, 1]`.
+    fn uniform(&mut self) -> f64 {
+        (((self.next_u64() >> 11) + 1) as f64) * (1.0 / 9_007_199_254_740_992.0)
+    }
+
+    /// Standard normal (Box-Muller; the sine branch is cached for the next call).
+    fn normal(&mut self) -> f64 {
+        if let Some(z) = self.spare.take() {
+            return z;
+        }
+        let (u1, u2) = (self.uniform(), self.uniform());
+        let r = (-2.0 * u1.ln()).sqrt();
+        let th = 2.0 * std::f64::consts::PI * u2;
+        self.spare = Some(r * th.sin());
+        r * th.cos()
+    }
+}
+
+fn long_seed(p: usize, n: usize) -> u64 {
+    LONG_SEED ^ ((p as u64) << 20) ^ (n as u64)
+}
+
+/// Generated inputs of one long case (all BF16-valued F32).
+struct LongData {
+    /// `[P+N, latent+tail]` latent cache rows (needle rows already planted).
+    cache: Vec<f32>,
+    /// `[N, H, nope+tail]` queries.
+    q: Vec<f32>,
+    /// Cache rows whose tail carries the needle.
+    planted: Vec<usize>,
+}
+
+fn gen_long(g: &LatentGeometry, p: usize, n: usize) -> LongData {
+    let mut rng = Rng::new(long_seed(p, n));
+    let (h, width, dqk) = (g.n_heads, g.row_width(), g.qk_dim());
+    let mut cache = vec![0f32; (p + n) * width];
+    for x in cache.iter_mut() {
+        *x = bf16r(rng.normal() as f32);
+    }
+    let mut q = vec![0f32; n * h * dqk];
+    for x in q.iter_mut() {
+        *x = bf16r((LONG_QUERY_STD * rng.normal()) as f32);
+    }
+    // Needle: tail = gain * mean over heads of the tail of the last query row, so
+    // a real softmax peak exists far from the diagonal (rows P/3 and, for N>1, P/2).
+    let mut planted = vec![p / 3];
+    if n > 1 {
+        planted.push(p / 2);
+    }
+    let needle: Vec<f32> = (0..g.tail)
+        .map(|d| {
+            let mean = (0..h)
+                .map(|hh| q[((n - 1) * h + hh) * dqk + g.nope + d] as f64)
+                .sum::<f64>()
+                / h as f64;
+            bf16r(LONG_NEEDLE_GAIN * mean as f32)
+        })
+        .collect();
+    for &r in &planted {
+        cache[r * width + g.latent..(r + 1) * width].copy_from_slice(&needle);
+    }
+    LongData { cache, q, planted }
+}
+
+fn worker_count() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(64)
+}
+
+/// Report a check but keep it out of the case verdict (`"gating": false`); its
+/// own `pass` value is preserved in the JSON.
+fn informational(mut c: Cmp) -> Cmp {
+    c.json["gating"] = json!(false);
+    c.ok = true;
+    c
+}
+
+/// Gate only on rel_l2 / cosine / finiteness; max_abs is printed but does not
+/// gate (`"max_abs_gating": false`).
+fn band_no_outlier(mut c: Cmp) -> Cmp {
+    let rel = c.json["rel_l2"].as_f64().unwrap_or(f64::INFINITY);
+    let cos = c.json["cosine"].as_f64().unwrap_or(0.0);
+    let nonfinite = c.json["nonfinite"].as_u64().unwrap_or(1);
+    let ok = rel <= BF16_REL_L2 && cos >= BF16_COSINE && nonfinite == 0;
+    c.json["pass"] = json!(ok);
+    c.json["max_abs_gating"] = json!(false);
+    c.ok = ok;
+    c
+}
+
+/// Case verdict + per-check JSON; every check states whether it gates.
+fn finish_checks(checks: Vec<Cmp>) -> (bool, Vec<Value>) {
+    let pass = checks.iter().all(|c| c.ok);
+    let js = checks
+        .into_iter()
+        .map(|mut c| {
+            if c.json.get("gating").is_none() {
+                c.json["gating"] = json!(true);
+            }
+            c.json
+        })
+        .collect();
+    (pass, js)
+}
+
+/// CPU K/V expansion operands. `round_kv`: ascending-index f32 fma accumulation
+/// rounded to BF16 like the device decompression; otherwise unrounded (f64
+/// accumulation, the mathematical K/V the absorbed route computes).
+#[derive(Clone, Copy)]
+struct Expand<'a> {
+    g: &'a LatentGeometry,
+    cache: &'a [f32],
+    wq: &'a [f32],
+    round_kv: bool,
+}
+
+/// K/V rows `r0..r0+rows` of one head.
+#[inline(always)]
+fn expand_rows_body(x: &Expand<'_>, head: usize, r0: usize, kout: &mut [f32], vout: &mut [f32]) {
+    let (g, cache, wq) = (x.g, x.cache, x.wq);
+    let (width, latent, per) = (g.row_width(), g.latent, g.nope + g.v_dim);
+    let rows = kout.len() / g.nope;
+    for rr in 0..rows {
+        let lat = &cache[(r0 + rr) * width..(r0 + rr) * width + latent];
+        if !x.round_kv {
+            for o in 0..per {
+                let w = &wq[(head * per + o) * latent..(head * per + o + 1) * latent];
+                let mut a = 0f64;
+                for k in 0..latent {
+                    a += lat[k] as f64 * w[k] as f64;
+                }
+                if o < g.nope {
+                    kout[rr * g.nope + o] = a as f32;
+                } else {
+                    vout[rr * g.v_dim + (o - g.nope)] = a as f32;
+                }
+            }
+            continue;
+        }
+        let mut e = 0;
+        while e < per {
+            let cnt = (per - e).min(4);
+            let base = head * per + e;
+            let mut acc = [0f32; 4];
+            if cnt == 4 {
+                let w0 = &wq[base * latent..(base + 1) * latent];
+                let w1 = &wq[(base + 1) * latent..(base + 2) * latent];
+                let w2 = &wq[(base + 2) * latent..(base + 3) * latent];
+                let w3 = &wq[(base + 3) * latent..(base + 4) * latent];
+                for k in 0..latent {
+                    let xk = lat[k];
+                    acc[0] = xk.mul_add(w0[k], acc[0]);
+                    acc[1] = xk.mul_add(w1[k], acc[1]);
+                    acc[2] = xk.mul_add(w2[k], acc[2]);
+                    acc[3] = xk.mul_add(w3[k], acc[3]);
+                }
+            } else {
+                for (j, a) in acc.iter_mut().enumerate().take(cnt) {
+                    let w = &wq[(base + j) * latent..(base + j + 1) * latent];
+                    for k in 0..latent {
+                        *a = lat[k].mul_add(w[k], *a);
+                    }
+                }
+            }
+            for (j, a) in acc.iter().enumerate().take(cnt) {
+                let o = e + j;
+                let val = bf16r(*a);
+                if o < g.nope {
+                    kout[rr * g.nope + o] = val;
+                } else {
+                    vout[rr * g.v_dim + (o - g.nope)] = val;
+                }
+            }
+            e += cnt;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "fma")]
+unsafe fn expand_rows_fma(x: &Expand<'_>, head: usize, r0: usize, kout: &mut [f32], vout: &mut [f32]) {
+    expand_rows_body(x, head, r0, kout, vout)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn expand_rows(x: &Expand<'_>, head: usize, r0: usize, kout: &mut [f32], vout: &mut [f32]) {
+    if std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: the running CPU reports FMA support.
+        unsafe { expand_rows_fma(x, head, r0, kout, vout) }
+    } else {
+        expand_rows_body(x, head, r0, kout, vout)
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn expand_rows(x: &Expand<'_>, head: usize, r0: usize, kout: &mut [f32], vout: &mut [f32]) {
+    expand_rows_body(x, head, r0, kout, vout)
+}
+
+/// Per-head expanded K_nope / V of every cache row: `[H][total][nope]`, `[H][total][v]`.
+fn cpu_expand(x: &Expand<'_>, total: usize) -> (Vec<f32>, Vec<f32>) {
+    const RB: usize = 64;
+    let g = x.g;
+    let mut kexp = vec![0f32; g.n_heads * total * g.nope];
+    let mut vexp = vec![0f32; g.n_heads * total * g.v_dim];
+    let mut tasks = Vec::new();
+    for (hh, (kh, vh)) in kexp
+        .chunks_mut(total * g.nope)
+        .zip(vexp.chunks_mut(total * g.v_dim))
+        .enumerate()
+    {
+        for (b, (kb, vb)) in kh.chunks_mut(RB * g.nope).zip(vh.chunks_mut(RB * g.v_dim)).enumerate() {
+            tasks.push((hh, b * RB, kb, vb));
+        }
+    }
+    let queue = Mutex::new(tasks);
+    std::thread::scope(|s| {
+        for _ in 0..worker_count() {
+            s.spawn(|| loop {
+                let task = queue.lock().unwrap().pop();
+                match task {
+                    Some((hh, r0, kb, vb)) => expand_rows(x, hh, r0, kb, vb),
+                    None => break,
+                }
+            });
+        }
+    });
+    drop(queue);
+    (kexp, vexp)
+}
+
+/// Independent CPU reference of one long case.
+struct CpuRef {
+    /// `[N, H*v]` BF16-valued F32.
+    y: Vec<f32>,
+    tasks: usize,
+    /// Largest softmax probability over all (row, head) tasks.
+    max_prob: f64,
+    mean_max_prob: f64,
+    /// (row, head) tasks whose argmax key is a planted needle row.
+    peak_on_planted: usize,
+    /// Max / mean over tasks of the softmax mass on the planted rows.
+    planted_mass_max: f64,
+    planted_mass_mean: f64,
+    /// (row, head) tasks with more than 0.3 softmax mass on the planted rows.
+    planted_mass_gt_0_3: usize,
+}
+
+/// `wq`: BF16-rounded expansion weight `[H*(nope+v), latent]`. Scores
+/// `scale * dot` in f64, causal `j <= P + i`, softmax in f64, `y = bf16(sum p*v)`.
+fn cpu_reference(
+    g: &LatentGeometry,
+    p: usize,
+    n: usize,
+    d: &LongData,
+    wq: &[f32],
+    exact: bool,
+) -> CpuRef {
+    let (h, nope, tail, v, latent, width, dqk) =
+        (g.n_heads, g.nope, g.tail, g.v_dim, g.latent, g.row_width(), g.qk_dim());
+    let total = p + n;
+    let (kexp, vexp) = cpu_expand(&Expand { g, cache: &d.cache, wq, round_kv: !exact }, total);
+    let scale = (dqk as f64).powf(-0.5);
+    let tasks_n = n * h;
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<(usize, Vec<f32>, f64, bool, f64)>> =
+        Mutex::new(Vec::with_capacity(tasks_n));
+    std::thread::scope(|s| {
+        for _ in 0..worker_count().min(tasks_n) {
+            s.spawn(|| {
+                let mut scores: Vec<f64> = Vec::new();
+                let mut acc = vec![0f64; v];
+                loop {
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    if idx >= tasks_n {
+                        break;
+                    }
+                    let (i, hh) = (idx / h, idx % h);
+                    let len = p + i + 1;
+                    let qv = &d.q[(i * h + hh) * dqk..(i * h + hh + 1) * dqk];
+                    let kh = &kexp[hh * total * nope..(hh + 1) * total * nope];
+                    let vh = &vexp[hh * total * v..(hh + 1) * total * v];
+                    scores.clear();
+                    let mut best = (f64::NEG_INFINITY, 0usize);
+                    for j in 0..len {
+                        let kn = &kh[j * nope..(j + 1) * nope];
+                        let tl = &d.cache[j * width + latent..(j + 1) * width];
+                        let mut dot = 0f64;
+                        for c in 0..nope {
+                            dot += qv[c] as f64 * kn[c] as f64;
+                        }
+                        for c in 0..tail {
+                            dot += qv[nope + c] as f64 * tl[c] as f64;
+                        }
+                        let sc = scale * dot;
+                        if sc > best.0 {
+                            best = (sc, j);
+                        }
+                        scores.push(sc);
+                    }
+                    let mut sum = 0f64;
+                    acc.fill(0.0);
+                    for (j, sc) in scores.iter().enumerate() {
+                        let w = (sc - best.0).exp();
+                        sum += w;
+                        let vr = &vh[j * v..(j + 1) * v];
+                        for c in 0..v {
+                            acc[c] += w * vr[c] as f64;
+                        }
+                    }
+                    let y: Vec<f32> = acc
+                        .iter()
+                        .map(|a| {
+                            let y = (a / sum) as f32;
+                            if exact { y } else { bf16r(y) }
+                        })
+                        .collect();
+                    let planted_mass = d
+                        .planted
+                        .iter()
+                        .map(|&j| (scores[j] - best.0).exp())
+                        .sum::<f64>()
+                        / sum;
+                    results.lock().unwrap().push((
+                        idx,
+                        y,
+                        1.0 / sum,
+                        d.planted.contains(&best.1),
+                        planted_mass,
+                    ));
+                }
+            });
+        }
+    });
+    let results = results.into_inner().unwrap();
+    let mut y = vec![0f32; n * h * v];
+    let (mut max_prob, mut sum_prob, mut peak_on_planted) = (0f64, 0f64, 0usize);
+    let (mut pm_max, mut pm_sum, mut pm_gt) = (0f64, 0f64, 0usize);
+    for (idx, yv, pmax, on_planted, pm) in &results {
+        y[idx * v..(idx + 1) * v].copy_from_slice(yv);
+        max_prob = max_prob.max(*pmax);
+        sum_prob += pmax;
+        peak_on_planted += *on_planted as usize;
+        pm_max = pm_max.max(*pm);
+        pm_sum += pm;
+        pm_gt += (*pm > 0.3) as usize;
+    }
+    let cnt = results.len().max(1) as f64;
+    CpuRef {
+        y,
+        tasks: results.len(),
+        max_prob,
+        mean_max_prob: sum_prob / cnt,
+        peak_on_planted,
+        planted_mass_max: pm_max,
+        planted_mass_mean: pm_sum / cnt,
+        planted_mass_gt_0_3: pm_gt,
+    }
+}
+
+/// BF16-rounded `kv_b` of the real checkpoint weights file (loaded once).
+fn long_weights<'a>(dir: &Path, slot: &'a mut Option<Vec<f32>>) -> Result<&'a [f32], String> {
+    if slot.is_none() {
+        let g = RAON_GEOMETRY;
+        let t = Tensors::load(&dir.join(LONG_WEIGHTS))?;
+        let kv_b = t.get("kv_b", g.expanded_width() * g.latent)?;
+        *slot = Some(kv_b.iter().map(|f| bf16r(*f)).collect());
+    }
+    slot.as_deref().ok_or_else(|| "long-case weights missing".to_string())
+}
+
+fn run_long_case(
+    gpu: &mut Gpu,
+    kv_b: &[f32],
+    p: usize,
+    n: usize,
+    routes: Routes,
+) -> Result<Value, String> {
+    let name = format!("long_p{p}_n{n}");
+    let g = RAON_GEOMETRY;
+    let (h, v, per) = (g.n_heads, g.v_dim, g.nope + g.v_dim);
+    let (width, dqk) = (g.row_width(), g.qk_dim());
+    let total = p + n;
+    let cap = total + 37; // latent-cache rows (poison beyond the live length)
+    let mcap = total + 11; // mirror rows
+    let scale = g.default_scale();
+
+    let data = gen_long(&g, p, n);
+    let t0 = Instant::now();
+    let cpu = cpu_reference(&g, p, n, &data, kv_b, false);
+    // Unrounded-f64 reference: what the absorbed route computes.
+    let cpu_exact = routes
+        .absorbed
+        .then(|| cpu_reference(&g, p, n, &data, kv_b, true));
+    eprintln!("mla {name}: CPU reference done in {:.1}s", t0.elapsed().as_secs_f64());
+
+    // Device state: poisoned cache/mirrors; all P+N rows uploaded directly.
+    let cache_t = poison_bf16(gpu, &[cap, width])?;
+    let bytes: Vec<u8> = data
+        .cache
+        .iter()
+        .flat_map(|f| f32_to_bf16(*f).to_le_bytes())
+        .collect();
+    gpu.memcpy_htod_auto(&cache_t.buf, &bytes).map_err(he)?;
+    drop(bytes);
+    let knope = poison_bf16(gpu, &[mcap, h, g.nope])?;
+    let vmir = poison_bf16(gpu, &[mcap, h, v])?;
+    let pos = gpu.alloc_tensor(&[1], DType::F32).map_err(he)?;
+    set_pos(gpu, &pos, p)?;
+    let d_q = up_f32(gpu, &data.q, &[n, h * dqk])?;
+    let d_w = up_bf16(gpu, kv_b, &[h * per, g.latent])?;
+    let d_yr = gpu.zeros(&[n, h * v], DType::F32).map_err(he)?;
+    let d_yt1 = gpu.zeros(&[n, h * v], DType::F32).map_err(he)?;
+    let d_yt2 = gpu.zeros(&[n, h * v], DType::F32).map_err(he)?;
+    let d_ya = gpu.zeros(&[n, h * v], DType::F32).map_err(he)?;
+    let rd = RouteDev::new(gpu, &g, n, routes, kv_b)?;
+
+    let outcome = (|| -> Result<Vec<Cmp>, String> {
+        let cache =
+            LatentCache { rows: &cache_t, capacity_rows: cap, pos: &pos, host_pos: Some(p) };
+        let mirror = ExpandedMirror { knope: &knope, vmir: &vmir, capacity_rows: mcap };
+        let dense = KvExpansion::Dense { weight: &d_w };
+        // Production Decompress over absolute row tiles (all P+N rows).
+        let mut s = 0;
+        while s < total {
+            let c = LONG_TILE.min(total - s);
+            execute_latent_attention(
+                gpu,
+                &LatentAttentionOp::Decompress {
+                    geometry: g,
+                    cache,
+                    mirror,
+                    expansion: dense,
+                    range: RowRange::Absolute { start: s, count: c },
+                },
+            )
+            .map_err(he)?;
+            s += c;
+        }
+        attn(gpu, &g, cache, Some(mirror), &d_q, &d_yr, n, scale, AttentionRoute::Reference)?;
+        if routes.tiled {
+            for y in [&d_yt1, &d_yt2] {
+                attn(gpu, &g, cache, Some(mirror), &d_q, y, n, scale, rd.tiled())?;
+            }
+        }
+        if routes.absorbed {
+            attn(gpu, &g, cache, None, &d_q, &d_ya, n, scale, rd.absorbed()?)?;
+        }
+        gpu.hip.device_synchronize().map_err(he)?;
+        let yr = gpu.download_f32(&d_yr).map_err(he)?;
+
+        let lab = |c: Cmp, route: &str, bit_exact: bool| {
+            let mut c = labeled(c, route, bit_exact);
+            c.json["P"] = json!(p);
+            c.json["N"] = json!(n);
+            c
+        };
+        let mut checks: Vec<Cmp> = Vec::new();
+        let needle_ok = cpu.planted_mass_gt_0_3 > 0;
+        checks.push(lab(
+            Cmp {
+                ok: needle_ok,
+                json: json!({
+                    "tensor": "needle_peak_present", "pass": needle_ok,
+                    "tasks_with_planted_mass_gt_0_3": cpu.planted_mass_gt_0_3,
+                    "peak_on_planted": cpu.peak_on_planted, "tasks": cpu.tasks,
+                }),
+            },
+            "cpu",
+            false,
+        ));
+        checks.push(lab(compare("attn_y_reference_vs_cpu", &yr, &cpu.y), "reference", false));
+        let mut yt1 = Vec::new();
+        if routes.tiled {
+            yt1 = gpu.download_f32(&d_yt1).map_err(he)?;
+            let yt2 = gpu.download_f32(&d_yt2).map_err(he)?;
+            checks.push(lab(compare("attn_y_tiled_vs_cpu", &yt1, &cpu.y), "tiled", false));
+            checks.push(lab(
+                exact("attn_y_tiled_repeat_bytewise", &f32_bytes(&yt1), &f32_bytes(&yt2)),
+                "tiled",
+                true,
+            ));
+            checks.push(lab(compare("reference_vs_tiled", &yt1, &yr), "tiled", false));
+        }
+        if routes.absorbed {
+            let ya = gpu.download_f32(&d_ya).map_err(he)?;
+            let exact_y = cpu_exact.as_ref().map(|c| &c.y[..]).unwrap_or(&[]);
+            checks.push(lab(compare("attn_y_absorbed_vs_cpu", &ya, exact_y), "absorbed", false));
+            checks.push(informational(lab(
+                compare("attn_y_absorbed_vs_cpu_bf16kv", &ya, &cpu.y),
+                "absorbed",
+                false,
+            )));
+            if routes.tiled {
+                checks.push(lab(band_no_outlier(compare("absorbed_vs_tiled", &ya, &yt1)), "absorbed", false));
+            }
+        }
+        Ok(checks)
+    })();
+
+    rd.free(gpu);
+    for t in [cache_t, knope, vmir, pos, d_q, d_w, d_yr, d_yt1, d_yt2, d_ya] {
+        let _ = gpu.free_tensor(t);
+    }
+    let checks = outcome?;
+
+    let (pass, check_json) = finish_checks(checks);
+    Ok(json!({
+        "name": name, "pass": pass, "P": p, "N": n,
+        "dims": {"N": n, "P": p, "H": h, "nope": g.nope, "tail": g.tail, "v": v,
+                 "latent": g.latent},
+        "generated": {
+            "prng": "xorshift64* + Box-Muller", "base_seed": format!("0x{LONG_SEED:016x}"),
+            "case_seed": format!("0x{:016x}", long_seed(p, n)),
+            "case_seed_rule": "base_seed ^ (P << 20) ^ N",
+            "latent_tail_std": 1.0, "query_std": LONG_QUERY_STD,
+            "needle_gain": LONG_NEEDLE_GAIN, "planted_rows": data.planted,
+            "planted_tail": "gain * mean over heads of the tail of query row N-1",
+            "weights": LONG_WEIGHTS,
+        },
+        "cpu_reference": {
+            "tasks": cpu.tasks, "max_prob": cpu.max_prob, "mean_max_prob": cpu.mean_max_prob,
+            "peak_on_planted": cpu.peak_on_planted,
+            "planted_mass_max": cpu.planted_mass_max,
+            "planted_mass_mean": cpu.planted_mass_mean,
+            "planted_mass_gt_0_3_tasks": cpu.planted_mass_gt_0_3,
+        },
+        "routes": routes.names(),
+        "checks": check_json,
+    }))
+}
+
+/// `--long 0` skips the generated long-context cases.
+fn long_enabled(opts: &BTreeMap<String, String>) -> Result<bool, String> {
+    match opts.get("long") {
+        None => Ok(true),
+        Some(s) => s
+            .parse::<usize>()
+            .map(|v| v != 0)
+            .map_err(|e| format!("--long `{s}`: {e}")),
+    }
 }
 
 /// Entry point used by `raon_oracle module --module mla`.
@@ -522,6 +1340,8 @@ pub fn run(fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, St
     if cases.is_empty() {
         return Err("mla manifest has no cases".into());
     }
+    let routes = Routes::parse(opts)?;
+    let long_on = long_enabled(opts)? && !opts.contains_key("negative");
     let filter = opts.get("case");
     let mut gpu = Gpu::init().map_err(he)?;
     let mut out = Vec::new();
@@ -533,18 +1353,39 @@ pub fn run(fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, St
             continue;
         }
         ran += 1;
-        let r = match run_case(&mut gpu, &dir, case) {
+        let r = match run_case(&mut gpu, &dir, case, routes) {
             Ok(v) => v,
             Err(e) => json!({"name": nm, "pass": false, "error": e}),
         };
         all &= r["pass"].as_bool().unwrap_or(false);
         out.push(r);
     }
+    let mut long_ran = 0usize;
+    if long_on {
+        let mut weights: Option<Vec<f32>> = None;
+        for (p, n) in LONG_CASES {
+            let nm = format!("long_p{p}_n{n}");
+            if filter.is_some_and(|f| !nm.contains(f.as_str())) {
+                continue;
+            }
+            ran += 1;
+            long_ran += 1;
+            let r = match long_weights(&dir, &mut weights)
+                .and_then(|w| run_long_case(&mut gpu, w, p, n, routes))
+            {
+                Ok(v) => v,
+                Err(e) => json!({"name": nm, "pass": false, "P": p, "N": n, "error": e}),
+            };
+            all &= r["pass"].as_bool().unwrap_or(false);
+            out.push(r);
+        }
+    }
     if ran == 0 {
         return Err(format!("no mla case matched filter {filter:?}"));
     }
     Ok(json!({
-        "module": "mla", "pass": all, "cases_run": ran,
+        "module": "mla", "pass": all, "cases_run": ran, "long_cases_run": long_ran,
+        "routes": routes.names(),
         "ref_sha256": manifest.get("ref_sha256").cloned().unwrap_or(Value::Null),
         "cases": out,
     }))
