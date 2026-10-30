@@ -2171,6 +2171,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_PP_GATE_MODEL` | scripts/pp-gate.sh | harness |
 | `HIPFIRE_PP_GATE_REQUIRE_SYSFS` | scripts/pp-gate.sh | harness |
 | `HIPFIRE_PP_GATE_TEST_NO_SYSFS` | scripts/pp-gate.sh | harness |
+| `HIPFIRE_PP_LANE_EDGE_HOST_WAIT` | crates/hipfire-arch-qwen4/src/bundle/pp_lanes.rs | developer |
 | `HIPFIRE_PP_LANE_GROUPS` | crates/hipfire-arch-qwen4/src/bundle/pp_lanes.rs, crates/hipfire-arch-qwen4/src/lane/groups.rs | developer |
 | `HIPFIRE_PP_LANE_OVERLAP` | crates/hipfire-arch-qwen4/src/bundle/pp_lanes.rs | developer |
 | `HIPFIRE_PP_LAYERS` | crates/hipfire-arch-qwen4/src/admission.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | developer |
