@@ -37,10 +37,15 @@
 //! every kernel through the launch funnels is bracketed by an event pair and
 //! synchronized, so the table is complete even for kernels that never carried a
 //! hand-placed `begin_timer`. The legacy `begin_timer` sum is reported next to
-//! it as a coverage cross-check. Reconciliation per section:
-//! `wall_unprofiled = kernel_sum + residual`, where the residual (launch gaps,
-//! idle GPU, host work, copies and any launch outside the funnels) is its own
-//! bucket, so bucket fractions of the unprofiled wall add to 1.
+//! it as a coverage cross-check. Decode is pinned eager (`HIPFIRE_GRAPH=0` when
+//! unset): a replayed graph has no per-launch events. Every span carries a fixed
+//! event+dispatch floor (`launch_span_floor_us`, measured with a minimal launch),
+//! so bucket times are reported floor-corrected beside the raw spans; the true
+//! kernel time of a bucket lies between the two. Reconciliation per section:
+//! `wall_unprofiled = corrected_kernel_sum + residual` (the residual — launch
+//! gaps, idle GPU, host work, copies, launches outside the funnels — is its own
+//! bucket, so bucket fractions of the unprofiled wall add to 1), and
+//! `residual_ms_range` brackets it using the raw sum.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
@@ -641,6 +646,7 @@ fn section_report(
             "bucket": b,
             "ms": ms,
             "raw_span_ms": raw_ms,
+            "frac_of_raw_span_sum": if b == "launch_gaps_untimed" { Value::Null } else { json!(raw_ms.as_f64().unwrap_or(0.0) * 1e3 / raw_sum_us) },
             "frac_of_wall": ms / wall_ms,
             "frac_of_kernel_sum": if b == "launch_gaps_untimed" { Value::Null } else { json!(ms / kernel_sum_ms) },
             "launches": calls,
@@ -659,6 +665,7 @@ fn section_report(
         "launches": launches,
         "head_launches_per_forward": head_launches,
         "residual_ms": gap_ms,
+        "residual_ms_range": [wall_ms - raw_sum_us / 1e3, gap_ms],
         "residual_frac_of_wall": gap_ms / wall_ms,
         "kernel_sum_exceeds_wall": kernel_sum_ms > wall_ms,
         "profile_inflation_ms": profiled_wall_ms - wall_ms,
@@ -666,9 +673,12 @@ fn section_report(
         "legacy_timer_coverage_of_kernel_sum": legacy_sum_ms / kernel_sum_ms,
         "buckets": buckets,
         "kernels": rows,
-        "note": "kernel_sum = launch-level hipEvent spans minus the per-launch floor (each launch synchronized); \
-                 residual = unprofiled wall - kernel_sum: launch gaps, idle GPU, host work, \
-                 copies and launches outside the funnels. Profiled wall is inflated by the per-launch syncs.",
+        "note": "raw spans = launch-level hipEvent pairs (each launch synchronized); every span carries a fixed \
+                 launch_span_floor_us (event + dispatch), so a bucket's true kernel time lies in [corrected, raw]. \
+                 buckets.ms is floor-corrected (clamped at 0 per kernel name); residual = unprofiled wall - corrected \
+                 kernel_sum (launch gaps, idle GPU, host work, copies, launches outside the funnels, plus any kernel \
+                 time the floor over-subtracted); residual_ms_range = [wall - raw_sum, residual]. A negative lower \
+                 bound means the raw spans over-count (launch-bound sections). Profiled wall is inflated by the per-launch syncs.",
     })
 }
 
@@ -1079,10 +1089,12 @@ fn print_section(s: &Value) {
     );
     for b in s["buckets"].as_array().into_iter().flatten() {
         eprintln!(
-            "  {:<20} {:>10.3} ms {:>6.1}% of wall {:>8} launches",
+            "  {:<20} {:>9.3} ms corr {:>6.1}% of wall | raw {:>9.3} ms {:>5.1}% of spans | {:>6} launches",
             b["bucket"].as_str().unwrap_or("?"),
             b["ms"].as_f64().unwrap_or(0.0),
             b["frac_of_wall"].as_f64().unwrap_or(0.0) * 100.0,
+            b["raw_span_ms"].as_f64().unwrap_or(0.0),
+            b["frac_of_raw_span_sum"].as_f64().unwrap_or(0.0) * 100.0,
             b["launches"],
         );
     }
