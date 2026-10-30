@@ -701,6 +701,9 @@ impl RaonConfig {
             mla_v_head: self.v_head,
             mhc_controls: self.mhc_controls(),
             decay_bottleneck: self.rda_decay_rank,
+            // An unparsable value is reported by `MlaPolicy::from_env` at load.
+            mirror_q8: crate::mla::MlaPolicy::from_env()
+                .map_or(crate::mla::MlaPolicy::DEFAULT.mirror_q8, |p| p.mirror_q8),
         }
     }
 }

@@ -22,7 +22,7 @@
 //! every stage is graph-capture safe and performs no host readback/allocation.
 //! Decode is the `rows == 1` instance of the same route.
 
-use rdna_compute::latent_attention_tiled::{LatentRows, TiledAttention};
+use rdna_compute::latent_attention_tiled::{q8_plane_row_bytes, LatentRows, TiledAttention};
 use rdna_compute::{Gpu, GpuTensor};
 
 use crate::types::DispatchError;
@@ -73,17 +73,23 @@ pub struct LatentCache<'a> {
     pub host_pos: Option<usize>,
 }
 
-/// Bounded expanded BF16 mirrors, token-major: `knope[t][h][nope]`,
-/// `vmir[t][h][v_dim]`, valid for `t < pos`. `capacity_rows` is the number of
-/// rows the caller has physically backed (independent of the latent cache's
-/// mapped capacity, and a bound rather than a stride, so a mirror can grow by
-/// mapping more rows in place). Sized by the caller; never an unconditional
-/// max-sequence allocation.
+/// Bounded expanded mirrors, token-major, valid for `t < pos`.
+/// `capacity_rows` is the number of rows the caller has physically backed
+/// (independent of the latent cache's mapped capacity, and a bound rather than
+/// a stride, so a mirror can grow by mapping more rows in place). Sized by the
+/// caller; never an unconditional max-sequence allocation.
+///
+/// * `q8 == false`: BF16 planes `knope[t][h][nope]`, `vmir[t][h][v_dim]`.
+/// * `q8 == true`: `Raw` byte planes of INT8 codes with one F16 scale per
+///   (row, head); a plane row is `n_heads * (width + 2)` bytes, codes then
+///   scales (see `rdna_compute::latent_attention_tiled::q8_plane_row_bytes`).
+///   Served by the tiled routes only; written by the `External` expansion only.
 #[derive(Clone, Copy)]
 pub struct ExpandedMirror<'a> {
     pub knope: &'a GpuTensor,
     pub vmir: &'a GpuTensor,
     pub capacity_rows: usize,
+    pub q8: bool,
 }
 
 /// Which cache rows a stage covers.
@@ -346,6 +352,13 @@ pub fn execute_latent_attention(
             check_mirror(mirror, mirror_end)?;
             let (dev_base, row0, count) = resolve_range(cache, *range)?;
             let base = dev_base.then_some(cache.pos);
+            if mirror.q8 && matches!(expansion, KvExpansion::Dense { .. }) {
+                return Err(refuse(
+                    "the dense expansion writes BF16 mirrors only; a Q8 mirror takes the external \
+                     expansion"
+                        .into(),
+                ));
+            }
             match expansion {
                 KvExpansion::Dense { weight } => gpu
                     .latent_attention_decompress_dense(
@@ -362,6 +375,20 @@ pub fn execute_latent_attention(
                         geometry.latent,
                         geometry.tail,
                         cache.capacity_rows,
+                        mirror.capacity_rows,
+                    )
+                    .map_err(hip),
+                KvExpansion::External { projected } if mirror.q8 => gpu
+                    .latent_attention_scatter_expanded_q8(
+                        projected,
+                        mirror.knope,
+                        mirror.vmir,
+                        base,
+                        row0,
+                        count,
+                        geometry.n_heads,
+                        geometry.nope,
+                        geometry.v_dim,
                         mirror.capacity_rows,
                     )
                     .map_err(hip),
@@ -446,6 +473,11 @@ fn attention(
     match route {
         AttentionRoute::Reference => {
             let m = need_mirror(mirror, cache, rows, "reference")?;
+            if m.q8 {
+                return Err(refuse(
+                    "the reference attention route does not read a Q8 expanded mirror".into(),
+                ));
+            }
             gpu.latent_attention_serial(
                 q,
                 cache.rows,
@@ -467,16 +499,46 @@ fn attention(
         }
         AttentionRoute::Tiled { workspace } => {
             let m = need_mirror(mirror, cache, rows, "tiled")?;
+            // BF16 mirror: element-unit views; Q8 mirror: byte-unit plane views.
+            let (k_a, v) = if m.q8 {
+                (
+                    LatentRows {
+                        buf: m.knope,
+                        offset: 0,
+                        tok_stride: q8_plane_row_bytes(g.n_heads, g.nope),
+                        head_stride: g.nope,
+                        width: g.nope,
+                    },
+                    LatentRows {
+                        buf: m.vmir,
+                        offset: 0,
+                        tok_stride: q8_plane_row_bytes(g.n_heads, g.v_dim),
+                        head_stride: g.v_dim,
+                        width: g.v_dim,
+                    },
+                )
+            } else {
+                (
+                    LatentRows {
+                        buf: m.knope,
+                        offset: 0,
+                        tok_stride: g.n_heads * g.nope,
+                        head_stride: g.nope,
+                        width: g.nope,
+                    },
+                    LatentRows {
+                        buf: m.vmir,
+                        offset: 0,
+                        tok_stride: g.n_heads * g.v_dim,
+                        head_stride: g.v_dim,
+                        width: g.v_dim,
+                    },
+                )
+            };
             let a = TiledAttention {
                 q,
                 y,
-                k_a: LatentRows {
-                    buf: m.knope,
-                    offset: 0,
-                    tok_stride: g.n_heads * g.nope,
-                    head_stride: g.nope,
-                    width: g.nope,
-                },
+                k_a,
                 k_b: LatentRows {
                     buf: cache.rows,
                     offset: g.latent,
@@ -484,13 +546,7 @@ fn attention(
                     head_stride: 0,
                     width: g.tail,
                 },
-                v: LatentRows {
-                    buf: m.vmir,
-                    offset: 0,
-                    tok_stride: g.n_heads * g.v_dim,
-                    head_stride: g.v_dim,
-                    width: g.v_dim,
-                },
+                v,
                 pos: cache.pos,
                 pos_offset: 0,
                 n_rows: rows,
@@ -499,7 +555,7 @@ fn attention(
                 max_rows: cache.capacity_rows.min(m.capacity_rows),
                 round_y_bf16: true,
             };
-            run_tiled(gpu, &a, *workspace)
+            run_tiled(gpu, &a, *workspace, m.q8)
         }
         AttentionRoute::Absorbed { ops, workspace } => {
             let packed_ok = ops.packed.dtype == rdna_compute::DType::BF16
@@ -548,7 +604,7 @@ fn attention(
                 max_rows: cache.capacity_rows,
                 round_y_bf16: false,
             };
-            run_tiled(gpu, &a, *workspace)?;
+            run_tiled(gpu, &a, *workspace, false)?;
             gpu.latent_attention_absorb_v(
                 ops.z, ops.packed, y, rows, g.n_heads, g.nope, g.v_dim, g.latent, true,
             )
@@ -557,16 +613,24 @@ fn attention(
     }
 }
 
-/// Prefill kernel for `rows > 1`, split-KV decode for `rows == 1`.
+/// Prefill kernel for `rows > 1`, split-KV decode for `rows == 1`; `q8`: the
+/// K_nope and V views are Q8 mirror planes.
 fn run_tiled(
     gpu: &mut Gpu,
     a: &TiledAttention<'_>,
     workspace: Option<&GpuTensor>,
+    q8: bool,
 ) -> Result<(), DispatchError> {
     if a.n_rows == 1 {
         let ws =
             workspace.ok_or_else(|| refuse("tiled decode needs the split-KV workspace".into()))?;
-        gpu.latent_attention_decode_split(a, ws).map_err(hip)
+        if q8 {
+            gpu.latent_attention_decode_split_q8(a, ws).map_err(hip)
+        } else {
+            gpu.latent_attention_decode_split(a, ws).map_err(hip)
+        }
+    } else if q8 {
+        gpu.latent_attention_flash_prefill_q8(a).map_err(hip)
     } else {
         gpu.latent_attention_flash_prefill(a).map_err(hip)
     }

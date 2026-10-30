@@ -15,7 +15,8 @@
 //!   maps ahead, fallibly, before admission or graph capture. VMM owners are
 //!   released only through `Gpu::free_tensor` (arena release/quarantine/
 //!   retired-VA semantics), never pooled;
-//! * an optional expanded BF16 K/V mirror (token-major, per MLA layer), also VMM-backed:
+//! * an optional expanded K/V mirror (token-major, per MLA layer; BF16, or INT8 codes with
+//!   per-(row, head) F16 scales when [`RaonStateDims::mirror_q8`]), also VMM-backed:
 //!   virtual maximum reserved lazily, physical rows mapped ahead on demand up to a
 //!   memory budget computed from the free device memory at slot admission (never
 //!   `max_seq` unconditionally); growth never moves an address, so it never
@@ -32,6 +33,7 @@
 //! operations.
 
 use hipfire_runtime::kv_backend::{KvChunkPlan, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES};
+use rdna_compute::latent_attention_tiled::q8_plane_row_bytes;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Alignment of every sub-allocation carved from a slab.
@@ -132,6 +134,9 @@ pub struct RaonStateDims {
     pub mhc_controls: usize,
     /// RDA decay bottleneck width (128).
     pub decay_bottleneck: usize,
+    /// Expanded K/V mirror stored as INT8 codes + one F16 scale per (row, head,
+    /// plane) instead of BF16 ([`crate::mla::MlaPolicy::mirror_q8`]).
+    pub mirror_q8: bool,
 }
 
 impl RaonStateDims {
@@ -164,6 +169,7 @@ impl RaonStateDims {
             mla_v_head: 128,
             mhc_controls: 17,
             decay_bottleneck: 128,
+            mirror_q8: true,
         }
     }
 
@@ -227,6 +233,23 @@ impl RaonStateDims {
         }
         if self.top_k > self.n_experts {
             return Err("raon state dims: top_k > n_experts".into());
+        }
+        if self.mirror_q8 {
+            // Kernel contract of the Q8 mirror (flash prefill K staging, 16-byte rows).
+            let nope = self.mla_qk_head - self.tail;
+            let rb = |w: usize| q8_plane_row_bytes(self.heads, w);
+            if nope % 16 != 0
+                || !(nope / 8).is_power_of_two()
+                || self.mla_v_head % 16 != 0
+                || rb(nope) % 16 != 0
+                || rb(self.mla_v_head) % 16 != 0
+            {
+                return Err(format!(
+                    "raon state dims: the Q8 mirror needs nope {nope} and v {} multiples of 16 \
+                     (nope/8 a power of two) and 16-byte plane rows; set HIPFIRE_RAON_MIRROR_Q8=0",
+                    self.mla_v_head
+                ));
+            }
         }
         Ok(())
     }
@@ -535,11 +558,19 @@ fn slab_view(
 // Expanded mirror
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Optional expanded BF16 K/V rows, token-major with the shared key tail left
-/// in the latent cache (the layout the latent attention op reads): per MLA
-/// layer `knope [rows, heads, nope]` and `vmir [rows, heads, v]`. With the VMM
-/// backend every plane reserves `max_seq` rows of virtual space and maps
-/// physical chunks on demand ([`RaonState::ensure_mirror_rows`]); addresses
+/// Optional expanded K/V rows, token-major with the shared key tail left in the
+/// latent cache (the layout the latent attention op reads): per MLA layer a
+/// `knope` plane (`[rows, heads, nope]`) and a `vmir` plane (`[rows, heads, v]`).
+///
+/// * BF16 mirror (`q8 == false`): BF16 planes of exactly that shape.
+/// * Q8 mirror (`q8 == true`, [`RaonStateDims::mirror_q8`]): `Raw` byte planes
+///   whose row is `heads * width` INT8 codes followed by `heads` F16 scales (one
+///   per (row, head); `heads * (width + 2)` bytes, see
+///   [`rdna_compute::latent_attention_tiled::q8_plane_row_bytes`]). 72,800 B per
+///   token over all layers instead of 143,360.
+///
+/// With the VMM backend every plane reserves `max_seq` rows of virtual space and
+/// maps physical chunks on demand ([`RaonState::ensure_mirror_rows`]); addresses
 /// never change, so growth never invalidates a captured graph's pointers. The
 /// dense fallback owns exactly `rows` rows and reallocates to grow (dropping
 /// the valid-row mark). Row `t` is valid for `t < RaonState::mirror_valid_rows`.
@@ -549,6 +580,8 @@ pub struct ExpandedMirror {
     pub rows: usize,
     pub knope: Vec<GpuTensor>,
     pub vmir: Vec<GpuTensor>,
+    /// The planes are Q8 byte planes (see above).
+    pub q8: bool,
     /// Growth plans of the K and V planes (`None` for dense planes).
     plans: Option<[KvChunkPlan; 2]>,
 }
@@ -556,11 +589,19 @@ pub struct ExpandedMirror {
 /// Bytes per token row of the K_nope and V planes of ONE layer.
 pub fn mirror_plane_row_bytes(d: &RaonStateDims) -> [usize; 2] {
     let nope = d.mla_qk_head - d.tail;
-    [d.heads * nope * 2, d.heads * d.mla_v_head * 2]
+    if d.mirror_q8 {
+        [
+            q8_plane_row_bytes(d.heads, nope),
+            q8_plane_row_bytes(d.heads, d.mla_v_head),
+        ]
+    } else {
+        [d.heads * nope * 2, d.heads * d.mla_v_head * 2]
+    }
 }
 
 /// Exact bytes per token row of the mirror over all MLA layers
-/// (`n_mla * heads * (nope + v) * 2`; 143,360 for the released geometry).
+/// (BF16: `n_mla * heads * (nope + v) * 2` = 143,360 for the released geometry;
+/// Q8: `n_mla * heads * (nope + v + 4)` = 72,800).
 pub fn mirror_row_bytes(d: &RaonStateDims) -> usize {
     let [k, v] = mirror_plane_row_bytes(d);
     (k + v) * d.n_mla
@@ -1154,16 +1195,28 @@ impl RaonState {
         )?;
         let mut knope = Vec::with_capacity(d.n_mla);
         let mut vmir = Vec::with_capacity(d.n_mla);
+        let [kb, vb] = mirror_plane_row_bytes(&d);
         let built = (|| -> Result<(), String> {
             for _ in 0..d.n_mla {
-                knope.push(hip(
-                    gpu.zeros(&[target, d.heads, nope], DType::BF16),
-                    "alloc dense mirror K",
-                )?);
-                vmir.push(hip(
-                    gpu.zeros(&[target, d.heads, d.mla_v_head], DType::BF16),
-                    "alloc dense mirror V",
-                )?);
+                if d.mirror_q8 {
+                    knope.push(hip(
+                        gpu.zeros(&[target, kb], DType::Raw),
+                        "alloc dense Q8 mirror K",
+                    )?);
+                    vmir.push(hip(
+                        gpu.zeros(&[target, vb], DType::Raw),
+                        "alloc dense Q8 mirror V",
+                    )?);
+                } else {
+                    knope.push(hip(
+                        gpu.zeros(&[target, d.heads, nope], DType::BF16),
+                        "alloc dense mirror K",
+                    )?);
+                    vmir.push(hip(
+                        gpu.zeros(&[target, d.heads, d.mla_v_head], DType::BF16),
+                        "alloc dense mirror V",
+                    )?);
+                }
             }
             Ok(())
         })();
@@ -1178,6 +1231,7 @@ impl RaonState {
             rows: target,
             knope,
             vmir,
+            q8: d.mirror_q8,
             plans: None,
         });
         self.mirror_valid_rows = 0;
@@ -1211,19 +1265,27 @@ impl RaonState {
                     // grown only below.
                     let k = hip(
                         unsafe {
-                            gpu.alloc_vmm_tensor(&[max_seq, d.heads, nope], DType::BF16, 0, &[])
+                            if d.mirror_q8 {
+                                gpu.alloc_vmm_tensor(&[max_seq, kb], DType::Raw, 0, &[])
+                            } else {
+                                gpu.alloc_vmm_tensor(&[max_seq, d.heads, nope], DType::BF16, 0, &[])
+                            }
                         },
                         "reserve mirror K VMM plane",
                     )?;
                     knope.push(k);
                     let v = hip(
                         unsafe {
-                            gpu.alloc_vmm_tensor(
-                                &[max_seq, d.heads, d.mla_v_head],
-                                DType::BF16,
-                                0,
-                                &[],
-                            )
+                            if d.mirror_q8 {
+                                gpu.alloc_vmm_tensor(&[max_seq, vb], DType::Raw, 0, &[])
+                            } else {
+                                gpu.alloc_vmm_tensor(
+                                    &[max_seq, d.heads, d.mla_v_head],
+                                    DType::BF16,
+                                    0,
+                                    &[],
+                                )
+                            }
                         },
                         "reserve mirror V VMM plane",
                     )?;
@@ -1241,6 +1303,7 @@ impl RaonState {
                 rows: 0,
                 knope,
                 vmir,
+                q8: d.mirror_q8,
                 plans: Some(plans),
             });
         }
@@ -1755,9 +1818,15 @@ mod tests {
 
     #[test]
     fn mirror_bytes_per_token_match_plan() {
-        let d = RaonStateDims::raon();
-        // 7*40*(128+128)*2 = 143,360 B/token (shared tail stays in the latent cache).
+        let mut d = RaonStateDims::raon();
+        // BF16: 7*40*(128+128)*2 = 143,360 B/token (shared tail stays in the latent cache).
+        d.mirror_q8 = false;
         assert_eq!(expanded_mirror_bytes(&d, 8192).unwrap(), 8192 * 143_360);
+        // Q8: per plane row 40*(128+2) = 5,200 B (codes + 40 F16 scales), K and V, 7 layers.
+        d.mirror_q8 = true;
+        assert_eq!(mirror_plane_row_bytes(&d), [5200, 5200]);
+        assert_eq!(expanded_mirror_bytes(&d, 8192).unwrap(), 8192 * 72_800);
+        assert!(d.validate().is_ok());
     }
 
     #[test]

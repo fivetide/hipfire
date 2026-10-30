@@ -418,6 +418,111 @@ impl Gpu {
         )
     }
 
+    /// External projector output `[n_rows, n_heads*(nope+v)]` (F32) → Q8
+    /// expanded mirror planes at rows `base + row0 + i`: per (row, head, plane)
+    /// INT8 codes with one F16 scale (`F16_rne(max|x| / 127)`), laid out as rows of
+    /// `n_heads * (width + 2)` bytes, codes then scales (see
+    /// `kernels/src/latent_attention_decompress.hip` and
+    /// [`crate::latent_attention_tiled::q8_plane_row_bytes`]). `knope` / `vmir`
+    /// are `Raw` byte tensors of at least `cap` plane rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn latent_attention_scatter_expanded_q8(
+        &mut self,
+        proj: &GpuTensor,
+        knope: &GpuTensor,
+        vmir: &GpuTensor,
+        base: Option<&GpuTensor>,
+        row0: usize,
+        n_rows: usize,
+        n_heads: usize,
+        nope: usize,
+        v: usize,
+        cap: usize,
+    ) -> HipResult<()> {
+        if n_rows == 0 {
+            return Ok(());
+        }
+        let per = nope + v;
+        let total = product(product(n_rows, n_heads, "scatter q8")?, per, "scatter q8")?;
+        need_dtype(proj, DType::F32, "projector output")?;
+        need_numel(proj, total, "projector output")?;
+        need_dtype(knope, DType::Raw, "Q8 K_nope mirror")?;
+        need_dtype(vmir, DType::Raw, "Q8 V mirror")?;
+        for (t, w, what) in [(knope, nope, "Q8 K_nope mirror"), (vmir, v, "Q8 V mirror")] {
+            let need = product(
+                cap,
+                crate::latent_attention_tiled::q8_plane_row_bytes(n_heads, w),
+                what,
+            )?;
+            if t.byte_size() < need {
+                return Err(err(format!(
+                    "latent_attention: {what} holds {} bytes, needs {need} for {cap} rows",
+                    t.byte_size()
+                )));
+            }
+        }
+        if let Some(b) = base {
+            need_scalar_i32(b, "row base")?;
+        }
+        let (r0, nr, nh, np, vv, cp_rows) = (
+            i32_of(row0, "row0")?,
+            i32_of(n_rows, "rows")?,
+            i32_of(n_heads, "heads")?,
+            i32_of(nope, "nope")?,
+            i32_of(v, "v")?,
+            i32_of(cap, "cap")?,
+        );
+        let blocks = product(n_rows, n_heads, "scatter q8")?;
+        if blocks > i32::MAX as usize {
+            return Err(err("latent_attention: scatter q8 grid exceeds i32"));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            DECOMPRESS_MODULE,
+            LATENT_ATTENTION_DECOMPRESS_SRC,
+            "latent_attention_scatter_expanded_q8",
+        )?;
+        let (pp, kp, vp, bp) = (
+            proj.buf.as_ptr(),
+            knope.buf.as_ptr(),
+            vmir.buf.as_ptr(),
+            base.map_or(std::ptr::null_mut(), |b| b.buf.as_ptr()),
+        );
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &r0 as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &np as *const _ as *mut c_void,
+            &vv as *const _ as *mut c_void,
+            &cp_rows as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "latent_attention_scatter_expanded_q8",
+            [blocks as u32, 1, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(bp);
+                b.push_i32(r0);
+                b.push_i32(nr);
+                b.push_i32(nh);
+                b.push_i32(np);
+                b.push_i32(vv);
+                b.push_i32(cp_rows);
+                b
+            },
+        )
+    }
+
     /// Fused dense decompression: cache latent rows × `w[(nope+v)*n_heads,
     /// latent]` (BF16 or F32 weights, FP32 accumulation in ascending latent
     /// order) → BF16 `knope`/`vmir` mirrors at rows `base + row0 + i`.

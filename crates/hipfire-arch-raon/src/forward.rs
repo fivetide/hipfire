@@ -493,6 +493,7 @@ fn mla_mixer(
                 knope: &mirror.knope[mi],
                 vmir: &mirror.vmir[mi],
                 capacity_rows: mirror.rows,
+                q8: mirror.q8,
             })
         }
         MlaRoute::Absorbed => None,
@@ -686,6 +687,7 @@ fn ensure_context(
                         knope: &mirror.knope[mi],
                         vmir: &mirror.vmir[mi],
                         capacity_rows: mirror.rows,
+                        q8: mirror.q8,
                     };
                     let mut done = valid;
                     while done < start {

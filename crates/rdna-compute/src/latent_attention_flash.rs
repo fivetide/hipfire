@@ -39,6 +39,7 @@ pub const LATENT_ATTENTION_FLASH_SRC: &str =
 
 const FLASH_MODULE: &str = "latent_attention_flash";
 const FLASH_FUNC: &str = "latent_attention_flash_prefill";
+const FLASH_Q8_FUNC: &str = "latent_attention_flash_prefill_q8";
 
 /// Largest query/key width (`k_a.width + k_b.width`) the kernel supports.
 pub const LATENT_ATTENTION_FLASH_MAX_DQ: usize = 1024;
@@ -98,6 +99,35 @@ fn flash_lds_bytes(waves: usize, dq: usize, dv: usize) -> usize {
     waves * 16 * (dq + 8) * 2 + dv.min(FLASH_DV_CHUNK) * FLASH_VP_WORDS * 4
 }
 
+/// LDS bytes of the dequantized K_nope tile of the Q8 kernel (64 keys).
+fn q8_k_tile_bytes(wa: usize) -> usize {
+    64 * (wa + 8) * 2
+}
+
+/// Base pointer of a Q8 plane view (byte units): 16-byte aligned base, whole-row
+/// byte strides that are multiples of 16, width a multiple of 16.
+fn q8_view_ptr(v: &LatentRows<'_>, what: &str) -> HipResult<*mut c_void> {
+    if v.tok_stride % 16 != 0 {
+        return Err(err(format!(
+            "latent_attention flash: Q8 {what} token stride {} is not a multiple of 16 bytes",
+            v.tok_stride
+        )));
+    }
+    if v.width % 16 != 0 {
+        return Err(err(format!(
+            "latent_attention flash: {what} width {} is not a multiple of 16",
+            v.width
+        )));
+    }
+    let p = v.buf.buf.as_ptr() as usize;
+    if p % 16 != 0 {
+        return Err(err(format!(
+            "latent_attention flash: Q8 {what} base pointer is not 16-byte aligned"
+        )));
+    }
+    Ok(p as *mut c_void)
+}
+
 impl Gpu {
     /// Causal flash-style prefill attention for `a.n_rows` query rows (`>= 1`;
     /// intended for `> 1`, see `latent_attention_decode` for single rows).
@@ -108,11 +138,30 @@ impl Gpu {
     /// `n_heads <= 65535`. Deterministic: fixed reduction orders, no atomics,
     /// bytes independent of `max_rows` as long as it does not truncate.
     pub fn latent_attention_flash_prefill(&mut self, a: &TiledAttention<'_>) -> HipResult<()> {
-        self.latent_attention_flash_prefill_with_source(
+        self.flash_prefill_impl(
             a,
             FLASH_MODULE,
             FLASH_FUNC,
             LATENT_ATTENTION_FLASH_SRC,
+            false,
+        )
+    }
+
+    /// [`Self::latent_attention_flash_prefill`] over a Q8 expanded mirror:
+    /// `a.k_a` and `a.v` are INT8 mirror planes (`Raw` bytes, rows of
+    /// [`crate::latent_attention_tiled::q8_plane_row_bytes`], codes then F16
+    /// per-head scales; see `kernels/src/latent_attention_flash.hip`), `a.k_b`
+    /// the BF16 latent cache tail. The value route is the chunked kernel (no wide
+    /// variant). Same determinism contract; the K_nope tile is dequantized once
+    /// per block into LDS, so the LDS budget includes `64 * (k_a.width + 8) * 2`
+    /// bytes. Requires `k_a.width / 8` to be a power of two.
+    pub fn latent_attention_flash_prefill_q8(&mut self, a: &TiledAttention<'_>) -> HipResult<()> {
+        self.flash_prefill_impl(
+            a,
+            FLASH_MODULE,
+            FLASH_Q8_FUNC,
+            LATENT_ATTENTION_FLASH_SRC,
+            true,
         )
     }
 
@@ -127,7 +176,29 @@ impl Gpu {
         func: &str,
         src: &str,
     ) -> HipResult<()> {
-        a.validate()?;
+        self.flash_prefill_impl(a, module, func, src, false)
+    }
+
+    fn flash_prefill_impl(
+        &mut self,
+        a: &TiledAttention<'_>,
+        module: &str,
+        func: &str,
+        src: &str,
+        q8: bool,
+    ) -> HipResult<()> {
+        if q8 {
+            a.validate_q8()?;
+            if !(a.k_a.width / 8).is_power_of_two() {
+                return Err(err(format!(
+                    "latent_attention flash: Q8 K tile staging needs k_a width / 8 to be a power \
+                     of two, got width {}",
+                    a.k_a.width
+                )));
+            }
+        } else {
+            a.validate()?;
+        }
         let wide_func = format!("{func}_wide");
         let (wa, wb, dv) = (a.k_a.width, a.k_b.width, a.v.width);
         let dq = wa + wb;
@@ -146,16 +217,20 @@ impl Gpu {
                 "latent_attention flash: n_heads exceeds 65535 (grid.y)",
             ));
         }
-        let ka_p = view_ptr(&a.k_a, "k_a")?;
+        let (ka_p, v_p) = if q8 {
+            (q8_view_ptr(&a.k_a, "k_a")?, q8_view_ptr(&a.v, "v")?)
+        } else {
+            (view_ptr(&a.k_a, "k_a")?, view_ptr(&a.v, "v")?)
+        };
         let kb_p = view_ptr(&a.k_b, "k_b")?;
-        let v_p = view_ptr(&a.v, "v")?;
         let (qp, yp, pp) = (a.q.buf.as_ptr(), a.y.buf.as_ptr(), a.pos.buf.as_ptr());
         if (qp as usize) % 16 != 0 || (yp as usize) % 16 != 0 {
             return Err(err(
                 "latent_attention flash: q/y base pointers must be 16-byte aligned",
             ));
         }
-        let wide = dv > FLASH_DV_CHUNK
+        let wide = !q8
+            && dv > FLASH_DV_CHUNK
             && dv % 64 == 0
             && dv <= WIDE_MAX_DV
             && wide_lds_bytes(dq, dv) <= LATENT_ATTENTION_FLASH_LDS_LIMIT;
@@ -167,21 +242,18 @@ impl Gpu {
                 1usize,
             )
         } else {
+            let lds =
+                |w: usize| flash_lds_bytes(w, dq, dv) + if q8 { q8_k_tile_bytes(wa) } else { 0 };
             let waves = [4usize, 2, 1]
                 .into_iter()
-                .find(|&w| flash_lds_bytes(w, dq, dv) <= LATENT_ATTENTION_FLASH_LDS_LIMIT)
+                .find(|&w| lds(w) <= LATENT_ATTENTION_FLASH_LDS_LIMIT)
                 .ok_or_else(|| {
                     err(format!(
                         "latent_attention flash: query width {dq} needs more than \
                          {LATENT_ATTENTION_FLASH_LDS_LIMIT} bytes of LDS"
                     ))
                 })?;
-            (
-                waves,
-                flash_lds_bytes(waves, dq, dv) as u32,
-                func,
-                dv.div_ceil(FLASH_DV_CHUNK),
-            )
+            (waves, lds(waves) as u32, func, dv.div_ceil(FLASH_DV_CHUNK))
         };
         let (nr, nh, wai, wbi, dvi, po, mr) = (
             i32_of(a.n_rows, "rows")?,

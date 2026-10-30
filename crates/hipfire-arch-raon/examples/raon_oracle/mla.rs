@@ -37,6 +37,14 @@
 //!               gates on rel_l2/cosine only (max_abs printed, not gating).
 //!               Every check JSON carries `"gating": true|false`.
 //!
+//! Q8 mirror (`tiled_q8`, runs with the tiled route): the expanded K_nope/V
+//! mirror may be Raw int8 planes (per (row, head, plane) F16 RNE scale
+//! `min(max|x|/127, 65504)`, codes `clamp(rint(x/scale), ±127)`). Gated: the
+//! External scatter bytes equal a host quantizer under two schedules (poison
+//! untouched); tiled attention on a Q8 mirror built from the dense mirror is
+//! byte-repeatable and within the BF16 band of the Reference route on the
+//! dequantized mirror, of the fixture (short) and of the CPU reference (long).
+//!
 //! Generated long-context cases `long_p<P>_n<N>` (skipped with `--long 0` and
 //! in `--negative` mode; selectable with `--case`): Raon geometry and the real
 //! `weights_raon.safetensors` kv_b; the latent cache and the queries come from a
@@ -57,6 +65,7 @@ use hipfire_dispatch::pipeline::latent_attention::{
 };
 use rdna_compute::latent_attention_absorb::latent_attention_absorb_packed_elems;
 use rdna_compute::latent_attention_decode::latent_attention_decode_workspace_elems;
+use rdna_compute::latent_attention_tiled::q8_plane_row_bytes;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
 
@@ -229,7 +238,45 @@ struct Cmp {
     json: Value,
 }
 
+/// Acceptance band of a `compare`: relative L2, cosine, and the max-abs gate as a
+/// fraction of max|reference| (catches localized corruption).
+#[derive(Clone, Copy)]
+struct Band {
+    rel_l2: f64,
+    cosine: f64,
+    max_abs_frac: f64,
+}
+
+const BF16_BAND: Band = Band {
+    rel_l2: BF16_REL_L2,
+    cosine: BF16_COSINE,
+    max_abs_frac: BF16_MAX_ABS_FRAC,
+};
+
+/// Q8 mirror vs the unquantized truth (fixture / CPU reference): the mirror's own
+/// quantization noise (INT8 codes, one F16 scale per 128 channels: ~0.4% rms per
+/// element, ~1% rms of the attention output on typical rows, ~2.3% on the
+/// extreme-range `*_spread` cases) on top of the BF16 band's arithmetic noise.
+const Q8_TRUTH_BAND: Band = Band {
+    rel_l2: 3e-2,
+    cosine: 0.999,
+    max_abs_frac: 0.10,
+};
+
+/// Tiled attention on a Q8 mirror vs the reference route on the same dequantized
+/// values (the decode kernel keeps `code * scale` in F32 where the reference
+/// reads it BF16-rounded, which the `*_spread` cases' huge logits amplify).
+const Q8_REF_BAND: Band = Band {
+    rel_l2: BF16_REL_L2,
+    cosine: BF16_COSINE,
+    max_abs_frac: 5e-2,
+};
+
 fn compare(name: &str, got: &[f32], want: &[f32]) -> Cmp {
+    compare_in(name, got, want, BF16_BAND)
+}
+
+fn compare_in(name: &str, got: &[f32], want: &[f32], band: Band) -> Cmp {
     let (mut num, mut den, mut dot, mut gg, mut max_abs, mut max_ref) =
         (0f64, 0f64, 0f64, 0f64, 0f64, 0f64);
     let mut nonfinite = 0usize;
@@ -256,19 +303,19 @@ fn compare(name: &str, got: &[f32], want: &[f32]) -> Cmp {
     } else {
         1.0
     };
-    let tol = 2e-5 + BF16_MAX_ABS_FRAC * max_ref;
+    let tol = 2e-5 + band.max_abs_frac * max_ref;
     let first = got
         .iter()
         .zip(want)
         .position(|(g, w)| !g.is_finite() || ((*g - *w).abs() as f64) > tol);
     let ok = got.len() == want.len()
         && nonfinite == 0
-        && rel <= BF16_REL_L2
-        && cos >= BF16_COSINE
+        && rel <= band.rel_l2
+        && cos >= band.cosine
         && first.is_none();
     let mut j = json!({
         "tensor": name, "pass": ok, "rel_l2": rel, "cosine": cos, "max_abs": max_abs,
-        "max_abs_ref": max_ref, "band": {"rel_l2": BF16_REL_L2, "cosine": BF16_COSINE,
+        "max_abs_ref": max_ref, "band": {"rel_l2": band.rel_l2, "cosine": band.cosine,
         "max_abs_tol": tol}, "len": got.len(), "nonfinite": nonfinite,
     });
     if let Some(i) = first {
@@ -368,6 +415,239 @@ fn bf16r(f: f32) -> f32 {
     bf16_to_f32(f32_to_bf16(f))
 }
 
+// ── Q8 mirror host model ────────────────────────────────────────────────────
+
+/// Byte the Q8 planes are poisoned with (any non-zero pattern).
+const Q8_POISON: u8 = 0x77;
+
+/// IEEE binary32 → binary16, round-to-nearest-even (subnormals, overflow → inf).
+fn f32_to_f16_rne(f: f32) -> u16 {
+    let u = f.to_bits();
+    let sign = ((u >> 16) & 0x8000) as u16;
+    let exp = ((u >> 23) & 0xff) as i32;
+    let man = u & 0x007f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if man != 0 { 0x0200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 31 {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = man | 0x0080_0000;
+        let shift = (14 - e) as u32;
+        let half = m >> shift;
+        let rem = m & ((1u32 << shift) - 1);
+        let tie = 1u32 << (shift - 1);
+        let up = rem > tie || (rem == tie && (half & 1) == 1);
+        return sign | (half + up as u32) as u16;
+    }
+    let half = ((e as u32) << 10) | (man >> 13);
+    let rem = man & 0x1fff;
+    let up = rem > 0x1000 || (rem == 0x1000 && (half & 1) == 1);
+    sign | (half + up as u32) as u16
+}
+
+/// The production Q8 quantizer for one (row, head, plane) vector: F16 RNE
+/// scale `min(max|x|/127, 65504)`, codes `clamp(rint(x / scale), ±127)`.
+fn q8_quant_vec(x: &[f32]) -> (Vec<i8>, u16) {
+    let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let s16 = f32_to_f16_rne((amax / 127.0f32).min(65504.0));
+    let sf = f16_to_f32(s16);
+    let codes = x
+        .iter()
+        .map(|v| {
+            if sf > 0.0 {
+                (v / sf).round_ties_even().clamp(-127.0, 127.0) as i8
+            } else {
+                0
+            }
+        })
+        .collect();
+    (codes, s16)
+}
+
+/// Host Q8 plane of `rows` rows: `bytes` is the production layout (per row
+/// `heads*width` int8 codes then `heads` LE F16 scales); `deq` is the BF16 (LE
+/// bytes, `[rows][heads][width]`) dequantization `bf16r(code * scale)` the
+/// prefill kernel feeds to the matrix units.
+struct Q8Plane {
+    bytes: Vec<u8>,
+    deq: Vec<u8>,
+}
+
+/// `src(vec_index, out)` fills `out` (`width` f32) with the vector of
+/// (row, head) = (`vec_index / heads`, `vec_index % heads`).
+fn q8_plane(
+    rows: usize,
+    heads: usize,
+    width: usize,
+    src: &(dyn Fn(usize, &mut [f32]) + Sync),
+) -> Q8Plane {
+    let rb = q8_plane_row_bytes(heads, width);
+    let db = heads * width * 2;
+    let mut bytes = vec![0u8; rows * rb];
+    let mut deq = vec![0u8; rows * db];
+    if rows == 0 {
+        return Q8Plane { bytes, deq };
+    }
+    let per = rows.div_ceil(worker_count().min(rows));
+    std::thread::scope(|sc| {
+        for (ci, (bc, dc)) in bytes
+            .chunks_mut(per * rb)
+            .zip(deq.chunks_mut(per * db))
+            .enumerate()
+        {
+            sc.spawn(move || {
+                let mut scratch = vec![0f32; width];
+                for r in 0..bc.len() / rb {
+                    let row = ci * per + r;
+                    for hh in 0..heads {
+                        src(row * heads + hh, &mut scratch);
+                        let (codes, s16) = q8_quant_vec(&scratch);
+                        let sf = f16_to_f32(s16);
+                        let brow = &mut bc[r * rb..(r + 1) * rb];
+                        let drow = &mut dc[r * db..(r + 1) * db];
+                        for (e, c) in codes.iter().enumerate() {
+                            brow[hh * width + e] = *c as u8;
+                            let d = f32_to_bf16(*c as f32 * sf).to_le_bytes();
+                            drow[(hh * width + e) * 2..(hh * width + e) * 2 + 2]
+                                .copy_from_slice(&d);
+                        }
+                        let so = heads * width + 2 * hh;
+                        brow[so..so + 2].copy_from_slice(&s16.to_le_bytes());
+                    }
+                }
+            });
+        }
+    });
+    Q8Plane { bytes, deq }
+}
+
+/// Q8 plane of a token-major BF16 mirror (`[rows][heads][width]`, LE bytes).
+fn q8_plane_from_bf16(b: &[u8], rows: usize, heads: usize, width: usize) -> Q8Plane {
+    q8_plane(rows, heads, width, &|vi, out| {
+        let off = vi * width * 2;
+        for (e, o) in out.iter_mut().enumerate() {
+            *o = bf16_to_f32(u16::from_le_bytes([b[off + 2 * e], b[off + 2 * e + 1]]));
+        }
+    })
+}
+
+/// `[cap_rows, row_bytes]` Raw plane filled with [`Q8_POISON`].
+fn poison_raw(gpu: &mut Gpu, cap_rows: usize, row_bytes: usize) -> Result<GpuTensor, String> {
+    upload_raw_padded(gpu, &[], cap_rows, row_bytes)
+}
+
+/// `[cap_rows, row_bytes]` Raw plane holding `prefix` then [`Q8_POISON`].
+fn upload_raw_padded(
+    gpu: &mut Gpu,
+    prefix: &[u8],
+    cap_rows: usize,
+    row_bytes: usize,
+) -> Result<GpuTensor, String> {
+    let t = gpu
+        .alloc_tensor(&[cap_rows, row_bytes], DType::Raw)
+        .map_err(he)?;
+    let mut buf = Vec::with_capacity(cap_rows * row_bytes);
+    buf.extend_from_slice(prefix);
+    buf.resize(cap_rows * row_bytes, Q8_POISON);
+    gpu.memcpy_htod_auto(&t.buf, &buf).map_err(he)?;
+    Ok(t)
+}
+
+/// Plain BF16 mirror plane `[cap_rows, heads, width]` holding `prefix` (BF16 LE
+/// bytes) then poison.
+fn upload_bf16_padded(gpu: &mut Gpu, prefix: &[u8], shape: &[usize]) -> Result<GpuTensor, String> {
+    let t = poison_bf16(gpu, shape)?;
+    gpu.memcpy_htod_auto(&t.buf, prefix).map_err(he)?;
+    Ok(t)
+}
+
+/// Tiled attention outputs (twice) on a Q8 mirror and the Reference output on
+/// its dequantization.
+struct Q8Attn {
+    y1: Vec<f32>,
+    y2: Vec<f32>,
+    yref: Vec<f32>,
+}
+
+/// Quantize the dense BF16 mirror (`knope`/`vmir`, valid rows `0..total`) on
+/// host, upload it as Q8 planes (capacity `mcap`) plus its dequantized BF16
+/// mirror, and run Tiled (twice) on the former and Reference on the latter.
+/// Frees everything it allocates, also on error.
+#[allow(clippy::too_many_arguments)]
+fn q8_mirror_attention(
+    gpu: &mut Gpu,
+    g: &LatentGeometry,
+    cache: LatentCache<'_>,
+    rd: &RouteDev,
+    knope: &GpuTensor,
+    vmir: &GpuTensor,
+    total: usize,
+    mcap: usize,
+    d_q: &GpuTensor,
+    n: usize,
+    scale: f32,
+) -> Result<Q8Attn, String> {
+    let (h, nope, v) = (g.n_heads, g.nope, g.v_dim);
+    let kb = gpu.download_raw_bytes(knope).map_err(he)?;
+    let vb = gpu.download_raw_bytes(vmir).map_err(he)?;
+    let kq = q8_plane_from_bf16(&kb, total, h, nope);
+    let vq = q8_plane_from_bf16(&vb, total, h, v);
+    drop((kb, vb));
+    let (rbk, rbv) = (q8_plane_row_bytes(h, nope), q8_plane_row_bytes(h, v));
+    let d_kq = upload_raw_padded(gpu, &kq.bytes, mcap, rbk)?;
+    let d_vq = upload_raw_padded(gpu, &vq.bytes, mcap, rbv)?;
+    let d_kd = upload_bf16_padded(gpu, &kq.deq, &[mcap, h, nope])?;
+    let d_vd = upload_bf16_padded(gpu, &vq.deq, &[mcap, h, v])?;
+    drop((kq, vq));
+    let d_y1 = gpu.zeros(&[n, h * v], DType::F32).map_err(he)?;
+    let d_y2 = gpu.zeros(&[n, h * v], DType::F32).map_err(he)?;
+    let d_yr = gpu.zeros(&[n, h * v], DType::F32).map_err(he)?;
+    let outcome = (|| -> Result<Q8Attn, String> {
+        let m8 = ExpandedMirror {
+            knope: &d_kq,
+            vmir: &d_vq,
+            capacity_rows: mcap,
+            q8: true,
+        };
+        let md = ExpandedMirror {
+            knope: &d_kd,
+            vmir: &d_vd,
+            capacity_rows: mcap,
+            q8: false,
+        };
+        for y in [&d_y1, &d_y2] {
+            attn(gpu, g, cache, Some(m8), d_q, y, n, scale, rd.tiled())?;
+        }
+        attn(
+            gpu,
+            g,
+            cache,
+            Some(md),
+            d_q,
+            &d_yr,
+            n,
+            scale,
+            AttentionRoute::Reference,
+        )?;
+        gpu.hip.device_synchronize().map_err(he)?;
+        Ok(Q8Attn {
+            y1: gpu.download_f32(&d_y1).map_err(he)?,
+            y2: gpu.download_f32(&d_y2).map_err(he)?,
+            yref: gpu.download_f32(&d_yr).map_err(he)?,
+        })
+    })();
+    for t in [d_kq, d_vq, d_kd, d_vd, d_y1, d_y2, d_yr] {
+        let _ = gpu.free_tensor(t);
+    }
+    outcome
+}
+
 /// Which non-reference routes run (the reference route always runs first).
 #[derive(Clone, Copy)]
 struct Routes {
@@ -404,6 +684,7 @@ impl Routes {
         let mut v = vec!["reference"];
         if self.tiled {
             v.push("tiled");
+            v.push("tiled_q8");
         }
         if self.absorbed {
             v.push("absorbed");
@@ -629,6 +910,7 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value, routes: Routes) -> Result<V
         knope: &knope,
         vmir: &vmir,
         capacity_rows: mcap,
+        q8: false,
     };
     let dense = KvExpansion::Dense { weight: &d_w };
     let run = |gpu: &mut Gpu, op: LatentAttentionOp<'_>| -> Result<(), String> {
@@ -847,6 +1129,7 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value, routes: Routes) -> Result<V
         knope: &kn_b,
         vmir: &vm_b,
         capacity_rows: mcap,
+        q8: false,
     };
     run(
         gpu,
@@ -874,6 +1157,39 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value, routes: Routes) -> Result<V
         &valid_rows(&v_a, h, v, total),
         &valid_rows(&v_b, h, v, total),
     ));
+
+    // 5b. Q8 mirror attention built from the dense mirror (schedule A): tiled
+    // on the Q8 planes vs Reference on their dequantization vs the fixture.
+    if routes.tiled {
+        gpu.hip.device_synchronize().map_err(he)?;
+        let q8 = q8_mirror_attention(
+            gpu, &g, cache, &rd, &knope, &vmir, total, mcap, &d_q, n, scale,
+        )?;
+        checks.push(labeled(
+            exact(
+                "attn_y_tiled_q8_repeat_bytewise",
+                &f32_bytes(&q8.y1),
+                &f32_bytes(&q8.y2),
+            ),
+            "tiled_q8",
+            true,
+        ));
+        checks.push(labeled(
+            compare_in(
+                "attn_y_tiled_q8_vs_q8_reference",
+                &q8.y1,
+                &q8.yref,
+                Q8_REF_BAND,
+            ),
+            "tiled_q8",
+            false,
+        ));
+        checks.push(labeled(
+            compare_in("attn_y_tiled_q8_vs_fixture", &q8.y1, r_y, Q8_TRUTH_BAND),
+            "tiled_q8",
+            false,
+        ));
+    }
 
     // 6. gather -> external projector (host, ascending-k fma) -> scatter.
     if total <= EXTERNAL_ROW_LIMIT {
@@ -910,6 +1226,7 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value, routes: Routes) -> Result<V
             knope: &kn_c,
             vmir: &vm_c,
             capacity_rows: mcap,
+            q8: false,
         };
         run(
             gpu,
@@ -937,6 +1254,108 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value, routes: Routes) -> Result<V
             &valid_rows(&v_a, h, v, total),
             &valid_rows(&v_c, h, v, total),
         ));
+
+        // 6b. Q8 mirror scatter of the same projector output: bytes must equal
+        // the host quantizer row by row, under two schedules, poison untouched.
+        if routes.tiled {
+            let (rbk, rbv) = (q8_plane_row_bytes(h, g.nope), q8_plane_row_bytes(h, v));
+            let proj_k = |vi: usize, out: &mut [f32]| {
+                let o = (vi / h) * h * per + (vi % h) * per;
+                out.copy_from_slice(&proj[o..o + g.nope]);
+            };
+            let proj_v = |vi: usize, out: &mut [f32]| {
+                let o = (vi / h) * h * per + (vi % h) * per + g.nope;
+                out.copy_from_slice(&proj[o..o + v]);
+            };
+            let want_k = q8_plane(total, h, g.nope, &proj_k).bytes;
+            let want_v = q8_plane(total, h, v, &proj_v).bytes;
+            let kq1 = poison_raw(gpu, mcap, rbk)?;
+            let vq1 = poison_raw(gpu, mcap, rbv)?;
+            let kq2 = poison_raw(gpu, mcap, rbk)?;
+            let vq2 = poison_raw(gpu, mcap, rbv)?;
+            let m1 = ExpandedMirror {
+                knope: &kq1,
+                vmir: &vq1,
+                capacity_rows: mcap,
+                q8: true,
+            };
+            let m2 = ExpandedMirror {
+                knope: &kq2,
+                vmir: &vq2,
+                capacity_rows: mcap,
+                q8: true,
+            };
+            run(
+                gpu,
+                LatentAttentionOp::Decompress {
+                    geometry: g,
+                    cache,
+                    mirror: m1,
+                    expansion: KvExpansion::External { projected: &d_proj },
+                    range: RowRange::Absolute {
+                        start: 0,
+                        count: total,
+                    },
+                },
+            )?;
+            // Schedule 2: 37-row absolute tiles over the prefix, new rows via
+            // the device base position; each tile's projected plane holds
+            // exactly its rows.
+            let mut tiles: Vec<GpuTensor> = Vec::new();
+            let mut s = 0;
+            while s < p {
+                let c = 37.min(p - s);
+                let tile = up_f32(gpu, &proj[s * h * per..(s + c) * h * per], &[c, h * per])?;
+                run(
+                    gpu,
+                    LatentAttentionOp::Decompress {
+                        geometry: g,
+                        cache,
+                        mirror: m2,
+                        expansion: KvExpansion::External { projected: &tile },
+                        range: RowRange::Absolute { start: s, count: c },
+                    },
+                )?;
+                tiles.push(tile);
+                s += c;
+            }
+            let tail = up_f32(gpu, &proj[p * h * per..total * h * per], &[n, h * per])?;
+            run(
+                gpu,
+                LatentAttentionOp::Decompress {
+                    geometry: g,
+                    cache,
+                    mirror: m2,
+                    expansion: KvExpansion::External { projected: &tail },
+                    range: RowRange::NewRows { count: n },
+                },
+            )?;
+            tiles.push(tail);
+            gpu.hip.device_synchronize().map_err(he)?;
+            let k1 = gpu.download_raw_bytes(&kq1).map_err(he)?;
+            let v1 = gpu.download_raw_bytes(&vq1).map_err(he)?;
+            let k2 = gpu.download_raw_bytes(&kq2).map_err(he)?;
+            let v2 = gpu.download_raw_bytes(&vq2).map_err(he)?;
+            checks.push(exact("mirror_q8_k_bitwise", &k1[..total * rbk], &want_k));
+            checks.push(exact("mirror_q8_v_bitwise", &v1[..total * rbv], &want_v));
+            checks.push(exact("mirror_q8_schedules_bitwise", &k1, &k2));
+            checks.push(exact("mirror_q8_schedules_v_bitwise", &v1, &v2));
+            let pk = vec![Q8_POISON; (mcap - total) * rbk];
+            let pv = vec![Q8_POISON; (mcap - total) * rbv];
+            checks.push(exact(
+                "mirror_q8_k_poison_untouched",
+                &k1[total * rbk..],
+                &pk,
+            ));
+            checks.push(exact(
+                "mirror_q8_v_poison_untouched",
+                &v1[total * rbv..],
+                &pv,
+            ));
+            for t in tiles.into_iter().chain([kq1, vq1, kq2, vq2]) {
+                let _ = gpu.free_tensor(t);
+            }
+        }
         for t in [plane, d_proj, kn_c, vm_c] {
             let _ = gpu.free_tensor(t);
         }
@@ -1450,6 +1869,7 @@ fn run_long_case(
             knope: &knope,
             vmir: &vmir,
             capacity_rows: mcap,
+            q8: false,
         };
         let dense = KvExpansion::Dense { weight: &d_w };
         // Production Decompress over absolute row tiles (all P+N rows).
@@ -1490,6 +1910,15 @@ fn run_long_case(
         }
         gpu.hip.device_synchronize().map_err(he)?;
         let yr = gpu.download_f32(&d_yr).map_err(he)?;
+        // Q8 mirror: quantize the dense mirror just built, run tiled on it and
+        // Reference on its dequantization.
+        let q8 = if routes.tiled {
+            Some(q8_mirror_attention(
+                gpu, &g, cache, &rd, &knope, &vmir, total, mcap, &d_q, n, scale,
+            )?)
+        } else {
+            None
+        };
 
         let lab = |c: Cmp, route: &str, bit_exact: bool| {
             let mut c = labeled(c, route, bit_exact);
@@ -1560,6 +1989,32 @@ fn run_long_case(
                     false,
                 ));
             }
+        }
+        if let Some(q8) = &q8 {
+            checks.push(lab(
+                compare_in("attn_y_tiled_q8_vs_cpu", &q8.y1, &cpu.y, Q8_TRUTH_BAND),
+                "tiled_q8",
+                false,
+            ));
+            checks.push(lab(
+                exact(
+                    "attn_y_tiled_q8_repeat_bytewise",
+                    &f32_bytes(&q8.y1),
+                    &f32_bytes(&q8.y2),
+                ),
+                "tiled_q8",
+                true,
+            ));
+            checks.push(lab(
+                compare_in(
+                    "attn_y_tiled_q8_vs_q8_reference",
+                    &q8.y1,
+                    &q8.yref,
+                    Q8_REF_BAND,
+                ),
+                "tiled_q8",
+                false,
+            ));
         }
         Ok(checks)
     })();

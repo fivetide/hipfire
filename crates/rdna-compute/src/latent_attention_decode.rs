@@ -51,6 +51,7 @@ pub const LATENT_ATTENTION_DECODE_SRC: &str =
 const DECODE_MODULE: &str = "latent_attention_decode";
 const PARTIAL_KERNEL: &str = "latent_attention_decode_partial";
 const MERGE_KERNEL: &str = "latent_attention_decode_merge";
+const PARTIAL_Q8_KERNEL: &str = "latent_attention_decode_partial_q8";
 
 /// Number of key splits (grid `x` of the partials kernel). Fixed: the merge
 /// order, and therefore the output bytes for a given `len`, depend on it.
@@ -119,13 +120,40 @@ impl Gpu {
         a: &TiledAttention<'_>,
         workspace: &GpuTensor,
     ) -> HipResult<()> {
+        self.decode_split_impl(a, workspace, false)
+    }
+
+    /// [`Self::latent_attention_decode_split`] over a Q8 expanded mirror:
+    /// `a.k_a` and `a.v` are INT8 mirror planes (`Raw` bytes, rows of
+    /// [`crate::latent_attention_tiled::q8_plane_row_bytes`]: codes then F16
+    /// per-head scales; see `kernels/src/latent_attention_decode.hip`), `a.k_b`
+    /// the BF16 latent cache tail. Same split layout, merge kernel and
+    /// determinism contract.
+    pub fn latent_attention_decode_split_q8(
+        &mut self,
+        a: &TiledAttention<'_>,
+        workspace: &GpuTensor,
+    ) -> HipResult<()> {
+        self.decode_split_impl(a, workspace, true)
+    }
+
+    fn decode_split_impl(
+        &mut self,
+        a: &TiledAttention<'_>,
+        workspace: &GpuTensor,
+        q8: bool,
+    ) -> HipResult<()> {
         if a.n_rows != 1 {
             return Err(err(format!(
                 "latent_attention decode: supports exactly one query row, got n_rows = {}",
                 a.n_rows
             )));
         }
-        a.validate()?;
+        if q8 {
+            a.validate_q8()?;
+        } else {
+            a.validate()?;
+        }
         let (wa, wb, dv) = (a.k_a.width, a.k_b.width, a.dv());
         let dq = wa + wb;
         if dq > LATENT_DECODE_MAX_DQ {
@@ -191,8 +219,14 @@ impl Gpu {
         let (kb_tok, kb_head) = (a.k_b.tok_stride as i64, a.k_b.head_stride as i64);
         let (v_tok, v_head) = (a.v.tok_stride as i64, a.v.head_stride as i64);
 
+        let partial_kernel = if q8 {
+            PARTIAL_Q8_KERNEL
+        } else {
+            PARTIAL_KERNEL
+        };
+        let nh = to_i32(a.n_heads, "n_heads")?;
         self.bind_thread()?;
-        self.ensure_kernel(DECODE_MODULE, LATENT_ATTENTION_DECODE_SRC, PARTIAL_KERNEL)?;
+        self.ensure_kernel(DECODE_MODULE, LATENT_ATTENTION_DECODE_SRC, partial_kernel)?;
         self.ensure_kernel(DECODE_MODULE, LATENT_ATTENTION_DECODE_SRC, MERGE_KERNEL)?;
 
         let mut partial_params: Vec<*mut c_void> = vec![
@@ -216,8 +250,11 @@ impl Gpu {
             &splits as *const _ as *mut c_void,
             &scale as *const _ as *mut c_void,
         ];
+        if q8 {
+            partial_params.push(&nh as *const _ as *mut c_void);
+        }
         self.launch_maybe_blob(
-            PARTIAL_KERNEL,
+            partial_kernel,
             [LATENT_DECODE_SPLITS as u32, a.n_heads as u32, 1],
             [DECODE_BLOCK, 1, 1],
             0,
@@ -243,6 +280,9 @@ impl Gpu {
                 b.push_i32(max_rows);
                 b.push_i32(splits);
                 b.push_f32(scale);
+                if q8 {
+                    b.push_i32(nh);
+                }
                 b
             },
         )?;

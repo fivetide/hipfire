@@ -125,6 +125,55 @@ fn bf16_view_end(v: &LatentRows<'_>, n_heads: usize, max_rows: usize, what: &str
     Ok(())
 }
 
+/// Bytes of one row of a Q8 expanded-mirror plane holding `n_heads` heads of
+/// `width` channels: `n_heads * width` int8 codes followed by `n_heads` F16
+/// scales (one per head). Head `h`'s codes start at byte `h * width`, its scale
+/// at byte `n_heads * width + 2 * h`.
+pub const fn q8_plane_row_bytes(n_heads: usize, width: usize) -> usize {
+    n_heads * (width + 2)
+}
+
+/// Q8 plane view contract: a `Raw` byte tensor whose view has `offset == 0`,
+/// `head_stride == width` and `tok_stride == q8_plane_row_bytes(n_heads, width)`
+/// (all in BYTES, the unit of `LatentRows` for these views).
+fn q8_plane_end(v: &LatentRows<'_>, n_heads: usize, max_rows: usize, what: &str) -> HipResult<()> {
+    if v.width == 0 {
+        return Err(err(format!("latent_attention tiled: {what} width is zero")));
+    }
+    if v.buf.dtype != DType::Raw {
+        return Err(err(format!(
+            "latent_attention tiled: Q8 {what} plane must be Raw bytes, got {:?}",
+            v.buf.dtype
+        )));
+    }
+    if v.offset != 0
+        || v.head_stride != v.width
+        || v.tok_stride != q8_plane_row_bytes(n_heads, v.width)
+    {
+        return Err(err(format!(
+            "latent_attention tiled: Q8 {what} plane view must have offset 0, head stride {} and \
+             token stride {} bytes (got offset {}, head stride {}, token stride {})",
+            v.width,
+            q8_plane_row_bytes(n_heads, v.width),
+            v.offset,
+            v.head_stride,
+            v.tok_stride
+        )));
+    }
+    let need = max_rows.checked_mul(v.tok_stride).ok_or_else(|| {
+        err(format!(
+            "latent_attention tiled: {what} extent overflows usize"
+        ))
+    })?;
+    if need > v.buf.byte_size() {
+        return Err(err(format!(
+            "latent_attention tiled: Q8 {what} plane needs {need} bytes, tensor holds {}",
+            v.buf.byte_size()
+        )));
+    }
+    Ok(())
+}
+
 impl TiledAttention<'_> {
     /// Query/key width per head.
     pub fn dq(&self) -> usize {
@@ -139,6 +188,16 @@ impl TiledAttention<'_> {
     /// Geometry/extent validation shared by every tiled launcher. Does not
     /// check kernel-specific alignment; launchers add their own.
     pub fn validate(&self) -> HipResult<()> {
+        self.validate_with(false)
+    }
+
+    /// [`Self::validate`] for the Q8 expanded-mirror launchers: `k_a` and `v`
+    /// are INT8 mirror planes (see [`q8_plane_row_bytes`]), `k_b` stays BF16.
+    pub fn validate_q8(&self) -> HipResult<()> {
+        self.validate_with(true)
+    }
+
+    fn validate_with(&self, q8: bool) -> HipResult<()> {
         if self.n_rows == 0 || self.n_heads == 0 {
             return Err(err(
                 "latent_attention tiled: rows and heads must be nonzero",
@@ -180,9 +239,17 @@ impl TiledAttention<'_> {
                 "latent_attention tiled: pos must hold a 4-byte device scalar",
             ));
         }
-        bf16_view_end(&self.k_a, self.n_heads, self.max_rows, "k_a")?;
+        if q8 {
+            q8_plane_end(&self.k_a, self.n_heads, self.max_rows, "k_a")?;
+        } else {
+            bf16_view_end(&self.k_a, self.n_heads, self.max_rows, "k_a")?;
+        }
         bf16_view_end(&self.k_b, self.n_heads, self.max_rows, "k_b")?;
-        bf16_view_end(&self.v, self.n_heads, self.max_rows, "v")?;
+        if q8 {
+            q8_plane_end(&self.v, self.n_heads, self.max_rows, "v")?;
+        } else {
+            bf16_view_end(&self.v, self.n_heads, self.max_rows, "v")?;
+        }
         if i32::try_from(self.max_rows + self.pos_offset + self.n_rows).is_err() {
             return Err(err("latent_attention tiled: row counts exceed i32"));
         }

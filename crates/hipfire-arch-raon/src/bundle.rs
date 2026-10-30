@@ -200,9 +200,10 @@ impl RaonBundle {
                 match state.fit_mirror_budget(gpu) {
                     Ok(rows) => eprintln!(
                         "raon1_mini: expanded K/V mirror budget {rows} rows of {} reserved context \
-                         ({} B/token); contexts beyond it use the absorbed route (HIPFIRE_RAON_MLA_ABSORB)",
+                         ({} B/token, {}); contexts beyond it use the absorbed route (HIPFIRE_RAON_MLA_ABSORB)",
                         state.max_seq(),
-                        crate::state::mirror_row_bytes(state.dims())
+                        crate::state::mirror_row_bytes(state.dims()),
+                        if state.dims().mirror_q8 { "Q8 (HIPFIRE_RAON_MIRROR_Q8)" } else { "BF16" }
                     ),
                     Err(e) => eprintln!("raon1_mini: mirror budget refit failed ({e}); keeping the admission estimate"),
                 }
