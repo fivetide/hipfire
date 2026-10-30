@@ -2110,6 +2110,13 @@ pub const SITES: &[Site] = &[
         decisions: &["qwen4-decode-share-loan-capture-guard"],
     },
     Site {
+        file: "hipfire-arch-qwen4/src/gpu_forward/ep_reserve_loan.rs",
+        function: "capturing",
+        occurrences: 4,
+        // The EP reserve loan drives the same LoanController through ExtentLoanOps.
+        decisions: &["qwen4-decode-share-loan-capture-guard"],
+    },
+    Site {
         file: "hipfire-arch-qwen4/src/decode_share_loan.rs",
         function: "capturing",
         occurrences: 1,
@@ -2153,7 +2160,7 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-arch-qwen4/src/gpu_forward.rs",
-        function: "new_inner",
+        function: "new_inner_with_reserve",
         occurrences: 2,
         decisions: &["qwen4-cpu-splice-eager-only"],
     },
