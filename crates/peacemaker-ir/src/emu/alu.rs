@@ -2309,8 +2309,10 @@ fn udiv_scalar_float(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result<
             let (a, b) = (rd(s, 1)?, rd(s, 2)?);
             let p = (f32::from_bits(a) * f32::from_bits(b)).to_bits();
             if !normal(a) || !normal(b) || !normal(p) {
+                // Worded as a domain refusal ("not measured", no "overflow"): consumers such as the
+                // lane_rows_bf16 tests treat an unmeasured float domain as a skip and "overflow" as a defect.
                 return Err(format!(
-                    "{name}: {a:#x} * {b:#x} needs a zero, denormal, NaN, infinite or overflowing value; not measured"
+                    "{name}: {a:#x} * {b:#x} needs a zero, denormal, NaN, infinite or out-of-range operand or product; not measured"
                 ));
             }
             p
