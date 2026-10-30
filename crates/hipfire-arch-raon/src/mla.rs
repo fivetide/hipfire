@@ -137,11 +137,13 @@ pub struct MlaPolicy {
     /// KLD vs the BF16 teacher matched the decompressed route (code24 0.0610
     /// vs 0.0612, WT2 0.2016 vs 0.2018, gfx1201). `0` refuses past the budget.
     pub absorb: bool,
-    /// `HIPFIRE_RAON_MIRROR_Q8` (default 1): store the expanded K_nope/V mirror
-    /// as INT8 codes with one F16 scale per (row, head, plane) (about half the
-    /// BF16 bytes per token, so twice the rows fit the mirror budget). Needs the
-    /// tiled kernels: the reference route reads BF16 mirrors only, so this is
-    /// forced off when `tiled` is off. `0` keeps the BF16 mirror.
+    /// `HIPFIRE_RAON_MIRROR_Q8` (default 1): allow the Q8 expanded K_nope/V mirror
+    /// (INT8 codes with one F16 scale per (row, head, plane); about half the BF16
+    /// bytes per token, so twice the rows fit the mirror budget). Capacity-based:
+    /// `RaonState::fit_mirror_budget` keeps the BF16 mirror when its budget covers
+    /// the whole reserved context (it is 1-2% faster) and picks Q8 otherwise.
+    /// Needs the tiled kernels (the reference route reads BF16 mirrors only), so
+    /// this is forced off when `tiled` is off. `0` always keeps the BF16 mirror.
     pub mirror_q8: bool,
 }
 

@@ -1099,12 +1099,27 @@ impl RaonState {
     /// Budget = rows already backed + what free memory still backs, after the
     /// latent growth to `max_seq`, [`ADMISSION_HEADROOM_BYTES`] and
     /// [`MIRROR_POST_ASSEMBLY_RESERVE_BYTES`]. Returns the new budget in rows.
+    ///
+    /// Format selection (capacity-based): while no mirror is backed yet and the Q8
+    /// mirror is allowed ([`RaonStateDims::mirror_q8`]), the BF16 mirror is kept
+    /// whenever its budget covers the whole reserved context (`max_seq`; it is
+    /// 1-2% faster), and Q8 is chosen otherwise (it backs about twice the rows).
+    /// The choice is made here, once, before any mirror memory exists.
     pub fn fit_mirror_budget(&mut self, gpu: &Gpu) -> Result<usize, String> {
         let (free, _) = hip(gpu.device_mem_info(), "query device memory")?;
         let usable = free
             .saturating_sub(self.pending_latent_bytes(gpu))
             .saturating_sub(ADMISSION_HEADROOM_BYTES)
             .saturating_sub(MIRROR_POST_ASSEMBLY_RESERVE_BYTES);
+        if self.dims.mirror_q8 && self.mirror.is_none() {
+            let bf16 = RaonStateDims {
+                mirror_q8: false,
+                ..self.dims.clone()
+            };
+            if mirror_rows_for_budget(&bf16, usable) >= self.max_seq {
+                self.dims.mirror_q8 = false;
+            }
+        }
         let rows = self.mirror_backed_rows() + mirror_rows_for_budget(&self.dims, usable);
         self.mirror_budget_rows = rows.min(self.max_seq);
         Ok(self.mirror_budget_rows)
