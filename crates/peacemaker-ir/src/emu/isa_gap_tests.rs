@@ -432,7 +432,11 @@ fn v_movreld_b32_writes_the_vgpr_offset_by_m0() {
     setv(&mut st, 7, &[0x1, 0x2]);
     st.m0 = 3;
     run(V_MOVRELD, &mut st).unwrap();
-    assert_eq!(getv(&st, 7, 2), vec![0x9, 0x2], "v4 + M0=3 = v7, active lane 0 only");
+    assert_eq!(
+        getv(&st, 7, 2),
+        vec![0x9, 0x2],
+        "v4 + M0=3 = v7, active lane 0 only"
+    );
     assert_eq!(getv(&st, 4, 1), vec![0], "v4 itself is untouched");
     st.m0 = 252;
     assert!(run(V_MOVRELD, &mut st).is_err());
