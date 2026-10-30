@@ -293,7 +293,11 @@ impl Gpu {
         let x_hs = nope + tail;
         let o_hs = latent + tail;
         need_numel(q, mul(mul(rows, n_heads, "q")?, x_hs, "q")?, "q plane")?;
-        need_numel(q_abs, mul(mul(rows, n_heads, "q_abs")?, o_hs, "q_abs")?, "q_abs plane")?;
+        need_numel(
+            q_abs,
+            mul(mul(rows, n_heads, "q_abs")?, o_hs, "q_abs")?,
+            "q_abs plane",
+        )?;
         if rows == 0 {
             return Ok(());
         }
@@ -341,7 +345,8 @@ impl Gpu {
         }
         // AvT_h starts `nope * latent` elements into each head block (16-byte
         // aligned because latent is a multiple of 8).
-        let w_ptr = unsafe { (packed.buf.as_ptr() as *mut u8).add(nope * latent * 2) } as *mut c_void;
+        let w_ptr =
+            unsafe { (packed.buf.as_ptr() as *mut u8).add(nope * latent * 2) } as *mut c_void;
         self.absorb_gemm(
             z.buf.as_ptr(),
             w_ptr,
@@ -384,7 +389,10 @@ impl Gpu {
             i32_of(x_hs, "input head stride")?,
             i32_of(o_hs, "output head stride")?,
         );
-        i32_of(mul(mul(rows, n_heads, "input")?, x_hs.max(o_hs), "plane")?, "plane element count")?;
+        i32_of(
+            mul(mul(rows, n_heads, "input")?, x_hs.max(o_hs), "plane")?,
+            "plane element count",
+        )?;
         let w_hs_u = w_hs as u64;
         let (nl_i, ks_i, kl_i, dc_i, tail_i) = (
             plan.nl as i32,

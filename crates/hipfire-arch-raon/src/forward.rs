@@ -41,8 +41,8 @@
 
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::latent_attention::{
-    execute_latent_attention, ExpandedMirror as DMirror, LatentAttentionOp, LatentCache, LatentGeometry,
-    RowRange,
+    execute_latent_attention, ExpandedMirror as DMirror, LatentAttentionOp, LatentCache,
+    LatentGeometry, RowRange,
 };
 use hipfire_dispatch::pipeline::stream_mix::{
     execute_stream_mix, StreamChart, StreamMixOp, StreamMixStage, StreamNorm,
@@ -98,7 +98,8 @@ impl RaonWork {
             ..RaonMhcShape::raon_mini()
         };
         let lower_bound = cfg.rda_gate_lower_bound.ok_or_else(|| {
-            "raon1_mini: RDA gate without a lower bound (-softplus form) is not implemented".to_string()
+            "raon1_mini: RDA gate without a lower bound (-softplus form) is not implemented"
+                .to_string()
         })?;
         let rda_geom = RdaGeometry {
             n_heads: cfg.n_heads,
@@ -188,7 +189,17 @@ impl RaonWork {
 }
 
 fn free_rda_scratch(gpu: &mut Gpu, r: RdaScratch) {
-    for t in [r.qconv, r.kconv, r.vconv, r.q, r.k, r.vprime, r.log_alpha, r.beta, r.y] {
+    for t in [
+        r.qconv,
+        r.kconv,
+        r.vconv,
+        r.q,
+        r.k,
+        r.vprime,
+        r.log_alpha,
+        r.beta,
+        r.y,
+    ] {
         let _ = gpu.free_tensor(t);
     }
 }
@@ -208,7 +219,8 @@ pub enum TapSite {
 
 /// Observer of the stream state (`[rows, streams, hidden]` F32 holding BF16
 /// values). Oracle only: a tap downloads and is not graph-capturable.
-pub type LayerTap<'a> = &'a mut dyn FnMut(&mut Gpu, TapSite, &GpuTensor, usize) -> Result<(), String>;
+pub type LayerTap<'a> =
+    &'a mut dyn FnMut(&mut Gpu, TapSite, &GpuTensor, usize) -> Result<(), String>;
 
 fn fire(
     tap: &mut Option<LayerTap<'_>>,
@@ -331,7 +343,14 @@ fn rda_mixer(
     project(gpu, &w.b_proj, x, &scratch.rda_b, rows, b)?;
     project(gpu, &w.rda_w_proj, x, &scratch.rda_delta, rows, b)?;
     project(gpu, &w.f_a_proj, x, &scratch.rda_f_lat, rows, b)?;
-    project(gpu, &w.f_b_proj, &scratch.rda_f_lat, &scratch.rda_f, rows, b)?;
+    project(
+        gpu,
+        &w.f_b_proj,
+        &scratch.rda_f_lat,
+        &scratch.rda_f,
+        rows,
+        b,
+    )?;
 
     let layer = RaonRdaLayer {
         conv_w_q: &w.q_conv,
@@ -358,8 +377,24 @@ fn rda_mixer(
         delta: &scratch.rda_delta,
         f: &scratch.rda_f,
     };
-    rda_forward_rows(gpu, &work.rda_geom, &layer, &st, &proj, &work.rda, &scratch.rda_gated, rows)?;
-    project(gpu, &w.o_proj, &scratch.rda_gated, &scratch.branch_out, rows, b)
+    rda_forward_rows(
+        gpu,
+        &work.rda_geom,
+        &layer,
+        &st,
+        &proj,
+        &work.rda,
+        &scratch.rda_gated,
+        rows,
+    )?;
+    project(
+        gpu,
+        &w.o_proj,
+        &scratch.rda_gated,
+        &scratch.branch_out,
+        rows,
+        b,
+    )
 }
 
 fn latent_geometry(cfg: &RaonConfig) -> LatentGeometry {
@@ -484,7 +519,14 @@ fn mla_mixer(
             eps: RAON_MLA_EPS,
         },
     )?;
-    project(gpu, &w.q_b_proj, &scratch.mla_qa_norm, &scratch.mla_q, rows, b)?;
+    project(
+        gpu,
+        &w.q_b_proj,
+        &scratch.mla_qa_norm,
+        &scratch.mla_q,
+        rows,
+        b,
+    )?;
     run_latent(
         gpu,
         LatentAttentionOp::SplitKv {
@@ -497,7 +539,16 @@ fn mla_mixer(
         },
     )?;
     if let Some(dm) = dmirror {
-        mla_expand(gpu, cfg, w, scratch, cache, dm, RowRange::NewRows { count: rows }, rows)?;
+        mla_expand(
+            gpu,
+            cfg,
+            w,
+            scratch,
+            cache,
+            dm,
+            RowRange::NewRows { count: rows },
+            rows,
+        )?;
     }
     run_latent(
         gpu,
@@ -521,7 +572,14 @@ fn mla_mixer(
             elements: rows * cfg.n_heads * cfg.v_head,
         },
     )?;
-    project(gpu, &w.o_proj, &scratch.mla_attn, &scratch.branch_out, rows, b)
+    project(
+        gpu,
+        &w.o_proj,
+        &scratch.mla_attn,
+        &scratch.branch_out,
+        rows,
+        b,
+    )
 }
 
 // ───────────────────────── FFN ─────────────────────────
@@ -602,7 +660,10 @@ fn ensure_context(
     match mla_route(work, s, end) {
         MlaRoute::Absorbed => {
             if !work.mla.absorbed_ready() {
-                return Err("raon1_mini: absorbed MLA route selected but its packed weights are not built".into());
+                return Err(
+                    "raon1_mini: absorbed MLA route selected but its packed weights are not built"
+                        .into(),
+                );
             }
             Ok(())
         }
@@ -654,11 +715,19 @@ fn ensure_context(
 /// Validate `tokens` and upload them to the slot's stable device id buffer.
 /// Host side of the embedding: never part of a captured region (a captured
 /// graph reads the same buffer, which the caller refreshes before each replay).
-fn stage_tokens(cfg: &RaonConfig, scratch: &RaonPrefillScratch, gpu: &mut Gpu, tokens: &[u32]) -> Result<(), String> {
+fn stage_tokens(
+    cfg: &RaonConfig,
+    scratch: &RaonPrefillScratch,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+) -> Result<(), String> {
     let mut bytes = Vec::with_capacity(tokens.len() * 4);
     for &t in tokens {
         if t as usize >= cfg.vocab {
-            return Err(format!("raon1_mini: token id {t} outside vocab {}", cfg.vocab));
+            return Err(format!(
+                "raon1_mini: token id {t} outside vocab {}",
+                cfg.vocab
+            ));
         }
         bytes.extend_from_slice(&t.to_le_bytes());
     }
@@ -677,18 +746,35 @@ fn embed_staged(
     rows: usize,
 ) -> Result<(), String> {
     let res = match w.embed_format {
-        EmbeddingFormat::Q8_0 => {
-            gpu.embedding_lookup_q8_batched(&w.embed, &scratch.branch_out, &scratch.token_ids, rows, cfg.hidden)
-        }
-        EmbeddingFormat::F32 => {
-            gpu.embedding_lookup_f32_batched(&w.embed, &scratch.branch_out, &scratch.token_ids, rows, cfg.hidden)
-        }
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
+            &w.embed,
+            &scratch.branch_out,
+            &scratch.token_ids,
+            rows,
+            cfg.hidden,
+        ),
+        EmbeddingFormat::F32 => gpu.embedding_lookup_f32_batched(
+            &w.embed,
+            &scratch.branch_out,
+            &scratch.token_ids,
+            rows,
+            cfg.hidden,
+        ),
         other => {
-            return Err(format!("raon1_mini: embedding format {other:?} is not routed (expected Q8F16 or F32)"));
+            return Err(format!(
+                "raon1_mini: embedding format {other:?} is not routed (expected Q8F16 or F32)"
+            ));
         }
     };
     res.map_err(|e| format!("raon1_mini: embedding lookup: {e:?}"))?;
-    broadcast_embedding(gpu, &work.mhc_shape, rows, &scratch.branch_out, cfg.hidden, &scratch.stream_a)
+    broadcast_embedding(
+        gpu,
+        &work.mhc_shape,
+        rows,
+        &scratch.branch_out,
+        cfg.hidden,
+        &scratch.stream_a,
+    )
 }
 
 /// Final mean + RMSNorm + lm_head for rows `row0..row0+count` of
@@ -718,7 +804,14 @@ pub fn readout_logits(
         eps: cfg.rms_eps,
     };
     final_mean_norm(gpu, &work.mhc_shape, count, &view, norm, &scratch.branch_in)?;
-    project(gpu, &w.lm_head, &scratch.branch_in, out, count, OutRound::Bf16)
+    project(
+        gpu,
+        &w.lm_head,
+        &scratch.branch_in,
+        out,
+        count,
+        OutRound::Bf16,
+    )
 }
 
 // ───────────────────────── the forward ─────────────────────────
@@ -767,7 +860,18 @@ fn forward_impl(
     let end = start + rows;
     ensure_context(cfg, w, s, scratch, work, gpu, end)?;
     stage_tokens(cfg, scratch, gpu, tokens)?;
-    forward_body(cfg, w, s, scratch, work, gpu, rows, start, want_logits, &mut tap)?;
+    forward_body(
+        cfg,
+        w,
+        s,
+        scratch,
+        work,
+        gpu,
+        rows,
+        start,
+        want_logits,
+        &mut tap,
+    )?;
     // One advance per call, after every MLA layer consumed the old length.
     s.set_n_tokens(gpu, end)
 }
@@ -815,7 +919,18 @@ pub fn decode_body(
     work: &RaonWork,
     gpu: &mut Gpu,
 ) -> Result<(), String> {
-    forward_body(cfg, w, s, scratch, work, gpu, 1, s.n_tokens(), true, &mut None)?;
+    forward_body(
+        cfg,
+        w,
+        s,
+        scratch,
+        work,
+        gpu,
+        1,
+        s.n_tokens(),
+        true,
+        &mut None,
+    )?;
     gpu.device_counter_add_i32(&s.seq_len, 1)
         .map_err(|e| format!("raon1_mini: device seq_len advance: {e:?}"))
 }
@@ -835,7 +950,14 @@ pub fn decode_binding(
     mix(w.embed.buf.as_ptr() as u64);
     mix(w.lm_head.buf.buf.as_ptr() as u64);
     mix(s.seq_len.buf.as_ptr() as u64);
-    for t in s.rda.iter().chain(&s.conv_q).chain(&s.conv_k).chain(&s.conv_v).chain(&s.mla_cache) {
+    for t in s
+        .rda
+        .iter()
+        .chain(&s.conv_q)
+        .chain(&s.conv_k)
+        .chain(&s.conv_v)
+        .chain(&s.mla_cache)
+    {
         mix(t.buf.as_ptr() as u64);
     }
     mix(s.capacity_rows() as u64);
@@ -898,21 +1020,32 @@ fn forward_body(
                 work,
                 rows,
                 cur,
-                StreamNorm { gamma: &layer.input_norm, eps },
+                StreamNorm {
+                    gamma: &layer.input_norm,
+                    eps,
+                },
                 &scratch.branch_in,
             )?;
             match (kind, &layer.mixer) {
                 (LayerKind::Rda, RaonMixer::Rda(rw)) => {
-                    let ri = cfg.rda_index(l).ok_or_else(|| format!("raon1_mini: layer {l} has no RDA slot"))?;
+                    let ri = cfg
+                        .rda_index(l)
+                        .ok_or_else(|| format!("raon1_mini: layer {l} has no RDA slot"))?;
                     rda_mixer(gpu, rw, ri, s, scratch, work, rows)
                         .map_err(|e| format!("raon1_mini L{l} rda: {e}"))?;
                 }
                 (LayerKind::Mla, RaonMixer::Mla(mw)) => {
-                    let mi = cfg.mla_index(l).ok_or_else(|| format!("raon1_mini: layer {l} has no MLA slot"))?;
+                    let mi = cfg
+                        .mla_index(l)
+                        .ok_or_else(|| format!("raon1_mini: layer {l} has no MLA slot"))?;
                     mla_mixer(gpu, cfg, mw, mi, s, scratch, work, rows, start)
                         .map_err(|e| format!("raon1_mini L{l} mla: {e}"))?;
                 }
-                _ => return Err(format!("raon1_mini: layer {l} weights do not match its configured mixer")),
+                _ => {
+                    return Err(format!(
+                        "raon1_mini: layer {l} weights do not match its configured mixer"
+                    ))
+                }
             }
             mhc_postmix(gpu, work, rows, cur, &scratch.branch_out, oth)?;
         }
@@ -921,7 +1054,11 @@ fn forward_body(
             tap,
             gpu,
             TapSite::Attn(l),
-            if cur_is_a { &scratch.stream_a } else { &scratch.stream_b },
+            if cur_is_a {
+                &scratch.stream_a
+            } else {
+                &scratch.stream_b
+            },
             rows,
         )?;
 
@@ -938,10 +1075,14 @@ fn forward_body(
                 work,
                 rows,
                 cur,
-                StreamNorm { gamma: &layer.post_attn_norm, eps },
+                StreamNorm {
+                    gamma: &layer.post_attn_norm,
+                    eps,
+                },
                 &scratch.branch_in,
             )?;
-            ffn_block(gpu, &ctx, work, layer, scratch, rows).map_err(|e| format!("raon1_mini L{l} ffn: {e}"))?;
+            ffn_block(gpu, &ctx, work, layer, scratch, rows)
+                .map_err(|e| format!("raon1_mini L{l} ffn: {e}"))?;
             mhc_postmix(gpu, work, rows, cur, &scratch.ffn_out, oth)?;
         }
         cur_is_a = !cur_is_a;
@@ -949,13 +1090,22 @@ fn forward_body(
             tap,
             gpu,
             TapSite::Ffn(l),
-            if cur_is_a { &scratch.stream_a } else { &scratch.stream_b },
+            if cur_is_a {
+                &scratch.stream_a
+            } else {
+                &scratch.stream_b
+            },
             rows,
         )?;
     }
-    debug_assert!(cur_is_a, "an even number of sites leaves the result in stream_a");
+    debug_assert!(
+        cur_is_a,
+        "an even number of sites leaves the result in stream_a"
+    );
     if !cur_is_a {
-        return Err("raon1_mini: odd number of mHC sites (layer count) — result not in stream_a".into());
+        return Err(
+            "raon1_mini: odd number of mHC sites (layer count) — result not in stream_a".into(),
+        );
     }
 
     if want_logits {
@@ -967,7 +1117,14 @@ fn forward_body(
             eps,
         };
         final_mean_norm(gpu, &work.mhc_shape, 1, &view, norm, &scratch.final_norm)?;
-        project(gpu, &w.lm_head, &scratch.final_norm, &scratch.logits, 1, OutRound::Bf16)?;
+        project(
+            gpu,
+            &w.lm_head,
+            &scratch.final_norm,
+            &scratch.logits,
+            1,
+            OutRound::Bf16,
+        )?;
     }
     Ok(())
 }
@@ -1003,7 +1160,18 @@ pub fn forward_token_tapped(
     want_logits: bool,
     tap: Option<LayerTap<'_>>,
 ) -> Result<(), String> {
-    forward_impl(cfg, w, s, scratch, work, gpu, &[token], pos, want_logits, tap)
+    forward_impl(
+        cfg,
+        w,
+        s,
+        scratch,
+        work,
+        gpu,
+        &[token],
+        pos,
+        want_logits,
+        tap,
+    )
 }
 
 /// `tokens.len()` (1..=`scratch.rows`) consecutive tokens starting at
@@ -1023,7 +1191,18 @@ pub fn forward_rows(
     start_pos: u32,
     want_logits: bool,
 ) -> Result<(), String> {
-    forward_rows_tapped(cfg, w, s, scratch, work, gpu, tokens, start_pos, want_logits, None)
+    forward_rows_tapped(
+        cfg,
+        w,
+        s,
+        scratch,
+        work,
+        gpu,
+        tokens,
+        start_pos,
+        want_logits,
+        None,
+    )
 }
 
 /// [`forward_rows`] with an optional stream observer.
@@ -1040,5 +1219,16 @@ pub fn forward_rows_tapped(
     want_logits: bool,
     tap: Option<LayerTap<'_>>,
 ) -> Result<(), String> {
-    forward_impl(cfg, w, s, scratch, work, gpu, tokens, start_pos, want_logits, tap)
+    forward_impl(
+        cfg,
+        w,
+        s,
+        scratch,
+        work,
+        gpu,
+        tokens,
+        start_pos,
+        want_logits,
+        tap,
+    )
 }

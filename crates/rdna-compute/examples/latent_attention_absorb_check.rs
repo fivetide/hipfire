@@ -97,7 +97,9 @@ fn up_bf16(gpu: &mut Gpu, data: &[u16], guard: bool) -> GpuTensor {
 
 /// Output tensor of `n` elements poisoned with `fill` bits, plus the guard.
 fn out_f32(gpu: &mut Gpu, n: usize, fill: u32) -> GpuTensor {
-    let t = gpu.alloc_tensor(&[n + GUARD], DType::F32).expect("alloc out");
+    let t = gpu
+        .alloc_tensor(&[n + GUARD], DType::F32)
+        .expect("alloc out");
     let mut bits = vec![fill; n];
     bits.extend((0..GUARD).map(guard_pattern));
     htod(gpu, &t, bytemuck_u32(&bits));
@@ -129,8 +131,16 @@ fn stats(got: &[f32], want: &[f64]) -> (f64, f64) {
         gg += g * g;
         gw += g * w;
     }
-    let rel = if ww > 0.0 { (dd / ww).sqrt() } else { dd.sqrt() };
-    let cos = if gg > 0.0 && ww > 0.0 { gw / (gg.sqrt() * ww.sqrt()) } else { 1.0 };
+    let rel = if ww > 0.0 {
+        (dd / ww).sqrt()
+    } else {
+        dd.sqrt()
+    };
+    let cos = if gg > 0.0 && ww > 0.0 {
+        gw / (gg.sqrt() * ww.sqrt())
+    } else {
+        1.0
+    };
     (rel, cos)
 }
 
@@ -179,7 +189,9 @@ fn make_weights(g: &Geo, rng: &mut Rng) -> (Vec<f32>, Vec<u16>, Vec<f32>) {
         }
         for c in 0..g.latent {
             for e in 0..g.v {
-                packed.push(bf16_bits(w[(h * (g.nope + g.v) + g.nope + e) * g.latent + c]));
+                packed.push(bf16_bits(
+                    w[(h * (g.nope + g.v) + g.nope + e) * g.latent + c],
+                ));
             }
         }
     }
@@ -245,7 +257,10 @@ fn run_geometry(gpu: &mut Gpu, g: &Geo, rows_list: &[usize], t: &mut Tally, seed
     let mut rng = Rng(seed);
     let (w_t, packed_host, wb) = make_weights(g, &mut rng);
     let elems = latent_attention_absorb_packed_elems(g.h, g.nope, g.v, g.latent);
-    t.check(elems == packed_host.len(), format!("{} packed_elems", g.name));
+    t.check(
+        elems == packed_host.len(),
+        format!("{} packed_elems", g.name),
+    );
 
     // ---- pack: byte-exact ----
     let w_t_dev = up_f32(gpu, &w_t);
@@ -275,27 +290,58 @@ fn run_geometry(gpu: &mut Gpu, g: &Geo, rows_list: &[usize], t: &mut Tally, seed
         let ow = g.latent + g.tail;
         // BF16-valued activations.
         let q: Vec<f32> = (0..rows * g.h * xw).map(|_| bf16_val(rng.unit())).collect();
-        let z: Vec<f32> = (0..rows * g.h * g.latent).map(|_| bf16_val(rng.unit())).collect();
+        let z: Vec<f32> = (0..rows * g.h * g.latent)
+            .map(|_| bf16_val(rng.unit()))
+            .collect();
         let q_dev = up_f32(gpu, &q);
         let z_dev = up_f32(gpu, &z);
 
         // ---- absorb_q ----
         let nq = rows * g.h * ow;
         let qa0 = out_f32(gpu, nq, NAN_BITS);
-        gpu.latent_attention_absorb_q(&q_dev, &packed_dev, &qa0, rows, g.h, g.nope, g.tail, g.v, g.latent)
-            .expect("absorb_q");
+        gpu.latent_attention_absorb_q(
+            &q_dev,
+            &packed_dev,
+            &qa0,
+            rows,
+            g.h,
+            g.nope,
+            g.tail,
+            g.v,
+            g.latent,
+        )
+        .expect("absorb_q");
         let a = dl_f32(gpu, &qa0);
         let qa1 = out_f32(gpu, nq, BIG_BITS);
-        gpu.latent_attention_absorb_q(&q_dev, &packed_dev, &qa1, rows, g.h, g.nope, g.tail, g.v, g.latent)
-            .expect("absorb_q repeat");
+        gpu.latent_attention_absorb_q(
+            &q_dev,
+            &packed_dev,
+            &qa1,
+            rows,
+            g.h,
+            g.nope,
+            g.tail,
+            g.v,
+            g.latent,
+        )
+        .expect("absorb_q repeat");
         let a1 = dl_f32(gpu, &qa1);
         let tag = format!("{} rows={rows}", g.name);
-        t.check(guard_ok(&a, nq) && guard_ok(&a1, nq), format!("{tag} q_abs guard"));
         t.check(
-            a[..nq].iter().zip(&a1[..nq]).all(|(x, y)| x.to_bits() == y.to_bits()),
+            guard_ok(&a, nq) && guard_ok(&a1, nq),
+            format!("{tag} q_abs guard"),
+        );
+        t.check(
+            a[..nq]
+                .iter()
+                .zip(&a1[..nq])
+                .all(|(x, y)| x.to_bits() == y.to_bits()),
             format!("{tag} q_abs repeat byte-identical (different poison)"),
         );
-        t.check(a[..nq].iter().all(|x| x.is_finite()), format!("{tag} q_abs fully written"));
+        t.check(
+            a[..nq].iter().all(|x| x.is_finite()),
+            format!("{tag} q_abs fully written"),
+        );
         // tail copy exact
         let mut tail_ok = true;
         for r in 0..rows {
@@ -318,7 +364,10 @@ fn run_geometry(gpu: &mut Gpu, g: &Geo, rows_list: &[usize], t: &mut Tally, seed
         }
         let (rel, cos) = stats(&got_all, &want_all);
         println!("  {tag} absorb_q  rel_l2={rel:.3e} cos={cos:.8}");
-        t.check(rel <= 1e-4 && cos >= 0.99999, format!("{tag} absorb_q band"));
+        t.check(
+            rel <= 1e-4 && cos >= 0.99999,
+            format!("{tag} absorb_q band"),
+        );
 
         // ---- host algebra: (qabs . c) + qt.kpe == qn . (Ak c) + qt.kpe ----
         {
@@ -331,8 +380,12 @@ fn run_geometry(gpu: &mut Gpu, g: &Geo, rows_list: &[usize], t: &mut Tally, seed
                 let kpe: Vec<f32> = (0..g.tail).map(|_| bf16_val(alg_rng.unit())).collect();
                 let qa = &a[(r * g.h + h) * ow..][..ow];
                 let qh = &q[(r * g.h + h) * xw..][..xw];
-                let lhs: f64 = (0..g.latent).map(|c| qa[c] as f64 * crow[c] as f64).sum::<f64>()
-                    + (0..g.tail).map(|j| qa[g.latent + j] as f64 * kpe[j] as f64).sum::<f64>();
+                let lhs: f64 = (0..g.latent)
+                    .map(|c| qa[c] as f64 * crow[c] as f64)
+                    .sum::<f64>()
+                    + (0..g.tail)
+                        .map(|j| qa[g.latent + j] as f64 * kpe[j] as f64)
+                        .sum::<f64>();
                 let mut rhs = 0.0f64;
                 let mut mag = 0.0f64;
                 for d in 0..g.nope {
@@ -360,20 +413,49 @@ fn run_geometry(gpu: &mut Gpu, g: &Geo, rows_list: &[usize], t: &mut Tally, seed
         }
         for round in [false, true] {
             let y0 = out_f32(gpu, ny, NAN_BITS);
-            gpu.latent_attention_absorb_v(&z_dev, &packed_dev, &y0, rows, g.h, g.nope, g.v, g.latent, round)
-                .expect("absorb_v");
+            gpu.latent_attention_absorb_v(
+                &z_dev,
+                &packed_dev,
+                &y0,
+                rows,
+                g.h,
+                g.nope,
+                g.v,
+                g.latent,
+                round,
+            )
+            .expect("absorb_v");
             let y = dl_f32(gpu, &y0);
             let y1 = out_f32(gpu, ny, BIG_BITS);
-            gpu.latent_attention_absorb_v(&z_dev, &packed_dev, &y1, rows, g.h, g.nope, g.v, g.latent, round)
-                .expect("absorb_v repeat");
+            gpu.latent_attention_absorb_v(
+                &z_dev,
+                &packed_dev,
+                &y1,
+                rows,
+                g.h,
+                g.nope,
+                g.v,
+                g.latent,
+                round,
+            )
+            .expect("absorb_v repeat");
             let yb = dl_f32(gpu, &y1);
             let tag = format!("{tag} v round={round}");
-            t.check(guard_ok(&y, ny) && guard_ok(&yb, ny), format!("{tag} y guard"));
             t.check(
-                y[..ny].iter().zip(&yb[..ny]).all(|(x, y)| x.to_bits() == y.to_bits()),
+                guard_ok(&y, ny) && guard_ok(&yb, ny),
+                format!("{tag} y guard"),
+            );
+            t.check(
+                y[..ny]
+                    .iter()
+                    .zip(&yb[..ny])
+                    .all(|(x, y)| x.to_bits() == y.to_bits()),
                 format!("{tag} repeat byte-identical (different poison)"),
             );
-            t.check(y[..ny].iter().all(|x| x.is_finite()), format!("{tag} y fully written"));
+            t.check(
+                y[..ny].iter().all(|x| x.is_finite()),
+                format!("{tag} y fully written"),
+            );
             let mut got_all = Vec::new();
             for &r in &sel {
                 got_all.extend_from_slice(&y[r * g.h * g.v..(r + 1) * g.h * g.v]);
@@ -407,8 +489,18 @@ fn run_geometry(gpu: &mut Gpu, g: &Geo, rows_list: &[usize], t: &mut Tally, seed
         let ny = rows * g.h * g.v;
         for round in [false, true] {
             let y0 = out_f32(gpu, ny, NAN_BITS);
-            gpu.latent_attention_absorb_v(&z_dev, &packed_dev, &y0, rows, g.h, g.nope, g.v, g.latent, round)
-                .expect("absorb_v onehot");
+            gpu.latent_attention_absorb_v(
+                &z_dev,
+                &packed_dev,
+                &y0,
+                rows,
+                g.h,
+                g.nope,
+                g.v,
+                g.latent,
+                round,
+            )
+            .expect("absorb_v onehot");
             let y = dl_f32(gpu, &y0);
             let mut exact = guard_ok(&y, ny);
             for r in 0..rows {
@@ -420,7 +512,10 @@ fn run_geometry(gpu: &mut Gpu, g: &Geo, rows_list: &[usize], t: &mut Tally, seed
                     }
                 }
             }
-            t.check(exact, format!("{} roundtrip one-hot rows={rows} round={round}", g.name));
+            t.check(
+                exact,
+                format!("{} roundtrip one-hot rows={rows} round={round}", g.name),
+            );
         }
     }
 }
@@ -438,38 +533,90 @@ fn expect_err(t: &mut Tally, what: &str, r: Result<(), hip_bridge::HipError>) {
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     println!("arch {}", gpu.arch);
-    let mut t = Tally { checks: 0, fails: 0 };
+    let mut t = Tally {
+        checks: 0,
+        fails: 0,
+    };
 
     let geos: [(Geo, &[usize]); 4] = [
         (
-            Geo { name: "raon", h: 40, nope: 128, tail: 64, v: 128, latent: 512 },
+            Geo {
+                name: "raon",
+                h: 40,
+                nope: 128,
+                tail: 64,
+                v: 128,
+                latent: 512,
+            },
             &[1, 2, 15, 16, 17, 33, 64, 129, 512, 4096],
         ),
         (
-            Geo { name: "H8-fixture", h: 8, nope: 64, tail: 32, v: 96, latent: 256 },
+            Geo {
+                name: "H8-fixture",
+                h: 8,
+                nope: 64,
+                tail: 32,
+                v: 96,
+                latent: 256,
+            },
             &[1, 2, 8, 9, 17, 64, 129, 512],
         ),
         (
-            Geo { name: "H3-w32-v48", h: 3, nope: 32, tail: 16, v: 48, latent: 64 },
+            Geo {
+                name: "H3-w32-v48",
+                h: 3,
+                nope: 32,
+                tail: 16,
+                v: 48,
+                latent: 64,
+            },
             &[1, 2, 8, 9, 15, 16, 17, 33, 64, 65, 129, 512],
         ),
         (
-            Geo { name: "H2-odd-tail", h: 2, nope: 16, tail: 6, v: 24, latent: 40 },
+            Geo {
+                name: "H2-odd-tail",
+                h: 2,
+                nope: 16,
+                tail: 6,
+                v: 24,
+                latent: 40,
+            },
             &[1, 3, 8, 9, 33, 129],
         ),
     ];
     for (i, (g, rows)) in geos.iter().enumerate() {
-        println!("geometry {} (H={} nope={} tail={} v={} latent={})", g.name, g.h, g.nope, g.tail, g.v, g.latent);
-        run_geometry(&mut gpu, g, rows, &mut t, 0x1234_5678_9abc_def1 ^ ((i as u64 + 1) * 0x9e37));
+        println!(
+            "geometry {} (H={} nope={} tail={} v={} latent={})",
+            g.name, g.h, g.nope, g.tail, g.v, g.latent
+        );
+        run_geometry(
+            &mut gpu,
+            g,
+            rows,
+            &mut t,
+            0x1234_5678_9abc_def1 ^ ((i as u64 + 1) * 0x9e37),
+        );
     }
 
     // ---- refusals ----
     {
         let w = up_f32(&mut gpu, &vec![0.0; 64 * 64]);
         let pk = up_bf16(&mut gpu, &vec![0u16; 64 * 64], false);
-        expect_err(&mut t, "pack nope%8", gpu.latent_attention_absorb_pack(&w, &pk, 1, 12, 8, 64));
-        expect_err(&mut t, "pack latent=0", gpu.latent_attention_absorb_pack(&w, &pk, 1, 8, 8, 0));
-        expect_err(&mut t, "pack too-small packed", gpu.latent_attention_absorb_pack(&w, &pk, 5, 8, 8, 64));
+        expect_err(
+            &mut t,
+            "pack nope%8",
+            gpu.latent_attention_absorb_pack(&w, &pk, 1, 12, 8, 64),
+        );
+        expect_err(
+            &mut t,
+            "pack latent=0",
+            gpu.latent_attention_absorb_pack(&w, &pk, 1, 8, 8, 0),
+        );
+        expect_err(
+            &mut t,
+            "pack too-small packed",
+            gpu.latent_attention_absorb_pack(&w, &pk, 5, 8, 8, 64),
+        );
         let q = up_f32(&mut gpu, &vec![0.0; 1024]);
         let out = up_f32(&mut gpu, &vec![0.0; 1024]);
         expect_err(

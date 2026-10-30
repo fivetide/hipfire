@@ -16,7 +16,10 @@ const TEMPLATE: &str = include_str!("fixtures/raon_tokenizer/chat_template.jinja
 const CASES: &str = include_str!("fixtures/raon_tokenizer/template.json");
 
 fn byte_char(b: u8) -> char {
-    let mut bs: Vec<u32> = (0x21..=0x7E).chain(0xA1..=0xAC).chain(0xAE..=0xFF).collect();
+    let mut bs: Vec<u32> = (0x21..=0x7E)
+        .chain(0xA1..=0xAC)
+        .chain(0xAE..=0xFF)
+        .collect();
     let mut cs = bs.clone();
     let mut n = 0;
     for b in 0u32..256 {
@@ -91,9 +94,16 @@ fn raon_template_generation_suffixes() {
         } else {
             "<|im_start|>assistant\n<think></think>\n\n"
         };
-        assert!(got.ends_with(want),
-            "case {}: bad suffix {:?}", c["name"], &got[got.len().saturating_sub(50)..]);
-        assert!(!got.starts_with("<|endoftext|>"), "no BOS in rendered prompt");
+        assert!(
+            got.ends_with(want),
+            "case {}: bad suffix {:?}",
+            c["name"],
+            &got[got.len().saturating_sub(50)..]
+        );
+        assert!(
+            !got.starts_with("<|endoftext|>"),
+            "no BOS in rendered prompt"
+        );
     }
 }
 
@@ -103,7 +113,9 @@ fn raon_template_tool_block_is_xml() {
     let cases: Vec<serde_json::Value> = serde_json::from_str(CASES).unwrap();
     let c = cases.iter().find(|c| c["name"] == "tool_history").unwrap();
     let got = render(&t, c).unwrap();
-    assert!(got.contains("<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\""));
+    assert!(
+        got.contains("<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\"")
+    );
     assert!(got.contains(
         "Let me check.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\n서울\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=add>\n"
     ));
@@ -168,7 +180,9 @@ fn raon_template_reasoning_started_in_think() {
     assert_eq!(r, "Let me think.\n");
     assert_eq!(c, "The answer is 4.");
     // Chunk-boundary invariance, including splitting inside the closer.
-    let chunks: Vec<&str> = full.split_inclusive(|ch| ch == '<' || ch == '/' || ch == 'k').collect();
+    let chunks: Vec<&str> = full
+        .split_inclusive(|ch| ch == '<' || ch == '/' || ch == 'k')
+        .collect();
     assert_eq!(route(true, &chunks), (r, c));
     // No closer: everything stays reasoning.
     let (r, c) = route(true, &["still thinking"]);

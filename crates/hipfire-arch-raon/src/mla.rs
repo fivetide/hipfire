@@ -161,7 +161,10 @@ fn parse_flag(name: &str, default: bool) -> Result<bool, String> {
 }
 
 impl MlaPolicy {
-    pub const DEFAULT: Self = Self { tiled: true, absorb: true };
+    pub const DEFAULT: Self = Self {
+        tiled: true,
+        absorb: true,
+    };
 
     pub fn from_env() -> Result<Self, String> {
         Ok(Self {
@@ -211,7 +214,11 @@ impl RaonMlaWork {
         policy: MlaPolicy,
     ) -> Result<Self, String> {
         let hip = |e: hip_bridge::HipError| format!("raon mla work: {e:?}");
-        let v_width = if policy.absorb { cfg.kv_lora.max(cfg.v_head) } else { cfg.v_head };
+        let v_width = if policy.absorb {
+            cfg.kv_lora.max(cfg.v_head)
+        } else {
+            cfg.v_head
+        };
         let ws = latent_attention_decode_workspace_elems(cfg.n_heads, v_width);
         let split_ws = gpu.zeros(&[ws], DType::F32).map_err(hip)?;
         let absorb = if policy.absorb {
@@ -224,7 +231,11 @@ impl RaonMlaWork {
                     .map_err(hip)
             });
             match z {
-                Ok((q_abs, z)) => Some(AbsorbWork { q_abs, z, packed: Vec::new() }),
+                Ok((q_abs, z)) => Some(AbsorbWork {
+                    q_abs,
+                    z,
+                    packed: Vec::new(),
+                }),
                 Err(e) => {
                     let _ = gpu.free_tensor(split_ws);
                     return Err(e);
@@ -233,7 +244,11 @@ impl RaonMlaWork {
         } else {
             None
         };
-        Ok(Self { policy, split_ws, absorb })
+        Ok(Self {
+            policy,
+            split_ws,
+            absorb,
+        })
     }
 
     pub fn policy(&self) -> MlaPolicy {
@@ -276,7 +291,8 @@ impl RaonMlaWork {
                 return Err(hip(e));
             }
         };
-        let elems = latent_attention_absorb_packed_elems(cfg.n_heads, cfg.qk_nope, cfg.v_head, latent);
+        let elems =
+            latent_attention_absorb_packed_elems(cfg.n_heads, cfg.qk_nope, cfg.v_head, latent);
         let mut built: Vec<GpuTensor> = Vec::new();
         let r = (|| -> Result<(), String> {
             for layer_idx in cfg.mla_layers() {
@@ -317,20 +333,26 @@ impl RaonMlaWork {
     }
 
     /// Attention route operands for MLA layer ordinal `mi` under `route`.
-    pub fn attention_route(&self, route: MlaRoute, mi: usize) -> Result<AttentionRoute<'_>, String> {
+    pub fn attention_route(
+        &self,
+        route: MlaRoute,
+        mi: usize,
+    ) -> Result<AttentionRoute<'_>, String> {
         let policy = self.policy;
         let ws = Some(&self.split_ws);
         match (route, policy.tiled) {
             (MlaRoute::Decompressed, false) => Ok(AttentionRoute::Reference),
             (MlaRoute::Decompressed, true) => Ok(AttentionRoute::Tiled { workspace: ws }),
             (MlaRoute::Absorbed, _) => {
-                let ab = self
-                    .absorb
-                    .as_ref()
-                    .filter(|a| mi < a.packed.len())
-                    .ok_or("raon mla: absorbed route selected but its packed weights are not built")?;
+                let ab = self.absorb.as_ref().filter(|a| mi < a.packed.len()).ok_or(
+                    "raon mla: absorbed route selected but its packed weights are not built",
+                )?;
                 Ok(AttentionRoute::Absorbed {
-                    ops: AbsorbOperands { packed: &ab.packed[mi], q_abs: &ab.q_abs, z: &ab.z },
+                    ops: AbsorbOperands {
+                        packed: &ab.packed[mi],
+                        q_abs: &ab.q_abs,
+                        z: &ab.z,
+                    },
                     workspace: ws,
                 })
             }
@@ -483,7 +505,10 @@ mod tests {
         let n = MlaTensorNames::for_layer(3);
         assert_eq!(n.q_a, "model.layers.3.self_attn.q_a_proj.weight");
         assert_eq!(n.kv_a, "model.layers.3.self_attn.kv_a_proj_with_mqa.weight");
-        assert_eq!(n.kv_a_norm, "model.layers.3.self_attn.kv_a_layernorm.weight");
+        assert_eq!(
+            n.kv_a_norm,
+            "model.layers.3.self_attn.kv_a_layernorm.weight"
+        );
         assert_eq!(n.kv_b, "model.layers.3.self_attn.kv_b_proj.weight");
         assert_eq!(n.g, "model.layers.3.self_attn.g_proj.weight");
         assert_eq!(n.o, "model.layers.3.self_attn.o_proj.weight");
@@ -505,8 +530,14 @@ mod tests {
     fn mirror_admission_is_bounded() {
         assert_eq!(mirror_bytes_per_row(), 40 * 256 * 2);
         assert_eq!(latent_cache_bytes(1), 1152);
-        assert_eq!(admitted_mirror_rows(1024, 1024 * mirror_bytes_per_row()), Some(1024));
-        assert_eq!(admitted_mirror_rows(1025, 1024 * mirror_bytes_per_row()), None);
+        assert_eq!(
+            admitted_mirror_rows(1024, 1024 * mirror_bytes_per_row()),
+            Some(1024)
+        );
+        assert_eq!(
+            admitted_mirror_rows(1025, 1024 * mirror_bytes_per_row()),
+            None
+        );
         assert_eq!(admitted_mirror_rows(usize::MAX, usize::MAX), None);
     }
 }

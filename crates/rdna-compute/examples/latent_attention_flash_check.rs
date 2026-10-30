@@ -90,9 +90,27 @@ fn geo_raon(h: usize, name: &'static str) -> Geo {
         name,
         h,
         bufs: vec![(h * 128, Role::K), (576, Role::K), (h * 128, Role::V)],
-        ka: ViewSpec { buf: 0, off: 0, tok: h * 128, head: 128, width: 128 },
-        kb: ViewSpec { buf: 1, off: 512, tok: 576, head: 0, width: 64 },
-        v: ViewSpec { buf: 2, off: 0, tok: h * 128, head: 128, width: 128 },
+        ka: ViewSpec {
+            buf: 0,
+            off: 0,
+            tok: h * 128,
+            head: 128,
+            width: 128,
+        },
+        kb: ViewSpec {
+            buf: 1,
+            off: 512,
+            tok: 576,
+            head: 0,
+            width: 64,
+        },
+        v: ViewSpec {
+            buf: 2,
+            off: 0,
+            tok: h * 128,
+            head: 128,
+            width: 128,
+        },
     }
 }
 
@@ -102,9 +120,27 @@ fn geo_absorbed(h: usize, latent: usize, tail: usize, name: &'static str) -> Geo
         name,
         h,
         bufs: vec![(ts, Role::Shared)],
-        ka: ViewSpec { buf: 0, off: 0, tok: ts, head: 0, width: latent },
-        kb: ViewSpec { buf: 0, off: latent, tok: ts, head: 0, width: tail },
-        v: ViewSpec { buf: 0, off: 0, tok: ts, head: 0, width: latent },
+        ka: ViewSpec {
+            buf: 0,
+            off: 0,
+            tok: ts,
+            head: 0,
+            width: latent,
+        },
+        kb: ViewSpec {
+            buf: 0,
+            off: latent,
+            tok: ts,
+            head: 0,
+            width: tail,
+        },
+        v: ViewSpec {
+            buf: 0,
+            off: 0,
+            tok: ts,
+            head: 0,
+            width: latent,
+        },
     }
 }
 
@@ -115,10 +151,32 @@ fn geo_generic(name: &'static str, h: usize, wa: usize, wb: usize, dv: usize) ->
     Geo {
         name,
         h,
-        bufs: vec![(h * ha + 16, Role::K), (wb + 24, Role::K), (h * hv + 8, Role::V)],
-        ka: ViewSpec { buf: 0, off: 8, tok: h * ha + 16, head: ha, width: wa },
-        kb: ViewSpec { buf: 1, off: 16, tok: wb + 24, head: 0, width: wb },
-        v: ViewSpec { buf: 2, off: 8, tok: h * hv + 8, head: hv, width: dv },
+        bufs: vec![
+            (h * ha + 16, Role::K),
+            (wb + 24, Role::K),
+            (h * hv + 8, Role::V),
+        ],
+        ka: ViewSpec {
+            buf: 0,
+            off: 8,
+            tok: h * ha + 16,
+            head: ha,
+            width: wa,
+        },
+        kb: ViewSpec {
+            buf: 1,
+            off: 16,
+            tok: wb + 24,
+            head: 0,
+            width: wb,
+        },
+        v: ViewSpec {
+            buf: 2,
+            off: 8,
+            tok: h * hv + 8,
+            head: hv,
+            width: dv,
+        },
     }
 }
 
@@ -129,9 +187,27 @@ fn geo_oracle() -> Geo {
         name: "oracle H8 64+32/96",
         h,
         bufs: vec![(h * 64, Role::K), (256 + 32, Role::K), (h * 96, Role::V)],
-        ka: ViewSpec { buf: 0, off: 0, tok: h * 64, head: 64, width: 64 },
-        kb: ViewSpec { buf: 1, off: 256, tok: 288, head: 0, width: 32 },
-        v: ViewSpec { buf: 2, off: 0, tok: h * 96, head: 96, width: 96 },
+        ka: ViewSpec {
+            buf: 0,
+            off: 0,
+            tok: h * 64,
+            head: 64,
+            width: 64,
+        },
+        kb: ViewSpec {
+            buf: 1,
+            off: 256,
+            tok: 288,
+            head: 0,
+            width: 32,
+        },
+        v: ViewSpec {
+            buf: 2,
+            off: 0,
+            tok: h * 96,
+            head: 96,
+            width: 96,
+        },
     }
 }
 
@@ -183,7 +259,11 @@ fn build_bufs(geo: &Geo, cap: usize, vis_end: usize, mode: usize, rng: &mut Rng)
     }
     // Rows beyond the visible range: poison everything in the row.
     for (bi, &(ts, role)) in geo.bufs.iter().enumerate() {
-        let (kp, vp) = if mode == 0 { (POISON_BIG, POISON_NAN) } else { (POISON_NAN, POISON_BIG) };
+        let (kp, vp) = if mode == 0 {
+            (POISON_BIG, POISON_NAN)
+        } else {
+            (POISON_NAN, POISON_BIG)
+        };
         for t in vis_end..cap {
             let lo = t * ts;
             let hi = ((t + 1) * ts).min(bits[bi].len());
@@ -192,19 +272,32 @@ fn build_bufs(geo: &Geo, cap: usize, vis_end: usize, mode: usize, rng: &mut Rng)
                     Role::K => kp,
                     Role::V => vp,
                     Role::Shared => {
-                        if e % 2 == 0 { kp } else { vp }
+                        if e % 2 == 0 {
+                            kp
+                        } else {
+                            vp
+                        }
                     }
                 };
             }
         }
     }
-    let f = bits.iter().map(|b| b.iter().map(|&x| bf16_f32(x)).collect()).collect();
+    let f = bits
+        .iter()
+        .map(|b| b.iter().map(|&x| bf16_f32(x)).collect())
+        .collect();
     HostBufs { bits, f }
 }
 
 /// F64 host reference, `[rows][H][dv]`.
 fn reference(
-    geo: &Geo, hb: &HostBufs, q: &[f32], rows: usize, pos: i32, po: usize, max_rows: usize,
+    geo: &Geo,
+    hb: &HostBufs,
+    q: &[f32],
+    rows: usize,
+    pos: i32,
+    po: usize,
+    max_rows: usize,
     scale: f32,
 ) -> Vec<f64> {
     let (h, dq, dv) = (geo.h, geo.dq(), geo.v.width);
@@ -274,10 +367,22 @@ fn metrics(got: &[f32], want: &[f64]) -> Metrics {
         mx = mx.max((g - w).abs());
     }
     if ww == 0.0 {
-        return Metrics { rel_l2: dd.sqrt(), cos: if gg == 0.0 { 1.0 } else { 0.0 }, max_abs: mx };
+        return Metrics {
+            rel_l2: dd.sqrt(),
+            cos: if gg == 0.0 { 1.0 } else { 0.0 },
+            max_abs: mx,
+        };
     }
-    let cos = if gg == 0.0 { 0.0 } else { gw / (gg.sqrt() * ww.sqrt()) };
-    Metrics { rel_l2: (dd / ww).sqrt(), cos, max_abs: mx }
+    let cos = if gg == 0.0 {
+        0.0
+    } else {
+        gw / (gg.sqrt() * ww.sqrt())
+    };
+    Metrics {
+        rel_l2: (dd / ww).sqrt(),
+        cos,
+        max_abs: mx,
+    }
 }
 
 struct Runner<'a> {
@@ -290,7 +395,8 @@ impl Runner<'_> {
         if self.emu {
             let src = format!(
                 "#define LAF_EMU_GFX11 1\n#define latent_attention_flash_prefill \
-                 latent_attention_flash_prefill_emu11\n{LATENT_ATTENTION_FLASH_SRC}"
+                 latent_attention_flash_prefill_emu11\n#define latent_attention_flash_prefill_wide \
+                 latent_attention_flash_prefill_emu11_wide\n{LATENT_ATTENTION_FLASH_SRC}"
             );
             self.gpu
                 .latent_attention_flash_prefill_with_source(
@@ -316,9 +422,7 @@ struct Totals {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_case(
-    r: &mut Runner<'_>, geo: &Geo, c: &Case, idx: usize, seed: u64, tot: &mut Totals,
-) {
+fn run_case(r: &mut Runner<'_>, geo: &Geo, c: &Case, idx: usize, seed: u64, tot: &mut Totals) {
     let (h, dq, dv) = (geo.h, geo.dq(), geo.v.width);
     let scale = (dq as f32).powf(-0.5);
     let reach = (c.pos as i64 + c.po as i64 + c.rows as i64).max(0) as usize;
@@ -327,10 +431,17 @@ fn run_case(
         None => (reach.max(1) + 37, false),
     };
     let vis_end = reach.min(max_rows_main);
-    let cap = max_rows_main + if truncating || c.max_rows.is_some() { 37 } else { 0 };
+    let cap = max_rows_main
+        + if truncating || c.max_rows.is_some() {
+            37
+        } else {
+            0
+        };
     let mut rng = Rng(seed ^ (idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let hb = build_bufs(geo, cap, vis_end, idx % 2, &mut rng);
-    let qv: Vec<f32> = (0..c.rows * h * dq).map(|_| bf16_f32(bf16_rne(rng.unit() * c.amp))).collect();
+    let qv: Vec<f32> = (0..c.rows * h * dq)
+        .map(|_| bf16_f32(bf16_rne(rng.unit() * c.amp)))
+        .collect();
     let want = reference(geo, &hb, &qv, c.rows, c.pos, c.po, max_rows_main, scale);
     let label = format!(
         "{} pos={} po={} rows={} max_rows={:?} amp={}",
@@ -377,7 +488,8 @@ fn run_case(
     let note = |tot: &mut Totals, msg: String| {
         tot.fails.push(format!("{label}: {msg}"));
     };
-    let bytes = |y: &[f32]| -> Vec<u8> { y.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect() };
+    let bytes =
+        |y: &[f32]| -> Vec<u8> { y.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect() };
 
     tot.cases += 1;
     let mut plain: Option<Vec<f32>> = None;
@@ -385,29 +497,58 @@ fn run_case(
         let y1 = run(r, max_rows_main, round, tot);
         let y2 = run(r, max_rows_main, round, tot);
         if bytes(&y1) != bytes(&y2) {
-            note(tot, format!("round={round}: repeat run is not byte-identical"));
+            note(
+                tot,
+                format!("round={round}: repeat run is not byte-identical"),
+            );
         }
         if !truncating {
             let y3 = run(r, vis_end.max(1), round, tot);
             if bytes(&y1) != bytes(&y3) {
-                note(tot, format!("round={round}: bytes differ for max_rows={}", vis_end.max(1)));
+                note(
+                    tot,
+                    format!(
+                        "round={round}: bytes differ for max_rows={}",
+                        vis_end.max(1)
+                    ),
+                );
             }
         }
         if y1.iter().any(|v| !v.is_finite()) {
-            note(tot, format!("round={round}: non-finite/unwritten outputs"));
+            let bad = y1.iter().filter(|v| !v.is_finite()).count();
+            let first = y1.iter().position(|v| !v.is_finite()).unwrap_or(0);
+            note(
+                tot,
+                format!(
+                    "round={round}: non-finite/unwritten outputs ({bad} of {}, first at {first} = row {} head {} col {})",
+                    y1.len(),
+                    first / (geo.h * dv),
+                    first / dv % geo.h,
+                    first % dv
+                ),
+            );
             continue;
         }
         // Rows with no visible key are exact zeros.
         for i in 0..c.rows {
             let lim = (c.pos as i64 + c.po as i64 + i as i64).min(max_rows_main as i64 - 1);
             if lim < 0 && y1[i * h * dv..(i + 1) * h * dv].iter().any(|&v| v != 0.0) {
-                note(tot, format!("round={round}: row {i} has no visible key but is nonzero"));
+                note(
+                    tot,
+                    format!("round={round}: row {i} has no visible key but is nonzero"),
+                );
                 break;
             }
         }
         let m = metrics(&y1, &want);
         if m.rel_l2 > REL_L2_MAX || m.cos < COS_MIN {
-            note(tot, format!("round={round}: rel_l2={:.3e} cos={:.7} max_abs={:.3e}", m.rel_l2, m.cos, m.max_abs));
+            note(
+                tot,
+                format!(
+                    "round={round}: rel_l2={:.3e} cos={:.7} max_abs={:.3e}",
+                    m.rel_l2, m.cos, m.max_abs
+                ),
+            );
         }
         if !round {
             tot.worst_rel = tot.worst_rel.max(m.rel_l2);
@@ -422,7 +563,10 @@ fn run_case(
                 let want_bits: Vec<u32> = p.iter().map(|&v| (bf16_rne(v) as u32) << 16).collect();
                 let got_bits: Vec<u32> = y1.iter().map(|v| v.to_bits()).collect();
                 if want_bits != got_bits {
-                    note(tot, "round=true differs from bf16(round=false) output".into());
+                    note(
+                        tot,
+                        "round=true differs from bf16(round=false) output".into(),
+                    );
                 }
             }
         }
@@ -435,29 +579,87 @@ fn run_case(
 }
 
 fn cases_for(quick: bool) -> Vec<Case> {
-    let pos_list: &[i32] = if quick { &[0, 17, 64, 200] } else { &[0, 1, 15, 16, 17, 62, 63, 64, 65, 126, 127, 128, 200, 1000] };
-    let rows_list: &[usize] = if quick { &[1, 16, 33, 129] } else { &[1, 2, 15, 16, 17, 33, 64, 65, 129] };
+    let pos_list: &[i32] = if quick {
+        &[0, 17, 64, 200]
+    } else {
+        &[0, 1, 15, 16, 17, 62, 63, 64, 65, 126, 127, 128, 200, 1000]
+    };
+    let rows_list: &[usize] = if quick {
+        &[1, 16, 33, 129]
+    } else {
+        &[1, 2, 15, 16, 17, 33, 64, 65, 129]
+    };
     let mut v = Vec::new();
     for &pos in pos_list {
         for &rows in rows_list {
-            v.push(Case { pos, po: 0, rows, max_rows: None, amp: 1.0 });
+            v.push(Case {
+                pos,
+                po: 0,
+                rows,
+                max_rows: None,
+                amp: 1.0,
+            });
         }
     }
     // pos_offset != 0
-    for &(pos, po, rows) in &[(0, 17, 33), (15, 64, 65), (200, 33, 129), (1000, 5, 17), (0, 1, 1), (7, 0, 16)] {
-        v.push(Case { pos, po, rows, max_rows: None, amp: 1.0 });
+    for &(pos, po, rows) in &[
+        (0, 17, 33),
+        (15, 64, 65),
+        (200, 33, 129),
+        (1000, 5, 17),
+        (0, 1, 1),
+        (7, 0, 16),
+    ] {
+        v.push(Case {
+            pos,
+            po,
+            rows,
+            max_rows: None,
+            amp: 1.0,
+        });
     }
     // max_rows truncation (and max_rows below the call's first row).
-    for &(pos, po, rows, mr) in &[(100, 0, 65, 130), (0, 0, 129, 70), (200, 0, 33, 20), (64, 0, 64, 100), (30, 7, 17, 40), (0, 0, 16, 16)] {
-        v.push(Case { pos, po, rows, max_rows: Some(mr), amp: 1.0 });
+    for &(pos, po, rows, mr) in &[
+        (100, 0, 65, 130),
+        (0, 0, 129, 70),
+        (200, 0, 33, 20),
+        (64, 0, 64, 100),
+        (30, 7, 17, 40),
+        (0, 0, 16, 16),
+    ] {
+        v.push(Case {
+            pos,
+            po,
+            rows,
+            max_rows: Some(mr),
+            amp: 1.0,
+        });
     }
     // Rows with no visible key.
     for &(pos, rows) in &[(-3, 33), (-70, 65), (-20, 65), (-1, 1), (-16, 17)] {
-        v.push(Case { pos, po: 0, rows, max_rows: None, amp: 1.0 });
+        v.push(Case {
+            pos,
+            po: 0,
+            rows,
+            max_rows: None,
+            amp: 1.0,
+        });
     }
     // Peaked attention.
-    v.push(Case { pos: 200, po: 0, rows: 65, max_rows: None, amp: 6.0 });
-    v.push(Case { pos: 17, po: 0, rows: 33, max_rows: None, amp: 6.0 });
+    v.push(Case {
+        pos: 200,
+        po: 0,
+        rows: 65,
+        max_rows: None,
+        amp: 6.0,
+    });
+    v.push(Case {
+        pos: 17,
+        po: 0,
+        rows: 33,
+        max_rows: None,
+        amp: 6.0,
+    });
     v
 }
 
@@ -467,7 +669,27 @@ fn run_suite(r: &mut Runner<'_>, quick: bool, tag: &str) -> bool {
         geo_absorbed(4, 512, 64, "absorbed H4 512+64/512 head_stride 0"),
         geo_generic("generic H3 32+16/48", 3, 32, 16, 48),
         geo_oracle(),
-        geo_generic("multi-chunk H2 48+16/192", 2, 48, 16, 192),
+        geo_generic(
+            "multi-chunk H2 48+16/192 (wide kernel, 4 x 48 cols)",
+            2,
+            48,
+            16,
+            192,
+        ),
+        geo_generic(
+            "multi-chunk H2 48+16/160 (chunked kernel, 128 + 32 cols)",
+            2,
+            48,
+            16,
+            160,
+        ),
+        geo_generic(
+            "wide H2 64+64/512 (wide kernel, 4 x 128 cols)",
+            2,
+            64,
+            64,
+            512,
+        ),
         geo_absorbed(2, 256, 32, "absorbed-small H2 256+32/256"),
     ];
     if !quick {
@@ -477,14 +699,39 @@ fn run_suite(r: &mut Runner<'_>, quick: bool, tag: &str) -> bool {
     for (gi, geo) in geos.iter().enumerate() {
         let cases = if geo.h == 40 {
             vec![
-                Case { pos: 1000, po: 0, rows: 65, max_rows: None, amp: 1.0 },
-                Case { pos: 0, po: 0, rows: 129, max_rows: None, amp: 1.0 },
-                Case { pos: 200, po: 17, rows: 33, max_rows: Some(150), amp: 1.0 },
+                Case {
+                    pos: 1000,
+                    po: 0,
+                    rows: 65,
+                    max_rows: None,
+                    amp: 1.0,
+                },
+                Case {
+                    pos: 0,
+                    po: 0,
+                    rows: 129,
+                    max_rows: None,
+                    amp: 1.0,
+                },
+                Case {
+                    pos: 200,
+                    po: 17,
+                    rows: 33,
+                    max_rows: Some(150),
+                    amp: 1.0,
+                },
             ]
         } else {
             cases_for(quick)
         };
-        let mut tot = Totals { cases: 0, launches: 0, fails: vec![], worst_rel: 0.0, worst_cos: 1.0, worst_abs: 0.0 };
+        let mut tot = Totals {
+            cases: 0,
+            launches: 0,
+            fails: vec![],
+            worst_rel: 0.0,
+            worst_cos: 1.0,
+            worst_abs: 0.0,
+        };
         for (ci, c) in cases.iter().enumerate() {
             run_case(r, geo, c, ci, 0xA5A5_0000 + gi as u64, &mut tot);
         }
@@ -515,11 +762,17 @@ fn main() {
     let is_gfx12 = gpu.arch.starts_with("gfx12");
     let mut ok = true;
     {
-        let mut r = Runner { gpu: &mut gpu, emu: false };
+        let mut r = Runner {
+            gpu: &mut gpu,
+            emu: false,
+        };
         ok &= run_suite(&mut r, quick, if is_gfx12 { "gfx12" } else { "native" });
     }
     if is_gfx12 && !no_emu {
-        let mut r = Runner { gpu: &mut gpu, emu: true };
+        let mut r = Runner {
+            gpu: &mut gpu,
+            emu: true,
+        };
         ok &= run_suite(&mut r, true, "gfx11-layout-emu");
     }
     println!("{}", if ok { "ALL PASS" } else { "FAILURES" });

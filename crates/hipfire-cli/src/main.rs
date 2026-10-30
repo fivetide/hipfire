@@ -11078,7 +11078,9 @@ mod tests {
         let plain = recorded_quantizer_argv("q-plain", &[]).expect("plain quantize");
         assert_eq!(plain.len(), 6, "argv: {plain:?}");
         assert_eq!(&plain[4], "--format");
-        assert!(!plain.iter().any(|a| a == "--mq4v2-symmetric" || a == "--tier"));
+        assert!(!plain
+            .iter()
+            .any(|a| a == "--mq4v2-symmetric" || a == "--tier"));
     }
 
     #[cfg(unix)]
@@ -11087,10 +11089,7 @@ mod tests {
         let err = recorded_quantizer_argv("q-badfmt", &["--format", "q8", "--mq4v2-symmetric"])
             .unwrap_err();
         assert!(err.to_string().contains("--format mq4 only"), "{err:#}");
-        assert!(Cli::try_parse_from([
-            "hipfire", "quantize", "m", "--tier", "bogus"
-        ])
-        .is_err());
+        assert!(Cli::try_parse_from(["hipfire", "quantize", "m", "--tier", "bogus"]).is_err());
     }
     #[test]
     fn run_stats_are_authoritative_and_missing_is_not_wall_rate() {

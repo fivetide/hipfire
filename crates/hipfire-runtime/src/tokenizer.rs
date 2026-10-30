@@ -135,7 +135,9 @@ impl PretokSplitter {
             });
         }
         if pattern.contains(RAON_PRETOK_MARKER) {
-            return Err("CJK-class pre-tokenizer regex is not the exact supported Raon pattern".into());
+            return Err(
+                "CJK-class pre-tokenizer regex is not the exact supported Raon pattern".into(),
+            );
         }
         let (src, has_tail) = match pattern.find(WS_LOOKAHEAD_ALT) {
             None => (pattern.to_owned(), false),
@@ -4865,34 +4867,76 @@ mod raon_pretok_tests {
     #[test]
     fn raon_pretok_hardcoded_pieces() {
         let s = splitter();
-        assert_eq!(pieces(&s, "Hello World foo bar  baz"), v(&["Hello World foo bar", " ", " baz"]));
+        assert_eq!(
+            pieces(&s, "Hello World foo bar  baz"),
+            v(&["Hello World foo bar", " ", " baz"])
+        );
         assert_eq!(
             pieces(&s, "1 12 123 1234 12345 123456 1234567"),
-            v(&["1", " ", "12", " ", "123", " ", "1", "234", " ", "12", "345", " ", "123", "456", " ", "1", "234", "567"])
+            v(&[
+                "1", " ", "12", " ", "123", " ", "1", "234", " ", "12", "345", " ", "123", "456",
+                " ", "1", "234", "567"
+            ])
         );
         assert_eq!(
             pieces(&s, "x_1234 1234_5678 a1b22c333"),
-            v(&["x", "_", "1", "234", " ", "1", "234", "_", "5", "678", " a", "1", "b", "22", "c", "333"])
+            v(&[
+                "x", "_", "1", "234", " ", "1", "234", "_", "5", "678", " a", "1", "b", "22", "c",
+                "333"
+            ])
         );
         assert_eq!(
-            pieces(&s, "\u{4e00}\u{9fa5}\u{9fa6}\u{9fff}\u{3400} \u{6f22}\u{5b57}"),
-            v(&["\u{4e00}\u{9fa5}", "\u{9fa6}\u{9fff}\u{3400}", " \u{6f22}\u{5b57}"])
+            pieces(
+                &s,
+                "\u{4e00}\u{9fa5}\u{9fa6}\u{9fff}\u{3400} \u{6f22}\u{5b57}"
+            ),
+            v(&[
+                "\u{4e00}\u{9fa5}",
+                "\u{9fa6}\u{9fff}\u{3400}",
+                " \u{6f22}\u{5b57}"
+            ])
         );
         assert_eq!(
             pieces(&s, "hello世界안녕こんにちはworld123세계"),
-            v(&["hello", "世界", "안녕", "こんにちは", "world", "123", "세계"])
+            v(&[
+                "hello",
+                "世界",
+                "안녕",
+                "こんにちは",
+                "world",
+                "123",
+                "세계"
+            ])
         );
         assert_eq!(
             pieces(&s, "line with trailing   \nnext line  \n\n  indent\n   "),
-            v(&["line with trailing", "   \n", "next line", "  \n\n", " ", " indent", "\n", "   "])
+            v(&[
+                "line with trailing",
+                "   \n",
+                "next line",
+                "  \n\n",
+                " ",
+                " indent",
+                "\n",
+                "   "
+            ])
         );
-        assert_eq!(pieces(&s, "a\r\nb\r\n\r\nc\r\n  d\r"), v(&["a", "\r\n", "b", "\r\n\r\n", "c", "\r\n", " ", " d", "\r"]));
+        assert_eq!(
+            pieces(&s, "a\r\nb\r\n\r\nc\r\n  d\r"),
+            v(&["a", "\r\n", "b", "\r\n\r\n", "c", "\r\n", " ", " d", "\r"])
+        );
         assert_eq!(
             pieces(&s, "a\tb\t\tc\u{a0}d\u{a0}\u{a0}e \u{a0}f\t \tg"),
-            v(&["a", "\t", "b", "\t", "\t", "c", "\u{a0}", "d", "\u{a0}", "\u{a0}", "e", " ", "\u{a0}", "f", "\t ", "\t", "g"])
+            v(&[
+                "a", "\t", "b", "\t", "\t", "c", "\u{a0}", "d", "\u{a0}", "\u{a0}", "e", " ",
+                "\u{a0}", "f", "\t ", "\t", "g"
+            ])
         );
         // Combining mark after a space is not a letter-word start.
-        assert_eq!(pieces(&s, "caf\u{e9} \u{301}x"), v(&["caf\u{e9}", " \u{301}", "x"]));
+        assert_eq!(
+            pieces(&s, "caf\u{e9} \u{301}x"),
+            v(&["caf\u{e9}", " \u{301}", "x"])
+        );
         // Superscripts / Arabic-Indic / fullwidth are \p{N}, grouped right-aligned.
         assert_eq!(
             pieces(&s, "\u{661}\u{662}\u{663}\u{664}\u{665} \u{ff11}\u{ff12}\u{ff13}\u{ff14} x\u{b2}\u{b3}\u{b9}"),
@@ -4937,21 +4981,38 @@ mod raon_pretok_tests {
         // Wrong behavior/invert with the Raon pattern: load error, not fallback.
         for (b, inv) in [("Removed", true), ("Isolated", true), ("Removed", false)] {
             let e = pretokenizer_from_hf_json(&split_node(RAON_PRETOK_PATTERN, b, inv));
-            assert!(matches!(e, Err(TokenizerError::UnsupportedPreTokenizer { .. })), "{b} {inv}");
+            assert!(
+                matches!(e, Err(TokenizerError::UnsupportedPreTokenizer { .. })),
+                "{b} {inv}"
+            );
         }
         // Modified CJK-class pattern (not the exact literal): error.
-        let altered = RAON_PRETOK_PATTERN.replace("[^\\s\\p{L}\\p{N}]+[\\r\\n/]*", "[^\\s\\p{L}\\p{N}]+[\\r\\n]*");
+        let altered = RAON_PRETOK_PATTERN.replace(
+            "[^\\s\\p{L}\\p{N}]+[\\r\\n/]*",
+            "[^\\s\\p{L}\\p{N}]+[\\r\\n]*",
+        );
         assert_ne!(altered, RAON_PRETOK_PATTERN);
         let e = pretokenizer_from_hf_json(&split_node(&altered, "Isolated", false));
-        assert!(matches!(e, Err(TokenizerError::UnsupportedPreTokenizer { .. })));
+        assert!(matches!(
+            e,
+            Err(TokenizerError::UnsupportedPreTokenizer { .. })
+        ));
     }
 
     fn hf_path() -> Option<std::path::PathBuf> {
         match std::env::var_os("HIPFIRE_RAON_TOKENIZER") {
             Some(p) => {
                 let p = std::path::PathBuf::from(p);
-                let p = if p.is_dir() { p.join("tokenizer.json") } else { p };
-                assert!(p.is_file(), "HIPFIRE_RAON_TOKENIZER={} is not a file", p.display());
+                let p = if p.is_dir() {
+                    p.join("tokenizer.json")
+                } else {
+                    p
+                };
+                assert!(
+                    p.is_file(),
+                    "HIPFIRE_RAON_TOKENIZER={} is not a file",
+                    p.display()
+                );
                 Some(p)
             }
             None => {
@@ -4967,7 +5028,10 @@ mod raon_pretok_tests {
         let Some(path) = hf_path() else { return };
         let tok = Tokenizer::from_hf_json(&std::fs::read_to_string(path).unwrap())
             .expect("official Raon tokenizer.json loads");
-        assert!(tok.hf_pretok.is_some(), "Raon splitter variant must be selected");
+        assert!(
+            tok.hf_pretok.is_some(),
+            "Raon splitter variant must be selected"
+        );
         let fx: serde_json::Value = serde_json::from_str(PARITY).unwrap();
         for c in fx["cases"].as_array().unwrap() {
             let text = c["text"].as_str().unwrap();

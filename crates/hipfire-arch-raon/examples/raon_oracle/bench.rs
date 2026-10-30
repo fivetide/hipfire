@@ -100,7 +100,9 @@ fn sync(gpu: &Gpu) -> Result<(), String> {
 
 fn opt_usize(opts: &BTreeMap<String, String>, key: &str, default: usize) -> Result<usize, String> {
     match opts.get(key) {
-        Some(s) => s.parse::<usize>().map_err(|e| format!("--{key} `{s}`: {e}")),
+        Some(s) => s
+            .parse::<usize>()
+            .map_err(|e| format!("--{key} `{s}`: {e}")),
         None => Ok(default),
     }
 }
@@ -184,7 +186,9 @@ fn stats(v: &[f64]) -> Value {
 // ───────────────────────── identity / environment ─────────────────────────
 
 fn read_trim(path: &str) -> Option<String> {
-    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 /// The line of a `pp_dpm_*` table marked active (`*`).
@@ -604,9 +608,20 @@ pub fn bucket_of(kernel: &str) -> &'static str {
             "mla_decompress"
         };
     }
-    if has("moe") || has("expert") || has("topk") || (has("ffn_situ") && has("grouped")) || (has("grouped") && has("ffn")) {
-        if has("router") || has("topk") || (has("scatter") && !has("unscatter")) || has("histogram")
-            || has("offsets") || has("permute") || has("combine_order") || has("sorted")
+    if has("moe")
+        || has("expert")
+        || has("topk")
+        || (has("ffn_situ") && has("grouped"))
+        || (has("grouped") && has("ffn"))
+    {
+        if has("router")
+            || has("topk")
+            || (has("scatter") && !has("unscatter"))
+            || has("histogram")
+            || has("offsets")
+            || has("permute")
+            || has("combine_order")
+            || has("sorted")
         {
             return "moe_route";
         }
@@ -636,8 +651,14 @@ pub fn bucket_of(kernel: &str) -> &'static str {
     if has("gemm") || has("gemv") || has("mmq") || has("wmma") || has("rocblas") || has("matmul") {
         return "trunk_gemm";
     }
-    if has("round") || has("convert") || has("copy") || has("add") || has("mul") || has("silu")
-        || has("swiglu") || has("cast")
+    if has("round")
+        || has("convert")
+        || has("copy")
+        || has("add")
+        || has("mul")
+        || has("silu")
+        || has("swiglu")
+        || has("cast")
     {
         return "elementwise";
     }
@@ -647,7 +668,11 @@ pub fn bucket_of(kernel: &str) -> &'static str {
 /// Accumulated launches: `(kernel, is_head) -> (calls, total_us)`.
 type KernelTable = HashMap<(String, bool), (u64, f64)>;
 
-fn absorb(table: &mut KernelTable, entries: Vec<rdna_compute::profile::LaunchEntry>, head: &[String]) {
+fn absorb(
+    table: &mut KernelTable,
+    entries: Vec<rdna_compute::profile::LaunchEntry>,
+    head: &[String],
+) {
     // The head is the tail of a forward that returns logits: tag the trailing
     // launches whose names equal the standalone readout's, in order.
     let n = entries.len();
@@ -764,13 +789,21 @@ fn section_report(
 fn launch_floor_us(gpu: &mut Gpu) -> Result<f64, String> {
     let t = hip(gpu.alloc_tensor(&[64], DType::F32), "alloc floor probe")?;
     for _ in 0..16 {
-        hip(gpu.bf16_round_trip_f32_strided(&t, 1, 0, 64, 64), "floor warmup")?;
+        hip(
+            gpu.bf16_round_trip_f32_strided(&t, 1, 0, 64, 64),
+            "floor warmup",
+        )?;
     }
     sync(gpu)?;
     rdna_compute::profile::start_launches();
     let mut r = Ok(());
     for _ in 0..512 {
-        r = r.and_then(|_| hip(gpu.bf16_round_trip_f32_strided(&t, 1, 0, 64, 64), "floor probe"));
+        r = r.and_then(|_| {
+            hip(
+                gpu.bf16_round_trip_f32_strided(&t, 1, 0, 64, 64),
+                "floor probe",
+            )
+        });
     }
     let entries = rdna_compute::profile::stop_launches().unwrap_or_default();
     let _ = gpu.free_tensor(t);
@@ -935,8 +968,16 @@ fn rebucket(path: &str) -> Result<Value, String> {
     let mut unmatched = std::collections::BTreeSet::new();
     for s in secs {
         let mut table = KernelTable::new();
-        for k in s.get("kernels").and_then(Value::as_array).into_iter().flatten() {
-            let name = k.get("name").and_then(Value::as_str).ok_or("kernel row lacks name")?;
+        for k in s
+            .get("kernels")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let name = k
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or("kernel row lacks name")?;
             let head = k.get("head").and_then(Value::as_bool).unwrap_or(false);
             let calls = k.get("calls").and_then(Value::as_u64).unwrap_or(0);
             let us = k.get("total_us").and_then(Value::as_f64).unwrap_or(0.0);
@@ -984,7 +1025,11 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
         .get("pp")
         .ok_or("bench: missing --pp")?
         .split(',')
-        .map(|t| t.trim().parse::<usize>().map_err(|e| format!("--pp `{t}`: {e}")))
+        .map(|t| {
+            t.trim()
+                .parse::<usize>()
+                .map_err(|e| format!("--pp `{t}`: {e}"))
+        })
         .collect::<Result<_, _>>()?;
     let tg = opt_usize(opts, "tg", 128)?;
     let reps = opt_usize(opts, "reps", 3)?;
@@ -1006,7 +1051,10 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
         .map_err(|e| format!("read prompt {}: {e}", prompt_file.display()))?;
     let prompt_md5 = md5_hex(text.as_bytes());
 
-    let model_id = model_identity(&model, opts.get("model-md5").map(String::as_str) == Some("skip"))?;
+    let model_id = model_identity(
+        &model,
+        opts.get("model-md5").map(String::as_str) == Some("skip"),
+    )?;
     let hfq = HfqFile::open(Path::new(&model)).map_err(|e| format!("open {model}: {e}"))?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer from HFQ metadata: {e:?}"))?;
@@ -1024,11 +1072,15 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
     let max_pp = pps.iter().copied().max().unwrap_or(0);
     let need = max_pp.max(if tg > 0 { tg_prompt + tg } else { 0 });
     let max_seq = match opts.get("max-seq") {
-        Some(s) => s.parse::<usize>().map_err(|e| format!("--max-seq `{s}`: {e}"))?,
+        Some(s) => s
+            .parse::<usize>()
+            .map_err(|e| format!("--max-seq `{s}`: {e}"))?,
         None => (need + 64).max(512),
     };
     if max_seq < need {
-        return Err(format!("--max-seq {max_seq} < the {need} rows the run needs"));
+        return Err(format!(
+            "--max-seq {max_seq} < the {need} rows the run needs"
+        ));
     }
 
     let precision = match PrefillPrecision::from_env()? {
@@ -1045,6 +1097,22 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
         "clocks_at_start": clocks_json(&pci),
     });
     let mut bundle = load_bundle(&mut gpu, ModelSource::Hfq(hfq), &model, max_seq)?;
+    // `--mirror-budget-rows N`: force the decompressed-route mirror budget so the absorbed route
+    // serves the rows beyond it (emulates a smaller card; recorded in the result JSON).
+    let forced_budget = match opts.get("mirror-budget-rows") {
+        Some(v) => {
+            let rows = v
+                .parse::<usize>()
+                .map_err(|e| format!("--mirror-budget-rows `{v}`: {e}"))?;
+            bundle.state.set_mirror_budget_rows(rows);
+            Some(rows)
+        }
+        None => None,
+    };
+    eprintln!(
+        "bench: mirror budget {} rows",
+        bundle.state.mirror_budget_rows()
+    );
     let result = (|| -> Result<Value, String> {
         bundle.set_prefill_mode(mode);
         let mut pass = true;
@@ -1071,7 +1139,16 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
         }
         let mut tg_row = Value::Null;
         if tg > 0 && !profile {
-            match bench_tg(&mut bundle, &mut gpu, &stream, tg, tg_prompt, reps, warmup, &pci) {
+            match bench_tg(
+                &mut bundle,
+                &mut gpu,
+                &stream,
+                tg,
+                tg_prompt,
+                reps,
+                warmup,
+                &pci,
+            ) {
                 Ok(v) => {
                     eprintln!(
                         "bench: tg{tg}: greedy {:.2} tok/s mean, device_loop {:.2} tok/s mean",
@@ -1131,6 +1208,8 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
                 "prefill_precision": precision,
                 "decode_route": bundle.decode_mode(),
                 "max_seq": max_seq,
+                "mirror_budget_rows": bundle.state.mirror_budget_rows(),
+                "mirror_budget_forced": forced_budget,
                 "env": env_controls(),
             },
             "prompt": {

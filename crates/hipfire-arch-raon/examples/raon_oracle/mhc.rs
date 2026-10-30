@@ -63,7 +63,10 @@ fn read_safetensors(path: &Path) -> Result<Tensors, String> {
     let header: Value = serde_json::from_slice(&bytes[8..body])
         .map_err(|e| format!("{}: header json: {e}", path.display()))?;
     let mut out = Tensors::new();
-    for (name, meta) in header.as_object().ok_or("safetensors header is not an object")? {
+    for (name, meta) in header
+        .as_object()
+        .ok_or("safetensors header is not an object")?
+    {
         if name == "__metadata__" {
             continue;
         }
@@ -78,7 +81,10 @@ fn read_safetensors(path: &Path) -> Result<Tensors, String> {
             .as_array()
             .filter(|a| a.len() == 2)
             .ok_or_else(|| format!("{name}: no data_offsets"))?;
-        let (s, e) = (off[0].as_u64().unwrap_or(0) as usize, off[1].as_u64().unwrap_or(0) as usize);
+        let (s, e) = (
+            off[0].as_u64().unwrap_or(0) as usize,
+            off[1].as_u64().unwrap_or(0) as usize,
+        );
         let raw = bytes
             .get(body + s..body + e)
             .ok_or_else(|| format!("{name}: data range outside file"))?;
@@ -121,7 +127,10 @@ fn load_manifest(dir: &Path, opts: &Opts) -> Result<(Vec<Case>, usize), String> 
     let want = opts.get("case");
     let mut out = Vec::new();
     for c in cases {
-        let name = c["name"].as_str().ok_or("manifest case without name")?.to_string();
+        let name = c["name"]
+            .as_str()
+            .ok_or("manifest case without name")?
+            .to_string();
         if want.is_some_and(|w| w != &name) {
             continue;
         }
@@ -140,7 +149,10 @@ fn load_manifest(dir: &Path, opts: &Opts) -> Result<(Vec<Case>, usize), String> 
             }
         }
         out.push(Case {
-            file: c["file"].as_str().ok_or_else(|| format!("case {name}: no file"))?.to_string(),
+            file: c["file"]
+                .as_str()
+                .ok_or_else(|| format!("case {name}: no file"))?
+                .to_string(),
             weights: c["weights"].as_str().map(str::to_string),
             name,
             mode,
@@ -155,14 +167,20 @@ fn load_manifest(dir: &Path, opts: &Opts) -> Result<(Vec<Case>, usize), String> 
 fn load_case(dir: &Path, root: &Path, case: &Case) -> Result<Tensors, String> {
     let mut t = read_safetensors(&dir.join(&case.file))?;
     if let Some(w) = &case.weights {
-        let p: PathBuf = if dir.join(w).exists() { dir.join(w) } else { root.join(w) };
+        let p: PathBuf = if dir.join(w).exists() {
+            dir.join(w)
+        } else {
+            root.join(w)
+        };
         t.extend(read_safetensors(&p)?);
     }
     Ok(t)
 }
 
 fn get<'a>(t: &'a Tensors, name: &str, len: usize) -> Result<&'a [f32], String> {
-    let x = t.get(name).ok_or_else(|| format!("fixture lacks tensor `{name}`"))?;
+    let x = t
+        .get(name)
+        .ok_or_else(|| format!("fixture lacks tensor `{name}`"))?;
     if x.data.len() != len {
         return Err(format!(
             "tensor `{name}` has {} values (shape {:?}), expected {len}",
@@ -221,8 +239,16 @@ fn compare(got: &[f32], want: &[f32], mode: StreamRounding) -> Cmp {
         g2 += g * g;
         dot += g * r;
     }
-    let rel_l2 = if r2 == 0.0 { d2.sqrt() } else { (d2 / r2).sqrt() };
-    let cosine = if r2 == 0.0 || g2 == 0.0 { f64::from((d2 == 0.0) as u8) } else { dot / (r2.sqrt() * g2.sqrt()) };
+    let rel_l2 = if r2 == 0.0 {
+        d2.sqrt()
+    } else {
+        (d2 / r2).sqrt()
+    };
+    let cosine = if r2 == 0.0 || g2 == 0.0 {
+        f64::from((d2 == 0.0) as u8)
+    } else {
+        dot / (r2.sqrt() * g2.sqrt())
+    };
     let (band, pass, atol) = match mode {
         StreamRounding::F32 => {
             let atol = 2e-5 + 2e-4 * max_ref;
@@ -264,14 +290,24 @@ struct CaseReport {
 
 impl CaseReport {
     fn new() -> Self {
-        Self { pass: true, tensors: Default::default(), first_fail: None }
+        Self {
+            pass: true,
+            tensors: Default::default(),
+            first_fail: None,
+        }
     }
     fn check(&mut self, name: &str, got: &[f32], want: &[f32], mode: StreamRounding) {
         let c = compare(got, want, mode);
         if !c.pass {
             self.pass = false;
             self.first_fail.get_or_insert_with(|| {
-                format!("{name}: {}", c.json.get("first_mismatch").or(c.json.get("worst")).unwrap_or(&Value::Null))
+                format!(
+                    "{name}: {}",
+                    c.json
+                        .get("first_mismatch")
+                        .or(c.json.get("worst"))
+                        .unwrap_or(&Value::Null)
+                )
             });
         }
         self.tensors.insert(name.to_string(), c.json);
@@ -279,9 +315,11 @@ impl CaseReport {
     fn invariant(&mut self, name: &str, ok: bool, detail: Value) {
         if !ok {
             self.pass = false;
-            self.first_fail.get_or_insert_with(|| format!("{name}: {detail}"));
+            self.first_fail
+                .get_or_insert_with(|| format!("{name}: {detail}"));
         }
-        self.tensors.insert(name.to_string(), json!({"pass": ok, "detail": detail}));
+        self.tensors
+            .insert(name.to_string(), json!({"pass": ok, "detail": detail}));
     }
     fn fail(name: &str, mode: &str, dims: &BTreeMap<String, usize>, err: String) -> Value {
         json!({"name": name, "pass": false, "mode": mode, "dims": dims, "detail": err})
@@ -305,21 +343,28 @@ struct Pool(Vec<GpuTensor>);
 
 impl Pool {
     fn up(&mut self, gpu: &mut Gpu, data: &[f32], shape: &[usize]) -> Result<GpuTensor, String> {
-        let t = gpu.upload_f32(data, shape).map_err(|e| format!("upload: {e:?}"))?;
+        let t = gpu
+            .upload_f32(data, shape)
+            .map_err(|e| format!("upload: {e:?}"))?;
         Ok(self.keep(t))
     }
     /// BF16-bits upload (values must already be BF16-representable).
     fn up_bf16(&mut self, gpu: &mut Gpu, data: &[f32]) -> Result<GpuTensor, String> {
-        let t = gpu.alloc_tensor(&[data.len()], DType::BF16).map_err(|e| format!("alloc: {e:?}"))?;
+        let t = gpu
+            .alloc_tensor(&[data.len()], DType::BF16)
+            .map_err(|e| format!("alloc: {e:?}"))?;
         let bits: Vec<u8> = data
             .iter()
             .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
             .collect();
-        gpu.memcpy_htod_auto(&t.buf, &bits).map_err(|e| format!("upload bf16: {e:?}"))?;
+        gpu.memcpy_htod_auto(&t.buf, &bits)
+            .map_err(|e| format!("upload bf16: {e:?}"))?;
         Ok(self.keep(t))
     }
     fn out(&mut self, gpu: &mut Gpu, shape: &[usize]) -> Result<GpuTensor, String> {
-        let t = gpu.alloc_tensor(shape, DType::F32).map_err(|e| format!("alloc: {e:?}"))?;
+        let t = gpu
+            .alloc_tensor(shape, DType::F32)
+            .map_err(|e| format!("alloc: {e:?}"))?;
         Ok(self.keep(t))
     }
     /// Keeps a non-owning duplicate handle so the original can be returned by
@@ -337,7 +382,9 @@ impl Pool {
 }
 
 fn download(gpu: &mut Gpu, t: &GpuTensor, len: usize) -> Result<Vec<f32>, String> {
-    let mut v = gpu.download_f32(t).map_err(|e| format!("download: {e:?}"))?;
+    let mut v = gpu
+        .download_f32(t)
+        .map_err(|e| format!("download: {e:?}"))?;
     v.truncate(len);
     Ok(v)
 }
@@ -450,7 +497,17 @@ fn site_case(gpu: &mut Gpu, case: &Case, t: &Tensors) -> Result<CaseReport, Stri
             },
         )
         .map_err(|e| e.to_string())?;
-        site.aggregate(gpu, rows, &streams, &work, StreamNorm { gamma: &gamma_t, eps: eps_norm }, &bin_t)?;
+        site.aggregate(
+            gpu,
+            rows,
+            &streams,
+            &work,
+            StreamNorm {
+                gamma: &gamma_t,
+                eps: eps_norm,
+            },
+            &bin_t,
+        )?;
         site.postmix(gpu, rows, &streams, &branch_t, &work, &xout_t)?;
 
         let got_pre = download(gpu, work.controls().pre, rows * n)?;
@@ -476,8 +533,18 @@ fn site_case(gpu: &mut Gpu, case: &Case, t: &Tensors) -> Result<CaseReport, Stri
         rep.check("post", &got_post, w_post, case.mode);
         rep.check("res", &got_res, w_res, case.mode);
         rep.check("agg", &download(gpu, &agg_t, rows * c)?, w_agg, case.mode);
-        rep.check("branch_in", &download(gpu, &bin_t, rows * c)?, w_bin, case.mode);
-        rep.check("x_out", &download(gpu, &xout_t, rows * cols)?, w_xout, case.mode);
+        rep.check(
+            "branch_in",
+            &download(gpu, &bin_t, rows * c)?,
+            w_bin,
+            case.mode,
+        );
+        rep.check(
+            "x_out",
+            &download(gpu, &xout_t, rows * cols)?,
+            w_xout,
+            case.mode,
+        );
         // The chart is doubly stochastic and nonnegative by construction; these
         // hold for the engine output independently of the reference.
         let (mut dev, mut min) = (0f32, f32::INFINITY);
@@ -579,7 +646,12 @@ fn head_case(gpu: &mut Gpu, case: &Case, t: &Tensors) -> Result<CaseReport, Stri
             let et = pool.up(gpu, emb, &[rows, c])?;
             let out = pool.out(gpu, &[rows, n, c])?;
             broadcast_embedding(gpu, &shape, rows, &et, c, &out)?;
-            rep.check("bcast", &download(gpu, &out, rows * n * c)?, want, case.mode);
+            rep.check(
+                "bcast",
+                &download(gpu, &out, rows * n * c)?,
+                want,
+                case.mode,
+            );
             return Ok(rep);
         }
         let stream = get(t, "stream", rows * n * c)?;
@@ -597,12 +669,21 @@ fn head_case(gpu: &mut Gpu, case: &Case, t: &Tensors) -> Result<CaseReport, Stri
                 streams: n,
                 width: c,
                 rounding: case.mode,
-                stage: StreamMixStage::Mean { streams: &st, norm: None, out: &mean_t },
+                stage: StreamMixStage::Mean {
+                    streams: &st,
+                    norm: None,
+                    out: &mean_t,
+                },
             },
         )
         .map_err(|e| e.to_string())?;
         final_mean_norm(gpu, &shape, rows, &st, StreamNorm { gamma: &gt, eps }, &h_t)?;
-        rep.check("mean", &download(gpu, &mean_t, rows * c)?, w_mean, case.mode);
+        rep.check(
+            "mean",
+            &download(gpu, &mean_t, rows * c)?,
+            w_mean,
+            case.mode,
+        );
         rep.check("h", &download(gpu, &h_t, rows * c)?, w_h, case.mode);
         Ok(rep)
     })();

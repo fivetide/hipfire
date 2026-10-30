@@ -25,11 +25,11 @@
 //! through this module.
 
 use crate::types::DispatchError;
+pub use rdna_compute::stream_mix::StreamRounding;
 use rdna_compute::stream_mix::{
     StreamAggregate, StreamGamma, StreamMean, StreamPostmix, StreamRouteHelmert,
     STREAM_MIX_MAX_STREAMS, STREAM_MIX_MAX_WIDTH,
 };
-pub use rdna_compute::stream_mix::StreamRounding;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 fn hip_err(what: impl std::fmt::Display, e: hip_bridge::HipError) -> DispatchError {

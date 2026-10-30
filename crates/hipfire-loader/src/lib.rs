@@ -28,13 +28,13 @@ use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_gemma4 as gemma4;
 use hipfire_arch_lfm2moe as lfm2moe;
-use hipfire_arch_raon as raon;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_muse_glimmer as glimmer;
 use hipfire_arch_qwen35::qwen35::{self};
 use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
+use hipfire_arch_raon as raon;
 use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::device_mesh::DimKind;
@@ -7465,7 +7465,13 @@ mod registry_tests {
             );
             covered.push(label);
         }
-        for label in ["qwen3_5", "qwen3_5_moe", "qwen4", "muse_glimmer", "raon1_mini"] {
+        for label in [
+            "qwen3_5",
+            "qwen3_5_moe",
+            "qwen4",
+            "muse_glimmer",
+            "raon1_mini",
+        ] {
             assert!(covered.contains(&label), "{label} not covered: {covered:?}");
         }
     }

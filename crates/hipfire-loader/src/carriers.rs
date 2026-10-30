@@ -9884,9 +9884,11 @@ impl Carrier for RaonCarrier {
         let mut error = None;
         match self.bench_prefill(m, gpu, synthetic, synthetic.len(), &mut error) {
             Some(true) => Some(None),
-            Some(false) => Some(Some(
-                error.unwrap_or_else(|| "raon1_mini bench decode prime failed".into()),
-            )),
+            Some(false) => {
+                Some(Some(error.unwrap_or_else(|| {
+                    "raon1_mini bench decode prime failed".into()
+                })))
+            }
             None => None,
         }
     }

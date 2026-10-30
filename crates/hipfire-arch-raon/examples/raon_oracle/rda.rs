@@ -137,14 +137,25 @@ fn compare(name: &str, got: &[f32], want: &[f32], band: Band) -> Value {
         max_abs = max_abs.max(d.abs());
         max_ref = max_ref.max(w.abs());
     }
-    let rel = if r2 > 0.0 { (d2 / r2).sqrt() } else { d2.sqrt() };
-    let cos = if r2 > 0.0 && g2 > 0.0 { dot / (r2.sqrt() * g2.sqrt()) } else if d2 == 0.0 { 1.0 } else { 0.0 };
+    let rel = if r2 > 0.0 {
+        (d2 / r2).sqrt()
+    } else {
+        d2.sqrt()
+    };
+    let cos = if r2 > 0.0 && g2 > 0.0 {
+        dot / (r2.sqrt() * g2.sqrt())
+    } else if d2 == 0.0 {
+        1.0
+    } else {
+        0.0
+    };
     let abs_lim = 2e-5 + 2e-4 * max_ref;
     let (pass, band_json, first_bad) = match band {
         Band::F32 { rel: lim } => {
-            let first = got.iter().zip(want).position(|(g, w)| {
-                ((*g as f64) - (*w as f64)).abs() > abs_lim || !g.is_finite()
-            });
+            let first = got
+                .iter()
+                .zip(want)
+                .position(|(g, w)| ((*g as f64) - (*w as f64)).abs() > abs_lim || !g.is_finite());
             (
                 rel <= lim && max_abs <= abs_lim && got.iter().all(|v| v.is_finite()),
                 json!({"kind": "f32", "rel_l2_max": lim, "max_abs_max": abs_lim}),
@@ -275,7 +286,10 @@ fn run_module_rows(
     let hk = pool.up(gpu, hist0[1], &[k - 1, p])?;
     let hv = pool.up(gpu, hist0[2], &[k - 1, p])?;
     let gated = pool.zeros(gpu, &[n, p])?;
-    if keep_scratch.as_ref().map_or(true, |s| s.max_rows < scratch_rows) {
+    if keep_scratch
+        .as_ref()
+        .map_or(true, |s| s.max_rows < scratch_rows)
+    {
         *keep_scratch = Some(RdaScratch::new(gpu, geom, scratch_rows)?);
     }
     let scratch = keep_scratch.as_ref().unwrap();
@@ -328,7 +342,12 @@ fn run_module_rows(
     })
 }
 
-fn module_case(gpu: &mut Gpu, case: &Value, t: &Tensors, out: &mut Vec<Value>) -> Result<(), String> {
+fn module_case(
+    gpu: &mut Gpu,
+    case: &Value,
+    t: &Tensors,
+    out: &mut Vec<Value>,
+) -> Result<(), String> {
     let n = dims(case, "N")?;
     let mut geom = RdaGeometry::raon();
     geom.n_heads = dims(case, "H")?;
@@ -336,7 +355,11 @@ fn module_case(gpu: &mut Gpu, case: &Value, t: &Tensors, out: &mut Vec<Value>) -
     // Model dtype follows the case mode: f32 cases have no BF16 boundaries.
     let bf16 = case["mode"].as_str() != Some("f32");
     geom.round_bf16 = bf16;
-    let bb = if bf16 { Band::Bf16 } else { Band::F32 { rel: 1e-4 } };
+    let bb = if bf16 {
+        Band::Bf16
+    } else {
+        Band::F32 { rel: 1e-4 }
+    };
     let p = geom.proj();
     let h = geom.n_heads;
     let s0 = t.need("S0")?;
@@ -359,7 +382,11 @@ fn module_case(gpu: &mut Gpu, case: &Value, t: &Tensors, out: &mut Vec<Value>) -
         ] {
             if let Some(want) = t.get(name) {
                 let got = dl(gpu, tensor)?;
-                let band = if name == "log_alpha" { Band::F32 { rel: 1e-4 } } else { bb };
+                let band = if name == "log_alpha" {
+                    Band::F32 { rel: 1e-4 }
+                } else {
+                    bb
+                };
                 out.push(json!({"stage": "module", "cmp":
                     compare(name, &got[..want_len], want, band)}));
             }
@@ -376,7 +403,10 @@ fn module_case(gpu: &mut Gpu, case: &Value, t: &Tensors, out: &mut Vec<Value>) -
             compare("S_out", &single.state, want,
                 if bf16 { Band::Rel { rel: 1e-2 } } else { Band::F32 { rel: state_rel } })}));
     }
-    for (i, nm) in ["hist_out_q", "hist_out_k", "hist_out_v"].iter().enumerate() {
+    for (i, nm) in ["hist_out_q", "hist_out_k", "hist_out_v"]
+        .iter()
+        .enumerate()
+    {
         let want = t.need(nm)?;
         // History is raw pre-conv input values: exact copies.
         out.push(json!({"stage": "module", "cmp":
@@ -446,9 +476,22 @@ fn module_case(gpu: &mut Gpu, case: &Value, t: &Tensors, out: &mut Vec<Value>) -
     if n >= 2 && n <= 1024 {
         let first = n / 2;
         let mut pool = Pool(Vec::new());
-        let split = run_module_rows(gpu, &mut pool, &geom, t, s0, hist0, &[first, n - first], n, &mut keep)?;
+        let split = run_module_rows(
+            gpu,
+            &mut pool,
+            &geom,
+            t,
+            s0,
+            hist0,
+            &[first, n - first],
+            n,
+            &mut keep,
+        )?;
         out.push(json!({"stage": "split", "cmp": compare("S_out", &split.state, &single.state, Band::Exact)}));
-        for (i, nm) in ["hist_out_q", "hist_out_k", "hist_out_v"].iter().enumerate() {
+        for (i, nm) in ["hist_out_q", "hist_out_k", "hist_out_v"]
+            .iter()
+            .enumerate()
+        {
             out.push(json!({"stage": "split", "cmp": compare(nm, &split.hist[i], &single.hist[i], Band::Exact)}));
         }
         out.push(json!({"stage": "split", "cmp": compare("gated", &split.gated, &single.gated, Band::Exact)}));
@@ -457,14 +500,29 @@ fn module_case(gpu: &mut Gpu, case: &Value, t: &Tensors, out: &mut Vec<Value>) -
         }
     }
     if let Some(s) = keep.take() {
-        for v in [s.qconv, s.kconv, s.vconv, s.q, s.k, s.vprime, s.log_alpha, s.beta, s.y] {
+        for v in [
+            s.qconv,
+            s.kconv,
+            s.vconv,
+            s.q,
+            s.k,
+            s.vprime,
+            s.log_alpha,
+            s.beta,
+            s.y,
+        ] {
             let _ = gpu.free_tensor(v);
         }
     }
     Ok(())
 }
 
-fn scalar_equiv_case(gpu: &mut Gpu, case: &Value, t: &Tensors, out: &mut Vec<Value>) -> Result<(), String> {
+fn scalar_equiv_case(
+    gpu: &mut Gpu,
+    case: &Value,
+    t: &Tensors,
+    out: &mut Vec<Value>,
+) -> Result<(), String> {
     let n = dims(case, "N")?;
     let h = dims(case, "H")?;
     let kd = dims(case, "K")?;
@@ -538,10 +596,14 @@ fn scalar_equiv_case(gpu: &mut Gpu, case: &Value, t: &Tensors, out: &mut Vec<Val
             compare("S_out_vs_scalar_gdn", gs, &scalar_s, Band::F32 { rel })}));
     }
     // PerHead and broadcast per-key must agree bit-for-bit (same arithmetic).
-    out.push(json!({"stage": "scalar_equiv", "route": "per_head_vs_per_key", "cmp":
-        compare("y", &results[0].1, &results[1].1, Band::Exact)}));
-    out.push(json!({"stage": "scalar_equiv", "route": "per_head_vs_per_key", "cmp":
-        compare("S_out", &results[0].2, &results[1].2, Band::Exact)}));
+    out.push(
+        json!({"stage": "scalar_equiv", "route": "per_head_vs_per_key", "cmp":
+        compare("y", &results[0].1, &results[1].1, Band::Exact)}),
+    );
+    out.push(
+        json!({"stage": "scalar_equiv", "route": "per_head_vs_per_key", "cmp":
+        compare("S_out", &results[0].2, &results[1].2, Band::Exact)}),
+    );
     for v in pool.0.drain(..) {
         let _ = gpu.free_tensor(v);
     }
@@ -559,7 +621,9 @@ pub fn run(fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, St
             .map_err(|e| format!("{}: {e}", dir.join("manifest.json").display()))?,
     )
     .map_err(|e| format!("manifest.json: {e}"))?;
-    let cases = manifest["cases"].as_array().ok_or("manifest has no `cases`")?;
+    let cases = manifest["cases"]
+        .as_array()
+        .ok_or("manifest has no `cases`")?;
     if cases.is_empty() {
         return Err("rda manifest has zero cases".into());
     }
@@ -570,7 +634,10 @@ pub fn run(fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, St
     let mut ran = 0usize;
     for case in cases {
         let name = case["name"].as_str().ok_or("case without name")?;
-        if filter.as_ref().map_or(false, |f| !name.contains(f.as_str())) {
+        if filter
+            .as_ref()
+            .map_or(false, |f| !name.contains(f.as_str()))
+        {
             continue;
         }
         ran += 1;

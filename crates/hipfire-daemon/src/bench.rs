@@ -533,16 +533,14 @@ pub(crate) fn handle_bench_decode(
             | hipfire_loader::BenchDecodeRoute::Qwen4
             | hipfire_loader::BenchDecodeRoute::Gemma4
             | hipfire_loader::BenchDecodeRoute::MuseGlimmer
-            | hipfire_loader::BenchDecodeRoute::Raon => {
-                hipfire_loader::carrier_for(m.arch_id)
-                    .and_then(|c| c.bench_decode_prime(m, gpu, &synthetic))
-                    .unwrap_or_else(|| {
-                        Some(format!(
-                            "bench_decode_prime: carrier missing or unimplemented for arch_id={}",
-                            m.arch_id
-                        ))
-                    })
-            }
+            | hipfire_loader::BenchDecodeRoute::Raon => hipfire_loader::carrier_for(m.arch_id)
+                .and_then(|c| c.bench_decode_prime(m, gpu, &synthetic))
+                .unwrap_or_else(|| {
+                    Some(format!(
+                        "bench_decode_prime: carrier missing or unimplemented for arch_id={}",
+                        m.arch_id
+                    ))
+                }),
             _ => Some(format!(
                 "bench_decode unsupported for arch_id={}",
                 m.arch_id
@@ -631,11 +629,9 @@ pub(crate) fn handle_bench_decode(
             | hipfire_loader::BenchDecodeRoute::Qwen4
             | hipfire_loader::BenchDecodeRoute::Gemma4
             | hipfire_loader::BenchDecodeRoute::MuseGlimmer
-            | hipfire_loader::BenchDecodeRoute::Raon => {
-                hipfire_loader::carrier_for(m.arch_id)
-                    .and_then(|c| c.bench_decode_run(m, gpu, context, iterations, &mut decode_err))
-                    .unwrap_or(false)
-            }
+            | hipfire_loader::BenchDecodeRoute::Raon => hipfire_loader::carrier_for(m.arch_id)
+                .and_then(|c| c.bench_decode_run(m, gpu, context, iterations, &mut decode_err))
+                .unwrap_or(false),
             _ => {
                 decode_err = Some(format!(
                     "bench_decode unsupported for arch_id={}",

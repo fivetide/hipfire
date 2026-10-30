@@ -629,6 +629,78 @@ fn qwen4_sampled_mtp_route_honors_penalties() {
     }
 }
 
+/// Qwen4 pipeline parallelism: sampled, unpenalized requests take native MTP
+/// (Leviathan verify, distribution-exact) exactly as on one card. The kill
+/// switch (`speculation.mtp_sampled = 0` → `supports_temp_swor` false, and
+/// the naive sampled mode under PP, which the route input also reports as
+/// not sampled-capable) and any penalty keep the PP AR producer.
+#[test]
+fn qwen4_pp_sampled_mtp_route_admits_unpenalized_leviathan_only() {
+    for pp in [2usize, 4, 8] {
+        let sampled = GenerationRouteInputs {
+            arch_id: 16,
+            pp,
+            has_speculator: true,
+            speculator_is_mtp: true,
+            supports_temp_swor: true,
+            temp: 0.7,
+            ..base()
+        };
+        for admitted in [
+            sampled,
+            GenerationRouteInputs {
+                user_explicit_sampling: true,
+                min_p: Some(0.05),
+                ..sampled
+            },
+            GenerationRouteInputs {
+                temp: 0.0,
+                ..sampled
+            },
+        ] {
+            assert_eq!(
+                select_generation_route(&admitted),
+                GenerationRoute::Qwen4Spec,
+                "pp {pp}: {admitted:?}"
+            );
+        }
+        for refused in [
+            // HIPFIRE_MTP_SAMPLED=0 / PP naive mode.
+            GenerationRouteInputs {
+                supports_temp_swor: false,
+                ..sampled
+            },
+            GenerationRouteInputs {
+                nonneutral_penalties: true,
+                ..sampled
+            },
+            GenerationRouteInputs {
+                nonneutral_penalties: true,
+                temp: 0.0,
+                ..sampled
+            },
+            GenerationRouteInputs {
+                force_ar_chat: true,
+                ..sampled
+            },
+            GenerationRouteInputs {
+                temp_spec_env_off: true,
+                ..sampled
+            },
+            GenerationRouteInputs {
+                kv_adaptive: true,
+                ..sampled
+            },
+        ] {
+            assert_eq!(
+                select_generation_route(&refused),
+                GenerationRoute::Qwen4Ar,
+                "pp {pp}: {refused:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn qwen35_mtp_route_honors_penalties_but_dflash_stays_ar() {
     // --- Arch 5 native MTP: penalties never demote a servable request. ---
@@ -1167,7 +1239,13 @@ fn stop_sequences_are_honoured_exactly_on_the_qwen_semantic_producers() {
     with_stop.sort_unstable();
     assert_eq!(
         with_stop,
-        ["qwen4_ar", "qwen4_spec", "qwen_ar", "qwen_dflash", "raon_ar"]
+        [
+            "qwen4_ar",
+            "qwen4_spec",
+            "qwen_ar",
+            "qwen_dflash",
+            "raon_ar"
+        ]
     );
     // Both Qwen4 routes a Flash-Next load can select carry tools AND stop, so
     // attaching MTP never changes which request shapes are accepted.

@@ -120,8 +120,6 @@ KNOWN_QUANTS = {
     "hf6",
     "q8",
     "hfq",
-    # Raon-1-mini-preview symmetric MQ4v2 (qt44 control artifact; `.sym-mq4v2.hfq`).
-    "sym-mq4v2",
 }
 # Allowlist for the optional per-entry `default_kv_mode` field (the registry is
 # the per-model card). MUST stay in sync with the hipfire-config schema and
@@ -362,9 +360,6 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
 
 
 def quant_for(file: str) -> str | None:
-    # Raon-1-mini symmetric MQ4v2 control artifact: `<stem>.sym-mq4v2.hfq`.
-    if file.endswith(".sym-mq4v2.hfq"):
-        return "sym-mq4v2"
     # DFlash drafts encode their quant in the stem: qwen35-9b-dflash-mq4.hfq
     m = re.search(r"[-.](mq\d)\.hfq$", file)
     if m and m.group(1) in KNOWN_QUANTS:

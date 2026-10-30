@@ -445,3 +445,323 @@ extern "C" __global__ __launch_bounds__(128) void latent_attention_flash_prefill
         }
     }
 }
+
+// ============================================================================
+// Wide-value variant: value width up to 512 in ONE pass over the keys.
+//
+// The chunked kernel above recomputes the score tile once per 128 value
+// columns, which makes the absorbed latent route (dq = 576, dv = 512) spend four
+// score passes per value pass. This kernel keeps the same fragment maps and
+// numerics, but one block of four waves owns one 16-query tile and one head:
+//   * score phase: wave w = 2 * half + sub computes the partial S^T of key
+//     sub-tile `sub` (16 keys of the 32-key tile) over half `half` of the
+//     contraction steps, into two independent accumulator chains;
+//   * the four partials are exchanged through LDS (lane-identical layout, so no
+//     lane movement) and every wave forms S = partial(half 0) + partial(half 1)
+//     in that fixed order, then runs the identical softmax (the softmax state of a
+//     query is replicated, bit for bit, in all four waves);
+//   * value phase: the full V^T tile (dv x 32 keys) is staged transposed in LDS;
+//     wave w accumulates value columns [w * dv/4, (w + 1) * dv/4).
+// Every score and value product is computed exactly once. Requirements on top of
+// the above: dv a multiple of 64 with dv / 4 <= 128; dynamic LDS =
+// 16 * (dq + 8) * 2 + dv * 20 * 4 + 4096 bytes; blockDim.x == 128, grid.z == 1.
+// ============================================================================
+
+#define LAW_KT 32      // keys per iteration
+#define LAW_VP 20      // words per V^T column: 16 key-pair words + 4 pad
+#ifndef LAW_VPF
+#define LAW_VPF 8      // value-fill rounds prefetched into registers (all of them for dv <= 512)
+#endif
+#ifndef LAW_SU
+#define LAW_SU 2       // contraction steps issued per score-loop iteration (alternating 2 chains)
+#endif
+
+// 32-key tile version of laf_v_store (pitch LAW_VP).
+static __device__ __forceinline__ void law_v_store(uint32_t* vs, int g, int p, uint4 a, uint4 b) {
+    const uint32_t aw[4] = {a.x, a.y, a.z, a.w};
+    const uint32_t bw[4] = {b.x, b.y, b.z, b.w};
+    uint32_t* col = vs + (g * 8) * LAW_VP + p;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        col[(2 * i) * LAW_VP] = (aw[i] & 0xffffu) | (bw[i] << 16);
+        col[(2 * i + 1) * LAW_VP] = (aw[i] >> 16) | (bw[i] & 0xffff0000u);
+    }
+}
+
+extern "C" __global__ __launch_bounds__(128) void latent_attention_flash_prefill_wide(
+    const float* __restrict__ q,         // [n_rows, H, dq]
+    float* __restrict__ y,               // [n_rows, H, dv]
+    const uint16_t* __restrict__ ka,     // BF16 view, offset already applied
+    const uint16_t* __restrict__ kb,
+    const uint16_t* __restrict__ vv,
+    const int* __restrict__ pos_ptr,     // device scalar: rows cached before this call
+    int n_rows, int n_heads, int wa, int wb, int dv, int pos_offset, int max_rows,
+    int ka_tok, int ka_head, int kb_tok, int kb_head, int v_tok, int v_head,
+    float scale, int round_y
+) {
+    extern __shared__ __attribute__((aligned(16))) unsigned char laf_smem[];
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5, lane = tid & 31, l16 = lane & 15, hh = lane >> 4;
+    const int dq = wa + wb;
+    const int qp = dq + 8;  // LDS pitch of a staged query row (elements)
+    uint16_t* qs = (uint16_t*)laf_smem;
+    uint32_t* vs = (uint32_t*)(laf_smem + (size_t)16 * qp * 2);
+    float* sp = (float*)(vs + (size_t)dv * LAW_VP);  // [4 waves][8][32 lanes]
+
+    const int h = blockIdx.y;
+    const int cw = dv >> 2;               // value columns owned by this wave
+    const int dvc0 = wave * cw;
+    const int ngroups = dv >> 3;          // 8-column groups of the whole V^T tile
+    const int tile = (int)gridDim.x - 1 - (int)blockIdx.x;  // heaviest tile first
+    const int i0 = tile * 16;
+
+    const int base = *pos_ptr + pos_offset;
+    const int row_l = i0 + l16;
+    const int lim_row = min(row_l, n_rows - 1);
+    const int lim_i = min(base + lim_row, max_rows - 1);
+    const int lim_first = min(base + min(i0, n_rows - 1), max_rows - 1);
+    const int lim_last = min(base + min(i0 + 15, n_rows - 1), max_rows - 1);
+    const int kend = max(0, lim_last + 1);
+
+    // ---- stage the 16 queries as BF16 (4 rows per wave) ------------------------
+    for (int r = wave * 4; r < wave * 4 + 4; ++r) {
+        const int row = i0 + r;
+        uint2* dst = (uint2*)(qs + (size_t)r * qp);
+        if (row < n_rows) {
+            const float4* src = (const float4*)(q + ((size_t)row * n_heads + h) * dq);
+            for (int c = lane; c < (dq >> 2); c += 32) {
+                const float4 f = src[c];
+                dst[c] = make_uint2(laf_f32_to_bf16(f.x) | (laf_f32_to_bf16(f.y) << 16),
+                                    laf_f32_to_bf16(f.z) | (laf_f32_to_bf16(f.w) << 16));
+            }
+        } else {
+            for (int c = lane; c < (dq >> 2); c += 32) dst[c] = make_uint2(0u, 0u);
+        }
+    }
+    __syncthreads();
+
+    const uint16_t* qrow = qs + (size_t)l16 * qp;
+
+    laf_f8_t acc_o[8];
+#pragma unroll
+    for (int d = 0; d < 8; ++d) acc_o[d] = laf_f8_t{0, 0, 0, 0, 0, 0, 0, 0};
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    // score phase geometry
+    const int sub = wave & 1, half = wave >> 1;
+    const int nsteps = dq >> 4;
+    const int nlo = (nsteps + 1) >> 1;
+    const int s0 = half ? nlo : 0, s1 = half ? nsteps : nlo;
+
+    // V^T fill geometry: lane&15 = key pair; word w = 2q + r of sub-tile ks holds
+    // keys (ks*16 + 4q + r) | (+2); the two lane halves take alternate 8-column groups.
+    const int vp = lane & 15;
+    const int vks = vp >> 3, vq = (vp >> 1) & 3, vr = vp & 1;
+    const int vklo = vks * 16 + 4 * vq + vr;
+    const int vkhi = vklo + 2;
+    const int gbase = wave * 2 + hh;  // group g = gbase + 8 * it
+
+    for (int kb0 = 0; kb0 < kend; kb0 += LAW_KT) {
+        // V rows into registers early (overlap the score phase).
+        const uint16_t* vpa = (kb0 + vklo < kend)
+            ? vv + (size_t)(kb0 + vklo) * v_tok + (size_t)h * v_head : nullptr;
+        const uint16_t* vpb = (kb0 + vkhi < kend)
+            ? vv + (size_t)(kb0 + vkhi) * v_tok + (size_t)h * v_head : nullptr;
+        uint4 va[LAW_VPF], vb[LAW_VPF];
+#pragma unroll
+        for (int it = 0; it < LAW_VPF; ++it) {
+            const int g = gbase + 8 * it;
+            va[it] = make_uint4(0u, 0u, 0u, 0u);
+            vb[it] = make_uint4(0u, 0u, 0u, 0u);
+            if (g < ngroups) {
+                if (vpa) va[it] = *(const uint4*)(vpa + g * 8);
+                if (vpb) vb[it] = *(const uint4*)(vpb + g * 8);
+            }
+        }
+
+        // ---- partial S^T of key sub-tile `sub`, contraction steps [s0, s1) -------
+        const int jr = kb0 + sub * 16 + l16;
+        const bool kvalid = jr < kend;
+        const uint16_t* kpa0 = ka + (size_t)jr * ka_tok + (size_t)h * ka_head;
+        const uint16_t* kpb0 = kb + (size_t)jr * kb_tok + (size_t)h * kb_head;
+        laf_f8_t acc_a = laf_f8_t{0, 0, 0, 0, 0, 0, 0, 0};
+        laf_f8_t acc_b = acc_a;
+        int s = s0;
+        for (; s + (LAW_SU - 1) < s1; s += LAW_SU) {
+#pragma unroll
+            for (int u = 0; u < LAW_SU; ++u) {
+                const int d = (s + u) * 16;
+                const laf_op_t qf = laf_ldop(qrow + d + LAF_QOFF(hh));
+                laf_op_t kf;
+                if (kvalid) {
+                    kf = (d < wa) ? laf_ldop(kpa0 + d + LAF_QOFF(hh))
+                                  : laf_ldop(kpb0 + (d - wa) + LAF_QOFF(hh));
+                } else {
+#pragma unroll
+                    for (int e = 0; e < (LAF_LAYOUT_G11 ? 16 : 8); ++e) kf[e] = 0;
+                }
+                if ((u & 1) == 0) acc_a = laf_wmma(kf, qf, acc_a);
+                else acc_b = laf_wmma(kf, qf, acc_b);
+            }
+        }
+        for (; s < s1; ++s) {
+            const int d = s * 16;
+            const laf_op_t qf = laf_ldop(qrow + d + LAF_QOFF(hh));
+            laf_op_t kf;
+            if (kvalid) {
+                kf = (d < wa) ? laf_ldop(kpa0 + d + LAF_QOFF(hh))
+                              : laf_ldop(kpb0 + (d - wa) + LAF_QOFF(hh));
+            } else {
+#pragma unroll
+                for (int e = 0; e < (LAF_LAYOUT_G11 ? 16 : 8); ++e) kf[e] = 0;
+            }
+            if (((s - s0) & 1) == 0) acc_a = laf_wmma(kf, qf, acc_a);
+            else acc_b = laf_wmma(kf, qf, acc_b);
+        }
+#pragma unroll
+        for (int j = 0; j < 8; ++j) sp[(wave * 8 + j) * 32 + lane] = acc_a[j] + acc_b[j];
+        __syncthreads();
+
+        // ---- scale, mask, online softmax (identical in all four waves) ------------
+        const bool need_mask = kb0 + (LAW_KT - 1) > lim_first;
+        float sv[2][8];
+        float tmax = -INFINITY;
+#pragma unroll
+        for (int ks = 0; ks < 2; ++ks) {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                float sc = (sp[(ks * 8 + j) * 32 + lane] + sp[((2 + ks) * 8 + j) * 32 + lane]) * scale;
+                if (need_mask) {
+#if LAF_LAYOUT_G11
+                    const int kj = kb0 + ks * 16 + 2 * j + hh;
+#else
+                    const int kj = kb0 + ks * 16 + 8 * hh + j;
+#endif
+                    sc = (kj <= lim_i) ? sc : -INFINITY;
+                }
+                sv[ks][j] = sc;
+                tmax = fmaxf(tmax, sc);
+            }
+        }
+        tmax = fmaxf(tmax, __shfl_xor(tmax, 16, 32));
+        const float m_new = fmaxf(m, tmax);
+        const float mshift = (m_new == -INFINITY) ? 0.0f : m_new;
+        const float corr = laf_exp(m - mshift);  // m == -inf -> 0 (nothing accumulated yet)
+        m = m_new;
+
+        float lsum = 0.0f;
+        laf_op_t pf[2];
+#pragma unroll
+        for (int ks = 0; ks < 2; ++ks) {
+            uint32_t pw[8];  // rounded probabilities, bf16 in the high half
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                pw[j] = laf_rne_hi(laf_exp(sv[ks][j] - mshift));
+                lsum += __uint_as_float(pw[j]);
+            }
+#if LAF_LAYOUT_G11
+            uint32_t own[4], oth[4];
+#pragma unroll
+            for (int w = 0; w < 4; ++w) own[w] = (pw[2 * w] >> 16) | pw[2 * w + 1];
+#pragma unroll
+            for (int w = 0; w < 4; ++w) oth[w] = __shfl_xor((int)own[w], 16, 32);
+            laf_u8_t W;
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                W[2 * w] = hh ? oth[w] : own[w];
+                W[2 * w + 1] = hh ? own[w] : oth[w];
+            }
+            pf[ks] = __builtin_bit_cast(laf_op_t, W);
+#else
+            uint32_t pk[4];
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                const int lo = 4 * (w >> 1) + (w & 1);
+                pk[w] = (pw[lo] >> 16) | pw[lo + 2];
+            }
+            const laf_u4_t W = {pk[0], pk[1], pk[2], pk[3]};
+            pf[ks] = __builtin_bit_cast(laf_op_t, W);
+#endif
+        }
+        l = l * corr + lsum;
+#pragma unroll
+        for (int d = 0; d < 8; ++d)
+            if (d * 16 < cw) acc_o[d] *= corr;
+
+        // ---- V^T tile into LDS ----------------------------------------------------
+#pragma unroll
+        for (int it = 0; it < LAW_VPF; ++it) {
+            const int g = gbase + 8 * it;
+            if (g < ngroups) law_v_store(vs, g, vp, va[it], vb[it]);
+        }
+        for (int g = gbase + 8 * LAW_VPF; g < ngroups; g += 8) {
+            uint4 a = make_uint4(0u, 0u, 0u, 0u), b = a;
+            if (vpa) a = *(const uint4*)(vpa + g * 8);
+            if (vpb) b = *(const uint4*)(vpb + g * 8);
+            law_v_store(vs, g, vp, a, b);
+        }
+        __syncthreads();
+
+        // ---- O^T += V^T . P^T -------------------------------------------------------
+#pragma unroll
+        for (int d = 0; d < 8; ++d) {
+            if (d * 16 < cw) {
+                const uint32_t* arow = vs + (size_t)(dvc0 + d * 16 + l16) * LAW_VP;
+#pragma unroll
+                for (int ks = 0; ks < 2; ++ks) {
+#if LAF_LAYOUT_G11
+                    const uint4 u0 = *(const uint4*)(arow + ks * 8);
+                    const uint4 u1 = *(const uint4*)(arow + ks * 8 + 4);
+                    const laf_u8_t w = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
+                    const laf_op_t af = __builtin_bit_cast(laf_op_t, w);
+#else
+                    const uint4 u0 = *(const uint4*)(arow + ks * 8 + 4 * hh);
+                    const laf_op_t af = __builtin_bit_cast(laf_op_t, u0);
+#endif
+                    acc_o[d] = laf_wmma(af, pf[ks], acc_o[d]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // ---- epilogue: y = O / l (this wave's value columns) -------------------------
+    const float l_tot = l + __shfl_xor(l, 16, 32);
+    const bool row_ok = row_l < n_rows;
+    float* yrow = y + ((size_t)(row_ok ? row_l : 0) * n_heads + h) * dv + dvc0;
+#pragma unroll
+    for (int d = 0; d < 8; ++d) {
+        if (d * 16 >= cw) continue;
+        float o[8];
+#if LAF_LAYOUT_G11
+        float own[4], rcv[4];
+#pragma unroll
+        for (int mm = 0; mm < 4; ++mm) {
+            const float send = hh ? acc_o[d][mm] : acc_o[d][4 + mm];
+            own[mm] = hh ? acc_o[d][4 + mm] : acc_o[d][mm];
+            rcv[mm] = __shfl_xor(send, 16, 32);
+        }
+#pragma unroll
+        for (int mm = 0; mm < 4; ++mm) {
+            o[2 * mm] = hh ? rcv[mm] : own[mm];
+            o[2 * mm + 1] = hh ? own[mm] : rcv[mm];
+        }
+#else
+#pragma unroll
+        for (int j = 0; j < 8; ++j) o[j] = acc_o[d][j];
+#endif
+        float r[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            float v = (l_tot > 0.0f) ? o[j] / l_tot : 0.0f;
+            if (round_y) v = __uint_as_float(laf_f32_to_bf16(v) << 16);
+            r[j] = v;
+        }
+        if (row_ok) {
+            float4* dst = (float4*)(yrow + d * 16 + 8 * hh);
+            dst[0] = make_float4(r[0], r[1], r[2], r[3]);
+            dst[1] = make_float4(r[4], r[5], r[6], r[7]);
+        }
+    }
+}

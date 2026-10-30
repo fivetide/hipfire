@@ -303,16 +303,12 @@ fn validate_mq4v2_xt_source(
     {
         return Err("final-code import requires an MQ4V2 XT source artifact".to_string());
     }
-    if let Some(tensor) = source
-        .tensors()
-        .iter()
-        .find(|tensor| {
-            !matches!(tensor.quant_type, 1 | 3 | MQ4V2_FINAL_CODE_QTYPE)
+    if let Some(tensor) = source.tensors().iter().find(|tensor| {
+        !matches!(tensor.quant_type, 1 | 3 | MQ4V2_FINAL_CODE_QTYPE)
                 // Raon keeps router/A_log/dt_bias/bias/eta (and non-exact
                 // gammas) as F32 (qt2); the class map is arch 19's own.
                 && !(source.arch_id == crate::raon::RAON_ARCH_ID && tensor.quant_type == 2)
-        })
-    {
+    }) {
         return Err(format!(
             "input is not the MQ4V2-XT type map: `{}` has qt={}",
             tensor.name, tensor.quant_type

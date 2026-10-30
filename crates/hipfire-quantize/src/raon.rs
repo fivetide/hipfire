@@ -2,16 +2,17 @@
 // Copyright (c) 2026 Kaden Schutt
 //! Raon-1-mini quantization recipe: MXFP8 E8M0 dequant, class map, 1088→1280 padding. Owner: slice Q.
 //!
-//! Producer for `raon-1-mini-preview.sym-mq4v2.hfq` (arch_id 19, `raon1_mini`):
-//! the symmetric qt44 (MQ4G256V2) RTN control artifact, same layout the XTS
-//! calibration/refit lane replaces in place.
+//! Producer for `raon-1-mini-preview.sym-mq4v2*.hfq` (arch_id 19, `raon1_mini`):
+//! the symmetric qt44 (MQ4G256V2) RTN control artifact for the experts/dense MLP
+//! with every attention projection (and `lm_head`) at Q8F16; the same layout the
+//! XTS calibration/refit lane replaces in place for the qt44 classes.
 //!
 //! Class map (PLAN §3.2, original HF tensor names preserved):
 //!
 //! | class | storage |
 //! |---|---|
-//! | embedding; MLA `q_b_proj`; RDA `f_a/f_b/b_proj/rda_w_proj` | Q8F16 (qt3) |
-//! | routed/shared/dense gate,up,down; RDA q/k/v/g/o; MLA q_a/kv_a/kv_b/g/o; `lm_head` | symmetric qt44 |
+//! | embedding; `lm_head` (default, `HIPFIRE_RAON_LM_HEAD=qt44` overrides); every attention projection: MLA `q_a/q_b/kv_a/kv_b/g/o`, RDA `q/k/v/o/g/f_a/f_b/b_proj/rda_w_proj` | Q8F16 (qt3), no AWQ sidecar |
+//! | routed/shared/dense gate,up,down | symmetric qt44 |
 //! | routed + shared `down_proj` (natural K1088) | qt44 `[N,1280]`, tail zero-padded **before** FWHT |
 //! | RMS gammas, conv, mHC alpha/b/phi | lossless: F16 when every value round-trips, else F32 |
 //! | router, `A_log`, `dt_bias`, correction bias, mHC `eta` | F32 |
@@ -38,7 +39,7 @@ pub(crate) const RAON_ARCH_ID: u32 = 19;
 pub(crate) const RAON_MODEL_TYPE: &str = "raon1_mini";
 /// Pinned official checkpoint revision this recipe was written against.
 pub(crate) const SOURCE_REVISION: &str = "8c9b802acacdbda9df16606689fcf437cf7262fb";
-pub(crate) const RECIPE: &str = "raon-mq4v2-symmetric-qt44-rtn-unit-awq/v1";
+pub(crate) const RECIPE: &str = "raon-mq4v2-symmetric-qt44-experts-q8f16-attn/v2";
 pub(crate) const MXFP8_BLOCK_K: usize = 32;
 /// Rotation group width of MQ4G256V2; physical K of padded tensors rounds up to it.
 const GROUP: usize = 256;
@@ -91,12 +92,21 @@ pub(crate) fn is_routed_expert_weight(name: &str) -> bool {
     layer_rest(name).is_some_and(|(_, rest)| routed_expert(rest).is_some())
 }
 
+/// `lm_head.weight` storage: Q8F16 by default; `HIPFIRE_RAON_LM_HEAD=qt44`
+/// keeps the symmetric qt44 head (smaller artifact).
+pub(crate) fn lm_head_storage() -> Storage {
+    match hipfire_config::developer_var("HIPFIRE_RAON_LM_HEAD").as_deref() {
+        Ok("qt44") => Storage::Qt44,
+        _ => Storage::Q8F16,
+    }
+}
+
 /// Storage class for a source tensor name; unknown names are an error, never
 /// a silent default.
 pub(crate) fn classify(name: &str) -> Result<Storage, String> {
     match name {
         "model.embed_tokens.weight" => return Ok(Storage::Q8F16),
-        "lm_head.weight" => return Ok(Storage::Qt44),
+        "lm_head.weight" => return Ok(lm_head_storage()),
         "model.norm.weight" => return Ok(Storage::Lossless),
         _ => {}
     }
@@ -134,8 +144,8 @@ pub(crate) fn classify(name: &str) -> Result<Storage, String> {
         | "self_attn.o_proj.weight"
         | "self_attn.q_a_proj.weight"
         | "self_attn.kv_a_proj_with_mqa.weight"
-        | "self_attn.kv_b_proj.weight" => Storage::Qt44,
-        "self_attn.q_b_proj.weight"
+        | "self_attn.kv_b_proj.weight"
+        | "self_attn.q_b_proj.weight"
         | "self_attn.f_a_proj.weight"
         | "self_attn.f_b_proj.weight"
         | "self_attn.b_proj.weight"
@@ -809,6 +819,7 @@ pub(crate) fn run_cli(input: &Path, output: &Path) -> Result<RaonSummary, String
         "hipfire_base_format": "mq4v2",
         "hipfire_symmetric_verified": true,
         "hipfire_quant_recipe": RECIPE,
+        "hipfire_lm_head": if lm_head_storage() == Storage::Q8F16 { "q8f16" } else { "qt44" },
         "hipfire_source_revision": SOURCE_REVISION,
         "hipfire_recipe_census": census,
         "hipfire_raon": {
@@ -931,7 +942,12 @@ pub(crate) fn verify_artifact(path: &Path, unit_sidecars: bool) -> Result<RaonSu
             s.sidecars += 1;
             continue;
         }
-        let storage = classify(&t.name)?;
+        let storage = match (t.name.as_str(), t.quant_type) {
+            // The head is admitted at either codec; the producer records its choice.
+            ("lm_head.weight", 3) => Storage::Q8F16,
+            ("lm_head.weight", 44) => Storage::Qt44,
+            _ => classify(&t.name)?,
+        };
         let ok_qt = match storage {
             Storage::Q8F16 => t.quant_type == 3,
             Storage::Qt44 | Storage::Qt44Padded => t.quant_type == 44,

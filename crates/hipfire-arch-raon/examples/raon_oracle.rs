@@ -59,7 +59,10 @@ struct Cli {
 fn parse_cli() -> Result<Cli, String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let sub = argv.first().cloned().ok_or("missing subcommand")?;
-    if !matches!(sub.as_str(), "module" | "state" | "logits" | "bench" | "generate") {
+    if !matches!(
+        sub.as_str(),
+        "module" | "state" | "logits" | "bench" | "generate"
+    ) {
         return Err(format!("unknown subcommand `{sub}`"));
     }
     let mut opts = BTreeMap::new();
@@ -91,7 +94,11 @@ fn parse_cli() -> Result<Cli, String> {
     if negative && sub != "module" {
         return Err("--negative applies to `module` only".into());
     }
-    Ok(Cli { sub, opts, negative })
+    Ok(Cli {
+        sub,
+        opts,
+        negative,
+    })
 }
 
 fn require<'a>(opts: &'a BTreeMap<String, String>, key: &str) -> Result<&'a str, String> {
@@ -173,17 +180,25 @@ fn module_fn(name: &str) -> Result<RunFn, String> {
         "rda" => raon_oracle::rda::run,
         "mla" => raon_oracle::mla::run,
         "moe" => raon_oracle::moe::run,
-        other => return Err(format!("unknown --module `{other}` (mhc|rda|mla|moe|norm|head)")),
+        other => {
+            return Err(format!(
+                "unknown --module `{other}` (mhc|rda|mla|moe|norm|head)"
+            ))
+        }
     })
 }
 
 fn run_generate(cli: &Cli) -> Result<bool, String> {
     require(&cli.opts, "model")?;
     let fixtures = PathBuf::from(cli.opts.get("fixtures").map(String::as_str).unwrap_or("."));
-    let result = raon_oracle::generate::run(&fixtures, &cli.opts).map_err(|e| format!("generate: {e}"))?;
+    let result =
+        raon_oracle::generate::run(&fixtures, &cli.opts).map_err(|e| format!("generate: {e}"))?;
     // generate::run streams its own text; `--json 1` additionally prints the result object.
     if cli.opts.get("json").map(String::as_str) == Some("1") {
-        println!("{}", serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?
+        );
     }
     Ok(result.get("pass").and_then(Value::as_bool).unwrap_or(true))
 }

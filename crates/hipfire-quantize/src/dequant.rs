@@ -346,8 +346,7 @@ pub(crate) fn dequantize_mxfp8_e8m0_strict(
                 .map_err(|e| format!("scale[{r},{j}]: {e}"))?;
             for c in j * block_k..(j + 1) * block_k {
                 let v = e4m3_to_f32_strict(weight_bytes[r * cols + c])
-                    .map_err(|e| format!("weight[{r},{c}]: {e}"))?
-                    as f64
+                    .map_err(|e| format!("weight[{r},{c}]: {e}"))? as f64
                     * scale as f64;
                 let v32 = v as f32;
                 if !v32.is_finite() {

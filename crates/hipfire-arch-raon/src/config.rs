@@ -162,10 +162,9 @@ pub struct RaonConfig {
 fn opt_usize(obj: &Value, key: &str, default: usize) -> Result<usize, String> {
     match obj.get(key) {
         None | Some(Value::Null) => Ok(default),
-        Some(v) => v
-            .as_u64()
-            .map(|n| n as usize)
-            .ok_or_else(|| format!("raon1_mini config: `{key}` must be a non-negative integer, got {v}")),
+        Some(v) => v.as_u64().map(|n| n as usize).ok_or_else(|| {
+            format!("raon1_mini config: `{key}` must be a non-negative integer, got {v}")
+        }),
     }
 }
 
@@ -204,12 +203,16 @@ fn layer_list(rda: &Value, key: &str, released: &[usize]) -> Result<Vec<usize>, 
             .iter()
             .map(|v| {
                 v.as_u64().map(|n| n as usize).ok_or_else(|| {
-                    format!("raon1_mini config: rda_config.{key} entry {v} is not a positive integer")
+                    format!(
+                        "raon1_mini config: rda_config.{key} entry {v} is not a positive integer"
+                    )
                 })
             })
             .collect(),
         Some(Value::Null) => Ok(released.to_vec()),
-        Some(v) => Err(format!("raon1_mini config: rda_config.{key} must be a list, got {v}")),
+        Some(v) => Err(format!(
+            "raon1_mini config: rda_config.{key} must be a list, got {v}"
+        )),
     }
 }
 
@@ -356,7 +359,9 @@ impl RaonConfig {
         }
         let tie = opt_bool(config, "tie_word_embeddings", false)?;
         if tie {
-            return Err("raon1_mini config: tie_word_embeddings=true unsupported (untied lm_head)".into());
+            return Err(
+                "raon1_mini config: tie_word_embeddings=true unsupported (untied lm_head)".into(),
+            );
         }
 
         // RDA block.
@@ -374,7 +379,11 @@ impl RaonConfig {
         let rda_cfg = match config.get("rda_config") {
             None | Some(Value::Null) => &default_rda,
             Some(v) if v.is_object() => v,
-            Some(v) => return Err(format!("raon1_mini config: rda_config must be an object, got {v}")),
+            Some(v) => {
+                return Err(format!(
+                    "raon1_mini config: rda_config must be an object, got {v}"
+                ))
+            }
         };
         let rda_heads = opt_usize(rda_cfg, "num_heads", n_heads)?;
         let rda_head_dim = opt_usize(rda_cfg, "head_dim", head_dim)?;
@@ -390,15 +399,14 @@ impl RaonConfig {
         if !rda_full_rank_gate {
             return Err("raon1_mini config: rda_config.full_rank_gate=false unsupported".into());
         }
-        let rda_gate_lower_bound = match rda_cfg.get("gate_lower_bound") {
-            None => Some(-5.0f32),
-            Some(Value::Null) => None,
-            Some(v) => Some(
-                v.as_f64()
-                    .ok_or_else(|| format!("raon1_mini config: gate_lower_bound {v} not a number"))?
-                    as f32,
-            ),
-        };
+        let rda_gate_lower_bound =
+            match rda_cfg.get("gate_lower_bound") {
+                None => Some(-5.0f32),
+                Some(Value::Null) => None,
+                Some(v) => Some(v.as_f64().ok_or_else(|| {
+                    format!("raon1_mini config: gate_lower_bound {v} not a number")
+                })? as f32),
+            };
         match rda_gate_lower_bound {
             Some(lb) if lb == -5.0 => {}
             other => {
@@ -524,7 +532,10 @@ impl RaonConfig {
                 .and_then(Value::as_u64)
                 .map(|n| n as u32)
                 .or(Some(259_200)),
-            bos_token_id: config.get("bos_token_id").and_then(Value::as_u64).map(|n| n as u32),
+            bos_token_id: config
+                .get("bos_token_id")
+                .and_then(Value::as_u64)
+                .map(|n| n as u32),
             generation: GenerationDefaults::default(),
             rda_layers_one_based: rda_layers,
             mla_layers_one_based: mla_layers,
@@ -573,7 +584,9 @@ impl RaonConfig {
             return Err("raon1_mini config: MLA q head dim (nope+rope) != 192".into());
         }
         if self.moe_down_k % QT44_GROUP != 0 || self.moe_down_k < self.moe_inter {
-            return Err("raon1_mini config: physical down K is not a qt44 group multiple >= logical".into());
+            return Err(
+                "raon1_mini config: physical down K is not a qt44 group multiple >= logical".into(),
+            );
         }
         if self.dense_inter % QT44_GROUP != 0 {
             return Err(format!(
@@ -605,10 +618,16 @@ impl RaonConfig {
         self.ffn_kinds[layer] == FfnKind::Moe
     }
     pub fn n_rda(&self) -> usize {
-        self.layer_kinds.iter().filter(|k| **k == LayerKind::Rda).count()
+        self.layer_kinds
+            .iter()
+            .filter(|k| **k == LayerKind::Rda)
+            .count()
     }
     pub fn n_mla(&self) -> usize {
-        self.layer_kinds.iter().filter(|k| **k == LayerKind::Mla).count()
+        self.layer_kinds
+            .iter()
+            .filter(|k| **k == LayerKind::Mla)
+            .count()
     }
     /// Zero-based layer indices of the RDA layers, ascending.
     pub fn rda_layers(&self) -> Vec<usize> {
@@ -620,13 +639,21 @@ impl RaonConfig {
     }
     /// Dense index of `layer` among RDA layers (its recurrent-state slot).
     pub fn rda_index(&self, layer: usize) -> Option<usize> {
-        self.is_rda(layer)
-            .then(|| self.layer_kinds[..layer].iter().filter(|k| **k == LayerKind::Rda).count())
+        self.is_rda(layer).then(|| {
+            self.layer_kinds[..layer]
+                .iter()
+                .filter(|k| **k == LayerKind::Rda)
+                .count()
+        })
     }
     /// Dense index of `layer` among MLA layers (its latent-cache slot).
     pub fn mla_index(&self, layer: usize) -> Option<usize> {
-        self.is_mla(layer)
-            .then(|| self.layer_kinds[..layer].iter().filter(|k| **k == LayerKind::Mla).count())
+        self.is_mla(layer).then(|| {
+            self.layer_kinds[..layer]
+                .iter()
+                .filter(|k| **k == LayerKind::Mla)
+                .count()
+        })
     }
     /// Per-head MLA query/key width (`nope + rope` = 192).
     pub fn mla_qk_head(&self) -> usize {
@@ -727,7 +754,9 @@ mod tests {
         .unwrap()
     }
 
-    const RDA0: [usize; 18] = [0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 17, 18, 20, 21, 22];
+    const RDA0: [usize; 18] = [
+        0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 17, 18, 20, 21, 22,
+    ];
     const MLA0: [usize; 7] = [3, 7, 11, 15, 19, 23, 24];
 
     #[test]
@@ -766,7 +795,10 @@ mod tests {
         assert_eq!((cfg.q_lora, cfg.kv_lora), (576, 512));
         assert_eq!((cfg.qk_nope, cfg.qk_rope, cfg.v_head), (128, 64, 128));
         assert_eq!((cfg.n_experts, cfg.top_k), (128, 6));
-        assert_eq!((cfg.moe_inter, cfg.moe_down_k, cfg.dense_inter), (1088, 1280, 12032));
+        assert_eq!(
+            (cfg.moe_inter, cfg.moe_down_k, cfg.dense_inter),
+            (1088, 1280, 12032)
+        );
         assert_eq!((cfg.situ_beta, cfg.situ_linear_beta), (4.0, 25.0));
         assert_eq!(cfg.mhc_streams, 4);
         assert_eq!(cfg.mhc_controls(), 17);
@@ -810,14 +842,24 @@ mod tests {
         assert_eq!(cfg.pad_token_id, Some(259200));
         assert_eq!(cfg.generation.presence_penalty, 1.5);
         // Single-int eos is accepted.
-        let meta2 = json!({"config": released_json(), "generation_config": {"eos_token_id": 259202}})
-            .to_string();
-        assert_eq!(RaonConfig::from_metadata_json(&meta2).unwrap().eos_token_ids, vec![259202]);
+        let meta2 =
+            json!({"config": released_json(), "generation_config": {"eos_token_id": 259202}})
+                .to_string();
+        assert_eq!(
+            RaonConfig::from_metadata_json(&meta2)
+                .unwrap()
+                .eos_token_ids,
+            vec![259202]
+        );
         // Missing wrapper and eos outside vocab are refused.
-        assert!(RaonConfig::from_metadata_json("{}").unwrap_err().contains("`config`"));
+        assert!(RaonConfig::from_metadata_json("{}")
+            .unwrap_err()
+            .contains("`config`"));
         let bad = json!({"config": released_json(), "generation_config": {"eos_token_id": 999999}})
             .to_string();
-        assert!(RaonConfig::from_metadata_json(&bad).unwrap_err().contains("outside vocab"));
+        assert!(RaonConfig::from_metadata_json(&bad)
+            .unwrap_err()
+            .contains("outside vocab"));
     }
 
     fn with_rda(rda: Vec<usize>, mla: Vec<usize>) -> Value {
@@ -871,34 +913,51 @@ mod tests {
     fn wrong_geometry_and_variants_are_refused() {
         let mut j = released_json();
         j["hidden_size"] = json!(2048);
-        assert!(RaonConfig::from_json(&j).unwrap_err().contains("hidden_size"));
+        assert!(RaonConfig::from_json(&j)
+            .unwrap_err()
+            .contains("hidden_size"));
         let mut j = released_json();
         j["head_dim"] = json!(64);
         assert!(RaonConfig::from_json(&j).unwrap_err().contains("head_dim"));
         let mut j = released_json();
         j["num_attention_heads"] = json!(32);
-        assert!(RaonConfig::from_json(&j).unwrap_err().contains("num_attention_heads"));
+        assert!(RaonConfig::from_json(&j)
+            .unwrap_err()
+            .contains("num_attention_heads"));
         let mut j = released_json();
         j["hidden_act"] = json!("silu");
-        assert!(RaonConfig::from_json(&j).unwrap_err().contains("hidden_act"));
+        assert!(RaonConfig::from_json(&j)
+            .unwrap_err()
+            .contains("hidden_act"));
         let mut j = released_json();
         j["tie_word_embeddings"] = json!(true);
-        assert!(RaonConfig::from_json(&j).unwrap_err().contains("tie_word_embeddings"));
+        assert!(RaonConfig::from_json(&j)
+            .unwrap_err()
+            .contains("tie_word_embeddings"));
         let mut j = released_json();
         j["moe_router_activation_func"] = json!("softmax");
         assert!(RaonConfig::from_json(&j).unwrap_err().contains("sigmoid"));
         let mut j = released_json();
         j["rda_config"]["gate_lower_bound"] = json!(null);
-        assert!(RaonConfig::from_json(&j).unwrap_err().contains("gate_lower_bound"));
+        assert!(RaonConfig::from_json(&j)
+            .unwrap_err()
+            .contains("gate_lower_bound"));
         let mut j = released_json();
         j["model_type"] = json!("qwen3_5");
-        assert!(RaonConfig::from_json(&j).unwrap_err().contains("model_type"));
+        assert!(RaonConfig::from_json(&j)
+            .unwrap_err()
+            .contains("model_type"));
         let mut j = released_json();
         j["rda_config"]["rda_layers"] = json!("nope");
         assert!(RaonConfig::from_json(&j).is_err());
         let mut j = released_json();
-        j["rda_config"].as_object_mut().unwrap().remove("mla_layers");
-        assert!(RaonConfig::from_json(&j).unwrap_err().contains("mla_layers"));
+        j["rda_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("mla_layers");
+        assert!(RaonConfig::from_json(&j)
+            .unwrap_err()
+            .contains("mla_layers"));
     }
 
     #[test]
@@ -909,8 +968,19 @@ mod tests {
         j["rda_config"]["rda_layers"] = json!([1, 2, 4]);
         j["rda_config"]["mla_layers"] = json!([3]);
         let cfg = RaonConfig::from_json(&j).unwrap();
-        assert_eq!(cfg.layer_kinds, vec![LayerKind::Rda, LayerKind::Rda, LayerKind::Mla, LayerKind::Rda]);
-        assert_eq!(cfg.ffn_kinds, vec![FfnKind::Dense, FfnKind::Moe, FfnKind::Moe, FfnKind::Moe]);
+        assert_eq!(
+            cfg.layer_kinds,
+            vec![
+                LayerKind::Rda,
+                LayerKind::Rda,
+                LayerKind::Mla,
+                LayerKind::Rda
+            ]
+        );
+        assert_eq!(
+            cfg.ffn_kinds,
+            vec![FfnKind::Dense, FfnKind::Moe, FfnKind::Moe, FfnKind::Moe]
+        );
     }
 
     #[test]
