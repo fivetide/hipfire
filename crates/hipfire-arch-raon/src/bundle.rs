@@ -41,6 +41,44 @@ impl PrefillMode {
     }
 }
 
+/// Activation precision of batched qt44 projections (`HIPFIRE_RAON_PREFILL_PRECISION`,
+/// PLAN §3.6). `F16` (default) keeps FP16 activations at every qt44 GEMM;
+/// `A4` admits the shared symmetric IU4/A8 activation-quantized prefill
+/// routes, which are not bit-equivalent and stay opt-in pending review.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefillPrecision {
+    F16,
+    A4,
+}
+
+impl PrefillPrecision {
+    pub fn from_env() -> Result<Self, String> {
+        match hipfire_config::developer_var("HIPFIRE_RAON_PREFILL_PRECISION") {
+            Err(_) => Ok(Self::F16),
+            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "" | "f16" => Ok(Self::F16),
+                "a4" => Ok(Self::A4),
+                other => Err(format!(
+                    "HIPFIRE_RAON_PREFILL_PRECISION={other:?}: expected `f16` or `a4`"
+                )),
+            },
+        }
+    }
+
+    /// Resolve the policy onto the device's feature flags once, at load.
+    /// `F16` turns off every activation-quantized prefill route for this
+    /// process's device; `A4` leaves the device defaults untouched.
+    fn apply(self, gpu: &mut Gpu) {
+        if self == Self::F16 {
+            let mut flags = (*gpu.flags).clone();
+            flags.iu4_prefill = Some(false);
+            flags.a8_prefill = false;
+            flags.gfx11_a8_prefill = false;
+            gpu.flags = std::sync::Arc::new(flags);
+        }
+    }
+}
+
 /// Everything one loaded Raon-1-mini model owns on the device.
 pub struct RaonBundle {
     pub config: RaonConfig,
@@ -69,7 +107,11 @@ impl RaonBundle {
         scratch: RaonPrefillScratch,
     ) -> Result<Self, String> {
         let built = PrefillMode::from_env()
-            .and_then(|m| RaonWork::new(gpu, &config, scratch.rows).map(|w| (m, w)));
+            .and_then(|m| PrefillPrecision::from_env().map(|p| (m, p)))
+            .and_then(|(m, p)| {
+                p.apply(gpu);
+                RaonWork::new(gpu, &config, scratch.rows).map(|w| (m, w))
+            });
         match built {
             Ok((prefill_mode, work)) => {
                 let eos = config.eos_token_ids.clone();
