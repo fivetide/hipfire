@@ -21,7 +21,11 @@ pub mod moe;
 /// Architecture id for Raon-1-mini.
 pub const ARCH_ID: u32 = 19;
 
-pub use bundle::{RaonBundle, PREFILL_SCRATCH_ROWS};
+pub use bundle::{PrefillMode, RaonBundle, PREFILL_SCRATCH_ROWS};
+pub use forward::{
+    forward_rows, forward_rows_tapped, forward_token, forward_token_tapped, readout_logits, LayerTap,
+    RaonWork, TapSite,
+};
 pub use carrier::load_raon_bundle;
 pub use config::{FfnKind, GenerationDefaults, LayerKind, RaonConfig};
 pub use projection::{project, project_row, project_rows, round_bf16_rows, OutRound};

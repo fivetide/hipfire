@@ -19,14 +19,21 @@
 //! * `expanded_mirror`     admission limits and ledger;
 //! * `vmm_owner_table`     every VMM owner released.
 //!
-//! `--mode serial|batched|graph` additionally requires the integrated forward:
-//! [`run_forward_mode`] returns `Err("forward not integrated")` until slice I
-//! lands, and `run` then reports `pass=false` — never a placeholder pass.
+//! `--mode serial|batched` additionally runs the integrated forward through
+//! [`run_forward_mode`] (route parity + same-route determinism on the real
+//! model); `--mode graph` is refused until slice G lands, so `run` reports
+//! `pass=false` for it — never a placeholder pass.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use hip_bridge::DeviceBuffer;
+use hipfire_arch_raon::bundle::{PrefillMode, RaonBundle};
+use hipfire_arch_raon::forward::forward_token;
+use hipfire_runtime::loader_api::ModelSource;
+use std::time::Instant;
+
+use super::logits::{check_tokens, load_bundle, read_tokens};
 use hipfire_arch_raon::state::{
     auto_backend, expanded_mirror_bytes, scratch_plan, state_budget, LatentBackend, RaonPrefillScratch,
     RaonState, RaonStateDims, ADMISSION_HEADROOM_BYTES, EXPANDED_MIRROR_MAX_ROWS,
@@ -115,15 +122,327 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
     Ok(out)
 }
 
-/// Full-forward state parity (`serial|batched|graph`): composes embedding,
-/// layers and head through the production forward and compares every RDA
-/// state/conv window/live latent row. Filled in by integration (slice I/B/G).
+/// Full-forward route parity (`serial|batched|graph`).
+///
+/// Loads the production bundle and drives the integrated forward over the
+/// `--tokens` list through the SERIAL route (`forward_token` per token, state
+/// advanced per token) and/or the BATCHED route (`bundle.prefill`, chunked),
+/// fingerprinting after each run every RDA state, every conv history plane
+/// (q/k/v), the live latent rows `[0, n_tokens)` of every MLA cache and the
+/// final logits.
+///
+/// * `serial`:  serial twice; same-route determinism is bitwise.
+/// * `batched`: serial once, batched twice; batched determinism is bitwise,
+///   cross-route logits must have cosine >= 0.999 and equal top-1. Cross-route
+///   state differences are reported, never gated bitwise.
+/// * `graph`:   refused (slice G).
+///
+/// Opts: `model` (HFQ), `tokens` (u32le binary or text ids, see `logits.rs`).
 pub fn run_forward_mode(
-    _gpu: &mut Gpu,
-    _mode: &str,
-    _opts: &BTreeMap<String, String>,
+    gpu: &mut Gpu,
+    mode: &str,
+    opts: &BTreeMap<String, String>,
 ) -> Result<Value, String> {
-    Err("forward not integrated".to_string())
+    if mode == "graph" {
+        return Err("graph mode not implemented (slice G)".to_string());
+    }
+    if mode != "serial" && mode != "batched" {
+        return Err(format!("forward mode `{mode}`: serial|batched (graph is slice G)"));
+    }
+    let model = opts.get("model").ok_or("state --mode serial|batched: missing --model")?;
+    let tok_path = opts.get("tokens").ok_or("state --mode serial|batched: missing --tokens")?;
+    let tokens = read_tokens(tok_path)?;
+    let max_seq = (tokens.len() + 64).max(512);
+    let src = ModelSource::from_path(model)?;
+    let mut bundle = load_bundle(gpu, src, model, max_seq)?;
+    let result = fwd_mode_inner(gpu, &mut bundle, mode, &tokens);
+    bundle.free_all(gpu);
+    result.map(|mut v| {
+        v["model"] = json!(model);
+        v
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FwdElem {
+    F32,
+    Bf16,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FwdRoute {
+    Serial,
+    Batched,
+}
+
+struct FwdItem {
+    name: String,
+    elem: FwdElem,
+    bytes: Vec<u8>,
+}
+
+struct FwdSnap {
+    items: Vec<FwdItem>,
+    n_tokens: usize,
+    secs: f64,
+}
+
+fn fwd_mode_inner(gpu: &mut Gpu, bundle: &mut RaonBundle, mode: &str, tokens: &[u32]) -> Result<Value, String> {
+    check_tokens(tokens, bundle.config.vocab, "tokens")?;
+    let n = tokens.len();
+    let mut out = json!({
+        "n_tokens": n,
+        "mode": mode,
+        "definitions": {
+            "bitwise_equal": "every captured byte identical",
+            "max_abs": "max |a-b| over the tensor",
+            "max_rel": "max_abs / max |b| (peak-relative)",
+            "rel_l2": "||a-b||2 / ||b||2",
+        },
+    });
+    let mut pass = true;
+    match mode {
+        "serial" => {
+            let s1 = fwd_run_route(gpu, bundle, tokens, FwdRoute::Serial)?;
+            let s2 = fwd_run_route(gpu, bundle, tokens, FwdRoute::Serial)?;
+            let det = fwd_compare(&s1, &s2)?;
+            let finite = fwd_logits_finite(&s1)?;
+            pass &= det["bitwise_equal"].as_bool() == Some(true) && finite;
+            out["serial"] = fwd_route_json(&s1);
+            out["serial_repeat_secs"] = json!(s2.secs);
+            out["serial_vs_serial"] = det;
+            out["logits_finite"] = json!(finite);
+        }
+        _ => {
+            let s = fwd_run_route(gpu, bundle, tokens, FwdRoute::Serial)?;
+            let b1 = fwd_run_route(gpu, bundle, tokens, FwdRoute::Batched)?;
+            let b2 = fwd_run_route(gpu, bundle, tokens, FwdRoute::Batched)?;
+            let det = fwd_compare(&b1, &b2)?;
+            let cross = fwd_compare(&s, &b1)?;
+            let (cos, top1_equal, finite) = fwd_logits_cross(&s, &b1)?;
+            let cross_ok = cos >= 0.999 && top1_equal;
+            pass &= det["bitwise_equal"].as_bool() == Some(true) && cross_ok && finite;
+            out["serial"] = fwd_route_json(&s);
+            out["batched"] = fwd_route_json(&b1);
+            out["batched_repeat_secs"] = json!(b2.secs);
+            out["batched_vs_batched"] = det;
+            out["serial_vs_batched"] = cross;
+            out["cross_route_logits"] = json!({
+                "cosine": cos,
+                "top1_equal": top1_equal,
+                "band": {"min_cosine": 0.999, "top1_equal": true},
+                "pass": cross_ok,
+            });
+            out["logits_finite"] = json!(finite);
+        }
+    }
+    out["pass"] = json!(pass);
+    Ok(out)
+}
+
+/// Reset, run `tokens` through `route`, synchronize and capture the state.
+fn fwd_run_route(gpu: &mut Gpu, b: &mut RaonBundle, tokens: &[u32], route: FwdRoute) -> Result<FwdSnap, String> {
+    b.reset(gpu)?;
+    b.state.ensure_capacity(gpu, tokens.len())?;
+    let t0 = Instant::now();
+    match route {
+        FwdRoute::Serial => {
+            let last = tokens.len() - 1;
+            for (i, &t) in tokens.iter().enumerate() {
+                forward_token(
+                    &b.config,
+                    &b.weights,
+                    &mut b.state,
+                    &mut b.scratch,
+                    &mut b.work,
+                    gpu,
+                    t,
+                    i as u32,
+                    i == last,
+                )?;
+            }
+        }
+        FwdRoute::Batched => {
+            b.set_prefill_mode(PrefillMode::Batched);
+            b.prefill(gpu, tokens)?;
+        }
+    }
+    hip_err(gpu.hip.device_synchronize(), "synchronize after route")?;
+    let secs = t0.elapsed().as_secs_f64();
+    if b.state.n_tokens() != tokens.len() {
+        return Err(format!(
+            "route advanced state to {} tokens, expected {}",
+            b.state.n_tokens(),
+            tokens.len()
+        ));
+    }
+    fwd_capture(gpu, b, secs)
+}
+
+fn fwd_capture(gpu: &Gpu, b: &RaonBundle, secs: f64) -> Result<FwdSnap, String> {
+    let st = &b.state;
+    let n = st.n_tokens();
+    let mut items = Vec::new();
+    for i in 0..st.dims().n_rda {
+        let r = &st.rda[i].buf;
+        items.push(FwdItem {
+            name: format!("rda[{i}]"),
+            elem: FwdElem::F32,
+            bytes: read_bytes(gpu, r, 0, r.size(), &format!("capture rda[{i}]"))?,
+        });
+        for (p, c) in [&st.conv_q[i], &st.conv_k[i], &st.conv_v[i]].into_iter().enumerate() {
+            items.push(FwdItem {
+                name: format!("conv_{}[{i}]", ["q", "k", "v"][p]),
+                elem: FwdElem::F32,
+                bytes: read_bytes(gpu, &c.buf, 0, c.buf.size(), &format!("capture conv{p}[{i}]"))?,
+            });
+        }
+    }
+    let rb = st.dims().latent_row_bytes();
+    for (l, t) in st.mla_cache.iter().enumerate() {
+        items.push(FwdItem {
+            name: format!("latent[{l}]"),
+            elem: FwdElem::Bf16,
+            bytes: read_bytes(gpu, &t.buf, 0, n * rb, &format!("capture latent[{l}] rows [0,{n})"))?,
+        });
+    }
+    let logits = hip_err(gpu.download_f32(&b.scratch.logits), "capture logits")?;
+    items.push(FwdItem {
+        name: "logits".to_string(),
+        elem: FwdElem::F32,
+        bytes: logits.iter().flat_map(|x| x.to_le_bytes()).collect(),
+    });
+    Ok(FwdSnap {
+        items,
+        n_tokens: n,
+        secs,
+    })
+}
+
+fn fwd_fnv1a(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn fwd_values(elem: FwdElem, bytes: &[u8]) -> impl Iterator<Item = f32> + '_ {
+    let w = if elem == FwdElem::F32 { 4 } else { 2 };
+    bytes.chunks_exact(w).map(move |c| match elem {
+        FwdElem::F32 => f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+        FwdElem::Bf16 => f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16),
+    })
+}
+
+fn fwd_route_json(s: &FwdSnap) -> Value {
+    let mut fp = serde_json::Map::new();
+    for it in &s.items {
+        fp.insert(it.name.clone(), json!(format!("{:016x}", fwd_fnv1a(&it.bytes))));
+    }
+    json!({
+        "n_tokens": s.n_tokens,
+        "secs": s.secs,
+        "tok_per_s": s.n_tokens as f64 / s.secs.max(1e-9),
+        "fingerprint_fnv1a64": Value::Object(fp),
+    })
+}
+
+fn fwd_logits(s: &FwdSnap) -> Result<Vec<f32>, String> {
+    let it = s
+        .items
+        .iter()
+        .find(|i| i.name == "logits")
+        .ok_or("snapshot lacks logits")?;
+    Ok(fwd_values(it.elem, &it.bytes).collect())
+}
+
+fn fwd_logits_finite(s: &FwdSnap) -> Result<bool, String> {
+    Ok(fwd_logits(s)?.iter().all(|x| x.is_finite()))
+}
+
+/// `(cosine, top-1 equal (first-max argmax), both finite)` between two routes.
+fn fwd_logits_cross(a: &FwdSnap, b: &FwdSnap) -> Result<(f64, bool, bool), String> {
+    let (la, lb) = (fwd_logits(a)?, fwd_logits(b)?);
+    if la.len() != lb.len() {
+        return Err("logits length differs between routes".into());
+    }
+    let (mut aa, mut bb, mut ab) = (0.0f64, 0.0f64, 0.0f64);
+    for (&x, &y) in la.iter().zip(&lb) {
+        let (x, y) = (x as f64, y as f64);
+        aa += x * x;
+        bb += y * y;
+        ab += x * y;
+    }
+    let cos = ab / (aa.sqrt() * bb.sqrt()).max(1e-300);
+    let argmax = |v: &[f32]| {
+        let mut best = 0usize;
+        for (i, &x) in v.iter().enumerate() {
+            if x > v[best] {
+                best = i;
+            }
+        }
+        best
+    };
+    let finite = la.iter().all(|x| x.is_finite()) && lb.iter().all(|x| x.is_finite());
+    Ok((cos, argmax(&la) == argmax(&lb), finite))
+}
+
+/// Per-tensor comparison of two snapshots (names/sizes must match).
+fn fwd_compare(a: &FwdSnap, b: &FwdSnap) -> Result<Value, String> {
+    if a.items.len() != b.items.len() {
+        return Err(format!("snapshots differ in tensor count: {} vs {}", a.items.len(), b.items.len()));
+    }
+    let mut all_equal = true;
+    let mut differing = 0usize;
+    let mut worst_abs = 0.0f64;
+    let mut worst_rel = 0.0f64;
+    let mut tensors = Vec::with_capacity(a.items.len());
+    for (x, y) in a.items.iter().zip(&b.items) {
+        if x.name != y.name || x.elem != y.elem || x.bytes.len() != y.bytes.len() {
+            return Err(format!("snapshot tensor mismatch: {} ({} B) vs {} ({} B)", x.name, x.bytes.len(), y.name, y.bytes.len()));
+        }
+        let equal = x.bytes == y.bytes;
+        let (mut max_abs, mut peak, mut dd, mut bb, mut nonfinite) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0usize);
+        if !equal {
+            for (p, q) in fwd_values(x.elem, &x.bytes).zip(fwd_values(y.elem, &y.bytes)) {
+                if !p.is_finite() || !q.is_finite() {
+                    nonfinite += 1;
+                    continue;
+                }
+                let (p, q) = (p as f64, q as f64);
+                max_abs = max_abs.max((p - q).abs());
+                peak = peak.max(q.abs());
+                dd += (p - q) * (p - q);
+                bb += q * q;
+            }
+        }
+        let max_rel = if peak > 0.0 { max_abs / peak } else { 0.0 };
+        let rel_l2 = if bb > 0.0 { (dd / bb).sqrt() } else { 0.0 };
+        all_equal &= equal;
+        if !equal {
+            differing += 1;
+        }
+        worst_abs = worst_abs.max(max_abs);
+        worst_rel = worst_rel.max(max_rel);
+        tensors.push(json!({
+            "name": x.name,
+            "bitwise_equal": equal,
+            "max_abs": max_abs,
+            "max_rel": max_rel,
+            "rel_l2": rel_l2,
+            "nonfinite_elems": nonfinite,
+        }));
+    }
+    Ok(json!({
+        "bitwise_equal": all_equal,
+        "tensors_compared": a.items.len(),
+        "tensors_differing": differing,
+        "worst_max_abs": worst_abs,
+        "worst_max_rel": worst_rel,
+        "tensors": tensors,
+    }))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

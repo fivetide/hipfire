@@ -28,6 +28,7 @@ use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_gemma4 as gemma4;
 use hipfire_arch_lfm2moe as lfm2moe;
+use hipfire_arch_raon as raon;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_muse_glimmer as glimmer;
 use hipfire_arch_qwen35::qwen35::{self};
@@ -406,6 +407,7 @@ pub fn arch_label(arch_id: u32) -> &'static str {
         16 => "qwen4",
         17 => "qwen3_5_embed",
         18 => "embedding_gemma2",
+        19 => "raon1_mini",
         40 => "flux_mmdit",
         45 => "flux2_mmdit",
         _ => "qwen3",
@@ -586,6 +588,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &FluxDiffusionCarrier,
     &Qwen35EmbedCarrier,
     &EmbeddingGemma2Carrier,
+    &RaonCarrier,
 ];
 
 // ─── Constants ────────────────────────────────────────────────────────
@@ -897,6 +900,7 @@ pub struct Deepseek4HeterogeneousBundle {
 /// (orphan rule). Field-identical to the prior loader-local struct. `eos_tok` is
 /// resolved at load time and rides along so the generate path doesn't re-tokenize.
 pub use lfm2moe::Lfm2MoeBundle;
+pub use raon::RaonBundle;
 
 /// MiniMax-M2 (arch_id=10) GPU bundle. Re-exported from the arch crate, which
 /// owns it so `impl SpecTarget for MiniMaxBundle` (the n-gram verify seam) can
@@ -1384,6 +1388,19 @@ impl LoadedModel {
         self.state
             .as_deref_mut()
             .and_then(|s| (s as &mut dyn Any).downcast_mut::<Lfm2MoeBundle>())
+    }
+
+    /// Raon-1-mini bundle if this model is arch_id=19, else None.
+    pub fn raon(&self) -> Option<&RaonBundle> {
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<RaonBundle>())
+    }
+
+    pub fn raon_mut(&mut self) -> Option<&mut RaonBundle> {
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<RaonBundle>())
     }
 
     /// MiniMax-M2 bundle if this model is arch_id=10, else None.
@@ -7238,6 +7255,7 @@ mod registry_tests {
             (10, false, "minimax"),
             (11, false, "lfm2moe"),
             (12, false, "cohere2moe"),
+            (19, false, "raon1_mini"),
             (40, false, "flux"),
             (40, true, "flux"),
             (45, false, "flux"),
@@ -7445,7 +7463,7 @@ mod registry_tests {
             );
             covered.push(label);
         }
-        for label in ["qwen3_5", "qwen3_5_moe", "qwen4", "muse_glimmer"] {
+        for label in ["qwen3_5", "qwen3_5_moe", "qwen4", "muse_glimmer", "raon1_mini"] {
             assert!(covered.contains(&label), "{label} not covered: {covered:?}");
         }
     }
@@ -7525,6 +7543,14 @@ mod registry_tests {
             }
         );
         assert_eq!(caps_of("cohere2moe"), text_only);
+        assert_eq!(
+            caps_of("raon1_mini"),
+            ArchCaps {
+                reasoning_contract: ReasoningContract::QwenJinja,
+                semantic_contract_version: Some(2),
+                ..text_only
+            }
+        );
         assert_eq!(
             caps_of("gemma4"),
             ArchCaps {

@@ -81,12 +81,5 @@ pub fn load_raon_bundle(src: ModelSource, ctx: &mut LoadCtx<'_>) -> Result<RaonB
             return Err(format!("raon1_mini: RaonPrefillScratch::new failed: {e}"));
         }
     };
-    let eos = config.eos_token_ids.clone();
-    Ok(RaonBundle {
-        config,
-        weights,
-        state,
-        scratch,
-        eos,
-    })
+    RaonBundle::new(ctx.gpu, config, weights, state, scratch)
 }
