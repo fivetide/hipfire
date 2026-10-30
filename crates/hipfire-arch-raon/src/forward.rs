@@ -710,6 +710,11 @@ fn forward_impl(
             cfg.n_layers
         ));
     }
+    if cfg.n_mla() > 0 && rows > MLA_TILE_ROWS {
+        return Err(format!(
+            "raon1_mini: {rows} rows exceed the {MLA_TILE_ROWS}-row MLA decompression tile"
+        ));
+    }
     let start = start_pos as usize;
     if start != s.n_tokens() {
         return Err(format!(

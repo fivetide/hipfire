@@ -7,7 +7,7 @@ use rdna_compute::{Gpu, GpuTensor};
 
 use crate::config::RaonConfig;
 use crate::forward::{forward_rows, forward_token, RaonWork};
-use crate::state::{RaonPrefillScratch, RaonState};
+use crate::state::{RaonPrefillScratch, RaonState, MLA_TILE_ROWS};
 use crate::weights::RaonWeights;
 
 /// Upper bound of token rows one batched prefill call stages (the scratch is
@@ -145,7 +145,7 @@ impl RaonBundle {
         }
         let chunk = match self.prefill_mode {
             PrefillMode::Serial => 1,
-            PrefillMode::Batched => self.scratch.rows.min(self.work.rows()),
+            PrefillMode::Batched => self.scratch.rows.min(self.work.rows()).min(MLA_TILE_ROWS),
         };
         let n_chunks = tokens.len().div_ceil(chunk);
         for (ci, piece) in tokens.chunks(chunk).enumerate() {
