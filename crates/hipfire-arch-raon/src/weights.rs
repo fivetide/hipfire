@@ -14,7 +14,7 @@
 //! | class | stored as | resident as |
 //! |---|---|---|
 //! | embedding | Q8F16 (qt 3), or qt 1/2/16/44 | raw Q8 table / host-decoded F32 |
-//! | projections (attn, dense/shared FFN, lm_head) | qt44 (symmetric MQ4G256V2) or Q8F16 (qt 3) when K is not a multiple of 256; qt 1/2/16 widen to F32 | [`WeightTensor`] (+ AWQ sidecar) |
+//! | projections (attn, dense/shared FFN, lm_head) | Q8F16 (qt 3; every attention projection and lm_head in the shipped recipe, no AWQ sidecar) or qt44 (symmetric MQ4G256V2, dense/shared FFN) when K is a multiple of 256; qt 1/2/16 widen to F32 | [`WeightTensor`] (+ AWQ sidecar on qt44) |
 //! | routed experts | symmetric qt44 only; gate rows ++ up rows fused per expert | per-expert `[2*1088, 2560]` and `[2560, 1280]` |
 //! | router, mHC selector, norms, conv, A_log, dt_bias, biases | qt 1/2/16 | F32 |
 //!
@@ -124,7 +124,7 @@ pub struct MlaWeights {
     pub q_a_proj: WeightTensor,
     /// F32 `[576]`.
     pub q_a_norm: GpuTensor,
-    /// `[7680, 576]`; K=576 is not a qt44 group multiple, so Q8F16.
+    /// `[7680, 576]`; Q8F16 (K=576 is not a qt44 group multiple).
     pub q_b_proj: WeightTensor,
     pub kv_a_proj: WeightTensor,
     /// F32 `[512]`.
