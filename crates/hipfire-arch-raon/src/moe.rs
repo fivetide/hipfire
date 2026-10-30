@@ -30,6 +30,7 @@ use hipfire_dispatch::pipeline::{
     SharedExpertPolicy,
 };
 use hipfire_runtime::llama::WeightTensor;
+use rdna_compute::ffn_activation::single_expert_table_words;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Raon geometry and activation constants consumed by the generic programs.
@@ -245,6 +246,8 @@ pub struct RaonMoeScratch {
     pub shared_rot: GpuTensor,
     /// Cast shared expert output `[rows, hidden]` (the shared-only result).
     pub shared_out: GpuTensor,
+    /// Single-expert grouping tables of the shared expert projections.
+    pub shared_tables: GpuTensor,
 }
 
 fn alloc_words(gpu: &mut Gpu, words: usize) -> Result<GpuTensor, String> {
@@ -280,6 +283,7 @@ impl RaonMoeScratch {
             shared_act: alloc_words(gpu, plan.shared_act)?,
             shared_rot: alloc_words(gpu, plan.shared_rot)?,
             shared_out: alloc_words(gpu, plan.shared_out)?,
+            shared_tables: alloc_words(gpu, plan.shared_tables)?,
         })
     }
 
@@ -311,6 +315,7 @@ impl RaonMoeScratch {
                 act: &self.shared_act,
                 rot: &self.shared_rot,
                 out: &self.shared_out,
+                tables: &self.shared_tables,
             }),
         }
     }
@@ -338,6 +343,7 @@ impl RaonMoeScratch {
             self.shared_act,
             self.shared_rot,
             self.shared_out,
+            self.shared_tables,
         ] {
             let _ = gpu.free_tensor(t);
         }
@@ -352,6 +358,8 @@ pub struct RaonDenseScratch {
     pub up_out: GpuTensor,
     pub act: GpuTensor,
     pub rot: GpuTensor,
+    /// Single-expert grouping tables of the dense projections.
+    pub tables: GpuTensor,
 }
 
 impl RaonDenseScratch {
@@ -365,11 +373,19 @@ impl RaonDenseScratch {
             up_out: alloc_words(gpu, rows * dims.dense_mi)?,
             act: alloc_words(gpu, rows * dims.dense_mi)?,
             rot: alloc_words(gpu, rows * dims.dense_mi)?,
+            tables: alloc_words(gpu, single_expert_table_words(rows))?,
         })
     }
 
     pub fn free(self, gpu: &mut Gpu) {
-        for t in [self.x_rot, self.gate_out, self.up_out, self.act, self.rot] {
+        for t in [
+            self.x_rot,
+            self.gate_out,
+            self.up_out,
+            self.act,
+            self.rot,
+            self.tables,
+        ] {
             let _ = gpu.free_tensor(t);
         }
     }
@@ -477,6 +493,7 @@ pub fn raon_dense_op<'a>(
             act: &scratch.act,
             rot: &scratch.rot,
             out: shared_out,
+            tables: &scratch.tables,
         },
         out,
     }
@@ -588,6 +605,7 @@ pub fn moe_scratch_bytes(dims: &RaonMoeDims, max_rows: usize) -> Result<usize, S
         p.shared_act,
         p.shared_rot,
         p.shared_out,
+        p.shared_tables,
     ];
     Ok(words.iter().map(|w| (*w).max(1) * 4).sum())
 }
@@ -595,5 +613,5 @@ pub fn moe_scratch_bytes(dims: &RaonMoeDims, max_rows: usize) -> Result<usize, S
 /// Bytes of [`RaonDenseScratch::new`] for `max_rows` rows.
 pub fn dense_scratch_bytes(dims: &RaonMoeDims, max_rows: usize) -> usize {
     let rows = max_rows.max(1);
-    (rows * dims.hidden + 4 * rows * dims.dense_mi) * 4
+    (rows * dims.hidden + 4 * rows * dims.dense_mi + single_expert_table_words(rows)) * 4
 }

@@ -109,3 +109,33 @@ extern "C" __global__ __launch_bounds__(256) void NAME(                         
 FFN_GROUPED_ENTRY(ffn_swiglu_grouped_f32, 0)
 FFN_GROUPED_ENTRY(ffn_swiglu_clamp_grouped_f32, 1)
 FFN_GROUPED_ENTRY(ffn_situ_grouped_f32, 2)
+
+// Single-expert grouping tables: one dense weight driven through the grouped
+// WMMA core / indexed GEMV as "expert 0" of a one-entry pointer table.
+//   words [0, 6)                      three u64 weight pointers (w0, w1, w2)
+//   words [6, 6 + rows_pad)           expert index per row, all 0
+//   words [6 + rows_pad, 6 + 2 rows_pad)   sorted_slot_index: i for i < rows, else -1
+//   words [6 + 2 rows_pad, +rows_pad/16)   expert_tile_ids, all 0
+// rows_pad = rows rounded up to a multiple of 16.
+// Grid ceil(rows_pad / 256) (at least 1), block 256.
+// Kernarg order: tables*, rows, rows_pad, w0, w1, w2
+extern "C" __global__ __launch_bounds__(256) void ffn_single_expert_tables(
+    int* tables, int rows, int rows_pad,
+    unsigned long long w0, unsigned long long w1, unsigned long long w2
+) {
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    if (i == 0) {
+        unsigned long long* ptrs = reinterpret_cast<unsigned long long*>(tables);
+        ptrs[0] = w0;
+        ptrs[1] = w1;
+        ptrs[2] = w2;
+    }
+    int* index = tables + 6;
+    int* sorted = tables + 6 + rows_pad;
+    int* tiles = tables + 6 + 2 * rows_pad;
+    if (i < rows_pad) {
+        index[i] = 0;
+        sorted[i] = (i < rows) ? i : -1;
+    }
+    if (i < rows_pad / 16) tiles[i] = 0;
+}

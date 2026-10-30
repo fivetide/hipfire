@@ -6635,6 +6635,8 @@ pub struct GroupedMoeScratchPlan {
     pub shared_act: usize,
     pub shared_rot: usize,
     pub shared_out: usize,
+    /// Single-expert grouping tables of the shared expert projections.
+    pub shared_tables: usize,
 }
 
 fn plan_overflow() -> DispatchError {
@@ -6665,6 +6667,11 @@ impl GroupedMoeScratchPlan {
             shared_up: mul(rows, g.shared_mi)?,
             shared_act: mul(rows, g.shared_down_k)?,
             shared_rot: mul(rows, g.shared_down_k)?,
+            shared_tables: if g.shared_mi == 0 {
+                0
+            } else {
+                rdna_compute::ffn_activation::single_expert_table_words(rows)
+            },
             shared_out: if g.shared_mi == 0 {
                 0
             } else {
@@ -6718,6 +6725,7 @@ impl GroupedMoeScratchPlan {
             shared_act: self.shared_act.max(o.shared_act),
             shared_rot: self.shared_rot.max(o.shared_rot),
             shared_out: self.shared_out.max(o.shared_out),
+            shared_tables: self.shared_tables.max(o.shared_tables),
         }
     }
 
@@ -6799,6 +6807,9 @@ pub struct GroupedMoeSharedScratch<'a> {
     /// Cast shared expert output `[rows, hidden]` (diagnostic: the shared-only
     /// result of the layer).
     pub out: &'a GpuTensor,
+    /// F32 words, at least `single_expert_table_words(rows)`: grouping tables
+    /// that run the qt44 gate/up/down weights as one-entry expert tables.
+    pub tables: &'a GpuTensor,
 }
 
 #[derive(Clone, Copy)]
@@ -7043,6 +7054,7 @@ impl<'a> GroupedMoeOp<'a> {
             scratch_need(ss.act, plan.shared_act, "shared.act")?;
             scratch_need(ss.rot, plan.shared_rot, "shared.rot")?;
             scratch_need(ss.out, plan.shared_out, "shared.out")?;
+            scratch_need(ss.tables, plan.shared_tables, "shared.tables")?;
         }
         Ok(plan)
     }
@@ -7088,21 +7100,72 @@ fn gated_ffn_from_basis(
 ) -> Result<(), DispatchError> {
     static GEMM: std::sync::LazyLock<GemmFamily> = std::sync::LazyLock::new(GemmFamily::new);
     let gemm = &*GEMM;
-    for (weight, y) in [(&w.gate, s.gate_out), (&w.up, s.up_out)] {
-        let (key, rotated) = projection_kind(weight.dtype, "gated-ffn-gate-up")?;
+    let (down_key, down_rotated) = projection_kind(w.down.dtype, "gated-ffn-down")?;
+    // One-entry grouping tables drive qt44 weights through the grouped F16 WMMA
+    // core (BF16 policy, rows >= 2) or the F32 indexed GEMV (exact policy), so a
+    // shared/dense projection never takes the quantized-activation prefill GEMMs
+    // (A8 / IU4 / FP8) that the dense GEMM entry selects at wide batches.
+    let any_qt44 = [&w.gate, &w.up, &w.down]
+        .iter()
+        .any(|p| p.dtype == DType::MQ4G256V2);
+    let views = if any_qt44 && !(cast.bf16() && rows == 1) {
+        hip!(gpu.ffn_single_expert_tables(s.tables, rows, [w.gate.buf, w.up.buf, w.down.buf]))?;
+        Some(Gpu::single_expert_views(s.tables, rows))
+    } else {
+        None
+    };
+    let project = |gpu: &mut Gpu,
+                   weight: &WeightRef<'_>,
+                   which: usize,
+                   xin: &GpuTensor,
+                   y: &GpuTensor,
+                   key: crate::types::KernelKey,
+                   m: usize,
+                   k: usize|
+     -> Result<(), DispatchError> {
+        if let (Some(v), DType::MQ4G256V2) = (views.as_ref(), weight.dtype) {
+            let ptr = [&v.gate_ptr, &v.up_ptr, &v.down_ptr][which];
+            if !cast.bf16() {
+                // FP32 activations and accumulation: the indexed GEMV with
+                // one rank per row (`top_k = 1`, expert 0).
+                return hip!(gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
+                    ptr, &v.index, xin, y, m, k, 1, rows,
+                ));
+            }
+            if ctx.arch.has_wmma_w32() || ctx.arch.is_rdna4() {
+                return hip!(gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(
+                    ptr, &v.tiles, &v.sorted, xin, y, m, k, 1, rows, rows,
+                ));
+            }
+        }
         gemm.run_key(
             key,
             ctx,
             gpu,
             &GemmParams {
                 w: weight,
-                x: if rotated { x_rot } else { x },
+                x: xin,
                 y,
                 batch_size: rows,
             },
+        )
+    };
+    for (which, (weight, y)) in [(&w.gate, s.gate_out), (&w.up, s.up_out)]
+        .into_iter()
+        .enumerate()
+    {
+        let (key, rotated) = projection_kind(weight.dtype, "gated-ffn-gate-up")?;
+        project(
+            gpu,
+            weight,
+            which,
+            if rotated { x_rot } else { x },
+            y,
+            key,
+            mi,
+            hidden,
         )?;
     }
-    let (down_key, down_rotated) = projection_kind(w.down.dtype, "gated-ffn-down")?;
     let awq = match w.down.awq_scale {
         Some(t) if down_rotated => FfnAwq::Vector(t),
         _ => FfnAwq::None,
@@ -7129,17 +7192,7 @@ fn gated_ffn_from_basis(
     } else {
         s.act
     };
-    gemm.run_key(
-        down_key,
-        ctx,
-        gpu,
-        &GemmParams {
-            w: &w.down,
-            x: down_x,
-            y: out,
-            batch_size: rows,
-        },
-    )?;
+    project(gpu, &w.down, 2, down_x, out, down_key, hidden, down_k)?;
     if cast.bf16() {
         hip!(gpu.ffn_round_bf16_f32(out, rows * hidden))?;
     }
@@ -7198,6 +7251,11 @@ pub fn execute_gated_ffn(gpu: &mut Gpu, op: &GatedFfnOp<'_>) -> Result<(), Dispa
     scratch_need(op.scratch.up_out, mul(r, op.mi)?, "up_out")?;
     scratch_need(op.scratch.act, mul(r, op.down_k)?, "act")?;
     scratch_need(op.scratch.rot, mul(r, op.down_k)?, "rot")?;
+    scratch_need(
+        op.scratch.tables,
+        rdna_compute::ffn_activation::single_expert_table_words(r),
+        "tables",
+    )?;
     if rotated_gate || rotated_up {
         if op.hidden % 256 != 0 {
             return Err(grouped_refusal("gated-ffn-geometry", ""));
@@ -7468,6 +7526,8 @@ mod grouped_moe_tests {
         assert_eq!(p.indexed_gate, 0);
         assert_eq!(p.shared_act, 512 * 1280);
         assert_eq!(p.shared_out, 512 * 2560);
+        // 3 u64 pointers + index/sorted (512 each) + 32 tile ids.
+        assert_eq!(p.shared_tables, 6 + 2 * 512 + 32);
     }
 
     #[test]
