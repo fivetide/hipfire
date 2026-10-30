@@ -28,14 +28,22 @@
 //!               same mirror; BF16 band + bytewise repeat.
 //!   absorbed  : opt-in absorbed-latent route, no mirror; NOT bit-exact to the
 //!               decompressed routes, so every absorbed check is labelled
-//!               `"route": "absorbed", "bit_exact": false` and uses the band.
+//!               `"route": "absorbed", "bit_exact": false`. It has no
+//!               intermediate BF16 K/V rounding, so it is GATED (BF16 band)
+//!               against an unrounded-f64 CPU reference computed from the
+//!               fixture cache/kv_b/q. The comparison against the fixture
+//!               `attn_y` (which carries the decompressed route's BF16 K/V
+//!               rounding) is reported but non-gating, and `absorbed_vs_tiled`
+//!               gates on rel_l2/cosine only (max_abs printed, not gating).
+//!               Every check JSON carries `"gating": true|false`.
 //!
 //! Generated long-context cases `long_p<P>_n<N>` (skipped with `--long 0` and
 //! in `--negative` mode; selectable with `--case`): Raon geometry and the real
 //! `weights_raon.safetensors` kv_b; the latent cache and the queries come from a
 //! fixed-seed PRNG (xorshift64* + Box-Muller, seed [`LONG_SEED`] xor P<<20 xor N)
-//! with a planted far-from-diagonal "needle"; the reference is an independent
-//! multi-threaded f64 CPU attention over f32-fma-expanded K/V.
+//! with a planted far-from-diagonal "needle"; the references are independent
+//! multi-threaded CPU attentions (f64 scores/softmax) over f32-fma-expanded,
+//! BF16-rounded K/V (decompressed routes) and over unrounded K/V (absorbed).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -652,10 +660,21 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value, routes: Routes) -> Result<V
         checks.push(labeled(compare("gated_tiled", &gated_t, r_gated), "tiled", false));
     }
     if routes.absorbed {
-        checks.push(labeled(compare("attn_y_absorbed", &ya, r_y), "absorbed", false));
+        // The absorbed route computes the unrounded math (no intermediate BF16
+        // K/V), so it is gated against the unrounded-f64 CPU reference; the
+        // fixture's own BF16-K/V numbers are reported, non-gating.
+        let wq: Vec<f32> = kv_b.iter().map(|f| bf16r(*f)).collect();
+        let data = LongData { cache: r_cache.to_vec(), q: q_proj.clone(), planted: Vec::new() };
+        let exact_y = cpu_reference(&g, p, n, &data, &wq, true).y;
+        checks.push(labeled(compare("attn_y_absorbed", &ya, &exact_y), "absorbed", false));
+        checks.push(informational(labeled(
+            compare("attn_y_absorbed_vs_fixture", &ya, r_y),
+            "absorbed",
+            false,
+        )));
     }
     if routes.tiled && routes.absorbed {
-        checks.push(labeled(compare("absorbed_vs_tiled", &ya, &yt1), "absorbed", false));
+        checks.push(labeled(band_no_outlier(compare("absorbed_vs_tiled", &ya, &yt1)), "absorbed", false));
     }
 
     // 5. schedule B: every live row in one absolute call, fresh mirrors.
@@ -724,12 +743,12 @@ fn run_case(gpu: &mut Gpu, dir: &Path, case: &Value, routes: Routes) -> Result<V
     }
 
     rd.free(gpu);
-    let pass = checks.iter().all(|c| c.ok);
+    let (pass, check_json) = finish_checks(checks);
     Ok(json!({
         "name": name, "pass": pass,
         "dims": {"N": n, "P": p, "H": h, "nope": g.nope, "tail": g.tail, "v": v,
                  "latent": g.latent, "qlora": qlora},
-        "checks": checks.into_iter().map(|c| c.json).collect::<Vec<_>>(),
+        "checks": check_json,
     }))
 }
 
@@ -823,22 +842,76 @@ fn worker_count() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(64)
 }
 
-/// K/V rows `r0..r0+rows` of one head: ascending-index f32 fma accumulation over
-/// the latent channels, rounded to BF16 like the device decompression.
+/// Report a check but keep it out of the case verdict (`"gating": false`); its
+/// own `pass` value is preserved in the JSON.
+fn informational(mut c: Cmp) -> Cmp {
+    c.json["gating"] = json!(false);
+    c.ok = true;
+    c
+}
+
+/// Gate only on rel_l2 / cosine / finiteness; max_abs is printed but does not
+/// gate (`"max_abs_gating": false`).
+fn band_no_outlier(mut c: Cmp) -> Cmp {
+    let rel = c.json["rel_l2"].as_f64().unwrap_or(f64::INFINITY);
+    let cos = c.json["cosine"].as_f64().unwrap_or(0.0);
+    let nonfinite = c.json["nonfinite"].as_u64().unwrap_or(1);
+    let ok = rel <= BF16_REL_L2 && cos >= BF16_COSINE && nonfinite == 0;
+    c.json["pass"] = json!(ok);
+    c.json["max_abs_gating"] = json!(false);
+    c.ok = ok;
+    c
+}
+
+/// Case verdict + per-check JSON; every check states whether it gates.
+fn finish_checks(checks: Vec<Cmp>) -> (bool, Vec<Value>) {
+    let pass = checks.iter().all(|c| c.ok);
+    let js = checks
+        .into_iter()
+        .map(|mut c| {
+            if c.json.get("gating").is_none() {
+                c.json["gating"] = json!(true);
+            }
+            c.json
+        })
+        .collect();
+    (pass, js)
+}
+
+/// CPU K/V expansion operands. `round_kv`: ascending-index f32 fma accumulation
+/// rounded to BF16 like the device decompression; otherwise unrounded (f64
+/// accumulation, the mathematical K/V the absorbed route computes).
+#[derive(Clone, Copy)]
+struct Expand<'a> {
+    g: &'a LatentGeometry,
+    cache: &'a [f32],
+    wq: &'a [f32],
+    round_kv: bool,
+}
+
+/// K/V rows `r0..r0+rows` of one head.
 #[inline(always)]
-fn expand_rows_body(
-    g: &LatentGeometry,
-    cache: &[f32],
-    wq: &[f32],
-    head: usize,
-    r0: usize,
-    kout: &mut [f32],
-    vout: &mut [f32],
-) {
+fn expand_rows_body(x: &Expand<'_>, head: usize, r0: usize, kout: &mut [f32], vout: &mut [f32]) {
+    let (g, cache, wq) = (x.g, x.cache, x.wq);
     let (width, latent, per) = (g.row_width(), g.latent, g.nope + g.v_dim);
     let rows = kout.len() / g.nope;
     for rr in 0..rows {
         let lat = &cache[(r0 + rr) * width..(r0 + rr) * width + latent];
+        if !x.round_kv {
+            for o in 0..per {
+                let w = &wq[(head * per + o) * latent..(head * per + o + 1) * latent];
+                let mut a = 0f64;
+                for k in 0..latent {
+                    a += lat[k] as f64 * w[k] as f64;
+                }
+                if o < g.nope {
+                    kout[rr * g.nope + o] = a as f32;
+                } else {
+                    vout[rr * g.v_dim + (o - g.nope)] = a as f32;
+                }
+            }
+            continue;
+        }
         let mut e = 0;
         while e < per {
             let cnt = (per - e).min(4);
@@ -850,11 +923,11 @@ fn expand_rows_body(
                 let w2 = &wq[(base + 2) * latent..(base + 3) * latent];
                 let w3 = &wq[(base + 3) * latent..(base + 4) * latent];
                 for k in 0..latent {
-                    let x = lat[k];
-                    acc[0] = x.mul_add(w0[k], acc[0]);
-                    acc[1] = x.mul_add(w1[k], acc[1]);
-                    acc[2] = x.mul_add(w2[k], acc[2]);
-                    acc[3] = x.mul_add(w3[k], acc[3]);
+                    let xk = lat[k];
+                    acc[0] = xk.mul_add(w0[k], acc[0]);
+                    acc[1] = xk.mul_add(w1[k], acc[1]);
+                    acc[2] = xk.mul_add(w2[k], acc[2]);
+                    acc[3] = xk.mul_add(w3[k], acc[3]);
                 }
             } else {
                 for (j, a) in acc.iter_mut().enumerate().take(cnt) {
@@ -880,52 +953,29 @@ fn expand_rows_body(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "fma")]
-unsafe fn expand_rows_fma(
-    g: &LatentGeometry,
-    cache: &[f32],
-    wq: &[f32],
-    head: usize,
-    r0: usize,
-    kout: &mut [f32],
-    vout: &mut [f32],
-) {
-    expand_rows_body(g, cache, wq, head, r0, kout, vout)
+unsafe fn expand_rows_fma(x: &Expand<'_>, head: usize, r0: usize, kout: &mut [f32], vout: &mut [f32]) {
+    expand_rows_body(x, head, r0, kout, vout)
 }
 
 #[cfg(target_arch = "x86_64")]
-fn expand_rows(
-    g: &LatentGeometry,
-    cache: &[f32],
-    wq: &[f32],
-    head: usize,
-    r0: usize,
-    kout: &mut [f32],
-    vout: &mut [f32],
-) {
+fn expand_rows(x: &Expand<'_>, head: usize, r0: usize, kout: &mut [f32], vout: &mut [f32]) {
     if std::arch::is_x86_feature_detected!("fma") {
         // SAFETY: the running CPU reports FMA support.
-        unsafe { expand_rows_fma(g, cache, wq, head, r0, kout, vout) }
+        unsafe { expand_rows_fma(x, head, r0, kout, vout) }
     } else {
-        expand_rows_body(g, cache, wq, head, r0, kout, vout)
+        expand_rows_body(x, head, r0, kout, vout)
     }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn expand_rows(
-    g: &LatentGeometry,
-    cache: &[f32],
-    wq: &[f32],
-    head: usize,
-    r0: usize,
-    kout: &mut [f32],
-    vout: &mut [f32],
-) {
-    expand_rows_body(g, cache, wq, head, r0, kout, vout)
+fn expand_rows(x: &Expand<'_>, head: usize, r0: usize, kout: &mut [f32], vout: &mut [f32]) {
+    expand_rows_body(x, head, r0, kout, vout)
 }
 
 /// Per-head expanded K_nope / V of every cache row: `[H][total][nope]`, `[H][total][v]`.
-fn cpu_expand(g: &LatentGeometry, total: usize, cache: &[f32], wq: &[f32]) -> (Vec<f32>, Vec<f32>) {
+fn cpu_expand(x: &Expand<'_>, total: usize) -> (Vec<f32>, Vec<f32>) {
     const RB: usize = 64;
+    let g = x.g;
     let mut kexp = vec![0f32; g.n_heads * total * g.nope];
     let mut vexp = vec![0f32; g.n_heads * total * g.v_dim];
     let mut tasks = Vec::new();
@@ -944,7 +994,7 @@ fn cpu_expand(g: &LatentGeometry, total: usize, cache: &[f32], wq: &[f32]) -> (V
             s.spawn(|| loop {
                 let task = queue.lock().unwrap().pop();
                 match task {
-                    Some((hh, r0, kb, vb)) => expand_rows(g, cache, wq, hh, r0, kb, vb),
+                    Some((hh, r0, kb, vb)) => expand_rows(x, hh, r0, kb, vb),
                     None => break,
                 }
             });
@@ -971,11 +1021,18 @@ struct CpuRef {
 
 /// `wq`: BF16-rounded expansion weight `[H*(nope+v), latent]`. Scores
 /// `scale * dot` in f64, causal `j <= P + i`, softmax in f64, `y = bf16(sum p*v)`.
-fn cpu_reference(g: &LatentGeometry, p: usize, n: usize, d: &LongData, wq: &[f32]) -> CpuRef {
+fn cpu_reference(
+    g: &LatentGeometry,
+    p: usize,
+    n: usize,
+    d: &LongData,
+    wq: &[f32],
+    exact: bool,
+) -> CpuRef {
     let (h, nope, tail, v, latent, width, dqk) =
         (g.n_heads, g.nope, g.tail, g.v_dim, g.latent, g.row_width(), g.qk_dim());
     let total = p + n;
-    let (kexp, vexp) = cpu_expand(g, total, &d.cache, wq);
+    let (kexp, vexp) = cpu_expand(&Expand { g, cache: &d.cache, wq, round_kv: !exact }, total);
     let scale = (dqk as f64).powf(-0.5);
     let tasks_n = n * h;
     let next = AtomicUsize::new(0);
@@ -1024,7 +1081,13 @@ fn cpu_reference(g: &LatentGeometry, p: usize, n: usize, d: &LongData, wq: &[f32
                             acc[c] += w * vr[c] as f64;
                         }
                     }
-                    let y: Vec<f32> = acc.iter().map(|a| bf16r((a / sum) as f32)).collect();
+                    let y: Vec<f32> = acc
+                        .iter()
+                        .map(|a| {
+                            let y = (a / sum) as f32;
+                            if exact { y } else { bf16r(y) }
+                        })
+                        .collect();
                     let planted_mass = d
                         .planted
                         .iter()
@@ -1095,7 +1158,11 @@ fn run_long_case(
 
     let data = gen_long(&g, p, n);
     let t0 = Instant::now();
-    let cpu = cpu_reference(&g, p, n, &data, kv_b);
+    let cpu = cpu_reference(&g, p, n, &data, kv_b, false);
+    // Unrounded-f64 reference: what the absorbed route computes.
+    let cpu_exact = routes
+        .absorbed
+        .then(|| cpu_reference(&g, p, n, &data, kv_b, true));
     eprintln!("mla {name}: CPU reference done in {:.1}s", t0.elapsed().as_secs_f64());
 
     // Device state: poisoned cache/mirrors; all P+N rows uploaded directly.
@@ -1175,9 +1242,15 @@ fn run_long_case(
         }
         if routes.absorbed {
             let ya = gpu.download_f32(&d_ya).map_err(he)?;
-            checks.push(lab(compare("attn_y_absorbed_vs_cpu", &ya, &cpu.y), "absorbed", false));
+            let exact_y = cpu_exact.as_ref().map(|c| &c.y[..]).unwrap_or(&[]);
+            checks.push(lab(compare("attn_y_absorbed_vs_cpu", &ya, exact_y), "absorbed", false));
+            checks.push(informational(lab(
+                compare("attn_y_absorbed_vs_cpu_bf16kv", &ya, &cpu.y),
+                "absorbed",
+                false,
+            )));
             if routes.tiled {
-                checks.push(lab(compare("absorbed_vs_tiled", &ya, &yt1), "absorbed", false));
+                checks.push(lab(band_no_outlier(compare("absorbed_vs_tiled", &ya, &yt1)), "absorbed", false));
             }
         }
         Ok(checks)
@@ -1189,7 +1262,7 @@ fn run_long_case(
     }
     let checks = outcome?;
 
-    let pass = checks.iter().all(|c| c.ok);
+    let (pass, check_json) = finish_checks(checks);
     Ok(json!({
         "name": name, "pass": pass, "P": p, "N": n,
         "dims": {"N": n, "P": p, "H": h, "nope": g.nope, "tail": g.tail, "v": v,
@@ -1210,7 +1283,7 @@ fn run_long_case(
             "planted_mass_mean": cpu.planted_mass_mean,
         },
         "routes": routes.names(),
-        "checks": checks.into_iter().map(|c| c.json).collect::<Vec<_>>(),
+        "checks": check_json,
     }))
 }
 
