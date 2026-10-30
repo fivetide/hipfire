@@ -1310,7 +1310,11 @@ pub(crate) fn download_lane_rows(
     let begin = first_row
         .checked_mul(vocab)
         .ok_or_else(|| "lane logits row offset overflow".to_string())?;
-    if n == 0 || begin.checked_add(n).map_or(true, |end| end > logits.numel()) {
+    if n == 0
+        || begin
+            .checked_add(n)
+            .map_or(true, |end| end > logits.numel())
+    {
         return Err(format!(
             "lane logits rows {first_row}..{} are outside the step logits",
             first_row.saturating_add(rows)
@@ -1322,8 +1326,7 @@ pub(crate) fn download_lane_rows(
     let view = logits.sub_offset(begin, n);
     // SAFETY: `scratch` holds at least `n` initialized f32s; any byte pattern
     // is a valid f32.
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(scratch.as_mut_ptr() as *mut u8, n * 4) };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(scratch.as_mut_ptr() as *mut u8, n * 4) };
     gpu.hip
         .memcpy_dtoh(bytes, &view.buf)
         .map_err(|e| format!("lane logits download: {e}"))?;
@@ -3457,7 +3460,11 @@ mod lane_sampling_tests {
         for r in 0..n {
             for _ in 0..VOCAB {
                 let v = (xorshift(&mut s) % 4000) as f32 / 1000.0;
-                out.push(if r % 3 == 1 { (v * 2.0).round() / 2.0 } else { v });
+                out.push(if r % 3 == 1 {
+                    (v * 2.0).round() / 2.0
+                } else {
+                    v
+                });
             }
             if r % 5 == 2 {
                 out[r * VOCAB + 7] = f32::NEG_INFINITY;
@@ -3568,7 +3575,10 @@ mod lane_sampling_tests {
                     };
                     // The picks make the lane's greedy accept commit exactly
                     // the naive window.
-                    assert_eq!(accept_native_greedy(&drafts, &picks, Some(eos)).unwrap(), naive);
+                    assert_eq!(
+                        accept_native_greedy(&drafts, &picks, Some(eos)).unwrap(),
+                        naive
+                    );
                     assert_eq!(&picks[..naive.committed.len()], &naive.committed[..]);
                     windows += 1;
                     rejected += usize::from(naive.accepted < depth);
@@ -3576,7 +3586,11 @@ mod lane_sampling_tests {
                     stream.extend_from_slice(&naive.committed);
                     step += 1;
                 }
-                assert_eq!(&stream[..], &ar[..stream.len()], "case {case} depth {depth}");
+                assert_eq!(
+                    &stream[..],
+                    &ar[..stream.len()],
+                    "case {case} depth {depth}"
+                );
                 if stream.last() == Some(&eos) {
                     eos_stops += 1;
                     let first = ar.iter().position(|&t| t == eos).unwrap();
@@ -3661,15 +3675,9 @@ mod lane_sampling_tests {
         let mut host = host_with(Some(s));
         let mut scratch: Vec<f32> = Vec::new();
         let mut picks = [1u32, 2];
-        let error = lane_sample_step(
-            &mut host,
-            None,
-            &mut picks,
-            0,
-            VOCAB,
-            &mut scratch,
-            |_| panic!("refused before the fetch"),
-        )
+        let error = lane_sample_step(&mut host, None, &mut picks, 0, VOCAB, &mut scratch, |_| {
+            panic!("refused before the fetch")
+        })
         .unwrap_err();
         assert!(error.contains("2 picks for a 1-row"), "{error}");
         // Short logits are refused too.

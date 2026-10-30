@@ -2893,7 +2893,10 @@ pub fn is_vmm_batch_request_eligible(
     }
     let sampling = resolve_batch_sampling(msg, m);
     if m.qwen4().is_some() {
-        let store_sampled = m.qwen4().and_then(|b| b.lanes()).is_some_and(|s| s.sampled());
+        let store_sampled = m
+            .qwen4()
+            .and_then(|b| b.lanes())
+            .is_some_and(|s| s.sampled());
         return qwen4_lane_sampling_admits(msg, &sampling, store_sampled);
     }
     sampling.temp <= 0.0 || vmm_sampled_lane(msg, m, &sampling).is_some()
@@ -3119,7 +3122,10 @@ pub fn vmm_loaded_ack(
         let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&ack) else {
             return ack;
         };
-        let sampled = m.qwen4().and_then(|b| b.lanes()).is_some_and(|s| s.sampled());
+        let sampled = m
+            .qwen4()
+            .and_then(|b| b.lanes())
+            .is_some_and(|s| s.sampled());
         qwen4_lane_ack_fields(
             &mut v, receipt, topology, &receipts, slots, row_budget, p, sampled,
         );
@@ -8064,7 +8070,10 @@ mod tests {
             true,
         );
         assert_eq!(v["continuous_batch_sampling"], "sampled");
-        assert_eq!(v["continuous_batch_sampled_modes"], serde_json::json!(["ar", "mtp"]));
+        assert_eq!(
+            v["continuous_batch_sampled_modes"],
+            serde_json::json!(["ar", "mtp"])
+        );
         let off = hipfire_arch_qwen4::lane::LaneStoreReceipt {
             spec: "off",
             spec_k: 0,
@@ -8081,7 +8090,10 @@ mod tests {
             params,
             true,
         );
-        assert_eq!(w["continuous_batch_sampled_modes"], serde_json::json!(["ar"]));
+        assert_eq!(
+            w["continuous_batch_sampled_modes"],
+            serde_json::json!(["ar"])
+        );
         let mut g = serde_json::json!({});
         qwen4_lane_ack_fields(
             &mut g,
@@ -8101,10 +8113,23 @@ mod tests {
     fn qwen4_lane_sampling_admission_follows_store_flag_and_penalties() {
         let msg = serde_json::json!({});
         let base = qwen4_neutral_sampling();
-        let greedy = BatchSampling { temp: 0.0, ..base.clone() };
-        let hot = BatchSampling { temp: 0.7, ..base.clone() };
-        let penalized = BatchSampling { temp: 0.7, repeat_penalty: 1.1, ..base.clone() };
-        let nan = BatchSampling { temp: f32::NAN, ..base };
+        let greedy = BatchSampling {
+            temp: 0.0,
+            ..base.clone()
+        };
+        let hot = BatchSampling {
+            temp: 0.7,
+            ..base.clone()
+        };
+        let penalized = BatchSampling {
+            temp: 0.7,
+            repeat_penalty: 1.1,
+            ..base.clone()
+        };
+        let nan = BatchSampling {
+            temp: f32::NAN,
+            ..base
+        };
         // Greedy is unaffected by the store flag.
         assert!(qwen4_lane_sampling_admits(&msg, &greedy, false));
         assert!(qwen4_lane_sampling_admits(&msg, &greedy, true));

@@ -9669,7 +9669,10 @@ mod tests {
                                 let w = sample_top_k_p_with_state(
                                     row, temp, 0.95, top_k, min_p, &mut state,
                                 );
-                                assert_eq!(g, w, "token seed={seed} top_k={top_k:?} min_p={min_p:?} temp={temp}");
+                                assert_eq!(
+                                    g, w,
+                                    "token seed={seed} top_k={top_k:?} min_p={min_p:?} temp={temp}"
+                                );
                                 assert_eq!(
                                     sampler_rng_snapshot(),
                                     state,

@@ -707,9 +707,17 @@ fn forward_inner(
                     .ok_or_else(|| format!("sampled lane {epoch:?} vanished"))?;
                 let mut one = [picks[row]];
                 let gpu_ref: &Gpu = gpu;
-                lane_sample_step(&mut lane.host, None, &mut one, 0, vocab, sample_host, |scratch| {
-                    download_lane_rows(gpu_ref, logits, rows_cap + ordinal, 1, vocab, scratch)
-                })
+                lane_sample_step(
+                    &mut lane.host,
+                    None,
+                    &mut one,
+                    0,
+                    vocab,
+                    sample_host,
+                    |scratch| {
+                        download_lane_rows(gpu_ref, logits, rows_cap + ordinal, 1, vocab, scratch)
+                    },
+                )
                 .map_err(|e| format!("lane {epoch:?}: {e}"))?;
                 picks[row] = one[0];
             }
