@@ -119,6 +119,14 @@ Flash-Next bench fixture”) and the registry rows in [MODELS.md](MODELS.md).
   PLE rows can be read from `.ple-q4` / `.ple-q8` sidecars (see
   [QUANTIZE.md](QUANTIZE.md#qwen4-flash-next-streaming-producer)).
 
+- **Raon-1-mini-preview XTS** (arch 19, `raon-1-mini-preview.sym-mq4v2.hfq`) by tensor
+  class: the attention classes (MLA and RDA projections, including the RDA gates and
+  the MLA/RDA LoRA factors) are promoted to Q8F16 (qt 3); `lm_head` is Q8; the routed
+  experts are symmetric MQ4V2 XT (qt 44) with the XTS refit (per-group AWQ alpha plus
+  GPTQ scale refit), so the int4-activation prefill and sealed MoE routes apply.
+  Prefill activation precision resolves once at load via
+  `HIPFIRE_RAON_PREFILL_PRECISION` (default f16; A4 is opt-in).
+
 **Historical sweep vs current registry.** The `mq4-xt` / `mq4` / `mq4 pro` ladder
 cells in [ladder.md](quant-formats/ladder.md) are the 2026-08 candidate sweep on
 dense Qwen3.8-27B (a measurement grid, not registry cards). The shipped XTS
