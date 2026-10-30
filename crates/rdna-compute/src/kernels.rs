@@ -5380,7 +5380,7 @@ pub const GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100_SHA256: &str =
     include_str!("../../../kernels/gemm_mq6g256v2_residual_pm_gfx1100.hxaco.sha256");
 /// gfx1100 PM twins of the generic gated-delta ops (two kernels, one module):
 /// `gated_delta_net_vector_serial_f32_pm_gfx1100` and `causal_conv_depthwise_silu_rows_f32_pm_gfx1100`,
-/// the card-judged hipcc candidates `R1Rda-05-dpp-lockstep-lanestore` / `R1Conv-04-rpw32-k4` sealed by
+/// the card-judged hipcc candidates `R2Rda-05-rs-tv8-prio` / `R1Conv-04-rpw32-k4` sealed by
 /// route A (`scripts/pm-hip-twin.sh`); incumbent kernargs, bit-identical output. Selected by
 /// `gated_delta_vector_pm` (`HIPFIRE_GATED_DELTA_VECTOR_PM=0` restores hipcc).
 pub const GATED_DELTA_VECTOR_PM_GFX1100: &[u8] =

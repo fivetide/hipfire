@@ -180,25 +180,25 @@
         "kernarg_segment_size": 136
       },
       "arch": "gfx1100",
-      "elf_bytes": 17312,
-      "elf_sha256": "017e808e2fcab6a1c8fb08ae3518f23350266203c5a02f9d2c5c79361fb20bc3",
+      "elf_bytes": 16800,
+      "elf_sha256": "065a4695f9dcaa44b7a74e5814e731e626a44f2660f3c3d3e2da7a91bd6db757",
       "hazards": {
-        "advisory": 24,
+        "advisory": 16,
         "blocking": 0,
         "checked": true,
-        "findings": 24,
+        "findings": 16,
         "pm_ir_obligations": 0
       },
-      "hxaco_bytes": 21408,
-      "hxaco_sha256": "6cc84379ea59d6b0d79e4bcbafa9ae139f2271393b2aef8b20da86a0c1106def",
+      "hxaco_bytes": 20896,
+      "hxaco_sha256": "14cef5693183e86678275a4a72627da987eece8b20ea9728aa94a27eca1407ff",
       "kernel": "gated_delta_net_vector_serial_f32_pm_gfx1100",
       "lds": 0,
       "lift_identity": "emit::checked ok; emitted bytes == input ELF",
       "rsrc2": 412,
       "scratch": 0,
-      "sgprs": 68,
-      "text_bytes": 5188,
-      "text_sha256": "efe50e5c7da96992ef4e3833292aa8972a520d948c94d2b2a4e497c142bbca47",
+      "sgprs": 62,
+      "text_bytes": 4824,
+      "text_sha256": "6d0b57fb7bb4d8f5f8ab1bbd3ceffeb31ffdb08bd1a761dbfebc8b8b60e8113f",
       "user_sgprs": 14,
       "vgprs": 96,
       "wavefront_size": 32
@@ -416,8 +416,8 @@
         "kernarg_segment_size": 344
       },
       "arch": "gfx1100",
-      "elf_bytes": 17312,
-      "elf_sha256": "017e808e2fcab6a1c8fb08ae3518f23350266203c5a02f9d2c5c79361fb20bc3",
+      "elf_bytes": 16800,
+      "elf_sha256": "065a4695f9dcaa44b7a74e5814e731e626a44f2660f3c3d3e2da7a91bd6db757",
       "hazards": {
         "advisory": 0,
         "blocking": 0,
@@ -425,8 +425,8 @@
         "findings": 0,
         "pm_ir_obligations": 0
       },
-      "hxaco_bytes": 21408,
-      "hxaco_sha256": "6cc84379ea59d6b0d79e4bcbafa9ae139f2271393b2aef8b20da86a0c1106def",
+      "hxaco_bytes": 20896,
+      "hxaco_sha256": "14cef5693183e86678275a4a72627da987eece8b20ea9728aa94a27eca1407ff",
       "kernel": "causal_conv_depthwise_silu_rows_f32_pm_gfx1100",
       "lds": 0,
       "lift_identity": "emit::checked ok; emitted bytes == input ELF",
@@ -443,10 +443,10 @@
   "judged_text_check": [
     {
       "symbol": "gated_delta_net_vector_serial_f32_pm_gfx1100",
-      "judged_object": "rda_serial-pp512-R1Rda-05-dpp-lockstep-lanestore",
+      "judged_object": "rda_serial-pp512-R2Rda-05-rs-tv8-prio",
       "judged_symbol": "gated_delta_net_vector_serial_f32",
-      "judged_code_sha256": "efe50e5c7da96992ef4e3833292aa8972a520d948c94d2b2a4e497c142bbca47",
-      "twin_text_sha256": "efe50e5c7da96992ef4e3833292aa8972a520d948c94d2b2a4e497c142bbca47",
+      "judged_code_sha256": "6d0b57fb7bb4d8f5f8ab1bbd3ceffeb31ffdb08bd1a761dbfebc8b8b60e8113f",
+      "twin_text_sha256": "6d0b57fb7bb4d8f5f8ab1bbd3ceffeb31ffdb08bd1a761dbfebc8b8b60e8113f",
       "equal": true
     },
     {

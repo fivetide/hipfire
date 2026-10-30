@@ -1,7 +1,11 @@
 // PM twin module (gfx1100): two per-arch kernel variants of generic ops, sealed by scripts/pm-hip-twin.sh.
-//   gated_delta_net_vector_serial_f32_pm_gfx1100  <- card-judged R1Rda-05-dpp-lockstep-lanestore
+//   gated_delta_net_vector_serial_f32_pm_gfx1100  <- card-judged R2Rda-05-rs-tv8-prio
 //   causal_conv_depthwise_silu_rows_f32_pm_gfx1100 <- card-judged R1Conv-04-rpw32-k4
 // Bodies are the judged candidates verbatim except the kernel symbol rename.
+// hip_loop: rows_per_wg=8
+// R2Rda-05-rs-tv8-prio
+// idea: R2-01 plus s_setprio(3) around the pred butterfly so the serial chain wins issue slots over sibling waves' independent VALU
+// prediction: 0.29-0.34
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
@@ -192,7 +196,9 @@ __global__ void gated_delta_net_vector_serial_f32_pm_gfx1100(
             S[r][0] = s0; S[r][1] = s1; S[r][2] = s2; S[r][3] = s3;
             acc[r] = s0 * kc[0] + s1 * kc[1] + s2 * kc[2] + s3 * kc[3];
         }
+        __builtin_amdgcn_s_setprio(3);
         gdv_wave_sum_tile(acc);
+        __builtin_amdgcn_s_setprio(0);
 #pragma unroll
         for (int r = 0; r < GDV_TV; r++) {
             float s0 = S[r][0], s1 = S[r][1], s2 = S[r][2], s3 = S[r][3];
@@ -204,11 +210,41 @@ __global__ void gated_delta_net_vector_serial_f32_pm_gfx1100(
             S[r][0] = s0; S[r][1] = s1; S[r][2] = s2; S[r][3] = s3;
             acc[r] = s0 * qc[0] + s1 * qc[1] + s2 * qc[2] + s3 * qc[3];
         }
-        gdv_wave_sum_tile(acc);
-        float ymine = acc[0];
+        float rs0[8];
 #pragma unroll
-        for (int r = 1; r < GDV_TV; r++) ymine = (lane == r) ? acc[r] : ymine;
-        if (lane < GDV_TV) out_row[lane] = round_out_bf16 ? gdv_bf16_rn(ymine) : ymine;
+        for (int r = 0; r < 8; r++) rs0[r] = acc[r];
+        float rs1[4];
+        { const bool hb = (lane & 16) != 0;
+#pragma unroll
+          for (int j = 0; j < 4; j++) {
+            const float a = rs0[j], b = rs0[j + 4];
+            const float kp = hb ? b : a;
+            const float sd = hb ? a : b;
+            rs1[j] = kp + __int_as_float(__builtin_amdgcn_permlanex16(__float_as_int(sd), __float_as_int(sd), 0x76543210u, 0xfedcba98u, false, false));
+          } }
+        float rs2[2];
+        { const bool hb = (lane & 8) != 0;
+#pragma unroll
+          for (int j = 0; j < 2; j++) {
+            const float a = rs1[j], b = rs1[j + 2];
+            const float kp = hb ? b : a;
+            const float sd = hb ? a : b;
+            rs2[j] = kp + gdv_xor_dpp<0x168>(sd);
+          } }
+        float rs3[1];
+        { const bool hb = (lane & 4) != 0;
+#pragma unroll
+          for (int j = 0; j < 1; j++) {
+            const float a = rs2[j], b = rs2[j + 1];
+            const float kp = hb ? b : a;
+            const float sd = hb ? a : b;
+            rs3[j] = kp + gdv_xor_dpp<0x164>(sd);
+          } }
+        float yv = rs3[0];
+        yv += gdv_xor_dpp<0x162>(yv);
+        yv += gdv_xor_dpp<0x161>(yv);
+        const int yrow = (((lane >> 4) & 1) << 2) | (((lane >> 3) & 1) << 1) | (((lane >> 2) & 1) << 0);
+        if ((lane & 3) == 0) out_row[yrow] = round_out_bf16 ? gdv_bf16_rn(yv) : yv;
 
         if (has_next) {
 #pragma unroll

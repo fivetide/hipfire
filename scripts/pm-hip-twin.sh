@@ -17,14 +17,12 @@
 # Writes kernels/<module>.hxaco, kernels/<module>.hxaco.sha256 and kernels/<module>.twin.json.
 #
 # Env: ROCM_PATH (default /opt/rocm/core), CARGO_TARGET_DIR, PM_TWIN_WORK (scratch dir, default
-#      <repo>/target/pm-hip-twin), PM_TWIN_JUDGE_OBJ (the r1card obj/ directory holding
-#      <node>-<shape>-<cand>/candidate.co.json).
+#      <repo>/target/pm-hip-twin).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROCM="${ROCM_PATH:-/opt/rocm/core}"
 WORK="${PM_TWIN_WORK:-$REPO/target/pm-hip-twin}"
-JUDGE="${PM_TWIN_JUDGE_OBJ:-/home/kaden/qcal/release-0.4.3/raon/scratch-pm/r1card/obj}"
 ARCH=gfx1100
 mkdir -p "$WORK"
 
@@ -58,22 +56,21 @@ seal_module() {
     i=$((i + 1))
   done
   "$TWIN_BIN" "${args[@]}" >/dev/null
-  python3 - "$dir/report.json" "$REPO/kernels/$module.twin.json" "$module" "$JUDGE" "$@" <<'PY'
+  python3 - "$dir/report.json" "$REPO/kernels/$module.twin.json" "$module" "$@" <<'PY'
 import json, sys
-report_path, out_path, module, judge, *specs = sys.argv[1:]
+report_path, out_path, module, *specs = sys.argv[1:]
 reports = json.load(open(report_path))
 if isinstance(reports, dict):
     reports = [reports]
 assert len(reports) == len(specs), (len(reports), len(specs))
 judged, bad = [], []
 for rep, spec in zip(reports, specs):
-    tsym, _isrc, _isym, jdir, jsym = spec.split(":")
-    want = json.load(open(f"{judge}/{jdir}/candidate.co.json"))["kernels"][jsym]["code_sha256"]
+    tsym, _isrc, _isym, label, want = spec.split(":")
     got = rep["text_sha256"]
-    judged.append({"symbol": tsym, "judged_object": jdir, "judged_symbol": jsym,
-                   "judged_code_sha256": want, "twin_text_sha256": got, "equal": want == got})
+    judged.append({"symbol": tsym, "judged_candidate": label, "judged_code_sha256": want,
+                   "twin_text_sha256": got, "equal": want == got})
     if want != got:
-        bad.append(f"{tsym}: twin .text {got} != judged {want} ({jdir})")
+        bad.append(f"{tsym}: twin .text {got} != judged {want} ({label})")
 with open(out_path, "w") as f:
     json.dump({"module": module, "arch": "gfx1100", "reports": reports, "judged_text_check": judged}, f, indent=2)
     f.write("\n")
@@ -83,9 +80,11 @@ PY
   echo "sealed kernels/$module.hxaco sha256 $(cat "$REPO/kernels/$module.hxaco.sha256")"
 }
 
+# spec = twin_sym:incumbent_src:incumbent_sym:judged_candidate:judged_code_sha256 (the candidate's `.text` sha256 as
+# compiled and timed by the gfx1100 card judge, hip_loop R1/R2 on the XTX; bit-identical to the incumbent there).
 seal_module gated_delta_vector_pm_gfx1100 gated_delta_vector_pm_gfx1100.hip \
-  "gated_delta_net_vector_serial_f32_pm_gfx1100:gated_delta_net_vector_serial.hip:gated_delta_net_vector_serial_f32:rda_serial-pp512-R1Rda-05-dpp-lockstep-lanestore:gated_delta_net_vector_serial_f32" \
-  "causal_conv_depthwise_silu_rows_f32_pm_gfx1100:causal_conv_depthwise_rows.hip:causal_conv_depthwise_silu_rows_f32:conv_rows-pp512-R1Conv-04-rpw32-k4:causal_conv_depthwise_silu_rows_f32"
+  "gated_delta_net_vector_serial_f32_pm_gfx1100:gated_delta_net_vector_serial.hip:gated_delta_net_vector_serial_f32:R2Rda-05-rs-tv8-prio:6d0b57fb7bb4d8f5f8ab1bbd3ceffeb31ffdb08bd1a761dbfebc8b8b60e8113f" \
+  "causal_conv_depthwise_silu_rows_f32_pm_gfx1100:causal_conv_depthwise_rows.hip:causal_conv_depthwise_silu_rows_f32:R1Conv-04-rpw32-k4:95629e55cb81c016bbca77dd366aebce2830c2612e7c8e9d4d927570b20e1a0a"
 
 seal_module gemm_mq4g256v2_moe_grouped_k2_pm_gfx1100 gemm_mq4g256v2_moe_grouped_k2_pm_gfx1100.hip \
-  "gemm_mq4g256v2_moe_grouped_wmma_k2_pm_gfx1100:gemm_mq4g256v2_moe_grouped_wmma_k2.hip:gemm_mq4g256v2_moe_grouped_wmma_k2:moe_k2-gu512-R1Moe-04-xlds-w4-t2:gemm_mq4g256v2_moe_grouped_wmma_k2"
+  "gemm_mq4g256v2_moe_grouped_wmma_k2_pm_gfx1100:gemm_mq4g256v2_moe_grouped_wmma_k2.hip:gemm_mq4g256v2_moe_grouped_wmma_k2:R1Moe-04-xlds-w4-t2:33675b778bc94940ad4fa6600111953b32eaeb2eb503ed530cd4b1b78ef4228d"

@@ -44,6 +44,7 @@ ds_swizzle_b32	memory
 s_add_co_ci_u32	alu
 s_add_co_i32	alu
 s_add_co_u32	alu
+s_add_f32	alu
 s_add_i32	alu
 s_add_nc_u64	alu
 s_add_u32	alu
@@ -67,6 +68,8 @@ s_cbranch_scc1	control
 s_cbranch_vccnz	control
 s_cbranch_vccz	control
 s_clause	wait
+s_cmp_ngt_f32	alu
+s_cmp_nlt_f32	alu
 s_cmp_eq_u32	alu
 s_cmp_eq_u64	alu
 s_cmp_ge_i32	alu
@@ -86,6 +89,7 @@ s_cmpk_lt_u32	alu
 s_cselect_b32	alu
 s_cselect_b64	alu
 s_ctz_i32_b32	alu
+s_cvt_i32_f32	alu
 s_cvt_f32_u32	alu
 s_cvt_u32_f32	alu
 s_delay_alu	wait
@@ -105,6 +109,9 @@ s_min_u32	alu
 s_mov_b32	alu
 s_mov_b64	alu
 s_movk_i32	alu
+s_fmamk_f32	alu
+s_rndne_f32	alu
+s_sub_f32	alu
 s_mul_f32	alu
 s_mul_hi_i32	alu
 s_mul_hi_u32	alu
@@ -228,6 +235,7 @@ v_pk_fma_f16	alu
 v_rcp_f32_e32	alu
 v_rcp_iflag_f32_e32	alu
 v_s_rcp_f32	alu
+v_s_exp_f32	alu
 v_readfirstlane_b32	alu
 v_rndne_f32_e32	alu
 v_sub_f32_e32	alu

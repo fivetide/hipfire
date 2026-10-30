@@ -9,8 +9,8 @@
 //! `scripts/pm-hip-twin.sh`, route A: lift identity, hazards, SGPR >= 16, kernarg ABI equal to
 //! the incumbent) holds two card-judged, bit-identical hipcc candidates:
 //!
-//! * [`RDA_SYMBOL`] replaces `gated_delta_net_vector_serial_f32` (`R1Rda-05-dpp-lockstep-lanestore`,
-//!   DPP lockstep row reductions). Same kernargs, grid `[n_heads, 128 / 8, 1]`, block 32, no LDS.
+//! * [`RDA_SYMBOL`] replaces `gated_delta_net_vector_serial_f32` (`R2Rda-05-rs-tv8-prio`,
+//!   DPP lockstep row reductions, raised issue priority on the pred butterfly). Same kernargs, grid `[n_heads, 128 / 8, 1]`, block 32, no LDS.
 //! * [`CONV_SYMBOL`] replaces `causal_conv_depthwise_silu_rows_f32` (`R1Conv-04-rpw32-k4`,
 //!   32 rows per workgroup). Same kernargs, grid `[ceil(C / 128), ceil(N / 32), 1]`, block 128, no
 //!   LDS. Row slice 0 alone reads `hist_in` and writes `hist_out`, so it is correct both in place
