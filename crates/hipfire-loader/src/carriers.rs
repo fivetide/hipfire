@@ -9873,6 +9873,49 @@ impl Carrier for RaonCarrier {
             }
         }
     }
+    /// Prime the decode probe: the same bounded batched prefill `bench_prefill`
+    /// runs (`context` synthetic rows from a cold slot).
+    fn bench_decode_prime(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+    ) -> Option<Option<String>> {
+        let mut error = None;
+        match self.bench_prefill(m, gpu, synthetic, synthetic.len(), &mut error) {
+            Some(true) => Some(None),
+            Some(false) => Some(Some(
+                error.unwrap_or_else(|| "raon1_mini bench decode prime failed".into()),
+            )),
+            None => None,
+        }
+    }
+    /// `iterations` production decode steps (`RaonBundle::decode_step`, the
+    /// route `serve` runs) on deterministic ids; no logits readback.
+    fn bench_decode_run(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        _context: usize,
+        iterations: usize,
+        decode_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let Some(bundle) = m.raon_mut() else {
+            *decode_err = Some("raon1_mini bench decode missing state".into());
+            return Some(false);
+        };
+        let vocab = bundle.config.vocab as u64;
+        let lo = 1024u64.min(vocab.saturating_sub(1));
+        let span = vocab - lo;
+        for i in 0..iterations as u64 {
+            let token = (lo + i.wrapping_mul(2654435761).wrapping_add(17) % span) as u32;
+            if let Err(e) = bundle.decode_step(gpu, token) {
+                *decode_err = Some(format!("raon1_mini bench decode step {i}: {e}"));
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;

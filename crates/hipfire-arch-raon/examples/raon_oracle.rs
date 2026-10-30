@@ -46,7 +46,8 @@ const USAGE: &str = "usage:
   raon_oracle state  --model M --tokens F --mode serial|batched|graph|state-only --out FILE
   raon_oracle logits --model M (--tokens F --teacher F | --kld REF.kldref.bin) --out FILE
   raon_oracle generate --model M ... (streams text to stdout; no --out)
-  raon_oracle bench  --model M --pp 512,8192 --tg 128 --out FILE
+  raon_oracle bench  --model M --pp 512,8192 --tg 128 [--reps 3] [--warmup 1] [--profile] --out FILE
+  raon_oracle bench  --bucket-json PROFILE.json --out FILE   (CPU-only re-bucketing of a saved --profile result)
 (extra `--key value` pairs are forwarded to the module as opts)";
 
 struct Cli {
@@ -71,6 +72,11 @@ fn parse_cli() -> Result<Cli, String> {
             .ok_or_else(|| format!("unexpected argument `{a}`"))?;
         if key == "negative" {
             negative = true;
+            i += 1;
+            continue;
+        }
+        if key == "profile" {
+            opts.insert("profile".to_string(), "1".to_string());
             i += 1;
             continue;
         }
@@ -229,11 +235,13 @@ fn run(cli: &Cli) -> Result<(bool, Value), String> {
             label = "logits".into();
         }
         "bench" => {
-            require(&cli.opts, "model")?;
-            parse_pp_list(require(&cli.opts, "pp")?)?;
-            require(&cli.opts, "tg")?
-                .parse::<usize>()
-                .map_err(|e| format!("--tg: {e}"))?;
+            if !cli.opts.contains_key("bucket-json") {
+                require(&cli.opts, "model")?;
+                parse_pp_list(require(&cli.opts, "pp")?)?;
+                require(&cli.opts, "tg")?
+                    .parse::<usize>()
+                    .map_err(|e| format!("--tg: {e}"))?;
+            }
             run_fn = raon_oracle::bench::run;
             fixtures = PathBuf::from(cli.opts.get("fixtures").map(String::as_str).unwrap_or("."));
             label = "bench".into();

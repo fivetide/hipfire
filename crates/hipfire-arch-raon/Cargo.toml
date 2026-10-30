@@ -25,3 +25,6 @@ deltanet = ["rdna-compute/deltanet", "hipfire-runtime/deltanet"]
 [[example]]
 name = "raon_oracle"
 required-features = ["lab"]
+
+[dev-dependencies]
+md5 = "0.8"
