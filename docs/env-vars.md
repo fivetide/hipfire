@@ -807,6 +807,7 @@ All developer-only, read once at load through the `[developer]` namespace (`hipf
 | `HIPFIRE_RAON_PREFILL` | **`batched`**; `serial` | Prefill route (`crates/hipfire-arch-raon/src/bundle.rs`). `batched` is the product route (N rows per module call); `serial` (one `forward_token` per prompt token) is the explicit oracle/control. |
 | `HIPFIRE_RAON_PREFILL_CHUNK_ROWS` | **unset / `auto`**; `512`, `1024`, `2048`, `4096` | Rows of one batched prefill chunk (`crates/hipfire-arch-raon/src/carrier.rs`, read once at load). Auto admits the widest of 4096 / 2048 / 1024 / 512 (each capped at the reserved context `max_seq`) whose scratch + module-work bytes fit the free VRAM after the weights and still leave an expanded-mirror budget at least as large as the 512-row policy's for the same `max_seq` (or large enough to cover the whole reserved context); 512 is the floor and is always taken when nothing wider fits, so a 20 GB card degrades to 512/1024 and never fails to load. An explicit value forces that cap: the mirror comparison is skipped, but a rung whose bytes do not fit is a named load error (512 is never an error). A wider chunk streams the routed-expert weights once per chunk instead of once per 512 rows; the MLA decompression tile stays 512 rows and wider chunks expand their new rows tile by tile. The admitted rows and the projected mirror budget are logged once at load (`raon1_mini: prefill chunk rows requested=… admitted=…`). Any other value is a named error. |
 | `HIPFIRE_RAON_PREFILL_PRECISION` | **`f16`**; `a8`, `a4` | Activation precision of batched qt44 projections (`bundle.rs`). `a8` admits only the int8-activation prefill GEMMs; `a4` the device's default symmetric IU4 route. Applies only to attention-class projections stored as qt44 (`MQ4G256V2`, e.g. the `sym-mq4v2` control artifact). It has no effect on the shipped `mq4-xts-a8attn-s` artifact, whose attention class is Q8F16 and has no activation-quantized route. It also has no effect on any FFN class (dense layer, shared and routed experts run the grouped F16-WMMA core). With `a8`/`a4` set, load logs one line per class saying whether it is reached. Neither is bit-equivalent to `f16`; both stay opt-in. |
+| `HIPFIRE_F32_TILED_ROWS` | **`1`**; `0` | Generic: the mHC stream-mix selector GEMM and the grouped-MoE router GEMM (`crates/hipfire-dispatch/src/pipeline/stream_mix.rs`, `moe_program.rs`) run the x-stationary `gemm_f32_tiled_rows`. It is bit-identical to `gemm_f32_batched` (same lane-strided FMA order and width-32 shuffle tree) but reads each activation row once per 8×MPW outputs instead of once per output. `0` restores `gemm_f32_batched` (kill switch). |
 | `HIPFIRE_RAON_ATTN_TILED` | **`1`**; `0` | MLA tiled causal prefill + split-KV decode kernels (`crates/hipfire-arch-raon/src/mla.rs`). `0` selects the serial reference kernel. |
 | `HIPFIRE_RAON_MLA_ABSORB` | **`1`**; `0` | Attend over the latent cache (absorbed algebra) once a context exceeds the expanded-mirror budget. Not bit-exact to the decompressed route (KLD matched). `0` refuses contexts past the budget. |
 | `HIPFIRE_RAON_MIRROR_Q8` | **`1`**; `0` | Allow the Q8 expanded MLA K_nope/V mirror (INT8 codes + one F16 scale per (row, head, plane): 72,800 B/token instead of 143,360). Capacity-based: the BF16 mirror is kept when its budget covers the whole reserved context (it is 1-2% faster); Q8 is used only when BF16 cannot cover it (a 20 GB card then keeps the fast route for about twice the rows before the absorbed route takes over). Tiled kernels only (forced off with `HIPFIRE_RAON_ATTN_TILED=0`). `0` always keeps the BF16 mirror (kill switch). |
@@ -952,7 +953,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1837
+**Count:** 1838
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1418,6 +1419,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | experimental |
 | `HIPFIRE_EXPERIMENTAL_MODE` | crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_F1LITE` | crates/hipfire-dispatch/src/pipeline/batched.rs, crates/rdna-compute/src/gemm.rs | developer |
+| `HIPFIRE_F32_TILED_ROWS` | crates/hipfire-dispatch/src/pipeline/stream_mix.rs | developer |
 | `HIPFIRE_FA2_A4_EPILOGUE` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_FA2_FILL` | crates/rdna-compute/src/attention.rs, crates/rdna-compute/src/kernel_registry.rs | developer |
 | `HIPFIRE_FA2_FP8` | crates/rdna-compute/examples/fa_pm_fp8_oracle.rs, crates/rdna-compute/src/attention.rs | developer |

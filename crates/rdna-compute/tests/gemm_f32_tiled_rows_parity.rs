@@ -47,12 +47,28 @@ fn gemm_f32_tiled_rows_bit_identical_to_batched() {
         let x = gpu
             .upload_f32(&rand_f32(&mut seed, n * k), &[n * k])
             .expect("upload x");
-        let want = gpu.alloc_tensor(&[n * m], rdna_compute::DType::F32).expect("alloc");
-        let got = gpu.alloc_tensor(&[n * m], rdna_compute::DType::F32).expect("alloc");
-        gpu.gemm_f32_batched(&a, &x, &want, m, k, n).expect("batched");
-        gpu.gemm_f32_tiled_rows(&a, &x, &got, m, k, n).expect("tiled");
-        let w: Vec<u32> = gpu.download_f32(&want).unwrap().iter().map(|v| v.to_bits()).collect();
-        let g: Vec<u32> = gpu.download_f32(&got).unwrap().iter().map(|v| v.to_bits()).collect();
+        let want = gpu
+            .alloc_tensor(&[n * m], rdna_compute::DType::F32)
+            .expect("alloc");
+        let got = gpu
+            .alloc_tensor(&[n * m], rdna_compute::DType::F32)
+            .expect("alloc");
+        gpu.gemm_f32_batched(&a, &x, &want, m, k, n)
+            .expect("batched");
+        gpu.gemm_f32_tiled_rows(&a, &x, &got, m, k, n)
+            .expect("tiled");
+        let w: Vec<u32> = gpu
+            .download_f32(&want)
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        let g: Vec<u32> = gpu
+            .download_f32(&got)
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
         assert_eq!(w, g, "(M,K,N)=({m},{k},{n})");
     }
 }
