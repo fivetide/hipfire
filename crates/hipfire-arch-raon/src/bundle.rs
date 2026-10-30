@@ -17,10 +17,9 @@ use crate::weights::RaonWeights;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeMode {
     /// Whole decode step (all layers + head) recorded once per admitted
-    /// context bucket and replayed per token (`HIPFIRE_GRAPH=1`; default except
-    /// on exact gfx1201).
+    /// context bucket and replayed per token. Product default.
     Graph,
-    /// Per-launch dispatch (`HIPFIRE_GRAPH=0`; default on exact gfx1201).
+    /// Per-launch dispatch (`HIPFIRE_GRAPH=0`): the oracle/control route.
     Eager,
 }
 
@@ -32,30 +31,18 @@ impl DecodeMode {
         }
     }
 
-    /// Resolve once at load. An explicit `HIPFIRE_GRAPH=0|1` wins. Otherwise
-    /// exact gfx1201 (R9700) decodes eager and every other arch graph: on gfx1201
-    /// a replayed decode graph runs at 82 tok/s in most fresh processes but at
-    /// 40 tok/s (2x the device time per step, host idle in the launch call) in a
-    /// sizeable fraction of them, in whole processes or in phases that flip
-    /// mid-process, while eager is a steady 77-78 tok/s in every process
-    /// measured. Retained replay (Redline) owning the launch stream or
-    /// CPU-executed weights make capture impossible, which is reported as
-    /// `Eager`.
+    /// Resolve once at load: `HIPFIRE_GRAPH=0` selects eager, otherwise graph.
+    /// Retained replay (Redline) owning the launch stream or CPU-executed
+    /// weights make capture impossible, which is reported as `Eager`.
+    ///
+    /// (gfx1201 note: decode there shows intermittent 2x-slow device time per
+    /// step, 40 vs 82 tok/s, in whole processes or in phases that flip
+    /// mid-process. It reproduces in eager decode and in llama.cpp on the same
+    /// card, so it is not a property of the graph route and graph stays the
+    /// default: it is the faster route when the card is in its fast state.)
     fn resolve(gpu: &Gpu) -> Self {
-        // The typed process config materializes its built-in default (`true`)
-        // into `gpu.flags.graph_forward`, so an explicit choice is only
-        // distinguishable from the default through the environment variable.
-        let explicit = std::env::var("HIPFIRE_GRAPH").ok().and_then(|v| match v.as_str() {
-            "1" | "true" | "TRUE" | "on" | "ON" => Some(true),
-            "0" | "false" | "FALSE" | "off" | "OFF" => Some(false),
-            _ => None,
-        });
-        match explicit {
-            Some(false) => return DecodeMode::Eager,
-            Some(true) => {}
-            None if gpu.flags.graph_forward == Some(false) => return DecodeMode::Eager,
-            None if gpu.arch == "gfx1201" => return DecodeMode::Eager,
-            None => {}
+        if gpu.flags.graph_forward == Some(false) {
+            return DecodeMode::Eager;
         }
         if gpu.replay.is_enabled() {
             eprintln!("raon1_mini: retained replay owns the launch stream; decode stays eager");
