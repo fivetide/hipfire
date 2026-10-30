@@ -6,9 +6,63 @@
 use rdna_compute::{Gpu, GpuTensor};
 
 use crate::config::RaonConfig;
-use crate::forward::{forward_rows, forward_token, RaonWork};
+use crate::forward::{
+    admit_decode_context, decode_binding, decode_body, forward_rows, forward_token, stage_decode_token, RaonWork,
+};
 use crate::state::{RaonPrefillScratch, RaonState, MLA_TILE_ROWS};
 use crate::weights::RaonWeights;
+
+/// Decode-step execution route (`HIPFIRE_GRAPH`, PLAN §3.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeMode {
+    /// Whole decode step (all layers + head) recorded once per admitted
+    /// context bucket and replayed per token. Product default.
+    Graph,
+    /// Per-launch dispatch (`HIPFIRE_GRAPH=0`): the oracle/control route.
+    Eager,
+}
+
+impl DecodeMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DecodeMode::Graph => "graph",
+            DecodeMode::Eager => "eager",
+        }
+    }
+
+    /// Resolve once at load: an explicit `HIPFIRE_GRAPH=0|1` wins, otherwise
+    /// graph. Retained replay (Redline) owning the launch stream or CPU-executed
+    /// weights make capture impossible, which is reported as `Eager`.
+    fn resolve(gpu: &Gpu) -> Self {
+        if gpu.flags.graph_forward == Some(false) {
+            return DecodeMode::Eager;
+        }
+        if gpu.replay.is_enabled() {
+            eprintln!("raon1_mini: retained replay owns the launch stream; decode stays eager");
+            return DecodeMode::Eager;
+        }
+        if gpu.owns_host_cpu_weights() {
+            hipfire_dispatch::log_capture_disabled_once();
+            return DecodeMode::Eager;
+        }
+        DecodeMode::Graph
+    }
+}
+
+/// Decode graph bookkeeping of one bundle. The recorded graph itself lives in
+/// `gpu.graphs` (the generic AR graph slot) keyed by `binding`.
+#[derive(Default)]
+struct DecodeGraph {
+    /// One real eager decode step ran, so every kernel module the decode body
+    /// launches is loaded before any capture (a capture cannot load modules).
+    warmed: bool,
+    /// Binding the graph in `gpu.graphs` was recorded with; 0 = none.
+    binding: u64,
+    captures: u64,
+    replays: u64,
+    /// Kernel nodes in the current recording.
+    kernel_nodes: usize,
+}
 
 /// Upper bound of token rows one batched prefill call stages (the scratch is
 /// sized for this, so a longer prompt is processed in chunks of at most this
@@ -105,6 +159,8 @@ pub struct RaonBundle {
     /// EOS token ids (`generation_config.json`: `<|im_end|>`-class ids).
     pub eos: Vec<u32>,
     prefill_mode: PrefillMode,
+    decode_mode: DecodeMode,
+    graph: DecodeGraph,
 }
 
 impl RaonBundle {
@@ -135,6 +191,8 @@ impl RaonBundle {
                     work,
                     eos,
                     prefill_mode,
+                    decode_mode: DecodeMode::resolve(gpu),
+                    graph: DecodeGraph::default(),
                 })
             }
             Err(e) => {
@@ -163,6 +221,28 @@ impl RaonBundle {
     /// Override the load-time route (oracle/control use).
     pub fn set_prefill_mode(&mut self, mode: PrefillMode) {
         self.prefill_mode = mode;
+    }
+
+    /// Decode route in effect: `"graph"` or `"eager"` (what benches record).
+    pub fn decode_mode(&self) -> &'static str {
+        self.decode_mode.as_str()
+    }
+
+    /// Override the decode route (oracle/control use). Switching never touches
+    /// the slot; a graph recorded earlier stays valid while its binding does.
+    pub fn set_decode_mode(&mut self, mode: DecodeMode) {
+        self.decode_mode = mode;
+    }
+
+    /// `(captures, replays)` of the decode graph since load: a replay is one
+    /// decode step served by a recorded graph (a capture step is not a replay).
+    pub fn decode_graph_stats(&self) -> (u64, u64) {
+        (self.graph.captures, self.graph.replays)
+    }
+
+    /// Kernel launches recorded in the current decode graph (0 = none).
+    pub fn decode_graph_kernel_nodes(&self) -> usize {
+        self.graph.kernel_nodes
     }
 
     /// Tokens consumed by the slot so far.
@@ -235,7 +315,9 @@ impl RaonBundle {
     }
 
     /// One decode step: consume `token`, leave its logits in
-    /// [`logits`](Self::logits).
+    /// [`logits`](Self::logits). Routed by [`decode_mode`](Self::decode_mode):
+    /// graph replay per token (recorded on first use per admitted context
+    /// bucket) or per-launch eager dispatch. Both advance the slot exactly once.
     pub fn decode_step(&mut self, gpu: &mut Gpu, token: u32) -> Result<(), String> {
         let pos = self.state.n_tokens();
         if pos + 1 > self.state.max_seq() {
@@ -244,20 +326,95 @@ impl RaonBundle {
                 self.state.max_seq()
             ));
         }
-        forward_token(
-            &self.config,
-            &self.weights,
-            &mut self.state,
-            &mut self.scratch,
-            &mut self.work,
-            gpu,
-            token,
-            pos as u32,
-            true,
-        )
+        match self.decode_mode {
+            DecodeMode::Eager => forward_token(
+                &self.config,
+                &self.weights,
+                &mut self.state,
+                &mut self.scratch,
+                &mut self.work,
+                gpu,
+                token,
+                pos as u32,
+                true,
+            ),
+            DecodeMode::Graph => self.decode_step_graph(gpu, token, pos),
+        }
     }
 
-    /// Start a cold request (zero recurrent state, conv history, length).
+    /// Graph route of [`decode_step`](Self::decode_step).
+    ///
+    /// Host work stays outside the recorded region: context admission (which
+    /// may grow the latent mapping / expanded mirror and thereby change the
+    /// binding), the token id upload into the stable device id buffer, and the
+    /// single `seq_len` advance after the step. The recorded body reads the
+    /// token id and `seq_len` from device memory, so one recording replays
+    /// correctly at every later position of the same binding.
+    ///
+    /// Recording executes nothing (HIP captures launches into the graph), so
+    /// the capturing step launches the fresh graph once and consumes its token
+    /// exactly once; no snapshot/restore is needed. The very first decode step
+    /// of the bundle runs the same body eagerly instead, so every kernel module
+    /// is loaded before a capture.
+    fn decode_step_graph(&mut self, gpu: &mut Gpu, token: u32, pos: usize) -> Result<(), String> {
+        let end = pos + 1;
+        admit_decode_context(&self.config, &self.weights, &mut self.state, &self.scratch, gpu, end)?;
+        stage_decode_token(&self.config, &self.scratch, gpu, token)?;
+        if !self.graph.warmed {
+            decode_body(&self.config, &self.weights, &self.state, &self.scratch, &self.work, gpu)?;
+            self.graph.warmed = true;
+            return self.state.set_n_tokens(gpu, end);
+        }
+        if gpu.active_stream.is_none() {
+            let stream = gpu
+                .hip
+                .stream_create()
+                .map_err(|e| format!("raon1_mini: decode graph stream: {e:?}"))?;
+            gpu.active_stream = Some(stream);
+        }
+        let binding = decode_binding(&self.weights, &self.state, &self.scratch);
+        let recorded = gpu.graphs.graph_exec.is_some()
+            && self.graph.binding == binding
+            && gpu.graphs.ar_forward_binding == binding;
+        if !recorded {
+            self.record_decode_graph(gpu, binding)?;
+            self.graph.captures += 1;
+        } else {
+            self.graph.replays += 1;
+        }
+        let stream = gpu.active_stream.as_ref().expect("decode graph stream just ensured");
+        gpu.graphs
+            .graph_launch(&gpu.hip, gpu.device_id, stream)
+            .map_err(|e| format!("raon1_mini: decode graph launch: {e:?}"))?;
+        self.state.set_n_tokens(gpu, end)
+    }
+
+    /// Record the decode body into the generic AR graph slot, replacing any
+    /// previous recording (an old bucket, or another model's).
+    fn record_decode_graph(&mut self, gpu: &mut Gpu, binding: u64) -> Result<(), String> {
+        gpu.graphs.drop_captured_graph(&gpu.hip, gpu.device_id);
+        self.graph.binding = 0;
+        let stream = gpu.active_stream.as_ref().expect("decode graph stream ensured by caller");
+        gpu.graphs
+            .begin_graph_capture(&gpu.hip, gpu.device_id, stream)
+            .map_err(|e| format!("raon1_mini: begin decode graph capture: {e:?}"))?;
+        let body = decode_body(&self.config, &self.weights, &self.state, &self.scratch, &self.work, gpu);
+        let stream = gpu.active_stream.as_ref().expect("decode graph stream ensured by caller");
+        if let Err(e) = body {
+            gpu.graphs.abort_graph_capture(&gpu.hip, gpu.device_id, stream);
+            return Err(format!("raon1_mini: decode graph capture failed (no eager fallback): {e}"));
+        }
+        gpu.graphs
+            .end_graph_capture(&gpu.hip, gpu.device_id, stream)
+            .map_err(|e| format!("raon1_mini: end decode graph capture: {e:?}"))?;
+        gpu.graphs.ar_forward_binding = binding;
+        self.graph.binding = binding;
+        self.graph.kernel_nodes = gpu.graphs.ar_forward_blobs.len();
+        Ok(())
+    }
+
+    /// Start a cold request (zero recurrent state, conv history, length). A
+    /// recorded decode graph stays valid: addresses and extents are unchanged.
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.state.reset(gpu)
     }
@@ -293,7 +450,13 @@ impl RaonBundle {
             work,
             eos: _,
             prefill_mode: _,
+            decode_mode: _,
+            graph,
         } = self;
+        // A recording of this bundle reads the buffers freed below.
+        if graph.binding != 0 && gpu.graphs.ar_forward_binding == graph.binding {
+            gpu.graphs.drop_captured_graph(&gpu.hip, gpu.device_id);
+        }
         work.free(gpu);
         if let Err(e) = scratch.free_gpu(gpu) {
             eprintln!("raon1_mini: scratch free: {e}");
