@@ -174,15 +174,27 @@ impl PrefillPrecision {
             match &layer.mixer {
                 RaonMixer::Rda(r) => {
                     for w in [
-                        &r.q_proj, &r.k_proj, &r.v_proj, &r.g_proj, &r.o_proj, &r.f_a_proj,
-                        &r.f_b_proj, &r.b_proj, &r.rda_w_proj,
+                        &r.q_proj,
+                        &r.k_proj,
+                        &r.v_proj,
+                        &r.g_proj,
+                        &r.o_proj,
+                        &r.f_a_proj,
+                        &r.f_b_proj,
+                        &r.b_proj,
+                        &r.rda_w_proj,
                     ] {
                         note(w);
                     }
                 }
                 RaonMixer::Mla(m) => {
                     for w in [
-                        &m.q_a_proj, &m.q_b_proj, &m.kv_a_proj, &m.kv_b_proj, &m.g_proj, &m.o_proj,
+                        &m.q_a_proj,
+                        &m.q_b_proj,
+                        &m.kv_a_proj,
+                        &m.kv_b_proj,
+                        &m.g_proj,
+                        &m.o_proj,
                     ] {
                         note(w);
                     }
