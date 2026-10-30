@@ -151,8 +151,10 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
         writeln!(out, "=== end ({} tokens, stop: {stop}) ===", generated.len()).map_err(w)?;
         out.flush().map_err(w)?;
         let decode_secs = t1.elapsed().as_secs_f64();
+        let (captures, replays) = bundle.decode_graph_stats();
         eprintln!(
-            "generate: prefill {} tok in {prefill_secs:.2}s ({:.1} tok/s); decode {} tok in {decode_secs:.2}s ({:.1} tok/s)",
+            "generate: decode_mode={} (graph captures {captures}, replays {replays}); prefill {} tok in {prefill_secs:.2}s ({:.1} tok/s); decode {} tok in {decode_secs:.2}s ({:.1} tok/s)",
+            bundle.decode_mode(),
             prompt.len(),
             prompt.len() as f64 / prefill_secs.max(1e-9),
             generated.len(),
@@ -166,6 +168,7 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
             "stop": stop,
             "prompt_tokens": prompt.len(),
             "think": think,
+            "decode_mode": bundle.decode_mode(),
             "prefill": match mode {
                 hipfire_arch_raon::bundle::PrefillMode::Serial => "serial",
                 hipfire_arch_raon::bundle::PrefillMode::Batched => "batched",
