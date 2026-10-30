@@ -47,10 +47,12 @@ pub mod gated_mlp;
 #[cfg(feature = "deltanet")]
 pub mod hybrid;
 pub(crate) mod layer_ops;
+pub mod latent_attention;
 pub mod mla;
 pub mod projection_split;
 pub mod sandwich;
 pub mod step_graph;
+pub mod stream_mix;
 pub(crate) mod steps;
 pub use layer_ops::{
     execute_argmax, execute_broadcast_add, execute_clear, execute_embedding, execute_final_hyper,

@@ -34,11 +34,14 @@ pub mod feature_flags;
 #[cfg(feature = "flash-attn-ck")]
 pub mod flash_attn_ck;
 pub mod flux_fused;
+pub mod ffn_activation;
 #[cfg(feature = "deltanet")]
 pub mod fn_gdn_dense;
 pub mod fp8_e4m3;
 pub mod gap_timing;
 pub mod gdn_chunk_prep_pm;
+#[cfg(feature = "deltanet")]
+pub mod gated_delta_vector;
 #[cfg(test)]
 mod gdn_q8ef_reference;
 pub mod gemm;
@@ -61,6 +64,7 @@ pub mod hc_row_fold;
 pub mod head_lanes;
 pub mod iu4_c8_pm;
 mod kernel_abi;
+pub mod latent_attention;
 pub mod kernel_pack;
 pub mod kernel_registry;
 pub mod kernels;

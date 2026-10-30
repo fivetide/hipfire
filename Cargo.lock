@@ -1527,6 +1527,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-raon"
+version = "0.1.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-config",
+ "hipfire-dispatch",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-toy"
 version = "0.4.4"
 dependencies = [

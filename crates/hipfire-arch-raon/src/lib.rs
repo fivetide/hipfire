@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+//! Raon-1-mini-preview (arch_id 19, `raon1_mini`): 25-layer hybrid of
+//! RDA (vector-decay gated delta) and NoPE MLA mixers, four-stream Raon mHC,
+//! SiTU dense/shared FFN and sigmoid top-6 MoE. Generic math lives in
+//! rdna-compute/hipfire-dispatch; this crate binds Raon parameters.
+pub mod config;
+pub mod weights;
+pub mod projection;
+pub mod state;
+pub mod bundle;
+pub mod arch_model;
+pub mod carrier;
+pub mod forward;
+pub mod prefill;
+pub mod mhc;
+pub mod rda;
+pub mod mla;
+pub mod moe;
+
+/// Architecture id for Raon-1-mini.
+pub const ARCH_ID: u32 = 19;

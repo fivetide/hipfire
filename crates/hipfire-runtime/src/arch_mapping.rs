@@ -125,8 +125,12 @@ pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
 /// Reserved source classifications with no executable carrier or reset owner.
 /// These strings remain accepted by [`lookup_model_type`] so packers and
 /// safetensors probing can preserve the wire id without publishing a route.
-pub const RESERVED_MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] =
-    &[("qwen4_exp", 16), ("qwen4_exp_text", 16)];
+/// arch 19 (`raon1_mini`) is source-only until the Raon carrier lands.
+pub const RESERVED_MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
+    ("qwen4_exp", 16),
+    ("qwen4_exp_text", 16),
+    ("raon1_mini", 19),
+];
 
 /// Look up an `arch_id` for a `model_type` / GGUF `general.architecture`
 /// string, including reserved source-only classifications.
