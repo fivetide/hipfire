@@ -70,9 +70,7 @@ pub fn grouped_sym_tier_admits(arch: &str, tier: PrefillActTier) -> bool {
 /// quantizers allocate through the MMQ scratch). The arch, shape and weight-format conditions are
 /// the call site's ([`grouped_sym_tier_admits`], [`q8_0_prefill_runs`]).
 pub fn prefill_quant_admitted(gpu: &Gpu, rows: usize) -> bool {
-    rows >= PREFILL_QUANT_MIN_ROWS
-        && !gpu.graphs.capture_mode
-        && !gpu.replay.is_recording()
+    rows >= PREFILL_QUANT_MIN_ROWS && !gpu.graphs.capture_mode && !gpu.replay.is_recording()
 }
 
 /// Whether [`q8_0_prefill_gemm`] with `tier` runs a quantized route for this `k` and `rows`

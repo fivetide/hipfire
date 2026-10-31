@@ -29,7 +29,8 @@ pub const A8_ENTRIES: [(usize, usize); 4] = [(1, 1), (2, 1), (1, 2), (2, 2)];
 
 /// gfx11 (gfx1100 / gfx1151) twin of the W4A8 module: RDNA3 K16 iu8 operand form, same fold, so its
 /// output is bit-identical to the gfx1201 module's for equal inputs.
-pub const A8_GFX11_SRC: &str = include_str!("../../../kernels/src/moe_grouped_qt44_a8_sym.gfx11.hip");
+pub const A8_GFX11_SRC: &str =
+    include_str!("../../../kernels/src/moe_grouped_qt44_a8_sym.gfx11.hip");
 pub const A8_GFX11_MODULE: &str = "moe_grouped_qt44_a8_sym_gfx11";
 /// Entries of the gfx11 W4A8 module (`nt4r2` spills and is not built).
 pub const A8_GFX11_ENTRIES: [(usize, usize); 5] = [(1, 1), (2, 1), (4, 1), (1, 2), (2, 2)];

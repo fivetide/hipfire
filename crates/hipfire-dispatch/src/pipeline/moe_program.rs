@@ -11,8 +11,8 @@
 //! lowerer: a caller can submit a complete sealed call or nothing.
 
 use super::q8_prefill::{
-    grouped_sym_tier_admits, prefill_quant_admitted, q8_0_prefill_gemm, q8_0_prefill_runs, PrefillActTier,
-    PREFILL_QUANT_MIN_ROWS,
+    grouped_sym_tier_admits, prefill_quant_admitted, q8_0_prefill_gemm, q8_0_prefill_runs,
+    PrefillActTier, PREFILL_QUANT_MIN_ROWS,
 };
 use super::steps::Step;
 use crate::context::DispatchCtx;

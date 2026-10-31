@@ -269,11 +269,13 @@ impl SiteWeight {
     /// `Ok` when this weight can run `tier` at prefill rows >= 64 on `arch`; otherwise the reason.
     fn can_run(&self, arch: &str, tier: PrefillActTier) -> Result<(), &'static str> {
         if !hipfire_dispatch::pipeline::grouped_sym_tier_admits(arch, tier) {
-            return Err(if hipfire_dispatch::pipeline::grouped_sym_tier_admits(arch, PrefillActTier::A8) {
-                "A4/FP8 prefill tiers are gfx1201-only"
-            } else {
-                "quantized prefill tiers are gfx1201/gfx1100/gfx1151-only"
-            });
+            return Err(
+                if hipfire_dispatch::pipeline::grouped_sym_tier_admits(arch, PrefillActTier::A8) {
+                    "A4/FP8 prefill tiers are gfx1201-only"
+                } else {
+                    "quantized prefill tiers are gfx1201/gfx1100/gfx1151-only"
+                },
+            );
         }
         if arch != "gfx1201" && matches!(*self, Self::Q8 { .. }) {
             return Err("Q8_0 has no gfx11 int8 route");
