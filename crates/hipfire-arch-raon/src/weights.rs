@@ -43,7 +43,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::moe::RoutedExpertWeights;
 use hipfire_dispatch::pipeline::{
-    ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources, ExpertTable,
+    grouped_sym_tier_admits, ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources,
+    ExpertTable, PrefillActTier,
 };
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
@@ -205,7 +206,8 @@ pub struct MoeFfnWeights {
     pub table: ExpertTable,
     pub cache: ExpertBindingCache,
     /// Every routed gate/up and down header is symmetric (`zp == -8 * sc`), verified on the device
-    /// at load (gfx1201 only); admits the grouped W4A4 expert core when the IU4 route is enabled.
+    /// at load on archs that admit a quantized grouped tier (gfx1201, gfx1100, gfx1151); admits the grouped
+    /// W4A8 / W4A4 expert core.
     pub iu4_symmetric: bool,
 }
 
@@ -1633,9 +1635,10 @@ fn seal_experts(
 }
 
 /// Whether every routed gate/up and down group header obeys `zp == -8 * sc` (the symmetric qt44
-/// contract the grouped W4A4 core reads: `w = sc * (u - 8)`), checked on the device with the
-/// route's header checker. `false` off gfx1201, for non-qt44 experts, or when the checker is
-/// unavailable; never an error (the route simply stays off).
+/// contract the grouped W4A8 / W4A4 cores read: `w = sc * (u - 8)`), checked on the device with the
+/// route's header checker. `false` on archs that admit no quantized grouped tier
+/// ([`grouped_sym_tier_admits`]), for non-qt44 experts, or when the checker is unavailable; never an
+/// error (the route simply stays off).
 fn verify_symmetric_headers(
     gpu: &mut Gpu,
     experts: &[ExpertWeights],
@@ -1645,7 +1648,9 @@ fn verify_symmetric_headers(
     let Some(first) = experts.first() else {
         return false;
     };
-    if gpu.arch != "gfx1201"
+    let quantized_tier = grouped_sym_tier_admits(&gpu.arch, PrefillActTier::A8)
+        || grouped_sym_tier_admits(&gpu.arch, PrefillActTier::A4);
+    if !quantized_tier
         || !experts.iter().all(|x| {
             x.gate_up.gpu_dtype == DType::MQ4G256V2 && x.down.gpu_dtype == DType::MQ4G256V2
         })

@@ -127,14 +127,22 @@ impl RaonSiteTiers {
 /// measurement on R9700 (`raon/pfx/ev/fp8/`, CHANGELOG): A8 and FP8 run at the same speed at every
 /// site, A8 has the lower KLD at every site, A4 alone exceeds the +0.002 KLD budget at every FFN
 /// site, and all-A8 costs code24 +0.0003 / WT2 +0.0011 vs all-F16 on the shipped artifact.
-/// Every other arch: all F16.
+/// gfx1100 / gfx1151: the routed experts run W4A8 on the gfx11 twin of the grouped kernel
+/// (7900 XTX pp512 +6.0%, Strix Halo +4.9%, KLD code24 -0.0005 / WT2 +0.00004 vs all-F16; receipts
+/// `raon/pfx/ev/a8r3/`); shared and dense FFN can run it too but are unmeasured there, and the Q8_0
+/// attention class has no gfx11 int8 route. Every other arch: all F16.
 pub fn default_table(arch: &str) -> RaonSiteTiers {
     /// gfx1201 default, indexed like [`RaonPrecisionSite::ALL`].
     const GFX1201: RaonSiteTiers = RaonSiteTiers::all(PrefillActTier::A8);
-    if arch == "gfx1201" {
-        GFX1201
-    } else {
-        RaonSiteTiers::ALL_F16
+    match arch {
+        "gfx1201" => GFX1201,
+        "gfx1100" | "gfx1151" => {
+            let mut t = RaonSiteTiers::ALL_F16;
+            t.set(RaonPrecisionSite::RoutedGateUp, PrefillActTier::A8);
+            t.set(RaonPrecisionSite::RoutedDown, PrefillActTier::A8);
+            t
+        }
+        _ => RaonSiteTiers::ALL_F16,
     }
 }
 
@@ -260,8 +268,15 @@ impl SiteWeight {
 
     /// `Ok` when this weight can run `tier` at prefill rows >= 64 on `arch`; otherwise the reason.
     fn can_run(&self, arch: &str, tier: PrefillActTier) -> Result<(), &'static str> {
-        if arch != "gfx1201" {
-            return Err("quantized prefill tiers are gfx1201-only");
+        if !hipfire_dispatch::pipeline::grouped_sym_tier_admits(arch, tier) {
+            return Err(if hipfire_dispatch::pipeline::grouped_sym_tier_admits(arch, PrefillActTier::A8) {
+                "A4/FP8 prefill tiers are gfx1201-only"
+            } else {
+                "quantized prefill tiers are gfx1201/gfx1100/gfx1151-only"
+            });
+        }
+        if arch != "gfx1201" && matches!(*self, Self::Q8 { .. }) {
+            return Err("Q8_0 has no gfx11 int8 route");
         }
         match *self {
             Self::Q8 { k } => {
@@ -634,12 +649,27 @@ mod tests {
             (r.effective, r.reason),
             (F16, Some("F32 weights are never tiered"))
         );
-        // other archs: F16 with the reason
-        for arch in ["gfx1100", "gfx1151", "gfx942"] {
+        // gfx11: A8 runs on the symmetric qt44 FFN weight (grouped gfx11 twin), never on Q8_0;
+        // A4/FP8 stay gfx1201-only; other archs: F16 with the reason
+        for arch in ["gfx1100", "gfx1151"] {
             let r = effective_tier(arch, A8, &[q8, sym(true)]);
+            assert_eq!((r.effective, r.runnable, r.total), (A8, 1, 2), "{arch}");
+            assert_eq!(effective_tier(arch, A8, &[q8]).effective, F16, "{arch}");
+            let r = effective_tier(arch, Fp8, &[sym(true)]);
             assert_eq!(r.effective, F16, "{arch}");
-            assert_eq!(r.reason, Some("quantized prefill tiers are gfx1201-only"));
+            assert_eq!(r.reason, Some("A4/FP8 prefill tiers are gfx1201-only"));
         }
+        let r = effective_tier("gfx942", A8, &[q8, sym(true)]);
+        assert_eq!(r.effective, F16);
+        assert_eq!(
+            r.reason,
+            Some("quantized prefill tiers are gfx1201/gfx1100/gfx1151-only")
+        );
+        let d = default_table("gfx1100");
+        assert_eq!(d.get(RaonPrecisionSite::RoutedGateUp), A8);
+        assert_eq!(d.get(RaonPrecisionSite::RoutedDown), A8);
+        assert_eq!(d.get(RaonPrecisionSite::Shared), F16);
+        assert_eq!(d.get(RaonPrecisionSite::MlaQ), F16);
         // an F16 request never has a reason, a site without weights falls back with one
         assert_eq!(effective_tier(R9700, F16, &[q8]).reason, None);
         let r = effective_tier(R9700, A8, &[]);

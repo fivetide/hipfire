@@ -11,7 +11,7 @@
 //! lowerer: a caller can submit a complete sealed call or nothing.
 
 use super::q8_prefill::{
-    prefill_quant_admitted, q8_0_prefill_gemm, q8_0_prefill_runs, PrefillActTier,
+    grouped_sym_tier_admits, prefill_quant_admitted, q8_0_prefill_gemm, q8_0_prefill_runs, PrefillActTier,
     PREFILL_QUANT_MIN_ROWS,
 };
 use super::steps::Step;
@@ -7143,7 +7143,9 @@ fn gated_ffn_from_basis(
         None
     };
     let tier = w.act_tier;
-    let quant_admitted = tier != PrefillActTier::F16 && prefill_quant_admitted(gpu, rows);
+    let quant_admitted = tier != PrefillActTier::F16
+        && grouped_sym_tier_admits(&gpu.arch, tier)
+        && prefill_quant_admitted(gpu, rows);
     let sym_ok = |weight: &WeightRef<'_>, y: &GpuTensor, m: usize, k: usize| -> bool {
         quant_admitted
             && cast.bf16()
@@ -7359,8 +7361,9 @@ pub struct GroupedMoeSiteTiers {
 /// Capability admission of the grouped symmetric quantized-activation routed-expert cores of
 /// [`execute_grouped_moe`], resolved per site: the caller bound loader-verified symmetric headers
 /// (`zp == -8 * sc` on every gate/up and down group,
-/// [`GroupedMoeRouted::iu4_symmetric_verified`]), the device is gfx1201, the experts are qt44
-/// (`MQ4G256V2`) and the shape fits the kernels ([`grouped_moe_iu4_shape_admits`]). The tier of each
+/// [`GroupedMoeRouted::iu4_symmetric_verified`]), the experts are qt44
+/// (`MQ4G256V2`) and the shape fits the kernels ([`grouped_moe_iu4_shape_admits`]); a site whose tier
+/// the arch lacks ([`grouped_sym_tier_admits`]) runs F16. The tier of each
 /// site is the caller's [`GroupedMoeRouted::act_tiers`]. AWQ (input vector, per-expert down table),
 /// the activation (SiLU/SiTU), the pad of the down K and the cast policy are handled by the stages
 /// around the two GEMMs and place no condition here. The route allocates only through the
@@ -7372,7 +7375,17 @@ pub fn grouped_moe_site_tiers(gpu: &Gpu, op: &GroupedMoeOp<'_>) -> GroupedMoeSit
         && op.routed.dtype == DType::MQ4G256V2
         && grouped_moe_iu4_shape_admits(&op.geometry, op.rows);
     if admitted {
-        op.routed.act_tiers
+        let on_arch = |t| {
+            if grouped_sym_tier_admits(&gpu.arch, t) {
+                t
+            } else {
+                PrefillActTier::F16
+            }
+        };
+        GroupedMoeSiteTiers {
+            gate_up: on_arch(op.routed.act_tiers.gate_up),
+            down: on_arch(op.routed.act_tiers.down),
+        }
     } else {
         GroupedMoeSiteTiers::default()
     }
@@ -7432,6 +7445,9 @@ fn grouped_sym_gemm(
     use rdna_compute::moe_grouped_qt44_iu4 as g;
     let (nt, rf) = match tier {
         PrefillActTier::A4 => g::select_entry(m_total, m),
+        PrefillActTier::A8 if matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151") => {
+            g::select_entry_a8_gfx11(&gpu.arch, m_total, m)
+        }
         PrefillActTier::A8 => g::select_entry_a8(m_total, m),
         PrefillActTier::Fp8 => g::select_entry_fp8(m_total, m),
         PrefillActTier::F16 => return Err(grouped_refusal("grouped-sym-f16-tier", "")),

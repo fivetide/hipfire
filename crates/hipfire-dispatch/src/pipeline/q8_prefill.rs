@@ -53,13 +53,24 @@ impl PrefillActTier {
 /// the F16 route stays.
 pub const PREFILL_QUANT_MIN_ROWS: usize = 64;
 
-/// Runtime admission shared by every quantized prefill tier: gfx1201, at least
+/// Arch half of the quantized prefill tiers (pure): the grouped symmetric qt44 cores
+/// (routed/shared/dense FFN) run W4A8 on gfx1201 and on the gfx11 twin (gfx1100, gfx1151), W4A4 and
+/// FP8 on gfx1201 only; the tiered Q8_0 GEMM is gfx1201 only ([`q8_0_prefill_runs`]).
+pub fn grouped_sym_tier_admits(arch: &str, tier: PrefillActTier) -> bool {
+    use rdna_compute::moe_grouped_qt44_iu4 as g;
+    match tier {
+        PrefillActTier::F16 => true,
+        PrefillActTier::A8 => g::a8_supported(arch),
+        PrefillActTier::A4 | PrefillActTier::Fp8 => g::a4_fp8_supported(arch),
+    }
+}
+
+/// Runtime admission shared by every quantized prefill tier: at least
 /// [`PREFILL_QUANT_MIN_ROWS`] rows, and neither graph capture nor Redline recording (the
-/// quantizers allocate through the MMQ scratch). Shape and weight-format conditions are the
-/// call site's.
+/// quantizers allocate through the MMQ scratch). The arch, shape and weight-format conditions are
+/// the call site's ([`grouped_sym_tier_admits`], [`q8_0_prefill_runs`]).
 pub fn prefill_quant_admitted(gpu: &Gpu, rows: usize) -> bool {
-    gpu.arch == "gfx1201"
-        && rows >= PREFILL_QUANT_MIN_ROWS
+    rows >= PREFILL_QUANT_MIN_ROWS
         && !gpu.graphs.capture_mode
         && !gpu.replay.is_recording()
 }
@@ -67,7 +78,8 @@ pub fn prefill_quant_admitted(gpu: &Gpu, rows: usize) -> bool {
 /// Whether [`q8_0_prefill_gemm`] with `tier` runs a quantized route for this `k` and `rows`
 /// (`false`: it would run the F16 batched GEMM).
 pub fn q8_0_prefill_runs(gpu: &Gpu, tier: PrefillActTier, k: usize, rows: usize) -> bool {
-    prefill_quant_admitted(gpu, rows)
+    gpu.arch == "gfx1201"
+        && prefill_quant_admitted(gpu, rows)
         && match tier {
             PrefillActTier::A8 => gpu.q8_a8_supported(k),
             PrefillActTier::Fp8 => gpu.q8_fp8_supported(k),
