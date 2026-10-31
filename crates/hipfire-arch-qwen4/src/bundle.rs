@@ -1524,7 +1524,11 @@ impl Qwen4Bundle {
         // The largest rung whose chunk-sized resources fit the free device
         // memory beside the kernels' lazily sized workspaces; the smallest
         // rung is attempted regardless and fails at allocation if it must.
-        let (free, _) = gpu.device_mem_info().map_err(BundleError::Hip)?;
+        // Planned capacity (total - own - reserve), not the instantaneous free
+        // figure: a transient foreign allocation must not shrink the chunk.
+        let planned = gpu.planned_capacity().map_err(BundleError::Hip)?;
+        let free = planned.bytes;
+        eprintln!("  qwen4 admission decision: prefill chunk rung search from {planned}");
         // A load that placed its experts for decode-share (`fixed` / `on`, a
         // donor tail in the lease) sized the placement for exactly this chunk and
         // this scratch plan: the chunk is final (no rung downshift) and a
@@ -1593,7 +1597,7 @@ impl Qwen4Bundle {
             Err(Qwen4GpuForwardError::CompactUnverified { verified, total })
                 if s1_tile.is_none() && mode == Qwen4ForwardScratchMode::FnSymGfx1201 =>
             {
-                let (free, _) = gpu.device_mem_info().map_err(BundleError::Hip)?;
+                let free = gpu.planned_capacity().map_err(BundleError::Hip)?.bytes;
                 let rows = full_fallback_rows(&self.config, requested, free as u64);
                 eprintln!(
                     "  qwen4 forward scratch: compact plan refused by the GPU symmetry check ({verified}/{total} layers verified); re-planned Full at {rows} rows"

@@ -524,7 +524,11 @@ fn copy_d2d(
 }
 
 fn check_free(gpu: &Gpu, need: usize, headroom: usize, what: &str) -> Result<(), String> {
-    let (free, total) = hip(gpu.device_mem_info(), "query device memory")?;
+    // Planned capacity (total - own - reserve), not the instantaneous free
+    // figure: a transient foreign allocation must not flip the route. The
+    // allocation that follows is the real check.
+    let cap = hip(gpu.planned_capacity(), "query device memory")?;
+    let (free, total) = (cap.bytes, cap.total);
     let required = need
         .checked_add(headroom)
         .ok_or_else(|| format!("raon state: {what}: byte overflow"))?;
@@ -896,7 +900,7 @@ impl RaonState {
         let pending_latent = budget
             .full_physical(dims)
             .saturating_sub(budget.initial_physical(dims));
-        let (free, _) = hip(gpu.device_mem_info(), "query device memory")?;
+        let free = hip(gpu.planned_capacity(), "query device memory")?.bytes;
         let usable = free
             .saturating_sub(pending_latent)
             .saturating_sub(ADMISSION_HEADROOM_BYTES)
@@ -1242,11 +1246,25 @@ impl RaonState {
     /// candidate's scratch+work bytes from this and asks
     /// [`Self::projected_mirror_budget_rows`] what is left for the mirror.
     pub fn mirror_available_bytes(&self, gpu: &Gpu) -> Result<usize, String> {
-        let (free, _) = hip(gpu.device_mem_info(), "query device memory")?;
-        Ok(free
-            .saturating_sub(self.pending_latent_bytes(gpu))
-            .saturating_sub(ADMISSION_HEADROOM_BYTES)
-            .saturating_sub(MIRROR_POST_ASSEMBLY_RESERVE_BYTES))
+        self.mirror_available_with_input(gpu).map(|(b, _)| b)
+    }
+
+    /// [`Self::mirror_available_bytes`] plus the planned-capacity input it was
+    /// decided from (for the load log). Planned from device total minus this
+    /// process's own allocations and a fixed reserve, never the instantaneous
+    /// free figure.
+    pub fn mirror_available_with_input(
+        &self,
+        gpu: &Gpu,
+    ) -> Result<(usize, rdna_compute::PlannedCapacity), String> {
+        let cap = hip(gpu.planned_capacity(), "query device memory")?;
+        Ok((
+            cap.bytes
+                .saturating_sub(self.pending_latent_bytes(gpu))
+                .saturating_sub(ADMISSION_HEADROOM_BYTES)
+                .saturating_sub(MIRROR_POST_ASSEMBLY_RESERVE_BYTES),
+            cap,
+        ))
     }
 
     /// Mirror budget in rows [`Self::fit_mirror_budget`] would settle on if
