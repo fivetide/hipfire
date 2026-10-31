@@ -1068,9 +1068,10 @@ impl Pool {
     }
     fn kind_ok(&self, spec: &TensorSpec) -> bool {
         match (self.items.get(&spec.name), spec.class) {
-            (Some(Loaded::Mat(_) | Loaded::MatDecode(..)), TensorClass::Proj | TensorClass::Router) => {
-                true
-            }
+            (
+                Some(Loaded::Mat(_) | Loaded::MatDecode(..)),
+                TensorClass::Proj | TensorClass::Router,
+            ) => true,
             (Some(Loaded::Vec(_)), TensorClass::F32Vec) => true,
             (Some(Loaded::Host(_)), TensorClass::HostF32) => true,
             (Some(Loaded::Embed(..)), TensorClass::Embedding) => true,
@@ -2259,19 +2260,27 @@ mod tests {
                 e.data_size = payload_bytes(qt, m, k).unwrap();
             }
         }
-        idx.retain(|e| !(e.name.ends_with(".awq_scale.weight") && {
-            let w = e.name.replace(".awq_scale.weight", ".weight");
-            is_always_active_ffn(&w)
-        }));
+        idx.retain(|e| {
+            !(e.name.ends_with(".awq_scale.weight") && {
+                let w = e.name.replace(".awq_scale.weight", ".weight");
+                is_always_active_ffn(&w)
+            })
+        });
     }
 
     #[test]
     fn always_active_ffn_classifier_covers_shared_and_dense_only() {
         assert!(is_always_active_ffn("model.layers.0.mlp.gate_proj.weight"));
-        assert!(is_always_active_ffn("model.layers.7.moe.shared_experts.down_proj.weight"));
-        assert!(!is_always_active_ffn("model.layers.7.moe.experts.3.down_proj.weight"));
+        assert!(is_always_active_ffn(
+            "model.layers.7.moe.shared_experts.down_proj.weight"
+        ));
+        assert!(!is_always_active_ffn(
+            "model.layers.7.moe.experts.3.down_proj.weight"
+        ));
         assert!(!is_always_active_ffn("model.layers.7.mlp_raon_mhc.phi_pre"));
-        assert!(!is_always_active_ffn("model.layers.7.self_attn.q_proj.weight"));
+        assert!(!is_always_active_ffn(
+            "model.layers.7.self_attn.q_proj.weight"
+        ));
     }
 
     #[test]
