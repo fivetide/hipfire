@@ -1457,6 +1457,9 @@ pub(crate) mod tests {
                 sizes: Vec::new(),
                 tags: (0..MAX_BUFFERS).map(|_| AtomicU64::new(0)).collect(),
                 events: Vec::new(),
+                epoch_ptr: 0,
+                boundary: Mutex::new(None),
+                ledger: Mutex::new(Vec::new()),
                 peers_enabled: AtomicBool::new(true),
                 calls: AtomicU64::new(0),
                 entered: AtomicU64::new(0),
@@ -1471,6 +1474,7 @@ pub(crate) mod tests {
             ranks: states,
             barrier: SpinBarrier::new(ranks, timeout),
             device_waits: false,
+            kernel_boundaries: false,
             started: Instant::now(),
         })
     }
