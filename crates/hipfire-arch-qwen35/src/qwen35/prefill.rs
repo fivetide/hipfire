@@ -2446,7 +2446,15 @@ fn memory_admitted_rung(
     use std::sync::atomic::{AtomicUsize, Ordering};
     static LAST_LOGGED: AtomicUsize = AtomicUsize::new(usize::MAX);
     let rung = memory_admitted_rung_planned(
-        gpu, config, kv_cache, perf_rows, lean, native_mq4, mq3, cached, free_deduction,
+        gpu,
+        config,
+        kv_cache,
+        perf_rows,
+        lean,
+        native_mq4,
+        mq3,
+        cached,
+        free_deduction,
     )?;
     if perf_rows > WIDENED_COMMIT_ROWS && LAST_LOGGED.swap(rung, Ordering::Relaxed) != rung {
         if let Ok(cap) = gpu.planned_capacity() {
@@ -2705,7 +2713,9 @@ fn log_resident_moe_decision(gpu: &Gpu, rows: usize) {
     static LAST: AtomicUsize = AtomicUsize::new(usize::MAX);
     if LAST.swap(rows, Ordering::Relaxed) != rows {
         if let Ok(cap) = gpu.planned_capacity() {
-            eprintln!("qwen35: admission decision: resident-MoE prefill chunk rows {rows} from {cap}");
+            eprintln!(
+                "qwen35: admission decision: resident-MoE prefill chunk rows {rows} from {cap}"
+            );
         }
     }
 }
@@ -7804,13 +7814,19 @@ mod tests {
                 at += c;
             }
             if n > 512 {
-                assert!(max_chunk <= receipt.admitted, "n={n}: physical {max_chunk} exceeds logged");
+                assert!(
+                    max_chunk <= receipt.admitted,
+                    "n={n}: physical {max_chunk} exceeds logged"
+                );
                 if n >= 4096 {
                     assert_eq!(receipt.admitted, max_chunk, "n={n}: logged != physical");
                 }
                 assert_eq!(receipt.admitted, 512);
                 let r = reason.expect("downgrade must be named");
-                assert!(r.contains("8192") && r.contains("512") && r.contains("scratch"), "{r}");
+                assert!(
+                    r.contains("8192") && r.contains("512") && r.contains("scratch"),
+                    "{r}"
+                );
                 assert!(format!("{receipt}").contains("admitted=512"));
             } else {
                 // Short call: n-row chunk, the planned ceiling is not downgraded.

@@ -2244,7 +2244,9 @@ impl HipRuntime {
             self.check(code, "hipFree")?;
             crate::registry::forget(buf.ptr as usize);
             self.own_device_bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(size)))
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(size))
+                })
                 .ok();
             Ok(())
         })
@@ -2527,7 +2529,10 @@ impl HipRuntime {
         let handle = self.mem_create_inner(size, prop)?;
         // Only device-placed backing counts against device capacity.
         if prop.location.type_ == HIP_MEM_LOCATION_TYPE_DEVICE {
-            self.own_vmm_handles.lock().unwrap().insert(handle as usize, size);
+            self.own_vmm_handles
+                .lock()
+                .unwrap()
+                .insert(handle as usize, size);
             self.own_device_bytes.fetch_add(size, Ordering::Relaxed);
         }
         Ok(handle)
@@ -2622,9 +2627,16 @@ impl HipRuntime {
     pub unsafe fn mem_release(&self, handle: HipMemGenericAllocationHandle) -> HipResult<()> {
         // SAFETY: forwarded caller contract.
         unsafe { self.mem_release_inner(handle) }?;
-        if let Some(size) = self.own_vmm_handles.lock().unwrap().remove(&(handle as usize)) {
+        if let Some(size) = self
+            .own_vmm_handles
+            .lock()
+            .unwrap()
+            .remove(&(handle as usize))
+        {
             self.own_device_bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(size)))
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(size))
+                })
                 .ok();
         }
         Ok(())

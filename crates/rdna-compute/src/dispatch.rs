@@ -12625,7 +12625,14 @@ impl PlannedCapacity {
         } else {
             free_now
         };
-        Self { bytes, total, own, reserve, free_now, planned }
+        Self {
+            bytes,
+            total,
+            own,
+            reserve,
+            free_now,
+            planned,
+        }
     }
 }
 
@@ -12639,7 +12646,11 @@ impl std::fmt::Display for PlannedCapacity {
                 m(self.bytes), m(self.total), m(self.own), m(self.reserve), m(self.free_now)
             )
         } else {
-            write!(f, "capacity={:.0} MiB (free figure: UMA/emu)", m(self.bytes))
+            write!(
+                f,
+                "capacity={:.0} MiB (free figure: UMA/emu)",
+                m(self.bytes)
+            )
         }
     }
 }
@@ -12657,6 +12668,9 @@ mod planned_capacity_tests {
     }
     #[test]
     fn uma_uses_free() {
-        assert_eq!(PlannedCapacity::new(5 * G, 32 * G, 8 * G, false).bytes, 5 * G);
+        assert_eq!(
+            PlannedCapacity::new(5 * G, 32 * G, 8 * G, false).bytes,
+            5 * G
+        );
     }
 }
