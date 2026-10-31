@@ -978,7 +978,11 @@ mod tests {
         let r = can_promote_with_records(&e, &p, &recs(bad.clone())).unwrap_err();
         assert_eq!(r.stage, ROWCLASS_STAGE);
         assert_eq!(r.passed, STAGES[..2].to_vec());
-        assert!(r.reason.contains("rows=1 ") && r.reason.contains("veto"), "{}", r.reason);
+        assert!(
+            r.reason.contains("rows=1 ") && r.reason.contains("veto"),
+            "{}",
+            r.reason
+        );
         assert!(!is_winner_with_records(&e, &p, &recs(bad)));
 
         // Regime refusal flows through the gate.
@@ -1013,7 +1017,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pmrc-promote-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rec.json");
-        let bad = rc_record(vec![rc_class(1, 1.6, 1.0, 1e-4), rc_class(512, 0.8, 1e-4, 1.0)]);
+        let bad = rc_record(vec![
+            rc_class(1, 1.6, 1.0, 1e-4),
+            rc_class(512, 0.8, 1e-4, 1.0),
+        ]);
         std::fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
         let mut e = ev();
         e.discovery.record_path = path.to_str().unwrap().to_owned();
