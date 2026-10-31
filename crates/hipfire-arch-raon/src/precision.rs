@@ -510,7 +510,13 @@ mod tests {
     fn default_tables_per_arch() {
         let d = default_table(R9700);
         assert_eq!(d, RaonSiteTiers::all(A8));
-        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx942", ""] {
+        let mut gfx11 = RaonSiteTiers::ALL_F16;
+        gfx11.set(S::RoutedGateUp, A8);
+        gfx11.set(S::RoutedDown, A8);
+        for arch in ["gfx1100", "gfx1151"] {
+            assert_eq!(default_table(arch), gfx11, "{arch}");
+        }
+        for arch in ["gfx1200", "gfx942", ""] {
             assert_eq!(default_table(arch), RaonSiteTiers::ALL_F16, "{arch}");
         }
         assert_eq!(parse("").unwrap().requested_tiers(), d);
@@ -519,7 +525,7 @@ mod tests {
             RaonPrecisionPolicy::parse("default", "gfx1100")
                 .unwrap()
                 .requested_tiers(),
-            RaonSiteTiers::ALL_F16
+            gfx11
         );
     }
 
@@ -559,7 +565,8 @@ mod tests {
         assert_eq!(p.requested(S::Shared), Fp8);
         // other arch: default base is all F16
         let p = RaonPrecisionPolicy::parse("dense=a8", "gfx1100").unwrap();
-        assert_eq!(p.requested(S::RoutedGateUp), F16);
+        assert_eq!(p.requested(S::RoutedGateUp), A8);
+        assert_eq!(p.requested(S::Shared), F16);
         assert_eq!(p.requested(S::Dense), A8);
     }
 
@@ -719,7 +726,10 @@ mod tests {
         assert_eq!(plan.effective.get(S::MlaQ), A8);
         assert_eq!(plan.effective.get(S::RoutedGateUp), F16);
         assert!(plan.coverage_line().contains("mla_q=a8"));
+        // an all-A8 request resolved on gfx1100: the Q8_0 attention class falls back to F16, the
+        // symmetric qt44 FFN sites keep A8 (gfx11 grouped twin)
         let plan = parse("default").unwrap().resolve("gfx1100", &w);
-        assert_eq!(plan.effective, RaonSiteTiers::ALL_F16);
+        assert_eq!(plan.effective.get(S::MlaQ), F16);
+        assert_eq!(plan.effective.get(S::RoutedGateUp), A8);
     }
 }
