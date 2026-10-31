@@ -137,7 +137,10 @@ fn a_crossing_tag_mismatch_aborts_every_family() {
     // "rank R entered [<expected>] but rank P's slot for buffer B holds [<actual>]":
     // whichever rank reports first, the two tags are the two crossings.
     let between = |after: &str| -> String {
-        let start = error.find(after).unwrap_or_else(|| panic!("{after:?} in {error}")) + after.len();
+        let start = error
+            .find(after)
+            .unwrap_or_else(|| panic!("{after:?} in {error}"))
+            + after.len();
         let len = error[start..].find(']').expect("closing bracket");
         error[start..start + len].to_string()
     };
@@ -153,7 +156,10 @@ fn a_crossing_tag_mismatch_aborts_every_family() {
         .join()
         .expect("bystander")
         .expect("bystander fails");
-    assert!(message.contains("aborted") && !is_expiry(&message), "{message}");
+    assert!(
+        message.contains("aborted") && !is_expiry(&message),
+        "{message}"
+    );
     assert!(gather.is_aborted() && tile.is_aborted());
 }
 
@@ -199,12 +205,18 @@ fn a_missing_participant_times_out_once_and_aborts_the_rest() {
     let mut expirations = 1; // the gather's, reported by `run_all`
     for waiter in waiters {
         let message = waiter.join().expect("waiter").expect("waiter fails");
-        assert!(message.contains("aborted"), "released by the abort: {message}");
+        assert!(
+            message.contains("aborted"),
+            "released by the abort: {message}"
+        );
         if is_expiry(&message) {
             expirations += 1;
         }
     }
-    assert_eq!(expirations, 1, "one timeout for the mesh, not one per family");
+    assert_eq!(
+        expirations, 1,
+        "one timeout for the mesh, not one per family"
+    );
     assert!(gather.is_aborted() && tile.is_aborted() && third.is_aborted());
 }
 
@@ -227,7 +239,11 @@ fn abort_is_idempotent() {
     assert!(gather.is_aborted() && tile.is_aborted());
     // Aborting again, through the pool and directly, changes nothing.
     pool.poison_mesh("second");
-    assert_eq!(calls.load(Ordering::SeqCst), 2, "callbacks run per poisoning");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "callbacks run per poisoning"
+    );
     pool.run_all(|| Ok(()), &|_, _: &mut Fake| Ok(()))
         .expect_err("poisoned");
     gather.abort();
