@@ -6554,7 +6554,8 @@ use crate::families::gemv::WeightRef;
 use crate::families::moe::{grouped_moe_m_total_bound, GroupedMoeGeometry, MOE_GROUPED_BLOCK_M};
 pub use rdna_compute::ffn_activation::{CombineOrder, FfnActivation, RouterKind};
 use rdna_compute::ffn_activation::{
-    FfnActivationGrouped, FfnActivationRows, FfnAwq, MoeCombine, MoeRouterTopK,
+    FfnActivationGrouped, FfnActivationGroupedI8, FfnActivationRows, FfnActivationRowsI8, FfnAwq,
+    MoeCombine, MoeRouterTopK,
 };
 use rdna_compute::DType;
 
@@ -7283,29 +7284,84 @@ fn gated_ffn_from_basis(
         Some(t) if down_rotated => FfnAwq::Vector(t),
         _ => FfnAwq::None,
     };
-    hip!(gpu.ffn_activation_rows_f32(&FfnActivationRows {
-        activation,
-        gate: s.gate_out,
-        gate_offset: 0,
-        gate_ld: mi,
-        up: s.up_out,
-        up_offset: 0,
-        up_ld: mi,
-        out: s.act,
-        rows,
-        logical_n: mi,
-        phys_n: down_k,
-        round_inputs: cast.bf16(),
-        round_output: cast.bf16(),
-        awq,
-    }))?;
-    let down_x = if down_rotated {
-        hip!(gpu.rotate_x_mq_batched(s.act, s.rot, down_k, rows))?;
-        s.rot
+    // A8 down: the activation, the rotation and the quantizer in one launch (the F32 `act` and
+    // `rot` planes are never written); every other route runs the three-stage chain. Admitted
+    // exactly where `project` would quantize `s.rot` for this down GEMM (`sym_ok`), so the
+    // prepared sidecar is the one it consumes.
+    let down_xq_fused = if down_rotated
+        && down_producer_fused_admits(
+            gpu.flags.gfx12_producer_quant_fused_enabled(),
+            tier,
+            mi,
+            down_k,
+        )
+        && sym_ok(&w.down, out, hidden, down_k)
+    {
+        let reservation = hip!(gpu.reserve_int8_mmq(down_k, rows))?;
+        let prepared = hip!(gpu.ffn_activation_rows_rotate_i8_f32(
+            &FfnActivationRowsI8 {
+                activation,
+                gate: s.gate_out,
+                gate_offset: 0,
+                gate_ld: mi,
+                up: s.up_out,
+                up_offset: 0,
+                up_ld: mi,
+                x_out: None,
+                rows,
+                logical_n: mi,
+                phys_n: down_k,
+                round_inputs: cast.bf16(),
+                round_output: cast.bf16(),
+                awq: match awq {
+                    FfnAwq::Vector(t) => Some(t),
+                    _ => None,
+                },
+            },
+            reservation,
+        ))?;
+        Some(hip!(gpu.int8_mmq_prepared_ptr(&prepared, down_k, rows))?)
     } else {
-        s.act
+        None
     };
-    project(gpu, &w.down, 2, down_x, out, down_key, hidden, down_k, None)?;
+    let down_x = if down_xq_fused.is_some() {
+        // Never read: `project` takes the prepared sidecar.
+        s.act
+    } else {
+        hip!(gpu.ffn_activation_rows_f32(&FfnActivationRows {
+            activation,
+            gate: s.gate_out,
+            gate_offset: 0,
+            gate_ld: mi,
+            up: s.up_out,
+            up_offset: 0,
+            up_ld: mi,
+            out: s.act,
+            rows,
+            logical_n: mi,
+            phys_n: down_k,
+            round_inputs: cast.bf16(),
+            round_output: cast.bf16(),
+            awq,
+        }))?;
+        if down_rotated {
+            hip!(gpu.rotate_x_mq_batched(s.act, s.rot, down_k, rows))?;
+            s.rot
+        } else {
+            s.act
+        }
+    };
+    project(
+        gpu,
+        &w.down,
+        2,
+        down_x,
+        out,
+        down_key,
+        hidden,
+        down_k,
+        down_xq_fused,
+    )?;
     if cast.bf16() {
         hip!(gpu.ffn_round_bf16_f32(out, rows * hidden))?;
     }
@@ -7441,6 +7497,37 @@ pub fn grouped_moe_iu4_shape_admits(g: &GroupedMoeGeometry, rows: usize) -> bool
         && g.down_k % 256 == 0
         && (2 * g.logical_mi) % 64 == 0
         && g.hidden % 64 == 0
+}
+
+/// Whether a down site runs the fused A8 producer (`Gpu::ffn_activation_grouped_rotate_i8_f32` /
+/// `Gpu::ffn_activation_rows_rotate_i8_f32`: activation + rotation + A8 quantizer in one launch,
+/// bytewise the three-launch chain). Pure: `fused_flag` is
+/// `Flags::gfx12_producer_quant_fused_enabled()` (exact gfx1201 and
+/// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED` not `0`), `tier` the down site's admitted tier. The route
+/// runs only for the A8 tier, and for the kernel's column geometry: whole 8-column lanes
+/// (`logical_n % 8`), whole 256-wide rotation groups (`down_k % 256`), `logical_n <= down_k`.
+/// The caller's own admission (rows floor, capture/recording refusal, symmetric format) already ran.
+pub fn down_producer_fused_admits(
+    fused_flag: bool,
+    tier: PrefillActTier,
+    logical_n: usize,
+    down_k: usize,
+) -> bool {
+    fused_flag
+        && tier == PrefillActTier::A8
+        && logical_n > 0
+        && logical_n % 8 == 0
+        && logical_n <= down_k
+        && down_k % 256 == 0
+}
+
+/// [`down_producer_fused_admits`] for the routed grouped down site.
+pub fn grouped_down_producer_fused_admits(
+    fused_flag: bool,
+    tier: PrefillActTier,
+    g: &GroupedMoeGeometry,
+) -> bool {
+    down_producer_fused_admits(fused_flag, tier, g.logical_mi, g.down_k)
 }
 
 /// Row floor of the grouped symmetric quantized cores: below it the weight stream of the expert
@@ -7677,31 +7764,69 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
                     rows,
                 ))?;
             }
-            hip!(gpu.ffn_activation_grouped_f32(&FfnActivationGrouped {
-                activation: op.policy.activation,
-                y_grouped: t.gate_up_rows,
-                sorted_slot_index: t.sorted_slot_index,
-                expert_tile_ids: t.expert_tile_ids,
-                out: s.act,
-                m_total,
-                block_m: MOE_GROUPED_BLOCK_M,
-                logical_n: g.logical_mi,
-                phys_n: g.down_k,
-                round_inputs: bf16,
-                round_output: bf16,
-                awq_table: down_awq_table,
-                n_experts: g.n_experts,
-            }))?;
-            hip!(gpu.rotate_x_mq_batched(s.act, s.rot, g.down_k, slots))?;
-            super::moe_capture::act_capture(
-                gpu,
-                super::moe_capture::SITE_DOWN,
-                s.rot,
-                slots,
-                g.down_k,
-            )?;
+            // A8 down: the activation, the rotation and the quantizer in one launch (the F32 `act`
+            // and `rot` planes are never written); every other tier runs the three-stage chain.
+            // HIPFIRE_MOE_ACT_CAPTURE records the rotated F32 producer input, which the fused
+            // launch never materializes, so an armed capture keeps the three-stage chain (its int8
+            // output is byte-identical to the fused launch).
+            let down_xq_fused = if !super::moe_capture::act_capture_enabled()
+                && grouped_down_producer_fused_admits(
+                    gpu.flags.gfx12_producer_quant_fused_enabled(),
+                    tiers.down,
+                    &g,
+                ) {
+                let reservation = hip!(gpu.reserve_int8_mmq(g.down_k, slots))?;
+                let prepared = hip!(gpu.ffn_activation_grouped_rotate_i8_f32(
+                    &FfnActivationGroupedI8 {
+                        activation: op.policy.activation,
+                        y_grouped: t.gate_up_rows,
+                        sorted_slot_index: t.sorted_slot_index,
+                        expert_tile_ids: t.expert_tile_ids,
+                        x_out: None,
+                        m_total,
+                        block_m: MOE_GROUPED_BLOCK_M,
+                        logical_n: g.logical_mi,
+                        phys_n: g.down_k,
+                        total_slots: slots,
+                        round_inputs: bf16,
+                        round_output: bf16,
+                        awq_table: down_awq_table,
+                        n_experts: g.n_experts,
+                    },
+                    reservation,
+                ))?;
+                Some(hip!(gpu.int8_mmq_prepared_ptr(&prepared, g.down_k, slots))?)
+            } else {
+                hip!(gpu.ffn_activation_grouped_f32(&FfnActivationGrouped {
+                    activation: op.policy.activation,
+                    y_grouped: t.gate_up_rows,
+                    sorted_slot_index: t.sorted_slot_index,
+                    expert_tile_ids: t.expert_tile_ids,
+                    out: s.act,
+                    m_total,
+                    block_m: MOE_GROUPED_BLOCK_M,
+                    logical_n: g.logical_mi,
+                    phys_n: g.down_k,
+                    round_inputs: bf16,
+                    round_output: bf16,
+                    awq_table: down_awq_table,
+                    n_experts: g.n_experts,
+                }))?;
+                hip!(gpu.rotate_x_mq_batched(s.act, s.rot, g.down_k, slots))?;
+                super::moe_capture::act_capture(
+                    gpu,
+                    super::moe_capture::SITE_DOWN,
+                    s.rot,
+                    slots,
+                    g.down_k,
+                )?;
+                None
+            };
             if tiers.down != PrefillActTier::F16 {
-                let xq = grouped_sym_quantize(gpu, tiers.down, s.rot, slots, g.down_k)?;
+                let xq = match down_xq_fused {
+                    Some(xq) => xq,
+                    None => grouped_sym_quantize(gpu, tiers.down, s.rot, slots, g.down_k)?,
+                };
                 grouped_sym_gemm(
                     gpu,
                     tiers.down,
@@ -7792,6 +7917,42 @@ mod grouped_moe_tests {
             down_k: 1280,
             shared_mi: 1088,
             shared_down_k: 1280,
+        }
+    }
+
+    #[test]
+    fn fused_down_producer_admits_only_the_a8_tier_flag_and_kernel_geometry() {
+        let g = raon_geometry();
+        assert!(grouped_down_producer_fused_admits(
+            true,
+            PrefillActTier::A8,
+            &g
+        ));
+        // `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED=0` (or another arch) restores the chain.
+        assert!(!grouped_down_producer_fused_admits(
+            false,
+            PrefillActTier::A8,
+            &g
+        ));
+        for tier in [PrefillActTier::F16, PrefillActTier::A4, PrefillActTier::Fp8] {
+            assert!(
+                !grouped_down_producer_fused_admits(true, tier, &g),
+                "{tier:?}"
+            );
+        }
+        for bad in [
+            GroupedMoeGeometry {
+                logical_mi: 1084,
+                ..g
+            },
+            GroupedMoeGeometry { logical_mi: 0, ..g },
+            GroupedMoeGeometry { down_k: 1088, ..g },
+            GroupedMoeGeometry { down_k: 1024, ..g },
+        ] {
+            assert!(
+                !grouped_down_producer_fused_admits(true, PrefillActTier::A8, &bad),
+                "{bad:?}"
+            );
         }
     }
 

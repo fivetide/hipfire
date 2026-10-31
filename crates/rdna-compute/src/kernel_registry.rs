@@ -3263,6 +3263,20 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::MQ_ROTATE_X_I8_GFX12_SRC,
             ["mq_rotate_x_i8_gfx12"]
         );
+        // Grouped MoE down producer of the A8 route: grouped activation + rotate + A8 blocks in one
+        // launch (`Gpu::ffn_activation_grouped_rotate_i8_f32`).
+        add!(
+            "ffn_grouped_activation_rotate_i8_gfx1201",
+            kernels::FFN_GROUPED_ACTIVATION_ROTATE_I8_SRC,
+            [
+                "ffn_swiglu_grouped_rotate_i8_gfx1201",
+                "ffn_swiglu_clamp_grouped_rotate_i8_gfx1201",
+                "ffn_situ_grouped_rotate_i8_gfx1201",
+                "ffn_swiglu_rows_rotate_i8_gfx1201",
+                "ffn_swiglu_clamp_rows_rotate_i8_gfx1201",
+                "ffn_situ_rows_rotate_i8_gfx1201"
+            ]
+        );
         add!(
             "qwen4_gemm_mq6g256v2_wmma_gfx12_x4",
             kernels::QWEN4_GEMM_MQ6G256V2_WMMA_GFX12_X4_SRC,
@@ -10825,6 +10839,20 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // Fused W4A8 down producer (activation + FWHT + block_i8_128 emit), gfx1201.
+        const FFN_ROTATE_I8_ADDED_MODULES: [&str; 1] = ["ffn_grouped_activation_rotate_i8_gfx1201"];
+        for module in FFN_ROTATE_I8_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing fused down producer module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         // BF16-weight GEMMs (batched + x-stationary tiled) for the Raon mHC selector
         // and grouped-MoE router.
         const BF16_XF32_ROWS_ADDED_MODULES: [&str; 2] =
@@ -10913,7 +10941,8 @@ mod tests {
                 + A3B_MOE_DEDUP_ADDED_MODULES.len()
                 + A3B_LANE_PROJ_ADDED_MODULES.len()
                 + BF16_XF32_ROWS_ADDED_MODULES.len()
-                + Q8_0_MMQ_ACT_ADDED_MODULES.len(),
+                + Q8_0_MMQ_ACT_ADDED_MODULES.len()
+                + FFN_ROTATE_I8_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name

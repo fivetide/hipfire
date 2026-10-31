@@ -5776,6 +5776,23 @@ pub const MQ_ROTATE_X_I8_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_ROTATE_KERNEL mq_rotate_x_i8_gfx11\n",
     include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
 );
+/// gfx1201 MoE / gated-FFN down producer of the A8 route (`Gpu::ffn_activation_grouped_rotate_i8_f32`,
+/// entries `ffn_{swiglu,swiglu_clamp,situ}_grouped_rotate_i8_gfx1201`; `Gpu::ffn_activation_rows_rotate_i8_f32`,
+/// entries `ffn_{swiglu,swiglu_clamp,situ}_rows_rotate_i8_gfx1201`): the gate/up activation
+/// (`ffn_grouped_activation_pad.hip`, concatenated whole so the element expression is
+/// the standalone kernel's own), the FWHT rotation (`mq_fwht256.h`) and the `block_i8_128`
+/// register emit in one launch. Blocks are byte-identical to the activation +
+/// `mq_rotate_x_batched` + `ensure_int8_mmq_x` chain. Grid `[m_total * (phys_n / 256), 1, 1]`
+/// (`[rows * (phys_n / 256), 1, 1]` for the rows entries), block 32.
+pub const FFN_GROUPED_ACTIVATION_ROTATE_I8_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    "#define HIPFIRE_FFN_GROUPED_ACTIVATION_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/block_i8_128_emit.hip"),
+    include_str!("../../../kernels/src/mq_fwht256.h"),
+    include_str!("../../../kernels/src/ffn_grouped_activation_pad.hip"),
+    include_str!("../../../kernels/src/ffn_grouped_activation_rotate_i8.gfx1201.hip")
+);
 // gfx12 (RDNA4) i8-WMMA MMQ port (single-wave 16-row tile, [32,1,1], LDS 0).
 // RDNA3's #if guard excludes gfx12, so RDNA4 needs this separate source.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str =

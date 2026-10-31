@@ -955,7 +955,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1841
+**Count:** 1843
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1029,7 +1029,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_BENCH_RUNS` | scripts/adaptive_b_bench.sh, scripts/bench_qwen36_ar_dflash.sh | harness |
 | `HIPFIRE_BENCH_WARMUPS` | scripts/kernel-tune-loop.sh | harness |
 | `HIPFIRE_BENCH_WORKLOAD` | scripts/kernel-tune-loop.sh | harness |
-| `HIPFIRE_BF16W_TILED_ROWS` | crates/hipfire-dispatch/src/pipeline/stream_mix.rs | developer |
+| `HIPFIRE_BF16W_TILED_ROWS` | crates/hipfire-dispatch/src/pipeline/stream_mix.rs, crates/hipfire-kernel-abi/src/families/generic_gemm.rs | developer |
 | `HIPFIRE_BF16_H_A4` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_BF16_H_FP8` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_BIN` | scripts/calibrate_multigpu.sh, scripts/install.sh | harness |
@@ -1449,6 +1449,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_FA_PREFILL_PM` | crates/hipfire-config/src/lib.rs, crates/hipfire-dispatch/src/families/attention.rs | developer |
 | `HIPFIRE_FA_PREFILL_PM_QPREP` | crates/hipfire-config/src/lib.rs, crates/railgun-cert/src/recording.rs | developer |
 | `HIPFIRE_FA_RAGGED_PACKET` | crates/hipfire-dispatch/src/pipeline/batched_attention.rs | developer |
+| `HIPFIRE_FFN_GROUPED_ACTIVATION_NO_STANDALONE` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_FIXED_TIER` | crates/hipfire-quantize/src/model_filter.rs, crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_FLASH_ATTN_CK_LIB` | crates/hipfire-config/src/lib.rs, crates/railgun-cert/src/recording.rs | experimental |
 | `HIPFIRE_FLASH_ATTN_CK_TEST_LIB` | crates/rdna-compute/src/flash_attn_ck.rs | developer |
@@ -1531,6 +1532,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_G12_NORM` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/examples/zba_fold_oracle.rs | stable |
 | `HIPFIRE_G12_RASTER` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_G3_BUILD_ID` | crates/hipfire-arch-qwen35/examples/shared_weight_state_oracle.rs | harness |
+| `HIPFIRE_G5_CAPTURE` | crates/rdna-compute/tests/ffn_grouped_i8_producer_oracle.rs | harness |
+| `HIPFIRE_G5_ONLY_CAPTURE` | crates/rdna-compute/tests/ffn_grouped_i8_producer_oracle.rs | harness |
 | `HIPFIRE_G942_TRUNK_GEMV` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs | developer |
 | `HIPFIRE_GATED_DELTA_VECTOR_PM` | crates/rdna-compute/src/gated_delta_vector_pm.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GATED_NORM_FP8_AWQ` | crates/rdna-compute/src/kernels.rs | developer |
@@ -2243,7 +2246,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD` | crates/hipfire-loader/src/lib.rs | developer |
 | `HIPFIRE_QWEN35_FA_EPILOGUE_FUSE` | crates/hipfire-dispatch/src/pipeline/hybrid.rs | developer |
 | `HIPFIRE_QWEN35_FA_PREP_FUSE` | crates/hipfire-dispatch/src/pipeline/hybrid.rs, crates/rdna-compute/tests/fa_prep_parity.rs | developer |
-| `HIPFIRE_QWEN35_FA_PREP_KERNEL` | crates/rdna-compute/src/kernel_registry.rs, crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_QWEN35_FA_PREP_KERNEL` | crates/rdna-compute/src/kernel_registry.rs, crates/rdna-compute/src/kernel_registry.rs | developer |
 | `HIPFIRE_QWEN35_FINITE_TRACE` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
 | `HIPFIRE_QWEN35_FIXTURE` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs | developer |
 | `HIPFIRE_QWEN35_GRAMMAR` | crates/hipfire-daemon/src/slots.rs, crates/hipfire-generate/src/ar.rs | developer |
