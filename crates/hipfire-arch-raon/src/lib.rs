@@ -17,6 +17,7 @@ pub mod prefill;
 pub mod projection;
 pub mod rda;
 pub mod rollback;
+pub mod session;
 pub mod spec_impl;
 pub mod state;
 mod verify_graph;

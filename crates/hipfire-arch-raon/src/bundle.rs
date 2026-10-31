@@ -2,6 +2,11 @@
 // Copyright (c) 2026 Kaden Schutt
 //! RaonBundle (config, weights, state, scratch, work, eos) and the generation
 //! entry points built on the forward. Owner: slice A/I.
+//!
+//! The bundle is also the model's [`hipfire_runtime::session_cache::SessionState`]
+//! (see [`crate::session`]): with a cache attached, a prefill restores the
+//! snapshot `ArchModel::session_plan` returned and captures new ones on the
+//! cold prefill chunk grid, byte-identical to a cold prefill.
 
 use crate::precision::{RaonPrecisionPlan, RaonPrecisionPolicy, SiteWeights};
 use rdna_compute::{Gpu, GpuTensor};
@@ -14,6 +19,10 @@ use crate::forward::{
 use crate::spec_impl::RaonSpecState;
 use crate::state::{RaonPrefillScratch, RaonState};
 use crate::weights::RaonWeights;
+use crate::session::session_stride;
+use hipfire_runtime::session_cache::{
+    SessionCache, SessionCacheUsage, SessionDriver, SessionRoute,
+};
 
 /// Decode-step execution route (`HIPFIRE_GRAPH`, PLAN §3.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +151,12 @@ pub struct RaonBundle {
     /// Speculative-decode state (DFlash2 capture, per-row verify head); empty
     /// until a speculator arms it, never touched by AR prefill or decode.
     pub(crate) spec: RaonSpecState,
+    /// Device architecture string (`gfx1201`, ...), part of the snapshot scope:
+    /// kernels differ per device, so their bits do too.
+    pub(crate) gpu_arch: String,
+    /// Prefill snapshot cache shared by every session; `None` = off. Taken out
+    /// of the bundle while it drives the bundle as its `SessionState`.
+    pub(crate) session: Option<SessionDriver>,
 }
 
 impl RaonBundle {
@@ -196,6 +211,8 @@ impl RaonBundle {
                     decode_mode: DecodeMode::resolve(gpu),
                     graph: DecodeGraph::default(),
                     spec: RaonSpecState::default(),
+                    gpu_arch: arch,
+                    session: None,
                 })
             }
             Err(e) => {
@@ -362,6 +379,134 @@ impl RaonBundle {
         Ok(())
     }
 
+    /// Attach the session cache: [`session_prefill`](Self::session_prefill)
+    /// then restores and captures snapshots through it.
+    pub fn attach_session_cache(&mut self, cache: SessionCache) {
+        self.session = Some(SessionDriver::new(cache));
+    }
+
+    /// The attached session cache, if any.
+    pub fn session_cache(&self) -> Option<&SessionCache> {
+        self.session.as_ref().map(SessionDriver::cache)
+    }
+
+    /// `SessionCache::usage` of the attached cache.
+    pub fn session_usage(&self) -> Option<SessionCacheUsage> {
+        self.session.as_ref().map(|s| s.cache().usage())
+    }
+
+    /// Device bytes of one stride snapshot: the persistent slab plus one stride
+    /// of rows of every latent stream.
+    pub fn session_snapshot_bytes(&self) -> usize {
+        let (_, persist) = self.state.persist_part();
+        let stride = session_stride(self.prefill_step_rows());
+        persist
+            + stride * self.state.dims().latent_row_bytes() * self.state.mla_cache.len()
+    }
+
+    /// Device bytes the live state may still map before it holds `through`
+    /// tokens: unmapped latent growth of every MLA layer plus the expanded
+    /// mirror's growth up to `min(through, mirror_budget_rows)` rows.
+    pub fn context_growth_bytes(&self, gpu: &Gpu, through: usize) -> u64 {
+        self.state.context_growth_bytes(gpu, through)
+    }
+
+    /// Before a request that may hold up to `through` tokens: have the cache
+    /// free snapshots until [`context_growth_bytes`](Self::context_growth_bytes)
+    /// more device bytes fit (the cache never takes memory the context needs).
+    /// No-op without a cache.
+    pub fn release_session_for_growth(&mut self, gpu: &mut Gpu, through: usize) {
+        if self.session.is_none() {
+            return;
+        }
+        let need = self.context_growth_bytes(gpu, through);
+        if let Some(session) = self.session.as_mut() {
+            session.release_for(gpu, need);
+        }
+    }
+
+    /// Run `f` with the driver taken out, so it can drive `self` as its
+    /// `SessionState`. `None` without a cache.
+    fn with_session<R>(&mut self, f: impl FnOnce(&mut SessionDriver, &mut Self) -> R) -> Option<R> {
+        let mut session = self.session.take()?;
+        let result = f(&mut session, self);
+        self.session = Some(session);
+        Some(result)
+    }
+
+    /// Prefill `prompt` skipping the `reused` tokens `ArchModel::session_plan`
+    /// returned (0 = cold): begin through the driver (restore, or cold reset),
+    /// run the rest in prefill chunks that stop at every armed snapshot
+    /// boundary, and leave the LAST prompt token's logits in
+    /// [`logits`](Self::logits). Without a cache `reused` must be 0. Reports
+    /// `prefill_progress` after every chunk. A failure leaves the slot
+    /// partially advanced: the caller resets it.
+    ///
+    /// The driver runs without live continuation, so every resume point is a
+    /// position of the cold chunk grid and the result equals a cold prefill's.
+    pub fn session_prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        prompt: &[u32],
+        reused: usize,
+    ) -> Result<(), String> {
+        let len = prompt.len();
+        if reused >= len {
+            return Err(format!(
+                "raon1_mini: reusing {reused} of {len} prompt tokens leaves nothing to compute"
+            ));
+        }
+        if len > self.state.max_seq() {
+            return Err(format!(
+                "raon1_mini: {len} prompt tokens exceed the reserved context of {} rows",
+                self.state.max_seq()
+            ));
+        }
+        match self.with_session(|session, bundle| {
+            session.begin(gpu, bundle, prompt, SessionRoute::Ar, reused, false)
+        }) {
+            Some(result) => {
+                result?;
+            }
+            None if reused == 0 => self.state.reset(gpu)?,
+            None => {
+                return Err(format!(
+                    "raon1_mini: session cache is not attached; cannot reuse {reused} tokens"
+                ))
+            }
+        }
+        if self.state.n_tokens() != reused {
+            return Err(format!(
+                "raon1_mini: session begin left the state at {} tokens, expected {reused}",
+                self.state.n_tokens()
+            ));
+        }
+        let step = self.prefill_step_rows();
+        let mut pos = reused;
+        while pos < len {
+            let boundary = self.session.as_ref().and_then(SessionDriver::next_boundary);
+            if boundary.is_some_and(|b| b <= pos) {
+                return Err(format!(
+                    "raon1_mini: session boundary {} is not past position {pos}",
+                    boundary.unwrap_or(0)
+                ));
+            }
+            let stop = boundary.unwrap_or(len).min(len);
+            for piece in prompt[pos..stop].chunks(step) {
+                pos += piece.len();
+                self.forward_chunk(gpu, piece, pos == len)?;
+                hipfire_runtime::prefill_progress::report(pos, len);
+            }
+            if boundary == Some(stop) {
+                self.with_session(|session, bundle| {
+                    session.at_boundary(gpu, bundle, &prompt[..stop])
+                })
+                .unwrap_or(Ok(()))?;
+            }
+        }
+        Ok(())
+    }
+
     /// One decode step: consume `token`, leave its logits in
     /// [`logits`](Self::logits). Routed by [`decode_mode`](Self::decode_mode):
     /// graph replay per token (recorded on first use per admitted context
@@ -503,9 +648,13 @@ impl RaonBundle {
         Ok(())
     }
 
-    /// Start a cold request (zero recurrent state, conv history, length). A
+    /// Start a cold request (zero recurrent state, conv history, length) and
+    /// forget the session driver's live state, whose rows this overwrites. A
     /// recorded decode graph stays valid: addresses and extents are unchanged.
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        if let Some(session) = self.session.as_mut() {
+            session.forget_live();
+        }
         self.state.reset(gpu)
     }
 
@@ -544,7 +693,12 @@ impl RaonBundle {
             decode_mode: _,
             graph,
             spec,
+            gpu_arch: _,
+            session,
         } = self;
+        if let Some(mut session) = session {
+            session.clear(gpu);
+        }
         // A recording of this bundle reads the buffers freed below.
         if graph.binding != 0 && gpu.graphs.ar_forward_binding == graph.binding {
             gpu.graphs.drop_captured_graph(&gpu.hip, gpu.device_id);
