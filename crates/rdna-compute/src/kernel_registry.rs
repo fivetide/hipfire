@@ -10802,6 +10802,21 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // gfx12 W8A8 / W8-FP8 Q8_0 prefill GEMMs (quantized-activation tiers).
+        const Q8_0_MMQ_ACT_ADDED_MODULES: [&str; 2] =
+            ["gemm_q8_0_mmq_i8_gfx12", "gemm_q8_0_mmq_fp8_gfx12"];
+        for module in Q8_0_MMQ_ACT_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing Q8_0 MMQ module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         // x-stationary tiled F32 GEMM for the mHC selector and grouped-MoE router.
         const F32_TILED_ROWS_ADDED_MODULES: [&str; 1] = ["gemm_f32_tiled_rows"];
         for module in F32_TILED_ROWS_ADDED_MODULES {
@@ -10887,7 +10902,8 @@ mod tests {
                 + A3B_LANE_WO_ADDED_MODULES.len()
                 + A3B_MOE_DEDUP_ADDED_MODULES.len()
                 + A3B_LANE_PROJ_ADDED_MODULES.len()
-                + F32_TILED_ROWS_ADDED_MODULES.len(),
+                + F32_TILED_ROWS_ADDED_MODULES.len()
+                + Q8_0_MMQ_ACT_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
