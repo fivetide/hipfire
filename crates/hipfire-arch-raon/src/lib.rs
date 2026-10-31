@@ -12,6 +12,7 @@ pub mod forward;
 pub mod mhc;
 pub mod mla;
 pub mod moe;
+pub mod precision;
 pub mod prefill;
 pub mod projection;
 pub mod rda;

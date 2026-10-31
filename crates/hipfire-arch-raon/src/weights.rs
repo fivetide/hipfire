@@ -147,6 +147,9 @@ pub struct GatedFfnWeights {
     pub up: WeightTensor,
     pub down: WeightTensor,
     pub decode: [Option<WeightTensor>; 3],
+    /// Every qt44 weight's group headers are symmetric (`zp == -8 * sc`), verified on the device at
+    /// load (gfx1201 only); admits the grouped symmetric quantized-activation cores for this FFN.
+    pub iu4_symmetric: bool,
 }
 
 impl GatedFfnWeights {
@@ -1350,7 +1353,34 @@ fn take_gated(pool: &mut Pool, prefix: &str) -> GatedFfnWeights {
         up,
         down,
         decode: [gate_dec, up_dec, down_dec],
+        iu4_symmetric: false,
     }
+}
+
+/// Whether every qt44 weight of a gated FFN (shared expert or dense MLP) has symmetric group
+/// headers (`zp == -8 * sc`, the contract of the grouped symmetric quantized-activation cores),
+/// checked on the device with the route's header checker. `false` off gfx1201, when the FFN has no
+/// qt44 weight, or when the checker is unavailable; never an error (the quantized tiers simply
+/// stay off for this FFN). Non-qt44 weights (Q8_0) are not covered by the verdict.
+fn verify_gated_symmetric(gpu: &mut Gpu, g: &GatedFfnWeights) -> bool {
+    let weights = [&g.gate, &g.up, &g.down];
+    if gpu.arch != "gfx1201" || !weights.iter().any(|w| w.gpu_dtype == DType::MQ4G256V2) {
+        return false;
+    }
+    for w in weights {
+        if w.gpu_dtype != DType::MQ4G256V2 {
+            continue;
+        }
+        let Ok(table) = ptr_table(gpu, &[w.buf.buf.as_ptr() as u64], "gated ffn sym check") else {
+            return false;
+        };
+        let ok = matches!(gpu.qwen4_moe_sym_check(&table, w.m, w.k, 1, 136), Ok(true));
+        free_t(gpu, table);
+        if !ok {
+            return false;
+        }
+    }
+    true
 }
 
 fn ptr_table(gpu: &mut Gpu, ptrs: &[u64], label: &str) -> Result<GpuTensor, String> {
@@ -1701,7 +1731,7 @@ fn build_moe(
             return Err(er);
         }
     };
-    let shared = take_gated(pool, &format!("{m}.shared_experts"));
+    let mut shared = take_gated(pool, &format!("{m}.shared_experts"));
     // The qt44 shared expert's gate/up scale must be the layer's (values are
     // verified identical by `check_moe_awq`): both present or both absent.
     // Q8F16/BF16 shared projections consume the plain activation and carry none.
@@ -1730,6 +1760,7 @@ fn build_moe(
         return Err(er);
     }
     let iu4_symmetric = verify_symmetric_headers(gpu, &experts, &gu, &dn);
+    shared.iu4_symmetric = verify_gated_symmetric(gpu, &shared);
     Ok(MoeFfnWeights {
         router: pool.take_mat(&format!("{m}.gate.weight")),
         e_bias: pool.take_vec(&format!("{m}.gate.e_score_correction_bias")),
@@ -1780,7 +1811,8 @@ fn build_layer(
                 &format!("{mlp}.up_proj.weight"),
                 cfg.hidden,
             )?;
-            let g = take_gated(pool, &mlp);
+            let mut g = take_gated(pool, &mlp);
+            g.iu4_symmetric = verify_gated_symmetric(gpu, &g);
             RaonFfn::Dense(g)
         }
     };

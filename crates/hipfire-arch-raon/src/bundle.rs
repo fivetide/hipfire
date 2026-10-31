@@ -3,7 +3,7 @@
 //! RaonBundle (config, weights, state, scratch, work, eos) and the generation
 //! entry points built on the forward. Owner: slice A/I.
 
-use hipfire_dispatch::pipeline::GroupedMoeActTier;
+use crate::precision::{RaonPrecisionPlan, RaonPrecisionPolicy, SiteWeights};
 use rdna_compute::{Gpu, GpuTensor};
 
 use crate::config::RaonConfig;
@@ -13,7 +13,7 @@ use crate::forward::{
 };
 use crate::spec_impl::RaonSpecState;
 use crate::state::{RaonPrefillScratch, RaonState};
-use crate::weights::{RaonMixer, RaonWeights};
+use crate::weights::RaonWeights;
 
 /// Decode-step execution route (`HIPFIRE_GRAPH`, PLAN §3.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,151 +107,17 @@ impl PrefillMode {
     }
 }
 
-/// Activation precision of batched qt44 projections (`HIPFIRE_RAON_PREFILL_PRECISION`,
-/// PLAN §3.6). `Default` (unset) runs the grouped routed experts W4A8 on gfx1201 for
-/// symmetric-verified qt44 experts and keeps every other qt44 GEMM at FP16; `F16` is the kill
-/// switch (FP16 everywhere); `A8` additionally admits the int8-activation attention-class
-/// prefill GEMMs (gfx1201 `a8_prefill`, gfx11 `gfx11_a8_prefill`); `A4` admits the device's
-/// default symmetric IU4 route and W4A4 routed experts (fails the KLD gate, opt-in only).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PrefillPrecision {
-    Default,
-    F16,
-    A8,
-    A4,
-}
-
-impl PrefillPrecision {
-    pub fn from_env() -> Result<Self, String> {
-        match hipfire_config::developer_var("HIPFIRE_RAON_PREFILL_PRECISION") {
-            Err(_) => Ok(Self::Default),
-            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-                "" => Ok(Self::Default),
-                "f16" => Ok(Self::F16),
-                "a8" => Ok(Self::A8),
-                "a4" => Ok(Self::A4),
-                other => Err(format!(
-                    "HIPFIRE_RAON_PREFILL_PRECISION={other:?}: expected `f16`, `a8` or `a4`"
-                )),
-            },
-        }
-    }
-
-    /// Activation tier of the grouped routed-expert GEMMs (`GroupedMoeRouted::act_tier`); admitted
-    /// only on gfx1201 for symmetric-verified qt44 experts, otherwise the F16 core runs.
-    pub fn routed_tier(self) -> GroupedMoeActTier {
-        match self {
-            Self::Default | Self::A8 => GroupedMoeActTier::A8,
-            Self::F16 => GroupedMoeActTier::F16,
-            Self::A4 => GroupedMoeActTier::A4,
-        }
-    }
-
-    /// Resolve the policy onto the device's feature flags once, at load.
-    /// `Default` and `F16` turn off every activation-quantized prefill route for this
-    /// process's device (the routed-expert tier is separate, see [`Self::routed_tier`]); `A8`
-    /// turns IU4 off and int8 on; `A4` leaves the device defaults untouched.
-    fn apply(self, gpu: &mut Gpu) {
-        let mut flags = (*gpu.flags).clone();
-        match self {
-            Self::Default | Self::F16 => {
-                flags.iu4_prefill = Some(false);
-                flags.a8_prefill = false;
-                flags.gfx11_a8_prefill = false;
-            }
-            Self::A8 => {
-                flags.iu4_prefill = Some(false);
-                flags.a8_prefill = true;
-                flags.gfx11_a8_prefill = true;
-            }
-            Self::A4 => return,
-        }
-        gpu.flags = std::sync::Arc::new(flags);
-    }
-
-    /// One load-time line per weight class that an `A8`/`A4` request does not
-    /// reach, so the setting never silently does nothing. Only qt44
-    /// (`MQ4G256V2`) attention-class projections go through the
-    /// activation-quantized batched GEMMs (device-dependent admission);
-    /// Q8F16/F32 projections have no such route, and every FFN class (dense
-    /// layer, shared and routed experts) runs the grouped F16-WMMA core.
-    fn report_coverage(self, weights: &RaonWeights, arch: &str) {
-        let label = match self {
-            Self::F16 => return,
-            Self::Default => {
-                let (verified, total) =
-                    weights
-                        .layers
-                        .iter()
-                        .fold((0usize, 0usize), |(v, t), l| match &l.ffn {
-                            crate::weights::RaonFfn::Moe(m) => {
-                                (v + usize::from(m.iu4_symmetric), t + 1)
-                            }
-                            _ => (v, t),
-                        });
-                eprintln!(
-                    "raon1_mini: routed experts run W4A8 (grouped int8-activation GEMMs) on {verified} of {total} MoE layers \
-                     (gfx1201 [{arch}] + loader-verified symmetric qt44); shared experts, the dense layer and \
-                     attention-class projections stay F16; HIPFIRE_RAON_PREFILL_PRECISION=f16 restores all-F16"
-                );
-                return;
-            }
-            Self::A8 => "a8",
-            Self::A4 => "a4",
-        };
-        let mut by_dtype: std::collections::BTreeMap<String, usize> = Default::default();
-        let mut note = |w: &hipfire_runtime::llama::WeightTensor| {
-            *by_dtype.entry(format!("{:?}", w.gpu_dtype)).or_default() += 1;
-        };
-        for layer in &weights.layers {
-            match &layer.mixer {
-                RaonMixer::Rda(r) => {
-                    for w in [
-                        &r.q_proj,
-                        &r.k_proj,
-                        &r.v_proj,
-                        &r.g_proj,
-                        &r.o_proj,
-                        &r.f_a_proj,
-                        &r.f_b_proj,
-                        &r.b_proj,
-                        &r.rda_w_proj,
-                    ] {
-                        note(w);
-                    }
-                }
-                RaonMixer::Mla(m) => {
-                    for w in [
-                        &m.q_a_proj,
-                        &m.q_b_proj,
-                        &m.kv_a_proj,
-                        &m.kv_b_proj,
-                        &m.g_proj,
-                        &m.o_proj,
-                    ] {
-                        note(w);
-                    }
-                }
-            }
-        }
-        let eligible = by_dtype.remove("MQ4G256V2").unwrap_or(0);
-        eprintln!(
-            "raon1_mini: HIPFIRE_RAON_PREFILL_PRECISION={label}: {eligible} qt44 attention-class \
-             projections may take the activation-quantized prefill GEMM (device admission)"
-        );
-        for (dtype, n) in by_dtype {
-            eprintln!(
-                "raon1_mini: HIPFIRE_RAON_PREFILL_PRECISION={label}: {n} {dtype} attention-class \
-                 projections stay F16/F32 (no activation-quantized route for {dtype})"
-            );
-        }
-        eprintln!(
-            "raon1_mini: HIPFIRE_RAON_PREFILL_PRECISION={label}: routed experts run the grouped {} GEMMs \
-             on gfx1201 for symmetric-verified qt44 experts; the dense layer and shared experts stay on the \
-             grouped F16-WMMA core",
-            if label == "a4" { "W4A4 (fails the KLD gate)" } else { "W4A8" }
-        );
-    }
+/// Pin the device's activation-quantized prefill feature flags OFF for this process: the qt44
+/// attention-class projections (`weight_gemm`: gfx1201 `a8_prefill`, IU4, gfx11 `gfx11_a8_prefill`)
+/// never take a tier in the typed policy ([`crate::precision`]), and the device defaults of those
+/// flags would otherwise quantize activations behind the policy's back. Every tiered site is
+/// reached through the policy's own routes instead.
+fn pin_flag_quant_routes_off(gpu: &mut Gpu) {
+    let mut flags = (*gpu.flags).clone();
+    flags.iu4_prefill = Some(false);
+    flags.a8_prefill = false;
+    flags.gfx11_a8_prefill = false;
+    gpu.flags = std::sync::Arc::new(flags);
 }
 
 /// Everything one loaded Raon-1-mini model owns on the device.
@@ -270,6 +136,9 @@ pub struct RaonBundle {
     prefill_mode: PrefillMode,
     decode_mode: DecodeMode,
     graph: DecodeGraph,
+    /// Prefill precision policy resolved at load ([`crate::precision`]): the request and the
+    /// effective tier of every site.
+    precision: RaonPrecisionPlan,
     /// Speculative-decode state (DFlash2 capture, per-row verify head); empty
     /// until a speculator arms it, never touched by AR prefill or decode.
     pub(crate) spec: RaonSpecState,
@@ -286,21 +155,23 @@ impl RaonBundle {
         state: RaonState,
         scratch: RaonPrefillScratch,
     ) -> Result<Self, String> {
+        let arch = gpu.arch.clone();
         let built = PrefillMode::from_env()
-            .and_then(|m| PrefillPrecision::from_env().map(|p| (m, p)))
-            .and_then(|(m, p)| {
-                p.apply(gpu);
-                p.report_coverage(&weights, &gpu.arch);
+            .and_then(|m| RaonPrecisionPolicy::from_env(&arch).map(|p| (m, p)))
+            .and_then(|(m, policy)| {
+                pin_flag_quant_routes_off(gpu);
+                let precision = policy.resolve(&arch, &SiteWeights::collect(&weights));
+                eprintln!("{}", precision.coverage_line());
                 let mut work = RaonWork::new(gpu, &config, scratch.rows)?;
-                work.set_routed_tier(p.routed_tier());
+                work.set_site_tiers(precision.effective);
                 if let Err(e) = work.mla.pack_absorbed(gpu, &config, &weights) {
                     work.free(gpu);
                     return Err(e);
                 }
-                Ok((m, work))
+                Ok((m, work, precision))
             });
         match built {
-            Ok((prefill_mode, work)) => {
+            Ok((prefill_mode, work, precision)) => {
                 let mut state = state;
                 match state.fit_mirror_budget(gpu) {
                     Ok(rows) => eprintln!(
@@ -321,6 +192,7 @@ impl RaonBundle {
                     work,
                     eos,
                     prefill_mode,
+                    precision,
                     decode_mode: DecodeMode::resolve(gpu),
                     graph: DecodeGraph::default(),
                     spec: RaonSpecState::default(),
@@ -347,6 +219,12 @@ impl RaonBundle {
     /// Prefill route selected at load (see [`PrefillMode::from_env`]).
     pub fn prefill_mode(&self) -> PrefillMode {
         self.prefill_mode
+    }
+
+    /// The prefill precision policy resolved at load: the request and the effective tier of every
+    /// site ([`crate::precision`]).
+    pub fn precision_plan(&self) -> &RaonPrecisionPlan {
+        &self.precision
     }
 
     /// Rows of one batched prefill chunk: the admitted scratch/work rows (see
@@ -662,6 +540,7 @@ impl RaonBundle {
             work,
             eos: _,
             prefill_mode: _,
+            precision: _,
             decode_mode: _,
             graph,
             spec,

@@ -10,6 +10,10 @@
 //! handles below are intentionally impossible to construct outside this
 //! lowerer: a caller can submit a complete sealed call or nothing.
 
+use super::q8_prefill::{
+    prefill_quant_admitted, q8_0_prefill_gemm, q8_0_prefill_runs, PrefillActTier,
+    PREFILL_QUANT_MIN_ROWS,
+};
 use super::steps::Step;
 use crate::context::DispatchCtx;
 use crate::cpu_exec;
@@ -6646,8 +6650,8 @@ impl GroupedMoeScratchPlan {
             x_rot: mul(rows, g.hidden)?,
             act: mul(slots, g.down_k)?,
             rot: mul(slots, g.down_k)?,
-            shared_gate: mul(rows, g.shared_mi)?,
-            shared_up: mul(rows, g.shared_mi)?,
+            shared_gate: mul(rows.div_ceil(16) * 16, g.shared_mi)?,
+            shared_up: mul(rows.div_ceil(16) * 16, g.shared_mi)?,
             shared_act: mul(rows, g.shared_down_k)?,
             shared_rot: mul(rows, g.shared_down_k)?,
             shared_tables: if g.shared_mi == 0 {
@@ -6655,10 +6659,11 @@ impl GroupedMoeScratchPlan {
             } else {
                 rdna_compute::ffn_activation::single_expert_table_words(rows)
             },
+            // The quantized one-expert GEMMs write whole 16-row tiles (`rows` rounded up).
             shared_out: if g.shared_mi == 0 {
                 0
             } else {
-                mul(rows, g.hidden)?
+                mul(rows.div_ceil(16) * 16, g.hidden)?
             },
             ..Self::default()
         };
@@ -6753,12 +6758,12 @@ pub struct GroupedMoeRouted<'a> {
     /// the down input (applied after the pad, before the FWHT).
     pub down_awq_ptrs: Option<&'a GpuTensor>,
     /// Every routed gate/up and down group header obeys `zp == -8 * sc` (checked at load); admits
-    /// the grouped W4A4 core ([`grouped_moe_iu4_admitted`]).
+    /// the grouped symmetric quantized-activation cores ([`grouped_moe_site_tiers`]).
     pub iu4_symmetric_verified: bool,
-    /// Activation tier the caller selects for the grouped routed-expert GEMMs
+    /// Activation tier the caller requests per grouped routed-expert GEMM site
     /// ([`grouped_moe_site_tiers`]); `F16` keeps the F16 WMMA core (kill switch). Only honoured when
-    /// the capability admission holds, and overridable per site by `HIPFIRE_MOE_GROUPED_TIERS`.
-    pub act_tier: GroupedMoeActTier,
+    /// the capability admission holds.
+    pub act_tiers: GroupedMoeSiteTiers,
 }
 
 /// Gate/up/down projections of one gated FFN (shared expert or dense layer).
@@ -6767,6 +6772,34 @@ pub struct GroupedMoeShared<'a> {
     pub gate: WeightRef<'a>,
     pub up: WeightRef<'a>,
     pub down: WeightRef<'a>,
+    /// Activation tier requested for this FFN's three projections at prefill. qt44 weights run the
+    /// grouped symmetric cores over the one-expert tables when
+    /// [`Self::iu4_symmetric_verified`] holds and the capability admission passes; Q8_0 weights run
+    /// [`q8_0_prefill_gemm`](super::q8_prefill::q8_0_prefill_gemm). `F16` (every constructor's
+    /// default, see [`Self::new`]) is the F16 WMMA core.
+    pub act_tier: PrefillActTier,
+    /// Every qt44 weight of this FFN has loader-verified symmetric headers (`zp == -8 * sc`).
+    pub iu4_symmetric_verified: bool,
+}
+
+impl<'a> GroupedMoeShared<'a> {
+    /// The F16 route: `act_tier = F16`, headers not verified.
+    pub fn new(gate: WeightRef<'a>, up: WeightRef<'a>, down: WeightRef<'a>) -> Self {
+        Self {
+            gate,
+            up,
+            down,
+            act_tier: PrefillActTier::F16,
+            iu4_symmetric_verified: false,
+        }
+    }
+
+    /// Request `tier` for this FFN with the loader's symmetric-header verdict.
+    pub fn with_tier(mut self, tier: PrefillActTier, iu4_symmetric_verified: bool) -> Self {
+        self.act_tier = tier;
+        self.iu4_symmetric_verified = iu4_symmetric_verified;
+        self
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -7095,9 +7128,11 @@ fn gated_ffn_from_basis(
     let gemm = &*GEMM;
     let (down_key, down_rotated) = projection_kind(w.down.dtype, "gated-ffn-down")?;
     // One-entry grouping tables drive qt44 weights through the grouped F16 WMMA
-    // core (BF16 policy, rows >= 2) or the F32 indexed GEMV (exact policy), so a
-    // shared/dense projection never takes the quantized-activation prefill GEMMs
-    // (A8 / IU4 / FP8) that the dense GEMM entry selects at wide batches.
+    // core (BF16 policy, rows >= 2) or the F32 indexed GEMV (exact policy). With a
+    // quantized `w.act_tier` and the capability admission (`prefill_quant_admitted`,
+    // loader-verified symmetric headers, 64-row M / 256 K tiles, 16-row output
+    // capacity) the same tables drive the grouped symmetric A4/A8/Fp8 cores instead;
+    // Q8_0 weights take `q8_0_prefill_gemm`. Everything else is the F16 route.
     let any_qt44 = [&w.gate, &w.up, &w.down]
         .iter()
         .any(|p| p.dtype == DType::MQ4G256V2);
@@ -7107,6 +7142,20 @@ fn gated_ffn_from_basis(
     } else {
         None
     };
+    let tier = w.act_tier;
+    let quant_admitted = tier != PrefillActTier::F16 && prefill_quant_admitted(gpu, rows);
+    let sym_ok = |weight: &WeightRef<'_>, y: &GpuTensor, m: usize, k: usize| -> bool {
+        quant_admitted
+            && cast.bf16()
+            && w.iu4_symmetric_verified
+            && weight.dtype == DType::MQ4G256V2
+            && m % 64 == 0
+            && k % 256 == 0
+            && views
+                .as_ref()
+                // The grouped core writes whole 16-row tiles of `y`.
+                .is_some_and(|v| y.buf.size() >= v.rows_pad * m * 4)
+    };
     let project = |gpu: &mut Gpu,
                    weight: &WeightRef<'_>,
                    which: usize,
@@ -7114,7 +7163,8 @@ fn gated_ffn_from_basis(
                    y: &GpuTensor,
                    key: crate::types::KernelKey,
                    m: usize,
-                   k: usize|
+                   k: usize,
+                   xq: Option<*mut std::ffi::c_void>|
      -> Result<(), DispatchError> {
         if let (Some(v), DType::MQ4G256V2) = (views.as_ref(), weight.dtype) {
             let ptr = [&v.gate_ptr, &v.up_ptr, &v.down_ptr][which];
@@ -7124,6 +7174,17 @@ fn gated_ffn_from_basis(
                 return hip!(gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
                     ptr, &v.index, xin, y, m, k, 1, rows,
                 ));
+            }
+            if sym_ok(weight, y, m, k) {
+                let xq = match xq {
+                    Some(p) => p,
+                    None => grouped_sym_quantize(gpu, tier, xin, rows, k)?,
+                };
+                // One expert: tile ids and `index` are all zero, so `index` doubles as
+                // the `[E + 1]` slot-offset prefix (`offsets[0] == 0`).
+                return grouped_sym_gemm(
+                    gpu, tier, ptr, &v.tiles, &v.index, &v.sorted, xq, y, m, k, 1, v.rows_pad, rows,
+                );
             }
             if ctx.arch.has_wmma_w32() || ctx.arch.is_rdna4() {
                 return hip!(gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(
@@ -7135,6 +7196,9 @@ fn gated_ffn_from_basis(
         // one-column WMMA tile.
         if rows == 1 && weight.dtype == DType::Q8_0 {
             return hip!(gpu.gemv_q8_0(weight.buf, xin, y, m, k));
+        }
+        if weight.dtype == DType::Q8_0 && q8_0_prefill_runs(gpu, tier, k, rows) {
+            return q8_0_prefill_gemm(gpu, tier, weight.buf, xin, y, m, k, rows).map(|_| ());
         }
         gemm.run_key(
             key,
@@ -7148,6 +7212,13 @@ fn gated_ffn_from_basis(
             },
         )
     };
+    // qt44 gate and up read the same rotated basis: quantize it once for both.
+    let gate_up_xq =
+        if sym_ok(&w.gate, s.gate_out, mi, hidden) && sym_ok(&w.up, s.up_out, mi, hidden) {
+            Some(grouped_sym_quantize(gpu, tier, x_rot, rows, hidden)?)
+        } else {
+            None
+        };
     for (which, (weight, y)) in [(&w.gate, s.gate_out), (&w.up, s.up_out)]
         .into_iter()
         .enumerate()
@@ -7162,6 +7233,7 @@ fn gated_ffn_from_basis(
             key,
             mi,
             hidden,
+            gate_up_xq,
         )?;
     }
     let awq = match w.down.awq_scale {
@@ -7190,7 +7262,7 @@ fn gated_ffn_from_basis(
     } else {
         s.act
     };
-    project(gpu, &w.down, 2, down_x, out, down_key, hidden, down_k)?;
+    project(gpu, &w.down, 2, down_x, out, down_key, hidden, down_k, None)?;
     if cast.bf16() {
         hip!(gpu.ffn_round_bf16_f32(out, rows * hidden))?;
     }
@@ -7277,74 +7349,36 @@ pub fn execute_gated_ffn(gpu: &mut Gpu, op: &GatedFfnOp<'_>) -> Result<(), Dispa
     )
 }
 
-/// Activation precision of one grouped routed-expert GEMM site.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GroupedMoeActTier {
-    /// F16 WMMA (`gemm_mq4g256v2_moe_grouped_wmma_k2`), the default route.
-    F16,
-    /// Symmetric W4A4 (`wmma_i32_16x16x32_iu4`, `block_i4_128` activations).
-    A4,
-    /// Symmetric W4A8 (`wmma_i32_16x16x16_iu8`, `block_i8_128` activations).
-    A8,
+/// Activation tier of each grouped routed-expert GEMM site.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GroupedMoeSiteTiers {
+    pub gate_up: PrefillActTier,
+    pub down: PrefillActTier,
 }
 
-impl GroupedMoeActTier {
-    fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "f16" => Some(Self::F16),
-            "a4" => Some(Self::A4),
-            "a8" => Some(Self::A8),
-            _ => None,
-        }
-    }
-}
-
-/// `HIPFIRE_MOE_GROUPED_TIERS=<gate_up>,<down>` (developer; each `f16|a4|a8`): per-site tier override
-/// of the grouped routed-expert core, applied on top of the capability admission (symmetric headers,
-/// qt44, shape, gfx1201, rows). Unset: both sites take the device tier ([`grouped_moe_device_tier`]).
-fn parse_site_tiers(s: &str) -> Option<(GroupedMoeActTier, GroupedMoeActTier)> {
-    let (g, d) = s.split_once(',')?;
-    Some((GroupedMoeActTier::parse(g)?, GroupedMoeActTier::parse(d)?))
-}
-
-/// Capability admission of the grouped symmetric quantized-activation routed-expert core of
-/// [`execute_grouped_moe`], resolved per site `(gate_up, down)`: the caller bound loader-verified
-/// symmetric headers (`zp == -8 * sc` on every gate/up and down group,
+/// Capability admission of the grouped symmetric quantized-activation routed-expert cores of
+/// [`execute_grouped_moe`], resolved per site: the caller bound loader-verified symmetric headers
+/// (`zp == -8 * sc` on every gate/up and down group,
 /// [`GroupedMoeRouted::iu4_symmetric_verified`]), the device is gfx1201, the experts are qt44
 /// (`MQ4G256V2`) and the shape fits the kernels ([`grouped_moe_iu4_shape_admits`]). The tier of each
-/// site is the caller's [`GroupedMoeRouted::act_tier`] unless `HIPFIRE_MOE_GROUPED_TIERS` overrides
-/// it. AWQ (input vector, per-expert down table), the activation (SiLU/SiTU), the pad of the down K
-/// and the cast policy are handled by the stages around the two GEMMs and place no condition here. The
-/// route allocates only through the activation scratch, so it is refused under graph capture and
-/// Redline recording. Anything not admitted is `(F16, F16)`.
-pub fn grouped_moe_site_tiers(
-    gpu: &Gpu,
-    op: &GroupedMoeOp<'_>,
-) -> (GroupedMoeActTier, GroupedMoeActTier) {
-    use GroupedMoeActTier::F16;
-    static OVERRIDE: std::sync::LazyLock<Option<(GroupedMoeActTier, GroupedMoeActTier)>> =
-        std::sync::LazyLock::new(|| {
-            let v = hipfire_config::developer_var("HIPFIRE_MOE_GROUPED_TIERS").ok()?;
-            let parsed = parse_site_tiers(&v);
-            if parsed.is_none() {
-                eprintln!("HIPFIRE_MOE_GROUPED_TIERS={v:?}: expected `<gate_up>,<down>` with each of f16|a4|a8; ignored");
-            }
-            parsed
-        });
-    let admitted = gpu.arch == "gfx1201"
+/// site is the caller's [`GroupedMoeRouted::act_tiers`]. AWQ (input vector, per-expert down table),
+/// the activation (SiLU/SiTU), the pad of the down K and the cast policy are handled by the stages
+/// around the two GEMMs and place no condition here. The route allocates only through the
+/// activation scratch, so it is refused under graph capture and Redline recording. Anything not
+/// admitted is F16 at both sites.
+pub fn grouped_moe_site_tiers(gpu: &Gpu, op: &GroupedMoeOp<'_>) -> GroupedMoeSiteTiers {
+    let admitted = prefill_quant_admitted(gpu, op.rows)
         && op.routed.iu4_symmetric_verified
         && op.routed.dtype == DType::MQ4G256V2
-        && grouped_moe_iu4_shape_admits(&op.geometry, op.rows)
-        && !gpu.graphs.capture_mode
-        && !gpu.replay.is_recording();
-    if !admitted {
-        return (F16, F16);
+        && grouped_moe_iu4_shape_admits(&op.geometry, op.rows);
+    if admitted {
+        op.routed.act_tiers
+    } else {
+        GroupedMoeSiteTiers::default()
     }
-    let tier = op.routed.act_tier;
-    OVERRIDE.unwrap_or((tier, tier))
 }
 
-/// Shape half of [`grouped_moe_iu4_admitted`] (pure): at least [`GROUPED_MOE_IU4_MIN_ROWS`] rows,
+/// Shape half of [`grouped_moe_site_tiers`] (pure): at least [`GROUPED_MOE_IU4_MIN_ROWS`] rows,
 /// both GEMM K extents (`hidden`, the padded `down_k`) whole qt44 groups of 256, and both M extents
 /// (`2 * logical_mi` gate/up rows, `hidden` down rows) multiples of the kernel's 64-row CTA tile.
 pub fn grouped_moe_iu4_shape_admits(g: &GroupedMoeGeometry, rows: usize) -> bool {
@@ -7355,9 +7389,75 @@ pub fn grouped_moe_iu4_shape_admits(g: &GroupedMoeGeometry, rows: usize) -> bool
         && g.hidden % 64 == 0
 }
 
-/// Row floor of the grouped IU4 core: below it the weight stream of the expert set dominates
-/// both routes and the F16 core stays.
-pub const GROUPED_MOE_IU4_MIN_ROWS: usize = 64;
+/// Row floor of the grouped symmetric quantized cores: below it the weight stream of the expert
+/// set dominates every route and the F16 core stays.
+pub const GROUPED_MOE_IU4_MIN_ROWS: usize = PREFILL_QUANT_MIN_ROWS;
+
+/// Quantize the F32 activation `x [n, k]` into the sidecar of `tier`'s grouped symmetric core
+/// (`block_i4_128` / `block_i8_128` / `block_fp8_128`, epoch-major), all in the shared MMQ scratch:
+/// the returned pointer stays valid until the next quantization. `tier` must be quantized.
+fn grouped_sym_quantize(
+    gpu: &mut Gpu,
+    tier: PrefillActTier,
+    x: &GpuTensor,
+    n: usize,
+    k: usize,
+) -> Result<*mut std::ffi::c_void, DispatchError> {
+    match tier {
+        PrefillActTier::A4 => hip!(gpu.ensure_int4_mmq_x(x, n, k)),
+        PrefillActTier::A8 => hip!(gpu.ensure_int8_mmq_x(x, n, k)),
+        PrefillActTier::Fp8 => hip!(gpu.ensure_fp8_mmq_x(x, n, k)),
+        PrefillActTier::F16 => Err(grouped_refusal("grouped-sym-f16-tier", "")),
+    }
+}
+
+/// Launch the grouped symmetric core of `tier` over the sidecar `xq` (same ABI and F32 output for
+/// all three): `y [m_total, m]` in grouped order, entry `(nt, rf)` from the tier's node-sweep table.
+#[allow(clippy::too_many_arguments)]
+fn grouped_sym_gemm(
+    gpu: &mut Gpu,
+    tier: PrefillActTier,
+    expert_weight_ptrs: &GpuTensor,
+    expert_tile_ids: &GpuTensor,
+    expert_offsets: &GpuTensor,
+    sorted_slot_index: &GpuTensor,
+    xq: *mut std::ffi::c_void,
+    y_grouped: &GpuTensor,
+    m: usize,
+    k: usize,
+    x_row_div: usize,
+    m_total: usize,
+    x_src_rows: usize,
+) -> Result<(), DispatchError> {
+    use rdna_compute::moe_grouped_qt44_iu4 as g;
+    let (nt, rf) = match tier {
+        PrefillActTier::A4 => g::select_entry(m_total, m),
+        PrefillActTier::A8 => g::select_entry_a8(m_total, m),
+        PrefillActTier::Fp8 => g::select_entry_fp8(m_total, m),
+        PrefillActTier::F16 => return Err(grouped_refusal("grouped-sym-f16-tier", "")),
+    };
+    let ptrs = (
+        expert_weight_ptrs,
+        expert_tile_ids,
+        expert_offsets,
+        sorted_slot_index,
+    );
+    match tier {
+        PrefillActTier::A4 => hip!(gpu.gemm_mq4g256v2_moe_grouped_iu4_sym(
+            ptrs.0, ptrs.1, ptrs.2, ptrs.3, xq, y_grouped, m, k, x_row_div, m_total, x_src_rows,
+            nt, rf,
+        )),
+        PrefillActTier::A8 => hip!(gpu.gemm_mq4g256v2_moe_grouped_a8_sym(
+            ptrs.0, ptrs.1, ptrs.2, ptrs.3, xq, y_grouped, m, k, x_row_div, m_total, x_src_rows,
+            nt, rf,
+        )),
+        PrefillActTier::Fp8 => hip!(gpu.gemm_mq4g256v2_moe_grouped_fp8_sym(
+            ptrs.0, ptrs.1, ptrs.2, ptrs.3, xq, y_grouped, m, k, x_row_div, m_total, x_src_rows,
+            nt, rf,
+        )),
+        PrefillActTier::F16 => unreachable!("returned above"),
+    }
+}
 
 /// Execute one grouped MoE layer: FP32 router linear and device-resident
 /// top-k, shared rotated input basis, routed experts on the indexed or the
@@ -7376,10 +7476,10 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
     let slots = rows * k;
     let bf16 = op.policy.cast.bf16();
     let protocol = op.protocol.resolve(rows);
-    let (tier_gu, tier_dn) = if protocol == GroupedMoeProtocol::Grouped {
+    let tiers = if protocol == GroupedMoeProtocol::Grouped {
         grouped_moe_site_tiers(gpu, op)
     } else {
-        (GroupedMoeActTier::F16, GroupedMoeActTier::F16)
+        GroupedMoeSiteTiers::default()
     };
 
     // Router: FP32 linear of the (BF16-valued) F32 input, then device top-k.
@@ -7473,11 +7573,11 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
                 m_total,
                 MOE_GROUPED_BLOCK_M,
             ))?;
-            if tier_gu == GroupedMoeActTier::A8 {
-                let (nt, rf) =
-                    rdna_compute::moe_grouped_qt44_iu4::select_entry_a8(m_total, 2 * g.logical_mi);
-                let xq = hip!(gpu.ensure_int8_mmq_x(s.x_rot, rows, g.hidden))?;
-                hip!(gpu.gemm_mq4g256v2_moe_grouped_a8_sym(
+            if tiers.gate_up != PrefillActTier::F16 {
+                let xq = grouped_sym_quantize(gpu, tiers.gate_up, s.x_rot, rows, g.hidden)?;
+                grouped_sym_gemm(
+                    gpu,
+                    tiers.gate_up,
                     op.routed.gate_up_ptrs,
                     t.expert_tile_ids,
                     t.expert_offsets,
@@ -7489,28 +7589,7 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
                     k,
                     m_total,
                     rows,
-                    nt,
-                    rf,
-                ))?;
-            } else if tier_gu == GroupedMoeActTier::A4 {
-                let (nt, rf) =
-                    rdna_compute::moe_grouped_qt44_iu4::select_entry(m_total, 2 * g.logical_mi);
-                let xq = hip!(gpu.ensure_int4_mmq_x(s.x_rot, rows, g.hidden))?;
-                hip!(gpu.gemm_mq4g256v2_moe_grouped_iu4_sym(
-                    op.routed.gate_up_ptrs,
-                    t.expert_tile_ids,
-                    t.expert_offsets,
-                    t.sorted_slot_index,
-                    xq,
-                    t.gate_up_rows,
-                    2 * g.logical_mi,
-                    g.hidden,
-                    k,
-                    m_total,
-                    rows,
-                    nt,
-                    rf,
-                ))?;
+                )?;
             } else {
                 hip!(gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(
                     op.routed.gate_up_ptrs,
@@ -7541,11 +7620,11 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
                 n_experts: g.n_experts,
             }))?;
             hip!(gpu.rotate_x_mq_batched(s.act, s.rot, g.down_k, slots))?;
-            if tier_dn == GroupedMoeActTier::A8 {
-                let (nt, rf) =
-                    rdna_compute::moe_grouped_qt44_iu4::select_entry_a8(m_total, g.hidden);
-                let xq = hip!(gpu.ensure_int8_mmq_x(s.rot, slots, g.down_k))?;
-                hip!(gpu.gemm_mq4g256v2_moe_grouped_a8_sym(
+            if tiers.down != PrefillActTier::F16 {
+                let xq = grouped_sym_quantize(gpu, tiers.down, s.rot, slots, g.down_k)?;
+                grouped_sym_gemm(
+                    gpu,
+                    tiers.down,
                     op.routed.down_ptrs,
                     t.expert_tile_ids,
                     t.expert_offsets,
@@ -7557,27 +7636,7 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
                     1,
                     m_total,
                     slots,
-                    nt,
-                    rf,
-                ))?;
-            } else if tier_dn == GroupedMoeActTier::A4 {
-                let (nt, rf) = rdna_compute::moe_grouped_qt44_iu4::select_entry(m_total, g.hidden);
-                let xq = hip!(gpu.ensure_int4_mmq_x(s.rot, slots, g.down_k))?;
-                hip!(gpu.gemm_mq4g256v2_moe_grouped_iu4_sym(
-                    op.routed.down_ptrs,
-                    t.expert_tile_ids,
-                    t.expert_offsets,
-                    t.sorted_slot_index,
-                    xq,
-                    s.down_rows,
-                    g.hidden,
-                    g.down_k,
-                    1,
-                    m_total,
-                    slots,
-                    nt,
-                    rf,
-                ))?;
+                )?;
             } else {
                 hip!(gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(
                     op.routed.down_ptrs,
@@ -7684,12 +7743,20 @@ mod grouped_moe_tests {
     }
 
     #[test]
-    fn site_tiers_parse() {
-        use GroupedMoeActTier::{A4, A8, F16};
-        assert_eq!(parse_site_tiers("a4,f16"), Some((A4, F16)));
-        assert_eq!(parse_site_tiers(" F16 , A8 "), Some((F16, A8)));
-        assert_eq!(parse_site_tiers("a4"), None);
-        assert_eq!(parse_site_tiers("a4,a5"), None);
+    fn site_tiers_default_to_f16_and_shared_plan_rounds_to_whole_tiles() {
+        let t = GroupedMoeSiteTiers::default();
+        assert_eq!(
+            (t.gate_up, t.down),
+            (PrefillActTier::F16, PrefillActTier::F16)
+        );
+        assert_eq!(GROUPED_MOE_IU4_MIN_ROWS, 64);
+        // The quantized one-expert GEMMs write whole 16-row tiles of the shared outputs.
+        let g = raon_geometry();
+        let p = GroupedMoeScratchPlan::for_protocol(&g, 70, GroupedMoeProtocol::Auto).unwrap();
+        assert_eq!(p.shared_gate, 80 * 1088);
+        assert_eq!(p.shared_up, 80 * 1088);
+        assert_eq!(p.shared_out, 80 * 2560);
+        assert_eq!(p.shared_act, 70 * 1280);
     }
 
     #[test]
