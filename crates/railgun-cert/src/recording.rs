@@ -1394,14 +1394,14 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
-        id: "grouped-moe-act-tier-eager-only",
+        id: "prefill-act-tier-eager-only",
         predicates: &[IsRecording, CaptureMode],
-        condition: "quantized-activation tiers (A8/A4) of the generic grouped routed-expert core, taken only eagerly: hipfire-dispatch moe_program.rs grouped_moe_site_tiers admits the caller's act_tier only when exact gfx1201, load-verified symmetric qt44 experts, the grouped IU4 shape admits, `!gpu.graphs.capture_mode` and `!gpu.replay.is_recording()`; otherwise both sites run the F16 grouped core",
+        condition: "quantized-activation prefill tiers (A4/A8/FP8), taken only eagerly: hipfire-dispatch q8_prefill.rs prefill_quant_admitted admits a caller's tier only when exact gfx1201, rows >= 64, `!gpu.graphs.capture_mode` and `!gpu.replay.is_recording()`; it gates the grouped routed-expert sites (moe_program.rs grouped_moe_site_tiers, plus load-verified symmetric qt44 experts and the grouped IU4 shape), the shared/dense gated FFN (gated_ffn_from_basis) and the tiered Q8_0 GEMM (q8_0_prefill_gemm); otherwise every site runs its F16 route",
         effect: KernelSelection,
-        switches: "eager: moe_grouped_qt44_a8_sym / moe_grouped_qt44_iu4_sym gate_up and down plus their int8/int4 activation producers (Raon prefill default A8 on gfx1201); hipGraph capture or a live Redline recording: the F16 grouped WMMA core for the same layer",
+        switches: "eager: moe_grouped_qt44_{iu4,a8,fp8}_sym with their int4/int8/e4m3 activation producers (routed, shared, dense qt44 FFN) and gemm_q8_0_mmq_{i8,fp8} with quantize_x_{q8,fp8}_blk32 (Q8_0 projections), per the Raon per-site policy on gfx1201; hipGraph capture or a live Redline recording: the F16 grouped WMMA core / gemm_q8_0_batched_chunked for the same site",
         kernels: &[],
         verdict: NotEquivalent,
-        evidence: "the A8/A4 tiers quantize the routed-expert activations, so their output differs from the F16 core's (code24/WT2 KLD deltas recorded in the CHANGELOG entry for the Raon W4A8 default); the only caller is the Raon batched prefill, which is never graph-captured or Redline-recorded, so no recorded program reaches the quantized tiers; the excluded branch is the unchanged F16 core",
+        evidence: "the quantized tiers quantize the GEMM activations, so their output differs from the F16 route's (code24/WT2 KLD deltas per site recorded in the CHANGELOG entry for the Raon per-site precision policy); the only callers are the Raon batched prefill sites, which are never graph-captured or Redline-recorded, so no recorded program reaches the quantized tiers; the excluded branch is the unchanged F16 route",
         reaches: &[],
     },
     Decision {
@@ -2406,10 +2406,10 @@ pub const SITES: &[Site] = &[
         decisions: &["qwen4-opt-in-eager-fusions"],
     },
     Site {
-        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
-        function: "grouped_moe_site_tiers",
+        file: "hipfire-dispatch/src/pipeline/q8_prefill.rs",
+        function: "prefill_quant_admitted",
         occurrences: 2,
-        decisions: &["grouped-moe-act-tier-eager-only"],
+        decisions: &["prefill-act-tier-eager-only"],
     },
     Site {
         file: "hipfire-dispatch/src/pipeline/moe_program.rs",
@@ -2802,6 +2802,12 @@ pub const SITES: &[Site] = &[
     Site {
         file: "rdna-compute/src/dispatch.rs",
         function: "ensure_int8_mmq_x",
+        occurrences: 1,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "ensure_fp8_mmq_x",
         occurrences: 1,
         decisions: &["scratch-launch-plumbing"],
     },
@@ -3535,6 +3541,12 @@ pub const SITES: &[Site] = &[
     Site {
         file: "rdna-compute/src/scratch.rs",
         function: "ensure_int8_mmq_x",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "ensure_fp8_mmq_x",
         occurrences: 2,
         decisions: &["scratch-launch-plumbing"],
     },
