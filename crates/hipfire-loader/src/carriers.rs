@@ -10584,7 +10584,7 @@ impl Carrier for RaonCarrier {
                 "  raon1_mini session cache: {} MiB budget, {} MiB per {}-token snapshot",
                 session_budget >> 20,
                 bundle.session_snapshot_bytes() >> 20,
-                hipfire_arch_raon::session::SESSION_STRIDE_TOKENS,
+                bundle.session_stride_tokens(),
             );
         }
         let speculator = match hipfire_arch_raon::carrier::dflash_draft(ctx.draft_path, ctx.spec)? {

@@ -395,13 +395,20 @@ impl RaonBundle {
         self.session.as_ref().map(|s| s.cache().usage())
     }
 
+    /// Snapshot stride in prompt tokens: the smallest multiple of the prefill
+    /// width that is at least [`crate::session::SESSION_STRIDE_TOKENS`].
+    pub fn session_stride_tokens(&self) -> usize {
+        session_stride(self.prefill_step_rows())
+    }
+
     /// Device bytes of one stride snapshot: the persistent slab plus one stride
     /// of rows of every latent stream.
     pub fn session_snapshot_bytes(&self) -> usize {
         let (_, persist) = self.state.persist_part();
-        let stride = session_stride(self.prefill_step_rows());
         persist
-            + stride * self.state.dims().latent_row_bytes() * self.state.mla_cache.len()
+            + self.session_stride_tokens()
+                * self.state.dims().latent_row_bytes()
+                * self.state.mla_cache.len()
     }
 
     /// Device bytes the live state may still map before it holds `through`
