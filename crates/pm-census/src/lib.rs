@@ -23,7 +23,11 @@
 //! * [`hw`] — per-arch peak table for rooflines.
 //! * [`ingest`] — `pm-census extract nodes` / `roofline` / `queue`: one
 //!   trace + model descriptor -> node corpus through `KernelAbiV1` + `WorkV1`.
+//! * [`capture`] — `pm-census extract route-hist` / `act-capture`: captured MoE
+//!   route dumps and activation rows -> sha256-identified `route_hist.v1` /
+//!   `act_capture.v1` judge inputs.
 
+pub mod capture;
 pub mod census;
 pub mod extract;
 pub mod hw;

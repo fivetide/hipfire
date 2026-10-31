@@ -1664,6 +1664,8 @@ pm-census extract — WorkloadCaseV1 corpus extraction
   pm-census extract merge    A.jsonl B.jsonl ... --out C.jsonl
   pm-census extract verify   C.jsonl
   pm-census extract nodes    --trace T --config C [--hfq H] --tokens N --out corpus.json   (node corpus; see `pm-census extract nodes --help`)
+  pm-census extract route-hist  --dump FILE [--model ID] [--experts E] --out route_hist.json   (route_hist.v1; see `pm-census extract route-hist --help`)
+  pm-census extract act-capture --dump FILE --out act_capture.json                              (act_capture.v1)
 
 common: [--model NAME] [--family F] [--arch A] [--phase prefill|ar|spec]
         [--mode eager|hip_graph|redline_pm4|railgun|unknown]
@@ -1916,6 +1918,8 @@ pub fn cli(args: &[String]) -> Result<(), String> {
             write_corpus(cases, &f.out()?)
         }
         "nodes" => crate::ingest::cli_nodes(rest),
+        "route-hist" => crate::capture::cli_route_hist(rest),
+        "act-capture" => crate::capture::cli_act_capture(rest),
         "merge" => {
             let f = Flags::parse(rest, &["out"])?;
             if f.positional.is_empty() {

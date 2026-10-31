@@ -46,6 +46,7 @@ pub use q8_prefill::{
     PrefillActTier, PREFILL_QUANT_MIN_ROWS,
 };
 pub(crate) mod draft_head;
+pub mod moe_capture;
 pub mod moe_dump;
 pub(crate) mod norm_fold;
 pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState};

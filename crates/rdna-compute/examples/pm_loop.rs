@@ -316,7 +316,7 @@ struct Opts {
 }
 
 const DRIVER_FLAGS: &str =
-    "--kernel K --shape S [--arch gfx1201|gfx1151|gfx1100] [--time N] [--rounds R] [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--offline] [--pool | --flush-l2 | --flush] [--out DIR] [--rip FILE.rip] [--cand-object FILE] [--null-control aa] [--noise-floor FILE] [--<knob> V]... [--base-<knob> V]...";
+    "--kernel K --shape S [--arch gfx1201|gfx1151|gfx1100] [--time N] [--rounds R] [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--offline] [--pool | --flush-l2 | --flush] [--out DIR] [--rip FILE.rip] [--cand-object FILE] [--null-control aa] [--noise-floor FILE] [--inputs capture:ACT_CAPTURE.json[@site]] [--<knob> V]... [--base-<knob> V]...";
 
 fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     let mut o = Opts {

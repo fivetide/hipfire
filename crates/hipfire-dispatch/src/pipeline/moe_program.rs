@@ -1301,6 +1301,12 @@ impl<'a> SealedMoeOp<'a> {
                     params.k_top,
                     receipt.adopted_from(),
                 )?;
+                super::moe_capture::route_dump(
+                    gpu,
+                    params.topk_indices,
+                    params.batch_size,
+                    params.k_top,
+                )?;
                 Ok(())
             }
             MoeProtocol::IndexedDecode => {
@@ -1574,6 +1580,10 @@ impl<'a> SealedMoeOp<'a> {
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
         {
+            super::moe_capture::act_capture_unavailable(
+                super::moe_capture::SITE_GATE_UP,
+                "sealed-grouped",
+            );
             let front = self.state.front.borrow_mut().take();
             return super::qt44_qt53_prefill::gate_up_front(
                 gpu,
@@ -1588,6 +1598,13 @@ impl<'a> SealedMoeOp<'a> {
         {
             return super::prefill_expert_iu4_gate_up_stage(gpu, params, &plan);
         }
+        super::moe_capture::act_capture(
+            gpu,
+            super::moe_capture::SITE_GATE_UP,
+            params.x_rot_batch,
+            params.batch_size,
+            params.gate_up_k,
+        )?;
         super::prefill_gate_up_stage(
             gpu,
             params,
@@ -1739,6 +1756,10 @@ impl<'a> SealedMoeOp<'a> {
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
         {
+            super::moe_capture::act_capture_unavailable(
+                super::moe_capture::SITE_DOWN,
+                "sealed-grouped",
+            );
             return super::qt44_qt53_prefill::down(
                 gpu,
                 params,
@@ -1751,6 +1772,13 @@ impl<'a> SealedMoeOp<'a> {
         {
             return super::prefill_expert_iu4_down_stage(gpu, params, &plan);
         }
+        super::moe_capture::act_capture(
+            gpu,
+            super::moe_capture::SITE_DOWN,
+            params.rot_batch,
+            params.batch_size * params.k_top,
+            params.down_k,
+        )?;
         let total_slots = params
             .batch_size
             .checked_mul(params.k_top)
@@ -7532,9 +7560,17 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
         n_experts: g.n_experts,
         top_k: k,
     }))?;
+    super::moe_capture::route_dump(gpu, s.topk_indices, rows, k)?;
 
     // One rotated input basis for the routed gate/up and the shared gate/up.
     rotate_input_basis(gpu, op.x, s.x_rot, op.routed.input_awq, g.hidden, rows)?;
+    super::moe_capture::act_capture(
+        gpu,
+        super::moe_capture::SITE_GATE_UP,
+        s.x_rot,
+        rows,
+        g.hidden,
+    )?;
 
     let down_awq_table = op.routed.down_awq_ptrs;
     let row_of_slot = match protocol {
@@ -7576,6 +7612,13 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
                 awq,
             }))?;
             hip!(gpu.rotate_x_mq_batched(s.act, s.rot, g.down_k, slots))?;
+            super::moe_capture::act_capture(
+                gpu,
+                super::moe_capture::SITE_DOWN,
+                s.rot,
+                slots,
+                g.down_k,
+            )?;
             hip!(gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
                 op.routed.down_ptrs,
                 s.topk_indices,
@@ -7650,6 +7693,13 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
                 n_experts: g.n_experts,
             }))?;
             hip!(gpu.rotate_x_mq_batched(s.act, s.rot, g.down_k, slots))?;
+            super::moe_capture::act_capture(
+                gpu,
+                super::moe_capture::SITE_DOWN,
+                s.rot,
+                slots,
+                g.down_k,
+            )?;
             if tiers.down != PrefillActTier::F16 {
                 let xq = grouped_sym_quantize(gpu, tiers.down, s.rot, slots, g.down_k)?;
                 grouped_sym_gemm(

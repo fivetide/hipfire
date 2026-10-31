@@ -1471,6 +1471,9 @@ fn forward_body(
                 },
                 &scratch.branch_in,
             )?;
+            // Developer capture (`HIPFIRE_MOE_ROUTE_DUMP` / `HIPFIRE_MOE_ACT_CAPTURE`):
+            // names this layer and its first row's position; a no-op when both are unset.
+            hipfire_dispatch::pipeline::moe_capture::set_site(l, start);
             ffn_block(gpu, &ctx, work, layer, scratch, rows)
                 .map_err(|e| format!("raon1_mini L{l} ffn: {e}"))?;
             mhc_postmix(gpu, work, rows, cur, &scratch.ffn_out, oth)?;

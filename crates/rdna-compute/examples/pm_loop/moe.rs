@@ -91,7 +91,11 @@
 //!   aliases synthetic expert `e % D`, a memory cap), `seed` (default 1),
 //!   `route` = `uniform` (default: `TOP` distinct uniform experts per token) |
 //!   `skew` (experts 0..min(5,TOP) on every token, rest uniform distinct) |
-//!   `all` (flat slot `f` -> expert `f % E`) | `one` (every slot to expert 0).
+//!   `all` (flat slot `f` -> expert `f % E`) | `one` (every slot to expert 0) |
+//!   `hist:<route_hist.json>[@L]` (replay the recorded per-token expert lists of a pinned
+//!   `route_hist.v1`, layer `L` or all layers' records in record order, cycling past the recording;
+//!   E and TOP must equal the recording's `n_experts`/`topk`, the ids bin is sha256-verified, the
+//!   record gets `route: {kind:"hist", path, id, layer}` and the shape `route_id`/`route_layer`).
 //!
 //! The kind (`gate_up` or `down`) comes from `--epi`; the GEMM dims follow
 //! `ExpertGeometry::plan` (so its admission rules apply):
@@ -274,6 +278,135 @@ enum Route {
     Skew,
     All,
     One,
+    Hist,
+}
+
+/// `--shape route=hist:<route_hist.json>[@L]`: the expert ids of a pinned `route_hist.v1`
+/// (`HIPFIRE_MOE_ROUTE_DUMP` records, headerless `i32` LE bin), layer `L` or every layer's
+/// records concatenated in record order. Token `t` takes recorded row `t % rows` (cycled).
+#[derive(Clone, Debug, PartialEq)]
+struct Hist {
+    path: String,
+    id: String,
+    layer: Option<u32>,
+    n_experts: usize,
+    topk: usize,
+    /// Row-major `rows x topk`.
+    ids: Vec<i32>,
+}
+
+impl Hist {
+    fn parse(spec: &str) -> Result<Hist> {
+        let (path, layer) = match spec.rsplit_once('@') {
+            Some((p, l)) => (
+                p,
+                Some(
+                    l.parse::<u32>()
+                        .map_err(|e| format!("--shape route=hist:{spec}: layer `{l}`: {e}"))?,
+                ),
+            ),
+            None => (spec, None),
+        };
+        Self::load(std::path::Path::new(path), layer)
+    }
+
+    fn load(path: &std::path::Path, layer: Option<u32>) -> Result<Hist> {
+        let err = |m: String| format!("--shape route=hist:{}: {m}", path.display());
+        let doc: Value =
+            serde_json::from_slice(&std::fs::read(path).map_err(|e| err(e.to_string()))?)
+                .map_err(|e| err(e.to_string()))?;
+        if doc["schema"] != "route_hist.v1" {
+            return Err(err(format!(
+                "schema {}: expected route_hist.v1",
+                doc["schema"]
+            )));
+        }
+        let id = crate::iu4::artefact_id(&doc).map_err(err)?;
+        let num = |v: &Value, what: &str| {
+            v.as_u64()
+                .map(|x| x as usize)
+                .ok_or_else(|| err(format!("missing or non-integer {what}")))
+        };
+        let n_experts = num(&doc["n_experts"], "n_experts")?;
+        let topk = num(&doc["topk"], "topk")?;
+        let bin_path = crate::iu4::sibling_path(
+            path,
+            doc["ids"]["path"]
+                .as_str()
+                .ok_or_else(|| err("missing ids.path".into()))?,
+        );
+        let bin =
+            std::fs::read(&bin_path).map_err(|e| err(format!("{}: {e}", bin_path.display())))?;
+        let (want, got) = (
+            doc["ids"]["sha256"].as_str().unwrap_or(""),
+            sha256_hex(&bin),
+        );
+        if want != got {
+            return Err(err(format!(
+                "ids sha256 mismatch ({}): manifest {want}, file {got}",
+                bin_path.display()
+            )));
+        }
+        let records = doc["records"]
+            .as_array()
+            .ok_or_else(|| err("missing records".into()))?;
+        let mut at = 0usize;
+        let mut ids = Vec::new();
+        for (i, r) in records.iter().enumerate() {
+            let (l, n, k) = (
+                num(&r["layer"], "record layer")?,
+                num(&r["n"], "record n")?,
+                num(&r["k"], "record k")?,
+            );
+            if k != topk {
+                return Err(err(format!("record {i}: k={k}, topk={topk}")));
+            }
+            let end = at + n * k * 4;
+            let part = bin.get(at..end).ok_or_else(|| {
+                err(format!(
+                    "record {i} runs past the ids bin ({} bytes)",
+                    bin.len()
+                ))
+            })?;
+            at = end;
+            if layer.is_some_and(|want| want as usize != l) {
+                continue;
+            }
+            for c in part.chunks_exact(4) {
+                let e = i32::from_le_bytes(c.try_into().unwrap());
+                if e < 0 || e as usize >= n_experts {
+                    return Err(err(format!(
+                        "record {i}: expert id {e} outside [0,{n_experts})"
+                    )));
+                }
+                ids.push(e);
+            }
+        }
+        if at != bin.len() {
+            return Err(err(format!(
+                "ids bin has {} bytes, records cover {at}",
+                bin.len()
+            )));
+        }
+        if ids.is_empty() {
+            return Err(err(match layer {
+                Some(l) => format!("no records for layer {l}"),
+                None => "no rows".into(),
+            }));
+        }
+        Ok(Hist {
+            path: path.display().to_string(),
+            id,
+            layer,
+            n_experts,
+            topk,
+            ids,
+        })
+    }
+
+    fn json(&self) -> Value {
+        json!({"kind": "hist", "path": self.path, "id": self.id, "layer": self.layer})
+    }
 }
 
 impl Route {
@@ -283,6 +416,7 @@ impl Route {
             Route::Skew => "skew",
             Route::All => "all",
             Route::One => "one",
+            Route::Hist => "hist",
         }
     }
 }
@@ -298,6 +432,8 @@ struct Geo {
     inter: usize,
     distinct: usize,
     route: Route,
+    /// `route=hist:<file>`: the recorded per-token expert lists (`Route::Hist`).
+    hist: Option<Hist>,
     seed: u64,
 }
 
@@ -341,6 +477,7 @@ impl Geo {
             inter: preset.4,
             distinct: 0,
             route: Route::Uniform,
+            hist: None,
             seed: 1,
         };
         let mut distinct = None;
@@ -357,14 +494,20 @@ impl Geo {
                 "D" => distinct = Some(num::<usize>(k, v)?),
                 "seed" => g.seed = num(k, v)?,
                 "route" => {
-                    g.route = match v.trim() {
+                    let v = v.trim();
+                    if let Some(spec) = v.strip_prefix("hist:") {
+                        g.hist = Some(Hist::parse(spec)?);
+                        g.route = Route::Hist;
+                        continue;
+                    }
+                    g.route = match v {
                         "uniform" => Route::Uniform,
                         "skew" => Route::Skew,
                         "all" => Route::All,
                         "one" => Route::One,
                         other => {
                             return Err(format!(
-                                "--shape route={other}: expected uniform|skew|all|one"
+                                "--shape route={other}: expected uniform|skew|all|one|hist:<route_hist.json>[@L]"
                             ))
                         }
                     }
@@ -428,6 +571,14 @@ impl Geo {
         if hot > self.experts {
             return Err("--shape route=skew needs E >= min(5, TOP)".into());
         }
+        if let Some(h) = &self.hist {
+            if h.n_experts != self.experts || h.topk != self.top {
+                return Err(format!(
+                    "--shape route=hist:{}: recording has E={} TOP={}, the shape has E={} TOP={}",
+                    h.path, h.n_experts, h.topk, self.experts, self.top
+                ));
+            }
+        }
         self.expert_geometry()?
             .plan(plan_arch(self.arch), WeightCodec::Mq4Sym)?;
         Ok(())
@@ -449,6 +600,14 @@ impl Geo {
         match self.route {
             Route::One => vec![0; l],
             Route::All => (0..l).map(|f| (f % self.experts) as u32).collect(),
+            Route::Hist => {
+                let ids = &self
+                    .hist
+                    .as_ref()
+                    .expect("Route::Hist carries its recording")
+                    .ids;
+                (0..l).map(|f| ids[f % ids.len()] as u32).collect()
+            }
             Route::Uniform | Route::Skew => {
                 let hot = self.hot();
                 let mut v = Vec::with_capacity(l);
@@ -1268,7 +1427,7 @@ impl Problem {
 
     fn shape_json(&self) -> Value {
         let g = &self.geo;
-        json!({
+        let mut v = json!({
             "preset": g.preset, "experts": g.experts, "top_k": g.top, "tokens": g.tokens,
             "hidden": g.hidden, "intermediate": g.inter, "distinct_experts": g.distinct,
             "route": g.route.name(), "seed": g.seed,
@@ -1278,7 +1437,12 @@ impl Problem {
             "live_slots": g.slots(), "total_slots": self.total_slots(),
             "expert_tensor_bytes": self.stride, "y_bytes_per_arm": self.y_bytes(),
             "device_bytes": self.device_bytes(),
-        })
+        });
+        if let Some(h) = &g.hist {
+            v["route_id"] = json!(h.id);
+            v["route_layer"] = json!(h.layer);
+        }
+        v
     }
 }
 
@@ -2096,6 +2260,7 @@ impl Moe {
             inter: 128,
             distinct: 2,
             route: Route::Uniform,
+            hist: None,
             seed: 7,
         };
         let p = Problem::new(&geo, self.cand.spec.kind)?;
@@ -2520,6 +2685,13 @@ impl Workload for Moe {
         v
     }
 
+    fn record_extra(&self) -> Vec<(String, Value)> {
+        match &self.problem.geo.hist {
+            Some(h) => vec![("route".to_owned(), h.json())],
+            None => Vec::new(),
+        }
+    }
+
     fn candidate_knobs(&self) -> Value {
         spec_json(self.cand)
     }
@@ -2670,6 +2842,76 @@ mod tests {
     use super::*;
 
     const ARCH: Arch = Arch::Gfx1201;
+
+    /// Write a synthetic `route_hist.v1` (2 records: layer 0 rows 3, layer 1 rows 2; E=256 TOP=8).
+    fn hist_fixture(tag: &str, tamper: bool) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("pm_loop_hist_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bin = Vec::new();
+        for r in 0..5i32 {
+            for j in 0..8i32 {
+                bin.extend(((r * 17 + j * 3) % 256).to_le_bytes());
+            }
+        }
+        let sha = sha256_hex(&bin);
+        if tamper {
+            bin[0] ^= 1;
+        }
+        std::fs::write(dir.join("h.ids.bin"), &bin).unwrap();
+        let doc = json!({
+            "schema": "route_hist.v1", "n_experts": 256, "topk": 8,
+            "records": [
+                {"layer": 0, "n": 3, "k": 8, "position": 0},
+                {"layer": 1, "n": 2, "k": 8, "position": 0},
+            ],
+            "ids": {"path": "h.ids.bin", "sha256": sha},
+            "id": "cd".repeat(32),
+        });
+        let p = dir.join("h.json");
+        std::fs::write(&p, serde_json::to_vec(&doc).unwrap()).unwrap();
+        p
+    }
+
+    #[test]
+    fn route_hist_replays_deterministically_and_cycles() {
+        let p = hist_fixture("det", false);
+        let shape = format!("a3b,T=7,route=hist:{}", p.display());
+        let a = Geo::parse(&shape, ARCH).unwrap();
+        let b = Geo::parse(&shape, ARCH).unwrap();
+        assert_eq!(a, b);
+        let (ra, rb) = (a.route_table(), b.route_table());
+        assert_eq!(ra, rb);
+        assert_eq!(ra.len(), 7 * 8);
+        // 5 recorded rows: token 5 replays row 0.
+        assert_eq!(ra[5 * 8..6 * 8], ra[..8]);
+        assert_eq!(ra[8], 17);
+        assert_eq!(a.route, Route::Hist);
+        let h = a.hist.as_ref().unwrap().json();
+        assert_eq!(
+            (h["kind"].as_str(), h["id"].as_str()),
+            (Some("hist"), Some("cd".repeat(32).as_str()))
+        );
+        assert!(h["layer"].is_null());
+        // `@1` selects layer 1's two rows.
+        let l1 = Geo::parse(&format!("{shape}@1"), ARCH).unwrap();
+        assert_eq!(l1.hist.as_ref().unwrap().json()["layer"], 1);
+        assert_eq!(l1.route_table()[..8], ra[3 * 8..4 * 8]);
+        assert_eq!(l1.route_table()[16..24], ra[3 * 8..4 * 8]);
+        assert!(Geo::parse(&format!("{shape}@9"), ARCH).is_err());
+    }
+
+    #[test]
+    fn route_hist_refuses_sha_and_shape_mismatch() {
+        let p = hist_fixture("sha", true);
+        let e = Geo::parse(&format!("a3b,route=hist:{}", p.display()), ARCH).unwrap_err();
+        assert!(e.contains("sha256 mismatch"), "{e}");
+        let p = hist_fixture("shape", false);
+        let e = Geo::parse(&format!("fn,route=hist:{}", p.display()), ARCH).unwrap_err();
+        assert!(
+            e.contains("E=256 TOP=8") && e.contains("E=512 TOP=10"),
+            "{e}"
+        );
+    }
 
     fn knobs(pairs: &[(&str, &str)]) -> Knobs {
         let mut k = Knobs::default();
