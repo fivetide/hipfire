@@ -84,7 +84,12 @@ struct Meta {
     n_mla: usize,
 }
 
-fn encode_meta(position: usize, persist_bytes: usize, latent_row_bytes: usize, n_mla: usize) -> Vec<u8> {
+fn encode_meta(
+    position: usize,
+    persist_bytes: usize,
+    latent_row_bytes: usize,
+    n_mla: usize,
+) -> Vec<u8> {
     let mut meta = Vec::with_capacity(META_BYTES);
     meta.extend_from_slice(META_MAGIC);
     for field in [position, persist_bytes, latent_row_bytes, n_mla] {
@@ -99,7 +104,9 @@ fn parse_meta(meta: &[u8]) -> Result<Meta, String> {
     }
     let field = |i: usize| {
         let at = 8 + 8 * i;
-        let bytes: [u8; 8] = meta[at..at + 8].try_into().expect("metadata length checked");
+        let bytes: [u8; 8] = meta[at..at + 8]
+            .try_into()
+            .expect("metadata length checked");
         u64::from_le_bytes(bytes) as usize
     };
     Ok(Meta {
@@ -296,7 +303,10 @@ mod tests {
     #[test]
     fn grid_end_beyond_up_to_is_excluded() {
         assert_eq!(grid_boundaries(512, 2048, 5000, 0, 4500), vec![2048, 4096]);
-        assert_eq!(grid_boundaries(512, 2048, 5000, 0, 2047), Vec::<usize>::new());
+        assert_eq!(
+            grid_boundaries(512, 2048, 5000, 0, 2047),
+            Vec::<usize>::new()
+        );
     }
 
     #[test]

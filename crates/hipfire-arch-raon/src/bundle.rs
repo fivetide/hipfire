@@ -16,10 +16,10 @@ use crate::forward::{
     admit_decode_context, decode_binding, decode_body, forward_rows, forward_token,
     stage_decode_token, stage_decode_token_on_stream, RaonWork,
 };
+use crate::session::session_stride;
 use crate::spec_impl::RaonSpecState;
 use crate::state::{RaonPrefillScratch, RaonState};
 use crate::weights::RaonWeights;
-use crate::session::session_stride;
 use hipfire_runtime::session_cache::{
     SessionCache, SessionCacheUsage, SessionDriver, SessionRoute,
 };

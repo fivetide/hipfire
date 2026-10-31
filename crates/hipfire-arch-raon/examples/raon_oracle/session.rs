@@ -60,7 +60,11 @@ fn argmax(v: &[f32]) -> usize {
     best
 }
 
-fn parse_usize(opts: &BTreeMap<String, String>, key: &str, default: usize) -> Result<usize, String> {
+fn parse_usize(
+    opts: &BTreeMap<String, String>,
+    key: &str,
+    default: usize,
+) -> Result<usize, String> {
     match opts.get(key) {
         Some(s) => s
             .parse::<usize>()
@@ -339,10 +343,7 @@ fn finish(cases: Vec<Value>, mut head: Value) -> Value {
 }
 
 pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, String> {
-    let model = opts
-        .get("model")
-        .ok_or("session: missing --model")?
-        .clone();
+    let model = opts.get("model").ok_or("session: missing --model")?.clone();
     let tokens_path = opts.get("tokens").ok_or("session: missing --tokens")?;
     let decode = parse_usize(opts, "decode", 16)?;
     if decode == 0 {
@@ -400,7 +401,9 @@ fn run_inner(
     let vocab = bundle.config.vocab;
     check_tokens(t_all, vocab, "tokens")?;
     if vocab <= 2048 {
-        return Err(format!("session: vocab {vocab} too small for the unrelated-prompt remap"));
+        return Err(format!(
+            "session: vocab {vocab} too small for the unrelated-prompt remap"
+        ));
     }
     bundle.set_prefill_mode(mode);
     let w = bundle.prefill_chunk_rows();
@@ -479,7 +482,8 @@ fn run_inner(
     });
     let mut cases: Vec<Value> = Vec::new();
     let mut budget = BudgetTrack::default();
-    let plan = |bundle: &RaonBundle, p: &[u32]| ArchModel::session_plan(bundle, p, SessionRoute::Ar);
+    let plan =
+        |bundle: &RaonBundle, p: &[u32]| ArchModel::session_plan(bundle, p, SessionRoute::Ar);
 
     // 1. Cold reference over a fresh cache.
     bundle.reset(gpu)?;
