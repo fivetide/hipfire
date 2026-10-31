@@ -208,7 +208,10 @@ fn main() {
     let big_only = arg("--shapes").as_deref() == Some("big");
     let mut gpu = Gpu::init().expect("gpu init");
     println!("arch {}", gpu.arch);
-    assert!(gpu.q8_a8_supported(32) && gpu.q8_fp8_supported(32), "needs gfx12");
+    assert!(
+        gpu.q8_a8_supported(32) && gpu.q8_fp8_supported(32),
+        "needs gfx12"
+    );
     let timer = Timer {
         e0: gpu.hip.event_create().unwrap(),
         e1: gpu.hip.event_create().unwrap(),

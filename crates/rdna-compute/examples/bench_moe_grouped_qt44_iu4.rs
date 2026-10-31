@@ -472,9 +472,11 @@ fn main() {
                                 first = Some(yv.clone());
                                 true
                             }
-                            Some(f) => f.iter().zip(yv.iter()).enumerate().all(|(i, (a, b))| {
-                                sorted[i / m] < 0 || a.to_bits() == b.to_bits()
-                            }),
+                            Some(f) => {
+                                f.iter().zip(yv.iter()).enumerate().all(|(i, (a, b))| {
+                                    sorted[i / m] < 0 || a.to_bits() == b.to_bits()
+                                })
+                            }
                         };
                         let st = compare(&yref, &yv, m, &sorted);
                         let flops = 2.0 * (m_total as f64) * m as f64 * k as f64;
@@ -565,7 +567,8 @@ fn main() {
                     .unwrap();
                 // Producer check: every block against the CPU contract (d bit-exact; codes compared by
                 // decoded value so -0 == +0).
-                let (mut pd_bad, mut pc_bad, mut pa_bad, mut p_blocks) = (0usize, 0usize, 0usize, 0usize);
+                let (mut pd_bad, mut pc_bad, mut pa_bad, mut p_blocks) =
+                    (0usize, 0usize, 0usize, 0usize);
                 for h in 0..k / 128 {
                     for t in 0..x_rows {
                         let o = (h * x_rows + t) * 136;
@@ -686,8 +689,12 @@ fn main() {
                         let mut sum = 0f32;
                         for h in 0..k / 128 {
                             wblob(e, row, h / 2, &mut gb);
-                            let sc = f16_to_f32(u16::from_le_bytes([gb[4 * (h & 1)], gb[4 * (h & 1) + 1]]));
-                            let blk = &xq_host[((h * x_rows + xrow) * 72)..((h * x_rows + xrow) * 72 + 72)];
+                            let sc = f16_to_f32(u16::from_le_bytes([
+                                gb[4 * (h & 1)],
+                                gb[4 * (h & 1) + 1],
+                            ]));
+                            let blk = &xq_host
+                                [((h * x_rows + xrow) * 72)..((h * x_rows + xrow) * 72 + 72)];
                             let d = f32::from_le_bytes([blk[0], blk[1], blk[2], blk[3]]);
                             let mut c = 0i32;
                             for i in 0..128 {
@@ -705,7 +712,9 @@ fn main() {
                             exact += 1;
                         }
                     }
-                    println!("  {proj}: exact CPU recompute {exact}/{checked} sampled outputs bit-equal");
+                    println!(
+                        "  {proj}: exact CPU recompute {exact}/{checked} sampled outputs bit-equal"
+                    );
                 }
                 let mut a8_exact = (0usize, 0usize);
                 {
@@ -723,8 +732,10 @@ fn main() {
                         let mut sum = 0f32;
                         for h in 0..k / 128 {
                             wblob(e, row, h / 2, &mut gb);
-                            let sc =
-                                f16_to_f32(u16::from_le_bytes([gb[4 * (h & 1)], gb[4 * (h & 1) + 1]]));
+                            let sc = f16_to_f32(u16::from_le_bytes([
+                                gb[4 * (h & 1)],
+                                gb[4 * (h & 1) + 1],
+                            ]));
                             let o = (h * x_rows + xrow) * 136;
                             let blk = &xq8_host[o..o + 136];
                             let d = f32::from_le_bytes([blk[0], blk[1], blk[2], blk[3]]);
@@ -749,7 +760,12 @@ fn main() {
                 // accumulates in F32 in an unspecified internal order, so bit-equality is expected
                 // only when every partial sum is F32-exact; the rest is reported as max|d|.
                 let fp8_cpu: (usize, usize);
-                let (mut fp8_max_vs_cpu, mut fp8_max_vs_f64, mut fp8_max_a8_vs_f64, mut fp8_max_ref) = (0f64, 0f64, 0f64, 0f64);
+                let (
+                    mut fp8_max_vs_cpu,
+                    mut fp8_max_vs_f64,
+                    mut fp8_max_a8_vs_f64,
+                    mut fp8_max_ref,
+                ) = (0f64, 0f64, 0f64, 0f64);
                 {
                     let yff = fp8_first.clone().unwrap_or_default();
                     let mut srng = Rng(55);
@@ -767,8 +783,10 @@ fn main() {
                         let mut a8ref64 = 0f64;
                         for h in 0..k / 128 {
                             wblob(e, row, h / 2, &mut gb);
-                            let sc =
-                                f16_to_f32(u16::from_le_bytes([gb[4 * (h & 1)], gb[4 * (h & 1) + 1]]));
+                            let sc = f16_to_f32(u16::from_le_bytes([
+                                gb[4 * (h & 1)],
+                                gb[4 * (h & 1) + 1],
+                            ]));
                             let o = (h * x_rows + xrow) * 136;
                             let blk = &xqf_host[o..o + 136];
                             let d = f32::from_le_bytes([blk[0], blk[1], blk[2], blk[3]]);
@@ -778,7 +796,8 @@ fn main() {
                             let mut c8 = 0f64;
                             for i in 0..128 {
                                 let wb = gb[8 + 64 * (h & 1) + i / 2];
-                                let wn = (if i % 2 == 0 { wb & 15 } else { wb >> 4 } as i32 - 8) as f64;
+                                let wn =
+                                    (if i % 2 == 0 { wb & 15 } else { wb >> 4 } as i32 - 8) as f64;
                                 c += wn * dec[blk[8 + pair_order(i)] as usize];
                                 c8 += wn * (blk8[8 + pair_order(i)] as i8 as f64);
                             }

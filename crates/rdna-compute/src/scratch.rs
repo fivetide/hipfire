@@ -3338,7 +3338,10 @@ impl ScratchState {
             needed,
         )?;
         let base = self.q8_a8_x_scratch.as_ref().unwrap().as_ptr();
-        Ok((base, (base as *mut u8).wrapping_add(scales_off) as *mut c_void))
+        Ok((
+            base,
+            (base as *mut u8).wrapping_add(scales_off) as *mut c_void,
+        ))
     }
 
     /// Always re-quantize the f32 activation row into the dedicated A8 sidecar.

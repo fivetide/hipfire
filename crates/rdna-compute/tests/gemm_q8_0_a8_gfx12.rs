@@ -487,7 +487,8 @@ fn fp8_q8_0_error_vs_f64_next_to_a8() {
         let y8 = gpu.alloc_tensor(&[n * m], DType::F32).expect("y8");
         let yf = gpu.alloc_tensor(&[n * m], DType::F32).expect("yf");
         gpu.gemm_q8_0_a8_batched(&w, &xt, &y8, m, k, n).expect("a8");
-        gpu.gemm_q8_0_fp8_batched(&w, &xt, &yf, m, k, n).expect("fp8");
+        gpu.gemm_q8_0_fp8_batched(&w, &xt, &yf, m, k, n)
+            .expect("fp8");
         let g8 = gpu.download_f32(&y8).expect("download");
         let gf = gpu.download_f32(&yf).expect("download");
         let mut reference = vec![0f64; n * m];

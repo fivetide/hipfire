@@ -354,7 +354,13 @@ mod tests {
             assert!(symbol_fp8(nt, rf).is_some(), "nt{nt}r{rf}");
         }
         assert!(symbol_fp8(4, 1).is_none());
-        for (m_total, m) in [(512, 1088), (4048, 2176), (7152, 2176), (25552, 2560), (4096, 12032)] {
+        for (m_total, m) in [
+            (512, 1088),
+            (4048, 2176),
+            (7152, 2176),
+            (25552, 2560),
+            (4096, 12032),
+        ] {
             let (nt, rf) = select_entry_fp8(m_total, m);
             assert!(FP8_ENTRIES.contains(&(nt, rf)));
             assert_eq!(m % (64 * rf), 0);
