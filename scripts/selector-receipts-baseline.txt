@@ -24,7 +24,7 @@ crates/hipfire-dispatch/src/families/gemm.rs MQ3V25_A4_GFX1201_MIN_ROWS
 crates/hipfire-dispatch/src/families/moe.rs NARROW_VERIFY_MAX_ROWS
 crates/hipfire-dispatch/src/families/moe_expert_iu4.rs EXPERT_IU4_MIN_ROWS
 crates/hipfire-dispatch/src/pipeline/moe_program.rs GROUPED_MOE_INDEXED_MAX_ROWS
-crates/hipfire-dispatch/src/pipeline/moe_program.rs GROUPED_MOE_IU4_MIN_ROWS
+crates/hipfire-dispatch/src/pipeline/q8_prefill.rs PREFILL_QUANT_MIN_ROWS
 crates/hipfire-dispatch/src/pipeline/sandwich.rs MUSE_RESIDUAL_MAX_M
 crates/hipfire-dispatch/src/sp_plan.rs SP_MAX_ROWS
 crates/hipfire-engine/src/scheduler.rs DEFAULT_GENERATE_MAX_TOKENS
