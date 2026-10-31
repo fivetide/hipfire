@@ -4894,11 +4894,21 @@ pub struct DflashCandidateProposal {
     /// Per-row probability of the selected token (entry of `probabilities` at
     /// the chosen index when temperature>0). `None` for greedy.
     pub selected_probabilities: Option<Vec<f32>>,
-    /// Per-row softmax (temperature 1) mass of the selected candidate over
-    /// the row's top-K selector scores, at every temperature (the draft's own
-    /// confidence; picks the DFlash2 verify depth).
+    /// Per-row softmax (temperature 1) mass of the row's TOP candidate over
+    /// its top-K selector scores ([`selector_row_confidence`]), at every
+    /// temperature: the draft's own confidence in this row, fixed before the
+    /// row's draw (picks the DFlash2 verify depth).
     pub confidence: Vec<f32>,
     pub top_k: usize,
+}
+
+/// The selector's confidence in one row: the temperature-1 softmax mass of
+/// its top candidate over the row's `scores` (`1 / Σ exp(s - max)`). A
+/// function of the row's scores only, so it is fixed before the row's draw.
+pub fn selector_row_confidence(scores: &[f32]) -> f32 {
+    let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let z: f32 = scores.iter().map(|&s| (s - max_s).exp()).sum();
+    1.0 / z
 }
 
 /// Softmax scores/temp → normalized q; sample index via inverse-CDF on `uniform`.
@@ -5083,10 +5093,15 @@ fn propose_inner_capture(
         if let Some(c) = capture.as_deref_mut() {
             c.extend_from_slice(&scores);
         }
-        // Softmax (temperature 1) mass of the selected candidate, at every
-        // request temperature: the draft's own confidence in this row.
-        let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let z: f32 = scores.iter().map(|&s| (s - max_s).exp()).sum();
+        // The draft's confidence in this row: its top candidate's
+        // temperature-1 mass, computed before the draw. It depends on the
+        // drafts of earlier rows only (through `pred`), never on this row's
+        // own draw: a verify depth cut on the drawn token's mass would admit
+        // a sampled draft into the verify more often when it is a likely one,
+        // and the verified row would no longer be distributed as `q`
+        // (DFlash2 `verify_depth`; the target law test lives there).
+        // Greedy picks the top candidate, so its value is unchanged.
+        confidence.push(selector_row_confidence(&scores));
         let sel_idx = if temperature == 0.0 {
             let mut best = 0usize;
             let mut best_s = scores[0];
@@ -5111,7 +5126,6 @@ fn propose_inner_capture(
             }
             idx
         };
-        confidence.push((scores[sel_idx] - max_s).exp() / z);
         let cand_id = top_ids[id_off + sel_idx];
         tokens.push(cand_id);
         pred = cand_id;
