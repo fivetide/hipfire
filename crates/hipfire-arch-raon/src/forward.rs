@@ -883,7 +883,8 @@ fn ffn_block(
     match &layer.ffn {
         RaonFfn::Dense(d) => {
             let (gate, up, down) = d.projections(rows);
-            let refs = RaonDenseRefs::from_parts(gate, up, down)?.with_iu4_symmetric(d.iu4_symmetric);
+            let refs =
+                RaonDenseRefs::from_parts(gate, up, down)?.with_iu4_symmetric(d.iu4_symmetric);
             forward_dense(
                 gpu,
                 ctx,
