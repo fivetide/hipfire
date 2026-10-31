@@ -1485,8 +1485,23 @@ fn ordinary_wrapper_pbs_prepare(
     }
     if plan.alloc_virtual {
         if let WrapperOwner::Virtual { rows, tape } = plan.owner {
-            let owner = PrefillBatchScratch::new_opt(gpu, config, rows, tape)?;
-            *scratch.reuse_virtual_pbs.borrow_mut() = Some(owner);
+            // The admission planned this owner from device capacity; the
+            // allocation is the real check. Only a real failure keeps the
+            // incumbent implicit cache and ceiling.
+            match PrefillBatchScratch::new_opt(gpu, config, rows, tape) {
+                Ok(owner) => *scratch.reuse_virtual_pbs.borrow_mut() = Some(owner),
+                Err(e) => {
+                    eprintln!(
+                        "prefill_chunk: allocating the {rows}-row virtual prefill owner failed ({e:?}); keeping the implicit cache and its ceiling"
+                    );
+                    return Ok(WrapperPbsPlan {
+                        owner: WrapperOwner::Physical,
+                        max_batch_override: None,
+                        free_virtual: false,
+                        alloc_virtual: false,
+                    });
+                }
+            }
         }
     }
     Ok(plan)
@@ -2794,7 +2809,14 @@ fn emit_prefill_chunk_receipt(
     static LAST_ADMITTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     if emit_prefill_chunk_receipt_guarded(&LAST_ADMITTED, requested, admitted, commit_stride) {
         if let Some(reason) = downgrade {
-            eprintln!("prefill_chunk: WARNING {reason}");
+            // An explicit knob that cannot be honored is a WARNING; a default
+            // ceiling narrowed by a smaller caller scratch is a plain note.
+            let level = if explicit_prefill_max_batch().is_some() {
+                "WARNING"
+            } else {
+                "note"
+            };
+            eprintln!("prefill_chunk: {level} {reason}");
         }
     }
 }
@@ -3872,11 +3894,31 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                     if let Some(old) = cached.take() {
                         let _ = old.free_gpu(gpu);
                     }
-                    *cached = Some(if lean {
-                        PrefillBatchScratch::new_opt_lean(gpu, config, owned_rows)?
-                    } else {
-                        PrefillBatchScratch::new_opt(gpu, config, owned_rows, false)?
-                    });
+                    // Admission plans from device capacity; the allocation is
+                    // the real check. Step down a rung only when it really
+                    // fails (a foreign allocation that leaves room never
+                    // narrows the route); the receipt below reports the rows
+                    // actually allocated.
+                    let mut rows = owned_rows;
+                    let built = loop {
+                        let attempt = if lean {
+                            PrefillBatchScratch::new_opt_lean(gpu, config, rows)
+                        } else {
+                            PrefillBatchScratch::new_opt(gpu, config, rows, false)
+                        };
+                        match attempt {
+                            Ok(p) => break p,
+                            Err(e) if rows > WIDENED_COMMIT_ROWS => {
+                                let next = (rows / 2).max(WIDENED_COMMIT_ROWS);
+                                eprintln!(
+                                    "prefill_chunk: allocating the {rows}-row prefill scratch failed ({e:?}); retrying with {next} rows"
+                                );
+                                rows = next;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    };
+                    *cached = Some(built);
                 }
                 own_pbs = cached.take();
                 widened_from_cache = true;
