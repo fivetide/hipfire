@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Node bench + accuracy for the gfx12 W8A8 Q8_0 GEMM (`gemm_q8_0_a8_batched`)
+//! Node bench + accuracy for the gfx12 W8A8 Q8_0 GEMM (`gemm_q8_0_a8_batched`) and its FP8
+//! twin (`gemm_q8_0_fp8_batched`: int8 weights as E4M3 x per-32 E4M3 activations)
 //! against the F16-activation incumbent (`gemm_q8_0_batched_chunked`).
 //!
 //! Per `(M, K)` shape and row count `N`:
@@ -143,6 +144,55 @@ fn diff(a: &[f32], b: &[f32]) -> ErrStat {
     }
 }
 
+/// Accuracy rows (one per route) against the F16 incumbent over the whole output and
+/// against an F64 reference on a random subset of (token, row) outputs.
+fn accuracy_rows(
+    md: &mut String,
+    (m, k, n): (usize, usize, usize),
+    wdeq: &[f64],
+    x_host: &[f32],
+    seed: u64,
+    inc: &[f32],
+    routes: &[(&str, &[f32])],
+) {
+    let mut r = Rng(seed);
+    let picks: Vec<(usize, usize)> = (0..384)
+        .map(|_| (r.next_u32() as usize % n, r.next_u32() as usize % m))
+        .collect();
+    let ref_v: Vec<f32> = picks
+        .iter()
+        .map(|&(tok, row)| {
+            let mut s = 0f64;
+            for c in 0..k {
+                s += wdeq[row * k + c] * x_host[tok * k + c] as f64;
+            }
+            s as f32
+        })
+        .collect();
+    let sub = |y: &[f32]| -> Vec<f32> { picks.iter().map(|&(t, r)| y[t * m + r]).collect() };
+    let mut emit = |name: &str, y: &[f32], d_inc: Option<ErrStat>| {
+        let d_ref = diff(&sub(y), &ref_v);
+        let (a, b, c) = d_inc.map_or(("-".into(), "-".into(), "-".into()), |d| {
+            (
+                format!("{:.4e}", d.max_abs),
+                format!("{:.4e}", d.mean_abs),
+                format!("{:.3e}", d.rel),
+            )
+        });
+        let _ = writeln!(
+            md,
+            "| {m} | {k} | {n} | {name} | {a} | {b} | {c} | {:.4e} | {:.4e} | {:.3e} |",
+            d_ref.max_abs, d_ref.mean_abs, d_ref.rel,
+        );
+    };
+    emit("F16 incumbent", inc, None);
+    for &(name, y) in routes {
+        emit(name, y, Some(diff(y, inc)));
+    }
+}
+
+const ACC_HEADER: &str = "| M | K | N | route | vs-incumbent max abs | mean abs | rel | vs-F64 max abs | mean abs | rel |\n|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|\n";
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |name: &str| {
@@ -158,7 +208,7 @@ fn main() {
     let big_only = arg("--shapes").as_deref() == Some("big");
     let mut gpu = Gpu::init().expect("gpu init");
     println!("arch {}", gpu.arch);
-    assert!(gpu.q8_a8_supported(32), "needs gfx12");
+    assert!(gpu.q8_a8_supported(32) && gpu.q8_fp8_supported(32), "needs gfx12");
     let timer = Timer {
         e0: gpu.hip.event_create().unwrap(),
         e1: gpu.hip.event_create().unwrap(),
@@ -166,18 +216,10 @@ fn main() {
     let mut md = String::new();
     let _ = writeln!(
         md,
-        "| M | K | N | incumbent F16 ms (TFLOP/s) | W8A8 ms (TFLOP/s) | speedup | quant ms | gemm 128x128 | gemm 128x64 | gemm 64x64 |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        "| M | K | N | F16 incumbent ms (TFLOP/s) | A8 ms (TFLOP/s) | FP8 ms (TFLOP/s) | A8 vs F16 | FP8 vs F16 | FP8 vs A8 | A8 quant ms | FP8 quant ms | A8 gemm 128x128 / 128x64 / 64x64 | FP8 gemm 128x128 / 128x64 / 64x64 |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|"
     );
-    let mut acc_md = String::new();
-    let _ = writeln!(
-        acc_md,
-        "| M | K | N | new-vs-inc max abs | mean abs | rel | new-vs-F64 max abs | mean abs | rel | inc-vs-F64 max abs | mean abs | rel |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
-    );
-    let mut clean_md = String::new();
-    let _ = writeln!(
-        clean_md,
-        "| M | K | N | new-vs-inc max abs | mean abs | rel | new-vs-F64 max abs | mean abs | rel | inc-vs-F64 max abs | mean abs | rel |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
-    );
+    let mut acc_md = String::from(ACC_HEADER);
+    let mut clean_md = String::from(ACC_HEADER);
     let mut rng = Rng(0x5eed_0a8a_0001);
     for &(m, k, label) in SHAPES {
         if big_only && m * k < 5120 * 2560 {
@@ -190,79 +232,82 @@ fn main() {
             let x_host = make_acts(n, k, &mut rng);
             let x = gpu.upload_f32(&x_host, &[n * k]).expect("x");
             let y_inc = gpu.alloc_tensor(&[n * m], DType::F32).expect("y");
-            let y_new = gpu.alloc_tensor(&[n * m], DType::F32).expect("y2");
+            let y_a8 = gpu.alloc_tensor(&[n * m], DType::F32).expect("y2");
+            let y_f8 = gpu.alloc_tensor(&[n * m], DType::F32).expect("y3");
 
             gpu.gemm_q8_0_batched_chunked(&w, &x, &y_inc, m, k, n)
                 .unwrap();
-            gpu.gemm_q8_0_a8_batched(&w, &x, &y_new, m, k, n).unwrap();
+            gpu.gemm_q8_0_a8_batched(&w, &x, &y_a8, m, k, n).unwrap();
+            gpu.gemm_q8_0_fp8_batched(&w, &x, &y_f8, m, k, n).unwrap();
             gpu.hip.device_synchronize().unwrap();
 
             let t_inc = time_ms(&mut gpu, &timer, iters, |g| {
                 g.gemm_q8_0_batched_chunked(&w, &x, &y_inc, m, k, n)
                     .unwrap()
             });
-            let t_new = time_ms(&mut gpu, &timer, iters, |g| {
-                g.gemm_q8_0_a8_batched(&w, &x, &y_new, m, k, n).unwrap()
+            let t_a8 = time_ms(&mut gpu, &timer, iters, |g| {
+                g.gemm_q8_0_a8_batched(&w, &x, &y_a8, m, k, n).unwrap()
             });
-            let acts = gpu.q8_a8_quantize_x(&x, n, k).unwrap();
-            let t_q = time_ms(&mut gpu, &timer, iters, |g| {
+            let t_f8 = time_ms(&mut gpu, &timer, iters, |g| {
+                g.gemm_q8_0_fp8_batched(&w, &x, &y_f8, m, k, n).unwrap()
+            });
+            // Producer + per-tile GEMM-only times for both routes (they share one scratch,
+            // so each route re-quantizes before its own tile loop).
+            let t_q_a8 = time_ms(&mut gpu, &timer, iters, |g| {
                 g.q8_a8_quantize_x(&x, n, k).unwrap();
             });
-            let mut t_tiles = Vec::new();
+            let acts_a8 = gpu.q8_a8_quantize_x(&x, n, k).unwrap();
+            // (the timing loop above leaves the sidecar quantized; re-quantize for the tile loop)
+            let mut t_tiles_a8 = Vec::new();
             for tile in Q8A8Tile::ALL {
-                let t = time_ms(&mut gpu, &timer, iters, |g| {
-                    g.gemm_q8_0_a8_gemm_tile(&w, &acts, &y_new, m, tile)
+                t_tiles_a8.push(time_ms(&mut gpu, &timer, iters, |g| {
+                    g.gemm_q8_0_a8_gemm_tile(&w, &acts_a8, &y_a8, m, tile)
                         .unwrap()
-                });
-                t_tiles.push(t);
+                }));
             }
-            // The tile loop left y_new from the last tile; recompute with the
-            // production pick for the accuracy comparison.
-            gpu.gemm_q8_0_a8_batched(&w, &x, &y_new, m, k, n).unwrap();
+            let t_q_f8 = time_ms(&mut gpu, &timer, iters, |g| {
+                g.q8_fp8_quantize_x(&x, n, k).unwrap();
+            });
+            let acts_f8 = gpu.q8_fp8_quantize_x(&x, n, k).unwrap();
+            let mut t_tiles_f8 = Vec::new();
+            for tile in Q8A8Tile::ALL {
+                t_tiles_f8.push(time_ms(&mut gpu, &timer, iters, |g| {
+                    g.gemm_q8_0_fp8_gemm_tile(&w, &acts_f8, &y_f8, m, tile)
+                        .unwrap()
+                }));
+            }
+            // The tile loops left the last tile's output; recompute with the production
+            // pick for the accuracy comparison.
+            gpu.gemm_q8_0_a8_batched(&w, &x, &y_a8, m, k, n).unwrap();
+            gpu.gemm_q8_0_fp8_batched(&w, &x, &y_f8, m, k, n).unwrap();
             gpu.hip.device_synchronize().unwrap();
 
             let tf = 2.0 * m as f64 * k as f64 * n as f64 / 1e12;
+            let tiles = |t: &[f32]| format!("{:.4} / {:.4} / {:.4}", t[0], t[1], t[2]);
             let _ = writeln!(
                 md,
-                "| {m} | {k} | {n} | {t_inc:.4} ({:.1}) | {t_new:.4} ({:.1}) | {:.2}x | {t_q:.4} | {:.4} ({:.2}x) | {:.4} ({:.2}x) | {:.4} ({:.2}x) |",
+                "| {m} | {k} | {n} | {t_inc:.4} ({:.1}) | {t_a8:.4} ({:.1}) | {t_f8:.4} ({:.1}) | {:.2}x | {:.2}x | {:.2}x | {t_q_a8:.4} | {t_q_f8:.4} | {} | {} |",
                 tf / (t_inc as f64 / 1e3),
-                tf / (t_new as f64 / 1e3),
-                t_inc / t_new,
-                t_tiles[0],
-                t_inc / t_tiles[0],
-                t_tiles[1],
-                t_inc / t_tiles[1],
-                t_tiles[2],
-                t_inc / t_tiles[2],
+                tf / (t_a8 as f64 / 1e3),
+                tf / (t_f8 as f64 / 1e3),
+                t_inc / t_a8,
+                t_inc / t_f8,
+                t_a8 / t_f8,
+                tiles(&t_tiles_a8),
+                tiles(&t_tiles_f8),
             );
 
             let inc = gpu.download_f32(&y_inc).unwrap();
-            let new = gpu.download_f32(&y_new).unwrap();
-            let d_ni = diff(&new, &inc);
-            // F64 reference on a random subset of (token, row) outputs.
-            let mut r2 = Rng(0xf64 + (m * 31 + n) as u64);
-            let (mut ref_v, mut new_v, mut inc_v) = (Vec::new(), Vec::new(), Vec::new());
-            for _ in 0..384 {
-                let tok = r2.next_u32() as usize % n;
-                let row = r2.next_u32() as usize % m;
-                let mut s = 0f64;
-                for c in 0..k {
-                    s += wdeq[row * k + c] * x_host[tok * k + c] as f64;
-                }
-                ref_v.push(s as f32);
-                new_v.push(new[tok * m + row]);
-                inc_v.push(inc[tok * m + row]);
-            }
-            // diff() takes (a, b) with b the reference; refs here are F32-rounded
-            // F64 sums (|ref| >> f32 eps relative to the errors measured).
-            let d_nr = diff(&new_v, &ref_v);
-            let d_ir = diff(&inc_v, &ref_v);
-            let _ = writeln!(
-                acc_md,
-                "| {m} | {k} | {n} | {:.4e} | {:.4e} | {:.3e} | {:.4e} | {:.4e} | {:.3e} | {:.4e} | {:.4e} | {:.3e} |",
-                d_ni.max_abs, d_ni.mean_abs, d_ni.rel,
-                d_nr.max_abs, d_nr.mean_abs, d_nr.rel,
-                d_ir.max_abs, d_ir.mean_abs, d_ir.rel,
+            let a8 = gpu.download_f32(&y_a8).unwrap();
+            let f8 = gpu.download_f32(&y_f8).unwrap();
+            accuracy_rows(
+                &mut acc_md,
+                (m, k, n),
+                &wdeq,
+                &x_host,
+                0xf64 + (m * 31 + n) as u64,
+                &inc,
+                &[("A8", &a8), ("FP8", &f8)],
             );
 
             // Same comparison on plain BF16-rounded Gaussian activations (no outlier
@@ -272,32 +317,20 @@ fn main() {
                 let xct = gpu.upload_f32(&xc, &[n * k]).expect("xc");
                 gpu.gemm_q8_0_batched_chunked(&w, &xct, &y_inc, m, k, n)
                     .unwrap();
-                gpu.gemm_q8_0_a8_batched(&w, &xct, &y_new, m, k, n).unwrap();
+                gpu.gemm_q8_0_a8_batched(&w, &xct, &y_a8, m, k, n).unwrap();
+                gpu.gemm_q8_0_fp8_batched(&w, &xct, &y_f8, m, k, n).unwrap();
                 gpu.hip.device_synchronize().unwrap();
                 let inc = gpu.download_f32(&y_inc).unwrap();
-                let new = gpu.download_f32(&y_new).unwrap();
-                let d_ni = diff(&new, &inc);
-                let mut r3 = Rng(0xc1ea + (m * 31 + n) as u64);
-                let (mut ref_v, mut new_v, mut inc_v) = (Vec::new(), Vec::new(), Vec::new());
-                for _ in 0..384 {
-                    let tok = r3.next_u32() as usize % n;
-                    let row = r3.next_u32() as usize % m;
-                    let mut s = 0f64;
-                    for c in 0..k {
-                        s += wdeq[row * k + c] * xc[tok * k + c] as f64;
-                    }
-                    ref_v.push(s as f32);
-                    new_v.push(new[tok * m + row]);
-                    inc_v.push(inc[tok * m + row]);
-                }
-                let d_nr = diff(&new_v, &ref_v);
-                let d_ir = diff(&inc_v, &ref_v);
-                let _ = writeln!(
-                    clean_md,
-                    "| {m} | {k} | {n} | {:.4e} | {:.4e} | {:.3e} | {:.4e} | {:.4e} | {:.3e} | {:.4e} | {:.4e} | {:.3e} |",
-                    d_ni.max_abs, d_ni.mean_abs, d_ni.rel,
-                    d_nr.max_abs, d_nr.mean_abs, d_nr.rel,
-                    d_ir.max_abs, d_ir.mean_abs, d_ir.rel,
+                let a8 = gpu.download_f32(&y_a8).unwrap();
+                let f8 = gpu.download_f32(&y_f8).unwrap();
+                accuracy_rows(
+                    &mut clean_md,
+                    (m, k, n),
+                    &wdeq,
+                    &xc,
+                    0xc1ea + (m * 31 + n) as u64,
+                    &inc,
+                    &[("A8", &a8), ("FP8", &f8)],
                 );
             }
         }

@@ -4406,6 +4406,14 @@ pub const GEMM_Q8_0_MMQ_4W_GFX1151_SRC: &str =
 pub const GEMM_Q8_0_MMQ_I8_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_mmq_i8.gfx12.hip");
 
+/// FP8 twin of [`GEMM_Q8_0_MMQ_I8_GFX12_SRC`]: Q8_0 int8 weights converted to E4M3 at LDS
+/// staging x per-row per-32-K E4M3 activations on `v_wmma_f32_16x16x16_fp8_fp8`, F32 output.
+/// Ships its own producer (`quantize_x_fp8_blk32`, F32 -> E4M3 + F32 scales, same sidecar
+/// layout as `quantize_x_q8_blk32`). Y[N,M] = X[N,K] @ A_q8[M,K]^T, K % 32 == 0; `_slow`
+/// variants take a 2-byte aligned weight base or K % 64 != 0.
+pub const GEMM_Q8_0_MMQ_FP8_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_q8_0_mmq_fp8.gfx12.hip");
+
 /// Exact-gfx1030 sdot4 MMQ probe for Q8_0 weights. This source is exposed to
 /// the dedicated channel test only; production dispatch remains unchanged.
 pub const GEMM_Q8_0_MMQ_GFX1030_SRC: &str =
