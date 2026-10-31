@@ -638,6 +638,13 @@ fn selector_q(
         .collect())
 }
 
+/// Raw feature rows the draft projects per `fc` GEMM through its staging
+/// buffer ([`DflashScratch::new_windowed_staged`]): every window's new rows
+/// (`<= DFLASH_BLOCK_MAX + 1`) in one GEMM, a cold prompt's window in
+/// `window / 128` of them. 128 Raon-1-mini feature rows (51200 F32) are 26 MB
+/// where the raw window ring was 0.42 GB.
+const FEATURE_STAGE_ROWS: usize = 128;
+
 /// Selector-confidence product below which a window stops verifying drafts.
 /// HIPF-135, Flash-Next on gfx1151 (verify ~36 ms + ~6 ms per row): over 6122
 /// block-8 windows, products 0.3-0.5 maximize the simulated tok/s (+18% over
@@ -701,8 +708,20 @@ pub fn build_dflash2_speculator(
         return Err("DFlash2 draft: candidate selector tensors are missing".into());
     }
     // The draft was trained over its declared sliding window; running it
-    // over any other span is a train/inference mask mismatch.
+    // over any other span is a train/inference mask mismatch. An all-sliding
+    // draft reads its context through the projected rows only, and the raw
+    // feature rows come from `target_hidden_host`: stage them instead of
+    // keeping a window-high raw ring on the device.
     let scratch = match config.declared_window {
+        Some(w) if config.all_layers_sliding => DflashScratch::new_windowed_staged(
+            gpu,
+            &config,
+            block,
+            w,
+            ctx_capacity,
+            weights.has_mq,
+            FEATURE_STAGE_ROWS,
+        ),
         Some(w) => {
             DflashScratch::new_windowed(gpu, &config, block, w, w, ctx_capacity, weights.has_mq)
         }

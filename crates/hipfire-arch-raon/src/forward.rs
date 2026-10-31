@@ -1610,43 +1610,13 @@ pub fn forward_rows_tapped(
     )
 }
 
-/// [`forward_rows`] with the DFlash2 device capture ([`DflashCapture`]): the
+/// [`forward_rows`] with the DFlash2 device capture ([`DflashCapture`]: the
 /// post-FFN carrier of the listed layers lands in `capture.dst` rows
-/// `capture.row0..capture.row0 + tokens.len()`. The launch sequence is
-/// [`forward_rows`]'s plus one strided copy per listed layer.
-#[allow(clippy::too_many_arguments)]
-pub fn forward_rows_captured(
-    cfg: &RaonConfig,
-    w: &RaonWeights,
-    s: &mut RaonState,
-    scratch: &mut RaonPrefillScratch,
-    work: &mut RaonWork,
-    gpu: &mut Gpu,
-    tokens: &[u32],
-    start_pos: u32,
-    want_logits: bool,
-    capture: Option<&DflashCapture<'_>>,
-) -> Result<(), String> {
-    forward_impl(
-        cfg,
-        w,
-        s,
-        scratch,
-        work,
-        gpu,
-        tokens,
-        start_pos,
-        want_logits,
-        None,
-        capture,
-        None,
-    )
-}
-
-/// [`forward_rows_captured`] with the rollback ring ([`RdaRing`]) armed: the
-/// RDA recurrence inputs of every row land in `ring` (same launch sequence).
-/// This is the verify forward (`crate::rollback`); `capture` is the DFlash2
-/// feature capture when the drafter wants this window's features.
+/// `capture.row0..capture.row0 + tokens.len()`, one strided copy per listed
+/// layer) and the rollback ring ([`RdaRing`]) armed (the RDA recurrence inputs
+/// of every row land in `ring`; same launch sequence). This is the verify
+/// forward (`crate::rollback`); `capture` is present when the drafter wants
+/// this window's features.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_rows_verify(
     cfg: &RaonConfig,

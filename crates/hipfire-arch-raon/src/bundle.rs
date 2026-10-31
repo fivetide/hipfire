@@ -8,8 +8,8 @@ use rdna_compute::{Gpu, GpuTensor};
 
 use crate::config::RaonConfig;
 use crate::forward::{
-    admit_decode_context, decode_binding, decode_body, forward_rows, forward_rows_captured,
-    forward_token, stage_decode_token, stage_decode_token_on_stream, RaonWork,
+    admit_decode_context, decode_binding, decode_body, forward_rows, forward_token,
+    stage_decode_token, stage_decode_token_on_stream, RaonWork,
 };
 use crate::spec_impl::RaonSpecState;
 use crate::state::{RaonPrefillScratch, RaonState};
@@ -425,33 +425,14 @@ impl RaonBundle {
 
     /// One prefill step: `piece` (1..=[`prefill_step_rows`](Self::prefill_step_rows)
     /// rows) from the slot's current position. `want_logits` leaves the last
-    /// row's logits in [`logits`](Self::logits). `capture_row0 = Some(r)`
-    /// additionally lands the DFlash2 feature rows of `piece` in the
-    /// speculative capture buffer from row `r` ([`RaonSpecState`]); `None`
-    /// issues exactly the AR launch sequence.
+    /// row's logits in [`logits`](Self::logits).
     pub(crate) fn forward_chunk(
         &mut self,
         gpu: &mut Gpu,
         piece: &[u32],
         want_logits: bool,
-        capture_row0: Option<usize>,
     ) -> Result<(), String> {
         let pos = self.state.n_tokens() as u32;
-        if let Some(row0) = capture_row0 {
-            let capture = self.spec.capture(row0)?;
-            return forward_rows_captured(
-                &self.config,
-                &self.weights,
-                &mut self.state,
-                &mut self.scratch,
-                &mut self.work,
-                gpu,
-                piece,
-                pos,
-                want_logits,
-                Some(&capture),
-            );
-        }
         if piece.len() == 1 {
             forward_token(
                 &self.config,
@@ -498,7 +479,7 @@ impl RaonBundle {
         let chunk = self.prefill_step_rows();
         let n_chunks = tokens.len().div_ceil(chunk);
         for (ci, piece) in tokens.chunks(chunk).enumerate() {
-            self.forward_chunk(gpu, piece, ci + 1 == n_chunks, None)?;
+            self.forward_chunk(gpu, piece, ci + 1 == n_chunks)?;
         }
         Ok(())
     }

@@ -22,10 +22,14 @@
 //! 2..=16, default 8), `--tokens N` (greedy stream length, default 64),
 //! `--max-seq N` (context rows to reserve; default prompt + tokens + 112, min 512).
 //!
-//! * `capture` (gate 1): prefill through `SpecTarget::spec_advance(hidden_out)`
-//!   on a fresh state, then on a second fresh state run
-//!   `RaonBundle::dflash_tap_reference` over the same tokens; every captured
-//!   feature float must be bit-identical.
+//! * `capture` (gate 1): (advance) prefill through
+//!   `SpecTarget::spec_advance(hidden_out)` on a fresh state (the production
+//!   prefill feature path: the AR launch sequence plus a per-layer download
+//!   tap), then on a second fresh state run `RaonBundle::dflash_tap_reference`
+//!   over the same tokens; (verify) prefill all but the last K = min(16,
+//!   prompt - 1) tokens, `verify_block` those K with the device capture, and
+//!   compare with the tap over the same K-row batch from the same state. Every
+//!   captured feature float must be bit-identical.
 //! * `emit` (gate 2): prefill, take the target's greedy seed, run one draft
 //!   block (`draft_forward_based`, target `lm_head_logits_device`,
 //!   `propose_candidates_device` = the call sequence of `Dflash2Speculator::step`)
@@ -62,7 +66,10 @@
 //!   `seq_len`, padding) is downloaded after each arm and must be byte-equal per
 //!   `keep`; the table prints the first differing layer/offset and the commit
 //!   cost of each arm. With `--draft` the verify also runs the DFlash feature
-//!   capture (the product verify). Exit 0 iff every `keep` is byte-equal.
+//!   capture (the product verify). Exit 0 iff every `keep` in 2..=7 is
+//!   byte-equal; keep 1 is printed but not judged, because the replay arm's
+//!   1-row forward takes the single-row decode route (different rounding from
+//!   the batched verify rows the recurrence arm reproduces).
 //!
 //! * `verifygraph` (verify-graph gate): for K = 1..=16 at three positions, one verify
 //!   window (`verify_block_logits` + feature capture, `verify_block` argmax, partial and
@@ -383,7 +390,6 @@ fn run_capture(
 ) -> Result<bool, String> {
     let (_hfq, cfg) = draft_config(require(opts, "draft")?)?;
     check_streams(bundle, &cfg)?;
-    let fw = cfg.feature_width();
     SpecTarget::set_dflash_extract_layers(bundle, cfg.target_layer_ids.clone());
 
     bundle.reset(gpu)?;
@@ -416,22 +422,75 @@ fn run_capture(
         t1.elapsed().as_secs_f64()
     );
 
-    let want = prompt.len() * fw;
-    if device_rows.len() != want || tap_rows.len() != want {
+    let advance_ok = compare_feature_rows(
+        "advance",
+        &device_rows,
+        &tap_rows,
+        prompt,
+        &cfg,
+        bundle.config.hidden,
+    );
+
+    // The verify's device capture (one strided copy per extract layer) over
+    // the last K prompt rows, against the tap over the same K-row batch from
+    // the same state.
+    let k = DFLASH_BLOCK_MAX.min(prompt.len() - 1);
+    let split = prompt.len() - k;
+    bundle.reset(gpu)?;
+    bundle.prefill(gpu, &prompt[..split])?;
+    let mut vs = SpecTarget::new_spec_scratch(bundle, gpu, k)?;
+    let mut verify_rows: Vec<f32> = Vec::new();
+    let verified = SpecTarget::verify_block(
+        bundle,
+        gpu,
+        &prompt[split..],
+        split,
+        vs.as_mut(),
+        Some(&mut verify_rows),
+    )
+    .and_then(|_| SpecTarget::abandon_verify(bundle, gpu, vs.as_mut()));
+    vs.free(gpu);
+    verified?;
+    bundle.reset(gpu)?;
+    bundle.prefill(gpu, &prompt[..split])?;
+    let tap_k = bundle.dflash_tap_reference(gpu, &prompt[split..])?;
+    let verify_ok = compare_feature_rows(
+        "verify",
+        &verify_rows,
+        &tap_k,
+        &prompt[split..],
+        &cfg,
+        bundle.config.hidden,
+    );
+    Ok(advance_ok && verify_ok)
+}
+
+/// Bit-compare captured feature rows `got` with the tap reference `want` over
+/// `tokens`; print one PASS/FAIL line naming the first differing float.
+fn compare_feature_rows(
+    label: &str,
+    got: &[f32],
+    want: &[f32],
+    tokens: &[u32],
+    cfg: &DflashConfig,
+    h: usize,
+) -> bool {
+    let fw = cfg.feature_width();
+    let expect = tokens.len() * fw;
+    if got.len() != expect || want.len() != expect {
         println!(
-            "FAIL capture: device rows {} floats, tap reference {} floats, expected {want} ({} rows x {fw})",
-            device_rows.len(),
-            tap_rows.len(),
-            prompt.len()
+            "FAIL capture {label}: captured {} floats, tap reference {} floats, expected {expect} ({} rows x {fw})",
+            got.len(),
+            want.len(),
+            tokens.len()
         );
-        return Ok(false);
+        return false;
     }
-    let h = bundle.config.hidden;
     let per_layer = cfg.target_streams_per_layer * h;
     let mut bad = 0usize;
     let mut first: Option<usize> = None;
     let mut max_abs = 0f32;
-    for (i, (a, b)) in device_rows.iter().zip(&tap_rows).enumerate() {
+    for (i, (a, b)) in got.iter().zip(want).enumerate() {
         if a.to_bits() != b.to_bits() {
             bad += 1;
             first.get_or_insert(i);
@@ -444,28 +503,28 @@ fn run_capture(
     match first {
         None => {
             println!(
-                "PASS capture: {} rows x {fw} floats ({} layers x {} streams x {h}) bit-identical to forward_rows_tapped Ffn(l)",
-                prompt.len(),
+                "PASS capture {label}: {} rows x {fw} floats ({} layers x {} streams x {h}) bit-identical to forward_rows_tapped Ffn(l)",
+                tokens.len(),
                 cfg.num_extract(),
                 cfg.target_streams_per_layer
             );
-            Ok(true)
+            true
         }
         Some(i) => {
             let (row, col) = (i / fw, i % fw);
             let (slot, rem) = (col / per_layer, col % per_layer);
             let (stream, hi) = (rem / h, rem % h);
             println!(
-                "FAIL capture: {bad}/{} floats differ (max |diff| {max_abs:.6e}); first at row {row} (token {}), extract slot {slot} (layer {}), stream {stream}, hidden {hi}: device {:#010x} ({}) vs tap {:#010x} ({})",
-                device_rows.len(),
-                prompt[row],
+                "FAIL capture {label}: {bad}/{} floats differ (max |diff| {max_abs:.6e}); first at row {row} (token {}), extract slot {slot} (layer {}), stream {stream}, hidden {hi}: captured {:#010x} ({}) vs tap {:#010x} ({})",
+                got.len(),
+                tokens[row],
                 cfg.target_layer_ids[slot],
-                device_rows[i].to_bits(),
-                device_rows[i],
-                tap_rows[i].to_bits(),
-                tap_rows[i],
+                got[i].to_bits(),
+                got[i],
+                want[i].to_bits(),
+                want[i],
             );
-            Ok(false)
+            false
         }
     }
 }
@@ -1922,7 +1981,14 @@ fn run_rollback(
             }
             let (bytes, first, s_layers, c_layers) = slab_diff(&a, &b, &lay, &conv, &dims);
             let equal = bytes == 0;
-            all_equal &= equal;
+            // keep 1 is reported, never judged: the replay arm's 1-row forward
+            // takes the single-row decode route (`forward_chunk` with one
+            // token), which rounds differently from the batched verify rows
+            // the recurrence arm reproduces, so the two arms differ by
+            // construction. keep 2..=7 replay through the batched route.
+            if keep >= 2 {
+                all_equal &= equal;
+            }
             println!(
                 "  {keep:>4}  {:<5} {bytes:>15}  {rec_ms:>13.3}  {replay_ms:>9.3}  {}",
                 if equal { "equal" } else { "DIFF" },
@@ -1951,7 +2017,7 @@ fn run_rollback(
     restored?;
     freed?;
     println!(
-        "{} rollback: the persistent slab after {} recurrence rollbacks {} byte-identical to the full-replay arm",
+        "{} rollback: the persistent slab after recurrence rollbacks keep 2..={} {} byte-identical to the full-replay arm (keep 1 reported only: the replay arm's 1-row forward takes the decode route)",
         if all_equal { "PASS" } else { "FAIL" },
         BLOCK - 1,
         if all_equal { "is" } else { "is NOT" }
