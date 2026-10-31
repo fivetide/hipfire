@@ -1805,7 +1805,16 @@ struct DevIn {
 impl DevIn {
     fn new(gpu: &mut Gpu, c: &CaseData) -> Result<Self, String> {
         let x = up_f32(gpu, &c.x)?;
-        let router_w = up_f32(gpu, &c.router_w)?;
+        // The production loader path: BF16 when every value is BF16-exact (the
+        // generator rounds, as the checkpoint is BF16), else F32.
+        let router_w = hipfire_arch_raon::upload_rows_weight(
+            gpu,
+            &c.router_w,
+            c.geom.e,
+            c.geom.c,
+            "router_w",
+        )?
+        .buf;
         let bias = up_f32(gpu, &c.e_bias)?;
         Ok(Self { x, router_w, bias })
     }

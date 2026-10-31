@@ -10527,8 +10527,10 @@ pub fn gemv_bf16_xf32_src(is_gfx1151: bool) -> &'static str {
         GEMV_BF16_XF32_SRC
     }
 }
-/// Batched BF16-weight × F32-input GEMM used by Qwen4's shared expert.
-/// Weights stay native BF16 and the output is row-major `[N, M]` F32.
+/// Batched BF16-weight × F32-input GEMM used by Qwen4's shared expert and by
+/// Raon's mHC selector and MoE router. Weights stay native BF16, the output is
+/// row-major `[N, M]` F32, and each output is bit-identical to `gemm_f32_batched`
+/// on the exactly widened weight.
 pub const GEMM_BF16_XF32_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/gemm_bf16_xf32_batched.hip");
 /// Exact BF16-weight × F32-input four-token row-tile GEMM.  Each wave reuses
@@ -11337,10 +11339,11 @@ pub const V4F_ATTN_SWA_BATCHED_DEBUG_SRC: &str =
 pub const GEMM_F32_REGISTER_TILED_SRC: &str =
     include_str!("../../../kernels/src/gemm_f32_register_tiled.hip");
 
-/// Row-tiled F32 GEMM (256-thread block, 4 rows, X staged in LDS),
-/// bit-identical to `gemm_f32_batched` per output.
-pub const GEMM_F32_TILED_ROWS_SRC: &str =
-    include_str!("../../../kernels/src/gemm_f32_tiled_rows.hip");
+/// Row-tiled BF16-weight x F32-activation GEMM (256-thread block, 4 rows, X
+/// staged in LDS), bit-identical per output to `gemm_f32_batched` on the exactly
+/// widened weight.
+pub const GEMM_BF16_XF32_TILED_ROWS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16_xf32_tiled_rows.hip");
 
 /// Atomic-free MQ2-Lloyd K4 MoE down kernel — writes [N × K_TOP × M]
 /// f32 with no atomicAdd contention. Pair with `moe_down_combine_k8_batched`

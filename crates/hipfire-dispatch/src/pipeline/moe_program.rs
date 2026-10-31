@@ -6733,7 +6733,8 @@ impl GroupedMoeScratchPlan {
 /// Router linear weights and selection bias.
 #[derive(Clone, Copy)]
 pub struct GroupedMoeRouter<'a> {
-    /// F32 `[n_experts, hidden]` (the router projection runs in FP32).
+    /// BF16 `[n_experts, hidden]` (F32 when the loader kept an inexact tensor in F32);
+    /// the router projection widens exactly and accumulates in FP32.
     pub weight: &'a GpuTensor,
     /// F32 `[n_experts]` selection-only correction bias; `None` is zero. Must
     /// be `None` for [`RouterKind::SoftmaxRenorm`].
@@ -6981,14 +6982,26 @@ impl<'a> GroupedMoeOp<'a> {
         }
         f32_like(self.x, "x")?;
         f32_like(self.out, "out")?;
-        f32_like(self.router.weight, "router.weight")?;
         scratch_need(self.x, plan.x_rot, "x")?;
         scratch_need(self.out, plan.x_rot, "out")?;
-        scratch_need(
-            self.router.weight,
-            mul(g.n_experts, g.hidden)?,
-            "router.weight",
-        )?;
+        let router_elem_bytes = match self.router.weight.dtype {
+            DType::BF16 => 2,
+            DType::F32 => 4,
+            other => {
+                return Err(DispatchError::Hip(format!(
+                    "grouped moe: `router.weight` must be a BF16 (or F32) tensor, got {other:?}"
+                )))
+            }
+        };
+        let router_need = mul(g.n_experts, g.hidden)?
+            .checked_mul(router_elem_bytes)
+            .ok_or_else(plan_overflow)?;
+        if self.router.weight.buf.size() < router_need {
+            return Err(DispatchError::Hip(format!(
+                "grouped moe: `router.weight` holds {} bytes, needs {router_need}",
+                self.router.weight.buf.size()
+            )));
+        }
         if let Some(b) = self.router.correction_bias {
             f32_like(b, "router.correction_bias")?;
             scratch_need(b, g.n_experts, "router.correction_bias")?;
@@ -7498,8 +7511,9 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
         GroupedMoeSiteTiers::default()
     };
 
-    // Router: FP32 linear of the (BF16-valued) F32 input, then device top-k.
-    hip!(crate::pipeline::stream_mix::f32_rows_gemm(
+    // Router: linear of the (BF16-valued) F32 input against the BF16 router weight
+    // (widened exactly in registers, F32 accumulate), then device top-k.
+    hip!(crate::pipeline::stream_mix::rows_gemm(
         gpu,
         op.router.weight,
         op.x,

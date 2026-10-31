@@ -5106,10 +5106,18 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMM_F32_SRC,
             ["gemm_f32_batched"]
         );
+        // Raon mHC selector and grouped-MoE router: BF16-weight x F32-activation
+        // GEMMs, batched (decode / verify / chunks) and x-stationary tiled (gfx1201
+        // prefill).
         add!(
-            "gemm_f32_tiled_rows",
-            kernels::GEMM_F32_TILED_ROWS_SRC,
-            ["gemm_f32_tiled_rows", "gemm_f32_tiled_rows_mp4"]
+            "gemm_bf16_xf32_batched",
+            kernels::GEMM_BF16_XF32_BATCHED_SRC,
+            ["gemm_bf16_xf32_batched"]
+        );
+        add!(
+            "gemm_bf16_xf32_tiled_rows",
+            kernels::GEMM_BF16_XF32_TILED_ROWS_SRC,
+            ["gemm_bf16_xf32_tiled_rows", "gemm_bf16_xf32_tiled_rows_mp4"]
         );
     }
     // lm_head rm2 muse tile (`gemm_hfq4g256_residual_muse_gfx1100_rm` rm=2):
@@ -10817,12 +10825,14 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
-        // x-stationary tiled F32 GEMM for the mHC selector and grouped-MoE router.
-        const F32_TILED_ROWS_ADDED_MODULES: [&str; 1] = ["gemm_f32_tiled_rows"];
-        for module in F32_TILED_ROWS_ADDED_MODULES {
+        // BF16-weight GEMMs (batched + x-stationary tiled) for the Raon mHC selector
+        // and grouped-MoE router.
+        const BF16_XF32_ROWS_ADDED_MODULES: [&str; 2] =
+            ["gemm_bf16_xf32_batched", "gemm_bf16_xf32_tiled_rows"];
+        for module in BF16_XF32_ROWS_ADDED_MODULES {
             assert!(
                 by_name.contains_key(module),
-                "missing F32 tiled rows module {module}"
+                "missing BF16-weight rows module {module}"
             );
             assert!(
                 !expected
@@ -10902,7 +10912,7 @@ mod tests {
                 + A3B_LANE_WO_ADDED_MODULES.len()
                 + A3B_MOE_DEDUP_ADDED_MODULES.len()
                 + A3B_LANE_PROJ_ADDED_MODULES.len()
-                + F32_TILED_ROWS_ADDED_MODULES.len()
+                + BF16_XF32_ROWS_ADDED_MODULES.len()
                 + Q8_0_MMQ_ACT_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );

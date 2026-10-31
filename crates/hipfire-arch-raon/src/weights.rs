@@ -16,7 +16,8 @@
 //! | embedding | Q8F16 (qt 3), or qt 1/2/16/44 | raw Q8 table / host-decoded F32 |
 //! | projections (attn, dense/shared FFN, lm_head) | Q8F16 (qt 3; every attention projection and lm_head in the shipped recipe, no AWQ sidecar) or qt44 (symmetric MQ4G256V2, dense/shared FFN) when K is a multiple of 256; qt 1/2/16 widen to F32 | [`WeightTensor`] (+ AWQ sidecar on qt44) |
 //! | routed experts | symmetric qt44 only; gate rows ++ up rows fused per expert | per-expert `[2*1088, 2560]` and `[2560, 1280]` |
-//! | router, mHC selector, norms, conv, A_log, dt_bias, biases | qt 1/2/16 | F32 |
+//! | router, mHC selector | qt 1/2/16 | BF16 (qt16 as stored; F16/F32 narrowed with every value verified BF16-representable, else that tensor stays F32) |
+//! | norms, conv, A_log, dt_bias, biases | qt 1/2/16 | F32 |
 //!
 //! The 1088-wide FFN intermediate is *physical* K=1280 for every down
 //! projection (routed and shared): the stored tensor is `[2560, 1280]` with
@@ -79,8 +80,9 @@ pub const MHC_PARAM_LEN: usize = MHC_PARAM_B_Z + (MHC_STREAMS - 1) * (MHC_STREAM
 
 /// One mHC site (`self_attn_raon_mhc` / `mlp_raon_mhc`).
 pub struct MhcSiteWeights {
-    /// F32 `[17, n*hidden]`: rows `0..4` = `phi_pre`, `4..8` = `phi_post`,
-    /// `8..17` = `res.phi_z` (values are the BF16 checkpoint values, exact).
+    /// BF16 `[17, n*hidden]` (F32 only when a value is not BF16-representable):
+    /// rows `0..4` = `phi_pre`, `4..8` = `phi_post`, `8..17` = `res.phi_z`
+    /// (the BF16 checkpoint values, exact).
     pub selector: WeightTensor,
     /// F32 `[MHC_PARAM_LEN]`, layout per the `MHC_PARAM_*` constants:
     /// `alpha_pre, alpha_post, alpha_z, eta, b_pre[4], b_post[4], b_z[9]`.
@@ -185,7 +187,7 @@ pub struct ExpertWeights {
 
 /// Sigmoid top-k MoE FFN.
 pub struct MoeFfnWeights {
-    /// F32 `[128, 2560]` (BF16 values expanded).
+    /// BF16 `[128, 2560]` (F32 only when a value is not BF16-representable).
     pub router: WeightTensor,
     /// F32 `[128]`, selection-only bias.
     pub e_bias: GpuTensor,
@@ -1085,17 +1087,33 @@ impl Pool {
     }
 }
 
-fn f32_weight(
-    gpu: &mut Gpu,
-    data: &[f32],
-    m: usize,
-    k: usize,
-    name: &str,
-) -> Result<WeightTensor, String> {
-    let buf = upload_f32_named(gpu, data, &[m, k], name)?;
-    Ok(WeightTensor {
+/// Counters of the router / mHC-selector residency (reported once per load).
+static ROWS_BF16_STORED: AtomicUsize = AtomicUsize::new(0);
+static ROWS_BF16_NARROWED: AtomicUsize = AtomicUsize::new(0);
+static ROWS_F32_KEPT: AtomicUsize = AtomicUsize::new(0);
+/// Device bytes the router / selector tensors occupy, and what F32 copies would.
+static ROWS_BYTES_RESIDENT: AtomicUsize = AtomicUsize::new(0);
+static ROWS_BYTES_AS_F32: AtomicUsize = AtomicUsize::new(0);
+
+/// Exact BF16 image of `data`: `Ok(bits)` when every value is exactly
+/// BF16-representable (low 16 bits of the F32 pattern are zero), else
+/// `Err((first inexact index, inexact count))`.
+fn bf16_exact_image(data: &[f32]) -> Result<Vec<u16>, (usize, usize)> {
+    let inexact = data.iter().filter(|v| v.to_bits() & 0xffff != 0).count();
+    if inexact != 0 {
+        let first = data
+            .iter()
+            .position(|v| v.to_bits() & 0xffff != 0)
+            .unwrap_or(0);
+        return Err((first, inexact));
+    }
+    Ok(data.iter().map(|v| (v.to_bits() >> 16) as u16).collect())
+}
+
+fn rows_weight_tensor(buf: GpuTensor, dtype: DType, m: usize, k: usize) -> WeightTensor {
+    WeightTensor {
         buf,
-        gpu_dtype: DType::F32,
+        gpu_dtype: dtype,
         m,
         k,
         row_stride: 0,
@@ -1104,7 +1122,105 @@ fn f32_weight(
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
         lloyd_lut_c16: None,
-    })
+    }
+}
+
+/// F32 `[m, k]` projection weight (qt 1/2/16 projections that no codec covers).
+fn f32_weight(
+    gpu: &mut Gpu,
+    data: &[f32],
+    m: usize,
+    k: usize,
+    name: &str,
+) -> Result<WeightTensor, String> {
+    let buf = upload_f32_named(gpu, data, &[m, k], name)?;
+    Ok(rows_weight_tensor(buf, DType::F32, m, k))
+}
+
+/// Uploads little-endian BF16 words as a device BF16 `[m, k]` weight (the
+/// buffer dtype is stamped BF16 so the selector/router GEMMs read it as BF16).
+fn upload_bf16_rows(
+    gpu: &mut Gpu,
+    bytes: &[u8],
+    m: usize,
+    k: usize,
+    name: &str,
+) -> Result<WeightTensor, String> {
+    let mut buf = gpu
+        .upload_raw(bytes, &[m, k])
+        .map_err(|e| format!("raon1_mini weights: upload {name}: {e:?}"))?;
+    buf.dtype = DType::BF16;
+    ROWS_BYTES_RESIDENT.fetch_add(buf.buf.size(), Ordering::Relaxed);
+    ROWS_BYTES_AS_F32.fetch_add(m * k * 4, Ordering::Relaxed);
+    Ok(rows_weight_tensor(buf, DType::BF16, m, k))
+}
+
+/// Router / mHC-selector weight `[m, k]` from F32 values (widened from F16/F32
+/// storage): resident as BF16 (half the bytes, narrowing is exact) when every
+/// value is exactly BF16-representable, which holds for the BF16 source
+/// checkpoint. A tensor with any inexact value stays F32 and is logged; the
+/// selector/router GEMMs run it on `gemm_f32_batched`, so values never change.
+/// The raon_oracle uploads its synthetic cases through this function too.
+pub fn upload_rows_weight(
+    gpu: &mut Gpu,
+    data: &[f32],
+    m: usize,
+    k: usize,
+    name: &str,
+) -> Result<WeightTensor, String> {
+    if data.len() != m * k {
+        return Err(format!(
+            "raon1_mini weights: {name}: {} elements, expected {}",
+            data.len(),
+            m * k
+        ));
+    }
+    match bf16_exact_image(data) {
+        Ok(bits) => {
+            let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+            let w = upload_bf16_rows(gpu, &bytes, m, k, name)?;
+            ROWS_BF16_NARROWED.fetch_add(1, Ordering::Relaxed);
+            Ok(w)
+        }
+        Err((first, count)) => {
+            eprintln!(
+                "raon1_mini weights: {name}: {count} of {} values are not exactly BF16-representable                  (first at element {first}: {:#010x}); keeping this tensor F32",
+                data.len(),
+                data[first].to_bits()
+            );
+            ROWS_F32_KEPT.fetch_add(1, Ordering::Relaxed);
+            let buf = upload_f32_named(gpu, data, &[m, k], name)?;
+            ROWS_BYTES_RESIDENT.fetch_add(buf.buf.size(), Ordering::Relaxed);
+            ROWS_BYTES_AS_F32.fetch_add(m * k * 4, Ordering::Relaxed);
+            Ok(rows_weight_tensor(buf, DType::F32, m, k))
+        }
+    }
+}
+
+/// Router weight from its stored bytes: BF16 (qt16) uploads as-is, byte for
+/// byte; F16 / F32 artifacts widen and narrow through [`upload_rows_weight`].
+fn load_router_weight(
+    gpu: &mut Gpu,
+    qt: u8,
+    data: &[u8],
+    m: usize,
+    k: usize,
+    name: &str,
+) -> Result<WeightTensor, String> {
+    if qt == QT_BF16 {
+        if data.len() != m * k * 2 {
+            return Err(format!(
+                "raon1_mini weights: {name}: {} BF16 bytes, expected {}",
+                data.len(),
+                m * k * 2
+            ));
+        }
+        let w = upload_bf16_rows(gpu, data, m, k, name)?;
+        ROWS_BF16_STORED.fetch_add(1, Ordering::Relaxed);
+        return Ok(w);
+    }
+    let f = widen_f32(qt, data, m * k, name)?;
+    upload_rows_weight(gpu, &f, m, k, name)
 }
 
 /// Shared-expert and dense-FFN projections: the always-active FFN weights
@@ -1268,12 +1384,16 @@ fn load_pool_item(
             (w, None) => Loaded::Mat(w),
             (w, Some(d)) => Loaded::MatDecode(w, d),
         },
-        TensorClass::Router => {
-            let f = read_bytes(hfq, name, |info, data| {
-                widen_f32(info.quant_type, data, spec.numel(), name)
-            })?;
-            Loaded::Mat(f32_weight(gpu, &f, spec.shape[0], spec.shape[1], name)?)
-        }
+        TensorClass::Router => Loaded::Mat(read_bytes(hfq, name, |info, data| {
+            load_router_weight(
+                gpu,
+                info.quant_type,
+                data,
+                spec.shape[0],
+                spec.shape[1],
+                name,
+            )
+        })?),
         TensorClass::F32Vec => {
             let f = read_bytes(hfq, name, |info, data| {
                 widen_f32(info.quant_type, data, spec.numel(), name)
@@ -1325,7 +1445,7 @@ fn load_mhc_site(
     params[MHC_PARAM_B_PRE..MHC_PARAM_B_POST].copy_from_slice(&b_pre);
     params[MHC_PARAM_B_POST..MHC_PARAM_B_Z].copy_from_slice(&b_post);
     params[MHC_PARAM_B_Z..].copy_from_slice(&b_z);
-    let selector = f32_weight(gpu, &sel, MHC_CONTROLS, w, &format!("{p}.selector"))?;
+    let selector = upload_rows_weight(gpu, &sel, MHC_CONTROLS, w, &format!("{p}.selector"))?;
     let params_t = match upload_f32_named(gpu, &params, &[MHC_PARAM_LEN], &format!("{p}.params")) {
         Ok(t) => t,
         Err(e) => {
@@ -1895,6 +2015,11 @@ pub fn load_raon_weights(
     BF16_FFN_TENSORS.store(0, Ordering::Relaxed);
     BF16_FFN_VALUES.store(0, Ordering::Relaxed);
     BF16_FFN_INEXACT.store(0, Ordering::Relaxed);
+    ROWS_BF16_STORED.store(0, Ordering::Relaxed);
+    ROWS_BF16_NARROWED.store(0, Ordering::Relaxed);
+    ROWS_F32_KEPT.store(0, Ordering::Relaxed);
+    ROWS_BYTES_RESIDENT.store(0, Ordering::Relaxed);
+    ROWS_BYTES_AS_F32.store(0, Ordering::Relaxed);
     if index.iter().any(|e| e.quant_type == QT_MQ4V2) && !hfq.mq4v2_symmetric() {
         return Err(
             "raon1_mini weights: qt44 tensors present but the artifact lacks the symmetric \
@@ -2002,6 +2127,21 @@ pub fn load_raon_weights(
             BF16_FFN_VALUES.swap(0, Ordering::Relaxed)
         );
     }
+    let (stored, narrowed, kept) = (
+        ROWS_BF16_STORED.swap(0, Ordering::Relaxed),
+        ROWS_BF16_NARROWED.swap(0, Ordering::Relaxed),
+        ROWS_F32_KEPT.swap(0, Ordering::Relaxed),
+    );
+    let (resident, as_f32) = (
+        ROWS_BYTES_RESIDENT.swap(0, Ordering::Relaxed),
+        ROWS_BYTES_AS_F32.swap(0, Ordering::Relaxed),
+    );
+    eprintln!(
+        "raon1_mini weights: router + mHC selector: {stored} read as stored BF16, {narrowed} narrowed \
+         from F16/F32 (every value verified BF16-representable), {kept} kept F32; {resident} device \
+         bytes resident ({as_f32} as F32, {} saved)",
+        as_f32.saturating_sub(resident)
+    );
     Ok(RaonWeights {
         embed,
         embed_format,

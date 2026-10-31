@@ -4,14 +4,15 @@
 
 //! Generic-op GEMM/GEMV launchers (hipcc): dense Q8_0/F32 GEMMs, grouped MoE GEMMs, embedding.
 //!
-//! Nine contracts, each with a [`WorkSpecV1`] sidecar:
+//! Ten contracts, each with a [`WorkSpecV1`] sidecar:
 //!
 //! | contract | exports | launcher |
 //! |---|---|---|
 //! | [`GEMM_Q8_0_WMMA`] | `gemm_q8_0_wmma_gfx12` (gfx1201), `gemm_q8_0_wmma` (gfx1100) | `Gpu::gemm_q8_0_wmma` (`crates/rdna-compute/src/gemm.rs`) |
 //! | [`GEMM_MQ4G256V2_MOE_GROUPED_WMMA`] | `gemm_mq4g256v2_moe_grouped_wmma_gfx12` (gfx1201), `gemm_mq4g256v2_moe_grouped_wmma_k2` (gfx1100) | `Gpu::gemm_mq4g256v2_moe_grouped_wmma_k2_impl` (`gemm.rs`) |
 //! | [`GEMM_F32_BATCHED`] | `gemm_f32_batched` (gfx1201, gfx1100) | `Gpu::gemm_f32_batched` (`gemm.rs`) |
-//! | [`GEMM_F32_TILED_ROWS`] / [`GEMM_F32_TILED_ROWS_MP4`] | `gemm_f32_tiled_rows`, `gemm_f32_tiled_rows_mp4` (gfx1201) | `Gpu::gemm_f32_tiled_rows` (`gemm.rs`), selector `f32_rows_gemm` (`crates/hipfire-dispatch/src/pipeline/stream_mix.rs`) |
+//! | [`GEMM_BF16_XF32_BATCHED`] | `gemm_bf16_xf32_batched` (gfx1201, gfx1100) | `Gpu::gemm_bf16_xf32_batched` (`gemm.rs`) |
+//! | [`GEMM_BF16_XF32_TILED_ROWS`] / [`GEMM_BF16_XF32_TILED_ROWS_MP4`] | `gemm_bf16_xf32_tiled_rows`, `gemm_bf16_xf32_tiled_rows_mp4` (gfx1201) | `Gpu::gemm_bf16_xf32_tiled_rows` (`gemm.rs`), selector `rows_gemm` (`crates/hipfire-dispatch/src/pipeline/stream_mix.rs`) |
 //! | [`GEMV_Q8_0`] | `gemv_q8_0` (gfx1201, gfx1100) | `Gpu::gemv_q8_0` (`crates/rdna-compute/src/gemv.rs`) |
 //! | [`EMBEDDING_Q8_BATCHED`] | `embedding_q8_batched` (gfx1201, gfx1100) | `Gpu::embedding_lookup_q8_batched` (`crates/rdna-compute/src/embedding.rs`) |
 //! | [`MOE_GROUPED_QT44_A8_SYM`] | `moe_grouped_qt44_a8_sym_gfx1201_nt{1,2}r{1,2}` (gfx1201) | `Gpu::gemm_mq4g256v2_moe_grouped_a8_sym` (`crates/rdna-compute/src/moe_grouped_qt44_iu4.rs`) |
@@ -40,6 +41,9 @@ use super::mq6_i8::{FORMAT_BLOCK_I8_128_KB_N, FORMAT_F32_N_M};
 
 // ---- formats -----------------------------------------------------------------
 
+/// BF16 flat tensor `[M, K]` row-major (u16 words, 2 bytes per element, widened exactly to f32 in registers).
+pub const FORMAT_BF16_FLAT: FormatId = FormatId("bf16.flat");
+
 /// `u64 [E]` table of expert weight slab base addresses (MQ4G256V2: `M x K/256` groups of 136 B).
 pub const FORMAT_EXPERT_PTR_TABLE_U64: FormatId = FormatId("moe_grouped.expert_ptr_table.u64");
 /// `i32 [ceil(m_total / 16)]`: expert id of each 16-slot tile, `-1` for sentinel tiles.
@@ -64,7 +68,8 @@ pub const NUMERIC_Q8_0_WMMA_F16: NumericContractId =
 pub const NUMERIC_MQ4_GROUPED_WMMA_F16: NumericContractId =
     NumericContractId("generic_gemm.mq4g256v2_grouped_x_f16.wmma_f32acc");
 /// F32 x F32, lane-strided FMA over K (lane `l` takes `k = l, l+32, ...`) then a width-32 `shfl_down` tree.
-/// `gemm_f32_tiled_rows*` is bit-identical to `gemm_f32_batched`.
+/// `gemm_f32_batched`, `gemm_bf16_xf32_batched` and `gemm_bf16_xf32_tiled_rows*` share it (BF16 operand
+/// A widens exactly, so the BF16 kernels are bit-identical to the F32 kernel on the widened weight).
 pub const NUMERIC_F32_LANE_STRIDED: NumericContractId =
     NumericContractId("generic_gemm.f32.lane_strided_fma.shfl_tree32");
 /// Q8_0 weight x F32 activation GEMV, 8-block unrolled lane-strided FMA, `shfl_down` tree.
@@ -524,7 +529,7 @@ pub static WORK_GEMM_MQ4G256V2_MOE_GROUPED_WMMA: WorkSpecV1 = WorkSpecV1 {
 };
 
 // ================================================================================================
-// gemm_f32_batched / gemm_f32_tiled_rows / gemm_f32_tiled_rows_mp4
+// gemm_f32_batched / gemm_bf16_xf32_batched / gemm_bf16_xf32_tiled_rows / gemm_bf16_xf32_tiled_rows_mp4
 // ================================================================================================
 
 const PARAMS_F32_GEMM: &[ParamV1] = &[
@@ -545,6 +550,36 @@ const OPS_F32_GEMM: &[OperandV1] = &[
         extent: Some(Expr::Mul(&[P_M, P_K, Expr::Const(4)])),
         nullable: false,
         note: "F32 weight `[M, K]` (the launcher also accepts an untyped `Raw` view whose logical dtype is F32)",
+    },
+    OperandV1 {
+        name: "B",
+        format: FORMAT_F32_FLAT,
+        access: Access::ReadOnly,
+        align: 4,
+        extent: Some(Expr::Mul(&[P_N, P_K, Expr::Const(4)])),
+        nullable: false,
+        note: "F32 activations `[N, K]`",
+    },
+    OperandV1 {
+        name: "Y",
+        format: FORMAT_F32_N_M,
+        access: Access::WriteOnly,
+        align: 4,
+        extent: Some(Expr::Mul(&[P_N, P_M, Expr::Const(4)])),
+        nullable: false,
+        note: "F32 output `[N, M]`; every element is written once (lane 0 of its wave)",
+    },
+];
+
+const OPS_BF16_XF32_GEMM: &[OperandV1] = &[
+    OperandV1 {
+        name: "A",
+        format: FORMAT_BF16_FLAT,
+        access: Access::ReadOnly,
+        align: 2,
+        extent: Some(Expr::Mul(&[P_M, P_K, Expr::Const(2)])),
+        nullable: false,
+        note: "BF16 weight `[M, K]` row-major (u16 words, 2-byte aligned), widened exactly to f32 in registers",
     },
     OperandV1 {
         name: "B",
@@ -634,9 +669,67 @@ pub static GEMM_F32_BATCHED: KernelAbiV1 = KernelAbiV1 {
     ],
 };
 
-/// Hidden block of the hipcc `gemm_f32_tiled_rows*` objects (they read `blockDim`): offsets from the
-/// metadata of `gfx1201/gemm_f32_tiled_rows.e23c665b964e8f70.hsaco` (both entries).
-const HIDDEN_F32_TILED: &[HiddenV1] = &[
+const FIELDS_BF16_XF32_BATCHED: &[FieldV1] = &[
+    ptr_field("W", 0, "A"),
+    ptr_field("X", 8, "B"),
+    ptr_field("Y", 16, "Y"),
+    i32_field("M", 24, P_M),
+    i32_field("K", 28, P_K),
+    i32_field("N", 32, P_N),
+];
+
+/// `gemm_bf16_xf32_batched`, one wave per output, BF16 weight: hipcc-JIT'd from
+/// `kernels/src/gemm_bf16_xf32_batched.hip`; same layout as [`GEMM_F32_BATCHED`] (the hsaco evidence
+/// cited there belongs to the F32 kernel; no BF16 hsaco hash is pinned): args `W@0` (read_only) `X@8`
+/// (read_only) `Y@16` (write_only), `M@24 K@28 N@32` by value, segment 36 / align 8, no hidden words,
+/// LDS 0, block 32. Lane-strided numerics identical to `gemm_f32_batched`.
+pub static GEMM_BF16_XF32_BATCHED: KernelAbiV1 = KernelAbiV1 {
+    id: "generic_gemm.bf16_xf32_batched.wave_per_output",
+    version: 1,
+    wave: 32,
+    numeric: NUMERIC_F32_LANE_STRIDED,
+    params: PARAMS_F32_GEMM,
+    operands: OPS_BF16_XF32_GEMM,
+    fields: FIELDS_BF16_XF32_BATCHED,
+    hidden: &[],
+    explicit_bytes: 36,
+    segment_bytes: 36,
+    segment_align: 8,
+    domain: DOMAIN_F32_BATCHED,
+    exports: &[
+        ExportV1 {
+            symbol: "gemm_bf16_xf32_batched",
+            arch: Arch::Gfx1201,
+            object: ObjectRefV1::HipccSource {
+                module: "gemm_bf16_xf32_batched",
+                source: "kernels/src/gemm_bf16_xf32_batched.hip",
+            },
+            block: [32, 1, 1],
+            dynamic_lds: 0,
+            group_segment_fixed: 0,
+            grid: [P_M, P_N, ONE],
+            consts: &[],
+        },
+        ExportV1 {
+            symbol: "gemm_bf16_xf32_batched",
+            arch: Arch::Gfx1100,
+            object: ObjectRefV1::HipccSource {
+                module: "gemm_bf16_xf32_batched",
+                source: "kernels/src/gemm_bf16_xf32_batched.hip",
+            },
+            block: [32, 1, 1],
+            dynamic_lds: 0,
+            group_segment_fixed: 0,
+            grid: [P_M, P_N, ONE],
+            consts: &[],
+        },
+    ],
+};
+
+/// Hidden block of the hipcc `gemm_bf16_xf32_tiled_rows*` objects (they read `blockDim`): offsets from the
+/// metadata of the F32 sibling `gfx1201/gemm_f32_tiled_rows.e23c665b964e8f70.hsaco` (both entries); the
+/// BF16 object is hipcc-JIT'd with the same entry layout.
+const HIDDEN_BF16_TILED: &[HiddenV1] = &[
     hip_hidden(40, 4, HiddenKind::BlockCount(Axis::X)),
     hip_hidden(44, 4, HiddenKind::BlockCount(Axis::Y)),
     hip_hidden(48, 4, HiddenKind::BlockCount(Axis::Z)),
@@ -652,7 +745,7 @@ const HIDDEN_F32_TILED: &[HiddenV1] = &[
     hip_hidden(104, 2, HiddenKind::GridDims),
 ];
 
-const DOMAIN_F32_TILED: &[DomainRuleV1] = &[
+const DOMAIN_BF16_TILED: &[DomainRuleV1] = &[
     rule(Rule::Positive(P_M), "no output rows"),
     rule(Rule::Positive(P_K), "empty reduction"),
     rule(Rule::Positive(P_N), "no activation rows"),
@@ -662,7 +755,7 @@ const DOMAIN_F32_TILED: &[DomainRuleV1] = &[
     ),
 ];
 
-const DOMAIN_F32_TILED_MP4: &[DomainRuleV1] = &[
+const DOMAIN_BF16_TILED_MP4: &[DomainRuleV1] = &[
     rule(Rule::Positive(P_M), "no output rows"),
     rule(Rule::Positive(P_K), "empty reduction"),
     rule(Rule::Positive(P_N), "no activation rows"),
@@ -676,31 +769,32 @@ const DOMAIN_F32_TILED_MP4: &[DomainRuleV1] = &[
     ),
 ];
 
-/// `gemm_f32_tiled_rows` (MPW=16, any M; grid x = ceil(M/128)): hsaco
-/// `~/.hipfire_kernels/gfx1201/gemm_f32_tiled_rows.e23c665b964e8f70.hsaco` (source byte-identical to
-/// `kernels/src/gemm_f32_tiled_rows.hip`; `b71442ce97f0b7f4` is an older source): args `A@0` (read_only)
+/// `gemm_bf16_xf32_tiled_rows` (MPW=16, any M; grid x = ceil(M/128)), BF16 weight: hipcc-JIT'd from
+/// `kernels/src/gemm_bf16_xf32_tiled_rows.hip` with the entry layout of its F32 sibling (the hsaco
+/// `gemm_f32_tiled_rows.e23c665b964e8f70` evidence belongs to that F32 kernel; no BF16 hsaco hash is
+/// pinned): args `A@0` (read_only)
 /// `X@8` (read_only) `Y@16` (write_only), `M@24 K@28 N@32` by value, then the 13 hidden words at
 /// 40..106, `.kernarg_segment_size` 296 / align 8, `.group_segment_fixed_size` 16384
 /// (`xs[4][1024]` f32), `.max_flat_workgroup_size` 256. The launcher chunks the grid-y extent.
-pub static GEMM_F32_TILED_ROWS: KernelAbiV1 = KernelAbiV1 {
-    id: "generic_gemm.f32_tiled_rows.mpw16",
+pub static GEMM_BF16_XF32_TILED_ROWS: KernelAbiV1 = KernelAbiV1 {
+    id: "generic_gemm.bf16_xf32_tiled_rows.mpw16",
     version: 1,
     wave: 32,
     numeric: NUMERIC_F32_LANE_STRIDED,
     params: PARAMS_F32_GEMM,
-    operands: OPS_F32_GEMM,
+    operands: OPS_BF16_XF32_GEMM,
     fields: FIELDS_F32_GEMM,
-    hidden: HIDDEN_F32_TILED,
+    hidden: HIDDEN_BF16_TILED,
     explicit_bytes: 36,
     segment_bytes: 296,
     segment_align: 8,
-    domain: DOMAIN_F32_TILED,
+    domain: DOMAIN_BF16_TILED,
     exports: &[ExportV1 {
-        symbol: "gemm_f32_tiled_rows",
+        symbol: "gemm_bf16_xf32_tiled_rows",
         arch: Arch::Gfx1201,
         object: ObjectRefV1::HipccSource {
-            module: "gemm_f32_tiled_rows",
-            source: "kernels/src/gemm_f32_tiled_rows.hip",
+            module: "gemm_bf16_xf32_tiled_rows",
+            source: "kernels/src/gemm_bf16_xf32_tiled_rows.hip",
         },
         block: [256, 1, 1],
         dynamic_lds: 0,
@@ -710,28 +804,28 @@ pub static GEMM_F32_TILED_ROWS: KernelAbiV1 = KernelAbiV1 {
     }],
 };
 
-/// `gemm_f32_tiled_rows_mp4` (MPW=4, `M <= 32`; grid x = ceil(M/32)): same object and layout as
-/// [`GEMM_F32_TILED_ROWS`] (`gemm_f32_tiled_rows.e23c665b964e8f70.hsaco`, entry
-/// `gemm_f32_tiled_rows_mp4`: segment 296, LDS 16384, max flat 256, identical hidden block).
-pub static GEMM_F32_TILED_ROWS_MP4: KernelAbiV1 = KernelAbiV1 {
-    id: "generic_gemm.f32_tiled_rows.mpw4",
+/// `gemm_bf16_xf32_tiled_rows_mp4` (MPW=4, `M <= 32`; grid x = ceil(M/32)): same object and layout as
+/// [`GEMM_BF16_XF32_TILED_ROWS`] (F32-sibling evidence `gemm_f32_tiled_rows.e23c665b964e8f70.hsaco`, entry
+/// `_mp4`: segment 296, LDS 16384, max flat 256, identical hidden block).
+pub static GEMM_BF16_XF32_TILED_ROWS_MP4: KernelAbiV1 = KernelAbiV1 {
+    id: "generic_gemm.bf16_xf32_tiled_rows.mpw4",
     version: 1,
     wave: 32,
     numeric: NUMERIC_F32_LANE_STRIDED,
     params: PARAMS_F32_GEMM,
-    operands: OPS_F32_GEMM,
+    operands: OPS_BF16_XF32_GEMM,
     fields: FIELDS_F32_GEMM,
-    hidden: HIDDEN_F32_TILED,
+    hidden: HIDDEN_BF16_TILED,
     explicit_bytes: 36,
     segment_bytes: 296,
     segment_align: 8,
-    domain: DOMAIN_F32_TILED_MP4,
+    domain: DOMAIN_BF16_TILED_MP4,
     exports: &[ExportV1 {
-        symbol: "gemm_f32_tiled_rows_mp4",
+        symbol: "gemm_bf16_xf32_tiled_rows_mp4",
         arch: Arch::Gfx1201,
         object: ObjectRefV1::HipccSource {
-            module: "gemm_f32_tiled_rows",
-            source: "kernels/src/gemm_f32_tiled_rows.hip",
+            module: "gemm_bf16_xf32_tiled_rows",
+            source: "kernels/src/gemm_bf16_xf32_tiled_rows.hip",
         },
         block: [256, 1, 1],
         dynamic_lds: 0,
@@ -754,24 +848,43 @@ const BIND_F32_K: BindV1 = BindV1 {
     },
 };
 
-/// Admission of `gemm_f32_batched`. The product selector `f32_rows_gemm` sends `n >= F32_TILED_ROWS_MIN_N`
-/// (512) rows to the tiled kernel on gfx1201 unless `HIPFIRE_F32_TILED_ROWS=0`, so ON THAT PATH batched
-/// is the complementary domain (`n < 512`, all rows on other archs). It is NOT limited to it: other
-/// launchers call `Gpu::gemm_f32_batched` directly at any row count (e.g. `hipfire-arch-raon/src/projection.rs`
-/// `DType::F32` weights, `hipfire-dispatch/src/families/gemm.rs`), and the Raon pp4096 trace shows it at
-/// 512 rows. The domain is therefore every row count; the predicate names the selector.
+/// Admission of `gemm_f32_batched`: the F32 fallback for tensors the loader kept F32 (the selector
+/// `rows_gemm` routes BF16-resident weights to the `gemm_bf16_xf32_*` kernels). It is not row-limited:
+/// other launchers call `Gpu::gemm_f32_batched` directly at any row count (e.g. `hipfire-dispatch/src/families/gemm.rs`).
 const ADMIT_F32_BATCHED: RowDomainV1 = RowDomainV1 {
     min_rows: 1,
     max_rows: None,
-    predicate: "crates/hipfire-dispatch/src/pipeline/stream_mix.rs::F32_TILED_ROWS_MIN_N",
+    predicate: "crates/hipfire-dispatch/src/pipeline/stream_mix.rs::BF16_TILED_ROWS_MIN_N",
     kill_env: None,
 };
 
-const ADMIT_F32_TILED: RowDomainV1 = RowDomainV1 {
+/// Admission of `gemm_bf16_xf32_batched`: the selector `rows_gemm` sends BF16-resident weights with
+/// `n < BF16_TILED_ROWS_MIN_N` (512) here, and every row count on archs without the tiled kernel
+/// (gfx1100) or with `HIPFIRE_BF16W_TILED_ROWS=0`; Raon's router calls it directly.
+const ADMIT_BF16_XF32_BATCHED: RowDomainV1 = RowDomainV1 {
+    min_rows: 1,
+    max_rows: None,
+    predicate: "crates/hipfire-dispatch/src/pipeline/stream_mix.rs::BF16_TILED_ROWS_MIN_N",
+    kill_env: None,
+};
+
+const ADMIT_BF16_TILED: RowDomainV1 = RowDomainV1 {
     min_rows: 512,
     max_rows: None,
-    predicate: "crates/hipfire-dispatch/src/pipeline/stream_mix.rs::F32_TILED_ROWS_MIN_N",
-    kill_env: Some("HIPFIRE_F32_TILED_ROWS"),
+    predicate: "crates/hipfire-dispatch/src/pipeline/stream_mix.rs::BF16_TILED_ROWS_MIN_N",
+    kill_env: Some("HIPFIRE_BF16W_TILED_ROWS"),
+};
+
+/// Weight binding of the BF16 GEMMs: the weight is BF16-resident, fused sibling rows allowed.
+const BIND_BF16_K: BindV1 = BindV1 {
+    param: "K",
+    source: BindSource::Weight {
+        by: "M",
+        by_axis: WeightAxis::Rows,
+        codecs: &[],
+        stacking: Stacking::Single,
+        fuse_siblings: true,
+    },
 };
 
 pub static WORK_GEMM_F32_BATCHED: WorkSpecV1 = WorkSpecV1 {
@@ -793,52 +906,71 @@ pub static WORK_GEMM_F32_BATCHED: WorkSpecV1 = WorkSpecV1 {
     },
 };
 
-pub static WORK_GEMM_F32_TILED_ROWS: WorkSpecV1 = WorkSpecV1 {
-    abi: &GEMM_F32_TILED_ROWS,
+pub static WORK_GEMM_BF16_XF32_BATCHED: WorkSpecV1 = WorkSpecV1 {
+    abi: &GEMM_BF16_XF32_BATCHED,
     work: WorkV1 {
         op_class: op_class::GEMM,
-        codec: "f32",
+        codec: "bf16",
         pipe: Pipe::ValuF32,
         macs: Some(Expr::Mul(&[P_M, P_N, P_K])),
         flops: None,
         bytes: None,
         rows: Some("N"),
-        admit: ADMIT_F32_TILED,
-        bind: &[
-            BindV1 {
-                param: "N",
-                source: BindSource::ChunkRows,
-            },
-            BIND_F32_K,
-        ],
-        note: "Grid y = ceil(N/4) leaves N in an interval of 4: ChunkRows narrows it. M in (32, ..] takes this entry, \
-               M <= 32 the mp4 entry. Admitted on gfx1201 only, at n >= 512 rows, `HIPFIRE_F32_TILED_ROWS=0` \
-               restores gemm_f32_batched. Bytes = A + X + Y extents.",
+        admit: ADMIT_BF16_XF32_BATCHED,
+        bind: &[BIND_BF16_K],
+        note: "One wave per output: grid (M, N) gives M and N exactly; K from the BF16 weight. Bytes = A + B + Y \
+               extents (A is 2 bytes per element). Every output re-reads its activation row (L2-served), so the \
+               true traffic exceeds the operand extents. Selector `rows_gemm`'s n < 512 / non-gfx1201 / \
+               kill-switch route for BF16-resident weights, and Raon's router.",
     },
 };
 
-pub static WORK_GEMM_F32_TILED_ROWS_MP4: WorkSpecV1 = WorkSpecV1 {
-    abi: &GEMM_F32_TILED_ROWS_MP4,
+pub static WORK_GEMM_BF16_XF32_TILED_ROWS: WorkSpecV1 = WorkSpecV1 {
+    abi: &GEMM_BF16_XF32_TILED_ROWS,
     work: WorkV1 {
         op_class: op_class::GEMM,
-        codec: "f32",
+        codec: "bf16",
         pipe: Pipe::ValuF32,
         macs: Some(Expr::Mul(&[P_M, P_N, P_K])),
         flops: None,
         bytes: None,
         rows: Some("N"),
-        admit: ADMIT_F32_TILED,
+        admit: ADMIT_BF16_TILED,
         bind: &[
             BindV1 {
                 param: "N",
                 source: BindSource::ChunkRows,
             },
-            BIND_F32_K,
+            BIND_BF16_K,
+        ],
+        note: "Grid y = ceil(N/4) leaves N in an interval of 4: ChunkRows narrows it. M in (32, ..] takes this entry, \
+               M <= 32 the mp4 entry. Admitted on gfx1201 only, at n >= 512 rows, `HIPFIRE_BF16W_TILED_ROWS=0` \
+               restores gemm_bf16_xf32_batched. Bytes = A + X + Y extents.",
+    },
+};
+
+pub static WORK_GEMM_BF16_XF32_TILED_ROWS_MP4: WorkSpecV1 = WorkSpecV1 {
+    abi: &GEMM_BF16_XF32_TILED_ROWS_MP4,
+    work: WorkV1 {
+        op_class: op_class::GEMM,
+        codec: "bf16",
+        pipe: Pipe::ValuF32,
+        macs: Some(Expr::Mul(&[P_M, P_N, P_K])),
+        flops: None,
+        bytes: None,
+        rows: Some("N"),
+        admit: ADMIT_BF16_TILED,
+        bind: &[
+            BindV1 {
+                param: "N",
+                source: BindSource::ChunkRows,
+            },
+            BIND_BF16_K,
         ],
         note: "The MPW=4 entry of the tiled kernel, taken when M <= 32 (the mHC selector, M = 17). Grid x = ceil(M/32) \
                is 1 for every admitted M, so the grid only bounds M to [1, 32]; the weight match (by M, interval \
                [1, 32]) then binds M exactly (e.g. the 17-row fused mHC phi) and K. Same row domain as \
-               gemm_f32_tiled_rows.",
+               gemm_bf16_xf32_tiled_rows.",
     },
 };
 
@@ -1546,8 +1678,9 @@ pub static ABIS: &[&KernelAbiV1] = &[
     &GEMM_Q8_0_WMMA,
     &GEMM_MQ4G256V2_MOE_GROUPED_WMMA,
     &GEMM_F32_BATCHED,
-    &GEMM_F32_TILED_ROWS,
-    &GEMM_F32_TILED_ROWS_MP4,
+    &GEMM_BF16_XF32_BATCHED,
+    &GEMM_BF16_XF32_TILED_ROWS,
+    &GEMM_BF16_XF32_TILED_ROWS_MP4,
     &GEMV_Q8_0,
     &EMBEDDING_Q8_BATCHED,
     &MOE_GROUPED_QT44_A8_SYM,
@@ -1559,8 +1692,9 @@ pub static WORK: &[&WorkSpecV1] = &[
     &WORK_GEMM_Q8_0_WMMA,
     &WORK_GEMM_MQ4G256V2_MOE_GROUPED_WMMA,
     &WORK_GEMM_F32_BATCHED,
-    &WORK_GEMM_F32_TILED_ROWS,
-    &WORK_GEMM_F32_TILED_ROWS_MP4,
+    &WORK_GEMM_BF16_XF32_BATCHED,
+    &WORK_GEMM_BF16_XF32_TILED_ROWS,
+    &WORK_GEMM_BF16_XF32_TILED_ROWS_MP4,
     &WORK_GEMV_Q8_0,
     &WORK_EMBEDDING_Q8_BATCHED,
     &WORK_MOE_GROUPED_QT44_A8_SYM,
@@ -1689,7 +1823,7 @@ mod tests {
 
     #[test]
     fn every_contract_self_checks() {
-        assert_eq!(ABIS.len(), 9);
+        assert_eq!(ABIS.len(), 10);
         for abi in ABIS {
             if let Err(e) = abi.self_check() {
                 panic!("{}: {e:#?}", abi.id);
@@ -1862,19 +1996,29 @@ mod tests {
                 );
             }
         }
+        for arch in [Arch::Gfx1201, Arch::Gfx1100] {
+            check_grid(
+                &GEMM_BF16_XF32_BATCHED,
+                arch,
+                "gemm_bf16_xf32_batched",
+                [544, 512],
+                &[("M", 17), ("K", 10240), ("N", 512)],
+                [Some("M"), Some("N")],
+            );
+        }
         // Tiled entries on the same shapes: router M = 128 (MPW16), selector M = 17 (MPW4), N = 512.
         check_grid(
-            &GEMM_F32_TILED_ROWS,
+            &GEMM_BF16_XF32_TILED_ROWS,
             Arch::Gfx1201,
-            "gemm_f32_tiled_rows",
+            "gemm_bf16_xf32_tiled_rows",
             [256, 128],
             &[("M", 128), ("K", 2560), ("N", 512)],
             [Some("M"), Some("N")],
         );
         check_grid(
-            &GEMM_F32_TILED_ROWS_MP4,
+            &GEMM_BF16_XF32_TILED_ROWS_MP4,
             Arch::Gfx1201,
-            "gemm_f32_tiled_rows_mp4",
+            "gemm_bf16_xf32_tiled_rows_mp4",
             [256, 128],
             &[("M", 17), ("K", 10240), ("N", 512)],
             [Some("M"), Some("N")],
@@ -1952,12 +2096,13 @@ mod tests {
                 .chain((0..ns).map(|i| (8 * np + 4 * i, 4)))
                 .collect()
         };
-        let cases: [(&KernelAbiV1, u32, u32, Vec<(u32, u32)>); 9] = [
+        let cases: [(&KernelAbiV1, u32, u32, Vec<(u32, u32)>); 10] = [
             (&GEMM_Q8_0_WMMA, 36, 36, ptr_scalar(3, 3)),
             (&GEMM_MQ4G256V2_MOE_GROUPED_WMMA, 60, 60, ptr_scalar(5, 5)),
             (&GEMM_F32_BATCHED, 36, 36, ptr_scalar(3, 3)),
-            (&GEMM_F32_TILED_ROWS, 36, 296, ptr_scalar(3, 3)),
-            (&GEMM_F32_TILED_ROWS_MP4, 36, 296, ptr_scalar(3, 3)),
+            (&GEMM_BF16_XF32_BATCHED, 36, 36, ptr_scalar(3, 3)),
+            (&GEMM_BF16_XF32_TILED_ROWS, 36, 296, ptr_scalar(3, 3)),
+            (&GEMM_BF16_XF32_TILED_ROWS_MP4, 36, 296, ptr_scalar(3, 3)),
             (&GEMV_Q8_0, 32, 32, ptr_scalar(3, 2)),
             (&EMBEDDING_Q8_BATCHED, 28, 288, ptr_scalar(3, 1)),
             (&MOE_GROUPED_QT44_A8_SYM, 72, 72, ptr_scalar(6, 6)),
@@ -1972,16 +2117,16 @@ mod tests {
         }
         // Hidden blocks: 13 words of the hipcc implicit-arg block, as the metadata lists them.
         assert!(GEMM_Q8_0_WMMA.hidden.is_empty() && GEMV_Q8_0.hidden.is_empty());
-        assert_eq!(GEMM_F32_TILED_ROWS.hidden.len(), 13);
-        assert_eq!(GEMM_F32_TILED_ROWS.hidden[0].offset, 40);
-        assert_eq!(GEMM_F32_TILED_ROWS.hidden[12].offset, 104);
+        assert_eq!(GEMM_BF16_XF32_TILED_ROWS.hidden.len(), 13);
+        assert_eq!(GEMM_BF16_XF32_TILED_ROWS.hidden[0].offset, 40);
+        assert_eq!(GEMM_BF16_XF32_TILED_ROWS.hidden[12].offset, 104);
         assert_eq!(EMBEDDING_Q8_BATCHED.hidden.len(), 13);
         assert_eq!(EMBEDDING_Q8_BATCHED.hidden[0].offset, 32);
         assert_eq!(EMBEDDING_Q8_BATCHED.hidden[12].offset, 96);
-        for e in GEMM_F32_TILED_ROWS
+        for e in GEMM_BF16_XF32_TILED_ROWS
             .exports
             .iter()
-            .chain(GEMM_F32_TILED_ROWS_MP4.exports)
+            .chain(GEMM_BF16_XF32_TILED_ROWS_MP4.exports)
         {
             assert_eq!(e.group_segment_fixed, 16384, "{}", e.symbol);
             assert_eq!(e.block, [256, 1, 1]);
@@ -1991,26 +2136,31 @@ mod tests {
     // ---- work specs ----------------------------------------------------------------------------
 
     #[test]
-    fn f32_tiled_admission_is_the_selector_floor() {
-        for w in [&WORK_GEMM_F32_TILED_ROWS, &WORK_GEMM_F32_TILED_ROWS_MP4] {
+    fn bf16_tiled_admission_is_the_selector_floor() {
+        for w in [
+            &WORK_GEMM_BF16_XF32_TILED_ROWS,
+            &WORK_GEMM_BF16_XF32_TILED_ROWS_MP4,
+        ] {
             assert_eq!(w.work.admit.min_rows, 512);
             assert_eq!(w.work.admit.max_rows, None);
-            assert_eq!(w.work.admit.kill_env, Some("HIPFIRE_F32_TILED_ROWS"));
+            assert_eq!(w.work.admit.kill_env, Some("HIPFIRE_BF16W_TILED_ROWS"));
             assert!(w
                 .work
                 .admit
                 .predicate
-                .ends_with("stream_mix.rs::F32_TILED_ROWS_MIN_N"));
+                .ends_with("stream_mix.rs::BF16_TILED_ROWS_MIN_N"));
         }
         // The batched kernel is admitted at every row count (direct callers), the selector named.
         assert_eq!(WORK_GEMM_F32_BATCHED.work.admit.min_rows, 1);
         assert_eq!(WORK_GEMM_F32_BATCHED.work.admit.max_rows, None);
+        assert_eq!(WORK_GEMM_BF16_XF32_BATCHED.work.admit.min_rows, 1);
+        assert_eq!(WORK_GEMM_BF16_XF32_BATCHED.work.admit.max_rows, None);
         // The source constant the contract mirrors.
         let text = std::fs::read_to_string(
             repo_root().join("crates/hipfire-dispatch/src/pipeline/stream_mix.rs"),
         )
         .unwrap();
-        assert!(text.contains("F32_TILED_ROWS_MIN_N: usize = 512;"));
+        assert!(text.contains("BF16_TILED_ROWS_MIN_N: usize = 512;"));
     }
 
     #[test]

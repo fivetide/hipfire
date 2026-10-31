@@ -136,7 +136,7 @@ impl RaonMoeDims {
 /// Borrowed tensors of one MoE layer (layers 1..24).
 #[derive(Clone, Copy)]
 pub struct RaonMoeLayerRefs<'a> {
-    /// F32 `[n_experts, hidden]` router weight (BF16 values expanded).
+    /// BF16 `[n_experts, hidden]` router weight (F32 when the loader kept an inexact tensor in F32).
     pub router_weight: &'a GpuTensor,
     /// F32 `[n_experts]` selection-only correction bias.
     pub correction_bias: &'a GpuTensor,
