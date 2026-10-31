@@ -10,9 +10,10 @@
 //! numeric candidate without that evidence is never promoted.
 
 use super::{
-    ktok, AttemptV1, ClaimPolicyV1, KldRunV1, KldTokenEvidenceV2, PromotionV1, Refusal,
+    ktok, rowclass, AttemptV1, ClaimPolicyV1, KldRunV1, KldTokenEvidenceV2, PromotionV1, Refusal,
     TuneEvidenceV1,
 };
+use serde_json::Value;
 
 pub const STAGES: [&str; 6] = [
     "m7",
@@ -369,27 +370,111 @@ pub fn kld_state_stage(ev: &TuneEvidenceV1, policy: &ClaimPolicyV1) -> Result<()
     Ok(())
 }
 
-fn run_stages_1_to_5(ev: &TuneEvidenceV1, policy: &ClaimPolicyV1) -> Result<(), Refusal> {
-    stage_m7(ev).map_err(|r| refuse(0, r))?;
-    stage_correctness(ev, policy).map_err(|r| refuse(1, r))?;
-    stage_abba(ev, policy).map_err(|r| refuse(2, r))?;
-    stage_noise(ev, policy).map_err(|r| refuse(3, r))?;
-    stage_confirm(ev, policy).map_err(|r| refuse(4, r))?;
-    Ok(())
+/// Stage name of the row-class gate ([`super::rowclass::gate`]). It is not in
+/// [`STAGES`]: it runs between `correctness` and `abba`, and only for records
+/// the gate [`applies`](super::rowclass::applies) to, which then also list it in
+/// the `passed` stages.
+pub const ROWCLASS_STAGE: &str = "rowclass";
+
+/// Parsed JSON of every attempt's `record_path` that can be read. An unreadable
+/// or non-JSON record is not a row-class record; its other stages still judge it.
+fn load_records(ev: &TuneEvidenceV1) -> Vec<(String, Value)> {
+    attempts(ev)
+        .filter_map(|(n, a)| {
+            let v = serde_json::from_slice(&std::fs::read(&a.record_path).ok()?).ok()?;
+            Some((n, v))
+        })
+        .collect()
 }
 
-/// Stages 1-5 all pass (KLD/state not considered).
+/// Row-class gate over every governed record. `Ok(true)` = at least one record
+/// was judged.
+fn stage_rowclass(recs: &[(String, Value)], policy: &ClaimPolicyV1) -> Result<bool, Refusal> {
+    let mut ran = false;
+    for (n, r) in recs {
+        if !rowclass::applies(r, policy) {
+            continue;
+        }
+        ran = true;
+        rowclass::gate(r, policy).map_err(|e| Refusal {
+            stage: ROWCLASS_STAGE.to_owned(),
+            reason: format!("{n}: {e}"),
+            passed: STAGES[..2].iter().map(|s| (*s).to_owned()).collect(),
+        })?;
+    }
+    Ok(ran)
+}
+
+/// `passed` of a refusal at stage `idx` when the row-class gate did / did not run.
+fn passed_before(idx: usize, rowclass_ran: bool) -> Vec<String> {
+    let mut p: Vec<String> = STAGES[..idx].iter().map(|s| (*s).to_owned()).collect();
+    if rowclass_ran && idx >= 2 {
+        p.insert(2, ROWCLASS_STAGE.to_owned());
+    }
+    p
+}
+
+/// Stages 1-5; `Ok(rowclass_ran)`.
+fn run_stages_1_to_5(
+    ev: &TuneEvidenceV1,
+    policy: &ClaimPolicyV1,
+    recs: &[(String, Value)],
+) -> Result<bool, Refusal> {
+    stage_m7(ev).map_err(|r| refuse(0, r))?;
+    stage_correctness(ev, policy).map_err(|r| refuse(1, r))?;
+    let ran = stage_rowclass(recs, policy)?;
+    let late = |idx: usize, reason: String| Refusal {
+        passed: passed_before(idx, ran),
+        ..refuse(idx, reason)
+    };
+    stage_abba(ev, policy).map_err(|r| late(2, r))?;
+    stage_noise(ev, policy).map_err(|r| late(3, r))?;
+    stage_confirm(ev, policy).map_err(|r| late(4, r))?;
+    Ok(ran)
+}
+
+/// Stages 1-5 all pass (KLD/state not considered). Attempt records are read from
+/// their `record_path`s for the row-class gate; see [`is_winner_with_records`].
 pub fn is_winner(ev: &TuneEvidenceV1, policy: &ClaimPolicyV1) -> bool {
-    run_stages_1_to_5(ev, policy).is_ok()
+    is_winner_with_records(ev, policy, &load_records(ev))
+}
+
+/// [`is_winner`] with the attempts' parsed records (`(attempt name, record)`)
+/// supplied by the caller.
+pub fn is_winner_with_records(
+    ev: &TuneEvidenceV1,
+    policy: &ClaimPolicyV1,
+    recs: &[(String, Value)],
+) -> bool {
+    run_stages_1_to_5(ev, policy, recs).is_ok()
 }
 
 pub fn can_promote(ev: &TuneEvidenceV1, policy: &ClaimPolicyV1) -> Result<PromotionV1, Refusal> {
-    run_stages_1_to_5(ev, policy)?;
-    kld_state_stage(ev, policy).map_err(|r| refuse(5, r))?;
+    can_promote_with_records(ev, policy, &load_records(ev))
+}
+
+/// [`can_promote`] with the attempts' parsed records supplied by the caller. A
+/// `hip_loop --rowclasses` record is refused if any admitted row class is
+/// `Slower` (listing the classes), if its regime does not fit the LLC, or, for a
+/// `contract:` node whose contract admits several classes, if it has no sweep.
+pub fn can_promote_with_records(
+    ev: &TuneEvidenceV1,
+    policy: &ClaimPolicyV1,
+    recs: &[(String, Value)],
+) -> Result<PromotionV1, Refusal> {
+    let ran = run_stages_1_to_5(ev, policy, recs)?;
+    kld_state_stage(ev, policy).map_err(|r| Refusal {
+        passed: passed_before(5, ran),
+        ..refuse(5, r)
+    })?;
     let ratios: Vec<f64> = attempts(ev).filter_map(|(_, a)| a.block_ratio).collect();
     let g = (ratios.iter().map(|r| r.ln()).sum::<f64>() / ratios.len() as f64).exp();
+    let mut passed: Vec<String> = STAGES.iter().map(|s| (*s).to_owned()).collect();
+    if ran {
+        passed.insert(2, ROWCLASS_STAGE.to_owned());
+    }
     Ok(PromotionV1 {
-        passed: STAGES.iter().map(|s| (*s).to_owned()).collect(),
+        passed,
         speedup: 1.0 / g,
     })
 }
@@ -847,5 +932,105 @@ mod tests {
 
     fn s_ev(e: &TuneEvidenceV1) -> String {
         serde_json::to_string(e).unwrap()
+    }
+
+    fn rc_class(rows: u64, ratio: f64, pf: f64, ps: f64) -> Value {
+        serde_json::json!({
+            "rows": rows, "shape": "M=128,K=2560", "identical_to_baseline": true,
+            "timing": {"ratio_median": ratio, "p_faster": pf, "p_slower": ps, "rounds": []},
+            "admitted": {"baseline": true, "candidate": true},
+        })
+    }
+
+    fn rc_record(classes: Vec<Value>) -> Value {
+        serde_json::json!({
+            "node": "contract:generic_gemm.f32_tiled_rows.mpw16",
+            "vs": "contract:generic_gemm.f32_batched.wave_per_output",
+            "arch": "gfx1201", "regime": "hot", "bytes_per_call": 1.0e6, "rowclasses": classes,
+        })
+    }
+
+    #[test]
+    fn rowclass_veto_and_sweep_requirement_in_promotion() {
+        let p = ClaimPolicyV1::default();
+        let e = ev();
+        let recs = |r: Value| vec![("discovery".to_owned(), r)];
+        // Non-contract records keep today's behaviour: no records, no gate.
+        assert!(can_promote_with_records(&e, &p, &[]).is_ok());
+        let plain = serde_json::json!({"node": "mq6_res", "arch": "gfx1201"});
+        assert!(can_promote_with_records(&e, &p, &recs(plain)).is_ok());
+
+        // Faster everywhere admitted: promoted, and the stage is listed.
+        let good = rc_record(vec![
+            rc_class(1, 0.8, 1e-4, 1.0),
+            rc_class(512, 0.8, 1e-4, 1.0),
+        ]);
+        let g = can_promote_with_records(&e, &p, &recs(good.clone())).unwrap();
+        assert_eq!(g.passed[2], ROWCLASS_STAGE);
+        assert_eq!(g.passed.len(), 7);
+        assert!(is_winner_with_records(&e, &p, &recs(good)));
+
+        // Any admitted Slower class vetoes, naming the class.
+        let bad = rc_record(vec![
+            rc_class(1, 1.6, 1.0, 1e-4),
+            rc_class(512, 0.8, 1e-4, 1.0),
+        ]);
+        let r = can_promote_with_records(&e, &p, &recs(bad.clone())).unwrap_err();
+        assert_eq!(r.stage, ROWCLASS_STAGE);
+        assert_eq!(r.passed, STAGES[..2].to_vec());
+        assert!(r.reason.contains("rows=1 ") && r.reason.contains("veto"), "{}", r.reason);
+        assert!(!is_winner_with_records(&e, &p, &recs(bad)));
+
+        // Regime refusal flows through the gate.
+        let mut big = rc_record(vec![rc_class(512, 0.8, 1e-4, 1.0)]);
+        big["bytes_per_call"] = serde_json::json!(1u64 << 30);
+        let r = can_promote_with_records(&e, &p, &recs(big)).unwrap_err();
+        assert!(r.reason.contains("last-level cache"), "{}", r.reason);
+
+        // A single shape for a contract admitted at many classes needs a sweep.
+        let mut single = rc_record(vec![]);
+        single.as_object_mut().unwrap().remove("rowclasses");
+        let r = can_promote_with_records(&e, &p, &recs(single.clone())).unwrap_err();
+        assert_eq!(r.stage, ROWCLASS_STAGE);
+        assert!(r.reason.contains("no row-class sweep"), "{}", r.reason);
+        let off = ClaimPolicyV1 {
+            require_rowclasses: false,
+            ..p.clone()
+        };
+        assert!(can_promote_with_records(&e, &off, &recs(single)).is_ok());
+
+        // Later-stage refusals list the row-class stage once it ran.
+        let mut late = ev();
+        late.discovery.sign_p = Some(0.5);
+        let ok = rc_record(vec![rc_class(512, 0.8, 1e-4, 1.0)]);
+        let r = can_promote_with_records(&late, &p, &recs(ok)).unwrap_err();
+        assert_eq!(r.stage, "abba");
+        assert_eq!(r.passed, vec!["m7", "correctness", ROWCLASS_STAGE]);
+    }
+
+    #[test]
+    fn rowclass_records_are_read_from_record_path() {
+        let dir = std::env::temp_dir().join(format!("pmrc-promote-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rec.json");
+        let bad = rc_record(vec![rc_class(1, 1.6, 1.0, 1e-4), rc_class(512, 0.8, 1e-4, 1.0)]);
+        std::fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+        let mut e = ev();
+        e.discovery.record_path = path.to_str().unwrap().to_owned();
+        let p = ClaimPolicyV1::default();
+        assert_eq!(can_promote(&e, &p).unwrap_err().stage, ROWCLASS_STAGE);
+        assert!(!is_winner(&e, &p));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn policy_defaults_for_rowclass_fields_load_from_old_json() {
+        let p: ClaimPolicyV1 = serde_json::from_str(
+            r#"{"sign_p_max":0.001,"min_effect":0.005,"confirm_processes":1,"aa_processes":3}"#,
+        )
+        .unwrap();
+        assert!(p.require_rowclasses && p.shares.is_empty());
+        let q: ClaimPolicyV1 = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(p, q);
     }
 }

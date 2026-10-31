@@ -19,6 +19,7 @@ fn usage() -> ! {
     eprintln!("  pm-census tune kld|promote|trial-table ...        R7 KLD/state gate (see `pm-census tune`)");
     eprintln!("  pm-census tune kld --stat token-bootstrap ...     R9 token-level KLD statistic over HFKTOK per-token files");
     eprintln!("  pm-census tune kld-power --sd SD --margin M ...   R9 chunks needed for a margin / minimum resolvable margin");
+    eprintln!("  pm-census tune selector-receipt --record R.json ... --constant N --path F --value V --out O  pm.selector_receipt.v1 from hip_loop --rowclasses records");
     std::process::exit(2);
 }
 
@@ -37,6 +38,7 @@ fn main() {
         "noise" => pm_census::noise::cli(rest),
         "tune" => match rest.split_first() {
             Some((sub, tail)) if sub == "export" => pm_census::tune::store::cli(tail),
+            Some((sub, _)) if sub == "selector-receipt" => pm_census::tune::rowclass::cli(rest),
             Some((sub, _))
                 if matches!(
                     sub.as_str(),
