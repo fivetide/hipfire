@@ -92,11 +92,13 @@ pub fn symbol_a8(nt: usize, rf: usize) -> Option<&'static str> {
     })
 }
 
-/// Default W4A8 `(nt, rf)` from the node sweep (`bench_moe_grouped_qt44_iu4`, R9700, uniform routing):
-/// at >= 12288 grouped rows the two-tile x two-fragment entry wins (2.64 ms gate/up, 1.63 ms down at
-/// 4096 tokens, 103-108 TOPS); at 512 tokens (weight-stream bound) `nt2r1` ties the field.
+/// Default W4A8 `(nt, rf)` from the node sweep (`bench_moe_grouped_qt44_iu4`, R9700, 64..8192 tokens,
+/// uniform and skewed routing, `raon/pfx/ev/fp8/a8sel/`): from 4096 grouped rows the two-tile x
+/// two-fragment entry wins (routed gate/up 0.95x of `nt2r1` at 640 tokens, 0.83x at 1024, 0.73x at
+/// 4096; one-expert shared/dense at 4096 rows 0.89-0.94x); below it (weight-stream bound) `nt2r1`
+/// ties or wins. Every entry gives bit-identical output.
 pub fn select_entry_a8(m_total: usize, m: usize) -> (usize, usize) {
-    if m_total >= 12288 && m % 128 == 0 {
+    if m_total >= 4096 && m % 128 == 0 {
         (2, 2)
     } else {
         (2, 1)
@@ -449,5 +451,24 @@ mod tests {
         assert_eq!(select_entry_a8_gfx11("gfx1151", 4048, 2176), (4, 1));
         assert_eq!(select_entry_a8_gfx11("gfx1100", 25552, 2560), (2, 2));
         assert!(!a8_supported("gfx1030") && a8_entries("gfx942").is_empty());
+    }
+
+    #[test]
+    fn a8_selector_switches_to_nt2r2_from_4096_grouped_rows() {
+        for (m_total, m) in [
+            (64, 2560),
+            (4048, 2176),
+            (4096, 12032),
+            (7152, 2176),
+            (25552, 2560),
+        ] {
+            let (nt, rf) = select_entry_a8(m_total, m);
+            assert!(A8_ENTRIES.contains(&(nt, rf)));
+            assert_eq!(m % (64 * rf), 0);
+        }
+        assert_eq!(select_entry_a8(4048, 2176), (2, 1));
+        assert_eq!(select_entry_a8(7152, 2176), (2, 2));
+        assert_eq!(select_entry_a8(4096, 2560), (2, 2));
+        assert_eq!(select_entry_a8(4096, 1088), (2, 1));
     }
 }
