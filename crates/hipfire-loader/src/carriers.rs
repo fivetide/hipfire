@@ -3218,7 +3218,10 @@ pub fn qwen4_ep_vram_layers(
             explicit_chunk,
             owner_routed_prefill,
             stage_min_rows,
-            npu: match hipfire_arch_qwen4::npu_trunk::NpuTrunkMode::from_env() {
+            npu: match hipfire_runtime::coproc::Mode::from_config(
+                hipfire_arch_qwen4::npu_trunk::SWITCH,
+                hipfire_runtime::coproc::Mode::Auto,
+            ) {
                 Ok(npu) => {
                     hipfire_arch_qwen4::slowlink_admission::npu_trunk_selected(&gpu.arch, npu)
                 }
