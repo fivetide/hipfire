@@ -507,6 +507,27 @@ fn widened_route(wide_candidate: bool, limit: usize) -> bool {
     wide_candidate && limit > WIDENED_COMMIT_ROWS
 }
 
+/// Window during which a widened-PBS rung that really failed to allocate is
+/// not retried.
+const WIDENED_ALLOC_FAIL_MEMO: std::time::Duration = std::time::Duration::from_secs(60);
+
+static WIDENED_ALLOC_FAILED: std::sync::Mutex<Option<(usize, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// Rows to try first: `rows`, narrowed below a rung that failed within the memo window.
+fn widened_alloc_clamp(rows: usize) -> usize {
+    match *WIDENED_ALLOC_FAILED.lock().unwrap() {
+        Some((failed, at)) if at.elapsed() < WIDENED_ALLOC_FAIL_MEMO && rows >= failed => {
+            (failed / 2).max(WIDENED_COMMIT_ROWS)
+        }
+        _ => rows,
+    }
+}
+
+fn widened_alloc_failed(rows: usize) {
+    *WIDENED_ALLOC_FAILED.lock().unwrap() = Some((rows, std::time::Instant::now()));
+}
+
 /// Rows of the owned widened PBS for an `n`-token call under `limit`.
 fn widened_owned_rows(limit: usize, n: usize) -> usize {
     limit.min(n).max(MIN_BATCH)
@@ -3899,7 +3920,10 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                     // fails (a foreign allocation that leaves room never
                     // narrows the route); the receipt below reports the rows
                     // actually allocated.
-                    let mut rows = owned_rows;
+                    // A rung that really failed is not retried for a short
+                    // window (no alloc/free thrash per request while memory is
+                    // genuinely short); the next window re-tries the planned rung.
+                    let mut rows = widened_alloc_clamp(owned_rows);
                     let built = loop {
                         let attempt = if lean {
                             PrefillBatchScratch::new_opt_lean(gpu, config, rows)
@@ -3913,6 +3937,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                                 eprintln!(
                                     "prefill_chunk: allocating the {rows}-row prefill scratch failed ({e:?}); retrying with {next} rows"
                                 );
+                                widened_alloc_failed(rows);
                                 rows = next;
                             }
                             Err(e) => return Err(e),
