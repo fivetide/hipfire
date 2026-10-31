@@ -11,6 +11,9 @@ fn usage() -> ! {
     eprintln!("  pm-census census ...                              see `pm-census census --help`");
     eprintln!("  pm-census ledger ...                              retained-PM4 dispatch ledger -> CensusV1 (see `pm-census ledger --help`)");
     eprintln!("  pm-census extract ...                             see `pm-census extract --help`");
+    eprintln!("  pm-census extract nodes ...                       trace + config + hfq -> node corpus (see `pm-census extract nodes --help`)");
+    eprintln!("  pm-census roofline <corpus.json> [--what-if K=PIPE,...]   per-token MACs by op class/weight group, peak ceilings");
+    eprintln!("  pm-census queue <corpus.json>... [--top N] [--md NODE-QUEUE.md]   leaves ranked by share x (1 - floor/measured)");
     eprintln!("  pm-census noise ...                               see `pm-census noise --help`");
     eprintln!("  pm-census tune plan|run|export ...                R4-R6 autotuner (see `pm-census tune`)");
     eprintln!("  pm-census tune kld|promote|trial-table ...        R7 KLD/state gate (see `pm-census tune`)");
@@ -28,6 +31,8 @@ fn main() {
         "inventory" => pm_census::inventory::cli(rest),
         "census" => pm_census::census::cli(rest),
         "extract" => pm_census::extract::cli(rest),
+        "roofline" => pm_census::ingest::cli_roofline(rest),
+        "queue" => pm_census::ingest::cli_queue(rest),
         "ledger" => pm_census::ledger::cli(rest),
         "noise" => pm_census::noise::cli(rest),
         "tune" => match rest.split_first() {

@@ -18,11 +18,19 @@
 //!   `CensusV1` cell for the dispatches rocprofv3 cannot see.
 //! * [`noise`] — measurement-noise harness over pm_loop records: A/A null
 //!   controls, per-round ABBA dispersion, cross-process sign tests.
+//! * [`model`] — model descriptor: `config.json` integers and the `.hfq`
+//!   tensor directory (header only) as weight groups.
+//! * [`hw`] — per-arch peak table for rooflines.
+//! * [`ingest`] — `pm-census extract nodes` / `roofline` / `queue`: one
+//!   trace + model descriptor -> node corpus through `KernelAbiV1` + `WorkV1`.
 
 pub mod census;
 pub mod extract;
+pub mod hw;
+pub mod ingest;
 pub mod inventory;
 pub mod ledger;
+pub mod model;
 pub mod noise;
 pub mod rocprof;
 pub mod tune;

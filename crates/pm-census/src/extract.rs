@@ -190,7 +190,7 @@ pub fn decode_node(
 
 /// Value of `e` when it names no launch param (only literals and the
 /// export's constants).
-fn const_value(e: &Expr, abi: &KernelAbiV1, export: &ExportV1) -> Option<u64> {
+pub(crate) fn const_value(e: &Expr, abi: &KernelAbiV1, export: &ExportV1) -> Option<u64> {
     match e {
         Expr::Const(c) => Some(*c),
         Expr::Param(n) => {
@@ -1663,6 +1663,7 @@ pm-census extract — WorkloadCaseV1 corpus extraction
   pm-census extract pm-loop  <record.json|jsonl> [common] --out corpus.jsonl
   pm-census extract merge    A.jsonl B.jsonl ... --out C.jsonl
   pm-census extract verify   C.jsonl
+  pm-census extract nodes    --trace T --config C [--hfq H] --tokens N --out corpus.json   (node corpus; see `pm-census extract nodes --help`)
 
 common: [--model NAME] [--family F] [--arch A] [--phase prefill|ar|spec]
         [--mode eager|hip_graph|redline_pm4|railgun|unknown]
@@ -1914,6 +1915,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
                 .collect::<Result<Vec<_>, _>>()?;
             write_corpus(cases, &f.out()?)
         }
+        "nodes" => crate::ingest::cli_nodes(rest),
         "merge" => {
             let f = Flags::parse(rest, &["out"])?;
             if f.positional.is_empty() {
