@@ -517,7 +517,22 @@ pub fn receipt(
     if recs.is_empty() {
         return Err("no --record given".to_owned());
     }
-    let values: Vec<Value> = recs.iter().map(|r| r.2.clone()).collect();
+    // hip_loop writes `vs` as `{baseline:{contract,..}, candidate:{..}}`; older/synthetic
+    // records carry a plain string. Normalize to `contract:<baseline id>`.
+    let values: Vec<Value> = recs
+        .iter()
+        .map(|r| {
+            let mut v = r.2.clone();
+            if let Some(id) = v
+                .pointer("/vs/baseline/contract")
+                .and_then(Value::as_str)
+                .map(|s| format!("contract:{s}"))
+            {
+                v["vs"] = Value::String(id);
+            }
+            v
+        })
+        .collect();
     let candidate = same_str(&values, "node")?;
     let incumbent = same_str(&values, "vs")?;
     let arch = same_str(&values, "arch")?;

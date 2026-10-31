@@ -29,10 +29,8 @@ from pathlib import Path
 
 SCHEMA = "pm.selector_receipt.v1"
 BASELINE_REL = "scripts/selector-receipts-baseline.txt"
-# (path, NAME) pairs awaiting a receipt from the card job.
-PENDING = {
-    ("crates/hipfire-dispatch/src/pipeline/stream_mix.rs", "F32_TILED_ROWS_MIN_N"),
-}
+# (path, NAME) pairs awaiting a receipt from a card job (empty: F32_TILED_ROWS_MIN_N got its receipt).
+PENDING: set = set()
 NAME_RE = re.compile(
     r"(^|_)(MIN|MAX)_(N|M|ROWS|TOKENS|BATCH|T)($|_)"
     r"|ROWS_MIN|MIN_ROWS|MIN_TOKENS|ROWS_MAX|MAX_ROWS"

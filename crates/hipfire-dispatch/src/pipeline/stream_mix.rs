@@ -220,6 +220,7 @@ pub(crate) fn f32_rows_gemm(
 /// Smallest row count that takes the tiled kernel: the measured prefill region
 /// (pp512 and up). Decode (n = 1) and speculative verify (n <= 16) stay on
 /// `gemm_f32_batched`.
+// selector-receipt: receipts/selectors/F32_TILED_ROWS_MIN_N.json
 pub(crate) const F32_TILED_ROWS_MIN_N: usize = 512;
 
 /// JITs every kernel [`execute_stream_mix`] can launch (stream-mix kernels and
