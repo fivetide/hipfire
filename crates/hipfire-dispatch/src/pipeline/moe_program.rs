@@ -6880,6 +6880,9 @@ fn projection_kind(
     match dtype {
         DType::MQ4G256V2 => Ok((KernelKey::GemmMq4G256V2, true)),
         DType::Q8_0 => Ok((KernelKey::GemmQ8_0BatchedChunked, false)),
+        // F16-resident exact image of a BF16 source weight (prefill); decode
+        // reads a Q8_0 copy of the same tensor.
+        DType::F16 => Ok((KernelKey::GemmF16WmmaMb8, false)),
         DType::F32 => Ok((KernelKey::GemmF32Batched, false)),
         _ => Err(grouped_refusal(variant, "projection-dtype")),
     }
@@ -7127,6 +7130,11 @@ fn gated_ffn_from_basis(
                     ptr, &v.tiles, &v.sorted, xin, y, m, k, 1, rows, rows,
                 ));
             }
+        }
+        // A single row (decode) over a Q8_0 weight: the Q8 GEMV, not a
+        // one-column WMMA tile.
+        if rows == 1 && weight.dtype == DType::Q8_0 {
+            return hip!(gpu.gemv_q8_0(weight.buf, xin, y, m, k));
         }
         gemm.run_key(
             key,

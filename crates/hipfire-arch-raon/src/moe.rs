@@ -176,8 +176,14 @@ impl<'a> RaonMoeLayerRefs<'a> {
     ) -> Self {
         let mut gate = shared_gate.dispatch_ref();
         let mut up = shared_up.dispatch_ref();
-        gate.awq_scale = gate_up_awq;
-        up.awq_scale = gate_up_awq;
+        // Only a qt44 shared gate/up consumes the rotated, AWQ-divided basis;
+        // Q8_0/F16/F32 projections read the plain activation and take no scale.
+        if gate.dtype == DType::MQ4G256V2 {
+            gate.awq_scale = gate_up_awq;
+        }
+        if up.dtype == DType::MQ4G256V2 {
+            up.awq_scale = gate_up_awq;
+        }
         Self {
             router_weight: &router.buf,
             correction_bias,

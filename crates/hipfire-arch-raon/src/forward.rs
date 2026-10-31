@@ -860,7 +860,8 @@ fn ffn_block(
 ) -> Result<(), String> {
     match &layer.ffn {
         RaonFfn::Dense(d) => {
-            let refs = RaonDenseRefs::from_parts(&d.gate, &d.up, &d.down)?;
+            let (gate, up, down) = d.projections(rows);
+            let refs = RaonDenseRefs::from_parts(gate, up, down)?;
             forward_dense(
                 gpu,
                 ctx,
@@ -873,12 +874,13 @@ fn ffn_block(
             )
         }
         RaonFfn::Moe(m) => {
+            let (shared_gate, shared_up, shared_down) = m.shared.projections(rows);
             let refs = RaonMoeLayerRefs::from_parts(
                 &m.router,
                 &m.e_bias,
-                &m.shared.gate,
-                &m.shared.up,
-                &m.shared.down,
+                shared_gate,
+                shared_up,
+                shared_down,
                 &m.expert_gate_up_ptrs,
                 &m.expert_down_ptrs,
                 m.gate_up_awq.as_ref(),
