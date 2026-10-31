@@ -122,24 +122,15 @@ impl RaonSiteTiers {
     }
 }
 
-/// The arch default table. gfx1201: the grouped routed experts run W4A8 (KLD-neutral on the
-/// shipped artifact, see CHANGELOG); every other site is F16. Every other arch: all F16.
-/// This is the one place the default is decided; change it after measurement.
+/// The arch default table. gfx1201: every site runs int8 activations (A8): W4A8 for the qt44
+/// routed/shared/dense FFN, W8A8 for the Q8_0 attention-class projections. Chosen per site by
+/// measurement on R9700 (`raon/pfx/ev/fp8/`, CHANGELOG): A8 and FP8 run at the same speed at every
+/// site, A8 has the lower KLD at every site, A4 alone exceeds the +0.002 KLD budget at every FFN
+/// site, and all-A8 costs code24 +0.0003 / WT2 +0.0011 vs all-F16 on the shipped artifact.
+/// Every other arch: all F16.
 pub fn default_table(arch: &str) -> RaonSiteTiers {
     /// gfx1201 default, indexed like [`RaonPrecisionSite::ALL`].
-    const GFX1201: RaonSiteTiers = RaonSiteTiers {
-        tiers: [
-            PrefillActTier::A8,  // routed_gu
-            PrefillActTier::A8,  // routed_dn
-            PrefillActTier::F16, // shared
-            PrefillActTier::F16, // dense
-            PrefillActTier::F16, // mla_q
-            PrefillActTier::F16, // mla_kv
-            PrefillActTier::F16, // mla_go
-            PrefillActTier::F16, // rda_qkvg
-            PrefillActTier::F16, // rda_o
-        ],
-    };
+    const GFX1201: RaonSiteTiers = RaonSiteTiers::all(PrefillActTier::A8);
     if arch == "gfx1201" {
         GFX1201
     } else {
@@ -501,18 +492,7 @@ mod tests {
     #[test]
     fn default_tables_per_arch() {
         let d = default_table(R9700);
-        assert_eq!((d.get(S::RoutedGateUp), d.get(S::RoutedDown)), (A8, A8));
-        for site in [
-            S::Shared,
-            S::Dense,
-            S::MlaQ,
-            S::MlaKv,
-            S::MlaGo,
-            S::RdaQkvg,
-            S::RdaO,
-        ] {
-            assert_eq!(d.get(site), F16, "{}", site.name());
-        }
+        assert_eq!(d, RaonSiteTiers::all(A8));
         for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx942", ""] {
             assert_eq!(default_table(arch), RaonSiteTiers::ALL_F16, "{arch}");
         }
