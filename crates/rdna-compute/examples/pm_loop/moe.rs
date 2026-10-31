@@ -1823,24 +1823,43 @@ fn cand_object_object(entry: Entry, path: &str, bytes: &[u8]) -> Result<Object> 
     let gen_elf = peacemaker_isa::native::assemble(&generator.s_text, entry.spec.arch)?;
     let got = crate::iu4::abi_signature(bytes, &symbol)
         .map_err(|e| format!("--cand-object {path}: not a code object exposing {symbol}: {e}"))?;
-    let want = crate::iu4::abi_signature(&gen_elf, &symbol)?;
+    // gfx1201: the reference is the shipped image's own entry (the object the baseline launches),
+    // when that image exports the symbol; otherwise (an NT the shipped image lacks) the emit's.
+    let (want, want_what) = match shipped_reference(entry) {
+        Some(image) if crate::iu4::abi_signature(image, &symbol).is_ok() => (
+            crate::iu4::abi_signature(image, &symbol)?,
+            "shipped baseline image",
+        ),
+        _ => (
+            crate::iu4::abi_signature(&gen_elf, &symbol)?,
+            "in-tree emit",
+        ),
+    };
     if got != want {
         return Err(format!(
-            "--cand-object {path}: ABI mismatch with the in-tree emit of {}:\n  object:    {got}\n  generator: {want}",
-            entry.variant()
+            "--cand-object {path}: ABI mismatch with the {want_what} of {} in field {}:\n  object:    {got}\n  reference: {want}",
+            entry.variant(),
+            abi_diff_field(&got, &want),
         ));
     }
+    let text_sha256 = kernel_text_sha256(bytes, &symbol)?;
     Ok(Object {
         source: json!({
             "source": format!("--cand-object {path} (prebuilt candidate code object)"),
             "variant": entry.variant(),
             "sha256": sha256_hex(bytes),
+            "symbol": symbol,
+            "text_sha256": text_sha256,
         }),
         desc: json!({
             "knobs": spec_json(entry),
             "cand_object": {
                 "path": path,
                 "sha256": sha256_hex(bytes),
+                "co_sha256": sha256_hex(bytes),
+                "symbol": symbol,
+                "text_sha256": text_sha256,
+                "abi_reference": want_what,
                 "variant": entry.variant(),
                 "identical_to_generator": bytes == gen_elf.as_slice(),
             },
@@ -1849,6 +1868,56 @@ fn cand_object_object(entry: Entry, path: &str, bytes: &[u8]) -> Result<Object> 
         launch_symbol: symbol,
         bytes: bytes.to_vec(),
     })
+}
+
+/// The shipped gfx1201 image holding `entry`'s symbol (None off gfx1201).
+fn shipped_reference(entry: Entry) -> Option<&'static [u8]> {
+    if entry.spec.arch != Arch::Gfx1201 {
+        return None;
+    }
+    Some(if entry.gp {
+        rdna_compute::kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201
+    } else {
+        rdna_compute::kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201
+    })
+}
+
+/// sha256 of `symbol`'s re-encoded instruction stream (the `.text` of that kernel).
+fn kernel_text_sha256(bytes: &[u8], symbol: &str) -> Result<String> {
+    let program = crate::lift(bytes)?;
+    let kernel = program
+        .kernels
+        .iter()
+        .find(|k| k.symbol.0 == symbol)
+        .ok_or_else(|| format!("object has no kernel {symbol}"))?;
+    let code = peacemaker_lift::emit::bytes(kernel, program.target.arch).map_err(err)?;
+    Ok(sha256_hex(&code))
+}
+
+/// Name of the first `abi_signature` field that differs between `a` and `b`.
+fn abi_diff_field(a: &str, b: &str) -> String {
+    const KEYS: [&str; 8] = [
+        "symbol",
+        "args",
+        "kernarg_bytes",
+        "kernarg_align",
+        "lds_bytes",
+        "max_flat_workgroup_size",
+        "wavefront_size",
+        "workgroup_processor_mode",
+    ];
+    let field = |s: &str, i: usize| -> String {
+        let start = s.find(&format!("{}=", KEYS[i])).unwrap_or(s.len());
+        let end = KEYS
+            .get(i + 1)
+            .and_then(|k| s.find(&format!(" {k}=")))
+            .unwrap_or(s.len());
+        s[start..end.max(start)].to_string()
+    };
+    (0..KEYS.len())
+        .find(|&i| field(a, i) != field(b, i))
+        .map(|i| KEYS[i].to_string())
+        .unwrap_or_else(|| "unknown".into())
 }
 
 /// Constructor for `--kernel qwen4_moe_sym` without `--rip` (gfx1201).
@@ -1882,9 +1951,9 @@ pub fn new_with_cand_object(
 ) -> Result<Box<dyn Workload>> {
     let cand_object = match cand_object {
         Some(p) => {
-            if arch != Arch::Gfx1100 {
+            if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1201) {
                 return Err(format!(
-                    "--cand-object is supported on gfx1100 only (got {})",
+                    "--cand-object is supported on gfx1100 and gfx1201 only (got {})",
                     arch.name()
                 ));
             }
@@ -4018,7 +4087,7 @@ mod tests {
             "{e}"
         );
         let e = build("gate_up", &junk, Arch::Gfx1151).err().unwrap();
-        assert!(e.contains("gfx1100 only"), "{e}");
+        assert!(e.contains("gfx1100 and gfx1201 only"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4075,5 +4144,96 @@ mod tests {
             .unwrap()
             .candidate()
             .is_err());
+    }
+
+    fn cand_object_on(epi: &str, shape: &str, tag: &str, bytes: &[u8]) -> Result<Object> {
+        let p =
+            std::env::temp_dir().join(format!("pm_loop_candobj_{}_{tag}.co", std::process::id()));
+        std::fs::write(&p, bytes).unwrap();
+        let mut k = knobs(&[("epi", epi)]);
+        let w = new_with_cand_object(shape, &mut k, None, Arch::Gfx1201, Some(&p));
+        let r = w.and_then(|w| w.candidate());
+        let _ = std::fs::remove_file(&p);
+        r
+    }
+
+    #[test]
+    fn gfx1201_cand_object_accepts_the_shipped_hxaco_for_every_flat_epi() {
+        let image = rdna_compute::kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201;
+        for epi in [
+            "gate_up",
+            "gate_up_nt4",
+            "gate_up_nt8",
+            "down",
+            "down_nt4",
+            "down_nt8",
+        ] {
+            let o =
+                cand_object_on(epi, "T=64", epi, image).unwrap_or_else(|e| panic!("{epi}: {e}"));
+            let c = &o.desc["cand_object"];
+            assert_eq!(c["co_sha256"], sha256_hex(image), "{epi}");
+            assert_eq!(c["abi_reference"], "shipped baseline image", "{epi}");
+            assert_eq!(c["text_sha256"].as_str().unwrap().len(), 64, "{epi}");
+            assert_eq!(c["symbol"], o.launch_symbol, "{epi}");
+        }
+    }
+
+    #[test]
+    fn gfx1201_cand_object_accepts_the_shipped_gp_hxaco() {
+        let image = rdna_compute::kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201;
+        for epi in ["down_gp_nt4"] {
+            let o =
+                cand_object_on(epi, "T=64", epi, image).unwrap_or_else(|e| panic!("{epi}: {e}"));
+            assert_eq!(o.desc["cand_object"]["co_sha256"], sha256_hex(image));
+        }
+    }
+
+    #[test]
+    fn gfx1201_cand_object_refuses_a_missing_symbol_and_non_objects() {
+        // The gp image has no flat gate_up_nt8 export.
+        let e = cand_object_on(
+            "gate_up_nt8",
+            "T=64",
+            "missing",
+            rdna_compute::kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201,
+        )
+        .err()
+        .unwrap();
+        assert!(e.contains("not a code object exposing"), "{e}");
+        let e = cand_object_on("gate_up_nt8", "T=64", "junk", b"not an object")
+            .err()
+            .unwrap();
+        assert!(e.contains("--cand-object"), "{e}");
+    }
+
+    #[test]
+    fn abi_diff_field_names_the_differing_field() {
+        let a = "symbol=s args=[A, B] kernarg_bytes=64 kernarg_align=8 lds_bytes=0 max_flat_workgroup_size=256 wavefront_size=32 workgroup_processor_mode=false";
+        assert_eq!(abi_diff_field(a, a), "unknown");
+        assert_eq!(
+            abi_diff_field(a, &a.replace("args=[A, B]", "args=[A]")),
+            "args"
+        );
+        assert_eq!(
+            abi_diff_field(a, &a.replace("kernarg_bytes=64", "kernarg_bytes=72")),
+            "kernarg_bytes"
+        );
+        assert_eq!(
+            abi_diff_field(a, &a.replace("size=256", "size=128")),
+            "max_flat_workgroup_size"
+        );
+    }
+
+    /// The pre-lockstep shipped object (a full hxaco from before NT8 lockstep).
+    #[test]
+    fn gfx1201_cand_object_pre_lockstep_object() {
+        let p = "/home/kaden/qcal/release-0.4.3/pm-krsi/land/moe-route/obj/baseline.0eea1673a5308805.co";
+        let Ok(bytes) = std::fs::read(p) else {
+            eprintln!("pre-lockstep object absent: {p}");
+            return;
+        };
+        let o = cand_object_on("gate_up_nt8", "T=64", "prelock", &bytes)
+            .unwrap_or_else(|e| panic!("pre-lockstep gate_up_nt8: {e}"));
+        eprintln!("pre-lockstep cand_object: {}", o.desc["cand_object"]);
     }
 }
