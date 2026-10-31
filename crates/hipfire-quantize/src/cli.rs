@@ -322,9 +322,9 @@ pub(crate) struct QuantizeArgs {
 
     /// Scope of `--raon-shared-ffn` / `--raon-shared-ffn-verify`: `all` (default) swaps the
     /// shared experts and the dense layer-0 MLP, `shared` only the MoE layers' shared
-    /// experts, `dense` only the dense layer-0 MLP; the rest stay qt44. The artifact
+    /// experts, `shared-gateup` only their gate/up weights, `dense` only the dense layer-0 MLP; the rest stay qt44. The artifact
     /// records `<storage>:<scope>` in `hipfire_raon.shared_ffn` for a partial scope.
-    #[arg(long, value_name = "SCOPE", value_parser = ["all", "shared", "dense"])]
+    #[arg(long, value_name = "SCOPE", value_parser = ["all", "shared", "shared-gateup", "dense"])]
     pub raon_shared_ffn_scope: Option<String>,
 
     /// Enable K-map promotion for dense models.

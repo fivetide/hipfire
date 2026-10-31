@@ -1807,6 +1807,12 @@ fn partial_scope_swaps_only_its_class_and_is_described_and_verified() {
     assert_eq!(storage_tag(SharedFfn::Q8F16, Scope::All), "q8f16");
     assert_eq!(storage_tag(SharedFfn::Q8F16, Scope::Dense), "q8f16:dense");
     assert!(Scope::parse("both").is_err());
+    assert_eq!(Scope::parse("shared-gateup").unwrap(), Scope::SharedGateUp);
+    assert!(Scope::SharedGateUp.covers("model.layers.1.moe.shared_experts.gate_proj.weight"));
+    assert!(Scope::SharedGateUp.covers("model.layers.1.moe.shared_experts.up_proj.weight"));
+    assert!(!Scope::SharedGateUp.covers("model.layers.1.moe.shared_experts.down_proj.weight"));
+    assert!(!Scope::SharedGateUp.covers("model.layers.0.mlp.gate_proj.weight"));
+    assert!(!Scope::Shared.covers("model.layers.0.mlp.down_proj.weight"));
 
     let dir = make_source(|_| {});
     let d = dir.path();
@@ -1814,6 +1820,12 @@ fn partial_scope_swaps_only_its_class_and_is_described_and_verified() {
     for (scope, target, replaced, tag) in [
         (Scope::Shared, SharedFfn::Q8F16, 6usize, "q8f16:shared"),
         (Scope::Dense, SharedFfn::Bf16, 3usize, "bf16:dense"),
+        (
+            Scope::SharedGateUp,
+            SharedFfn::Q8F16,
+            4usize,
+            "q8f16:shared-gateup",
+        ),
     ] {
         let out = d.join(format!("scope-{}.hfq", scope.as_str()));
         let s = swap_shared_ffn(&shipped, d, &out, target, scope).unwrap();
@@ -1847,7 +1859,7 @@ fn partial_scope_swaps_only_its_class_and_is_described_and_verified() {
         assert!(rep.ok(), "{:?}\n{}", rep.violations, rep.table());
         assert_eq!(rep.rows[CLASS_SIDECAR].tensors, replaced);
         // Verify expects the same scope: the other scopes must fail.
-        for other in [Scope::All, Scope::Shared, Scope::Dense] {
+        for other in [Scope::All, Scope::Shared, Scope::SharedGateUp, Scope::Dense] {
             if other != scope {
                 assert!(
                     !raon_hfq_diff(&shipped, &out, target, other).unwrap().ok(),

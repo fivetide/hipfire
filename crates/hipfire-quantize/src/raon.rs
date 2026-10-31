@@ -184,6 +184,8 @@ pub(crate) fn shared_ffn_storage() -> Result<SharedFfn, String> {
 pub(crate) enum Scope {
     All,
     Shared,
+    /// Only the shared experts' gate/up weights; shared down and the dense MLP stay qt44.
+    SharedGateUp,
     Dense,
 }
 
@@ -192,9 +194,10 @@ impl Scope {
         match s {
             "all" => Ok(Scope::All),
             "shared" => Ok(Scope::Shared),
+            "shared-gateup" => Ok(Scope::SharedGateUp),
             "dense" => Ok(Scope::Dense),
             other => Err(format!(
-                "unknown shared-FFN scope `{other}` (expected all|shared|dense)"
+                "unknown shared-FFN scope `{other}` (expected all|shared|shared-gateup|dense)"
             )),
         }
     }
@@ -203,6 +206,7 @@ impl Scope {
         match self {
             Scope::All => "all",
             Scope::Shared => "shared",
+            Scope::SharedGateUp => "shared-gateup",
             Scope::Dense => "dense",
         }
     }
@@ -210,9 +214,10 @@ impl Scope {
     /// Is `name` an always-active FFN weight inside this scope?
     pub(crate) fn covers(self, name: &str) -> bool {
         match ffn_class_index(name) {
-            Some(CLASS_DENSE) => self != Scope::Shared,
-            Some(_) => self != Scope::Dense,
-            None => false,
+            Some(CLASS_DENSE) => matches!(self, Scope::All | Scope::Dense),
+            Some(CLASS_GATE_UP) => self != Scope::Dense,
+            Some(CLASS_DOWN) => matches!(self, Scope::All | Scope::Shared),
+            _ => false,
         }
     }
 }
