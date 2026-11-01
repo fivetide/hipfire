@@ -1897,6 +1897,44 @@ impl DeltaNetSnapshot {
         Ok(())
     }
 
+    /// Copy one DeltaNet layer's live state (recurrent S, scales, conv, EF residual) into this
+    /// snapshot, ordered on the active stream. A bank-pair prefill stages its bank boundary one
+    /// layer at a time, between the two banks' runs of that layer.
+    pub fn save_layer_from(
+        &mut self,
+        state: &DeltaNetState,
+        layer: usize,
+        gpu: &mut Gpu,
+    ) -> HipResult<()> {
+        for (dst, src) in [
+            (&self.s_matrix_bufs, &state.s_matrices),
+            (&self.s_scale_bufs, &state.s_scales),
+            (&self.conv_state_bufs, &state.conv_states),
+            (&self.s_ef_residual_bufs, &state.s_ef_residual),
+        ] {
+            if let (Some(dst), Some(src)) = (dst.get(layer), src.get(layer)) {
+                gpu.memcpy_dtod_at_auto(dst, 0, &src.buf, 0, src.buf.size().min(dst.size()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy every buffer of `other` (a snapshot of the same state geometry) into this one.
+    pub fn copy_from(&mut self, other: &DeltaNetSnapshot, gpu: &mut Gpu) -> HipResult<()> {
+        for (dst, src) in [
+            (&self.s_matrix_bufs, &other.s_matrix_bufs),
+            (&self.s_scale_bufs, &other.s_scale_bufs),
+            (&self.conv_state_bufs, &other.conv_state_bufs),
+            (&self.s_ef_residual_bufs, &other.s_ef_residual_bufs),
+        ] {
+            for (d, s) in dst.iter().zip(src) {
+                // Active stream: ordered after the staged per-layer copies.
+                gpu.memcpy_dtod_at_auto(d, 0, s, 0, s.size().min(d.size()))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Async copy live state → backup on `stream`.
     ///
     /// Caller owns cross-stream ordering. MTP trunk-spine uses this as an
@@ -13061,6 +13099,40 @@ pub fn take_dn_checkpoint(
     interval: usize,
     cap: usize,
 ) {
+    admit_dn_checkpoint(cks, dn, kv, gpu, pos, interval, cap, |snap, gpu| {
+        snap.save_from(dn, gpu)
+    });
+}
+
+/// [`take_dn_checkpoint`] of a state staged earlier at `pos` (a bank-pair prefill's bank
+/// boundary) instead of the live state; same ring, interval and memory rules.
+#[allow(clippy::too_many_arguments)]
+pub fn take_dn_checkpoint_staged(
+    cks: &mut Vec<(usize, DeltaNetSnapshot)>,
+    staged: &DeltaNetSnapshot,
+    dn: &DeltaNetState,
+    kv: &KvCache,
+    gpu: &mut Gpu,
+    pos: usize,
+    interval: usize,
+    cap: usize,
+) {
+    admit_dn_checkpoint(cks, dn, kv, gpu, pos, interval, cap, |snap, gpu| {
+        snap.copy_from(staged, gpu)
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_dn_checkpoint(
+    cks: &mut Vec<(usize, DeltaNetSnapshot)>,
+    dn: &DeltaNetState,
+    kv: &KvCache,
+    gpu: &mut Gpu,
+    pos: usize,
+    interval: usize,
+    cap: usize,
+    fill: impl FnOnce(&mut DeltaNetSnapshot, &mut Gpu) -> HipResult<()>,
+) {
     if pos == 0 || cap == 0 {
         return;
     }
@@ -13085,7 +13157,7 @@ pub fn take_dn_checkpoint(
             }
         }
     };
-    if let Err(e) = snap.save_from(dn, gpu) {
+    if let Err(e) = fill(&mut snap, gpu) {
         // A recycled slot is partially overwritten, so it cannot rejoin the
         // ring either way: free it.
         eprintln!("take_dn_checkpoint: pos={pos} skipped: snapshot save failed: {e}");

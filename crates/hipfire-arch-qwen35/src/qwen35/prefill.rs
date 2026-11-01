@@ -4074,6 +4074,52 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                     }
                 }
             }
+            // qwen3.8-27b co-processor pair: a full bank A plus a real bank B of an ordinary
+            // dense prefill. Shorter tails stay GPU-only in every mode, so `on` and `emulate`
+            // split a prompt identically.
+            #[cfg(target_os = "linux")]
+            if let (true, Some(npu)) = (
+                wide && chunk_n == crate::npu_trunk::BANK_ROWS,
+                scratch.npu_trunk.borrow().as_ref(),
+            ) {
+                let pair_b = crate::npu_trunk::NpuTrunk::bank_b_rows(remaining).filter(|&b| {
+                    fa_pair_common_admitted
+                        && per_token_hidden_out.is_none()
+                        && mask_override.is_none()
+                        && pbs.max_batch >= chunk_n
+                        && fa_layers_batched_ok(kv_cache, weights, config, gpu.arch.as_str())
+                        && !gpu.graphs.capture_mode
+                        && !gpu.replay.is_recording()
+                        && !super::vl_prefill::overlaps(start_pos + chunk_start, chunk_n + b)
+                });
+                if let Some(b) = pair_b {
+                    let a_end = chunk_start + chunk_n;
+                    eprintln!(
+                        "{}: pair rows={chunk_n}+{b} pos={} mode={}",
+                        crate::npu_trunk::SWITCH.tag,
+                        start_pos + chunk_start,
+                        npu.mode()
+                    );
+                    if let Err(e) = forward_prefill_npu_pair(
+                        gpu,
+                        weights,
+                        config,
+                        [&tokens[chunk_start..a_end], &tokens[a_end..a_end + b]],
+                        start_pos + chunk_start,
+                        kv_cache,
+                        dn_state,
+                        scratch,
+                        [pbs, &npu.bank_b],
+                        npu,
+                        needs_last_token_logits,
+                    ) {
+                        npu.abort(&format!("{e:?}"));
+                        return Err(e);
+                    }
+                    chunk_start = a_end + b;
+                    continue;
+                }
+            }
             // F2 pair peek is only relevant to the legacy 512-row schedule;
             // widened chunks carry their tail directly.
             let pair_b = if chunk_n == FA_PAIR_ROWS
@@ -7148,6 +7194,282 @@ fn forward_prefill_chunk_pair(
     Ok(())
 }
 
+/// qwen3.8-27b co-processor pair: two consecutive chunks (banks A = 0, B = 1) of one request
+/// run layer-major on [`hipfire_runtime::coproc::pair_schedule`]. `Prepare(l, b)` lands any
+/// owed residual fold, runs the layer's RMSNorm + rotation (+ AWQ) to F16 and hands the bank to
+/// the trunk (pack + kick, or the `emulate` twin GEMM); `Run(l, b)` consumes the projections
+/// into the bank's `dn_*` / `fa_*` scratch and runs the mixer core, out-projection and FFN with
+/// the native in-projection skipped. Bank A precedes bank B on every layer, so recurrent state,
+/// KV and logits see the rows in sequential order. Callers hold the envelope: ordinary
+/// sequential prefill, dense batched GDN/FA layers, no hidden ring / tape / tree / side output.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn forward_prefill_npu_pair(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: [&[u32]; 2],
+    start: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    s: &Qwen35Scratch,
+    pbs: [&PrefillBatchScratch; 2],
+    npu: &crate::npu_trunk::NpuTrunk,
+    needs_last_token_logits: bool,
+) -> HipResult<()> {
+    use hipfire_runtime::coproc::{pair_schedule, PairOp};
+    let rows = [tokens[0].len(), tokens[1].len()];
+    let starts = [start, start + rows[0]];
+    kv_cache.require_mapped_capacity(checked_kv_end(
+        start,
+        rows[0] + rows[1],
+        "forward_prefill_npu_pair",
+    )?)?;
+    let dim = config.dim;
+    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+    let n_v_heads = config.linear_num_value_heads;
+    let hd = config.linear_key_head_dim;
+    let dim_row_bytes = dim * 4;
+    let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
+    let math = verify_dense_math(gpu);
+    let dims = hybrid_dims(config);
+    let flash = flash_scratch(s);
+    let tap_fn = batched_attention_tap(config);
+    let tap = tap_fn.get();
+    let commit = rows.map(|n| widened_commit_stride(true, n));
+    let scan = [0, 1].map(|b| {
+        dense_gdn_chunk_scan_admitted(
+            gpu, weights, config, kv_cache, dn_state, rows[b], commit[b], true,
+        )
+    });
+    let multirow = [0, 1].map(|b| {
+        q8_multirow_attn_admitted(
+            gpu.arch_caps.arch(),
+            kv_cache.quant_q8,
+            config.head_dim,
+            rows[b],
+            starts[b] + rows[b],
+            fa_pertoken_min_ctx(gpu.arch_caps.arch()),
+            false,
+            false,
+            gpu.graphs.capture_mode,
+            gpu.replay.is_recording(),
+            gfx1100_split_verify_admitted(
+                gpu,
+                config,
+                kv_cache.quant_q8 && matches!(kv_cache.v_mode, llama::VMode::Q8),
+                kv_cache.uses_vmm_backend(),
+                rows[b],
+                starts[b] + rows[b],
+                s.flash_partials.numel(),
+            ),
+        )
+    });
+    let ctx = rows.map(|n| {
+        DispatchCtx::new(gpu)
+            .with_workload(prefill_dispatch_workload(false, false, false))
+            .with_batch_size(n)
+    });
+    // Recurrent-state / KV slot of every layer (both banks share them).
+    let mut slot = Vec::with_capacity(config.n_layers);
+    let (mut delta, mut kv) = (0usize, 0usize);
+    for t in &config.layer_types {
+        match t {
+            LayerType::LinearAttention => {
+                slot.push(delta);
+                delta += 1;
+            }
+            LayerType::FullAttention => {
+                slot.push(kv);
+                kv += 1;
+            }
+        }
+    }
+    let init = |gpu: &mut Gpu, b: usize| -> HipResult<()> {
+        batch_chunk_embed_tokens(
+            gpu,
+            weights,
+            tokens[b],
+            s,
+            pbs[b],
+            rows[b],
+            dim,
+            dim_row_bytes,
+            true,
+            false,
+            false,
+            None,
+            None,
+        )?;
+        batch_chunk_upload_positions(
+            gpu,
+            pbs[b],
+            BatchSemantics::Sequential,
+            starts[b],
+            rows[b],
+            None,
+            false,
+        )
+    };
+    init(gpu, 0)?;
+    let mut seq = [None, None];
+    let mut last = None;
+    for op in pair_schedule(config.n_layers) {
+        match op {
+            PairOp::Init { bank } => init(gpu, bank)?,
+            PairOp::Prepare { layer, bank } => {
+                let (norm, next) = match &weights.layers[layer] {
+                    LayerWeights::DeltaNet(l) => (&l.attn_norm, l.wqkv.dispatch_ref()),
+                    LayerWeights::FullAttn(l) => (&l.attn_norm, l.wq.dispatch_ref()),
+                    _ => return Err(HipError::new(0, "npu pair: layer is not dense GDN/FA")),
+                };
+                gpu.flush_residual_fold()?;
+                // The F16 producer of this norm is not built on gfx1151 and lean scratch has no F16
+                // plane: F32 norm + AWQ + FWHT here, the trunk casts into its own F16 input.
+                hipfire_dispatch::pipeline::batched::fused_rmsnorm_rotate_mq_batched_for(
+                    gpu,
+                    &pbs[bank].x_batch,
+                    norm,
+                    &next,
+                    &pbs[bank].x_rot_batch,
+                    dim,
+                    config.norm_eps,
+                    rows[bank],
+                )?;
+                seq[bank] = npu.prepare(gpu, layer, bank, pbs[bank], rows[bank])?;
+            }
+            PairOp::Run { layer, bank } => {
+                let n = rows[bank];
+                npu.consume(gpu, layer, bank, seq[bank], pbs[bank], n)?;
+                last = seq[bank].take().or(last);
+                let view = pbs[bank].view();
+                let projected = hipfire_dispatch::pipeline::batched::BatchScratch {
+                    in_projected: true,
+                    ..view
+                };
+                match &weights.layers[layer] {
+                    LayerWeights::DeltaNet(l) => {
+                        let scan = scan[bank]
+                            && [
+                                l.wqkv.gpu_dtype,
+                                l.wz.gpu_dtype,
+                                l.w_beta.gpu_dtype,
+                                l.w_alpha.gpu_dtype,
+                            ] == [DType::MQ4G256V2; 4]
+                            && slot[layer] < dn_state.s_ef_residual.len();
+                        batch_chunk_delta_net_attn(
+                            gpu,
+                            &l.mixer_view(),
+                            &dims,
+                            &projected,
+                            &deltanet_state_view(dn_state),
+                            n,
+                            dim,
+                            k_dim,
+                            v_dim,
+                            n_v_heads,
+                            hd,
+                            BatchSemantics::Sequential,
+                            None,
+                            None,
+                            0,
+                            slot[layer],
+                            q8_wmma_arch,
+                            q8_wmma_arch,
+                            BatchEpilogue::Residual,
+                            DflashFusionCtx::Off,
+                            commit[bank],
+                            scan,
+                        )?;
+                        l.ffn_rows(
+                            gpu,
+                            config.norm_eps,
+                            &view,
+                            n,
+                            dim,
+                            q8_wmma_arch,
+                            q8_wmma_arch,
+                            MlpOutput::Residual,
+                            DflashFusionCtx::Off,
+                            math,
+                        )?;
+                    }
+                    LayerWeights::FullAttn(l) => {
+                        batch_chunk_full_attn_attn(
+                            gpu,
+                            multirow[bank],
+                            &l.mixer_view(),
+                            &dims,
+                            &projected,
+                            &flash,
+                            &kv_view(kv_cache),
+                            n,
+                            dim,
+                            starts[bank],
+                            starts[bank] + n,
+                            &ctx[bank],
+                            BatchSemantics::Sequential,
+                            None,
+                            q8_wmma_arch,
+                            q8_wmma_arch,
+                            slot[layer],
+                            layer,
+                            BatchEpilogue::Residual,
+                            DflashFusionCtx::Off,
+                            commit[bank],
+                            tap,
+                        )?;
+                        l.ffn_rows(
+                            gpu,
+                            config.norm_eps,
+                            &view,
+                            n,
+                            dim,
+                            q8_wmma_arch,
+                            q8_wmma_arch,
+                            MlpOutput::Residual,
+                            DflashFusionCtx::Off,
+                            math,
+                        )?;
+                    }
+                    _ => unreachable!("checked at Prepare"),
+                }
+                dump_hidden_localize(
+                    gpu,
+                    &pbs[bank].x_batch,
+                    n,
+                    starts[bank],
+                    dim,
+                    layer,
+                    "batched",
+                );
+                // Bank B has not touched this layer yet: its recurrent state is the state at the
+                // bank boundary, the snapshot an unpaired prefill takes between its chunks.
+                if bank == 0 && matches!(config.layer_types[layer], LayerType::LinearAttention) {
+                    npu.stage_layer(gpu, dn_state, slot[layer])?;
+                }
+            }
+        }
+    }
+    npu.finish(last)?;
+    npu.set_cut(starts[1]);
+    batch_chunk_final_logits(
+        gpu,
+        weights,
+        config,
+        s,
+        pbs[1],
+        rows[1],
+        dim,
+        dim_row_bytes,
+        None,
+        needs_last_token_logits,
+        true,
+        &ctx[1],
+    )
+}
+
 /// Every full-attention layer takes the batched FA route (KV tier with
 /// batched keys + batch-admissible layer weights); else the per-token FA
 /// fallback runs. Shared by the chunk body and the VL route check.
@@ -7169,6 +7491,66 @@ fn fa_layers_batched_ok(
             }
             _ => true,
         })
+}
+
+/// Common admission of the dense GDN chunk-scan route for one `n`-row chunk;
+/// `plain_call` carries the caller's own clauses (sequential, no tree / tape /
+/// band / capture side outputs, plain fusion). Per-layer dtype checks follow.
+#[allow(clippy::too_many_arguments)]
+fn dense_gdn_chunk_scan_admitted(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    kv_cache: &llama::KvCache,
+    dn_state: &DeltaNetState,
+    n: usize,
+    commit_stride: Option<usize>,
+    plain_call: bool,
+) -> bool {
+    let mq3_scan = mq3_wide_route(gpu, weights);
+    let mq4_scan = dense_layers_are_all_mq4v2(weights);
+    plain_call
+        && gpu.flags.gfx12_gdn_chunk_scan
+        // The GDN chunk-scan arm has no `SingletonWmma` producer.
+        && !gpu.fp8_verify_scope
+        && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
+        && config.num_experts == 0
+        && config.linear_num_key_heads == 16
+        && config.linear_num_value_heads == 48
+        && config.linear_key_head_dim == 128
+        && config.linear_value_head_dim == 128
+        && config.conv_kernel_dim == 4
+        // Each dtype must have its own admitted qkvza producer; the A4/A8
+        // flags cannot enable a qt44 scan when the MQ4 projection route is off.
+        // gfx1201 admits both MQ4V2 projection routes: iu4-direct (default) or
+        // FP8-WMMA qkvza (HIPFIRE_IU4_PREFILL=0 arm). Every qkvza dispatch arm
+        // writes the same f32 dn_qkv/dn_z/dn_beta/dn_alpha scratch the scan
+        // consumes, so the scan is route-agnostic. gfx11 keeps the iu4 gate.
+        && (mq3_scan
+            || (mq4_scan
+                && (gpu.flags.iu4_prefill_enabled()
+                    || (gpu.arch == "gfx1201" && gpu.flags.gfx12_mq4v2_fp8_qkvza))))
+        // The scan never reads KV, so the clause only names qualified tiers:
+        // native FP8 (gfx1201-only), Q8 on gfx11, and the fwht4/fwht3 4/3-bit
+        // K tiers (`quant_asym4`/`quant_asym3`, any V) on every scan arch.
+        && (kv_cache.quant_fp8
+            || (gpu.arch != "gfx1201" && kv_cache.quant_q8)
+            || kv_cache.quant_asym4
+            || kv_cache.quant_asym3)
+        && dn_state.quant == StateQuant::Q8
+        && !dn_state.s_matrices.is_empty()
+        && dn_state.s_matrices.len() == dn_state.s_scales.len()
+        && dn_state.s_matrices.len() == dn_state.conv_states.len()
+        && dn_state.s_matrices.len() == dn_state.s_ef_residual.len()
+        && !gpu.graphs.capture_mode
+        // Only a forward being recorded into a Redline tape must stay off the
+        // chunk scan; prefill never records, so a Redline-enabled process
+        // prefills exactly like the HIP-graph default.
+        && !gpu.replay.is_recording()
+        && n >= 64
+        && (n <= 512
+            || (commit_stride == Some(512)
+                && (n % 512 == 0 || (64..512).contains(&(n % 512)))))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7428,62 +7810,29 @@ pub(crate) fn forward_batch_chunk_impl(
         ));
     }
     let mq3_scan = mq3_wide_route(gpu, weights);
-    let mq4_scan = dense_layers_are_all_mq4v2(weights);
-    let gdn_chunk_scan_common_admitted = gpu.flags.gfx12_gdn_chunk_scan
-        // The GDN chunk-scan arm has no `SingletonWmma` producer.
-        && !gpu.fp8_verify_scope
-        && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
-        && config.num_experts == 0
-        && config.linear_num_key_heads == 16
-        && config.linear_num_value_heads == 48
-        && config.linear_key_head_dim == 128
-        && config.linear_value_head_dim == 128
-        && config.conv_kernel_dim == 4
-        // Each dtype must have its own admitted qkvza producer; the A4/A8
-        // flags cannot enable a qt44 scan when the MQ4 projection route is off.
-        // gfx1201 admits both MQ4V2 projection routes: iu4-direct (default) or
-        // FP8-WMMA qkvza (HIPFIRE_IU4_PREFILL=0 arm). Every qkvza dispatch arm
-        // writes the same f32 dn_qkv/dn_z/dn_beta/dn_alpha scratch the scan
-        // consumes, so the scan is route-agnostic. gfx11 keeps the iu4 gate.
-        && (mq3_scan
-            || (mq4_scan
-                && (gpu.flags.iu4_prefill_enabled()
-                    || (gpu.arch == "gfx1201" && gpu.flags.gfx12_mq4v2_fp8_qkvza))))
-        // The scan never reads KV, so the clause only names qualified tiers:
-        // native FP8 (gfx1201-only), Q8 on gfx11, and the fwht4/fwht3 4/3-bit
-        // K tiers (`quant_asym4`/`quant_asym3`, any V) on every scan arch.
-        && (kv_cache.quant_fp8
-            || (gpu.arch != "gfx1201" && kv_cache.quant_q8)
-            || kv_cache.quant_asym4
-            || kv_cache.quant_asym3)
-        && dn_state.quant == StateQuant::Q8
-        && !dn_state.s_matrices.is_empty()
-        && dn_state.s_matrices.len() == dn_state.s_scales.len()
-        && dn_state.s_matrices.len() == dn_state.conv_states.len()
-        && dn_state.s_matrices.len() == dn_state.s_ef_residual.len()
-        && matches!(batch_semantics, BatchSemantics::Sequential)
-        && tree_verify.is_none()
-        && gdn_tape.is_none()
-        && fusion == DflashFusionCtx::Off
-        && !gpu.graphs.capture_mode
-        // Only a forward being recorded into a Redline tape must stay off the
-        // chunk scan; prefill never records, so a Redline-enabled process
-        // prefills exactly like the HIP-graph default.
-        && !gpu.replay.is_recording()
-        // A DFlash prompt seed's ring copies each layer's finished residual
-        // rows, whichever recurrence kernel produced them.
-        && hidden_rb.map_or(true, |rb| rb.rides_ordinary_prefill(gpu))
-        // A prompt fill that hands its hidden rows to a draft head runs the
-        // same scan plain AR prefill runs; verify captures stay sequential.
-        && !captures_verify_hidden(per_token_hidden_out)
-        && band.is_none()
-        && max_layer.is_none()
-        && routed_out.is_none()
-        && mask_override.is_none()
-        && n >= 64
-        && (n <= 512
-            || (commit_stride == Some(512)
-                && (n % 512 == 0 || (64..512).contains(&(n % 512)))));
+    let gdn_chunk_scan_common_admitted = dense_gdn_chunk_scan_admitted(
+        gpu,
+        weights,
+        config,
+        kv_cache,
+        dn_state,
+        n,
+        commit_stride,
+        matches!(batch_semantics, BatchSemantics::Sequential)
+            && tree_verify.is_none()
+            && gdn_tape.is_none()
+            && fusion == DflashFusionCtx::Off
+            // A DFlash prompt seed's ring copies each layer's finished residual
+            // rows, whichever recurrence kernel produced them.
+            && hidden_rb.map_or(true, |rb| rb.rides_ordinary_prefill(gpu))
+            // A prompt fill that hands its hidden rows to a draft head runs the
+            // same scan plain AR prefill runs; verify captures stay sequential.
+            && !captures_verify_hidden(per_token_hidden_out)
+            && band.is_none()
+            && max_layer.is_none()
+            && routed_out.is_none()
+            && mask_override.is_none(),
+    );
     // Default-resolved MoE route (explicit `HIPFIRE_GDN_MOE_CHUNK_SCAN` wins,
     // unset follows qualification): the dense chunk-scan clauses that apply to
     // a MoE LA layer (no KV-cache or iu4-prefill clause: the MoE projection

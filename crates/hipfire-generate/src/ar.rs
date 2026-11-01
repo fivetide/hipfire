@@ -5098,6 +5098,7 @@ pub fn generate(
                     }
                 }
             };
+            let chunk_max = hipfire_arch_qwen35::npu_trunk::outer_chunk_rows(scratch, chunk_max);
             let mut start = 0usize;
             while start < new_tokens.len() {
                 if check_abort(id) {
@@ -5181,6 +5182,15 @@ pub fn generate(
                 // (&mut m.dn_state) and &mut m.prefill_checkpoints are disjoint
                 // fields, so this composes with the live kv/dn borrows.
                 if ckpt_resume_enabled() {
+                    hipfire_arch_qwen35::npu_trunk::take_pair_checkpoint(
+                        scratch,
+                        &mut m.prefill_checkpoints,
+                        dn,
+                        kv,
+                        gpu,
+                        ckpt_interval(),
+                        ckpt_max(),
+                    );
                     speculative::take_dn_checkpoint(
                         &mut m.prefill_checkpoints,
                         dn,

@@ -7,7 +7,7 @@ Neither preparation path opens hardware or schedules prefill.
 Qwen4 reads `fusions.npu_trunk` (env `HIPFIRE_QWEN4_NPU_TRUNK`) with
 `hipfire_runtime::coproc::Mode::from_config(SWITCH, Mode::Auto)`: `off`, `auto` (default), `on`, or `emulate`. Mode, containment, admission and pair geometry are shared in `hipfire_runtime::coproc`.
 At load, auto resolves silently to off on every arch except gfx1151.
-The qwen3.8-27b switch is `fusions.qwen35_npu_trunk` (env `HIPFIRE_QWEN35_NPU_TRUNK`, default `off`); any other value is refused at load until its prefill driver lands.
+The qwen3.8-27b switch is `fusions.qwen35_npu_trunk` (env `HIPFIRE_QWEN35_NPU_TRUNK`, default `off`): `on` runs the AR prefill in bank pairs (8192 + 512..8192 rows) with every GDN/FA in-projection on the NPU (N512 K5120 programs, `bf16_direct`), `emulate` runs the same W8 x A8 GEMM on the GPU twin, and `auto` stays GPU-only until a measured 27B calibration exists. The DFlash prompt seed (ring pieces of at most the draft window) never forms a pair.
 
 ## Serving status (0.4.2)
 

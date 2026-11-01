@@ -466,7 +466,14 @@ pub(crate) fn unspillable_no_fit_refusal(
 /// [`KvCache::free_gpu`]) and the original error is preserved with any
 /// cleanup/VMM-pending context appended.
 pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, String> {
-    crate::npu_trunk::check_mode()?;
+    let npu_mode = crate::npu_trunk::resolve_mode()?;
+    #[cfg(not(target_os = "linux"))]
+    if !npu_mode.is_off() {
+        return Err(format!(
+            "{}: the NPU trunk is Linux-only",
+            crate::npu_trunk::SWITCH.env
+        ));
+    }
     let ModelSource::Hfq(mut hfq) = src else {
         return Err("qwen35: directory source unsupported".into());
     };
@@ -615,6 +622,18 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
             return Err(release_after_failed_load(e, weight_lease.take(), ctx.gpu));
         }
     };
+    #[cfg(target_os = "linux")]
+    if !npu_mode.is_off() {
+        match crate::npu_trunk::NpuTrunk::load(ctx.gpu, &weights, &config, npu_mode) {
+            Ok(npu) => *scratch.npu_trunk.borrow_mut() = Some(npu),
+            Err(e) => {
+                let _ = scratch.free_gpu(ctx.gpu);
+                let cleanup = free_dn_kv_and_weights(dn, kv, weights, ctx.gpu);
+                let e = append_cleanup_context(e, cleanup);
+                return Err(release_after_failed_load(e, weight_lease.take(), ctx.gpu));
+            }
+        }
+    }
     let scratch_ms = scratch_started.elapsed().as_secs_f64() * 1e3;
     eprintln!(
         "QWEN35_LOAD_PHASES route={route} weights_ms={weights_ms:.3} kv_ms={kv_ms:.3} dn_ms={dn_ms:.3} scratch_ms={scratch_ms:.3}"

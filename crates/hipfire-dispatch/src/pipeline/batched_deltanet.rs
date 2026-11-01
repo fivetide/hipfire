@@ -2203,18 +2203,20 @@ pub fn batch_chunk_delta_net_attn(
         _ => None,
     };
     let math = verify_dense_math(gpu);
-    let prep_fused = batch_chunk_delta_net_input_projection(
-        gpu,
-        layer,
-        config,
-        pbs,
-        n,
-        dim,
-        q8_wmma_arch,
-        fusion,
-        gdn_targets.as_ref(),
-        math,
-    )?;
+    // A co-processor projection has no fused GDN-prep epilogue: the scan preps itself.
+    let prep_fused = !pbs.in_projected
+        && batch_chunk_delta_net_input_projection(
+            gpu,
+            layer,
+            config,
+            pbs,
+            n,
+            dim,
+            q8_wmma_arch,
+            fusion,
+            gdn_targets.as_ref(),
+            math,
+        )?;
 
     if let Some(views) = gdn_chunk_scan_views {
         gdn_chunk_scan_layer(
