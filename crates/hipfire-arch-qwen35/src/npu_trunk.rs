@@ -3,8 +3,10 @@
 //! on the NPU; `emulate`: the same W8 x A8 GEMM on the GPU twin). The pair loop itself is
 //! `qwen35::prefill::forward_prefill_npu_pair`.
 
+use hipfire_runtime::coproc::calibration::{model_trunk_index_sha256, runtime_calibration_key};
 use hipfire_runtime::coproc::{
-    EpilogueContract, FamilyDecl, GroupDecl, LayerKindDecl, Mode, StageMap, Switch,
+    admission::off_line, auto_admission, pair_time, Calibration, EpilogueContract, FamilyDecl,
+    GroupDecl, LayerKindDecl, Mode, StageMap, Switch, CHUNK,
 };
 use peacemaker_npu::kernels::gemm_core::{Control, Epilogue};
 use peacemaker_npu::kernels::gemm_g80_n512::{design_g80_n512, pack_b_bf16, WAVE_N};
@@ -23,22 +25,60 @@ pub const SWITCH: Switch = Switch {
     name: "qwen35_npu_trunk",
 };
 
-/// The resolved mode, or a load error naming the switch. `auto` stays GPU-only (one `off` line):
-/// no measured 27B calibration exists, so the planner has nothing to price a pair with.
+/// Developer fault injection: the 1-based relay chain whose watchdog is forced (the real NPU
+/// timeout path).
+pub const FAULT_CHAIN: &str = "HIPFIRE_QWEN35_NPU_TRUNK_FAULT_CHAIN";
+
+/// The compiled-in measured Halo record (`qwen3.8-27b.mq4`, gfx1151 + XDNA2), the only record
+/// `auto` binds.
+const BUILTIN: &str = include_str!("npu_trunk/halo-xdna2-27b-v1.json");
+
+/// The resolved mode (default `off`), or a load error naming the switch.
 pub fn resolve_mode() -> Result<Mode, String> {
-    let mode = Mode::from_config(SWITCH, Mode::Off)?;
-    if mode == Mode::Auto {
-        eprintln!(
-            "{}",
-            hipfire_runtime::coproc::admission::off_line(
-                SWITCH,
-                false,
-                "no measured qwen3.8-27b calibration"
-            )
-        );
-        return Ok(Mode::Off);
+    Mode::from_config(SWITCH, Mode::Off)
+}
+
+/// The index digest `auto` keys its calibration on, taken while the loader still owns the HFQ;
+/// `None` in every other mode.
+pub fn model_index(
+    mode: Mode,
+    hfq: &hipfire_runtime::hfq::HfqFile,
+) -> Option<Result<String, String>> {
+    (mode == Mode::Auto).then(|| model_trunk_index_sha256(hfq))
+}
+
+/// `auto` admission: the built-in record bound to this host (GPU `pci`, NPU firmware, kernel
+/// release), for the model `index`. Admits only when the planner selects every family (the
+/// driver owns all seven); otherwise logs one `off` line with the reason and returns `None`.
+pub fn auto_calibration(
+    arch: &str,
+    pci: &str,
+    index: &Result<String, String>,
+) -> Option<Calibration> {
+    let admit = || -> Result<Calibration, String> {
+        let mut cal: Calibration = serde_json::from_str(BUILTIN).map_err(|e| e.to_string())?;
+        cal.validate(&STAGE_MAP)?;
+        let key =
+            runtime_calibration_key(arch, pci, index.as_ref().map_err(Clone::clone)?, "stock")?;
+        cal.bind_builtin(&key)?;
+        if auto_admission(&STAGE_MAP, &cal, &key)? != STAGE_MAP.all() {
+            return Err("calibration selects a family subset; the driver owns every family".into());
+        }
+        Ok(cal)
+    };
+    admit()
+        .map_err(|e| eprintln!("{}", off_line(SWITCH, false, &e)))
+        .ok()
+}
+
+/// The `auto` pair test at prompt position `pos`: a full bank A (`CHUNK` rows) plus a bank B of
+/// `b` rows pairs only when the calibrated pair time strictly beats GPU-only by the record's
+/// margin, the planner's natural-pair test at this prefix.
+pub fn pair_beats_gpu(cal: &Calibration, pos: usize, b: usize) -> bool {
+    b >= cal.gpu.min_bank_rows && {
+        let t = pair_time(&STAGE_MAP, cal, STAGE_MAP.all(), CHUNK, pos, b, pos + CHUNK);
+        t.t < (1.0 - cal.margin) * t.gpu_only
     }
-    Ok(mode)
 }
 
 /// The input projections the NPU may own, grouped by kind: GDN qkv, z, a, b, then FA q, k, v.
@@ -253,14 +293,25 @@ mod driver;
 #[cfg(target_os = "linux")]
 pub use driver::{NpuTrunk, BANK_ROWS};
 
-/// Outer prefill chunk for a caller that splits a prompt before `forward_prefill_batch`: an armed
-/// trunk needs both banks of a pair in one call, so a full-bank `chunk_max` doubles.
-pub fn outer_chunk_rows(scratch: &crate::qwen35::Qwen35Scratch, chunk_max: usize) -> usize {
+/// Outer prefill chunk for a caller that splits a prompt before `forward_prefill_batch`, at
+/// prompt position `pos` with `remaining` rows left: a full-bank `chunk_max` doubles exactly when
+/// the armed trunk admits the pair there (both banks must be in one call). A refused pair keeps
+/// the caller's chunking, so its end-of-chunk checkpoints equal `off`.
+pub fn outer_chunk_rows(
+    scratch: &crate::qwen35::Qwen35Scratch,
+    chunk_max: usize,
+    pos: usize,
+    remaining: usize,
+) -> usize {
     #[cfg(target_os = "linux")]
-    if chunk_max >= BANK_ROWS && scratch.npu_trunk.borrow().is_some() {
+    if chunk_max >= BANK_ROWS
+        && scratch.npu_trunk.borrow().as_ref().is_some_and(|npu| {
+            NpuTrunk::bank_b_rows(remaining).is_some_and(|b| npu.admits_pair(pos, b))
+        })
+    {
         return 2 * BANK_ROWS;
     }
-    let _ = scratch;
+    let _ = (scratch, pos, remaining);
     chunk_max
 }
 
@@ -298,6 +349,38 @@ mod tests {
         STAGE_MAP.validate().unwrap();
         let kinds: Vec<usize> = (0..64).map(|l| usize::from(l % 4 == 3)).collect();
         STAGE_MAP.check_model(&kinds, 5120).unwrap();
+    }
+
+    fn builtin() -> Calibration {
+        serde_json::from_str(BUILTIN).unwrap()
+    }
+
+    /// The shipped record binds its own key (qwen3.8-27b.mq4 index digest) and `auto` admits every
+    /// family, the only ownership the driver runs.
+    #[test]
+    fn builtin_record_admits_every_family_for_its_key() {
+        let cal = builtin();
+        cal.validate(&STAGE_MAP).unwrap();
+        assert_eq!(
+            cal.key.model_trunk_index_sha256,
+            "feb45abd725a69db31863f457c3fb90cab9f84526117e799af6383a4f382e03a"
+        );
+        assert_eq!(
+            auto_admission(&STAGE_MAP, &cal, &cal.key).unwrap(),
+            STAGE_MAP.all()
+        );
+    }
+
+    /// Halo measured `on` against `off`: an 8192 + 8192 pair saves 11.5% (p16k) and an 8192 + 1305
+    /// pair loses 6.7% (p9); `auto` must take the first and refuse the second, at any prefix.
+    #[test]
+    fn auto_pairs_full_banks_and_refuses_a_short_bank_b() {
+        let cal = builtin();
+        assert!(pair_beats_gpu(&cal, 0, CHUNK));
+        assert!(pair_beats_gpu(&cal, 6 * CHUNK, CHUNK));
+        assert!(!pair_beats_gpu(&cal, 0, 1305));
+        assert!(!pair_beats_gpu(&cal, 6 * CHUNK, 1305));
+        assert!(!pair_beats_gpu(&cal, 0, cal.gpu.min_bank_rows - 64));
     }
 
     #[cfg(target_os = "linux")]

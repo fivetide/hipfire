@@ -270,7 +270,7 @@ The shared mode, stage-map type, containment, admission and pair geometry live i
 `hipfire_runtime::coproc`. The Flash-Next trunk consumes all of them; the qwen3.8-27b dense stage
 consumes the mode switch, the `StageMap` type and the pair schedule. Its switch is
 `fusions.qwen35_npu_trunk` / `HIPFIRE_QWEN35_NPU_TRUNK` (`off|auto|on|emulate`, default `off`;
-`auto` stays GPU-only until a measured 27B calibration exists). `on` / `emulate` run the plain AR
+`auto` pairs where the built-in measured calibration prices a pair below GPU-only). `on` / `emulate` run the plain AR
 prefill (not the DFlash prompt seed) in bank pairs on `coproc::pair_schedule`
 (`qwen35::prefill::forward_prefill_npu_pair`, device half `npu_trunk::NpuTrunk`).
 

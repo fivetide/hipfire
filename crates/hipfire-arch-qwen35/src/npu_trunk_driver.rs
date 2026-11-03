@@ -4,12 +4,14 @@
 //! `bf16_direct` epilogue on the GPU twin, so `on == emulate` byte for byte. Every 27B family is
 //! owned (no family selection without a calibration).
 
-use super::{pack_group, Mode, FAMILIES, K, STAGE_MAP, SWITCH};
+use super::{pack_group, Mode, FAMILIES, FAULT_CHAIN, K, STAGE_MAP, SWITCH};
 use crate::qwen35::{
     DeltaNetState, LayerType, LayerWeights, PrefillBatchScratch, Qwen35Config, Qwen35Weights,
 };
 use crate::speculative::DeltaNetSnapshot;
 use hip_bridge::{HipError, HipResult};
+use hipfire_runtime::coproc::containment::{FaultClass, FaultLatch};
+use hipfire_runtime::coproc::Calibration;
 use peacemaker_npu::kernels::gemm_g80_n512::build_panel_program_n512;
 use railgun::npu::trunk::{
     LayerPanels, NpuTrunkRuntime, OpenOptions, PanelBuild, PanelProgram, Seq, Shape, TxnBuilder,
@@ -101,6 +103,15 @@ pub struct NpuTrunk {
     /// at the first pair), and that boundary's position until the caller adopts it.
     stage: RefCell<Option<DeltaNetSnapshot>>,
     cut: Cell<Option<usize>>,
+    /// `auto` only: the bound calibration that prices each candidate pair against GPU-only.
+    cal: Option<Calibration>,
+    /// Process-wide fault latch: the first NPU fault turns the route off for good.
+    latch: RefCell<FaultLatch>,
+    /// Set by a failed relay call of the current pair (versus a GPU HipError).
+    npu_fault: Cell<bool>,
+    /// The recurrent state before the current pair, restored when an NPU fault reruns its rows
+    /// GPU-only (allocated at the first pair).
+    pre: RefCell<Option<DeltaNetSnapshot>>,
 }
 
 // SAFETY: the driver exclusively owns the relay's HIP Rc graph; none of it escapes, and the
@@ -108,12 +119,14 @@ pub struct NpuTrunk {
 unsafe impl Send for NpuTrunk {}
 
 impl NpuTrunk {
-    /// Arms `mode` (`on` or `emulate`) for a loaded 27B, or refuses with the reason.
+    /// Arms `mode` (`on`, `emulate`, or an admitted `auto` with its bound calibration) for a
+    /// loaded 27B, or refuses with the reason. `auto` opens the NPU exactly as `on` does.
     pub fn load(
         gpu: &mut Gpu,
         weights: &Qwen35Weights,
         config: &Qwen35Config,
         mode: Mode,
+        cal: Option<Calibration>,
     ) -> Result<Self, String> {
         let started = std::time::Instant::now();
         if gpu.arch != "gfx1151" {
@@ -275,13 +288,21 @@ impl NpuTrunk {
                     other => Err(format!("{other:?} is not a qwen3.8-27b trunk shape")),
                 });
                 let pci = gpu.hip.device_pci_bus_id(gpu.device_id).map_err(fail_s)?;
+                // Developer fault injection: force the watchdog of the Nth relay chain (the real
+                // NPU-timeout path).
+                let fault_chain = hipfire_config::developer_var(FAULT_CHAIN)
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok().filter(|&n| n > 0));
                 let rt = NpuTrunkRuntime::open_with_builder(
                     programs,
                     resident,
                     2,
                     BANK_ROWS,
                     &pci,
-                    OpenOptions::default(),
+                    OpenOptions {
+                        fault_chain,
+                        ..OpenOptions::default()
+                    },
                     Some(builder),
                 )
                 .map_err(|e| fail(e).to_string())?;
@@ -329,6 +350,10 @@ impl NpuTrunk {
                 bank_b,
                 stage: RefCell::new(None),
                 cut: Cell::new(None),
+                cal,
+                latch: RefCell::new(FaultLatch::default()),
+                npu_fault: Cell::new(false),
+                pre: RefCell::new(None),
             })
         })();
         if result.is_err() {
@@ -344,6 +369,65 @@ impl NpuTrunk {
     pub fn bank_b_rows(remaining: usize) -> Option<usize> {
         let b = remaining.checked_sub(BANK_ROWS)?.min(BANK_ROWS);
         (b >= MIN_BANK_B_ROWS).then_some(b)
+    }
+
+    /// Whether the pair at prompt position `pos` (bank A = `BANK_ROWS` rows, bank B = `b` rows)
+    /// runs: never after an NPU fault; always in `on` / `emulate`; in `auto` per
+    /// [`super::pair_beats_gpu`].
+    pub fn admits_pair(&self, pos: usize, b: usize) -> bool {
+        if self.latch.borrow().tripped() {
+            return false;
+        }
+        let Some(cal) = &self.cal else {
+            return true;
+        };
+        super::pair_beats_gpu(cal, pos, b)
+    }
+
+    /// Before a pair: keep the recurrent state, so an NPU fault can rerun the pair's rows GPU-only.
+    /// KV needs no copy: the rerun rewrites the same positions.
+    pub fn save_pre(&self, gpu: &mut Gpu, dn: &DeltaNetState) -> HipResult<()> {
+        self.npu_fault.set(false);
+        let mut pre = self.pre.borrow_mut();
+        if pre.is_none() {
+            *pre = Some(DeltaNetSnapshot::new_for(gpu, dn)?);
+        }
+        let pre = pre.as_mut().expect("allocated above");
+        (0..dn.s_matrices.len()).try_for_each(|layer| pre.save_layer_from(dn, layer, gpu))
+    }
+
+    /// After a failed pair (the relay already aborted): an NPU fault latches the route off,
+    /// restores the pre-pair recurrent state and returns `Ok(true)`, so the caller reruns the
+    /// same rows on the GPU route (the request then equals `off` from this pair on). A GPU
+    /// HipError returns `Ok(false)`: its context is sticky, the request fails with it.
+    pub fn contain(&self, gpu: &mut Gpu, dn: &mut DeltaNetState, e: &HipError) -> HipResult<bool> {
+        if !self.npu_fault.take() {
+            return Ok(false);
+        }
+        if self
+            .latch
+            .borrow_mut()
+            .trip(FaultClass::NpuRuntime, &e.to_string())
+        {
+            eprintln!(
+                "{}: fault ({}): {e}; route off for this process, pair rows rerun GPU-only",
+                SWITCH.tag,
+                FaultClass::NpuRuntime.as_str()
+            );
+        }
+        gpu.hip.device_synchronize()?;
+        self.pre
+            .borrow()
+            .as_ref()
+            .expect("save_pre ran before the pair")
+            .restore_to(dn, gpu)?;
+        Ok(true)
+    }
+
+    /// A failed relay call: marks the pair's fault as the NPU's.
+    fn npu_fail(&self, e: impl std::fmt::Display) -> HipError {
+        self.npu_fault.set(true);
+        fail(e)
     }
 
     /// Projects layer `layer` of bank `bank` from `pbs.x_rot_batch` (RMSNorm + rotation + AWQ
@@ -385,7 +469,8 @@ impl NpuTrunk {
         };
         let shape = SHAPES[kind];
         unsafe {
-            rt.prepare_bank(bank, stream(gpu)).map_err(fail)?;
+            rt.prepare_bank(bank, stream(gpu))
+                .map_err(|e| self.npu_fail(e))?;
             let layout = NpuBf16Layout {
                 padded_rows: rt.chain_rows(shape, rows),
                 k: K,
@@ -396,12 +481,12 @@ impl NpuTrunk {
                 x,
                 rows,
                 layout,
-                rt.a_out_arena(bank).map_err(fail)?.device as *mut c_void,
+                rt.a_out_arena(bank).map_err(|e| self.npu_fail(e))?.device as *mut c_void,
                 &self.d[bank],
             )?;
             rt.kick(layer, shape, bank, rows, stream(gpu))
                 .map(Some)
-                .map_err(fail)
+                .map_err(|e| self.npu_fail(e))
         }
     }
 
@@ -420,7 +505,10 @@ impl NpuTrunk {
             return Ok(());
         };
         let kind = self.kinds[layer];
-        unsafe { rt.wait_gpu(seq, stream(gpu)).map_err(fail)? };
+        unsafe {
+            rt.wait_gpu(seq, stream(gpu))
+                .map_err(|e| self.npu_fail(e))?
+        };
         let arena = &self.c[bank][kind];
         for out in outputs(kind, pbs) {
             npu_trunk_copy_projection_arena(
@@ -438,7 +526,10 @@ impl NpuTrunk {
                 0,
             )?;
         }
-        unsafe { rt.retire_bank(seq, stream(gpu)).map_err(fail) }
+        unsafe {
+            rt.retire_bank(seq, stream(gpu))
+                .map_err(|e| self.npu_fail(e))
+        }
     }
 
     /// After the pair's last consume: surfaces a relay failure before the pair's outputs are used.
@@ -446,8 +537,8 @@ impl NpuTrunk {
         let (Some(rt), Some(seq)) = (&self.runtime, last) else {
             return Ok(());
         };
-        rt.wait_host(seq).map_err(fail)?;
-        rt.check_error().map_err(fail)
+        rt.wait_host(seq).map_err(|e| self.npu_fail(e))?;
+        rt.check_error().map_err(|e| self.npu_fail(e))
     }
 
     /// A pair failed: release every outstanding GPU wait so the stream drains. `on` stays failed

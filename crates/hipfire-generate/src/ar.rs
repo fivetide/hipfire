@@ -5098,7 +5098,6 @@ pub fn generate(
                     }
                 }
             };
-            let chunk_max = hipfire_arch_qwen35::npu_trunk::outer_chunk_rows(scratch, chunk_max);
             let mut start = 0usize;
             while start < new_tokens.len() {
                 if check_abort(id) {
@@ -5106,6 +5105,9 @@ pub fn generate(
                     break;
                 }
                 let remaining = new_tokens.len() - start;
+                let chunk_max = hipfire_arch_qwen35::npu_trunk::outer_chunk_rows(
+                    scratch, chunk_max, m.seq_pos, remaining,
+                );
                 let outer = qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, chunk_max)
                     .unwrap_or(remaining.min(chunk_max).max(1));
                 let end = (start + outer).min(new_tokens.len());

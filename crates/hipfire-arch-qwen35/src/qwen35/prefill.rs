@@ -4075,8 +4075,8 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 }
             }
             // qwen3.8-27b co-processor pair: a full bank A plus a real bank B of an ordinary
-            // dense prefill. Shorter tails stay GPU-only in every mode, so `on` and `emulate`
-            // split a prompt identically.
+            // dense prefill, when the trunk admits it (`auto`: the calibrated cost test). Shorter
+            // tails stay GPU-only in every mode, so `on` and `emulate` split a prompt identically.
             #[cfg(target_os = "linux")]
             if let (true, Some(npu)) = (
                 wide && chunk_n == crate::npu_trunk::BANK_ROWS,
@@ -4091,6 +4091,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                         && !gpu.graphs.capture_mode
                         && !gpu.replay.is_recording()
                         && !super::vl_prefill::overlaps(start_pos + chunk_start, chunk_n + b)
+                        && npu.admits_pair(start_pos + chunk_start, b)
                 });
                 if let Some(b) = pair_b {
                     let a_end = chunk_start + chunk_n;
@@ -4100,6 +4101,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                         start_pos + chunk_start,
                         npu.mode()
                     );
+                    npu.save_pre(gpu, dn_state)?;
                     if let Err(e) = forward_prefill_npu_pair(
                         gpu,
                         weights,
@@ -4114,6 +4116,10 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                         needs_last_token_logits,
                     ) {
                         npu.abort(&format!("{e:?}"));
+                        if npu.contain(gpu, dn_state, &e)? {
+                            // NPU fault: the route is latched off; rerun these rows GPU-only.
+                            continue;
+                        }
                         return Err(e);
                     }
                     chunk_start = a_end + b;

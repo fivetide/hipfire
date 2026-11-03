@@ -477,6 +477,8 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     let ModelSource::Hfq(mut hfq) = src else {
         return Err("qwen35: directory source unsupported".into());
     };
+    #[cfg(target_os = "linux")]
+    let npu_index = crate::npu_trunk::model_index(npu_mode, &hfq);
 
     let config_placement_started = std::time::Instant::now();
     let config = <Qwen35 as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
@@ -624,13 +626,36 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     };
     #[cfg(target_os = "linux")]
     if !npu_mode.is_off() {
-        match crate::npu_trunk::NpuTrunk::load(ctx.gpu, &weights, &config, npu_mode) {
-            Ok(npu) => *scratch.npu_trunk.borrow_mut() = Some(npu),
-            Err(e) => {
-                let _ = scratch.free_gpu(ctx.gpu);
-                let cleanup = free_dn_kv_and_weights(dn, kv, weights, ctx.gpu);
-                let e = append_cleanup_context(e, cleanup);
-                return Err(release_after_failed_load(e, weight_lease.take(), ctx.gpu));
+        // `auto` arms only with an admitting calibration and falls back to GPU-only on any
+        // refusal; the forced modes fail the load instead.
+        let cal = npu_index.as_ref().map(|index| {
+            let pci = ctx.gpu.hip.device_pci_bus_id(ctx.gpu.device_id);
+            let pci = pci.map_err(|e| e.to_string());
+            crate::npu_trunk::auto_calibration(&ctx.gpu.arch, pci.as_deref().unwrap_or(""), index)
+        });
+        if !matches!(cal, Some(None)) {
+            match crate::npu_trunk::NpuTrunk::load(
+                ctx.gpu,
+                &weights,
+                &config,
+                npu_mode,
+                cal.flatten(),
+            ) {
+                Ok(npu) => *scratch.npu_trunk.borrow_mut() = Some(npu),
+                Err(e) if npu_mode == hipfire_runtime::coproc::Mode::Auto => eprintln!(
+                    "{}",
+                    hipfire_runtime::coproc::admission::off_line(
+                        crate::npu_trunk::SWITCH,
+                        true,
+                        &e
+                    )
+                ),
+                Err(e) => {
+                    let _ = scratch.free_gpu(ctx.gpu);
+                    let cleanup = free_dn_kv_and_weights(dn, kv, weights, ctx.gpu);
+                    let e = append_cleanup_context(e, cleanup);
+                    return Err(release_after_failed_load(e, weight_lease.take(), ctx.gpu));
+                }
             }
         }
     }
