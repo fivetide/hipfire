@@ -1,0 +1,77 @@
+## Default-ON env flags in crates/hipfire-arch-qwen4 (repo at beta 39f5fd421)
+
+Read sites are in `crates/hipfire-arch-qwen4/src` (test and example code excluded). "OFF size" is not measured unless stated. "introduced" is the first `git log -S` line for the name; `?` means the lookup did not finish before this file was written (see notes).
+
+| env var | kind | file:line of read | default-ON evidence | what OFF does | OFF-path size | obsolete signal | introduced |
+|---|---|---|---|---|---|---|---|
+| HIPFIRE_QWEN4_CAPTURE_RING_COMPACT | bool | state.rs:2103 | `developer_bool(CAPTURE_RING_COMPACT_ENV, true)` | full (non-compact) capture ring layout | not measured | NONE | 3f018b70d qwen4 EP reserve: explicit scratch-donor planning |
+| HIPFIRE_QWEN4_PLE_WIDE_READERS | bool | bundle.rs:915 | `developer_bool("…", true)` | 16 concurrent PLE reads per request | 1 expr | NONE | 309baf974 perf(qwen4): scale PLE row-store readers with request size |
+| HIPFIRE_QWEN4_TAIL_SNAPSHOT | bool | bundle.rs:999 | `developer_bool(TAIL_SNAPSHOT_ENV, true)` | no tail snapshot | not measured | NONE (commit title says "prototype") | a7f58373d qwen4: tail lineage resident (HIPFIRE_QWEN4_TAIL_SNAPSHOT) |
+| HIPFIRE_QWEN4_LANE_COST | bool | mtp_lanes.rs:391 | `developer_bool("…", true)` | gfx1151-prior, store-pooled, probe-budget lane floor | not measured | doc: "the lane floor this module had before profiles"; "legacy profile" | fc4313aa5 qwen4 EP lanes: gfx1201 lane cost profile |
+| HIPFIRE_QWEN4_LANE_MEASURED_DEPTH | bool | mtp_lanes.rs:400 | `developer_bool("…", true)` | static table decides AR too | 1 fn | doc: "under the legacy profile" | 44c3c7838 qwen4 EP lanes: measured R9700 step cost |
+| HIPFIRE_QWEN4_LANE_COMMIT_FILL | bool | mtp_lanes.rs:1316 | `developer_bool("…", true)` (gated by gfx1201) | per-row `mtp_append_token` commit | 1 fn | NONE | 371ca9f89 qwen4 EP lanes: 48-row cycle loses ~400 launches |
+| HIPFIRE_QWEN4_EXPERT_STAGE_CAPTURE | bool | gpu_forward/slab_stage.rs:1410, 1724, 2199; gpu_forward.rs:7225 | `developer_bool(…, true)` | `capture: false` | not measured | NONE | 2cb949068 feat(qwen4): long-prefill expert staging under wide-hidden capture |
+| HIPFIRE_QWEN4_DRAFT_SHARDED_MOE | bool | mtp_gpu.rs:78 | `developer_bool(…, true)` ("default on") | per-rank draft MoE, no sharded pass | not measured | NONE | 99ede8e6a qwen4 EP mesh: sharded draft-head MoE under X2 |
+| HIPFIRE_QWEN4_MTP_APPEND_DET | bool | mtp_gpu.rs:200 (const `MTP_APPEND_DET_DEFAULT = true`, mtp_gpu.rs:181) | `developer_bool(ENV, MTP_APPEND_DET_DEFAULT)` | incumbent append kernels | 1 fn | commit title says "opt-in"; code default is on (gfx1151 only) | 9df419db1 qwen4: add opt-in gfx1151 fixed-K DET MTP prompt append |
+| HIPFIRE_QWEN4_MTP_TOKEN_RING | bool | mtp_gpu.rs:261 | `developer_bool(…, true)` | no pinned token ring; host-synced uploads | 1 fn | NONE | 79ad6c123 qwen4 EP2 MTP decode host syncs |
+| HIPFIRE_EP_MTP_RESERVE_SHARE | bool | ep_reserve.rs:51 | `developer_bool(…, true)` | no reserve sharing | not measured | commit body calls it a lab override | 625e6aebc EP: lab override HIPFIRE_EP_MTP_RESERVE_SHARE=1 |
+| HIPFIRE_QWEN4_EP_TRUNK_SHARD_MTP | bool | weights/trunk_shard.rs:131 | `developer_bool(…, true)` | native MTP head dropped under the shard (AR-only) | 1 fn | commit title says "inert, default off"; code default is on | a3f564ec8 qwen4 EP trunk shard (inert, default off) |
+| HIPFIRE_QWEN4_MTP_DRAFT_PROJ_BATCH | bool | mtp_gpu/rows.rs:79 | `developer_bool(…, true)` | one indexed-attention op per lane | not measured | NONE | abec0f69d qwen4 MTP draft rounds: head QSA Q8 projections batched |
+| HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS_XBATCH | bool | mtp_gpu/rows.rs:943 | `developer_bool(…, true)` | each row ranked with one-row launches | 1 expr | code comment: "bisection switch" | 174f33eda qwen4 mtp: batched MTP head rounds (B2+B3) |
+| HIPFIRE_QWEN4_MTP_BATCHED_FILL | bool | mtp_spec.rs:10948 (state_parity.rs:2984 only reports it) | `developer_bool(…, true)` | per-row Append prompt fill | not measured | NONE | a5b0cc14f perf(qwen4): batched native-MTP prompt fill |
+| HIPFIRE_QWEN4_MTP_SKIP_INTERMEDIATE_PICK | bool | mtp_spec.rs:11005 | `developer_bool(…, true)` | non-final prefill chunks run LM head, argmax, readback | 1 fn | NONE | 638750e35 qwen4 MTP: skip the LM head, argmax and readback on non-final prompt-fill chunks |
+| HIPFIRE_QWEN4_EP_TRUNK_SHARD_PMASK | bool | gpu_forward.rs:4112 | `developer_bool(…, true)` | compact zero-dummy route | not measured | NONE | 948ac8bb5 qwen4 EP trunk shard: partial tile mask |
+| HIPFIRE_QWEN4_TOKEN_READBACK_EARLY | bool | gpu_forward.rs:13622 | `developer_bool(…, true)` | late token readback | 1 field | NONE | ed009aaff perf(qwen4/gfx1151): exact Flash-Next decode levers |
+| HIPFIRE_QWEN4_EP_GATHER_DEVICE_WAIT | bool | ep.rs:1824 (gated by gfx1201) | `developer_bool(…, true)` | host waits per MoE layer | 1 expr | NONE | 371ca9f89 (same commit line as LANE_COMMIT_FILL in lookup) |
+| HIPFIRE_EP_MTP_LANE_COPY | bool | ep.rs:3077 | `!developer_bool(…, true)` (kill on `0`) | no copy-lane windows | 1 expr | commit title says "copy opt-in"; code default is on | 30a3ecec5 EP serve: lane K capped at 3, copy opt-in |
+| HIPFIRE_EP_RESERVE_RECEIPT_HASH | bool | gpu_forward/ep_reserve_forward.rs:1192 | `developer_bool(…, true)` (only read when receipts are on; receipts default off) | receipts without hashes | 1 expr | NONE | 30e478fb7 qwen4 EP: route B reserve decoupling (opt-in HIPFIRE_EP_RESERVE_DECOUPLE=1) |
+| HIPFIRE_QWEN4_SP_SLAB | bool | slowlink_prefill/sp.rs:347 | `developer_bool(SP_SLAB_ENV, SP_SLAB_DEFAULT = true)` (slowlink_sp.rs:37) | no hybrid SP on slab profile | 1 expr | slowlink_sp.rs:30 calls it a kill switch; commit title says "opt-in =1" | 526c0569f SP over the slab route (opt-in HIPFIRE_QWEN4_SP_SLAB=1) |
+| HIPFIRE_QWEN4_DECODE_SHARE_SHADOWS | bool | decode_share.rs:156 | `developer_bool(…, true)` | no F16/INT8 shadows in donor tail | 1 fn | NONE | a0e571597 qwen4 decode-share: F16 and INT8 weight shadows |
+| HIPFIRE_QWEN4_SYM_VERDICT_CACHE | bool | artifact.rs:1927 | `!developer_bool(VERDICT_CACHE_ENV, true)` | uncached symmetry scan | 1 branch | NONE | 858cd330b qwen4: cache the routed-expert symmetry scan verdict |
+| HIPFIRE_EP_UNIT_TAIL_PREFILL | lever (default on) | expert_unit_tail.rs:336 `tail_lever` (`developer_bool(env, true)`); used at ep.rs:820, expert_unit_tail.rs:363 | `tail_lever` | pool invisible to prefill routes | not measured | doc: "=0 is the kill switch" | ? |
+| HIPFIRE_EP_UNIT_TAIL_PEER | lever (default on) | expert_unit_tail.rs:336; ep.rs:825 | `tail_lever` | no peer-slot tables | not measured | NONE | ? |
+| HIPFIRE_EP_UNIT_TAIL_PINS | lever (default on) | expert_unit_tail.rs:336; ep.rs:859, expert_unit_tail.rs:379 | `tail_lever` | pinned owners stay off with tail | not measured | NONE | ? |
+| HIPFIRE_EP_UNIT_TAIL_FILL_OVERLAP | lever (default on) | expert_unit_tail.rs:336; ep.rs:908 | `tail_lever` | fills issued at retirement | not measured | NONE | ? |
+| HIPFIRE_EP_TAIL_LOG_DIRECT | lever (default on) | expert_unit_tail.rs:336; ep.rs:912 | `tail_lever` | per-layer copy into tail log | not measured | NONE | ? |
+| HIPFIRE_EP_UNIT_TAIL_PEER_RESERVE | lever (default on) | expert_unit_tail.rs:336; ep.rs:915 | `tail_lever` | candidate-waits rule | not measured | NONE | ? |
+| HIPFIRE_EP_BALANCED_OWNERS | kill (`!= Ok("0")`) | gpu_forward.rs:3998 | `developer_var(…) != Ok("0")` | static `e % ranks` owners | not measured | NONE | ? |
+| HIPFIRE_EP_UNIT_PINNED_OWNERS | kill (`raw != Some("0")`) | expert_ep_units.rs:1126 (read at gpu_forward.rs:4035, 14160) | `ep_unit_pinned_owners_on` | static owners on unit layers (D1) | 1 fn | NONE | ? |
+| HIPFIRE_QWEN4_PENALTY_PREPASS | kill (`!= Ok("0")`) | bundle.rs:275 | `penalty_prepass_enabled()` | host penalty path | 1 fn | doc: "Diagnostic / A-B only" | ? |
+| HIPFIRE_MTP_AR_FLOOR | kill (`!= Ok("0")`) | mtp_lanes.rs:355; mtp_spec.rs:10709 | `developer_var(…) != Ok("0")` | no AR floor | 2 sites | NONE | ? |
+| HIPFIRE_QWEN4_EP_DRAFT_SPLIT | kill (`!= Ok("0")`) | mesh_lane_protocol.rs:4242 | `ep_draft_split_enabled()` | all lanes replicated | 1 fn | NONE | ? |
+| HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT | kill (`is_none_or(!= "0")`) | lane_exec.rs:163 | `ep_lane_prefill_wave_from` | serial singleton tiles | 1 fn | NONE | ? |
+| HIPFIRE_EP_LANE_PREFILL_WAVE_TILE | kill (`!= "0"`) | gpu_forward/ep_wave.rs:84 (fn at :79) | `ep_wave_tile_enabled_from` | tile route not in wave | 1 fn | NONE | ? |
+| HIPFIRE_EP_LANE_PREFILL_WAVE_SHARD | kill (`!= "0"`) | gpu_forward/ep_wave.rs:108 (fn at :103) | `ep_wave_shard_enabled_from` | trunk-shard partial wave off | 1 fn | NONE | ? |
+| HIPFIRE_EP_LANE_PREFILL_WAVE_SMALL_LANES | kill (`!= "0"`) | gpu_forward/ep_wave.rs:166 (fn at :161) | `ep_wave_small_lanes_enabled_from` | 9..=64-row lanes stay serial | 1 fn | NONE | ? |
+| HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT | kill (`!= "0"`) | gpu_forward/ep_wave.rs:229 (fn at :224) | `ep_wave_joint_enabled_from` | dense stages not joint | 1 fn | NONE | ? |
+| HIPFIRE_PP_LANE_OVERLAP | kill (`!= Some("0")`) | bundle/pp_lanes.rs:1013 | `decode_overlap_enabled` (pp_lanes.rs:994) | sequential decode | 1 fn | NONE | ? |
+| HIPFIRE_QWEN4_EP_SEQ_PARALLEL | sp_switch (None/""/1/on/true = on) | trunk_route.rs:46 | `sp_switch` (trunk_route.rs:40) | all-reduce prefill route | 1 fn | NONE | ? |
+| HIPFIRE_QWEN4_EP_SP_SUB512 | sp_switch | trunk_route.rs:68 (static at :64) | `sp_switch` | sub-512 band uses all-reduce | 1 fn | NONE | ? |
+| HIPFIRE_QWEN4_EP_SP_SUB512_WAVE | sp_switch | trunk_route.rs:109 | `sp_switch` | wave not joint HC SP | 1 fn | NONE | ? |
+| HIPFIRE_QWEN4_EP_SP_INDEXER | sp_indexer_switch | trunk_route.rs:143 | `sp_indexer_switch` (trunk_route.rs:138) | every rank selects every row | 1 fn | NONE | ? |
+| HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD | mode (`1`/`0`/default true) | gpu_forward.rs:13614; ple_stage.rs:38-44 | `PLE_ASYNC_UPLOAD_DEFAULT = true` (ple_stage.rs:33) | synchronous PLE upload | 1 fn | NONE | ? |
+| HIPFIRE_QWEN4_MOE_SYM_IU4 | typed kill (only `Some(false)` kills) | gpu_forward.rs:12795 `developer_typed_bool` | `sym_iu4_kill_verdict` (gpu_forward.rs:1237) | F16/SIMT fallback; EP refuses it. Route itself is outside this crate | not measured | NONE | ? |
+| HIPFIRE_QWEN4_EP_TAIL_BORROW | kill (unset = on) | gpu_forward/ep_tail_borrow.rs:68-70 (`EP_TAIL_BORROW_DEFAULT_ON = true`), parse at :89 | unset → `Default`; the read site was not traced | borrow off | not measured | doc: "on since the served A/B" | ? |
+| HIPFIRE_QWEN4_COMPACT_SCRATCH | mode (tri-state) | gpu_forward.rs:596-598 (knob), :612 (`knob != Some(false)`) | default on for slab / sym-IU4 artifacts | full scratch | not measured | NONE | ? |
+| HIPFIRE_QWEN4_DECODE_SHARE | mode | decode_share.rs:87, 93 (`from_env`); parse 69-80 | `DECODE_SHARE_DEFAULT = On` (decode_share.rs:49); None/auto → On | `off` or any other value → Off | not measured | NONE | ? |
+| HIPFIRE_QWEN4_TRUNK_OVERLAY | mode (auto) | trunk_overlay.rs:61; parse 45-55 | None/auto → Auto (applies on the default arch gfx1151) | `0` → skip | not measured | NONE | ? |
+| HIPFIRE_QWEN4_EP_VOCAB_SHARD | mode (ShardSwitch::Default) | ep_vocab_shard.rs:132 | Default = EP2 over two exact gfx1201 cards | off | not measured | NONE | ? |
+| HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD | mode (Default) | ep_vocab_shard.rs:102 | Default attaches only with exchange attached | off | not measured | NONE | ? |
+| HIPFIRE_QWEN4_EP_TRUNK_SHARD | mode (ShardSwitch::Default) | weights/trunk_shard.rs:76 | unset → Default; shipped default for EP2 over two gfx1201 | off | not measured | NONE | ? |
+| HIPFIRE_EP_EXPERT_STAGE | mode (arch default) | expert_ep_units.rs:1624 (var), :1614 (`!= Some("0")`) | `expert_stage_switch` → `host_link::expert_stage_default(arch)` | off | not measured | NONE | ? |
+| HIPFIRE_QWEN4_EXPERT_STAGE | mode (arch default) | expert_residency.rs:2810, 2844 → `expert_stage_switch` (expert_residency.rs:2819) | unset → `expert_stage_default(arch)` | off | not measured | NONE | ? |
+| HIPFIRE_EP_OWNER_ROUTED_PREFILL | kill, conditional | gpu_forward.rs:4083 → `ep_owner_routed_prefill_on` (:4072) | `ep_lever_on` (`!= Some("0")`) && (!trunk_shard \|\| reserve \|\| pmask) | owner-routed prefill off | not measured | NONE | ? |
+| HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS | bool, conditional | mtp_gpu/rows.rs:35 | default = `qwen4_ep() >= 2 \|\| is_stock_fp8()` | per-lane draft chains | 1 expr | NONE | ? |
+| HIPFIRE_QWEN4_S1_TIER | bool, conditional | slowlink_admission.rs:144 | default = `memory::qwen4_gfx1100_tier_package(arch)` | S1 tier off | not measured | NONE | ? |
+| HIPFIRE_QWEN4_EXPERT_HOTSET_CENSUS_RESERVE | bool, conditional | expert_hotset.rs:124 | default = `memory::qwen4_gfx1100_tier_package(arch)` | census reserve off | not measured | NONE | ? |
+| HIPFIRE_QWEN4_EP_EXPERT_HOTSET | mode (Default) | expert_ep_units.rs `ep_units_policy` (~:1209) | None → Default; `hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON = true` (hipfire-config lib.rs:10983) | `0`/blank → Off | not measured | NONE | ? |
+| HIPFIRE_QWEN4_EXPERT_DROP_ZERO | bool, conditional | artifact.rs:1949 → `expert_drop_zero_default_requested` (:1958) | unset → `gate` (= EP_EXPERT_HOTSET_DEFAULT_ON) && policy != Off && sidecar exists | drop-zero off | not measured | NONE | ? |
+| HIPFIRE_EP_UNIT_TAIL | mode (default tail on a unit-plan load) | expert_unit_tail.rs:330; resolve at :316-325 (`None → Some(default)`) | unset → default tail slots/fills | `""`/`0`/`off` → off (expert_unit_tail.rs:275) | not measured | NONE | ? |
+
+## Notes
+
+- The `introduced` lookup did not finish. 24 of 63 names have a commit; the other 39 are `?`. Their `git log -S` runs were still going in the background when this was written. The partial results are in `sweep/scratch_c4/introduced_snapshot.tsv`. I stopped the monitor, but the background `xargs` job may still be running and writing `sweep/scratch_c4/introduced.tsv`. I did not confirm that it exited.
+- Kind/default conflicts between commit titles and code, to verify: HIPFIRE_QWEN4_EP_TRUNK_SHARD_MTP ("inert, default off" vs `developer_bool(…, true)`), HIPFIRE_EP_MTP_LANE_COPY ("copy opt-in" vs `!developer_bool(…, true)`), HIPFIRE_QWEN4_SP_SLAB ("opt-in =1" vs `SP_SLAB_DEFAULT = true`), HIPFIRE_QWEN4_MTP_APPEND_DET ("opt-in" vs `MTP_APPEND_DET_DEFAULT = true`).
+- Conditional-default rows (arch, topology or artifact dependent) are listed as default-ON only where the default expression is on for the shipped configuration. The effective default varies by arch.
+- Not counted here: HIPFIRE_QWEN4_TRUNK_A8, HIPFIRE_QWEN4_MOE_DOWN_A8, HIPFIRE_QWEN4_MOE_GU_A8 and HIPFIRE_QWEN4_MOE_EP_A8. This crate only prints their kill messages, and the accessor lives outside it. The LANE_ALLROWS-type flags are also read outside this crate. HIPFIRE_EP_TRUNK_BALANCED_OWNERS is default-off. HIPFIRE_MTP_SAMPLED_MODE defaults to `leviathan`, a mode choice with no on/off meaning. HIPFIRE_QWEN4_SLOWLINK_PREFILL is a typed bool with None → Auto. HIPFIRE_QWEN4_EXPERT_HOTSET_POLICY (ranked default) and HIPFIRE_QWEN4_MTP_INCREMENTAL are developer-route selectors, not default-ON features.
+- HIPFIRE_EP_UNIT_TAIL_PREFILL, PEER, PINS, FILL_OVERLAP, TAIL_LOG_DIRECT and PEER_RESERVE all go through `tail_lever` (expert_unit_tail.rs:336). Each is a separate flag with its own kill switch. PREFILL/PEER/PINS only take effect when the tail itself is on.
