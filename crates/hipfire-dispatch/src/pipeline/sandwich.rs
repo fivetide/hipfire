@@ -1000,8 +1000,10 @@ pub enum KvRoute<'a> {
     /// Continuous-batch lanes over a lane-major absolute-position Q8 cache:
     /// row `r` is lane `r` at its own position `positions[r]`, and lane `r`'s
     /// cache is the `lane_capacity` rows from row `r * lane_capacity`. Lanes
-    /// outside `active_mask` neither write nor attend. The per-head kernel
-    /// sizes its LDS by `lane_capacity` (see
+    /// outside `active_mask` neither write nor attend. A K=V sublayer writes
+    /// its K rows as V; a query-only sublayer (KV sharing) attends the lanes
+    /// its source layer wrote. The per-head kernel sizes its LDS by
+    /// `lane_capacity` (see
     /// `Gpu::attention_q8_0_kv_independent_max_lane_capacity`).
     Lanes {
         lane_capacity: usize,
@@ -1301,13 +1303,10 @@ impl SandwichAttentionOp<'_> {
                 lane_capacity,
                 active_mask,
             } => {
-                if s.steps_route().is_none() || !s.batched() || rows > 64 {
+                if !s.batched() || rows > 64 {
                     return Err(invalid(format!(
-                        "{L}: lanes need 1..=64 batched rows on the steps route, got {rows}"
+                        "{L}: lanes need 1..=64 batched rows, got {rows}"
                     )));
-                }
-                if !matches!(&self.kv_proj, Some(KvProjection { wv: Some(_), .. })) {
-                    return Err(invalid(format!("{L}: lanes need K and V projections")));
                 }
                 if *lane_capacity == 0 || rows * lane_capacity > kv.physical_cap {
                     return Err(invalid(format!(
@@ -1872,8 +1871,9 @@ impl SandwichAttentionOp<'_> {
         .map_err(hip)
     }
 
-    /// [`KvRoute::Lanes`]: masked per-lane K/V writes, then per-lane causal
-    /// attention, windowed on sliding layers.
+    /// [`KvRoute::Lanes`]: masked per-lane K/V writes (a query-only sublayer
+    /// writes none), then per-lane causal attention, windowed on sliding
+    /// layers.
     fn attend_lanes(
         &self,
         gpu: &mut Gpu,
@@ -1888,7 +1888,8 @@ impl SandwichAttentionOp<'_> {
             self.stream.rows,
         );
         let positions = self.positions()?;
-        for (cache, src) in [(kv.k_cache, self.k), (kv.v_cache, self.v)] {
+        let writes = [(kv.k_cache, self.k), (kv.v_cache, self.v)];
+        for (cache, src) in writes.into_iter().filter(|_| self.kv_proj.is_some()) {
             gpu.kv_cache_write_q8_0_independent_masked(
                 cache,
                 src,
@@ -3436,6 +3437,9 @@ mod validation_tests {
             active_mask,
         };
         assert!(check_kv(RowsRoute::Prefill, STEPS, 0, 4, lanes(CAP / 4, 0b1011)).is_ok());
+        // Gemma 4 runs its rows on the Wide ladder.
+        let wide = SandwichRoute::Wide;
+        assert!(check_kv(RowsRoute::Prefill, wide, 0, 4, lanes(CAP / 4, 0b1111)).is_ok());
         refused(
             check_kv(RowsRoute::Prefill, STEPS, 0, 4, lanes(CAP / 4 + 1, 0b1111)),
             "4 lanes of 17 rows outside a cache of 64 rows",

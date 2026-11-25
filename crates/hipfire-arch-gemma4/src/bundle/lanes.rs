@@ -10,6 +10,13 @@
 //! resident caches keep their buffers, so the captured decode graph stays
 //! bound to them.
 //!
+//! The lanes' K/V live in one lane-major arena per cache slot: lane `i`
+//! owns the `max_seq` rows from row `i * max_seq`. That is the layout
+//! `KvRoute::Lanes` attends with `lane_capacity == max_seq` (batch row `r`
+//! is lane `r`), so one forward over the lanes' rows can read and write
+//! every lane in place. A lane's own caches are non-owning views of its
+//! region, which the whole-step forward swaps in.
+//!
 //! A lane is never a conversation record ([`MeshLanes::keeps_records`]):
 //! decoded rows are not reused (`bundle.rs`), so a finished lane is freed.
 
@@ -23,6 +30,7 @@ use hipfire_runtime::multi_gpu::Gpus;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 struct Lane {
+    /// Views of this lane's region of the arenas; never freed.
     kv_sliding: KvCache,
     kv_full: KvCache,
     n_tokens: usize,
@@ -30,8 +38,12 @@ struct Lane {
     tag: Option<u64>,
 }
 
-/// The staged lanes and the device argmax slot their rows share.
+/// The staged lanes, their K/V arenas and the device argmax slot their rows
+/// share.
 pub(super) struct Gemma4Lanes {
+    /// Lane-major arenas of `lanes.len() * max_seq` rows per slot.
+    arena_sliding: KvCache,
+    arena_full: KvCache,
     lanes: Vec<Lane>,
     top1: GpuTensor,
     /// Sampled requests may take a lane (`serve.batch_sampled`).
@@ -40,18 +52,41 @@ pub(super) struct Gemma4Lanes {
 
 impl Gemma4Lanes {
     pub(super) fn free_gpu(self, gpu: &mut Gpu) {
-        for lane in self.lanes {
-            let _ = lane.kv_sliding.free_gpu(gpu);
-            let _ = lane.kv_full.free_gpu(gpu);
-        }
+        let _ = self.arena_sliding.free_gpu(gpu);
+        let _ = self.arena_full.free_gpu(gpu);
         let _ = gpu.free_tensor(self.top1);
     }
 }
 
-/// A KV set shaped like `kv` (Q8 caches only).
-fn alloc_like(gpu: &mut Gpu, kv: &KvCache) -> Result<KvCache> {
-    KvCache::new_gpu_q8(gpu, kv.k_gpu.len(), kv.n_kv_heads, kv.head_dim, kv.max_seq)
+/// A lane-major arena for `n` KV sets shaped like `kv` (Q8 caches only).
+fn alloc_arena(gpu: &mut Gpu, kv: &KvCache, n: usize) -> Result<KvCache> {
+    let rows = n * kv.max_seq;
+    KvCache::new_gpu_q8(gpu, kv.k_gpu.len(), kv.n_kv_heads, kv.head_dim, rows)
         .map_err(|e| format!("gemma4 lane KV: {e:?}"))
+}
+
+/// Lane `lane`'s region of `arena` as a non-owning KV set shaped like `kv`.
+fn lane_view(gpu: &mut Gpu, arena: &KvCache, kv: &KvCache, lane: usize) -> Result<KvCache> {
+    let lane_bytes = kv.max_seq * q8_row_bytes(kv);
+    // The arena tensors count f32 words.
+    if !lane_bytes.is_multiple_of(4) {
+        return Err(format!(
+            "gemma4 lane KV: {lane_bytes} lane bytes are not whole words"
+        ));
+    }
+    let (offset, len) = (lane * lane_bytes / 4, lane_bytes / 4);
+    let views = |tensors: &[GpuTensor]| {
+        tensors
+            .iter()
+            .map(|t| t.try_sub_offset(offset, len))
+            .collect::<std::result::Result<Vec<_>, String>>()
+    };
+    // Zero slots allocate nothing; the views replace them.
+    let mut view = KvCache::new_gpu_q8(gpu, 0, kv.n_kv_heads, kv.head_dim, kv.max_seq)
+        .map_err(|e| format!("gemma4 lane KV view: {e:?}"))?;
+    view.k_gpu = views(&arena.k_gpu)?;
+    view.v_gpu = views(&arena.v_gpu)?;
+    Ok(view)
 }
 
 /// Copy the first `rows` positions of every K/V slot of `src` into `dst`.
@@ -70,9 +105,9 @@ fn copy_rows(gpu: &mut Gpu, dst: &KvCache, src: &KvCache, rows: usize) -> Result
 }
 
 impl Gemma4Bundle {
-    /// Stage `n` engine lanes, each a KV set shaped like the resident caches;
-    /// `sampled` admits sampled requests to them. Q8 caches only (a park
-    /// copies Q8 rows).
+    /// Stage `n` engine lanes, each a KV set shaped like the resident caches
+    /// in lane-major arenas; `sampled` admits sampled requests to them. Q8
+    /// caches only (a park copies Q8 rows).
     pub fn stage_engine_lanes(&mut self, gpu: &mut Gpu, n: usize, sampled: bool) -> Result<()> {
         if self.lanes.is_some() {
             return Err("gemma4 engine lanes are already staged".into());
@@ -81,28 +116,38 @@ impl Gemma4Bundle {
         if !(sliding.quant_q8 && full.quant_q8) {
             return Err("gemma4 engine lanes need Q8 KV caches".into());
         }
-        let top1 = gpu
-            .zeros(&[std::mem::size_of::<u32>()], DType::Raw)
-            .map_err(|e| format!("gemma4 lane argmax slot: {e:?}"))?;
+        let arena_sliding = alloc_arena(gpu, sliding, n)?;
+        let arena_full = match alloc_arena(gpu, full, n) {
+            Ok(arena) => arena,
+            Err(error) => {
+                let _ = arena_sliding.free_gpu(gpu);
+                return Err(error);
+            }
+        };
+        let top1 = match gpu.zeros(&[std::mem::size_of::<u32>()], DType::Raw) {
+            Ok(top1) => top1,
+            Err(error) => {
+                let _ = arena_sliding.free_gpu(gpu);
+                let _ = arena_full.free_gpu(gpu);
+                return Err(format!("gemma4 lane argmax slot: {error:?}"));
+            }
+        };
         let mut staged = Gemma4Lanes {
+            arena_sliding,
+            arena_full,
             lanes: Vec::with_capacity(n),
             top1,
             sampled,
         };
-        for _ in 0..n {
-            let lane =
-                alloc_like(gpu, sliding).and_then(|kv_sliding| match alloc_like(gpu, full) {
-                    Ok(kv_full) => Ok(Lane {
-                        kv_sliding,
-                        kv_full,
-                        n_tokens: 0,
-                        tag: None,
-                    }),
-                    Err(error) => {
-                        let _ = kv_sliding.free_gpu(gpu);
-                        Err(error)
-                    }
-                });
+        for i in 0..n {
+            let lane = lane_view(gpu, &staged.arena_sliding, sliding, i).and_then(|kv_sliding| {
+                Ok(Lane {
+                    kv_sliding,
+                    kv_full: lane_view(gpu, &staged.arena_full, full, i)?,
+                    n_tokens: 0,
+                    tag: None,
+                })
+            });
             match lane {
                 Ok(lane) => staged.lanes.push(lane),
                 Err(error) => {
