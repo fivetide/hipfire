@@ -55,12 +55,13 @@
 use crate::config::Gemma4Config;
 use crate::gemma4::{Gemma4State, Gemma4Weights, LayerWeights, GEMMA4_FORWARD_BATCH_MAX};
 use crate::program::{
-    eager_layer_kv, head, Geometry, LayerRefs, LayerScratch, PleScratch, ProgramBinding, Resident,
-    RowActivations, RowBuffers, RowWidths,
+    eager_layer_kv, head, Geometry, LaneKv, LayerRefs, LayerScratch, PleScratch, ProgramBinding,
+    Resident, RowActivations, RowBuffers, RowWidths,
 };
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{execute_steps, Step};
 use hipfire_dispatch::types::RotationPlan;
+use hipfire_runtime::llama::KvCache;
 use hipfire_runtime::llama::{weight_gemv, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -571,6 +572,7 @@ fn eager_resident(state: &Gemma4State) -> Resident<'_> {
         attend_through: None,
         v_norm_ones: &state.v_norm_ones,
         flash_partials: &state.q8_flash_partials,
+        lanes: None,
     }
 }
 
@@ -779,6 +781,7 @@ pub fn forward_batch_spec(
         per_pos_argmax_out,
         per_pos_logits_out,
         true,
+        None,
     )?;
     gpu.download_f32(&state.logits)
         .map_err(|e| format!("gemma4 forward_batch download logits: {e:?}"))
@@ -797,7 +800,7 @@ pub fn forward_rows_device(
     head: bool,
 ) -> Result<(), String> {
     forward_rows(
-        cfg, weights, state, gpu, tokens, start_pos, None, None, None, head,
+        cfg, weights, state, gpu, tokens, start_pos, None, None, None, head, None,
     )
 }
 
@@ -820,14 +823,57 @@ pub fn forward_prefill_batch(
             continue;
         }
         forward_rows(
-            cfg, weights, state, gpu, chunk, pos, None, None, None, false,
+            cfg, weights, state, gpu, chunk, pos, None, None, None, false, None,
         )?;
     }
     Ok(())
 }
 
-/// The batched program over `tokens` at `[start_pos, start_pos + B)`; with
-/// `last_logits` the last row's logits are computed into `state.logits`.
+/// Engine-lane rows of [`forward_lane_rows`]: row `r` decodes lane `r` at
+/// `positions[r]` over the lane-major arenas, whose lanes hold `max_seq`
+/// rows each (the resident caches' shape). Rows outside `active_mask`
+/// run the GEMMs on their (ignored) token but neither write nor attend.
+pub struct LaneRows<'a> {
+    pub kv_sliding: &'a KvCache,
+    pub kv_full: &'a KvCache,
+    pub positions: &'a [usize],
+    pub active_mask: u64,
+}
+
+/// One forward over `tokens.len()` engine-lane rows (weights read once):
+/// each row's argmax (`argmax_out`) and/or soft-capped logits row
+/// (`logits_out`, `[rows, vocab]`). The resident state's position is not
+/// touched. A row is not bit-identical to the one-row decode of the same
+/// lane (batched GEMMs, MoE and head).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_lane_rows(
+    cfg: &Gemma4Config,
+    weights: &Gemma4Weights,
+    state: &mut Gemma4State,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+    lanes: &LaneRows<'_>,
+    argmax_out: Option<&mut Vec<u32>>,
+    logits_out: Option<&mut Vec<f32>>,
+) -> Result<(), String> {
+    forward_rows(
+        cfg,
+        weights,
+        state,
+        gpu,
+        tokens,
+        0,
+        None,
+        argmax_out,
+        logits_out,
+        false,
+        Some(lanes),
+    )
+}
+
+/// The batched program over `tokens` at `[start_pos, start_pos + B)` (or,
+/// with `lanes`, each row at its lane's position); with `last_logits` the
+/// last row's logits are computed into `state.logits`.
 #[allow(clippy::too_many_arguments)]
 fn forward_rows(
     cfg: &Gemma4Config,
@@ -840,6 +886,7 @@ fn forward_rows(
     mut per_pos_argmax_out: Option<&mut Vec<u32>>,
     mut per_pos_logits_out: Option<&mut Vec<f32>>,
     last_logits: bool,
+    lanes: Option<&LaneRows<'_>>,
 ) -> Result<(), String> {
     let b = tokens.len();
     if b == 0 {
@@ -857,8 +904,22 @@ fn forward_rows(
     let max_kv = cfg.max_kv_dim();
     let ple_dim = cfg.hidden_size_per_layer_input;
     let ple_packed = cfg.n_layers * ple_dim;
-    // seq_len after this batch = absolute positions [start_pos, start_pos+B).
-    checked_batch_seq_len(start_pos, b, state.max_seq)?;
+    match lanes {
+        Some(l) => {
+            let rows_ok = l.positions.len() == b && (b >= 64 || l.active_mask >> b == 0);
+            let past = l.positions.iter().find(|&&p| p >= state.max_seq);
+            if !rows_ok || past.is_some() {
+                return Err(format!(
+                    "gemma4 lane rows: {b} rows, positions {:?}, mask {:#x} outside {} lane rows",
+                    l.positions, l.active_mask, state.max_seq
+                ));
+            }
+        }
+        // seq_len after this batch = absolute positions [start_pos, start_pos+B).
+        None => {
+            checked_batch_seq_len(start_pos, b, state.max_seq)?;
+        }
+    }
     if !(state.kv_sliding.quant_q8 && state.kv_full.quant_q8) {
         return Err("gemma4 forward_batch: batched attention needs Q8 caches".to_string());
     }
@@ -871,6 +932,16 @@ fn forward_rows(
         ffn: ffn_hd,
     };
     let acts = RowActivations::new(&mut bufs, gpu, b, start_pos, widths)?;
+    if let Some(l) = lanes {
+        let bytes: Vec<u8> = l
+            .positions
+            .iter()
+            .flat_map(|&p| (p as i32).to_ne_bytes())
+            .collect();
+        gpu.hip
+            .memcpy_htod(&acts.positions.buf, &bytes)
+            .map_err(|e| format!("gemma4 lane rows htod positions: {e:?}"))?;
+    }
     let (x, x_rot) = (&acts.x, &acts.attn_rot);
     let mut ple_buf =
         |n: usize, label: &str| (ple_dim != 0).then(|| bufs.alloc(n, label)).transpose();
@@ -1014,7 +1085,18 @@ fn forward_rows(
     });
     let binding = ProgramBinding {
         geo: Geometry::eager(cfg),
-        resident: eager_resident(state),
+        resident: match lanes {
+            Some(l) => Resident {
+                kv_sliding: l.kv_sliding,
+                kv_full: l.kv_full,
+                lanes: Some(LaneKv {
+                    capacity: state.max_seq,
+                    active_mask: l.active_mask,
+                }),
+                ..eager_resident(state)
+            },
+            None => eager_resident(state),
+        },
         rows: b,
         position: start_pos,
         positions: Some(&acts.positions),
@@ -1031,7 +1113,9 @@ fn forward_rows(
     }
     execute_steps(gpu, &ctx, &steps).map_err(|e| format!("gemma4 forward_batch: {e}"))?;
     drop(steps);
-    state.n_tokens = start_pos + b;
+    if lanes.is_none() {
+        state.n_tokens = start_pos + b;
+    }
 
     // ── Spec-decode out-params (ADDITIVE; all default-off). ──
     // `x` here holds the [B, dim] post-residual hidden for all B positions.

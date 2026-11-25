@@ -1555,7 +1555,7 @@ pub static FIELDS: &[ConfigField] = &[
         ValueRule::Enum(&["off", "greedy", "seeded"]),
         true,
         "HIPFIRE_QWEN4_LANE_ROW_EXACT",
-        "Opt-in (default off). Flash-Next native-MTP lanes on exact gfx1201: greedy makes greedy output independent of batch composition, seeded also seeded sampled requests. Costs decode step time at C4/C8 (0.54-0.74x tok/s measured on R9700 EP2); off is the default."
+        "Opt-in (default off). Flash-Next native-MTP lanes on exact gfx1201: greedy makes greedy output independent of batch composition, seeded also seeded sampled requests. Costs decode step time at C4/C8 (0.54-0.74x tok/s measured on R9700 EP2); off is the default. Gemma 4 engine lanes: greedy (seeded: every) lane row keeps the one-row decode instead of the shared lane forward."
     ),
     field!(
         "serve.queue_timeout_ms",

@@ -270,6 +270,19 @@ pub(crate) struct Resident<'a> {
     /// Ones vector of the larger head dim (weight-less V norm).
     pub v_norm_ones: &'a GpuTensor,
     pub flash_partials: &'a GpuTensor,
+    /// Engine lanes: the caches are lane-major arenas and batch row `r` is
+    /// lane `r` at its own position (`KvRoute::Lanes`); `None` = one
+    /// position-indexed sequence.
+    pub lanes: Option<LaneKv>,
+}
+
+/// Lane layout of [`Resident::lanes`]: lane `r` owns the `capacity` rows
+/// from row `r * capacity`; rows outside `active_mask` neither write nor
+/// attend.
+#[derive(Clone, Copy)]
+pub(crate) struct LaneKv {
+    pub capacity: usize,
+    pub active_mask: u64,
 }
 
 /// Which cache slot a layer attends, and whether it writes its own row.
@@ -593,11 +606,17 @@ impl<'a> ProgramBinding<'a> {
                 v_cache: &kv.v_gpu[kv_slot.slot],
                 physical_cap: kv.physical_cap,
                 window: attn.window,
-                route: KvRoute::Tier {
-                    tier: kv.tier_inputs(),
-                    givens_cos: kv.givens_cos.as_ref(),
-                    givens_sin: kv.givens_sin.as_ref(),
-                    flash_partials: r.flash_partials,
+                route: match r.lanes {
+                    Some(lanes) => KvRoute::Lanes {
+                        lane_capacity: lanes.capacity,
+                        active_mask: lanes.active_mask,
+                    },
+                    None => KvRoute::Tier {
+                        tier: kv.tier_inputs(),
+                        givens_cos: kv.givens_cos.as_ref(),
+                        givens_sin: kv.givens_sin.as_ref(),
+                        flash_partials: r.flash_partials,
+                    },
                 },
             },
             pos_buf: r.pos_buf,

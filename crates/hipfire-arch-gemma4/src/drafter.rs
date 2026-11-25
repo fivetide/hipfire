@@ -935,6 +935,7 @@ fn run_step(
             attend_through: ds.attend_through.map(|p| (p, &ds.through.buf)),
             v_norm_ones: &target_state.v_norm_ones,
             flash_partials: &target_state.q8_flash_partials,
+            lanes: None,
         },
         rows: 1,
         position: pos,

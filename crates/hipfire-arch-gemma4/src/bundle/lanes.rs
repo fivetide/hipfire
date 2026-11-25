@@ -3,31 +3,44 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Gemma 4's engine lanes ([`MeshLanes`]): one extra KV set per request that
-//! decodes beside others. Gemma 4 has no batched-rows decode, so a lane epoch
-//! runs each row as its own one-token forward on that lane's KV (whole-step
-//! interleaving): the eager decode the legacy loop's captured graph replays
-//! byte-identically, with the lane's caches swapped in for the step. The
-//! resident caches keep their buffers, so the captured decode graph stays
-//! bound to them.
+//! decodes beside others.
 //!
 //! The lanes' K/V live in one lane-major arena per cache slot: lane `i`
 //! owns the `max_seq` rows from row `i * max_seq`. That is the layout
 //! `KvRoute::Lanes` attends with `lane_capacity == max_seq` (batch row `r`
-//! is lane `r`), so one forward over the lanes' rows can read and write
-//! every lane in place. A lane's own caches are non-owning views of its
-//! region, which the whole-step forward swaps in.
+//! is lane `r`), so one forward over the lanes' rows reads the weights once
+//! and reads and writes every lane in place ([`forward::forward_lane_rows`],
+//! the mixed-row epoch). Its rows are not bit-identical to the one-row
+//! decode (batched GEMMs, grouped MoE, batched head). Rows of the row-exact
+//! class (`serve.batch_exact`), epochs of fewer than [`MIXED_MIN_ROWS`]
+//! shared rows, and loads without batched rows
+//! run the one-row decode instead (whole-step): the eager decode the legacy
+//! loop's captured graph replays byte-identically, with the lane's caches
+//! (non-owning views of its region) swapped in for the step. The resident
+//! caches keep their buffers, so the captured decode graph stays bound to
+//! them.
 //!
 //! A lane is never a conversation record ([`MeshLanes::keeps_records`]):
 //! decoded rows are not reused (`bundle.rs`), so a finished lane is freed.
 
 use super::mesh_family::device;
 use super::{q8_row_bytes, Gemma4Bundle};
+use crate::config::Gemma4Config;
 use crate::forward;
+use crate::gemma4::{Gemma4State, Gemma4Weights};
+use hipfire_config::LaneRowExact;
 use hipfire_runtime::llama::KvCache;
 use hipfire_runtime::mesh_family::{DecodeOut, MeshLanes};
 use hipfire_runtime::multi_gpu::executor::Result;
 use hipfire_runtime::multi_gpu::Gpus;
 use rdna_compute::{DType, Gpu, GpuTensor};
+
+/// Fewest shared rows one lane forward runs; fewer run one-row decodes. A
+/// row routes its own top-8 of 128 experts, so the expert reads grow with
+/// the rows and only the dense part is shared. halo gfx1151, 26B-A4B mq4,
+/// `hipfire bench` stateless, TPOT p50: 2 rows 42.7 ms in one forward vs
+/// 2 x 20 ms one-row; 4 rows 56.7 ms vs 4 x 20 ms (HIPF-545).
+const MIXED_MIN_ROWS: usize = 3;
 
 struct Lane {
     /// Views of this lane's region of the arenas; never freed.
@@ -48,6 +61,11 @@ pub(super) struct Gemma4Lanes {
     top1: GpuTensor,
     /// Sampled requests may take a lane (`serve.batch_sampled`).
     sampled: bool,
+    /// The load runs batched rows, so an epoch of [`MIXED_MIN_ROWS`]+ shared
+    /// rows is one forward ([`forward::forward_lane_rows`]).
+    mixed: bool,
+    /// `serve.batch_exact`: which rows keep the one-row decode.
+    exact: LaneRowExact,
 }
 
 impl Gemma4Lanes {
@@ -132,12 +150,18 @@ impl Gemma4Bundle {
                 return Err(format!("gemma4 lane argmax slot: {error:?}"));
             }
         };
+        // The lane attention sizes its LDS by one lane's rows.
+        let head_dim = sliding.head_dim.max(full.head_dim);
+        let lds_ok =
+            gpu.attention_q8_0_kv_independent_max_lane_capacity(head_dim) >= sliding.max_seq;
         let mut staged = Gemma4Lanes {
             arena_sliding,
             arena_full,
             lanes: Vec::with_capacity(n),
             top1,
             sampled,
+            mixed: self.prefill_rows > 1 && (2..=64).contains(&n) && lds_ok,
+            exact: hipfire_config::qwen4_lane_row_exact(),
         };
         for i in 0..n {
             let lane = lane_view(gpu, &staged.arena_sliding, sliding, i).and_then(|kv_sliding| {
@@ -186,7 +210,7 @@ impl MeshLanes for Gemma4Bundle {
         })
     }
 
-    /// Every row is its own forward: one epoch steps every decoding lane.
+    /// One epoch steps every decoding lane.
     fn lane_rows(&self) -> usize {
         self.lane_capacity()
     }
@@ -246,44 +270,46 @@ impl MeshLanes for Gemma4Bundle {
             ..
         } = self;
         let staged = lanes.as_mut().ok_or("no gemma4 engine lanes staged")?;
-        let resident = state.n_tokens;
-        let mut outs = Vec::with_capacity(rows.len());
-        for &(tag, token, logits) in rows {
-            let lane = staged
-                .lanes
-                .iter_mut()
-                .find(|lane| lane.tag == Some(tag))
-                .ok_or_else(|| format!("no gemma4 lane holds request {tag}"))?;
-            std::mem::swap(&mut state.kv_sliding, &mut lane.kv_sliding);
-            std::mem::swap(&mut state.kv_full, &mut lane.kv_full);
-            let position = lane.n_tokens as u32;
-            let out = forward::decode_step_device(config, weights, state, gpu, token, position)
-                .and_then(|()| {
-                    if logits {
-                        return gpu
-                            .download_f32(&state.logits)
-                            .map(DecodeOut::Logits)
-                            .map_err(|e| format!("gemma4 lane logits: {e:?}"));
-                    }
-                    gpu.argmax_f32_batched(&state.logits, &staged.top1, config.vocab_size, 1)
-                        .and_then(|()| gpu.download_raw_bytes(&staged.top1))
-                        .map_err(|e| format!("gemma4 lane argmax: {e:?}"))
-                        .and_then(|bytes| {
-                            bytes
-                                .get(..4)
-                                .map(|b| {
-                                    DecodeOut::Top1(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                                })
-                                .ok_or_else(|| "gemma4 lane argmax readback is short".to_string())
-                        })
-                });
-            std::mem::swap(&mut state.kv_sliding, &mut lane.kv_sliding);
-            std::mem::swap(&mut state.kv_full, &mut lane.kv_full);
-            state.n_tokens = resident;
-            outs.push(out?);
-            lane.n_tokens += 1;
+        let lane_of = rows
+            .iter()
+            .map(|&(tag, ..)| {
+                staged
+                    .lanes
+                    .iter()
+                    .position(|lane| lane.tag == Some(tag))
+                    .ok_or_else(|| format!("no gemma4 lane holds request {tag}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // `logits` rows are sampled; the rest are greedy (argmax).
+        // ponytail: `seeded` keeps every row exact, unseeded sampled ones
+        // too: rows carry no seed flag. Pass it when unseeded rows matter.
+        let mode = staged.exact;
+        let exact = |logits: bool| match mode {
+            LaneRowExact::Off => false,
+            LaneRowExact::Greedy => !logits,
+            LaneRowExact::GreedySeeded => true,
+        };
+        let shared: Vec<usize> = (0..rows.len()).filter(|&i| !exact(rows[i].2)).collect();
+        let mut outs: Vec<Option<DecodeOut>> = rows.iter().map(|_| None).collect();
+        if staged.mixed && shared.len() >= MIXED_MIN_ROWS {
+            let lane_rows: Vec<_> = shared
+                .iter()
+                .map(|&i| (lane_of[i], rows[i].1, rows[i].2))
+                .collect();
+            let mixed = step_mixed(config, weights, state, gpu, staged, &lane_rows)?;
+            for (&i, out) in shared.iter().zip(mixed) {
+                outs[i] = Some(out);
+            }
         }
-        Ok(outs)
+        for (i, &(_, token, logits)) in rows.iter().enumerate() {
+            if outs[i].is_none() {
+                let out = step_one(
+                    config, weights, state, gpu, staged, lane_of[i], token, logits,
+                )?;
+                outs[i] = Some(out);
+            }
+        }
+        Ok(outs.into_iter().flatten().collect())
     }
 
     fn free_lane(&mut self, tag: u64) {
@@ -296,4 +322,98 @@ impl MeshLanes for Gemma4Bundle {
             lane.n_tokens = 0;
         }
     }
+}
+
+/// One forward over `rows` (`(lane, token, logits)`, each lane once): row
+/// `r` of it is lane `r`, lanes without a row are masked out. Returns the
+/// outputs in `rows` order and advances each lane.
+fn step_mixed(
+    cfg: &Gemma4Config,
+    weights: &Gemma4Weights,
+    state: &mut Gemma4State,
+    gpu: &mut Gpu,
+    staged: &mut Gemma4Lanes,
+    rows: &[(usize, u32, bool)],
+) -> Result<Vec<DecodeOut>> {
+    let n = rows.iter().map(|r| r.0).max().map_or(0, |lane| lane + 1);
+    let (mut tokens, mut positions, mut mask) = (vec![0u32; n], vec![0usize; n], 0u64);
+    for &(lane, token, _) in rows {
+        tokens[lane] = token;
+        positions[lane] = staged.lanes[lane].n_tokens;
+        mask |= 1 << lane;
+    }
+    let (mut top1, mut logits) = (Vec::new(), Vec::new());
+    let want_top1 = rows.iter().any(|r| !r.2);
+    let want_logits = rows.iter().any(|r| r.2);
+    forward::forward_lane_rows(
+        cfg,
+        weights,
+        state,
+        gpu,
+        &tokens,
+        &forward::LaneRows {
+            kv_sliding: &staged.arena_sliding,
+            kv_full: &staged.arena_full,
+            positions: &positions,
+            active_mask: mask,
+        },
+        want_top1.then_some(&mut top1),
+        want_logits.then_some(&mut logits),
+    )?;
+    let vocab = cfg.vocab_size;
+    Ok(rows
+        .iter()
+        .map(|&(lane, _, sampled)| {
+            staged.lanes[lane].n_tokens += 1;
+            if sampled {
+                DecodeOut::Logits(logits[lane * vocab..(lane + 1) * vocab].to_vec())
+            } else {
+                DecodeOut::Top1(top1[lane])
+            }
+        })
+        .collect())
+}
+
+/// Lane `lane` runs `token` as its own one-token forward (whole-step), with
+/// its caches swapped into the resident state for the step.
+#[allow(clippy::too_many_arguments)]
+fn step_one(
+    cfg: &Gemma4Config,
+    weights: &Gemma4Weights,
+    state: &mut Gemma4State,
+    gpu: &mut Gpu,
+    staged: &mut Gemma4Lanes,
+    lane: usize,
+    token: u32,
+    logits: bool,
+) -> Result<DecodeOut> {
+    let resident = state.n_tokens;
+    let lane = &mut staged.lanes[lane];
+    std::mem::swap(&mut state.kv_sliding, &mut lane.kv_sliding);
+    std::mem::swap(&mut state.kv_full, &mut lane.kv_full);
+    let position = lane.n_tokens as u32;
+    let out =
+        forward::decode_step_device(cfg, weights, state, gpu, token, position).and_then(|()| {
+            if logits {
+                return gpu
+                    .download_f32(&state.logits)
+                    .map(DecodeOut::Logits)
+                    .map_err(|e| format!("gemma4 lane logits: {e:?}"));
+            }
+            gpu.argmax_f32_batched(&state.logits, &staged.top1, cfg.vocab_size, 1)
+                .and_then(|()| gpu.download_raw_bytes(&staged.top1))
+                .map_err(|e| format!("gemma4 lane argmax: {e:?}"))
+                .and_then(|bytes| {
+                    bytes
+                        .get(..4)
+                        .map(|b| DecodeOut::Top1(u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+                        .ok_or_else(|| "gemma4 lane argmax readback is short".to_string())
+                })
+        });
+    std::mem::swap(&mut state.kv_sliding, &mut lane.kv_sliding);
+    std::mem::swap(&mut state.kv_full, &mut lane.kv_full);
+    state.n_tokens = resident;
+    let out = out?;
+    lane.n_tokens += 1;
+    Ok(out)
 }
