@@ -1527,16 +1527,16 @@ impl Batch for Ctx<'_> {
 
     /// Speculative requests on lanes that run windows (their windows are the
     /// singleton's greedy or naive sampled accept; sampled only on lanes that
-    /// continue the seeded stream), AR ones on AR lanes. A minimum token count
-    /// or a think budget keeps a speculative request resident: the lane's
-    /// windows stop at EOS and are never forced.
+    /// continue the seeded stream), AR ones on lanes that take AR requests.
+    /// A minimum token count or a think budget keeps a speculative request
+    /// resident: the lane's windows stop at EOS and are never forced.
     fn lane_takes(&mut self, idx: usize) -> bool {
-        let (windows, sampled) = self.lanes().map_or((false, false), |lanes| {
-            (lanes.windows(), lanes.sampled_windows())
+        let (windows, sampled, ar) = self.lanes().map_or((false, false, false), |lanes| {
+            (lanes.windows(), lanes.sampled_windows(), lanes.ar_lanes())
         });
         let live = self.live(idx);
         match &live.spec {
-            None => !windows,
+            None => ar,
             Some(_) => {
                 windows
                     && (live.sampler.temperature <= 0.0 || sampled)

@@ -1035,6 +1035,7 @@ fn decode_run_overlap(
                     .sub_offset(batch.first_row * int, batch.rows * int),
                 wide_hidden: None,
                 vocab_shard: None,
+                layer_capture: None,
             };
             launched = true;
             forward_lanes(gpu, band, &mut rows, &out, &policy)

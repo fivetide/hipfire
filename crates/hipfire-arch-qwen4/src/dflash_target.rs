@@ -80,7 +80,7 @@ impl Qwen4Bundle {
     }
 
     /// Feature row width: `layers × hidden` F32.
-    fn dflash_row_width(&self) -> usize {
+    pub(crate) fn dflash_row_width(&self) -> usize {
         self.dflash
             .as_ref()
             .map_or(0, |target| target.layers.len() * self.config.hidden_size)
@@ -197,6 +197,22 @@ impl Qwen4Bundle {
             rows: capture.sub_offset(0, rows * self.dflash_row_width()),
             row: 0,
         }))
+    }
+
+    /// [`Self::dflash_layer_capture`] of a lane step: `None` until a DFlash2
+    /// request allocated the capture (no lane holds a draft context before).
+    pub(crate) fn dflash_lane_capture(
+        &self,
+        rows: usize,
+    ) -> Result<Option<Qwen4LayerCapture>, BundleError> {
+        if self
+            .dflash
+            .as_ref()
+            .is_none_or(|target| target.capture.is_none())
+        {
+            return Ok(None);
+        }
+        self.dflash_layer_capture(rows)
     }
 
     /// Append the first `rows` captured feature rows (`layers × hidden` F32

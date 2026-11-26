@@ -144,7 +144,8 @@ pub fn last_draft_graph_stats() -> Option<crate::dflash::DraftGraphStats> {
 /// cumulative committed feature rows (`[rows × feature_width]` F32,
 /// the draft's context) and the target-minted verify scratch.
 pub struct Dflash2Speculator {
-    weights: DflashWeights,
+    /// Shared with the request contexts parked in lanes ([`Dflash2Lane`]).
+    weights: std::sync::Arc<DflashWeights>,
     scratch: DflashScratch,
     config: DflashConfig,
     /// Feature rows of committed positions `host_base..`, in order: grows by
@@ -426,6 +427,10 @@ impl Dflash2Speculator {
 }
 
 impl Speculator for Dflash2Speculator {
+    fn drafter_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
     fn name(&self) -> &'static str {
         "dflash2"
     }
@@ -545,46 +550,24 @@ impl Speculator for Dflash2Speculator {
         let b = self.block_size.min(max_emit).max(2);
         let h = self.config.hidden;
         let drafts_n = b - 1;
-
-        // Noise block [seed, MASK × (b-1)]: raw target embedding rows.
-        if self.mask_row.is_empty() {
-            self.mask_row = target.embed_row(gpu, self.config.mask_token_id)?;
-        }
-        let seed_row = target.embed_row(gpu, seed)?;
-        if seed_row.len() != h || self.mask_row.len() != h {
-            return Err(format!(
-                "Dflash2Speculator: target embedding rows have {} floats, the draft needs {h}",
-                seed_row.len()
-            ));
-        }
-        let mut noise = Vec::with_capacity(b * h);
-        noise.extend_from_slice(&seed_row);
-        for _ in 1..b {
-            noise.extend_from_slice(&self.mask_row);
-        }
-        // Context rows sit at their absolute positions, the block after them.
-        let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
-        let positions_k: Vec<i32> = (0..(position + b) as i32).collect();
         let traced = tracing_windows();
         let t_draft = traced.then(|| {
             let _ = gpu.hip.device_synchronize();
             std::time::Instant::now()
         });
-        draft_forward_based(
+        draft_forward_block(
             gpu,
+            target,
             &self.weights,
             &self.config,
-            Some(&noise),
-            Some(self.target_hidden_host.as_slice()),
-            self.host_base,
-            &positions_q,
-            &positions_k,
-            b,
-            position,
             &mut self.scratch,
-            false,
-        )
-        .map_err(|e| format!("Dflash2Speculator draft_forward: {e}"))?;
+            &mut self.mask_row,
+            &self.target_hidden_host,
+            self.host_base,
+            position,
+            seed,
+            b,
+        )?;
         let draft_ms = t_draft.map(|t| {
             let _ = gpu.hip.device_synchronize();
             t.elapsed().as_secs_f64() * 1e3
@@ -827,7 +810,9 @@ impl Speculator for Dflash2Speculator {
             verify_scratch,
             ..
         } = *self;
-        weights.free_gpu(gpu);
+        if let Ok(weights) = std::sync::Arc::try_unwrap(weights) {
+            weights.free_gpu(gpu);
+        }
         *LAST_GRAPH_STATS.lock().unwrap() = Some(scratch.draft_graph_stats());
         scratch.free_gpu(gpu);
         if let Some(vs) = verify_scratch {
@@ -1068,6 +1053,256 @@ fn verify_depth(confidence: &[f32]) -> usize {
     confident.max(1).min(confidence.len())
 }
 
+/// The draft forward of the noise block `[seed, MASK × (b-1)]` at `position`
+/// over the committed feature `rows` (from position `base`): the draft's
+/// final rows land in `scratch.x`. Fills `mask_row` on first use.
+#[allow(clippy::too_many_arguments)]
+fn draft_forward_block(
+    gpu: &mut Gpu,
+    target: &mut dyn SpecTarget,
+    weights: &DflashWeights,
+    config: &DflashConfig,
+    scratch: &mut DflashScratch,
+    mask_row: &mut Vec<f32>,
+    rows: &[f32],
+    base: usize,
+    position: usize,
+    seed: u32,
+    b: usize,
+) -> Result<(), String> {
+    let h = config.hidden;
+    // Noise block [seed, MASK × (b-1)]: raw target embedding rows.
+    if mask_row.is_empty() {
+        *mask_row = target.embed_row(gpu, config.mask_token_id)?;
+    }
+    let seed_row = target.embed_row(gpu, seed)?;
+    if seed_row.len() != h || mask_row.len() != h {
+        return Err(format!(
+            "Dflash2Speculator: target embedding rows have {} floats, the draft needs {h}",
+            seed_row.len()
+        ));
+    }
+    let mut noise = Vec::with_capacity(b * h);
+    noise.extend_from_slice(&seed_row);
+    for _ in 1..b {
+        noise.extend_from_slice(mask_row);
+    }
+    // Context rows sit at their absolute positions, the block after them.
+    let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
+    let positions_k: Vec<i32> = (0..(position + b) as i32).collect();
+    draft_forward_based(
+        gpu,
+        weights,
+        config,
+        Some(&noise),
+        Some(rows),
+        base,
+        &positions_q,
+        &positions_k,
+        b,
+        position,
+        scratch,
+        false,
+    )
+    .map_err(|e| format!("Dflash2Speculator draft_forward: {e}"))
+}
+
+/// A greedy request's draft context parked in a target lane
+/// ([`Dflash2Speculator::take_lane`]): its committed feature rows and its own
+/// draft scratch (the uploaded rows and their projection), over the
+/// speculator's shared weights. The lane drafts its windows
+/// ([`Self::draft`]); the target verifies them in its own batched step and
+/// hands the committed rows back ([`Self::commit`]).
+pub struct Dflash2Lane {
+    weights: std::sync::Arc<DflashWeights>,
+    config: DflashConfig,
+    scratch: DflashScratch,
+    rows: Vec<f32>,
+    base: usize,
+    tokens: Vec<u32>,
+    window: Option<usize>,
+    block: usize,
+    mask_row: Vec<f32>,
+}
+
+// SAFETY: a lane and the speculator it shares its weights with live on the
+// one thread that owns their GPU; the `Arc` only counts owners and is never
+// used from two threads at once.
+unsafe impl Send for Dflash2Lane {}
+
+impl Dflash2Lane {
+    fn row_elems(&self) -> usize {
+        self.config.feature_width()
+    }
+
+    /// Committed positions the feature rows end at.
+    pub fn position(&self) -> usize {
+        self.base + self.rows.len() / self.row_elems()
+    }
+
+    /// The greedy window at `position` on `seed`: the selector's drafts cut
+    /// to the confident prefix ([`verify_depth`]), at most `max_drafts` (0:
+    /// an AR row, nothing drafted). Exactly the drafts the singleton's
+    /// greedy window verifies for the same budget.
+    pub fn draft(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        max_drafts: usize,
+    ) -> Result<Vec<u32>, String> {
+        if self.position() != position {
+            return Err(format!(
+                "Dflash2Lane: feature rows end at {}, the window starts at {position}",
+                self.position()
+            ));
+        }
+        if max_drafts == 0 {
+            return Ok(Vec::new());
+        }
+        // The singleton's block for `max_emit = max_drafts + 1`.
+        let b = self.block.min(max_drafts + 1).max(2);
+        let drafts_n = b - 1;
+        draft_forward_block(
+            gpu,
+            target,
+            &self.weights,
+            &self.config,
+            &mut self.scratch,
+            &mut self.mask_row,
+            &self.rows,
+            self.base,
+            position,
+            seed,
+            b,
+        )?;
+        let h = self.config.hidden;
+        let hidden_rows = self.scratch.x.sub_offset(h, drafts_n * h);
+        let logits = target.lm_head_logits_device(gpu, &hidden_rows, drafts_n)?;
+        let proposal = propose_candidates_device_penalized(
+            gpu,
+            &self.weights,
+            &self.scratch,
+            &hidden_rows,
+            &logits,
+            drafts_n,
+            seed,
+            0.0,
+            None,
+            None,
+        )
+        .map_err(|e| format!("Dflash2Lane selector: {e}"))?;
+        let depth = verify_depth(&proposal.confidence);
+        Ok(proposal.tokens[..depth].to_vec())
+    }
+
+    /// The verify committed `tokens` (the window's seed and its accepted
+    /// drafts) at the context's end; `rows` holds at least their feature
+    /// rows, in order.
+    pub fn commit(&mut self, rows: &[f32], tokens: &[u32]) -> Result<(), String> {
+        let elems = tokens.len() * self.row_elems();
+        if rows.len() < elems {
+            return Err(format!(
+                "Dflash2Lane: {} feature floats, the commit of {} tokens needs {elems}",
+                rows.len(),
+                tokens.len()
+            ));
+        }
+        self.rows.extend_from_slice(&rows[..elems]);
+        self.tokens.extend_from_slice(tokens);
+        if let Some(window) = self.window {
+            let row_elems = self.row_elems();
+            self.base += trim_feature_rows(&mut self.rows, row_elems, window);
+        }
+        Ok(())
+    }
+
+    /// Keep the context through committed position `end` (a cancelled lane
+    /// rewound to it). Whether it holds every row through `end`.
+    pub fn truncate(&mut self, end: usize) -> bool {
+        if end < self.base || end > self.position() {
+            return false;
+        }
+        if end < self.position() {
+            self.rows.truncate((end - self.base) * self.row_elems());
+            self.tokens.truncate(end);
+            // Device copies of rows at or past `end` are stale now.
+            self.scratch.reset_upload_tracking();
+        }
+        true
+    }
+
+    /// Free the lane's draft scratch (the weights stay with the speculator).
+    pub fn free(self, gpu: &mut Gpu) {
+        self.scratch.free_gpu(gpu);
+        if let Ok(weights) = std::sync::Arc::try_unwrap(self.weights) {
+            weights.free_gpu(gpu);
+        }
+    }
+}
+
+impl Dflash2Speculator {
+    /// Move the greedy request's draft context (its feature rows through
+    /// `position` and its draft scratch) into a lane; the speculator keeps a
+    /// fresh scratch (`spare`'s, a freed lane's, when given) and an empty
+    /// context, as after [`Speculator::reset`].
+    pub fn take_lane(
+        &mut self,
+        gpu: &mut Gpu,
+        position: usize,
+        spare: Option<Dflash2Lane>,
+    ) -> Result<Dflash2Lane, String> {
+        if self.sampled() || self.request.penalties_active() {
+            return Err("Dflash2Speculator: only a greedy neutral request drafts in a lane".into());
+        }
+        self.check_host_rows(position)?;
+        let mut scratch = match spare {
+            Some(spare) => {
+                let mut scratch = spare.scratch;
+                scratch.reset_upload_tracking();
+                scratch
+            }
+            None => new_draft_scratch(
+                gpu,
+                &self.config,
+                self.block_size,
+                self.ctx_capacity,
+                self.weights.has_mq,
+            )?,
+        };
+        std::mem::swap(&mut scratch, &mut self.scratch);
+        if let Some(vs) = self.verify_scratch.as_mut() {
+            vs.clear();
+        }
+        Ok(Dflash2Lane {
+            weights: std::sync::Arc::clone(&self.weights),
+            config: self.config.clone(),
+            scratch,
+            rows: std::mem::take(&mut self.target_hidden_host),
+            base: std::mem::take(&mut self.host_base),
+            tokens: std::mem::take(&mut self.host_tokens),
+            window: self.feature_window,
+            block: self.block_size,
+            mask_row: self.mask_row.clone(),
+        })
+    }
+
+    /// The reverse of [`Self::take_lane`]: the lane's context becomes this
+    /// speculator's (a request continues live from its lane record). Returns
+    /// the speculator's own scratch as an empty spare lane.
+    pub fn adopt_lane(&mut self, mut lane: Dflash2Lane) -> Dflash2Lane {
+        std::mem::swap(&mut self.scratch, &mut lane.scratch);
+        self.target_hidden_host = std::mem::take(&mut lane.rows);
+        self.host_base = std::mem::take(&mut lane.base);
+        self.host_tokens = std::mem::take(&mut lane.tokens);
+        if let Some(vs) = self.verify_scratch.as_mut() {
+            vs.clear();
+        }
+        lane
+    }
+}
+
 /// The draft scratch [`build_dflash2_speculator`] runs on: an all-sliding
 /// draft was trained over its declared window, so it reads its context
 /// through the projected rows only and stages the raw feature rows from the
@@ -1169,7 +1404,7 @@ pub fn build_dflash2_speculator(
         }
     };
     Ok(Box::new(Dflash2Speculator {
-        weights,
+        weights: std::sync::Arc::new(weights),
         scratch,
         config,
         target_hidden_host: Vec::new(),

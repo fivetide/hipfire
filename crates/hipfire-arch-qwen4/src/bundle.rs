@@ -229,6 +229,11 @@ pub struct Qwen4Bundle {
     /// Each AR lane's turn-start resident snapshot, taken from the session at
     /// its park: a cancelled lane rewinds to it and stays a record.
     lane_marks: Vec<(u64, LiveMark)>,
+    /// The DFlash2 draft context of every engine lane whose request drafts
+    /// with the DFlash2 drafter (its lane record included), by lane tag.
+    pub(crate) dflash_lanes: Vec<(u64, hipfire_runtime::dflash2_spec::Dflash2Lane)>,
+    /// Freed DFlash2 lanes' draft scratches, for the next park.
+    pub(crate) dflash_spare: Vec<hipfire_runtime::dflash2_spec::Dflash2Lane>,
     pub(crate) pair_session_stage: Option<PairSessionStage>,
     /// Slow-link (S1) layer-major prompt transaction owner: admitted profile,
     /// boundary stages, the open window, receipt and failure injection.
@@ -1057,6 +1062,8 @@ impl Qwen4Bundle {
             penalty_stage: None,
             session: None,
             lane_marks: Vec::new(),
+            dflash_lanes: Vec::new(),
+            dflash_spare: Vec::new(),
             pair_session_stage: None,
             slowlink: SlowlinkOwner::default(),
             turn_snapshots: hipfire_config::developer_bool(TURN_SNAPSHOTS_ENV, false),
@@ -5594,12 +5601,49 @@ impl Qwen4Bundle {
         spec: Option<crate::lane::LaneSpecConfig>,
         copy: Option<crate::lane::LaneCopyConfig>,
     ) -> Result<(), BundleError> {
+        self.stage_lane_store(gpu, max_lanes, row_budget, spec, copy, 0)
+    }
+
+    /// Stage a single-card AR lane store whose lanes verify externally drafted
+    /// point-mass windows ([`crate::lane_exec::Qwen4LaneExecutor::draft_step_external`]):
+    /// each lane holds an `external_rows`-row GDN capture ring and the snapshot mirror
+    /// a rollback needs. `external_rows == 0` stages the plain AR store.
+    pub fn stage_lanes_external(
+        &mut self,
+        gpu: &mut Gpu,
+        max_lanes: usize,
+        row_budget: usize,
+        external_rows: usize,
+        end_of_turn: Option<u32>,
+    ) -> Result<(), BundleError> {
+        self.stage_lane_store(gpu, max_lanes, row_budget, None, None, external_rows)?;
+        if let Some(store) = self.lanes.as_mut() {
+            store.set_external_eos(end_of_turn);
+        }
+        Ok(())
+    }
+
+    fn stage_lane_store(
+        &mut self,
+        gpu: &mut Gpu,
+        max_lanes: usize,
+        row_budget: usize,
+        spec: Option<crate::lane::LaneSpecConfig>,
+        copy: Option<crate::lane::LaneCopyConfig>,
+        external_rows: usize,
+    ) -> Result<(), BundleError> {
         if self.expert_cache.is_some() {
             return Err(BundleError::Forward(
                 "exact expert cache does not support continuous-batch lanes".into(),
             ));
         }
         self.pp_refuse("continuous-batch lanes")?;
+        if external_rows > 0 && (self.ep.is_some() || self.has_cpu_deferred_experts()) {
+            return Err(BundleError::Forward(
+                "Qwen4 external-verify lanes need a single-card load without CPU-spliced experts"
+                    .to_string(),
+            ));
+        }
         // An EP reserve-sharing load runs lane decode steps on the 512-row
         // resident bank (prefill tiles borrow like a singleton prompt), so a
         // store with more lanes than resident rows cannot step.
@@ -5672,8 +5716,16 @@ impl Qwen4Bundle {
             let chunk = self.spec_chunk_rows().unwrap_or(1).max(1);
             self.ensure_spec_hidden(gpu, (spec.k + 1).max(chunk))?;
         }
-        let store = crate::lane::Qwen4LaneStore::new(gpu, self, max_lanes, row_budget, spec, copy)
-            .map_err(BundleError::Forward)?;
+        let store = crate::lane::Qwen4LaneStore::new(
+            gpu,
+            self,
+            max_lanes,
+            row_budget,
+            spec,
+            copy,
+            external_rows,
+        )
+        .map_err(BundleError::Forward)?;
         self.lanes = Some(store);
         Ok(())
     }
@@ -6599,6 +6651,8 @@ impl Qwen4Bundle {
             dflash,
             session,
             lane_marks,
+            dflash_lanes,
+            dflash_spare,
             pair_session_stage,
             slowlink,
             penalty_stage,
@@ -6621,6 +6675,13 @@ impl Qwen4Bundle {
                 session.discard_mark(mark);
             }
             session.clear(gpu);
+        }
+        for lane in dflash_lanes
+            .into_iter()
+            .map(|(_, lane)| lane)
+            .chain(dflash_spare)
+        {
+            lane.free(gpu);
         }
         let mut pair_stage_error = None;
         if let Some(stage) = pair_session_stage {

@@ -779,6 +779,21 @@ fn stage_qwen4_lanes(
             }),
         });
     let spec_on_k = spec.as_ref().map(|s| s.k);
+    // A single card on the engine loop under the DFlash2 drafter stages AR
+    // lanes that also verify its drafts: one draft block per lane window.
+    let external_rows =
+        (spec.is_none() && topology == "single" && hipfire_runtime::config::get().engine_loop)
+            .then(|| {
+                m.speculator
+                    .as_ref()
+                    .filter(|s| s.name() == "dflash2")
+                    .map(|s| {
+                        s.block_size()
+                            .min(hipfire_arch_qwen4::gpu_forward_lanes::LANE_MAX_ROWS)
+                    })
+            })
+            .flatten()
+            .filter(|&rows| rows > 1);
     if bundle.state.qsa_backend() != Qwen4KvBackend::Vmm {
         return refuse("QSA context backend is not VMM");
     }
@@ -801,7 +816,8 @@ fn stage_qwen4_lanes(
             gpu.vmm_recommended_granularity().unwrap_or(1),
             requested,
             row_budget,
-            spec_on_k,
+            // The external-verify ring is sized as a native-MTP lane's.
+            spec_on_k.or(external_rows.map(|rows| rows - 1)),
             None,
         ) else {
             return refuse("lane store device bytes overflow");
@@ -842,6 +858,13 @@ fn stage_qwen4_lanes(
         bundle.pp_stage_lanes(gpus, requested, row_budget, spec)
     } else {
         match m.qwen4_mut() {
+            Some(bundle) if external_rows.is_some() => bundle.stage_lanes_external(
+                gpu,
+                requested,
+                row_budget,
+                external_rows.unwrap_or_default(),
+                end_of_turn,
+            ),
             Some(bundle) => {
                 match bundle.stage_lanes_with_copy(gpu, requested, row_budget, spec, copy) {
                     // A native-MTP EP store that does not fit (or is refused) is

@@ -578,16 +578,16 @@ pub(crate) fn take_head_ticket(
     lane: &mut Qwen4LaneState,
 ) -> Result<(), String> {
     spec_of(lane, "take_head_ticket")?;
-    let Qwen4LaneState { state, spec, .. } = lane;
+    let Qwen4LaneState {
+        state,
+        spec,
+        window,
+        ..
+    } = lane;
     let Some(spec) = spec.as_mut() else {
         unreachable!("checked above");
     };
-    let LaneSpec {
-        head,
-        draft,
-        window,
-        ..
-    } = spec;
+    let LaneSpec { head, draft, .. } = spec;
     let window = window
         .as_mut()
         .ok_or_else(|| "take_head_ticket: lane has no pending window".to_string())?;
@@ -621,17 +621,23 @@ pub(crate) fn begin_lane_window(
     plan: &LanePlan,
 ) -> Result<(), String> {
     let epoch = plan.key.request_epoch;
-    let Qwen4LaneState { state, spec, .. } = &mut *lane;
-    let Some(spec) = spec.as_mut() else {
+    let Qwen4LaneState {
+        state,
+        spec,
+        window,
+        ..
+    } = &mut *lane;
+    // A spec-less (external-verify) lane opens a window only for a verify.
+    if spec.is_none() && plan.max_rows() <= 1 {
         return Ok(());
-    };
-    if spec.window.is_some() {
+    }
+    if window.is_some() {
         return Err(format!(
             "draft_step: lane {epoch:?} has an unconsumed window (commit or abort the step first)"
         ));
     }
     let position = state.position;
-    spec.window = Some(PendingWindow {
+    *window = Some(PendingWindow {
         route: plan.route,
         position,
         seed: plan.seed,
@@ -646,6 +652,9 @@ pub(crate) fn begin_lane_window(
         probe_saved: None,
         probe: None,
     });
+    let Some(spec) = spec.as_mut() else {
+        return Ok(());
+    };
     if let Some(expect) = expected_head_position(plan) {
         if spec.head.position() != expect {
             return Err(format!(
@@ -680,10 +689,8 @@ pub(crate) fn begin_lane_window(
 /// Save the head's request state before the probe's Draft op (the singleton
 /// saves and restores it around its probe: it is not part of the head ticket).
 pub(crate) fn save_probe_state(lane: &mut Qwen4LaneState) {
-    if let Some(spec) = lane.spec.as_mut() {
-        if let Some(window) = spec.window.as_mut() {
-            window.probe_saved = Some(spec.draft);
-        }
+    if let (Some(spec), Some(window)) = (lane.spec.as_ref(), lane.window.as_mut()) {
+        window.probe_saved = Some(spec.draft);
     }
 }
 
@@ -698,16 +705,16 @@ pub(crate) fn settle_probe(
     outcome: ProbeOutcome,
 ) -> Result<(), String> {
     spec_of(lane, "settle_probe")?;
-    let Qwen4LaneState { state, spec, .. } = lane;
+    let Qwen4LaneState {
+        state,
+        spec,
+        window,
+        ..
+    } = lane;
     let Some(spec) = spec.as_mut() else {
         unreachable!("checked above");
     };
-    let LaneSpec {
-        head,
-        draft,
-        window,
-        ..
-    } = spec;
+    let LaneSpec { head, draft, .. } = spec;
     let window = window
         .as_mut()
         .ok_or_else(|| "settle_probe: lane has no pending window".to_string())?;
@@ -743,10 +750,9 @@ pub(crate) fn arm_lane_verify(
 ) -> Result<(), String> {
     let epoch = vl.key.request_epoch;
     let rows = vl.rows.len();
-    let Qwen4LaneState { state, spec, .. } = lane;
-    let window = spec
+    let Qwen4LaneState { state, window, .. } = lane;
+    let window = window
         .as_mut()
-        .and_then(|spec| spec.window.as_mut())
         .ok_or_else(|| format!("Verify lane {epoch:?} has no window"))?;
     if !verify_capable(window.route, window.source, window.forced)
         || window.seed != vl.rows[0]
@@ -834,17 +840,17 @@ pub(crate) fn prepare_rank_lane(
     let d = p.decision;
     let epoch = p.verify.key.request_epoch;
     let (steps, owed_held) = {
-        let spec = lane
-            .spec
-            .as_ref()
-            .ok_or_else(|| "prepare_rank_lane: lane has no MTP state".to_string())?;
-        let window = spec
+        // A spec-less (external-verify) lane has no head and owes nothing.
+        let window = lane
             .window
             .as_ref()
             .ok_or_else(|| "prepare_rank_lane: lane has no pending window".to_string())?;
         (
             window.steps,
-            spec.lag.as_ref().map_or(0, HeadLagStore::owed),
+            lane.spec
+                .as_ref()
+                .and_then(|spec| spec.lag.as_ref())
+                .map_or(0, HeadLagStore::owed),
         )
     };
     let prep = head_prepare(
@@ -859,7 +865,7 @@ pub(crate) fn prepare_rank_lane(
     let forced = matches!(p.plan.kind, LaneKind::Forced(_));
     match prep {
         HeadPrepare::TargetOnly if rows > 1 => {
-            let target = prepare_target_only(bundle, gpu, lane, &p)?;
+            let target = prepare_target_only(bundle, gpu, lane, p.decision, p.verify, p.row_begin)?;
             Ok(RankPrepared {
                 lane: PreparedRankLane::TargetOnly { target },
                 head_rows: 0,
@@ -969,9 +975,8 @@ pub(crate) fn prepare_rank_lane(
 }
 
 fn window_row(lane: &Qwen4LaneState) -> Result<(usize, u32), String> {
-    lane.spec
+    lane.window
         .as_ref()
-        .and_then(|s| s.window.as_ref())
         .map(|w| (w.position, w.seed))
         .ok_or_else(|| "lane has no pending window".to_string())
 }
@@ -982,16 +987,16 @@ fn take_unused_head_ticket(
     bundle: &mut Qwen4Bundle,
     lane: &mut Qwen4LaneState,
 ) -> Result<Option<HeadTicket>, String> {
-    let Qwen4LaneState { state, spec, .. } = lane;
+    let Qwen4LaneState {
+        state,
+        spec,
+        window,
+        ..
+    } = lane;
     let Some(spec) = spec.as_mut() else {
         return Ok(None);
     };
-    let LaneSpec {
-        head,
-        draft,
-        window,
-        ..
-    } = spec;
+    let LaneSpec { head, draft, .. } = spec;
     let Some(ticket) = window.as_mut().and_then(|w| w.head_ticket.take()) else {
         return Ok(None);
     };
@@ -1007,25 +1012,27 @@ fn take_unused_head_ticket(
 
 /// The target half of a verify window on a head-free lane: the ring rollback
 /// to the consumed rows and the target ticket's validation (no head, no
-/// pending hidden: a head-free lane never drafts again).
-fn prepare_target_only(
+/// pending hidden: a head-free lane never drafts again). `row_begin`: the
+/// lane's first row in the step.
+pub(crate) fn prepare_target_only(
     bundle: &mut Qwen4Bundle,
     gpu: &mut Gpu,
     lane: &mut Qwen4LaneState,
-    p: &RankPrepare<'_>,
+    decision: &LaneDecision,
+    verify: &VerifyLane,
+    row_begin: usize,
 ) -> Result<TargetTicket, String> {
-    let rows = p.verify.rows.len();
-    let consumed = p.decision.consumed_rows;
+    let rows = verify.rows.len();
+    let consumed = decision.consumed_rows;
     if consumed == 0 || consumed > rows {
         return Err(format!(
             "target-only window consumed {consumed} of {rows} rows"
         ));
     }
-    let position = p.verify.position;
-    let Qwen4LaneState { state, spec, .. } = lane;
-    let window = spec
+    let position = verify.position;
+    let Qwen4LaneState { state, window, .. } = lane;
+    let window = window
         .as_mut()
-        .and_then(|spec| spec.window.as_mut())
         .ok_or_else(|| "target-only window: lane has no pending window".to_string())?;
     let target = window
         .target_ticket
@@ -1048,10 +1055,10 @@ fn prepare_target_only(
             ));
         }
         let ple_normed = bundle
-            .lane_ple_normed_rows(p.row_begin, rows)
+            .lane_ple_normed_rows(row_begin, rows)
             .map_err(|e| format!("target-only window: PLE rows: {e}"))?;
         lane_call(bundle.with_lane(state, None, |b| {
-            b.rollback_verify_rows_retain_with(gpu, snapshot, consumed, &p.verify.rows, &ple_normed)
+            b.rollback_verify_rows_retain_with(gpu, snapshot, consumed, &verify.rows, &ple_normed)
         }))
         .map_err(|e| format!("target-only window: ring rollback: {e}"))?;
     }

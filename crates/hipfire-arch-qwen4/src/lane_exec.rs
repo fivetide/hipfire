@@ -385,7 +385,7 @@ pub(crate) struct LaneView<'a> {
     position: usize,
     /// `state.max_seq_len`.
     max_seq_len: usize,
-    /// `Some` on an MTP lane.
+    /// `Some` on an MTP lane, or on an external-verify lane with an open window.
     spec: Option<SpecView<'a>>,
 }
 
@@ -395,8 +395,8 @@ pub(crate) fn view_of(lane: &Qwen4LaneState) -> LaneView<'_> {
         host: &lane.host,
         position: lane.state.position,
         max_seq_len: lane.state.max_seq_len,
-        spec: lane.spec.as_ref().map(|spec| SpecView {
-            window: spec.window.as_ref().map(|w| WindowView {
+        spec: (lane.spec.is_some() || lane.window.is_some()).then(|| SpecView {
+            window: lane.window.as_ref().map(|w| WindowView {
                 route: w.route,
                 position: w.position,
                 seed: w.seed,
@@ -753,7 +753,26 @@ impl Qwen4LaneExecutor<'_> {
             }
             return self.bundle.ep_lane_draft_step(gpu, requests);
         }
-        self.draft_step_local(gpu, requests, forced)
+        self.draft_step_local(gpu, requests, forced, &[])
+    }
+
+    /// [`Self::draft_step`] on an external-verify store
+    /// ([`Qwen4Bundle::stage_lanes_external`]): each `(epoch, drafts)` lane
+    /// verifies exactly `drafts`, proposed outside the store (a point-mass
+    /// copy window, greedy accept; empty: one AR row). Drafts past the
+    /// store's verify rows are refused, never clamped. Single card only.
+    pub fn draft_step_external(
+        &mut self,
+        gpu: &mut Gpu,
+        external: &[(RequestEpoch, Vec<u32>)],
+    ) -> Result<Vec<LaneDraft>, String> {
+        let rows = self.bundle.lanes.as_ref().map_or(0, |s| s.external_rows());
+        if self.bundle.ep.is_some() || rows == 0 {
+            return Err("draft_step_external: needs a single-card external-verify store".into());
+        }
+        let requests: Vec<(RequestEpoch, usize)> =
+            external.iter().map(|(e, d)| (*e, d.len())).collect();
+        self.draft_step_local(gpu, &requests, &[], external)
     }
 
     fn draft_step_local(
@@ -761,6 +780,7 @@ impl Qwen4LaneExecutor<'_> {
         gpu: &mut Gpu,
         requests: &[(RequestEpoch, usize)],
         forced: &[(RequestEpoch, Vec<u32>)],
+        external: &[(RequestEpoch, Vec<u32>)],
     ) -> Result<Vec<LaneDraft>, String> {
         let mut store = self
             .bundle
@@ -770,7 +790,8 @@ impl Qwen4LaneExecutor<'_> {
         let result = match store.phase.check_draft() {
             Ok(()) => {
                 store.step_started = Some(Instant::now());
-                let drafted = plan_and_draft(self.bundle, gpu, &mut store, requests, forced);
+                let drafted =
+                    plan_and_draft(self.bundle, gpu, &mut store, requests, forced, external);
                 if drafted.is_err() {
                     let epochs: Vec<RequestEpoch> = requests.iter().map(|(e, _)| *e).collect();
                     for epoch in &epochs {
@@ -1133,7 +1154,7 @@ fn provision_inner(
         .collect();
     if store.spec().is_none() && !decode.is_empty() && !store.proto_mut()?.has_flight() {
         let requests: Vec<(RequestEpoch, usize)> = decode.iter().map(|e| (*e, 0)).collect();
-        plan_and_draft(bundle, gpu, store, &requests, &[])?;
+        plan_and_draft(bundle, gpu, store, &requests, &[], &[])?;
     }
     check_sealed(plan, store.proto_mut()?)?;
     // `HIPFIRE_QWEN4_LANE_PAGE_TRACE`: free bytes before/after every lane map and what the budget planned.
@@ -1166,11 +1187,11 @@ fn provision_lane_maps(
     lane.state
         .ensure_mapped_capacity(gpu, end)
         .map_err(|e| format!("{PROVISION_MAP_REFUSED}{end} positions for {epoch:?}: {e}"))?;
+    let head_live = lane.window.as_ref().is_none_or(|w| w.head_live);
     if let Some(spec) = lane.spec.as_mut() {
         // A head-free (retired, no copy future) lane's head lags the
         // trunk and is never touched; a lagging head (copy future) is
         // mapped like a live one: its owed rows are appended at prepare.
-        let head_live = spec.window.as_ref().is_none_or(|w| w.head_live);
         if head_live {
             spec.head.ensure_mapped_capacity(gpu, end).map_err(|e| {
                 format!("{PROVISION_MAP_REFUSED}{end} head positions for {epoch:?}: {e}")
@@ -1401,9 +1422,7 @@ fn run_prefill_tiles(
     }
     let vocab = bundle.lane_vocab();
     let spec_config = store.spec();
-    let lane_eos = spec_config
-        .and_then(|config| config.end_of_turn)
-        .unwrap_or(bundle.config.eos_token_id);
+    let lane_eos = store.lane_eos(bundle.config.eos_token_id);
     // The step's bracket continues the lane prompt when some lane of this store still has
     // prompt rows after the tiles of this step: an EP tail-borrow epoch then stays open for the
     // next step (one restore per long prompt) instead of closing at the bracket's end.
@@ -1778,9 +1797,7 @@ fn commit_inner(
         }
     }
     let spec_config = store.spec();
-    let eos = spec_config
-        .and_then(|config| config.end_of_turn)
-        .unwrap_or(bundle.config.eos_token_id);
+    let eos = store.lane_eos(bundle.config.eos_token_id);
     let mut proto = store.take_proto()?;
     let result = commit_with_proto(
         bundle,
@@ -1953,9 +1970,7 @@ fn commit_with_proto(
                     .ok_or_else(|| format!("commit_step: {:?} has no published window", r.epoch))?;
                 // The window ends with its step (its tickets were consumed at
                 // the publish).
-                if let Some(spec) = lane.spec.as_mut() {
-                    spec.window = None;
-                }
+                lane.window = None;
                 // The host table mirrors the root's published state.
                 lane.host.generated.extend_from_slice(&out.emitted);
                 lane.host.pending_seed = Some(out.next_seed);
@@ -2543,7 +2558,7 @@ mod commit_window_tests {
             .find("RequestStepKind::Ar | RequestStepKind::Verify { .. } =>")
             .expect("decode arm");
         let arm = &body[ar..];
-        let clear = arm.find("spec.window = None;").expect("window cleared");
+        let clear = arm.find("lane.window = None;").expect("window cleared");
         let mirror = arm
             .find("lane.host.pending_seed = Some(out.next_seed)")
             .expect("mirror");

@@ -1232,8 +1232,6 @@ pub struct LaneSpec {
     pub draft: DraftHeadRequestState,
     /// `[hc_count * hidden]` F32: the next window's row-0 head hidden.
     pub pending_hidden: GpuTensor,
-    /// The routed window between `draft_step` and `commit_step`.
-    pub(crate) window: Option<PendingWindow>,
     /// Owed head rows of a retired lane with a copy future (`None`: the
     /// store stages no copy lane, a retired lane is head-free).
     pub(crate) lag: Option<HeadLagStore>,
@@ -1285,15 +1283,13 @@ impl LaneSpec {
             head,
             draft: DraftHeadRequestState::default(),
             pending_hidden,
-            window: None,
             lag,
             stats: LaneSpecStats::default(),
         })
     }
 
-    /// Back to a request's start: empty head, zero pending hidden, no
-    /// window, no owed rows, fresh counters (the window router lives at the
-    /// root).
+    /// Back to a request's start: empty head, zero pending hidden, no owed rows,
+    /// fresh counters.
     ///
     /// The zero-fills (head arenas, pending hidden) are enqueued into `batch`; the
     /// caller owns the one wait ([`Gpu::memset_batch_sync`], also after an error).
@@ -1309,7 +1305,6 @@ impl LaneSpec {
             self.pending_hidden.buf.size(),
         )
         .map_err(|e| format!("lane pending hidden reset: {e}"))?;
-        self.window = None;
         if let Some(lag) = self.lag.as_mut() {
             lag.clear();
         }
@@ -1318,7 +1313,7 @@ impl LaneSpec {
     }
 
     /// Start this (kept or fresh) lane spec from a promoted singleton's
-    /// `parts`: its pending hidden copied in, no window, no owed rows, fresh
+    /// `parts`: its pending hidden copied in, no owed rows, fresh
     /// counters. The head and draft request state are the singleton's own and
     /// swap in at commit; its agreement and retirement seed the root's lane
     /// policy.
@@ -1333,7 +1328,6 @@ impl LaneSpec {
         gpu.copy_d2d(parts.pending_hidden, &self.pending_hidden, bytes)
             .map_err(|e| format!("pending hidden copy: {e}"))?;
         self.draft = DraftHeadRequestState::default();
-        self.window = None;
         if let Some(lag) = self.lag.as_mut() {
             lag.clear();
         }
@@ -1360,7 +1354,12 @@ fn new_payload(
     ring_rows: usize,
     spec_cfg: Option<SpecAlloc>,
 ) -> Result<(Qwen4State, Option<LaneSpec>), String> {
-    let mirror = Qwen4LaneStore::state_mirror(spec_cfg.map(|(config, _, _, _)| config));
+    // Every lane with a capture ring (MTP or external-verify) rolls back to a snapshot.
+    let mirror = if ring_rows > 0 || spec_cfg.is_some() {
+        census::SPEC_LANE_MIRROR
+    } else {
+        census::AR_LANE_MIRROR
+    };
     let mut state = bundle
         .new_lane_state(gpu, mirror)
         .map_err(|e| format!("admit: allocate lane {slot}: {e}"))?;
@@ -1441,6 +1440,7 @@ fn reset_cell_into(
         .reset_into(gpu, batch)
         .map_err(|e| format!("admit: reset lane {slot}: {e}"))?;
     cell.state.row_capture_armed = false;
+    cell.window = None;
     match (store_has_spec, cell.spec.as_mut()) {
         (true, Some(spec)) => spec
             .reset_into(gpu, batch)
@@ -1505,6 +1505,8 @@ pub struct Qwen4LaneState {
     pub state: Qwen4State,
     /// `Some` on every lane of a store staged with spec, `None` on AR lanes.
     pub spec: Option<LaneSpec>,
+    /// The routed window between `draft_step` and `commit_step`.
+    pub(crate) window: Option<PendingWindow>,
 }
 
 /// A lane-table cell: host bookkeeping plus a device payload that outlives
@@ -1520,7 +1522,12 @@ impl LaneCell for Qwen4LaneState {
     type Payload = (Qwen4State, Option<LaneSpec>);
 
     fn assemble(host: LaneHost, (state, spec): Self::Payload) -> Self {
-        Self { host, state, spec }
+        Self {
+            host,
+            state,
+            spec,
+            window: None,
+        }
     }
 
     fn host(&self) -> &LaneHost {
@@ -2366,6 +2373,12 @@ pub struct Qwen4LaneStore {
     /// The capture ring of a slot past the copy lane's `wide_lanes`
     /// (`k + 1` rows; equals `ring_rows` without a copy lane).
     narrow_ring_rows: usize,
+    /// Verify rows per lane of an external-verify store (`0` otherwise): each lane's
+    /// capture ring holds that many rows (`Qwen4LaneExecutor::draft_step_external`).
+    external_rows: usize,
+    /// The end-of-turn token an external-verify lane's window stops at
+    /// (`None`: the model's EOS), as an MTP store's `LaneSpecConfig::end_of_turn`.
+    external_eos: Option<u32>,
     format: Qwen4StateFormat,
     backend: Qwen4KvBackend,
     policy: LaneStagePolicy,
@@ -2428,7 +2441,9 @@ impl Qwen4LaneStore {
     /// A store for `max_lanes` lanes and its step output buffers. On the exact gfx942
     /// single device every slot's state is allocated here ([`Self::preallocate_payloads`]);
     /// elsewhere states are allocated on first admission into a slot. With `spec`
-    /// every lane is an MTP lane.
+    /// every lane is an MTP lane. With `external_rows` (and neither `spec` nor `copy`)
+    /// every lane is an AR lane with an `external_rows`-row capture ring for drafts
+    /// verified from outside the store.
     pub(crate) fn new(
         gpu: &mut Gpu,
         bundle: &Qwen4Bundle,
@@ -2436,6 +2451,7 @@ impl Qwen4LaneStore {
         row_budget: usize,
         spec: Option<LaneSpecConfig>,
         copy: Option<LaneCopyConfig>,
+        external_rows: usize,
     ) -> Result<Self, String> {
         if !bundle.config.profile.is_flash_next() {
             return Err(format!(
@@ -2450,6 +2466,13 @@ impl Qwen4LaneStore {
         }
         if row_budget == 0 {
             return Err("lane store: row_budget must be at least 1".to_string());
+        }
+        if external_rows > 0 && (external_rows > LANE_MAX_ROWS || spec.is_some() || copy.is_some())
+        {
+            return Err(format!(
+                "lane store: external verify lanes take no spec or copy lane \
+                 and at most {LANE_MAX_ROWS} rows"
+            ));
         }
         // Developer overrides, refused before any device allocation.
         let group_override =
@@ -2571,6 +2594,9 @@ impl Qwen4LaneStore {
                 return Err("lane store: the copy lane needs MTP lanes (spec)".to_string());
             }
             (Some(spec), None) => (spec.k + 1, max_lanes * (spec.k + 1), 0, None),
+            (None, None) if external_rows > 0 => {
+                (external_rows, max_lanes * external_rows, 0, None)
+            }
             (None, None) => (0, max_lanes, 0, None),
         };
         let rows = rows_cap + max_lanes;
@@ -2614,6 +2640,8 @@ impl Qwen4LaneStore {
             row_budget: row_budget.min(max_lanes),
             ring_rows,
             narrow_ring_rows: spec.map_or(ring_rows, |s| s.k + 1),
+            external_rows,
+            external_eos: None,
             format: bundle.state_format(),
             backend: bundle.state.qsa_backend(),
             policy,
@@ -3049,6 +3077,7 @@ impl Qwen4LaneStore {
                         }
                     }
                     cell.state.row_capture_armed = false;
+                    cell.window = None;
                     Ok(None)
                 }
                 None => {
@@ -3083,6 +3112,7 @@ impl Qwen4LaneStore {
         let k = spec_cfg.map(|(config, _, _, _)| config.k);
         let eos = spec_cfg
             .and_then(|(config, _, _, _)| config.end_of_turn)
+            .or(self.external_eos)
             .unwrap_or(bundle.config.eos_token_id);
         let promoted = parts.as_ref().map(|p| (p.agreement, p.retired));
         let admitted = self.proto_mut()?.admit_decoding(DecodeAdmission {
@@ -3120,9 +3150,7 @@ impl Qwen4LaneStore {
             // A half-run window's tickets die with it: the next admission's
             // reset invalidates them.
             lane.state.row_capture_armed = false;
-            if let Some(spec) = lane.spec.as_mut() {
-                spec.window = None;
-            }
+            lane.window = None;
         }
         self.table.poison(epoch);
     }
@@ -3177,10 +3205,32 @@ impl Qwen4LaneStore {
     }
 
     /// Verify rows one lane holds at most: `1 + max(k, take cap)` with the
-    /// copy lane, else the row-exact guard ([`LANE_MAX_ROWS`], the plan's
-    /// historical bound).
+    /// copy lane, the external rows of an external-verify store, else the
+    /// row-exact guard ([`LANE_MAX_ROWS`], the plan's historical bound).
     pub(crate) fn verify_rows_per_lane(&self) -> usize {
-        self.copy.map_or(LANE_MAX_ROWS, |c| c.verify_rows)
+        match self.copy {
+            Some(c) => c.verify_rows,
+            None if self.external_rows > 0 => self.external_rows,
+            None => LANE_MAX_ROWS,
+        }
+    }
+
+    /// Verify rows per lane of an external-verify store (`0` for every other store).
+    pub fn external_rows(&self) -> usize {
+        self.external_rows
+    }
+
+    /// Set the end-of-turn token of an external-verify store's windows.
+    pub(crate) fn set_external_eos(&mut self, end_of_turn: Option<u32>) {
+        self.external_eos = end_of_turn;
+    }
+
+    /// The token a lane window stops at: the store's end of turn, else `model_eos`.
+    pub(crate) fn lane_eos(&self, model_eos: u32) -> u32 {
+        self.spec()
+            .and_then(|config| config.end_of_turn)
+            .or(self.external_eos)
+            .unwrap_or(model_eos)
     }
 
     /// Whether this store was staged to admit sampled lanes

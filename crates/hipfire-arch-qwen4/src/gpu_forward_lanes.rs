@@ -1357,6 +1357,10 @@ pub struct LaneOutputs<'a> {
     /// head, today's layout. Only an AR / verify step of the output band takes a shard (refused
     /// for prefill waves, recorded or captured steps).
     pub vocab_shard: Option<VocabShardView>,
+    /// The DFlash2 drafter's feature rows of every row of a single-card AR /
+    /// verify step ([`Qwen4LayerCapture`] from row 0, lanes concatenated);
+    /// `None`: no capture.
+    pub(crate) layer_capture: Option<crate::gpu_forward::Qwen4LayerCapture>,
 }
 
 /// Which logits a prefill wave writes.
@@ -2091,6 +2095,79 @@ impl MoeStepHooks for HcAllRowsScope {
             _ => false,
         };
         gpu.set_wide_verify_rows(if all_rows { self.rows } else { self.prior });
+        Ok(())
+    }
+}
+
+/// The DFlash2 layer capture of a lane step ([`LaneOutputs::layer_capture`]):
+/// each `(step, slot, first row)` target is the attention HC write of the
+/// layer after a captured one, before which its rows' streams hold that
+/// layer's completed output; the write's own input rows are averaged over
+/// the HC streams into `slot` of `rows` from the target's first row.
+struct LaneCapture<'h> {
+    targets: &'h [(*const (), usize, usize)],
+    rows: &'h GpuTensor,
+    slots: usize,
+    hc: usize,
+    hidden: usize,
+    bf16: bool,
+    fired: &'h std::cell::Cell<usize>,
+}
+
+/// The hooks a lane program runs with: the all-rows scope and the DFlash2
+/// capture, either or both.
+struct LaneStepHooks<'h> {
+    scope: Option<HcAllRowsScope>,
+    capture: Option<LaneCapture<'h>>,
+}
+
+impl MoeStepHooks for LaneStepHooks<'_> {
+    fn before_moe(&mut self, _gpu: &mut Gpu) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        Ok(())
+    }
+    fn after_moe(&mut self, _gpu: &mut Gpu) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        Ok(())
+    }
+    fn before_step(
+        &mut self,
+        gpu: &mut Gpu,
+        step: &Step<'_>,
+    ) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        if let Some(scope) = self.scope.as_mut() {
+            scope.before_step(gpu, step)?;
+        }
+        let Some(capture) = self.capture.as_ref() else {
+            return Ok(());
+        };
+        let at = step as *const Step<'_> as *const ();
+        for &(target, slot, begin) in capture.targets {
+            if target != at {
+                continue;
+            }
+            let Step::HyperWrite(op) = step else {
+                return Err(hipfire_dispatch::types::DispatchError::Hip(
+                    "DFlash2 lane capture point is not an HC write".into(),
+                ));
+            };
+            let stride = capture.slots * capture.hidden;
+            rdna_compute::tensor_ops::hc_mean_capture_f32(
+                gpu,
+                op.input,
+                &capture.rows.sub_offset(begin * stride, op.rows * stride),
+                op.rows,
+                capture.hc,
+                capture.hidden,
+                stride,
+                slot * capture.hidden,
+                capture.bf16,
+            )
+            .map_err(|error| {
+                hipfire_dispatch::types::DispatchError::Hip(format!(
+                    "DFlash2 lane capture: {error}"
+                ))
+            })?;
+            capture.fired.set(capture.fired.get() + 1);
+        }
         Ok(())
     }
 }
@@ -3906,6 +3983,24 @@ fn forward_lanes_scoped(
             with_ple_project(&mut program);
         }
         let mut steps: Vec<Step<'_>> = Vec::with_capacity(program.len() * lanes.len() * 2);
+        // DFlash2 layer capture of an AR / verify step (`LaneOutputs::layer_capture`):
+        // `(step, slot, first row)` of every capture point, see the HC write below.
+        let capture = ar_out.and_then(|out| out.layer_capture.as_ref());
+        if let Some(capture) = capture {
+            if sp_views.is_some() || prefill {
+                return Err(invalid(
+                    "a DFlash2 lane capture runs on a single-card AR step only",
+                ));
+            }
+            if capture
+                .layers
+                .iter()
+                .any(|&l| l + 1 >= config.num_hidden_layers)
+            {
+                return Err(invalid("a DFlash2 lane capture of the last trunk layer"));
+            }
+        }
+        let mut capture_at: Vec<(usize, usize, usize)> = Vec::new();
         let mut qsa_commits: Vec<QsaCommit> = Vec::new();
         // Capture written in place (exact gfx1201): a verify lane's GDN
         // qkv in-projection that runs as its own launch over exactly that lane's rows writes the
@@ -4076,6 +4171,16 @@ fn forward_lanes_scoped(
                                 ),
                             };
                             sp_streams_partial |= sp.is_some();
+                            // DFlash2 capture: right before the attention write of
+                            // the layer after a captured one, these rows' streams
+                            // hold the captured layer's completed output.
+                            if let Some(capture) = capture.filter(|_| !mlp && layer > 0) {
+                                if let Some(slot) =
+                                    capture.layers.iter().position(|&l| l + 1 == layer)
+                                {
+                                    capture_at.push((steps.len(), slot, seg.begin));
+                                }
+                            }
                             steps.push(Step::HyperWrite(HyperWriteOp {
                                 ar: if mlp {
                                     crate::trunk_route::ffn_writer()
@@ -4633,20 +4738,37 @@ fn forward_lanes_scoped(
         // The all-rows HC steps run under the wide few-row scope (`HcAllRowsScope`); every other
         // step keeps the step's own.
         let prior_wide = gpu.wide_verify_rows;
+        let capture_targets: Vec<(*const (), usize, usize)> = capture_at
+            .iter()
+            .map(|&(at, slot, begin)| (&steps[at] as *const Step<'_> as *const (), slot, begin))
+            .collect();
+        let capture_fired = std::cell::Cell::new(0usize);
         let execute = |gpu: &mut Gpu, steps: &[Step<'_>]| {
-            let result = if hc_seg.is_some() {
-                let mut scope = HcAllRowsScope {
+            let mut hooks = LaneStepHooks {
+                scope: hc_seg.is_some().then_some(HcAllRowsScope {
                     rows: n,
                     prior: prior_wide,
                     exact: exact_scope,
                     moe: moe_all,
-                };
-                let result = execute_validated_steps_with_moe_hooks(gpu, &ctx, steps, &mut scope);
-                gpu.set_wide_verify_rows(prior_wide);
-                result
+                }),
+                capture: capture.map(|capture| LaneCapture {
+                    targets: &capture_targets,
+                    rows: &capture.rows,
+                    slots: capture.layers.len(),
+                    hc: dims.hc_count,
+                    hidden: config.hidden_size,
+                    bf16: bf16_state,
+                    fired: &capture_fired,
+                }),
+            };
+            let result = if hooks.scope.is_some() || hooks.capture.is_some() {
+                execute_validated_steps_with_moe_hooks(gpu, &ctx, steps, &mut hooks)
             } else {
                 execute_validated_steps(gpu, &ctx, steps)
             };
+            if hooks.scope.is_some() {
+                gpu.set_wide_verify_rows(prior_wide);
+            }
             result.map_err(|error| {
                 Qwen4GpuForwardError::Dispatch(format!("execute lane program: {error:?}"))
             })
@@ -4733,6 +4855,15 @@ fn forward_lanes_scoped(
             }
         }
         execute(gpu, &steps[split..])?;
+        if capture_fired.get() != capture_targets.len()
+            || (capture.is_some() && capture_targets.is_empty())
+        {
+            return Err(invalid(format!(
+                "DFlash2 lane capture fired {} of {} points",
+                capture_fired.get(),
+                capture_targets.len()
+            )));
+        }
 
         // Wide hidden capture: every row's final streams, lanes concatenated
         // (the singleton verify's `wide_hidden_capture` copy).

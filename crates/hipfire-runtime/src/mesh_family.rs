@@ -182,9 +182,14 @@ pub trait MeshLanes {
     }
     /// Whether these lanes run speculative windows: a request parks with its
     /// drafter's state ([`Self::park_window`]) and steps in windows
-    /// ([`Self::step_windows`]); an AR request does not park.
+    /// ([`Self::step_windows`]).
     fn windows(&self) -> bool {
         false
+    }
+    /// Whether an AR request parks into these lanes ([`Self::park`]); by
+    /// default only lanes that run no windows take one.
+    fn ar_lanes(&self) -> bool {
+        !self.windows()
     }
     /// Whether a sampled speculative request may park into a window lane
     /// (the lane continues its seeded stream).

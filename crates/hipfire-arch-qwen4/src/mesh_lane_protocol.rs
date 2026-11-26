@@ -2455,6 +2455,21 @@ impl MeshRoot {
         requests: &[LaneRequest],
         budgets: &WindowBudgets,
     ) -> Result<WindowStart, ProtocolError> {
+        self.plan_window_external(prior_evidence, requests, &[], budgets)
+    }
+
+    /// [`Self::plan_window`] with `external`: per request epoch, the point-mass
+    /// drafts of an AR-store lane (greedy, no policy, no forced rows), planned
+    /// as one copy window whose proposals are exactly these; empty is one AR
+    /// row. An epoch absent from `external` plans as usual. Over-long drafts
+    /// are refused, never clamped.
+    pub fn plan_window_external(
+        &mut self,
+        prior_evidence: Option<&MergedCostEvidence>,
+        requests: &[LaneRequest],
+        external: &[(RequestEpoch, Vec<u32>)],
+        budgets: &WindowBudgets,
+    ) -> Result<WindowStart, ProtocolError> {
         self.check_live()?;
         if !matches!(self.phase, StepPhase::Idle | StepPhase::Published) {
             return Err(ProtocolError::Phase {
@@ -2495,6 +2510,14 @@ impl MeshRoot {
             _ => {}
         }
 
+        // Point-mass drafts of AR-store lanes, per epoch (see `plan_window_external`).
+        let ext_of = |epoch: RequestEpoch| {
+            external
+                .iter()
+                .find(|(e, _)| *e == epoch)
+                .map(|(_, d)| d.as_slice())
+        };
+
         // Resolve lanes in request order; duplicates and stale epochs fail.
         let mut seen = HashSet::new();
         for r in requests {
@@ -2523,6 +2546,25 @@ impl MeshRoot {
                     "{:?}: no tokens remaining",
                     r.epoch
                 )));
+            }
+            if let Some(ext) = ext_of(r.epoch) {
+                if lane.policy.is_some() || r.forced.is_some() || r.sampling != SamplingMode::Greedy
+                {
+                    return Err(ProtocolError::Config(format!(
+                        "{:?}: external drafts need a greedy lane with no policy and no forced rows",
+                        r.epoch
+                    )));
+                }
+                let room = (budgets.verify_rows_per_lane - 1)
+                    .min(r.remaining.saturating_sub(1))
+                    .min(r.context_left.saturating_sub(1));
+                if ext.len() > room {
+                    return Err(ProtocolError::Budget(format!(
+                        "{:?}: {} external drafts exceed the window's {room}",
+                        r.epoch,
+                        ext.len()
+                    )));
+                }
             }
         }
 
@@ -2652,6 +2694,16 @@ impl MeshRoot {
                     HeadState::Lag { .. } if !copy_active => HeadState::Free,
                     h => h,
                 };
+            } else if let Some(ext) = ext_of(r.epoch).filter(|e| !e.is_empty()) {
+                // External drafts are a point-mass copy window with no head
+                // rounds, cut after the first EOS as the copy chooser does.
+                let cut = match lane.eos.and_then(|eos| ext.iter().position(|&t| t == eos)) {
+                    Some(i) => i + 1,
+                    None => ext.len(),
+                };
+                plan.source = ProposalSource::Copy;
+                plan.max_depth = cut;
+                plan.copy_drafts = ext[..cut].to_vec();
             } else if let Some(policy) = sl.policy.as_mut() {
                 let budget = max_drafts.min(policy.max_k());
                 plan.budget = budget;
@@ -3781,6 +3833,11 @@ impl MeshRoot {
             .zip(&updates)
             .zip(&final_sources)
             .filter_map(|((l, (_, _, w)), &fsrc)| {
+                // A policy-less lane has no price to teach: an external
+                // (AR-store) copy window settles nothing.
+                if self.lanes[&l.key.request_epoch].policy.is_none() {
+                    return None;
+                }
                 let w = w.clone()?;
                 // Native windows and the synced/retired AR rows price the
                 // native floor; a copy window prices the external (copy)

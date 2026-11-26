@@ -1167,13 +1167,13 @@ pub(crate) fn enqueue_batched_draft(
             head,
             draft,
             pending_hidden,
-            window,
             ..
         } = lane
             .spec
             .as_mut()
             .ok_or_else(|| "drafting lane lost its MTP state".to_string())?;
-        let window_position = window
+        let window_position = lane
+            .window
             .as_ref()
             .ok_or_else(|| "draft op without a pending window".to_string())?
             .position;
@@ -1413,7 +1413,12 @@ pub(crate) fn prepare_lane_window_with(
         .hc_count
         .checked_mul(bundle.config.hidden_size)
         .ok_or_else(|| "finish_lane_window: hidden width overflow".to_string())?;
-    let Qwen4LaneState { state, spec, .. } = lane;
+    let Qwen4LaneState {
+        state,
+        spec,
+        window,
+        ..
+    } = lane;
     let spec = spec
         .as_mut()
         .ok_or_else(|| "finish_lane_window: lane has no MTP state".to_string())?;
@@ -1421,7 +1426,6 @@ pub(crate) fn prepare_lane_window_with(
         head,
         draft,
         pending_hidden,
-        window,
         ..
     } = spec;
     let window = window
@@ -1582,7 +1586,12 @@ pub(crate) fn ar_synced_head(
         .hc_count
         .checked_mul(bundle.config.hidden_size)
         .ok_or_else(|| "ar_synced_head: hidden width overflow".to_string())?;
-    let Qwen4LaneState { state, spec, .. } = lane;
+    let Qwen4LaneState {
+        state,
+        spec,
+        window,
+        ..
+    } = lane;
     let spec = spec
         .as_mut()
         .ok_or_else(|| "ar_synced_head: lane has no MTP state".to_string())?;
@@ -1590,7 +1599,6 @@ pub(crate) fn ar_synced_head(
         head,
         draft,
         pending_hidden,
-        window,
         ..
     } = spec;
     let window = window
@@ -1646,7 +1654,9 @@ pub(crate) fn prefill_tile(
     sample_host: &mut crate::lane::SampleScratch,
     sample_arena: &mut Option<hipfire_runtime::lane_draw::LaneDrawArena>,
 ) -> Result<Option<u32>, String> {
-    let Qwen4LaneState { host, state, spec } = lane;
+    let Qwen4LaneState {
+        host, state, spec, ..
+    } = lane;
     let spec = spec
         .as_mut()
         .ok_or_else(|| "prefill_tile: lane has no MTP state".to_string())?;
@@ -1748,7 +1758,9 @@ pub(crate) fn fill_head_after_wave(
     hidden_row0: usize,
     append_scratch: Option<&mut MtpAppendScratch>,
 ) -> Result<(), String> {
-    let Qwen4LaneState { host, state, spec } = lane;
+    let Qwen4LaneState {
+        host, state, spec, ..
+    } = lane;
     let spec = spec
         .as_mut()
         .ok_or_else(|| "fill_head_after_wave: lane has no MTP state".to_string())?;
@@ -1866,7 +1878,9 @@ pub(crate) fn fill_heads_after_wave(
         .checked_mul(bundle.config.hidden_size)
         .ok_or_else(|| "fill_heads_after_wave: hidden width overflow".to_string())?;
     for fill in fills.iter() {
-        let Qwen4LaneState { host, state, spec } = &*fill.lane;
+        let Qwen4LaneState {
+            host, state, spec, ..
+        } = &*fill.lane;
         let spec = spec
             .as_ref()
             .ok_or_else(|| "fill_heads_after_wave: lane has no MTP state".to_string())?;
@@ -1994,7 +2008,9 @@ fn fill_rows_serially(
     row: usize,
 ) -> Result<(), String> {
     let (tokens, hidden_row0) = (fill.tokens, fill.hidden_row0);
-    let Qwen4LaneState { host, state, spec } = &mut *fill.lane;
+    let Qwen4LaneState {
+        host, state, spec, ..
+    } = &mut *fill.lane;
     let LaneSpec {
         head,
         draft,

@@ -302,7 +302,7 @@ pub struct RankLaneStats {
 
 /// One lane's window on this rank.
 /// One lane's window on this rank. The device window itself (tickets, head
-/// steps, the prepared repair) lives in the lane's `spec.window`
+/// steps, the prepared repair) lives in the lane's `window`
 /// ([`crate::mesh_rank_copy`]); this is the rank-protocol side.
 struct LaneWin {
     plan: LanePlan,
@@ -594,17 +594,13 @@ fn lane_mut<'a>(store: &'a mut Qwen4LaneStore, epoch: &RequestEpoch) -> R<&'a mu
 /// since the snapshots, so committing a valid ticket only retires it) and
 /// disarm the ring. Used for a rejected or aborted window.
 fn clear_window(bundle: &mut Qwen4Bundle, lane: &mut Qwen4LaneState) {
-    let Qwen4LaneState { state, spec, .. } = lane;
-    state.row_capture_armed = false;
-    let Some(spec) = spec.as_mut() else {
-        return;
-    };
-    let LaneSpec {
-        head,
-        draft,
+    let Qwen4LaneState {
+        state,
+        spec,
         window,
         ..
-    } = spec;
+    } = lane;
+    state.row_capture_armed = false;
     let Some(w) = window.take() else {
         return;
     };
@@ -615,7 +611,8 @@ fn clear_window(bundle: &mut Qwen4Bundle, lane: &mut Qwen4LaneState) {
             }
         });
     }
-    if let Some(HeadTicket::Local(ticket)) = w.head_ticket {
+    if let (Some(HeadTicket::Local(ticket)), Some(spec)) = (w.head_ticket, spec.as_mut()) {
+        let LaneSpec { head, draft, .. } = spec;
         let _ = bundle.with_lane(state, Some((head, draft)), |b| {
             if b.mtp_validate_commit(ticket).is_ok() {
                 b.mtp_commit_validated(ticket);
@@ -1081,7 +1078,12 @@ impl RankLane<'_> {
                             if is_probe_op(plan_of(&op.key)?, op.position) {
                                 save_probe_state(&mut *lanes[slot]);
                             }
-                            let Qwen4LaneState { state, spec, .. } = &mut *lanes[slot];
+                            let Qwen4LaneState {
+                                state,
+                                spec,
+                                window,
+                                ..
+                            } = &mut *lanes[slot];
                             let spec = spec
                                 .as_mut()
                                 .ok_or_else(|| "drafting lane lost its MTP state".to_string())?;
@@ -1089,7 +1091,6 @@ impl RankLane<'_> {
                                 head,
                                 draft,
                                 pending_hidden,
-                                window,
                                 ..
                             } = spec;
                             let window_position = window
@@ -1173,9 +1174,8 @@ impl RankLane<'_> {
                         };
                         let j = {
                             let w = lanes[slot]
-                                .spec
+                                .window
                                 .as_ref()
-                                .and_then(|s| s.window.as_ref())
                                 .ok_or_else(|| "draft op without a pending window".to_string())?;
                             op.position - w.position
                         };
@@ -1191,9 +1191,7 @@ impl RankLane<'_> {
                             abandoned = outcome.restores_head();
                         }
                         if !abandoned {
-                            if let Some(w) =
-                                lanes[slot].spec.as_mut().and_then(|s| s.window.as_mut())
-                            {
+                            if let Some(w) = lanes[slot].window.as_mut() {
                                 w.steps += 1;
                             }
                         }
@@ -1294,7 +1292,7 @@ impl RankLane<'_> {
                 if vl.rows.len() > 1 && lane.spec.is_some() {
                     // The sealed rows are the window's proposals (the root's
                     // seal, after any draft truncation / probe outcome).
-                    if let Some(w) = lane.spec.as_mut().and_then(|s| s.window.as_mut()) {
+                    if let Some(w) = lane.window.as_mut() {
                         w.drafts = vl.rows[1..].to_vec();
                     }
                     arm_lane_verify(bundle, gpu, &mut **lane, vl)?;
@@ -1324,6 +1322,7 @@ impl RankLane<'_> {
                     top1: shard.as_ref().map_or(&full_top1, |s| &s.top1),
                     wide_hidden: hidden,
                     vocab_shard: shard.as_ref().map(|s| s.view),
+                    layer_capture: None,
                 };
                 forward_lanes(gpu, bundle, &mut rows, &out, &policy).map_err(|e| e.to_string())
             };
@@ -1454,7 +1453,7 @@ impl RankLane<'_> {
                     },
                 )?;
                 head_rows += prepared.head_rows;
-                if let Some(w) = lane.spec.as_mut().and_then(|s| s.window.as_mut()) {
+                if let Some(w) = lane.window.as_mut() {
                     w.prepared = Some(prepared.lane);
                 }
             }
@@ -1985,18 +1984,12 @@ impl LaneMeshExecutor for RankLane<'_> {
             for (win, d) in step.lanes.iter().zip(&decision.lanes) {
                 let epoch = win.plan.key.request_epoch;
                 let lane = lane_mut(store, &epoch)?;
-                let prepared = lane
-                    .spec
-                    .as_mut()
-                    .and_then(|s| s.window.as_mut())
-                    .and_then(|w| w.prepared.take());
+                let prepared = lane.window.as_mut().and_then(|w| w.prepared.take());
                 if let Some(prepared) = prepared {
                     publish_rank_lane(bundle, gpu, lane, prepared)
                         .map_err(|e| format!("{epoch:?}: publish: {e}"))?;
                 }
-                if let Some(spec) = lane.spec.as_mut() {
-                    spec.window = None;
-                }
+                lane.window = None;
                 // The lane's host metadata, as `commit_verify`/`commit_host`.
                 lane.host.generated.extend_from_slice(&d.emitted);
                 lane.host.pending_seed = Some(d.next_seed);

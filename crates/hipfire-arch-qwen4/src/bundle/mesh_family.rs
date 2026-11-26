@@ -12,6 +12,7 @@ use crate::gpu_forward::Qwen4MeshHead;
 use crate::mesh_bindings::{Qwen4MeshBindings, Qwen4RankBand};
 use crate::program::qwen4_step_graph_with_output;
 use hipfire_dispatch::pipeline::step_graph::StepGraph;
+use hipfire_runtime::dflash2_spec::Dflash2Speculator;
 use hipfire_runtime::mesh_family::{DecodeOut, EpochInput, LaneWindow, MeshFamily, MeshLanes};
 use hipfire_runtime::multi_gpu::executor::{MeshStepBindings, Result};
 use hipfire_runtime::multi_gpu::Gpus;
@@ -147,17 +148,32 @@ impl Qwen4Bundle {
         rows: &[(u64, usize)],
         forced: &[(RequestEpoch, Vec<u32>)],
     ) -> Result<Vec<LaneWindow>> {
-        let requests: Vec<(RequestEpoch, usize)> = rows
+        let requests: Vec<RequestEpoch> = rows.iter().map(|&(tag, _)| lane_epoch(tag)).collect();
+        let budgets: Vec<(RequestEpoch, usize)> = rows
             .iter()
             .map(|&(tag, drafts)| (lane_epoch(tag), drafts))
             .collect();
         let drafted = self
             .lane_executor()
             .map_err(text)?
-            .draft_step_forced(gpu, &requests, forced)?;
+            .draft_step_forced(gpu, &budgets, forced)?;
+        Ok(self.verify_drafted(gpu, &requests, &drafted, None)?.0)
+    }
+
+    /// The lane step of the drafted windows of `requests`: one verify over
+    /// every lane commits each lane's greedy accept. With `features`, the
+    /// step's DFlash2 feature rows are appended to it (plan row order) and
+    /// each request's first plan row is returned with its window.
+    fn verify_drafted(
+        &mut self,
+        gpu: &mut Gpu,
+        requests: &[RequestEpoch],
+        drafted: &[crate::lane_exec::LaneDraft],
+        features: Option<&mut Vec<f32>>,
+    ) -> Result<(Vec<LaneWindow>, Vec<usize>)> {
         let store = self.lanes().ok_or("Qwen4 lanes are not staged")?;
-        let mut slotted = Vec::with_capacity(rows.len());
-        for (epoch, _) in &requests {
+        let mut slotted = Vec::with_capacity(requests.len());
+        for epoch in requests {
             let slot = store
                 .slot_of(epoch)
                 .ok_or_else(|| format!("engine lane {} is not admitted", epoch.request_tag))?;
@@ -207,12 +223,28 @@ impl Qwen4Bundle {
             });
             plan.decode_rows += len;
         }
-        let advances = {
+        let stepped = {
             let mut executor = self.lane_executor().map_err(text)?;
             let out = executor
                 .provision_step(gpu, &plan)
-                .and_then(|()| executor.forward_step(gpu, &plan))
-                .and_then(|stepped| executor.commit_step(gpu, &plan, stepped));
+                .and_then(|()| executor.forward_step(gpu, &plan));
+            if out.is_err() {
+                executor.abort_step(&plan);
+            }
+            out?
+        };
+        // The step's feature rows are read before the commit's rollback.
+        if let Some(features) = features {
+            if let Err(error) = self.read_dflash_capture(gpu, plan.decode_rows, features) {
+                if let Ok(mut executor) = self.lane_executor() {
+                    executor.abort_step(&plan);
+                }
+                return Err(format!("DFlash2 lane features: {error}"));
+            }
+        }
+        let advances = {
+            let mut executor = self.lane_executor().map_err(text)?;
+            let out = executor.commit_step(gpu, &plan, stepped);
             if out.is_err() {
                 executor.abort_step(&plan);
             }
@@ -220,18 +252,134 @@ impl Qwen4Bundle {
         };
         requests
             .iter()
-            .map(|(epoch, _)| {
+            .map(|epoch| {
+                let begin = plan
+                    .requests
+                    .iter()
+                    .find(|r| r.epoch == *epoch)
+                    .map_or(0, |r| r.rows.begin);
                 advances
                     .iter()
                     .find(|advance| advance.epoch == *epoch && !advance.committed_ids.is_empty())
-                    .map(|advance| LaneWindow {
-                        committed: advance.committed_ids.clone(),
-                        drafted: advance.verified_rows.saturating_sub(1),
-                        accepted: advance.accepted_drafts,
+                    .map(|advance| {
+                        (
+                            LaneWindow {
+                                committed: advance.committed_ids.clone(),
+                                drafted: advance.verified_rows.saturating_sub(1),
+                                accepted: advance.accepted_drafts,
+                            },
+                            begin,
+                        )
                     })
                     .ok_or_else(|| format!("lane {} committed nothing", epoch.request_tag))
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()
+            .map(|windows| windows.into_iter().unzip())
+    }
+
+    /// Whether the engine lanes run DFlash2 windows: an external-verify store
+    /// ([`Self::stage_lanes_external`]) under an armed DFlash2 drafter.
+    fn dflash_windows(&self) -> bool {
+        self.dflash.is_some() && self.lanes().is_some_and(|store| store.external_rows() > 1)
+    }
+
+    /// DFlash2 contexts of lanes released elsewhere (a poisoned step) become
+    /// spares.
+    fn settle_dflash_lanes(&mut self) {
+        let mut i = 0;
+        while i < self.dflash_lanes.len() {
+            let tag = self.dflash_lanes[i].0;
+            if self
+                .lanes()
+                .and_then(|store| store.lane(&lane_epoch(tag)))
+                .is_none()
+            {
+                let (_, lane) = self.dflash_lanes.swap_remove(i);
+                self.dflash_spare.push(lane);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// One epoch of DFlash2 windows: every `(tag, drafts)` lane drafts at
+    /// most `drafts` on its own context (one draft forward each), then one
+    /// lane step verifies every lane's drafts and each lane's context takes
+    /// the feature rows of the rows its lane kept.
+    fn dflash_step(&mut self, gpu: &mut Gpu, rows: &[(u64, usize)]) -> Result<Vec<LaneWindow>> {
+        let max_drafts = self
+            .lanes()
+            .map_or(0, |store| store.external_rows())
+            .saturating_sub(1);
+        let model_eos = self.config.eos_token_id;
+        let eos = self
+            .lanes()
+            .map_or(model_eos, |store| store.lane_eos(model_eos));
+        let mut requests = Vec::with_capacity(rows.len());
+        let mut external = Vec::with_capacity(rows.len());
+        let mut starts = Vec::with_capacity(rows.len());
+        for &(tag, cap) in rows {
+            let epoch = lane_epoch(tag);
+            let (position, seed) = {
+                let store = self.lanes().ok_or("Qwen4 lanes are not staged")?;
+                let lane = store
+                    .lane(&epoch)
+                    .ok_or_else(|| format!("engine lane {tag} is not admitted"))?;
+                let seed = store
+                    .root_seed(&epoch)
+                    .or(lane.host.pending_seed)
+                    .ok_or("a decoding lane has no pending seed")?;
+                (lane.state.position, seed)
+            };
+            let at = self
+                .dflash_lanes
+                .iter()
+                .position(|(t, _)| *t == tag)
+                .ok_or_else(|| format!("engine lane {tag} has no DFlash2 context"))?;
+            let (_, mut lane) = self.dflash_lanes.swap_remove(at);
+            let drafts = lane.draft(gpu, self, position, seed, cap.min(max_drafts));
+            self.dflash_lanes.push((tag, lane));
+            let mut drafts = drafts?;
+            // A window ends before a drafted end of turn: the singleton
+            // replays a stop inside its window as a forward of the rows
+            // before it, which is exactly this window's verify.
+            if let Some(stop) = drafts.iter().position(|&t| t == eos) {
+                drafts.truncate(stop);
+            }
+            let mut block = Vec::with_capacity(1 + drafts.len());
+            block.push(seed);
+            block.extend_from_slice(&drafts);
+            requests.push(epoch);
+            external.push((epoch, drafts));
+            starts.push((position, block));
+        }
+        let drafted = self
+            .lane_executor()
+            .map_err(text)?
+            .draft_step_external(gpu, &external)?;
+        let mut features = Vec::new();
+        let (windows, begins) =
+            self.verify_drafted(gpu, &requests, &drafted, Some(&mut features))?;
+        let width = self.dflash_row_width();
+        for ((&(tag, _), (position, block)), begin) in rows.iter().zip(&starts).zip(begins) {
+            // The rows the lane kept: its accepted drafts and its seed (an
+            // accepted end-of-turn draft keeps no bonus row).
+            let kept = self
+                .lanes()
+                .and_then(|store| store.lane(&lane_epoch(tag)))
+                .map(|lane| lane.state.position)
+                .and_then(|end| end.checked_sub(*position))
+                .filter(|&kept| (1..=block.len()).contains(&kept))
+                .ok_or_else(|| format!("engine lane {tag} kept no rows of its window"))?;
+            let lane = self
+                .dflash_lanes
+                .iter_mut()
+                .find(|(t, _)| *t == tag)
+                .map(|(_, lane)| lane)
+                .ok_or_else(|| format!("engine lane {tag} has no DFlash2 context"))?;
+            lane.commit(&features[begin * width..], &block[..kept])?;
+        }
+        Ok(windows)
     }
 }
 
@@ -423,7 +571,11 @@ impl MeshLanes for Qwen4Bundle {
     }
 
     fn windows(&self) -> bool {
-        self.lanes().is_some_and(|store| store.spec().is_some())
+        self.lanes().is_some_and(|store| store.spec().is_some()) || self.dflash_windows()
+    }
+
+    fn ar_lanes(&self) -> bool {
+        self.lanes().is_some_and(|store| store.spec().is_none())
     }
 
     fn park_window(
@@ -435,6 +587,26 @@ impl MeshLanes for Qwen4Bundle {
         drafter: &mut dyn hipfire_runtime::spec::Speculator,
         remaining: usize,
     ) -> Result<()> {
+        let gpu = device(gpus)?;
+        if self.dflash_windows() {
+            // The request's draft context moves into the lane; its trunk
+            // state promotes like an AR lane's.
+            let drafter = drafter
+                .drafter_any_mut()
+                .and_then(|any| any.downcast_mut::<Dflash2Speculator>())
+                .ok_or("a DFlash2 lane takes the DFlash2 drafter")?;
+            self.settle_dflash_lanes();
+            let position = (prompt.len() + emitted.len())
+                .checked_sub(1)
+                .ok_or("park: no pending seed")?;
+            let lane = drafter.take_lane(gpu, position, self.dflash_spare.pop())?;
+            let promoted = self.promote(gpu, tag, prompt, emitted.to_vec(), remaining, None, None);
+            match promoted {
+                Ok(()) => self.dflash_lanes.push((tag, lane)),
+                Err(_) => self.dflash_spare.push(drafter.adopt_lane(lane)),
+            }
+            return promoted;
+        }
         let drafter = drafter
             .drafter_any_mut()
             .and_then(|any| any.downcast_mut::<crate::mtp_spec::Qwen4MtpDrafter>())
@@ -442,7 +614,7 @@ impl MeshLanes for Qwen4Bundle {
         let sampling = drafter.naive_lane_sampling()?;
         let parts = drafter.promotion_parts()?;
         self.promote(
-            device(gpus)?,
+            gpu,
             tag,
             prompt,
             emitted.to_vec(),
@@ -453,13 +625,19 @@ impl MeshLanes for Qwen4Bundle {
     }
 
     fn sampled_windows(&self) -> bool {
-        self.windows() && self.lanes().is_some_and(|store| store.promotes_sampled())
+        self.windows()
+            && !self.dflash_windows()
+            && self.lanes().is_some_and(|store| store.promotes_sampled())
     }
 
     /// The legacy fn-lanes window ([`crate::lane_exec::Qwen4LaneExecutor`]):
     /// the root routes and drafts every lane, then one verify step over all
-    /// of them commits each lane's greedy accept.
+    /// of them commits each lane's greedy accept. DFlash2 lanes draft on
+    /// their own contexts first ([`Self::dflash_step`]).
     fn step_windows(&mut self, gpus: &mut Gpus, rows: &[(u64, usize)]) -> Result<Vec<LaneWindow>> {
+        if self.dflash_windows() {
+            return self.dflash_step(device(gpus)?, rows);
+        }
         self.windows(device(gpus)?, rows, &[])
     }
 
@@ -472,7 +650,7 @@ impl MeshLanes for Qwen4Bundle {
         gpus: &mut Gpus,
         tag: u64,
         tokens: &[u32],
-        drafter: Option<&mut dyn hipfire_runtime::spec::Speculator>,
+        mut drafter: Option<&mut dyn hipfire_runtime::spec::Speculator>,
     ) -> Result<()> {
         let gpu = device(gpus)?;
         let epoch = lane_epoch(tag);
@@ -493,6 +671,7 @@ impl MeshLanes for Qwen4Bundle {
                 store.root_seed(&epoch).or(lane.host.pending_seed),
             )
         };
+        let dflash = self.dflash_lanes.iter().any(|(t, _)| *t == tag);
         // A retired lane's head lags with no owed rows: refused before the
         // forced row, which it could not use.
         if head.is_some_and(|head| head != at) {
@@ -500,8 +679,13 @@ impl MeshLanes for Qwen4Bundle {
                 "lane record {tag}: the MTP head is at {head:?}, the trunk at {at}"
             ));
         }
-        if let Some(seed) = unrun_seed(head.is_some(), at, seed, tokens) {
-            self.windows(gpu, &[(tag, 0)], &[(epoch, vec![seed])])?;
+        if let Some(seed) = unrun_seed(head.is_some() || dflash, at, seed, tokens) {
+            if dflash {
+                // A one-row window runs the pick and keeps its feature row.
+                self.dflash_step(gpu, &[(tag, 0)])?;
+            } else {
+                self.windows(gpu, &[(tag, 0)], &[(epoch, vec![seed])])?;
+            }
         }
         let marked = self
             .lane_marks
@@ -535,6 +719,7 @@ impl MeshLanes for Qwen4Bundle {
                     ));
                 }
                 let drafter = drafter
+                    .as_deref_mut()
                     .and_then(|d| d.drafter_any_mut())
                     .and_then(|any| any.downcast_mut::<crate::mtp_spec::Qwen4MtpDrafter>())
                     .ok_or("an MTP lane record continues with a native Qwen4 MTP drafter")?;
@@ -542,6 +727,28 @@ impl MeshLanes for Qwen4Bundle {
                 true
             }
         };
+        // A DFlash2 lane record's draft context goes back to the drafter that
+        // continues it (cut to a cancelled lane's rewind); an AR request
+        // continues without it.
+        if let Some(at) = self.dflash_lanes.iter().position(|(t, _)| *t == tag) {
+            let (_, mut context) = self.dflash_lanes.swap_remove(at);
+            let speculator = drafter
+                .as_deref_mut()
+                .and_then(|d| d.drafter_any_mut())
+                .and_then(|any| any.downcast_mut::<Dflash2Speculator>());
+            match speculator {
+                Some(speculator) if context.truncate(position.min(tokens.len())) => {
+                    self.dflash_spare.push(speculator.adopt_lane(context));
+                }
+                Some(_) => {
+                    self.dflash_spare.push(context);
+                    return Err(format!(
+                        "lane record {tag}: its DFlash2 context does not hold position {position}"
+                    ));
+                }
+                None => self.dflash_spare.push(context),
+            }
+        }
         // As the promotion: the resident request moves sealed.
         self.seal_gdn_streams(gpu).map_err(text)?;
         self.with_lanes(|store, bundle| {
@@ -707,6 +914,10 @@ impl MeshLanes for Qwen4Bundle {
         }
         if let Err(error) = self.release_lane(&lane_epoch(tag)) {
             eprintln!("[engine] lane {tag} release: {error}");
+        }
+        if let Some(at) = self.dflash_lanes.iter().position(|(t, _)| *t == tag) {
+            let (_, context) = self.dflash_lanes.swap_remove(at);
+            self.dflash_spare.push(context);
         }
     }
 
