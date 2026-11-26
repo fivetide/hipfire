@@ -744,7 +744,7 @@ impl Driver {
                     self.core.release_resident();
                 }
                 _ if keeps_records => {
-                    // A window lane first runs to its committed end.
+                    // A window lane must be able to reach its committed end.
                     let lanes = lanes_of(m).ok_or("the load staged no engine lanes")?;
                     match lanes.close_record(gpus, live.tag, &live.history) {
                         Ok(()) => runner.records.push(LaneRecord {
