@@ -7001,6 +7001,25 @@ impl Qwen4MtpDrafter {
             .ok_or_else(|| "Qwen4 MTP pending hidden is not allocated".to_string())
     }
 
+    /// Take a lane record's pending hidden (the reverse of
+    /// [`Self::promotion_parts`]): the next turn continues that conversation.
+    pub(crate) fn adopt_pending_hidden(
+        &mut self,
+        gpu: &mut Gpu,
+        hidden: &GpuTensor,
+    ) -> Result<(), String> {
+        let pending = self.pending_hidden()?;
+        let bytes = pending.byte_size();
+        if hidden.byte_size() != bytes {
+            return Err(format!(
+                "lane pending hidden is {} bytes, the drafter's is {bytes}",
+                hidden.byte_size()
+            ));
+        }
+        gpu.copy_d2d(hidden, pending, bytes)
+            .map_err(|e| format!("pending hidden copy: {e}"))
+    }
+
     /// The pending target-hidden row, for the parity harnesses.
     pub(crate) fn pending_hidden_for_parity(&self) -> Result<&GpuTensor, String> {
         self.pending_hidden()

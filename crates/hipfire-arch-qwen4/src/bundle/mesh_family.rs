@@ -420,28 +420,65 @@ impl MeshLanes for Qwen4Bundle {
 
     /// The reverse of the promotion's swap: the lane's request states move
     /// into the resident slot, and the session keeps them as its live state.
-    fn unpark(&mut self, gpus: &mut Gpus, tag: u64, tokens: &[u32]) -> Result<()> {
+    /// An MTP lane's head and draft policy move back with them, and its
+    /// pending hidden goes to `drafter` (the reverse of `promotion_parts`).
+    fn unpark(
+        &mut self,
+        gpus: &mut Gpus,
+        tag: u64,
+        tokens: &[u32],
+        drafter: Option<&mut dyn hipfire_runtime::spec::Speculator>,
+    ) -> Result<()> {
         let gpu = device(gpus)?;
         let epoch = lane_epoch(tag);
         if self.session.is_none() {
             return Err("no session cache: a lane record cannot continue live".into());
         }
-        let position = self
-            .lanes()
-            .and_then(|store| store.lane(&epoch))
-            .map(|lane| lane.state.position);
+        let lane = self.lanes().and_then(|store| store.lane(&epoch));
+        let position = lane.map(|lane| lane.state.position);
         if position != Some(tokens.len()) {
             return Err(format!(
                 "lane record {tag} sits at {position:?}, not at its {} tokens",
                 tokens.len()
             ));
         }
+        let head = lane
+            .and_then(|lane| lane.spec.as_ref())
+            .map(|spec| spec.head.position());
+        let drafter = match head {
+            None => None,
+            Some(head) => {
+                if head != tokens.len() {
+                    return Err(format!(
+                        "lane record {tag}: the MTP head sits at {head}, not at {}",
+                        tokens.len()
+                    ));
+                }
+                // A retained ticket of the last resident request is not moved.
+                self.promotion_resident_ready()?;
+                Some(
+                    drafter
+                        .and_then(|d| d.drafter_any_mut())
+                        .and_then(|any| any.downcast_mut::<crate::mtp_spec::Qwen4MtpDrafter>())
+                        .ok_or("an MTP lane record continues with a native Qwen4 MTP drafter")?,
+                )
+            }
+        };
         // As the promotion: the resident request moves sealed.
         self.seal_gdn_streams(gpu).map_err(text)?;
         self.with_lanes(|store, bundle| {
             let lane = store
                 .lane_mut(&epoch)
                 .ok_or_else(|| format!("lane record {tag} disappeared"))?;
+            if let (Some(drafter), Some(spec)) = (drafter, lane.spec.as_mut()) {
+                let mtp = bundle
+                    .mtp
+                    .as_mut()
+                    .ok_or("an MTP lane record needs the resident MTP head")?;
+                drafter.adopt_pending_hidden(gpu, &spec.pending_hidden)?;
+                std::mem::swap(&mut mtp.state, &mut spec.head);
+                mtp.draft.set_request_state(spec.draft);
+            }
             bundle.state.clamp_f16_valid();
             lane.state.clamp_f16_valid();
             bundle.state.swap_requests(&mut lane.state);
@@ -451,10 +488,52 @@ impl MeshLanes for Qwen4Bundle {
         // The kept state continues: request-local PLE work of an earlier
         // request must not publish into it (`session_begin`'s live rule).
         self.invalidate_ple_epoch().map_err(text)?;
+        let route = if head.is_some() {
+            SessionRoute::Mtp
+        } else {
+            SessionRoute::Ar
+        };
         if let Some(session) = self.session.as_mut() {
-            session.adopt_live(tokens, SessionRoute::Ar);
+            session.adopt_live(tokens, route);
         }
         Ok(())
+    }
+
+    /// A finished window lane ran every committed token but its last, the
+    /// pending seed (the singleton's owed token): one head-synced AR row
+    /// runs it, as the singleton's terminal advance does. A window that
+    /// stopped inside its drafts sits past `tokens`: no record.
+    fn close_record(&mut self, gpus: &mut Gpus, tag: u64, tokens: &[u32]) -> Result<()> {
+        if !self.windows() {
+            return Ok(());
+        }
+        let epoch = lane_epoch(tag);
+        let at = |bundle: &Self| {
+            let store = bundle.lanes()?;
+            let lane = store.lane(&epoch)?;
+            Some((
+                lane.state.position,
+                store.root_seed(&epoch).or(lane.host.pending_seed),
+            ))
+        };
+        match at(self) {
+            Some((position, _)) if position == tokens.len() => return Ok(()),
+            Some((position, seed))
+                if position + 1 == tokens.len() && seed == tokens.last().copied() =>
+            {
+                self.step_windows(gpus, &[(tag, 0)])?;
+            }
+            other => {
+                return Err(format!(
+                    "lane {tag} at {other:?} does not end at its {} tokens",
+                    tokens.len()
+                ))
+            }
+        }
+        match at(self) {
+            Some((position, _)) if position == tokens.len() => Ok(()),
+            other => Err(format!("lane {tag} at {other:?} after its last row")),
+        }
     }
 
     fn step_lanes(&mut self, gpus: &mut Gpus, rows: &[(u64, u32, bool)]) -> Result<Vec<DecodeOut>> {
@@ -577,11 +656,5 @@ impl MeshLanes for Qwen4Bundle {
         if let Err(error) = self.release_lane(&lane_epoch(tag)) {
             eprintln!("[engine] lane {tag} release: {error}");
         }
-    }
-
-    /// An MTP lane's state runs ahead of a window that stopped inside it: no
-    /// record continues it.
-    fn keeps_records(&self) -> bool {
-        !self.windows()
     }
 }

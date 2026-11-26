@@ -721,7 +721,9 @@ impl Driver {
             let tokenizer = m.tokenizer.as_ref().ok_or("tokenizer disappeared")?;
             live.wire
                 .commit_turn(tokenizer, &live.streamed, &mut m.asst_turn_cache);
-            let keeps_records = lanes_of(m).is_some_and(|lanes| lanes.keeps_records());
+            let (keeps_records, windows) = lanes_of(m).map_or((false, false), |lanes| {
+                (lanes.keeps_records(), lanes.windows())
+            });
             match live.held {
                 Some(Place::Resident) => {
                     // The singleton's commit, then the conversation moves into
@@ -732,19 +734,29 @@ impl Driver {
                     let state = m.state.as_deref_mut().ok_or("the model has no state")?;
                     state.session_commit_live_mesh(gpus, kept);
                     // A speculative turn keeps no lane record: its follow-up
-                    // continues the live state with the drafter's own state,
-                    // which a lane does not hold.
-                    if keeps_records && !live.invalidated && live.spec.is_none() {
+                    // continues the live state with the drafter's own state.
+                    // Lanes that run windows take no AR park.
+                    if keeps_records && !windows && !live.invalidated && live.spec.is_none() {
                         if let Some(lanes) = lanes_of(m) {
                             keep_record(lanes, runner, gpus, live.tag, &live.history);
                         }
                     }
                     self.core.release_resident();
                 }
-                _ if keeps_records => runner.records.push(LaneRecord {
-                    tag: live.tag,
-                    tokens: live.history,
-                }),
+                _ if keeps_records => {
+                    // A window lane first runs to its committed end.
+                    let lanes = lanes_of(m).ok_or("the load staged no engine lanes")?;
+                    match lanes.close_record(gpus, live.tag, &live.history) {
+                        Ok(()) => runner.records.push(LaneRecord {
+                            tag: live.tag,
+                            tokens: live.history,
+                        }),
+                        Err(error) => {
+                            eprintln!("[engine] lane {} kept no record: {error}", live.tag);
+                            lanes.free_lane(live.tag);
+                        }
+                    }
+                }
                 _ => {
                     if let Some(lanes) = lanes_of(m) {
                         lanes.free_lane(live.tag);
@@ -1299,7 +1311,15 @@ impl Batch for Ctx<'_> {
                 .mesh_family()
                 .and_then(|family| family.mesh_lanes())
             {
-                if let Err(error) = lanes.unpark(self.gpus, record.tag, &record.tokens) {
+                // A speculative turn continues with the load's drafter.
+                let drafter = match live.spec {
+                    Some(_) => self
+                        .speculator
+                        .as_deref_mut()
+                        .map(|d| d as &mut dyn hipfire_runtime::spec::Speculator),
+                    None => None,
+                };
+                if let Err(error) = lanes.unpark(self.gpus, record.tag, &record.tokens, drafter) {
                     eprintln!("[engine] lane record {} not continued: {error}", record.tag);
                     lanes.free_lane(record.tag);
                 }
@@ -1529,18 +1549,20 @@ impl Batch for Ctx<'_> {
             .as_mut()
             .ok_or("park of a missing request")?;
         let d = run.draft.as_mut().ok_or("a window lane needs a drafter")?;
-        self.state
+        let lanes = self
+            .state
             .mesh_family()
             .and_then(|family| family.mesh_lanes())
-            .ok_or("the load staged no engine lanes")?
-            .park_window(
-                self.gpus,
-                live.tag,
-                &live.prompt,
-                &d.emitted,
-                &mut *d.drafter,
-                remaining,
-            )?;
+            .ok_or("the load staged no engine lanes")?;
+        make_room(lanes, &mut self.runner.records);
+        lanes.park_window(
+            self.gpus,
+            live.tag,
+            &live.prompt,
+            &d.emitted,
+            &mut *d.drafter,
+            remaining,
+        )?;
         let mut d = run
             .take_window_drafting()
             .ok_or("a parked speculative request was not at a window boundary")?;
