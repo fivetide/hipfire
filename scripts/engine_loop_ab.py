@@ -858,6 +858,10 @@ def judge_conc(arms, c, expect_engine):
                                f"request did (tokens not compared)")
         follow = [k for k in reqs if k.startswith("multiturn/") and not k.endswith("/0")]
         r["cache_below_ref"] = sorted(k for k in follow if cached(reqs[k]) < cached(rr.get(k)))
+        # report only: a k>1 follow-up that reuses less than the same request at k=1 lost
+        # its live record (a refused lane record, or a broken handover; HIPF-554)
+        r["cache_below_c1"] = sorted(k for k in follow if k.split("/")[1] != "1"
+                                     and cached(reqs[k]) < cached(reqs.get(at(k, 1))))
         r["cache_hits"] = [sum(cached(reqs[k]) > 0 for k in follow), sum(cached(rr.get(k)) > 0 for k in follow),
                            len(follow)]
         if follow and not r["cache_hits"][0]:

@@ -103,6 +103,19 @@ impl Qwen4Bundle {
         }
         Ok(())
     }
+
+    /// Whether window lane `epoch` sits one row short of `tokens`, its next
+    /// row the conversation's last token (its pending seed).
+    fn record_owes_seed(&self, epoch: &RequestEpoch, tokens: &[u32]) -> bool {
+        self.lanes().is_some_and(|store| {
+            store.spec().is_some()
+                && store.lane(epoch).is_some_and(|lane| {
+                    lane.state.position + 1 == tokens.len()
+                        && store.root_seed(epoch).or(lane.host.pending_seed)
+                            == tokens.last().copied()
+                })
+        })
+    }
 }
 
 impl MeshFamily for Qwen4Bundle {
@@ -429,11 +442,16 @@ impl MeshLanes for Qwen4Bundle {
         tokens: &[u32],
         drafter: Option<&mut dyn hipfire_runtime::spec::Speculator>,
     ) -> Result<()> {
-        let gpu = device(gpus)?;
         let epoch = lane_epoch(tag);
         if self.session.is_none() {
             return Err("no session cache: a lane record cannot continue live".into());
         }
+        // A window lane's record still owes its pending seed
+        // ([`MeshLanes::close_record`]): it runs now, on continuation only.
+        if self.record_owes_seed(&epoch, tokens) {
+            self.step_windows(gpus, &[(tag, 0)])?;
+        }
+        let gpu = device(gpus)?;
         let lane = self.lanes().and_then(|store| store.lane(&epoch));
         let position = lane.map(|lane| lane.state.position);
         if position != Some(tokens.len()) {
@@ -500,40 +518,36 @@ impl MeshLanes for Qwen4Bundle {
     }
 
     /// A finished window lane ran every committed token but its last, the
-    /// pending seed (the singleton's owed token): one head-synced AR row
-    /// runs it, as the singleton's terminal advance does. A window that
-    /// stopped inside its drafts sits past `tokens`: no record.
-    fn close_record(&mut self, gpus: &mut Gpus, tag: u64, tokens: &[u32]) -> Result<()> {
+    /// pending seed (the singleton's owed token): [`Self::unpark`] runs it as
+    /// one head-synced AR row, so a record no turn continues costs nothing.
+    /// Refused: a window that stopped inside its drafts (the lane sits past
+    /// `tokens`), and a lane whose head lags its trunk (retired to head-free
+    /// AR; a lane keeps no owed head rows, so it cannot catch up).
+    fn close_record(&mut self, _gpus: &mut Gpus, tag: u64, tokens: &[u32]) -> Result<()> {
         if !self.windows() {
             return Ok(());
         }
         let epoch = lane_epoch(tag);
-        let at = |bundle: &Self| {
-            let store = bundle.lanes()?;
-            let lane = store.lane(&epoch)?;
-            Some((
-                lane.state.position,
-                store.root_seed(&epoch).or(lane.host.pending_seed),
-            ))
-        };
-        match at(self) {
-            Some((position, _)) if position == tokens.len() => return Ok(()),
-            Some((position, seed))
-                if position + 1 == tokens.len() && seed == tokens.last().copied() =>
-            {
-                self.step_windows(gpus, &[(tag, 0)])?;
-            }
-            other => {
-                return Err(format!(
-                    "lane {tag} at {other:?} does not end at its {} tokens",
-                    tokens.len()
-                ))
-            }
+        let lane = self
+            .lanes()
+            .and_then(|store| store.lane(&epoch))
+            .ok_or_else(|| format!("lane {tag} is not admitted"))?;
+        let (trunk, head) = (
+            lane.state.position,
+            lane.spec.as_ref().map(|spec| spec.head.position()),
+        );
+        if head.is_some_and(|head| head != trunk) {
+            return Err(format!(
+                "lane {tag}: the MTP head sits at {head:?}, the trunk at {trunk}"
+            ));
         }
-        match at(self) {
-            Some((position, _)) if position == tokens.len() => Ok(()),
-            other => Err(format!("lane {tag} at {other:?} after its last row")),
+        if trunk == tokens.len() || self.record_owes_seed(&epoch, tokens) {
+            return Ok(());
         }
+        Err(format!(
+            "lane {tag} at {trunk} does not end at its {} tokens",
+            tokens.len()
+        ))
     }
 
     fn step_lanes(&mut self, gpus: &mut Gpus, rows: &[(u64, u32, bool)]) -> Result<Vec<DecodeOut>> {
