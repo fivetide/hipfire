@@ -11,9 +11,9 @@
 //! is lane `r`), so one forward over the lanes' rows reads the weights once
 //! and reads and writes every lane in place ([`forward::forward_lane_rows`],
 //! the mixed-row epoch). Its rows are not bit-identical to the one-row
-//! decode (batched GEMMs, grouped MoE, batched head). Rows of the row-exact
-//! class (`serve.batch_exact`), epochs of fewer than [`MIXED_MIN_ROWS`]
-//! shared rows, and loads without batched rows
+//! decode (batched GEMMs and per-row positions in attention). Rows of the
+//! row-exact class (`serve.batch_exact`), a lone shared row, and loads
+//! without batched rows
 //! run the one-row decode instead (whole-step): the eager decode the legacy
 //! loop's captured graph replays byte-identically, with the lane's caches
 //! (non-owning views of its region) swapped in for the step. The resident
@@ -35,13 +35,6 @@ use hipfire_runtime::multi_gpu::executor::Result;
 use hipfire_runtime::multi_gpu::Gpus;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-/// Fewest shared rows one lane forward runs; fewer run one-row decodes. A
-/// row routes its own top-8 of 128 experts, so the expert reads grow with
-/// the rows and only the dense part is shared. halo gfx1151, 26B-A4B mq4,
-/// `hipfire bench` stateless, TPOT p50: 2 rows 42.7 ms in one forward vs
-/// 2 x 20 ms one-row; 4 rows 56.7 ms vs 4 x 20 ms (HIPF-545).
-const MIXED_MIN_ROWS: usize = 3;
-
 struct Lane {
     /// Views of this lane's region of the arenas; never freed.
     kv_sliding: KvCache,
@@ -61,8 +54,9 @@ pub(super) struct Gemma4Lanes {
     top1: GpuTensor,
     /// Sampled requests may take a lane (`serve.batch_sampled`).
     sampled: bool,
-    /// The load runs batched rows, so an epoch of [`MIXED_MIN_ROWS`]+ shared
-    /// rows is one forward ([`forward::forward_lane_rows`]).
+    /// The load runs batched rows, so an epoch of 2+ shared rows is one
+    /// forward ([`forward::forward_lane_rows`]).
+    /// halo 26B-A4B: 2 rows 36.6 ms vs 2 x 20.1 ms one-row (HIPF-545).
     mixed: bool,
     /// `serve.batch_exact`: which rows keep the one-row decode.
     exact: LaneRowExact,
@@ -291,7 +285,7 @@ impl MeshLanes for Gemma4Bundle {
         };
         let shared: Vec<usize> = (0..rows.len()).filter(|&i| !exact(rows[i].2)).collect();
         let mut outs: Vec<Option<DecodeOut>> = rows.iter().map(|_| None).collect();
-        if staged.mixed && shared.len() >= MIXED_MIN_ROWS {
+        if staged.mixed && shared.len() >= 2 {
             let lane_rows: Vec<_> = shared
                 .iter()
                 .map(|&i| (lane_of[i], rows[i].1, rows[i].2))

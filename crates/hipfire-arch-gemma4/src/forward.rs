@@ -844,7 +844,7 @@ pub struct LaneRows<'a> {
 /// each row's argmax (`argmax_out`) and/or soft-capped logits row
 /// (`logits_out`, `[rows, vocab]`). The resident state's position is not
 /// touched. A row is not bit-identical to the one-row decode of the same
-/// lane (batched GEMMs, MoE and head).
+/// lane (batched GEMMs; grouped MoE past `LANE_ROW_MOE_MAX` rows).
 #[allow(clippy::too_many_arguments)]
 pub fn forward_lane_rows(
     cfg: &Gemma4Config,
@@ -1030,9 +1030,15 @@ fn forward_rows(
         _ => None,
     };
     // Grouped routed-expert scratch for the batched rows (index buffers are
-    // i32 in F32-sized slots).
+    // i32 in F32-sized slots). Up to LANE_ROW_MOE_MAX lane rows run the
+    // one-row indexed expert kernels row by row instead: the rows rarely
+    // share an expert, and the grouped kernel pads each expert to a 16-slot
+    // tile. halo 26B-A4B lane forward: 2 rows 39.7 -> 36.6 ms, 3 rows 48.1
+    // -> 45.5, 4 rows 55.7 -> 54.6, 8 rows 80.7 -> 90.0 (HIPF-545).
+    const LANE_ROW_MOE_MAX: usize = 4;
+    let grouped = b > 1 && !(lanes.is_some() && b <= LANE_ROW_MOE_MAX);
     let routed_batch = match state.moe.as_ref() {
-        Some(_) if b > 1 => {
+        Some(_) if grouped => {
             let (k, ne, mi) = (
                 cfg.top_k_experts,
                 cfg.num_experts,
@@ -1115,6 +1121,56 @@ fn forward_rows(
     drop(steps);
     if lanes.is_none() {
         state.n_tokens = start_pos + b;
+    } else {
+        // Lane rows take the one-row decode's head per row (its gemv, not the
+        // batched/per-row-download head below): 2.4 ms a row instead of 7.6
+        // on halo 26B-A4B (HIPF-545), and the argmax stays on the device.
+        let vocab = cfg.vocab_size;
+        let logits_b = bufs.alloc(b * vocab, "lane_logits")?;
+        let lm_head = weights.lm_head.dispatch_ref();
+        let geo = Geometry::eager(cfg);
+        let rows: Vec<_> = (0..b)
+            .map(|i| {
+                (
+                    x.sub_offset(i * dim, dim),
+                    logits_b.sub_offset(i * vocab, vocab),
+                )
+            })
+            .collect();
+        let mut head_steps = Vec::with_capacity(3 * b);
+        for (x_row, logits_row) in &rows {
+            head(
+                &geo,
+                &weights.final_norm,
+                &lm_head,
+                x_row,
+                &state.tmp,
+                logits_row,
+                &mut head_steps,
+            );
+        }
+        execute_steps(gpu, &ctx, &head_steps).map_err(|e| format!("gemma4 lane head: {e}"))?;
+        if let Some(out) = per_pos_argmax_out {
+            let idx = bufs.alloc(b, "lane_argmax")?;
+            gpu.argmax_f32_batched(&logits_b, &idx, vocab, b)
+                .map_err(|e| format!("gemma4 lane argmax: {e:?}"))?;
+            let bytes = gpu
+                .download_raw_bytes(&idx)
+                .map_err(|e| format!("gemma4 lane argmax dtoh: {e:?}"))?;
+            out.clear();
+            out.extend(
+                bytes[..4 * b]
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+            );
+        }
+        if let Some(out) = per_pos_logits_out {
+            *out = gpu
+                .download_f32(&logits_b)
+                .map_err(|e| format!("gemma4 lane logits dtoh: {e:?}"))?;
+            out.truncate(b * vocab);
+        }
+        return Ok(());
     }
 
     // ── Spec-decode out-params (ADDITIVE; all default-off). ──
